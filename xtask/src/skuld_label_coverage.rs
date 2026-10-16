@@ -451,6 +451,7 @@ pub(crate) fn run_nextest_list(
     let (program, args) = list_command.split_first().context("empty nextest list command")?;
 
     let mut command = Command::new(program);
+    crate::child_env::scrub(&mut command);
     command.args(args).current_dir(repo_root);
     match skuld_labels {
         Some(v) => {

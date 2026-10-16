@@ -175,6 +175,24 @@ pub fn installer_assembly_step_timeouts(
     Ok(out)
 }
 
+/// Step label → declared `timeout-minutes`, for the steps of `job_id` that
+/// declare a literal one.
+pub fn step_timeouts(ci_yaml: &str, job_id: &str) -> Result<BTreeMap<String, u64>> {
+    let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
+    let job = ci
+        .jobs
+        .get(job_id)
+        .with_context(|| format!("ci.yaml declares no job {job_id:?}"))?;
+    let mut out = BTreeMap::new();
+    for (i, step) in job.steps.iter().enumerate() {
+        let label = step.label(i);
+        if let Some(Ok(minutes)) = step.timeout_minutes.as_ref().map(|v| resolve_timeout(&label, v)) {
+            out.insert(label, minutes);
+        }
+    }
+    Ok(out)
+}
+
 /// Labels of the steps of `job_id` that declare no literal `timeout-minutes` —
 /// absent, an expression, or not a whole number. A step with no bound of its
 /// own runs to the job wall, and a wall that fires destroys the step's log

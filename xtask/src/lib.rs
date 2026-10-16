@@ -15,6 +15,7 @@ use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_
 
 pub mod bindir;
 pub mod check_vendoring_integrity;
+pub mod child_env;
 pub mod ci_coverage;
 pub mod ci_nextest_parity;
 pub mod ci_platform_coverage;
@@ -252,6 +253,14 @@ pub enum Command {
     /// archive with no registry. Wired into `prek.toml` as the
     /// `check-schemars-pin` hook. See `xtask/src/schemars_pin.rs`.
     CheckSchemarsPin,
+    /// Run the prek hooks CI runs once (`portable`: every hook not listed in
+    /// `.github/lint.toml`) or on every platform (`platform-dependent`: the
+    /// hooks it lists). Both are derived from that one list.
+    Prek {
+        /// Which of the two runs to perform.
+        #[arg(value_enum)]
+        which: prek_split::PrekRun,
+    },
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
     /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
@@ -451,6 +460,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),
         Command::GolangciLint { args } => run_golangci_lint(&args),
+        Command::Prek { which } => prek_split::run(which, &repo_root()?),
         Command::ProvisionUpstreamV2ray => run_provision_upstream_v2ray(),
         Command::PullSubrepo { path, tag } => run_pull_subrepo(path, tag),
         Command::ForceCommitConflictedSubrepo { path, tag } => {

@@ -611,7 +611,9 @@ pub fn declared_schemars_requirements(metadata: &str) -> Result<(String, Vec<Str
 /// lockfile that has drifted.
 pub fn cargo_metadata_json(repo_root: &Path) -> Result<String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let out = Command::new(&cargo)
+    let mut cmd = Command::new(&cargo);
+    crate::child_env::scrub(&mut cmd);
+    let out = cmd
         .args(["metadata", "--format-version", "1", "--locked"])
         .current_dir(repo_root)
         .output()

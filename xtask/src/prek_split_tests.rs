@@ -1,26 +1,27 @@
-//! Unit tests for the prek hook split plus the structural conformance test that
-//! holds every `prek.toml` hook to an explicit, evidenced classification.
+//! Unit tests for the lint split plus the conformance tests that hold the real
+//! `.github/lint.toml`, `prek.toml` and `ci.yaml` to it.
 
 use std::collections::BTreeSet;
 use std::fs;
 
-use crate::manifest::Manifest;
-use crate::prek_split::{hook_ids, host_bound_hooks, portable_skip};
+use crate::prek_split::{hook_ids, LintSplit};
 
 fn set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
-// ===== hook_ids ======================================================================================================
-
-#[skuld::test]
-fn hook_ids_cover_table_form_and_inline_form_and_dedupe() {
-    let toml = r#"
+const PREK: &str = r#"
 [[repos]]
 repo = "local"
 
 [[repos.hooks]]
-id = "local-one"
+id = "cargo-clippy"
+
+[[repos.hooks]]
+id = "go-lint"
+
+[[repos.hooks]]
+id = "ty"
 
 [[repos]]
 repo = "https://example.invalid/hooks"
@@ -41,218 +42,117 @@ id = "twice"
 id = "twice"
 name = "second config of the same hook"
 "#;
+
+// ===== hook_ids ======================================================================================================
+
+#[skuld::test]
+fn hook_ids_cover_table_form_and_inline_form_and_dedupe() {
     assert_eq!(
-        hook_ids(toml).unwrap(),
-        set(&["local-one", "inline-a", "inline-b", "twice"])
+        hook_ids(PREK).unwrap(),
+        set(&["cargo-clippy", "go-lint", "ty", "inline-a", "inline-b", "twice"])
     );
 }
 
-// ===== portable_skip / host_bound_hooks ==============================================================================
+// ===== LintSplit =====================================================================================================
 
-fn fixture() -> Manifest {
-    Manifest::parse(
-        r#"
-targets:
-  portable:
-    platforms: [linux/amd64]
-    run:
-      - bash:
-          command: prek run --all-files --show-diff-on-failure
-          environment: { SKIP: "cargo-clippy, go-lint" }
-  host-bound:
-    platforms: [linux/amd64]
-    run: prek run go-lint other --all-files --show-diff-on-failure
-  no-skip:
-    platforms: [linux/amd64]
-    run: prek run --all-files
-  no-prek:
-    platforms: [linux/amd64]
-    run: echo
-"#,
-    )
-    .unwrap()
+fn split(lint_toml: &str) -> anyhow::Result<LintSplit> {
+    LintSplit::parse(lint_toml, PREK)
 }
 
 #[skuld::test]
-fn the_skip_set_is_read_from_the_prek_step_environment() {
-    assert_eq!(
-        portable_skip(&fixture(), "portable").unwrap(),
-        set(&["cargo-clippy", "go-lint"])
-    );
-    assert_eq!(portable_skip(&fixture(), "no-skip").unwrap(), set(&[]));
+fn the_listed_hooks_are_the_platform_dependent_ones() {
+    let s = split(r#"platform-dependent = ["go-lint", "inline-a"]"#).unwrap();
+    assert_eq!(s.platform_dependent(), ["go-lint", "inline-a"]);
+}
+
+/// A listed id that no hook has would silently run nothing on every leg, so it
+/// is an error that names the id.
+#[skuld::test]
+fn a_listed_id_that_is_not_a_hook_is_an_error() {
+    let err = split(r#"platform-dependent = ["go-lint", "go-lnt"]"#).unwrap_err();
+    assert!(format!("{err:#}").contains("go-lnt"), "{err:#}");
+}
+
+/// A typo in the key would make the list empty and every hook run once; a
+/// missing or extra key is an error, not an empty list.
+#[skuld::test]
+fn a_missing_or_unknown_key_is_an_error() {
+    assert!(split("").is_err());
+    assert!(split(r#"platform-dependant = ["go-lint"]"#).is_err());
+    assert!(split("platform-dependent = [\"go-lint\"]\nother = 1").is_err());
+    assert!(split(r#"platform-dependent = "go-lint""#).is_err());
 }
 
 #[skuld::test]
-fn the_host_bound_ids_are_the_positional_arguments_of_prek_run() {
+fn an_empty_list_is_allowed_and_means_every_hook_runs_once() {
+    let s = split("platform-dependent = []").unwrap();
+    assert!(s.platform_dependent().is_empty());
+    assert_eq!(s.platform_dependent_args(), None, "nothing to run on every leg");
     assert_eq!(
-        host_bound_hooks(&fixture(), "host-bound").unwrap(),
-        set(&["go-lint", "other"])
+        s.portable_args(),
+        ["run", "--all-files", "--show-diff-on-failure", "--skip", "cargo-clippy"]
     );
 }
 
-/// A bare `prek run --all-files` would run every hook: it is not a host-bound
-/// target, and returning an empty set for it would pass vacuously.
+/// The portable run skips what runs elsewhere: the listed hooks (every leg) and
+/// `cargo-clippy` (the per-leg `clippy-*` steps). The per-leg run names exactly
+/// the listed hooks. Both come from the one list.
 #[skuld::test]
-fn a_target_that_names_no_hook_or_no_prek_step_is_an_error() {
-    assert!(host_bound_hooks(&fixture(), "no-skip").is_err());
-    assert!(host_bound_hooks(&fixture(), "no-prek").is_err());
-    assert!(portable_skip(&fixture(), "no-prek").is_err());
-    assert!(portable_skip(&fixture(), "gone").is_err());
+fn both_runs_are_derived_from_the_one_list() {
+    let s = split(r#"platform-dependent = ["go-lint", "inline-a"]"#).unwrap();
+    assert_eq!(
+        s.portable_args(),
+        [
+            "run",
+            "--all-files",
+            "--show-diff-on-failure",
+            "--skip",
+            "cargo-clippy",
+            "--skip",
+            "go-lint",
+            "--skip",
+            "inline-a"
+        ]
+    );
+    assert_eq!(
+        s.platform_dependent_args().unwrap(),
+        ["run", "go-lint", "inline-a", "--all-files", "--show-diff-on-failure"]
+    );
+}
+
+#[skuld::test]
+fn a_duplicate_id_is_listed_once() {
+    let s = split(r#"platform-dependent = ["go-lint", "go-lint"]"#).unwrap();
+    assert_eq!(s.platform_dependent(), ["go-lint"]);
 }
 
 // ===== conformance ===================================================================================================
-
-/// How a hook's verdict depends on the machine that runs it.
-enum Class {
-    /// Same verdict on every host: run once, in the linux/amd64 leg.
-    Portable(&'static str),
-    /// The verdict depends on the host's OS or arch: run in every leg.
-    HostBound(&'static str),
-    /// Host-bound, and run per leg by the `clippy-*` steps instead of prek.
-    PerLegClippy(&'static str),
-}
-
-impl Class {
-    fn evidence(&self) -> &'static str {
-        match self {
-            Class::Portable(e) | Class::HostBound(e) | Class::PerLegClippy(e) => e,
-        }
-    }
-}
-
-/// EVERY hook in `prek.toml`, classified with the evidence for the class. A new
-/// hook fails `every_prek_hook_is_classified` until it is added here, which is
-/// the point: the default for an unclassified hook must not be "run once".
-///
-/// "Measured" entries were run on a darwin host on 2026-10-16.
-fn classes() -> Vec<(&'static str, Class)> {
-    use Class::{HostBound, PerLegClippy, Portable};
-    vec![
-        ("no-std-test", Portable("pygrep over file text")),
-        ("no-cargo-in-tests", Portable("pygrep over file text")),
-        (
-            "cargo-fmt",
-            Portable(
-                "measured: `cargo fmt --check` on darwin flagged a mis-formatted line appended to the \
-                 `#![cfg(windows)]` file crates/tun-engine/src/dns_confine/privileged_tests.rs; rustfmt parses \
-                 every module without evaluating cfg",
-            ),
-        ),
-        (
-            "cargo-clippy",
-            PerLegClippy("type-checks the cfg-gated code of the host's own target; skipped in prek, run by clippy-*"),
-        ),
-        (
-            "go-fmt",
-            Portable(
-                "measured: `golangci-lint fmt --diff` on darwin flagged mis-formatted lines appended to BOTH \
-                 keepalive_windows.go and keepalive_linux.go; gofumpt reads files and applies no build tags",
-            ),
-        ),
-        (
-            "go-lint",
-            HostBound(
-                "measured: with a self-assignment appended to keepalive_windows.go, `golangci-lint run` on darwin \
-                 reported 0 issues and GOOS=windows reported the finding; it type-checks packages under the host's \
-                 GOOS, so _windows/_linux/_darwin files are linted only on their own platform",
-            ),
-        ),
-        ("check-version-hole", Portable("compares Cargo.toml with git tags")),
-        ("check-version-garter", Portable("compares Cargo.toml with git tags")),
-        ("check-version-galoshes", Portable("compares Cargo.toml with git tags")),
-        ("check-version-ex-ray", Portable("compares version.toml with git tags")),
-        (
-            "gen-ui-constants",
-            Portable("parses Rust source text, writes TypeScript"),
-        ),
-        ("check-vendoring-integrity", Portable("text scan of vendored trees")),
-        (
-            "check-schemars-pin",
-            Portable("`cargo metadata` without --filter-platform resolves every target's dependencies"),
-        ),
-        ("check-workspace-lints", Portable("python over Cargo.toml text")),
-        ("format-section-comments", Portable("python over file text")),
-        (
-            "ty",
-            Portable("ty.toml sets python-platform = \"all\", so POSIX-only and Windows-only APIs both resolve"),
-        ),
-        (
-            "validate-docs",
-            Portable("Sphinx build of docs/, no host-specific input"),
-        ),
-        (
-            "check-executables-have-shebangs",
-            Portable("reads file content and the git file mode"),
-        ),
-        (
-            "check-shebang-scripts-are-executable",
-            Portable(
-                "compares the shebang against the committed git file mode; moving it from a Windows checkout to \
-                 Linux makes the working-tree mode real, so a previously invisible finding is a true finding",
-            ),
-        ),
-        ("mixed-line-ending", Portable("reads file bytes")),
-        ("editorconfig-checker", Portable("reads file text")),
-        ("yapf", Portable("formats Python source text")),
-        ("mdformat", Portable("formats Markdown text")),
-        ("biome-check", Portable("lints and formats JS/TS source text")),
-    ]
-}
 
 fn read_repo(rel: &str) -> String {
     let root = crate::repo_root().expect("repo root");
     fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-fn ids_of(want_portable: bool) -> BTreeSet<String> {
-    classes()
-        .into_iter()
-        .filter(|(_, c)| matches!(c, Class::Portable(_)) == want_portable)
-        .map(|(id, _)| id.to_string())
-        .collect()
-}
-
-/// The lint split runs platform-independent hooks once and platform-dependent
-/// hooks on every leg. Which is which is a fact about each hook, so each hook is
-/// classified by name here, with its evidence; the build.yaml targets are then
-/// held to that classification.
+/// `.github/lint.toml` lists only hooks `prek.toml` has. Every other hook is
+/// portable by default, so a new hook needs no entry anywhere.
 #[skuld::test]
-fn every_prek_hook_is_classified() {
-    let hooks = hook_ids(&read_repo("prek.toml")).expect("parse prek.toml");
-    let classified: BTreeSet<String> = classes().into_iter().map(|(id, _)| id.to_string()).collect();
-    assert_eq!(
-        hooks.symmetric_difference(&classified).collect::<Vec<_>>(),
-        Vec::<&String>::new(),
-        "prek.toml hooks and the classification in prek_split_tests.rs disagree: classify any new hook \
-         as Portable (same verdict on every host) or HostBound, with evidence"
+fn the_repo_lint_toml_lists_only_real_hooks() {
+    let s = LintSplit::parse(&read_repo(".github/lint.toml"), &read_repo("prek.toml")).expect("lint.toml");
+    assert!(
+        !s.platform_dependent().is_empty(),
+        "go-lint is platform-dependent (see the evidence in lint.toml); an empty list drops its per-leg run"
     );
 }
 
-/// The portable run skips exactly the hooks that are not portable.
+/// CI runs the two derived commands and nothing hand-listed: the portable one
+/// on the `portable-lint` leg, the platform-dependent one on every leg.
 #[skuld::test]
-fn the_portable_run_skips_exactly_the_non_portable_hooks() {
-    let manifest = Manifest::parse(&read_repo("build.yaml")).expect("parse build.yaml");
-    assert_eq!(portable_skip(&manifest, "prek-portable").unwrap(), ids_of(false));
-}
-
-/// The per-leg run names exactly the host-bound hooks prek itself runs.
-#[skuld::test]
-fn the_host_bound_run_names_exactly_the_host_bound_hooks_prek_runs() {
-    let manifest = Manifest::parse(&read_repo("build.yaml")).expect("parse build.yaml");
-    let want: BTreeSet<String> = classes()
-        .into_iter()
-        .filter(|(_, c)| matches!(c, Class::HostBound(_)))
-        .map(|(id, _)| id.to_string())
-        .collect();
-    assert_eq!(host_bound_hooks(&manifest, "prek-host-bound").unwrap(), want);
-}
-
-#[skuld::test]
-fn every_classification_cites_evidence() {
-    for (id, class) in classes() {
-        assert!(
-            class.evidence().len() > 10,
-            "{id}: classify with evidence, not a bare label"
-        );
-    }
+fn ci_runs_the_derived_prek_commands() {
+    let ci_yaml = read_repo(".github/workflows/ci.yaml");
+    let runs = crate::ci_platform_coverage::step_runs(&ci_yaml, "ci").expect("step runs");
+    assert_eq!(runs["lint"].trim(), "cargo xtask prek portable");
+    assert_eq!(
+        runs["lint-platform-dependent"].trim(),
+        "cargo xtask prek platform-dependent"
+    );
 }

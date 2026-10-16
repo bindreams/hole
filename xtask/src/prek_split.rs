@@ -1,18 +1,34 @@
 //! Which prek hooks run once, and which on every platform.
 //!
-//! Backs the conformance tests in `prek_split_tests.rs`. The unified `ci` job
-//! runs `prek-portable` (every hook whose verdict is the same on any host) in
-//! the linux/amd64 leg only, and `prek-host-bound` (hooks whose verdict depends
-//! on the host's OS or arch, such as golangci-lint, which type-checks under the
-//! host's `GOOS`) in every leg. The two build.yaml targets state the split; the
-//! readers here let a test hold them to a per-hook classification.
+//! The unified `ci` job runs the hooks whose verdict is the same on any host
+//! once, in the linux/amd64 leg (`portable`), and the hooks that depend on the
+//! host in every leg (`platform-dependent`, today golangci-lint, which
+//! type-checks under the host's `GOOS`). `.github/lint.toml` lists the
+//! platform-dependent hooks; every other hook is portable by default, so a new
+//! hook is checked once without being named anywhere. Both runs are derived
+//! from that one list, and a listed id that `prek.toml` does not have is an
+//! error rather than a hook that quietly never runs.
 
 use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
+use clap::ValueEnum;
+use serde::Deserialize;
 
-use crate::ci_coverage::{join_line_continuations, split_commands, step_command, step_environment};
-use crate::manifest::{Manifest, Step};
+/// The hook the per-leg `clippy-*` steps run instead of prek, so neither prek
+/// run does.
+const CLIPPY_HOOK: &str = "cargo-clippy";
+
+/// Which of the two derived runs to perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PrekRun {
+    /// Every hook that is not platform-dependent (run once).
+    Portable,
+    /// The platform-dependent hooks (run on every leg).
+    PlatformDependent,
+}
 
 /// Every hook id `prek.toml` configures, from both `[[repos.hooks]]` tables and
 /// inline `hooks = [ ... ]` arrays. A hook configured twice (the two `mdformat`
@@ -37,54 +53,90 @@ pub fn hook_ids(prek_toml: &str) -> Result<BTreeSet<String>> {
     Ok(out)
 }
 
-fn prek_run_step<'a>(manifest: &'a Manifest, target: &str) -> Result<(&'a Step, String)> {
-    let t = manifest
-        .get(target)
-        .with_context(|| format!("build.yaml declares no target {target:?}"))?;
-    for step in &t.run {
-        for cmd in split_commands(&join_line_continuations(&step_command(step))) {
-            let toks: Vec<&str> = cmd.split_whitespace().collect();
-            if toks.windows(2).any(|w| w[0] == "prek" && w[1] == "run") {
-                return Ok((step, cmd));
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LintToml {
+    #[serde(rename = "platform-dependent")]
+    platform_dependent: Vec<String>,
+}
+
+/// The split read from `.github/lint.toml` and checked against `prek.toml`.
+#[derive(Debug)]
+pub struct LintSplit {
+    platform_dependent: Vec<String>,
+}
+
+impl LintSplit {
+    /// Parse `lint_toml` and require every listed id to be a hook of `prek_toml`.
+    pub fn parse(lint_toml: &str, prek_toml: &str) -> Result<Self> {
+        let parsed: LintToml = toml::from_str(lint_toml).context("parsing .github/lint.toml")?;
+        let hooks = hook_ids(prek_toml)?;
+        let mut platform_dependent: Vec<String> = Vec::new();
+        for id in parsed.platform_dependent {
+            ensure!(
+                hooks.contains(&id),
+                ".github/lint.toml lists {id:?} as platform-dependent, but prek.toml has no such hook"
+            );
+            if !platform_dependent.contains(&id) {
+                platform_dependent.push(id);
             }
         }
+        Ok(Self { platform_dependent })
     }
-    bail!("build.yaml target {target:?} has no `prek run` step")
+
+    /// The listed hook ids, in file order.
+    pub fn platform_dependent(&self) -> &[String] {
+        &self.platform_dependent
+    }
+
+    /// Arguments of the `prek` call that runs every other hook.
+    pub fn portable_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = ["run", "--all-files", "--show-diff-on-failure"]
+            .map(String::from)
+            .into();
+        for id in std::iter::once(CLIPPY_HOOK).chain(self.platform_dependent.iter().map(String::as_str)) {
+            args.extend(["--skip".to_string(), id.to_string()]);
+        }
+        args
+    }
+
+    /// Arguments of the `prek` call that runs the listed hooks; `None` when the
+    /// list is empty (a bare `prek run` would run every hook).
+    pub fn platform_dependent_args(&self) -> Option<Vec<String>> {
+        if self.platform_dependent.is_empty() {
+            return None;
+        }
+        let mut args = vec!["run".to_string()];
+        args.extend(self.platform_dependent.iter().cloned());
+        args.extend(["--all-files".to_string(), "--show-diff-on-failure".to_string()]);
+        Some(args)
+    }
 }
 
-/// The hook ids target `target`'s `prek run` step skips through `SKIP`
-/// (comma-separated, as prek reads it).
-pub fn portable_skip(manifest: &Manifest, target: &str) -> Result<BTreeSet<String>> {
-    let (step, _) = prek_run_step(manifest, target)?;
-    Ok(step_environment(step)
-        .get("SKIP")
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-/// The hook ids target `target`'s `prek run` step names, i.e. its positional
-/// arguments. A bare `prek run` names none and would run every hook, so it is an
-/// error here rather than an empty set.
-pub fn host_bound_hooks(manifest: &Manifest, target: &str) -> Result<BTreeSet<String>> {
-    let (_, cmd) = prek_run_step(manifest, target)?;
-    let toks: Vec<&str> = cmd.split_whitespace().collect();
-    let run_at = toks
-        .windows(2)
-        .position(|w| w[0] == "prek" && w[1] == "run")
-        .expect("prek_run_step found it")
-        + 2;
-    let ids: BTreeSet<String> = toks[run_at..]
-        .iter()
-        .filter(|t| !t.starts_with('-'))
-        .map(|t| t.to_string())
-        .collect();
-    if ids.is_empty() {
-        bail!("build.yaml target {target:?} runs `prek run` without naming a hook, so it runs every hook");
+/// Perform `which` against the repository at `repo_root`.
+pub fn run(which: PrekRun, repo_root: &Path) -> Result<()> {
+    let read = |rel: &str| std::fs::read_to_string(repo_root.join(rel)).with_context(|| format!("reading {rel}"));
+    let split = LintSplit::parse(&read(".github/lint.toml")?, &read("prek.toml")?)?;
+    let args = match which {
+        PrekRun::Portable => split.portable_args(),
+        PrekRun::PlatformDependent => match split.platform_dependent_args() {
+            Some(args) => args,
+            None => {
+                println!("xtask: .github/lint.toml lists no platform-dependent hook; nothing to run");
+                return Ok(());
+            }
+        },
+    };
+    println!("xtask: prek {}", args.join(" "));
+    let mut cmd = Command::new("prek");
+    crate::child_env::scrub(&mut cmd);
+    let status = cmd
+        .args(&args)
+        .current_dir(repo_root)
+        .status()
+        .context("running prek (is it installed? `uv tool install prek`)")?;
+    if !status.success() {
+        bail!("prek {} failed: {status}", args.join(" "));
     }
-    Ok(ids)
+    Ok(())
 }

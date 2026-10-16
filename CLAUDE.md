@@ -284,7 +284,7 @@ before editing; the sections linked below are the authoritative source.
 
 ## macOS CI is the scarce resource
 
-~9 darwin jobs per PR against a small shared pool; the Windows and Linux legs finish long
+2 darwin jobs per PR (one per arch) against a small shared pool; the Windows and Linux legs finish long
 before them. Queue depth scales with the number of concurrent branches, not their size. Land
 what is open before starting more.
 

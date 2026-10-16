@@ -7,13 +7,18 @@
 //! matrix leg so a test can compare the result against a table written
 //! independently of ci.yaml.
 //!
-//! The evaluation models a HEALTHY run: every step that runs succeeds, nothing
-//! is cancelled, so `success()` and `always()` hold, `failure()` and
-//! `cancelled()` do not, and `steps.<id>.outcome` is `success` for a step that
-//! runs on this leg and `skipped` for one that does not. The expression subset
-//! is deliberately small (`&&`, `||`, `!`, `==`, `!=`, parentheses, the four
-//! status functions, `matrix.*` and `steps.<id>.outcome`); anything else is an
-//! error, so the grammar cannot silently widen.
+//! [`steps_on`] models a HEALTHY run: every step that runs succeeds, nothing is
+//! cancelled, so `success()` and `always()` hold, `failure()` and `cancelled()`
+//! do not, and `steps.<id>.outcome` is `success` for a step that runs on this
+//! leg and `skipped` for one that does not. [`steps_on_after_failure`] models
+//! the run in which exactly one named step fails and nothing is cancelled: from
+//! then on `success()` is false, `failure()` is true, a step with no status
+//! function in its `if:` (or no `if:`) is skipped, as GitHub's implicit
+//! `success()` does, and the failed step's outcome is `failure`. It does not
+//! model cancellation, `continue-on-error`, or a second failure. The expression
+//! subset is deliberately small (`&&`, `||`, `!`, `==`, `!=`, parentheses, the
+//! four status functions, `matrix.*` and `steps.<id>.outcome`); anything else
+//! is an error, so the grammar cannot silently widen.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,6 +39,8 @@ struct CiYaml {
 
 #[derive(Deserialize)]
 struct Job {
+    #[serde(default, rename = "continue-on-error")]
+    continue_on_error: Option<serde_yml::Value>,
     #[serde(default)]
     strategy: Option<Strategy>,
     #[serde(default)]
@@ -60,6 +67,8 @@ struct Step {
     if_: Option<serde_yml::Value>,
     #[serde(default)]
     run: Option<String>,
+    #[serde(default)]
+    uses: Option<String>,
     #[serde(default, rename = "continue-on-error")]
     continue_on_error: Option<serde_yml::Value>,
 }
@@ -94,6 +103,11 @@ impl Leg {
         format!("{}/{}", self.string("os"), self.string("arch"))
     }
 
+    /// The leg's job wall (`matrix.timeout`) in minutes, if it is a literal.
+    pub fn wall(&self) -> Option<u64> {
+        self.fields.get("timeout").and_then(serde_yml::Value::as_u64)
+    }
+
     fn value(&self, key: &str) -> Val {
         match self.fields.get(key) {
             None | Some(serde_yml::Value::Null) => Val::Null,
@@ -121,33 +135,105 @@ pub fn legs(ci_yaml: &str, job_id: &str) -> Result<Vec<Leg>> {
 
 /// The ids of the steps of `job_id` that run on `leg` in a healthy run.
 pub fn steps_on(leg: &Leg, ci_yaml: &str, job_id: &str) -> Result<BTreeSet<String>> {
+    run_job(leg, ci_yaml, job_id, None)
+}
+
+/// The ids of the steps of `job_id` that run on `leg` when the step `failing`
+/// fails and nothing else goes wrong. `failing` must itself run on the leg.
+pub fn steps_on_after_failure(leg: &Leg, ci_yaml: &str, job_id: &str, failing: &str) -> Result<BTreeSet<String>> {
+    run_job(leg, ci_yaml, job_id, Some(failing))
+}
+
+fn run_job(leg: &Leg, ci_yaml: &str, job_id: &str, failing: Option<&str>) -> Result<BTreeSet<String>> {
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let job = job(&ci, job_id)?;
 
     let mut ran: BTreeSet<String> = BTreeSet::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut failed: Option<String> = None;
     for (i, step) in job.steps.iter().enumerate() {
         let id = step_id(step, i)?;
         let runs = match &step.if_ {
-            None => true,
+            // No `if:` is an implicit `success()`.
+            None => failed.is_none(),
             Some(cond) => {
                 let text = condition_text(cond).with_context(|| format!("step {id:?}"))?;
                 let ctx = Ctx {
                     leg,
                     ran: &ran,
                     seen: &seen,
+                    failed: failed.as_deref(),
                 };
-                eval(&text, &ctx)
-                    .with_context(|| format!("evaluating `if: {text}` of step {id:?}"))?
-                    .truthy()
+                let (value, used_status_function) =
+                    eval(&text, &ctx).with_context(|| format!("evaluating `if: {text}` of step {id:?}"))?;
+                // GitHub adds `success() &&` to an `if:` that names no status function.
+                value.truthy() && (used_status_function || failed.is_none())
             }
         };
         seen.insert(id.to_string());
         if runs {
             ran.insert(id.to_string());
+            if failing == Some(id) {
+                failed = Some(id.to_string());
+            }
         }
     }
+    if let Some(id) = failing {
+        ensure!(
+            failed.is_some(),
+            "step {id:?} does not run on {}, so it cannot fail there",
+            leg.name()
+        );
+    }
     Ok(ran)
+}
+
+/// Ids of the steps of `job_id` after `id` that are in `ran` and are not an
+/// artifact upload (`uses: actions/upload-artifact@…`). Whatever runs after a
+/// lane that corrupts the machine or leaves root-owned files must not be able
+/// to run a toolchain, and a `uses:` step can be one (`setup-build`,
+/// `setup-node`), so it is reported like a script step.
+pub fn non_upload_steps_after(ci_yaml: &str, job_id: &str, id: &str, ran: &BTreeSet<String>) -> Result<Vec<String>> {
+    let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
+    let job = job(&ci, job_id)?;
+    let after = steps_after(ci_yaml, job_id, id)?;
+    let mut out = Vec::new();
+    for (i, step) in job.steps.iter().enumerate() {
+        let step_id = step_id(step, i)?;
+        let is_upload = step
+            .uses
+            .as_deref()
+            .is_some_and(|u| u.starts_with("actions/upload-artifact@"));
+        if after.iter().any(|a| a == step_id) && ran.contains(step_id) && !is_upload {
+            out.push(step_id.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// `(step id, budget)` of the steps that run on `leg` in a healthy run and
+/// declare a `timeout-minutes` above the leg's job wall. Such a step's own bound
+/// can never fire: the wall ends the job first and GitHub drops the log (#989).
+/// A step with no literal budget is `ci_steps_declare_a_literal_timeout`'s
+/// concern. Steps that run only after a failure are not checked.
+pub fn steps_over_wall(leg: &Leg, ci_yaml: &str, job_id: &str) -> Result<Vec<(String, u64)>> {
+    let wall = leg
+        .wall()
+        .with_context(|| format!("leg {} has no literal `timeout` for the job wall", leg.name()))?;
+    let budgets = crate::ci_timeouts::step_timeouts(ci_yaml, job_id)?;
+    let ran = steps_on(leg, ci_yaml, job_id)?;
+    let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
+    let job = job(&ci, job_id)?;
+    let mut out = Vec::new();
+    for (i, step) in job.steps.iter().enumerate() {
+        let id = step_id(step, i)?;
+        if let Some(&minutes) = budgets.get(id) {
+            if ran.contains(id) && minutes > wall {
+                out.push((id.to_string(), minutes));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The ids of the steps after `id`, in order.
@@ -180,14 +266,20 @@ pub fn step_runs(ci_yaml: &str, job_id: &str) -> Result<BTreeMap<String, String>
     Ok(out)
 }
 
-/// Ids of the steps declaring `continue-on-error` as anything but a literal
-/// `false`: an expression is not evaluated, so it may be true.
-pub fn steps_with_continue_on_error(ci_yaml: &str, job_id: &str) -> Result<Vec<String>> {
+/// Where `continue-on-error` is declared as anything but a literal `false`: the
+/// job (labelled `<job>`) and each step by id. An expression is not evaluated,
+/// so it may be true, and a job-level `true` lets every step fail while the job
+/// stays green.
+pub fn continue_on_error_declarations(ci_yaml: &str, job_id: &str) -> Result<Vec<String>> {
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let job = job(&ci, job_id)?;
+    let lenient = |v: &Option<serde_yml::Value>| !matches!(v, None | Some(serde_yml::Value::Bool(false)));
     let mut out = Vec::new();
+    if lenient(&job.continue_on_error) {
+        out.push("<job>".to_string());
+    }
     for (i, step) in job.steps.iter().enumerate() {
-        if !matches!(&step.continue_on_error, None | Some(serde_yml::Value::Bool(false))) {
+        if lenient(&step.continue_on_error) {
             out.push(step_id(step, i)?.to_string());
         }
     }
@@ -301,6 +393,8 @@ struct Ctx<'a> {
     /// Steps already considered (ran or skipped), so a forward reference is an
     /// error rather than a quiet `skipped`.
     seen: &'a BTreeSet<String>,
+    /// The step that failed earlier in the run, if any.
+    failed: Option<&'a str>,
 }
 
 fn condition_text(cond: &serde_yml::Value) -> Result<String> {
@@ -316,12 +410,14 @@ fn condition_text(cond: &serde_yml::Value) -> Result<String> {
         .to_string())
 }
 
-fn eval(text: &str, ctx: &Ctx) -> Result<Val> {
+/// The value of `text`, and whether it called a status function.
+fn eval(text: &str, ctx: &Ctx) -> Result<(Val, bool)> {
     let tokens = tokenize(text)?;
     let mut p = Parser {
         tokens: &tokens,
         at: 0,
         ctx,
+        used_status_function: false,
     };
     let v = p.or()?;
     ensure!(
@@ -329,7 +425,7 @@ fn eval(text: &str, ctx: &Ctx) -> Result<Val> {
         "trailing input after the expression: {:?}",
         &tokens[p.at..]
     );
-    Ok(v)
+    Ok((v, p.used_status_function))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -407,6 +503,7 @@ struct Parser<'a> {
     tokens: &'a [Tok],
     at: usize,
     ctx: &'a Ctx<'a>,
+    used_status_function: bool,
 }
 
 impl Parser<'_> {
@@ -480,7 +577,8 @@ impl Parser<'_> {
                         self.eat(&Tok::RParen),
                         "function {name:?} takes arguments, which are not supported"
                     );
-                    return call(&name);
+                    self.used_status_function = true;
+                    return call(&name, self.ctx.failed.is_some());
                 }
                 self.ctx.lookup(&name)
             }
@@ -489,11 +587,13 @@ impl Parser<'_> {
     }
 }
 
-/// Status functions of a healthy run.
-fn call(name: &str) -> Result<Val> {
+/// Status functions, for a run in which an earlier step has failed or not.
+fn call(name: &str, an_earlier_step_failed: bool) -> Result<Val> {
     match name {
-        "success" | "always" => Ok(Val::Bool(true)),
-        "failure" | "cancelled" => Ok(Val::Bool(false)),
+        "success" => Ok(Val::Bool(!an_earlier_step_failed)),
+        "always" => Ok(Val::Bool(true)),
+        "failure" => Ok(Val::Bool(an_earlier_step_failed)),
+        "cancelled" => Ok(Val::Bool(false)),
         other => bail!("function {other:?}() is not supported in an `if:` expression"),
     }
 }
@@ -517,7 +617,13 @@ impl Ctx<'_> {
                 self.seen.contains(id),
                 "`steps.{id}.outcome` refers to a step that is not defined before this one"
             );
-            let outcome = if self.ran.contains(id) { "success" } else { "skipped" };
+            let outcome = if self.failed == Some(id) {
+                "failure"
+            } else if self.ran.contains(id) {
+                "success"
+            } else {
+                "skipped"
+            };
             return Ok(Val::Str(outcome.to_string()));
         }
         bail!("unsupported context reference {name:?} in `if:` expression")

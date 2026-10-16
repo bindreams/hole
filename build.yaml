@@ -344,34 +344,15 @@ targets:
     # cargo-fmt + repo-wide hooks, for a developer's own machine. SKIP=cargo-clippy
     # because clippy lives in the per-platform clippy-* targets above. Platforms
     # wide-open so devs on any host can `cargo xtask run prek` locally. CI runs
-    # the same hooks as the two targets below, split by whether a hook's verdict
-    # depends on the host.
+    # the same hooks as `cargo xtask prek portable` (once) and
+    # `cargo xtask prek platform-dependent` (every leg); `.github/lint.toml`
+    # lists the platform-dependent ones.
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
       - bash:
           command: prek run --all-files --show-diff-on-failure
           environment: { SKIP: cargo-clippy }
-
-  prek-portable:
-    # Every hook whose verdict is the same on any host; CI runs it once, in the
-    # linux/amd64 leg. SKIP names exactly the hooks `prek-host-bound` runs plus
-    # cargo-clippy (see `prek` above); `prek_split_tests.rs` holds this list to
-    # a per-hook classification, so a new hook cannot default into "run once".
-    platforms:
-      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    run:
-      - bash:
-          command: prek run --all-files --show-diff-on-failure
-          environment: { SKIP: "cargo-clippy,go-lint" }
-
-  prek-host-bound:
-    # Hooks whose verdict depends on the host: golangci-lint type-checks under
-    # the host's GOOS, so `_windows`/`_linux`/`_darwin` Go files are linted only
-    # on their own platform. CI runs it in every leg.
-    platforms:
-      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    run: prek run go-lint --all-files --show-diff-on-failure
 
   frontend-check:
     # tsc --noEmit + Vitest unit tests. Platform-independent (tsc and

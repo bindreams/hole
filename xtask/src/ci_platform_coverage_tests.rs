@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use crate::ci_platform_coverage::{
-    legs, reaches_sidecar_rewrite, steps_after, steps_on, steps_with_continue_on_error, Leg,
+    continue_on_error_declarations, legs, non_upload_steps_after, reaches_sidecar_rewrite, steps_after, steps_on,
+    steps_on_after_failure, steps_over_wall, Leg,
 };
 use crate::manifest::Manifest;
 
@@ -203,7 +204,222 @@ jobs:
       - id: d
         run: echo
 ";
-    assert_eq!(steps_with_continue_on_error(ci, "ci").unwrap(), vec!["a", "c"]);
+    assert_eq!(continue_on_error_declarations(ci, "ci").unwrap(), vec!["a", "c"]);
+}
+
+/// A job-level `continue-on-error` lets every step fail while the job stays
+/// green, so it counts like a step-level one, literal or fed by the matrix.
+#[skuld::test]
+fn a_job_level_continue_on_error_is_reported_unless_literally_false() {
+    for (value, reported) in [
+        ("true", true),
+        ("${{ matrix.experimental }}", true),
+        ("${{ matrix.os == 'linux' }}", true),
+        ("false", false),
+    ] {
+        let ci = format!(
+            "
+jobs:
+  ci:
+    continue-on-error: {value}
+    steps:
+      - id: a
+        run: echo
+"
+        );
+        let got = continue_on_error_declarations(&ci, "ci").unwrap();
+        assert_eq!(!got.is_empty(), reported, "job-level continue-on-error: {value}");
+    }
+    let none = "
+jobs:
+  ci:
+    steps:
+      - id: a
+        run: echo
+";
+    assert!(continue_on_error_declarations(none, "ci").unwrap().is_empty());
+}
+
+// ===== failure scenarios =============================================================================================
+
+const FAILURE_FIXTURE: &str = r"
+jobs:
+  ci:
+    strategy:
+      matrix:
+        include:
+          - { os: linux, arch: amd64, runner: l }
+    steps:
+      - id: a
+        run: echo
+      - id: b
+        run: echo
+      - id: after-implicit
+        run: echo
+      - id: after-not-cancelled
+        if: ${{ !cancelled() }}
+        run: echo
+      - id: cleanup
+        if: ${{ always() }}
+        run: echo
+      - id: on-failure
+        if: ${{ failure() }}
+        run: echo
+      - id: gated-on-b
+        if: ${{ !cancelled() && steps.b.outcome == 'success' }}
+        run: echo
+      - id: gated-on-not-skipped
+        if: ${{ !cancelled() && steps.b.outcome != 'skipped' }}
+        run: echo
+      - id: explicit-success
+        if: ${{ success() }}
+        run: echo
+";
+
+fn ran_after_failure_of(id: &str) -> BTreeSet<String> {
+    let all = legs(FAILURE_FIXTURE, "ci").unwrap();
+    steps_on_after_failure(&all[0], FAILURE_FIXTURE, "ci", id).unwrap()
+}
+
+/// GitHub gives a step with no status function an implicit `success()`, so it
+/// is skipped once an earlier step has failed; `!cancelled()` and `always()` are
+/// status functions and run on.
+#[skuld::test]
+fn after_a_failure_only_steps_with_a_status_function_other_than_success_run() {
+    let ran = ran_after_failure_of("b");
+    assert!(ran.contains("a") && ran.contains("b"), "steps up to the failure ran");
+    assert!(
+        !ran.contains("after-implicit"),
+        "implicit success() is false after a failure"
+    );
+    assert!(!ran.contains("explicit-success"));
+    assert!(ran.contains("after-not-cancelled"));
+    assert!(ran.contains("cleanup"));
+    assert!(ran.contains("on-failure"), "failure() is true after a failure");
+}
+
+/// The failed step's own outcome is `failure`, which is what separates a gate
+/// written `== 'success'` from one weakened to `!= 'skipped'`.
+#[skuld::test]
+fn the_failed_step_has_the_outcome_failure() {
+    let ran = ran_after_failure_of("b");
+    assert!(!ran.contains("gated-on-b"), "== 'success' no longer holds");
+    assert!(
+        ran.contains("gated-on-not-skipped"),
+        "!= 'skipped' still holds for a failed step"
+    );
+}
+
+#[skuld::test]
+fn a_healthy_run_is_the_scenario_with_no_failure() {
+    let all = legs(FAILURE_FIXTURE, "ci").unwrap();
+    let ran = steps_on(&all[0], FAILURE_FIXTURE, "ci").unwrap();
+    assert!(ran.contains("after-implicit") && ran.contains("explicit-success") && ran.contains("gated-on-b"));
+    assert!(!ran.contains("on-failure"));
+}
+
+#[skuld::test]
+fn a_failure_of_a_step_that_does_not_run_is_an_error() {
+    let all = legs(FIXTURE, "ci").unwrap();
+    // `hole-build` is gated on `matrix.hole`, which linux/amd64 does not set.
+    let err = steps_on_after_failure(leg(&all, "linux/amd64"), FIXTURE, "ci", "hole-build").unwrap_err();
+    assert!(format!("{err:#}").contains("hole-build"), "{err:#}");
+}
+
+// ===== what may run after a lane =====================================================================================
+
+#[skuld::test]
+fn only_artifact_uploads_may_follow_a_lane_without_being_reported() {
+    let ci = "
+jobs:
+  ci:
+    steps:
+      - id: lane
+        run: echo
+      - id: upload
+        uses: actions/upload-artifact@v7
+      - id: script
+        run: echo
+      - id: toolchain-action
+        uses: ./.github/actions/setup-build
+      - id: other-action
+        uses: actions/setup-node@v7
+      - id: skipped-here
+        run: echo
+";
+    let ran: BTreeSet<String> = ["lane", "upload", "script", "toolchain-action", "other-action"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        non_upload_steps_after(ci, "ci", "lane", &ran).unwrap(),
+        vec!["script", "toolchain-action", "other-action"]
+    );
+}
+
+// ===== budgets against the wall ======================================================================================
+
+const WALL_FIXTURE: &str = r"
+jobs:
+  ci:
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      matrix:
+        include:
+          - { os: linux, arch: amd64, runner: l, timeout: 30 }
+          - { os: linux, arch: arm64, runner: l, timeout: 60, big: true }
+    steps:
+      - id: small
+        timeout-minutes: 10
+        run: echo
+      - id: big
+        if: ${{ matrix.big == true }}
+        timeout-minutes: 45
+        run: echo
+      - id: exact
+        timeout-minutes: 30
+        run: echo
+";
+
+#[skuld::test]
+fn a_step_budget_above_the_wall_of_a_leg_it_runs_on_is_reported() {
+    // Switch the 45-minute step on for the 30-minute leg.
+    let ci = WALL_FIXTURE.replace(
+        "{ os: linux, arch: amd64, runner: l, timeout: 30 }",
+        "{ os: linux, arch: amd64, runner: l, timeout: 30, big: true }",
+    );
+    let all = legs(&ci, "ci").unwrap();
+    assert_eq!(
+        steps_over_wall(&all[0], &ci, "ci").unwrap(),
+        vec![("big".to_string(), 45)]
+    );
+}
+
+/// A step that does not run on a leg is not held to that leg's wall, and a
+/// budget equal to the wall is allowed (it can still fire first).
+#[skuld::test]
+fn a_step_off_the_leg_or_equal_to_the_wall_is_not_reported() {
+    let all = legs(WALL_FIXTURE, "ci").unwrap();
+    assert!(steps_over_wall(&all[0], WALL_FIXTURE, "ci").unwrap().is_empty());
+    assert!(steps_over_wall(&all[1], WALL_FIXTURE, "ci").unwrap().is_empty());
+}
+
+#[skuld::test]
+fn a_leg_without_a_literal_wall_is_an_error() {
+    let ci = "
+jobs:
+  ci:
+    strategy:
+      matrix:
+        include:
+          - { os: linux, arch: amd64, runner: l }
+    steps:
+      - id: a
+        timeout-minutes: 5
+        run: echo
+";
+    let all = legs(ci, "ci").unwrap();
+    assert!(steps_over_wall(&all[0], ci, "ci").is_err());
 }
 
 fn sidecar_manifest() -> Manifest {
@@ -297,7 +513,7 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
         "install-nextest",
         "install-prek",
         "provision",
-        "lint-host",
+        "lint-platform-dependent",
         "archive",
         "test-garter",
         "test-galoshes",
@@ -435,41 +651,33 @@ fn every_ci_step_is_either_in_the_mapping_or_failure_only() {
 #[skuld::test]
 fn nothing_but_the_proof_step_and_uploads_follows_the_windows_tun_lane() {
     let ci_yaml = read_repo(".github/workflows/ci.yaml");
-    let runs = step_runs(&ci_yaml);
     let on_windows = steps_on_leg(&ci_yaml, "windows/amd64");
-    let offenders: Vec<String> = steps_after(&ci_yaml, "ci", "hole-test-tun")
+    let offenders: Vec<String> = non_upload_steps_after(&ci_yaml, "ci", "hole-test-tun", &on_windows)
         .expect("order")
         .into_iter()
-        .filter(|id| on_windows.contains(id) && id != "hole-verify-executed")
-        .filter(|id| runs.contains_key(id.as_str()))
+        .filter(|id| id != "hole-verify-executed")
         .collect();
     assert!(
         offenders.is_empty(),
-        "script steps after the Windows TUN lane (#200): {offenders:?}"
+        "steps other than an artifact upload after the Windows TUN lane (#200): {offenders:?}"
     );
 }
 
 /// The macOS TUN lane runs as root and leaves root-owned files in `target/` that
-/// no later unprivileged step could overwrite, so no script step follows it on a
-/// macOS leg.
+/// no later unprivileged step could overwrite, so nothing but an artifact upload
+/// follows it on a macOS leg — no script step, and no `uses:` step that runs a
+/// toolchain (`./.github/actions/setup-build`, `setup-node`, ...).
 #[skuld::test]
 fn the_macos_root_lane_is_the_last_script_step_on_macos() {
     let ci_yaml = read_repo(".github/workflows/ci.yaml");
-    let runs = step_runs(&ci_yaml);
-    let on_darwin: BTreeSet<String> = ["darwin/amd64", "darwin/arm64"]
-        .iter()
-        .flat_map(|name| steps_on_leg(&ci_yaml, name))
-        .collect();
-    let offenders: Vec<String> = steps_after(&ci_yaml, "ci", "hole-test-tun-macos")
-        .expect("order")
-        .into_iter()
-        .filter(|id| on_darwin.contains(id))
-        .filter(|id| runs.contains_key(id.as_str()))
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "script steps after the macOS root lane: {offenders:?}"
-    );
+    for name in ["darwin/amd64", "darwin/arm64"] {
+        let ran = steps_on_leg(&ci_yaml, name);
+        let offenders = non_upload_steps_after(&ci_yaml, "ci", "hole-test-tun-macos", &ran).expect("order");
+        assert!(
+            offenders.is_empty(),
+            "{name}: steps other than an artifact upload after the macOS root lane: {offenders:?}"
+        );
+    }
 }
 
 /// `ex-ray` and `galoshes` binaries under `.cache/` are inputs of the `hole` and
@@ -519,7 +727,7 @@ fn nothing_between_hole_build_and_the_last_hole_lane_rewrites_the_sidecars() {
 fn no_step_of_the_ci_job_continues_on_error() {
     let ci_yaml = read_repo(".github/workflows/ci.yaml");
     assert_eq!(
-        steps_with_continue_on_error(&ci_yaml, "ci").unwrap(),
+        continue_on_error_declarations(&ci_yaml, "ci").unwrap(),
         Vec::<String>::new()
     );
 }
@@ -531,4 +739,144 @@ fn steps_on_leg(ci_yaml: &str, name: &str) -> BTreeSet<String> {
 
 fn step_runs(ci_yaml: &str) -> BTreeMap<String, String> {
     crate::ci_platform_coverage::step_runs(ci_yaml, "ci").expect("step runs")
+}
+
+/// A step's own `timeout-minutes` can only fire if the job wall is not reached
+/// first: when the wall fires instead, GitHub never uploads the log and the run
+/// is a bare `cancelled` (#989). So no step that runs on a leg has a budget
+/// above that leg's wall.
+#[skuld::test]
+fn no_step_budget_exceeds_the_wall_of_a_leg_it_runs_on() {
+    let ci_yaml = read_repo(".github/workflows/ci.yaml");
+    for l in legs(&ci_yaml, "ci").expect("legs") {
+        assert_eq!(
+            steps_over_wall(&l, &ci_yaml, "ci").expect("budgets"),
+            Vec::<(String, u64)>::new(),
+            "{}: steps whose own budget exceeds the job wall, so the wall fires first",
+            l.name()
+        );
+    }
+}
+
+/// The longest `timeout-minutes` of any job before #1073 that now runs on the
+/// leg (owner, 2026-09-10: job walls are raised, never lowered). Read off
+/// `origin/main` at b834d335 and independent of ci.yaml.
+const WALL_FLOOR: [(&str, u64); 6] = [
+    ("windows/amd64", 80),
+    ("windows/arm64", 45),
+    ("darwin/amd64", 150),
+    ("darwin/arm64", 80),
+    ("linux/amd64", 45),
+    ("linux/arm64", 45),
+];
+
+#[skuld::test]
+fn no_leg_wall_is_below_the_walls_of_the_jobs_it_absorbed() {
+    let ci_yaml = read_repo(".github/workflows/ci.yaml");
+    let all = legs(&ci_yaml, "ci").expect("legs");
+    for (name, floor) in WALL_FLOOR {
+        let wall = leg(&all, name)
+            .wall()
+            .unwrap_or_else(|| panic!("{name} has no literal timeout"));
+        assert!(
+            wall >= floor,
+            "{name}: wall {wall} is below the {floor} minutes a previous job allowed"
+        );
+    }
+}
+
+// ===== failure paths =================================================================================================
+
+fn ran_after_failure(leg_name: &str, failing: &str) -> BTreeSet<String> {
+    let ci_yaml = read_repo(".github/workflows/ci.yaml");
+    let all = legs(&ci_yaml, "ci").expect("legs");
+    steps_on_after_failure(leg(&all, leg_name), &ci_yaml, "ci", failing).expect("evaluate steps")
+}
+
+/// A failed installer E2E must still tear down: kill the app, uninstall, verify
+/// the uninstall, and upload the logs. The TUN lane still runs, because one
+/// failing lane hides nothing.
+#[skuld::test]
+fn a_failed_installer_e2e_still_cleans_up_and_leaves_the_other_lanes_running() {
+    let ran = ran_after_failure("windows/amd64", "installer-e2e");
+    for id in [
+        "installer-kill",
+        "installer-dump-log",
+        "installer-uninstall",
+        "installer-verify-uninstall",
+        "installer-upload-msi-logs",
+        "installer-upload-bridge-logs",
+        "hole-test-tun",
+    ] {
+        assert!(ran.contains(id), "{id} must run after installer-e2e fails");
+    }
+}
+
+/// The #999 proof step reads both lanes' reports, which is only meaningful once
+/// both passed: a failed lane leaves partial reports and is its own signal.
+#[skuld::test]
+fn the_proof_step_runs_only_when_both_lanes_passed() {
+    for failing in ["hole-test-non-tun", "hole-test-tun"] {
+        let ran = ran_after_failure("windows/amd64", failing);
+        assert!(
+            !ran.contains("hole-verify-executed"),
+            "hole-verify-executed ran although {failing} failed"
+        );
+    }
+    assert!(steps_on_leg(&read_repo(".github/workflows/ci.yaml"), "windows/amd64").contains("hole-verify-executed"));
+}
+
+#[skuld::test]
+fn a_failed_non_tun_lane_does_not_hide_the_tun_lane() {
+    assert!(ran_after_failure("windows/amd64", "hole-test-non-tun").contains("hole-test-tun"));
+    for name in ["darwin/amd64", "darwin/arm64"] {
+        assert!(
+            ran_after_failure(name, "hole-test-non-tun").contains("hole-test-tun-macos"),
+            "{name}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_failed_dmg_still_captures_diagnostics_and_runs_the_hole_lanes() {
+    for name in ["darwin/amd64", "darwin/arm64"] {
+        let ran = ran_after_failure(name, "dmg");
+        for id in [
+            "dmg-diagnostics",
+            "dmg-upload-diagnostics",
+            "hole-build",
+            "hole-test-non-tun",
+        ] {
+            assert!(ran.contains(id), "{name}: {id} must run after dmg fails");
+        }
+    }
+}
+
+/// Steps that are meant to run when something failed earlier: log dumps and
+/// artifact uploads.
+const RUNS_AFTER_A_FAILURE: [&str; 4] = [
+    "installer-dump-log",
+    "installer-upload-msi-logs",
+    "installer-upload-bridge-logs",
+    "hole-upload-bridge-logs",
+];
+
+/// Every later step requires `provision`, so a broken VM fails once instead of
+/// once per lane: after it fails, only the evidence-collecting steps run.
+#[skuld::test]
+fn a_failed_provision_stops_every_lane() {
+    let ci_yaml = read_repo(".github/workflows/ci.yaml");
+    let after = steps_after(&ci_yaml, "ci", "provision").expect("order");
+    for l in legs(&ci_yaml, "ci").expect("legs") {
+        let ran = steps_on_after_failure(&l, &ci_yaml, "ci", "provision").expect("evaluate steps");
+        let offenders: Vec<&String> = after
+            .iter()
+            .filter(|id| ran.contains(id.as_str()) && !RUNS_AFTER_A_FAILURE.contains(&id.as_str()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "{}: steps that run although provisioning failed: {offenders:?}",
+            l.name()
+        );
+    }
 }

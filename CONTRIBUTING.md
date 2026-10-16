@@ -2773,11 +2773,21 @@ and a rerun repeats the platform's whole job.
   `rerun-if-changed` inputs of the `hole` build script. On Windows nothing that
   uses loopback follows the TUN lane (#200); on macOS the root TUN lane is the
   last step that runs a toolchain. See `xtask/src/ci_platform_coverage.rs`.
-- **Lint is split by host dependence.** `cargo xtask run prek-portable` runs the
-  hooks whose verdict is the same on any host, once, in linux/amd64;
-  `prek-host-bound` runs the rest (golangci-lint) on every leg. Every hook in
-  `prek.toml` is classified in `xtask/src/prek_split_tests.rs`, with evidence; a
-  new hook fails that test until it is.
+- **Lint is split by host dependence.** `.github/lint.toml` lists the prek hooks
+  whose verdict depends on the host (`platform-dependent`, today golangci-lint),
+  with the evidence. `cargo xtask prek platform-dependent` runs those on every
+  leg; `cargo xtask prek portable` runs every other hook once, in linux/amd64.
+  A new hook is portable unless it is listed; a listed id that `prek.toml` lacks
+  is an error.
+- **Test lanes compile nothing.** The `hole-test-*` steps run under
+  `.github/scripts/fail-on-compile.sh`, which fails the step if cargo prints a
+  `Compiling` line, with `CARGO_LOG` set so the log says why each unit was
+  dirty. The causes found when it was introduced: `cargo xtask` leaked
+  `cargo run`'s `CARGO_MANIFEST_DIR` to its children, whose `ring` build script
+  hashes it (`xtask/src/child_env.rs`); build scripts named `.git/packed-refs`
+  or a packed branch ref in `rerun-if-changed`, and a missing path reruns the
+  script on every invocation (`xtask-lib/src/git_rerun.rs`); and `sudo env`
+  dropped `CARGO_INCREMENTAL`, which is part of every workspace unit's profile.
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 

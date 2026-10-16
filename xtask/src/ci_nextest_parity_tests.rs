@@ -3,7 +3,7 @@
 
 use std::fs;
 
-use crate::ci_nextest_parity::{target_nextest_run, test_job};
+use crate::ci_nextest_parity::{target_nextest_run, test_job, NO_COMPILE_GATE};
 use crate::manifest::Manifest;
 
 // ===== test_job ======================================================================================================
@@ -274,6 +274,96 @@ jobs:
     );
 }
 
+// ===== launch prefix: the no-compile gate and forwarded variables ====================================================
+
+/// The no-compile gate wraps the command, so it is a launcher like `sudo`: the
+/// compared text is what comes after it.
+#[skuld::test]
+fn the_no_compile_gate_is_stripped_and_reported() {
+    let ci = format!(
+        "
+jobs:
+  j:
+    steps:
+      - run: cargo xtask build tests
+      - name: plain
+        run: cargo nextest run -E 'package(a)'
+      - name: gated
+        run: {NO_COMPILE_GATE} cargo nextest run -E 'package(a)'
+"
+    );
+    let job = test_job(&ci, "j", None).expect("analyze");
+    assert_eq!(job.runs[0].1, job.runs[1].1);
+    assert!(!job.launches[0].1.gated);
+    assert!(job.launches[1].1.gated);
+}
+
+/// Under `sudo` the child's environment is whatever `env` is told, so the
+/// ambient value of a variable is forwarded by naming it. The child then sees
+/// what the compile step saw, which is the property this module guards.
+#[skuld::test]
+fn a_forwarded_variable_is_a_launcher_not_a_change() {
+    let ci = r#"
+jobs:
+  j:
+    steps:
+      - run: cargo xtask build tests
+      - name: root
+        run: sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" cargo nextest run -E 'package(a)'
+"#;
+    let job = test_job(ci, "j", None).expect("analyze");
+    assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
+    let launch = &job.launches[0].1;
+    assert!(launch.privileged);
+    assert!(launch.forwarded.contains("CARGO_INCREMENTAL"));
+    assert!(
+        !launch.forwarded.contains("PATH"),
+        "PATH is neutral, not a forward of interest"
+    );
+}
+
+/// A literal value is a change (it can differ from what the compile step saw),
+/// and so is a value taken from another variable.
+#[skuld::test]
+fn a_set_or_renamed_variable_is_not_a_forward() {
+    for assignment in [
+        "CARGO_INCREMENTAL=0",
+        "CARGO_INCREMENTAL=$OTHER",
+        "RUSTFLAGS=${CARGO_INCREMENTAL}",
+    ] {
+        let ci = format!(
+            r#"
+jobs:
+  j:
+    steps:
+      - run: cargo xtask build tests
+      - name: root
+        run: sudo env "{assignment}" cargo nextest run -E 'package(a)'
+"#
+        );
+        let err = test_job(&ci, "j", None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("fingerprint-neutral"),
+            "{assignment}: {err:#}"
+        );
+    }
+}
+
+/// `${NAME}` is the same forward as `$NAME`.
+#[skuld::test]
+fn a_braced_forward_is_recognized() {
+    let ci = r#"
+jobs:
+  j:
+    steps:
+      - run: cargo xtask build tests
+      - name: root
+        run: sudo env "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" cargo nextest run -E 'package(a)'
+"#;
+    let job = test_job(ci, "j", None).expect("analyze");
+    assert!(job.launches[0].1.forwarded.contains("CARGO_INCREMENTAL"));
+}
+
 // ===== target_nextest_run ============================================================================================
 
 fn fixture_manifest() -> Manifest {
@@ -394,7 +484,7 @@ fn an_unknown_prefix_is_an_error_not_an_empty_pass() {
 /// `hole-` steps of `ci.yaml`'s `ci` job that we require to be nextest runs.
 const TEST_HOLE_RUN_STEPS: [&str; 3] = [
     "Test (non-TUN)",
-    "Test (TUN, runs last for #200)",
+    "Test (TUN, last test lane for #200)",
     "Test (TUN, macOS — root for pfctl)",
 ];
 
@@ -435,5 +525,58 @@ fn ci_test_hole_steps_match_the_hole_tests_target() {
              (see module docs for why)",
             job.target
         );
+    }
+}
+
+/// A test lane that compiles anything is not re-executing what `hole-build`
+/// built: on Windows it recompiled `hole`, `galoshes` and `garter-bin`, on macOS
+/// the root step recompiled twenty workspace crates as root. Every `hole-` test
+/// lane therefore runs under the gate, which fails the step if cargo prints a
+/// `Compiling` line, so the property is checked on every run rather than
+/// remembered.
+#[skuld::test]
+fn every_hole_test_lane_runs_under_the_no_compile_gate() {
+    let root = crate::repo_root().expect("repo root");
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
+    let job = test_job(&ci_yaml, "ci", Some("hole-")).expect("analyze ci.yaml");
+
+    let ungated: Vec<&str> = job
+        .launches
+        .iter()
+        .filter(|(_, launch)| !launch.gated)
+        .map(|(label, _)| label.as_str())
+        .collect();
+    assert_eq!(
+        ungated,
+        Vec::<&str>::new(),
+        "these hole- test lanes can compile without failing; start them with {NO_COMPILE_GATE}"
+    );
+    assert!(
+        root.join(NO_COMPILE_GATE).is_file(),
+        "{NO_COMPILE_GATE} is referenced by ci.yaml but missing"
+    );
+}
+
+/// `sudo env` replaces the environment wholesale. `CARGO_INCREMENTAL` (set to 0
+/// by the toolchain action) is part of every workspace unit's profile, so a root
+/// step that drops it hashes each workspace crate differently and recompiles all
+/// of them (measured: 20 crates, as root). Variables dropped for the same reason
+/// belong in this list, each with its measurement.
+#[skuld::test]
+fn a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint() {
+    const MUST_FORWARD: [&str; 1] = ["CARGO_INCREMENTAL"];
+    let root = crate::repo_root().expect("repo root");
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
+    let job = test_job(&ci_yaml, "ci", Some("hole-")).expect("analyze ci.yaml");
+
+    let privileged: Vec<_> = job.launches.iter().filter(|(_, l)| l.privileged).collect();
+    assert!(!privileged.is_empty(), "no privileged lane found: the guard is vacuous");
+    for (label, launch) in privileged {
+        for var in MUST_FORWARD {
+            assert!(
+                launch.forwarded.contains(var),
+                "privileged lane {label:?} does not forward {var}: add \"{var}=${var}\" after `sudo env`"
+            );
+        }
     }
 }
