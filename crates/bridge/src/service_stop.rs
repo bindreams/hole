@@ -40,7 +40,7 @@ pub enum StopPhase {
     /// left whatever it was awaiting, shut the IPC server's connection tasks
     /// down, and probed the update marker. Reported from the control handler.
     StopRequested,
-    /// Wait for the proxy-manager lock, which an in-flight start or request holds.
+    /// Wait for the proxy-manager lock.
     AcquireProxy,
     /// Persist the session event to the target file.
     PersistTarget,
@@ -110,8 +110,9 @@ impl StopPhase {
             // A startup recovery step that shells out (`netsh`, `route`) can
             // hold the main task for seconds; so can joining connection tasks.
             StopPhase::StopRequested => Duration::from_secs(10),
-            // Held by an in-flight start, which is cancelled but unwinds its
-            // own steps first.
+            // Normally immediate: the IPC connection tasks, the lock's holders,
+            // are aborted and joined before this phase. The long hint is headroom
+            // for a holder that outlives them.
             StopPhase::AcquireProxy => Duration::from_secs(30),
             StopPhase::PersistTarget => Duration::from_secs(10),
             // External-command DNS restore.
@@ -139,6 +140,21 @@ enum StopControl {
     /// Not reported: a later phase was already reported, or another thread was
     /// mid-report (and so is at or past the first phase).
     Superseded,
+}
+
+impl StopControl {
+    /// The outcome to hold when `incoming` arrives while `held` is still
+    /// waiting to be logged. A second Stop or Shutdown control is always
+    /// `Superseded` by the first, so the first's report is the one that
+    /// happened and must not be overwritten before it is logged.
+    fn merge(held: StopControl, incoming: StopControl) -> StopControl {
+        match (held, incoming) {
+            (StopControl::Reported(held), StopControl::Reported(_)) => StopControl::Reported(held),
+            (StopControl::Reported(held), StopControl::Superseded) => StopControl::Reported(held),
+            (StopControl::Superseded, StopControl::Reported(incoming)) => StopControl::Reported(incoming),
+            (StopControl::Superseded, StopControl::Superseded) => StopControl::Superseded,
+        }
+    }
 }
 
 /// Reports teardown phases through `report`. A failed report is logged and
@@ -202,10 +218,14 @@ impl<F: Fn(StopPhase) -> std::io::Result<()>> StopProgress<F> {
     }
 
     fn store_stop_control(&self, outcome: StopControl) {
-        *self
+        let mut slot = self
             .stop_control
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(match slot.take() {
+            Some(held) => StopControl::merge(held, outcome),
+            None => outcome,
+        });
     }
 
     fn report_if_advancing(&self, last: &mut Option<StopPhase>, phase: StopPhase) -> Option<std::io::Result<()>> {
@@ -248,10 +268,22 @@ impl<F: Fn(StopPhase) -> std::io::Result<()>> StopProgress<F> {
 /// The Stop/Shutdown control: report [`StopPhase::StopRequested`], then `signal`
 /// the main task. The report goes first so the SCM never sees `Running` after a
 /// Stop it has delivered; nothing before the signal can wait on another thread,
-/// and nothing here logs (see the module doc).
+/// and nothing here logs (see the module doc). The signal runs even if the
+/// report panics: a lost signal is a lost Stop.
 pub fn request_stop<F: Fn(StopPhase) -> std::io::Result<()>>(progress: &StopProgress<F>, signal: impl FnOnce()) {
+    let _signal = SignalOnDrop(Some(signal));
     progress.report_stop_control();
-    signal();
+}
+
+/// Runs the closure when dropped, normally or by unwinding.
+struct SignalOnDrop<S: FnOnce()>(Option<S>);
+
+impl<S: FnOnce()> Drop for SignalOnDrop<S> {
+    fn drop(&mut self) {
+        if let Some(signal) = self.0.take() {
+            signal();
+        }
+    }
 }
 
 /// [`request_stop`] signalling the main task through `shutdown_tx`, which holds
@@ -300,11 +332,13 @@ pub async fn run_phase<T, Fut: Future>(
 /// Teardown after the serve loop exits. `stop_proxy` receives `progress` and
 /// enters the phases of the proxy stop itself; this brackets it with
 /// [`StopPhase::AcquireProxy`] before and the ETW close and the drop of the
-/// remaining resources after.
-pub async fn tear_down<F, Fut>(
+/// remaining resources after. `etw` is the consumer to close, if one started;
+/// without one [`StopPhase::CloseEtw`] is not entered.
+pub async fn tear_down<F, Fut, E>(
     progress: &Arc<StopProgress<F>>,
     stop_proxy: impl FnOnce(Arc<StopProgress<F>>) -> Fut,
-    close_etw: impl FnOnce(),
+    etw: Option<E>,
+    close_etw: impl FnOnce(E),
     drop_resources: impl FnOnce(),
 ) where
     F: Fn(StopPhase) -> std::io::Result<()>,
@@ -312,14 +346,19 @@ pub async fn tear_down<F, Fut>(
 {
     progress.enter(StopPhase::AcquireProxy);
     stop_proxy(Arc::clone(progress)).await;
-    progress.enter(StopPhase::CloseEtw);
-    close_etw();
+    run_phase(
+        &mut |phase| progress.enter(phase),
+        StopPhase::CloseEtw,
+        etw,
+        |etw| async move { close_etw(etw) },
+    )
+    .await;
     progress.enter(StopPhase::DropResources);
     drop_resources();
 }
 
 /// [`tear_down`] for the service: stop `proxy` in response to `shutdown_event()`,
-/// close `etw`, then drop `held` and the last handle on `proxy`.
+/// close `etw` if there is one, then drop `held` and the last handle on `proxy`.
 ///
 /// `shutdown_event` runs before [`StopPhase::AcquireProxy`], so that phase
 /// covers only the wait for the proxy-manager lock, not the filesystem probe
@@ -328,7 +367,7 @@ pub async fn tear_down_service<F, P, R, E, H>(
     progress: &Arc<StopProgress<F>>,
     proxy: Arc<tokio::sync::Mutex<ProxyManager<P, R>>>,
     shutdown_event: impl FnOnce() -> SessionEvent,
-    etw: E,
+    etw: Option<E>,
     held: H,
 ) where
     F: Fn(StopPhase) -> std::io::Result<()>,
@@ -345,7 +384,8 @@ pub async fn tear_down_service<F, P, R, E, H>(
                 tracing::error!(error = %e, "error stopping proxy during shutdown");
             }
         },
-        || drop(etw),
+        etw,
+        drop,
         move || {
             drop(held);
             drop_last_handle(proxy);

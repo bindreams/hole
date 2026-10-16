@@ -181,7 +181,8 @@ fn teardown_enters_the_proxy_phases_through_the_progress_it_hands_the_stop_work(
                 log.step("stop_proxy_end");
             }
         },
-        || log.step("close_etw"),
+        Some(()),
+        |()| log.step("close_etw"),
         || log.step("drop_resources"),
     ));
     assert_eq!(
@@ -394,6 +395,89 @@ fn a_stop_control_arriving_after_a_later_phase_is_logged_as_superseded() {
     );
 }
 
+/// A reporter that refuses only `StopRequested`, so a hand-off that was
+/// reported and failed is told apart from one that never reached the SCM.
+fn refuse_stop_requested(p: StopPhase) -> std::io::Result<()> {
+    if p == StopPhase::StopRequested {
+        Err(std::io::Error::other("SCM refused"))
+    } else {
+        Ok(())
+    }
+}
+
+fn assert_stop_requested_trail(out: &str) {
+    assert!(
+        out.lines()
+            .any(|l| l.contains("INFO") && l.contains("service stop phase") && l.contains("StopRequested")),
+        "no StopRequested phase line:\n{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.contains("WARN") && l.contains("failed to report StopPending") && l.contains("StopRequested")),
+        "no failed-report warning for StopRequested:\n{out}"
+    );
+}
+
+#[skuld::test]
+fn a_second_stop_control_does_not_replace_the_first_ones_unlogged_report() {
+    // Stop then Shutdown (or Stop twice) can both reach the handler before the
+    // first StopPending takes effect. The second is superseded, but the first
+    // reported and failed, and its trail must survive.
+    let writer = VecWriter::new();
+    let progress = StopProgress::new(refuse_stop_requested);
+    request_stop(&progress, || {});
+    request_stop(&progress, || {});
+
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    progress.enter(StopPhase::AcquireProxy);
+    assert_stop_requested_trail(&writer.snapshot_string());
+}
+
+#[skuld::test]
+fn a_stop_control_that_loses_the_report_lock_does_not_replace_the_first_ones_unlogged_report() {
+    // The same loss through the other superseding path: the second control finds
+    // another thread mid-report, so it never reaches `report_if_advancing`.
+    let in_report = std::sync::mpsc::channel::<()>();
+    let release = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release.1);
+    let progress = Arc::new(StopProgress::new(move |p| {
+        if p == StopPhase::StopProxy {
+            in_report.0.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+        refuse_stop_requested(p)
+    }));
+    request_stop(&progress, || {});
+
+    let writer = VecWriter::new();
+    let main_task = {
+        let progress = Arc::clone(&progress);
+        let writer = writer.clone();
+        std::thread::spawn(move || {
+            let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+            progress.enter(StopPhase::StopProxy)
+        })
+    };
+    in_report.1.recv().unwrap();
+    request_stop(&progress, || {});
+
+    release.0.send(()).unwrap();
+    main_task.join().unwrap();
+    assert_stop_requested_trail(&writer.snapshot_string());
+}
+
+#[skuld::test]
+fn a_stop_control_whose_report_panics_still_signals_the_main_task() {
+    // A lost signal is a lost Stop: the main task would never leave its await.
+    let progress = StopProgress::new(|_| -> std::io::Result<()> { panic!("report closure panicked") });
+    let signalled = std::cell::Cell::new(false);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        request_stop(&progress, || signalled.set(true))
+    }));
+    assert!(result.is_err(), "the report closure did not panic");
+    assert!(signalled.get(), "the panic skipped the shutdown signal");
+}
+
 #[skuld::test]
 fn a_hand_off_is_logged_once() {
     let writer = VecWriter::new();
@@ -556,6 +640,17 @@ fn the_last_handle_is_dropped_by_drop_last_handle() {
 }
 
 #[skuld::test]
+fn a_sole_owner_is_dropped_without_a_log_line() {
+    let writer = VecWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_at(
+        &writer,
+        tracing_subscriber::filter::LevelFilter::TRACE,
+    ));
+    drop_last_handle(Arc::new(DropFlag(Arc::default(), "value")));
+    assert_eq!(writer.snapshot_string(), "");
+}
+
+#[skuld::test]
 fn a_surviving_clone_is_logged_and_keeps_the_value_alive() {
     let writer = VecWriter::new();
     let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
@@ -611,7 +706,7 @@ fn service_teardown_probes_the_event_before_waiting_on_the_proxy_and_drops_in_ph
             log.step("event");
             SessionEvent::ProcessExiting
         },
-        StepOnDrop(log.clone(), "etw dropped"),
+        Some(StepOnDrop(log.clone(), "etw dropped")),
         StepOnDrop(log.clone(), "held dropped"),
     ));
     assert_eq!(
@@ -630,6 +725,29 @@ fn service_teardown_probes_the_event_before_waiting_on_the_proxy_and_drops_in_ph
 }
 
 #[skuld::test]
+fn service_teardown_without_an_etw_consumer_does_not_enter_close_etw() {
+    // The ETW consumer can fail to start; CloseEtw names work that then does not exist.
+    let log = Log::default();
+    let progress = Arc::new(log.progress());
+    let (proxy, _dir) = idle_manager_with_state_dir();
+    block_on(tear_down_service(
+        &progress,
+        proxy,
+        || SessionEvent::ProcessExiting,
+        None::<()>,
+        (),
+    ));
+    assert_eq!(
+        log.events(),
+        vec![
+            Event::Reported(StopPhase::AcquireProxy),
+            Event::Reported(StopPhase::PersistTarget),
+            Event::Reported(StopPhase::DropResources),
+        ]
+    );
+}
+
+#[skuld::test]
 fn service_teardown_names_a_proxy_handle_that_outlives_it() {
     // A connection task still holding a router clone would drop the manager on
     // whatever thread released it, outside DropResources.
@@ -643,7 +761,7 @@ fn service_teardown_names_a_proxy_handle_that_outlives_it() {
         &progress,
         proxy,
         || SessionEvent::ProcessExiting,
-        (),
+        Some(()),
         (),
     ));
     assert!(writer.snapshot_string().contains("outlived the teardown"));

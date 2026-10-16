@@ -258,7 +258,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // disconnect, so the target is left unchanged either way; only the
         // event differs, distinguishing an update cutover from a plain
         // machine shutdown for anyone reading the log/history.
-        //
         service_stop::tear_down_service(
             &stop_progress,
             proxy_shutdown,
