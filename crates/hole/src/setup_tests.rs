@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 use super::*;
 
 // CommandLineToArgvW roundtrip ========================================================================================

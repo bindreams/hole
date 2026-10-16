@@ -62,6 +62,7 @@ use std::path::Path;
 
 use super::super::{run_capturing, BestEffortPhase, FatalPhase, Phase};
 use crate::error::RoutingError;
+use util::system_tool::SystemTool;
 // `macos.rs` is mounted as `mod platform` under `failclosed`, so `super` is the
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
@@ -378,36 +379,10 @@ fn engage_pf_action(pf_enabled: bool, has_persisted: bool) -> PfEngageAction {
 
 const PFCONF: &str = "/etc/pf.conf";
 
-/// `pfctl`'s fixed system path. This runs as root — a bare `"pfctl"` would
-/// resolve against the caller's `PATH`, letting an earlier, attacker-writable
-/// directory on it shadow the real binary. `/sbin/pfctl` is where macOS ships
-/// it, unconditionally.
-///
-/// NOT a closed hardening. Every other macOS root spawn in the tree is still
-/// PATH-resolved: `route` (`routing.rs`, `device/ipv6_addr/macos.rs`),
-/// `ifconfig` (`device/ipv6_addr/macos.rs`), `networksetup`, `dscacheutil` and
-/// `killall` (`bridge/src/dns/system/macos.rs`), `launchctl`
-/// (`bridge/src/platform/macos.rs`, `bridge/src/cutover/os/macos.rs`) and
-/// `dseditgroup`, `stat` and `logname` (`bridge/src/group.rs`). A `--service`
-/// bridge inherits launchd's fixed `PATH`, but a GUI-elevated one inherits the
-/// user's, `/opt/homebrew/bin` included. Pinning this one call site is correct
-/// in itself and delivers no net attack-surface reduction while the rest
-/// stand; widening it is tracked separately.
-const PFCTL: &str = "/sbin/pfctl";
-
-/// Build the argv `pfctl` runs with: [`PFCTL`]'s absolute path followed by
-/// `args`. Pure so the hardening in [`PFCTL`]'s doc is unit-tested without
-/// spawning anything.
-fn pfctl_cmd(args: &[&str]) -> Vec<String> {
-    std::iter::once(PFCTL)
-        .chain(args.iter().copied())
-        .map(str::to_owned)
-        .collect()
-}
-
+/// Runs `pfctl` through [`SystemTool::Pfctl`] (absolute path).
 fn pfctl<P: Phase>(args: &[&str], stdin: Option<&[u8]>, phase: P) -> Result<std::process::Output, RoutingError> {
-    let cmd = pfctl_cmd(args);
-    run_capturing(&cmd, stdin, phase).map_err(|e| RoutingError::RouteSetup(format!("pfctl spawn failed: {e}")))
+    run_capturing(SystemTool::Pfctl, args, stdin, phase)
+        .map_err(|e| RoutingError::RouteSetup(format!("pfctl spawn failed: {e}")))
 }
 
 /// `pfctl -E` (refcounted enable) + parse the enable token from its output. The

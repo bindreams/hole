@@ -8,6 +8,8 @@
 // Each scenario writes a `ChildResult` JSON file to `HOLE_LOGGING_TEST_OUTPUT`
 // and the parent reads + asserts on it.
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use crate::logging::logging_tests::{CapturedEvent, ChildResult};
 use crate::logging::{redirect_stdio_to_tracing_for_tests, StdioRelayHandles};
 use std::io::Write;

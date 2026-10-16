@@ -12,6 +12,8 @@
 //! process, and a sibling test's spawn can inherit a pipe's write end and defer
 //! its EOF indefinitely.
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 

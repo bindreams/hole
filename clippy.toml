@@ -19,6 +19,98 @@ reason = "Route setup must go through `Routing::install`. Only `SystemRouting::i
 path = "tun_engine::routing::teardown_routes"
 reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in tun-engine and `recover_routes` may call this. See #165."
 
+# System tools — spawn by absolute path --------------------------------------------------------------------------------
+#
+# The bridge runs as root/SYSTEM. A program named without a directory is
+# resolved through `PATH` (macOS) or, on Windows, the application directory and
+# the current directory before System32 — all of which a lower-privileged user
+# can influence. `util::system_tool::SystemTool::command` builds the `Command`
+# for every OS tool from an absolute path (`SystemPowershell::command` for a root
+# PowerShell); the bans below keep a bare name from
+# being typed again. A spawn of something that is not an OS tool (Hole's own
+# executable, dev tooling, a user-privilege helper) takes a per-site
+# `#[allow(clippy::disallowed_methods)]` with a reason; test files use a
+# module-level one.
+
+[[disallowed-methods]]
+path = "std::process::Command::new"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+
+[[disallowed-methods]]
+path = "tokio::process::Command::new"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+allow-invalid = true  # only crates with tokio's `process` feature can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::Command::new"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::run"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::run_line"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::tokio::Command::new"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::tokio::run"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::tokio::run_line"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::Command::executable"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::Command::arg"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::Command::args"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::Command::commandline"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::tokio::Command::executable"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::tokio::Command::arg"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::tokio::Command::args"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::tokio::Command::commandline"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
 # Port allocation — enforce bind_ephemeral over raw free_port ----------------------------------------------------------
 #
 # Direct callers of `port_alloc::free_port` skip the divorced-port-number

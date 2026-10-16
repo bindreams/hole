@@ -1,5 +1,7 @@
 //! A probe route owned for exactly as long as the test that installed it.
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use std::net::IpAddr;
 use std::process::Command;
 

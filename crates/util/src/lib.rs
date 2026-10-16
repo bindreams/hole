@@ -9,6 +9,9 @@
 //!   a log, plus the byte-level writer that enforces it.
 //! - [`retry`] — exponential-backoff retry helpers + transient-error
 //!   predicates (`is_bind_race` / `is_file_contention`).
+//! - [`system_tool`] — absolute paths for the OS tools Hole spawns, so a
+//!   bare program name is never resolved through `PATH` or the working
+//!   directory.
 //! - [`syn_budget`] — a TCP connect whose SYN-retransmission budget is
 //!   chosen deliberately, so a refusal-vs-timeout verdict is observable on
 //!   Windows without racing the OS's own ~2 s refusal cost.
@@ -24,6 +27,8 @@ pub mod port_alloc;
 pub mod redact;
 pub mod retry;
 pub mod syn_budget;
+#[cfg(any(target_os = "macos", windows))]
+pub mod system_tool;
 
 // Install the workspace test subscriber + panic hook. The dev-dep is gated on
 // cfg(test) because it isn't linked in non-test builds.

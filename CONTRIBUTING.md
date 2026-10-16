@@ -354,6 +354,53 @@ Compile-time enforcement is in the root [`clippy.toml`](clippy.toml)
 DNS FFIs `SetInterfaceDnsSettings`/`GetInterfaceDnsSettings`). See #165 (the
 incident) and #397 (the `Dns` extension).
 
+### System tools (absolute paths)
+
+The bridge runs as root/SYSTEM, so it never spawns an OS tool by bare name: a bare
+name is resolved through `PATH` (macOS) or, on Windows, through the application
+directory and the *current directory* before System32
+([`CreateProcess`, "lpApplicationName"](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)),
+and a lower-privileged user can influence all of those. Every OS tool is a
+[`util::system_tool::SystemTool`](crates/util/src/system_tool.rs) variant
+(`route`, `ifconfig`, `pfctl`, `networksetup`, `launchctl`, `dseditgroup`, … on
+macOS; `route`, `netsh`, `net`, `pnputil` on Windows), and
+`SystemTool::command()` is the only way to build its `Command`: the program is an
+absolute path, on Windows under the directory `GetSystemDirectoryW` reports. A
+root PowerShell is deliberately not a `SystemTool` variant:
+`util::system_tool::SystemPowershell::command(script)` is its only constructor, so
+a PowerShell without the module pin below cannot be written. If
+that call fails, `path()`/`command()` return the error and the caller carries it
+as its spawn error (`CommandFailure::Spawn`, or the `io::Error` it already
+returns), so a best-effort teardown logs it and goes on. The root PowerShell
+child gets `PSModulePath` set to the system module directory alone, both in its
+environment and by an assignment `SystemPowershell::command` prepends to every script
+(PowerShell rebuilds an inherited value equal to the machine's, so the
+environment alone does not hold): its default begins with the invoking user's
+writable `Documents\WindowsPowerShell\Modules`, and cmdlet autoload would run a
+planted module as SYSTEM/admin.
+`RouteCommand`/`SetupCommand` carry a `SystemTool` plus the arguments, not an argv
+whose first element is a program name. Compile-time enforcement is
+[`clippy.toml`](clippy.toml): `std::process::Command::new`,
+`tokio::process::Command::new` and every `cosca` command constructor
+(`Command::new`, `run`, `run_line`, sync and `tokio`) are disallowed, and so are
+the `cosca::Command` methods that name its program (`executable`, `arg`, `args`,
+`commandline`), because `Command: Default` is a constructor no path can ban. A
+spawn that is not an OS tool (Hole's own executable, the unprivileged GUI's
+`osascript`, the developer's `sudo`, `xtask`/`dev-console` tooling, test
+harnesses) takes an `#[allow]` with its reason; test files and tooling files take
+a module-level one. Bridge production code never does: an inner
+`#![allow(clippy::disallowed_methods)]` switches the process ban off for the whole
+module, so a spawn there takes an item-level allow. A library the privileged
+binary must not call (`handle-holders`' `lsof`) is a `[dev-dependencies]` entry
+of the bridge, not a `[dependencies]` one. Test and tooling code that runs under `sudo`/an admin shell
+in CI (the privileged lanes) is attended and keeps bare names.
+
+The plugin spawn is the one root spawn this does not cover:
+`resolve_plugin_path_inner` returns a bare plugin name when no sibling binary
+exists next to the bridge, and `garter::BinaryPlugin::run` (which carries the
+per-site allow) passes it to cosca, which searches `PATH`. Closing it changes what
+users can configure; it is bindreams/hole#1072.
+
 `Dns` has a two-layer seam — outer (`MockDns` at `ProxyManager::new_with_dns`)
 and inner per-platform backend (`MockBackend` at `SystemDns::new_with_backend`).
 Both are necessary: an outer-only mock can pass while `SystemDns::apply` ignores
@@ -409,6 +456,30 @@ defused by `shutdown()` and is constructed only in the `Ok` branch of
 `Dns::apply`. **Known follow-up:** `SystemRoutes::Drop` still tears down routing
 synchronously (blocks the worker on `netsh`/`route`); converting it to the
 `shutdown` + `DebugDropBomb` discipline is tracked.
+
+### Windows service stop reporting
+
+`run_service` reports `SERVICE_STOP_PENDING` with one checkpoint per teardown
+phase ([`StopPhase`](crates/bridge/src/service_stop.rs)), and `Stopped` only
+after the last. The proxy-side phases are entered by
+`ProxyManager::stop_with_progress`, each just before the work it names and only
+when that work exists in the session. The first report is made by the control
+handler the moment Stop/Shutdown arrives, before the main task is signalled, so
+a stop that lands during a startup await does not read as `Running`. A later
+phase is reported when the previous one finishes and nothing reports on a timer,
+so a wedged phase freezes the checkpoint where `sc queryex` and the
+cutover/uninstall `NotifyServiceStatusChange` waiters can see it.
+
+Each phase entered is logged at info (`service stop phase`, with its
+checkpoint) to `bridge.log`, never by the control handler: it does no log I/O of
+its own (a panic still passes through the process-wide panic hook; see the
+`service_stop.rs` module doc) and catches a panicking report, since an unwinding
+panic aborts the service. The shutdown forwarder task logs the first phase's
+hand-off the moment it wakes from the shutdown signal, so a stop wedged before
+its first entry still leaves a line. On an msiexec timeout the CI
+diagnostics print `sc queryex HoleBridge` and those lines. A path that fails
+before teardown (bind failure) skips the proxy and ETW phases. Only Windows CI
+exercises the SCM side.
 
 ### Spawn-retry & file-contention
 
@@ -1116,8 +1187,8 @@ milliseconds.
 
 - **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
   `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin
-  (`pfctl -f -`, absolute `/sbin/pfctl` — `PFCTL`'s own doc has the hardening
-  caveat and lists the other macOS root spawns it does not close).
+  (`pfctl -f -`, spawned as `SystemTool::Pfctl`, so by absolute path — see
+  [System tools](#system-tools-absolute-paths)).
   Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`);
   the token is persisted to `bridge-failclosed.json` *before* the blocking
   ruleset loads (persist-before-mutate), and a failed persist unwinds the `-E`
@@ -1142,8 +1213,7 @@ milliseconds.
   passing (the chosen contract; `load_cover_ruleset`'s doc).
   Disclosed, not fixed here: a *failed* re-engage during a transition still
   reloads `/etc/pf.conf` over a still-good prior cover (bindreams/hole#1004 — it
-  warns where it fires), two privileged test files' own bare `pfctl` calls
-  (bindreams/hole#1005), and the lockdown half of the state-purge question
+  warns where it fires) and the lockdown half of the state-purge question
   (bindreams/hole#1015, sequenced behind bindreams/hole#1002).
 
 Each platform splits a pure, unit-tested rule/spec builder (transient:
@@ -2829,8 +2899,9 @@ through these IN ORDER before proposing any timeout bump:
 1. **Run `cargo clippy --workspace --no-default-features`** — `disallowed_methods`
    rejects raw `routing::setup_routes`/`teardown_routes` and
    `shadowsocks_service::local::Server::new` outside trait impls.
-1. **Check for new `std::process::Command::new` in `crates/bridge/src/`** — not
-   clippy-covered; each is a potential test-time subprocess leak.
+1. **Check for new `std::process::Command::new` in `crates/bridge/src/`** — clippy
+   rejects it (see [System tools](#system-tools-absolute-paths)), so a hit carries an
+   `#[allow]`; each is a potential test-time subprocess leak.
 1. **Check skuld's per-test `pass (NN ms)` lines** for a duration outlier.
 1. **Compare with a recent main CI run** on the same runner image.
 1. **Only if all the above rule out code issues**, consider the runner image

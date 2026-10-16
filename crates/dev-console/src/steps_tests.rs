@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use crate::steps::{resolve_tool, stage_dir_path, StageDirGuard};
 
 use tokio::io::AsyncReadExt as _;

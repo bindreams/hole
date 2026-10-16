@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 use std::process::Command;
 
 use super::pull_subrepo::test_support::{git, git_output, install_rejecting_pre_commit_hook, ConflictKind, Fixture};

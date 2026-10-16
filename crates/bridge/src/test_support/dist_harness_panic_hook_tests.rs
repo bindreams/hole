@@ -20,6 +20,8 @@
 //!
 //! See bindreams/hole#303 (regression gate (b)).
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use crate::test_support::dist_fixture::stage_dist_bin_dir;
 use crate::test_support::dist_harness::DistHarness;
 use crate::test_support::rt;

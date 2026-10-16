@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 use std::path::{Path, PathBuf};
 
 fn main() {

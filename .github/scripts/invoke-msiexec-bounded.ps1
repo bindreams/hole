@@ -133,6 +133,32 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
         Write-Host "(failed to query HoleBridge service: $($_.Exception.Message))"
     }
 
+    # `Get-Service` shows `StopPending` but not the phase; the checkpoint plus the
+    # last "service stop phase" log line (`StopPhase` in
+    # crates/bridge/src/service_stop.rs) name it.
+    Write-Host "--- HoleBridge SCM status (STATE, CHECKPOINT, WAIT_HINT) ---"
+    try {
+        sc.exe queryex HoleBridge
+    } catch {
+        Write-Host "(failed to run sc.exe queryex HoleBridge: $($_.Exception.Message))"
+    }
+
+    Write-Host "--- bridge.log: stop phases entered (one stop is 12 lines at most) ---"
+    try {
+        $bridgeLog = Join-Path (Join-Path $env:ProgramData 'hole\logs') 'bridge.log'
+        # Oldest first: size rotation (file-rotate AppendCount) moves the active
+        # file to `bridge.log.1`, so a stop that straddles a rotation spans both.
+        $logs = @("$bridgeLog.1", $bridgeLog) | Where-Object { Test-Path $_ }
+        if ($logs) {
+            $phases = @(Select-String -Path $logs -Pattern 'service stop phase' -ErrorAction Stop | Select-Object -Last 12 | ForEach-Object { $_.Line })
+            if ($phases) { $phases } else { Write-Host "(no service stop phase lines in $($logs -join ', '))" }
+        } else {
+            Write-Host "(log not found at $bridgeLog)"
+        }
+    } catch {
+        Write-Host "(failed to read bridge.log: $($_.Exception.Message))"
+    }
+
     Write-Host "--- hole.exe processes ---"
     try {
         $holeProcs = Get-Process hole -ErrorAction SilentlyContinue

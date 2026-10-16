@@ -668,6 +668,40 @@ fn server_accepts_connection() {
 }
 
 #[skuld::test]
+fn run_until_returns_only_after_every_connection_has_released_the_proxy() {
+    // The service drops the proxy manager as the last handle in a teardown
+    // phase of its own. That only holds if no connection task still holds a
+    // router clone when the server stops.
+    rt().block_on(async {
+        let path = test_socket_path("run-until");
+        let proxy = mock_proxy();
+        let observer = Arc::clone(&proxy);
+        let server = IpcServer::bind(&path, proxy, "test").unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let run = tokio::spawn(async move {
+            server
+                .run_until(async {
+                    let _ = stop_rx.await;
+                })
+                .await
+        });
+
+        // A live keep-alive connection: its handler task exists when the stop lands.
+        let mut client = TestClient::connect(&path).await;
+        get_status(&mut client).await;
+
+        stop_tx.send(()).unwrap();
+        run.await.unwrap().unwrap();
+        assert_eq!(
+            Arc::strong_count(&observer),
+            1,
+            "a connection task or the server still holds the proxy"
+        );
+        drop(client);
+    });
+}
+
+#[skuld::test]
 fn every_response_carries_bridge_version_header() {
     rt().block_on(async {
         let path = test_socket_path("ver-header");

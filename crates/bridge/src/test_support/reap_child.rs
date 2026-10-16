@@ -13,6 +13,8 @@
 //! process, and a sibling test's `CreateProcess(bInheritHandles=TRUE)` can
 //! inherit a pipe's write end and defer its EOF indefinitely.
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 

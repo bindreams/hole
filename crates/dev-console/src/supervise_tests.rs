@@ -3,6 +3,8 @@
 //! (sudo, TUN, Vite, webview) is the manual smoke test in the PR checklist —
 //! it needs a password prompt and a real network stack.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use crate::policy::ChildRole;
 use crate::supervise::{create_run_dir, has_exited, teardown_grouped};
 use crate::test_child;

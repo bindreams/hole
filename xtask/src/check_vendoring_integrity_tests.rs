@@ -2,6 +2,8 @@
 //! repo with a `.gitrepo`, a `VENDORING.md`, and an outer `go.mod`), running
 //! `check_vendoring_integrity::run` against it for real, not a mock.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::path::Path;
 use std::process::Command;
 

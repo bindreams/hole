@@ -154,8 +154,6 @@ pub fn execute_plan<O: SwapOps>(plan: &SwapPlan, ops: &O) -> std::io::Result<()>
 
 #[cfg(target_os = "macos")]
 mod imp {
-    #![allow(clippy::disallowed_methods)]
-
     use std::io;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
