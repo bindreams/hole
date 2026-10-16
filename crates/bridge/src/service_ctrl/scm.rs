@@ -51,6 +51,7 @@ where
     let OwnedHandler { entry, context } = own(handler);
     // SAFETY: `entry` is a valid `LPHANDLER_FUNCTION_EX` for the context
     // `own` paired it with, and that context is never freed.
+    #[allow(clippy::disallowed_methods)] // the one sanctioned registration: `entry` and `context` come from `own`
     let handle = unsafe { RegisterServiceCtrlHandlerExW(&HSTRING::from(name), Some(entry), Some(context)) }
         .map_err(io::Error::from)?;
     Ok(StatusHandle(handle))

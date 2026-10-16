@@ -224,6 +224,11 @@ path = "windows_service::service_control_handler::register"
 reason = "Frees the handler on the first Stop while the SCM still holds it. Register through `service_ctrl::register`, which owns the handler via `service_ctrl::own`."
 allow-invalid = true  # windows-service is a Windows-only dependency; other targets cannot resolve the path.
 
+[[disallowed-methods]]
+path = "windows::Win32::System::Services::RegisterServiceCtrlHandlerExW"
+reason = "A handler registered here must outlive every control the SCM can send. Register through `service_ctrl::register`, which owns the handler via `service_ctrl::own`."
+allow-invalid = true  # the `windows` crate is a Windows-only dependency; other targets cannot resolve the path.
+
 # Bridge cancellation contract -----------------------------------------------------------------------------------------
 #
 # Fresh `CancellationToken::new()` inside `crates/bridge/src/` defeats
