@@ -43,7 +43,6 @@ cosca = { workspace = true }
 hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
 util = { path = "../util" }
-handle-holders = { path = "../handle-holders" }
 tun-engine = { path = "../tun-engine" }
 dump = { path = "../dump" }
 garter = { path = "../garter" }
@@ -159,6 +158,10 @@ ferrisetw = "1.2.0"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+# Test-harness-only (`test_support::dist_harness`). A dev-dependency so the
+# privileged bridge binary cannot link it: `handle_holders::find_holders` spawns
+# `lsof` by PATH on macOS.
+handle-holders = { path = "../handle-holders" }
 # Enables tun-engine's `test-utils` for tests only — the production dep above
 # does not. Brings both modules this crate's tests need: `tun_engine::test_utils`,
 # the privileged-lane OS harness (probe routes, shelled-out command diagnostics,

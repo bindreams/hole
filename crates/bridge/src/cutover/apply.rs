@@ -127,7 +127,6 @@ mod windows {
     //! identity into the marker before it can act), the conditional job-breakaway
     //! probe, and the ToolHelp thread-resume. Raw JobObject/ToolHelp FFI is
     //! sanctioned here per the #165 isolation contract.
-    #![allow(clippy::disallowed_methods)]
 
     use std::os::windows::process::CommandExt;
 
@@ -205,6 +204,8 @@ mod windows {
         target_version: &str,
     ) -> std::io::Result<std::process::Child> {
         let exe = std::env::current_exe()?;
+        #[allow(clippy::disallowed_methods)]
+        // Hole's own executable by absolute path, not an OS tool; see clippy.toml System tools
         let mut cmd = std::process::Command::new(exe);
         cmd.args([
             "bridge",
@@ -228,6 +229,8 @@ mod windows {
             Some((p, r)) => (p, r.trim_start()),
             None => (cmdline, ""),
         };
+        #[allow(clippy::disallowed_methods)]
+        // test seam: spawns the test's own observable command (attended); see clippy.toml System tools
         let mut cmd = std::process::Command::new(program);
         if !rest.is_empty() {
             cmd.raw_arg(rest);

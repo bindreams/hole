@@ -382,7 +382,11 @@ the `cosca::Command` methods that name its program (`executable`, `arg`, `args`,
 spawn that is not an OS tool (Hole's own executable, the unprivileged GUI's
 `osascript`, the developer's `sudo`, `xtask`/`dev-console` tooling, test
 harnesses) takes an `#[allow]` with its reason; test files and tooling files take
-a module-level one. Test and tooling code that runs under `sudo`/an admin shell
+a module-level one. Bridge production code never does: an inner
+`#![allow(clippy::disallowed_methods)]` switches the process ban off for the whole
+module, so a spawn there takes an item-level allow. A library the privileged
+binary must not call (`handle-holders`' `lsof`) is a `[dev-dependencies]` entry
+of the bridge, not a `[dependencies]` one. Test and tooling code that runs under `sudo`/an admin shell
 in CI (the privileged lanes) is attended and keeps bare names.
 
 The plugin spawn is the one root spawn this does not cover:
