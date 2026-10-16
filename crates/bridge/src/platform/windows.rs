@@ -195,9 +195,9 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let shutdown = tokio_util::sync::CancellationToken::new();
         {
             let shutdown = shutdown.clone();
+            let stop_progress = std::sync::Arc::clone(&stop_progress);
             tokio::spawn(async move {
-                let _ = shutdown_rx.await;
-                shutdown.cancel();
+                service_stop::forward_stop(&stop_progress, shutdown_rx, || shutdown.cancel()).await;
             });
         }
 

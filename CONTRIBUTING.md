@@ -425,7 +425,10 @@ cutover/uninstall `NotifyServiceStatusChange` waiters can see it.
 
 Each phase entered is logged at info (`service stop phase`, with its
 checkpoint) to `bridge.log`, by the main task: the control handler does no log
-I/O (see the `service_stop.rs` module doc). On an msiexec timeout the CI
+I/O (see the `service_stop.rs` module doc) and catches a panicking report, since
+an unwinding panic aborts the service. The main task logs the first phase's
+hand-off the moment it wakes from the shutdown signal, so a stop wedged before
+its first entry still leaves a line. On an msiexec timeout the CI
 diagnostics print `sc queryex HoleBridge` and those lines. A path that fails
 before teardown (bind failure) skips the proxy and ETW phases. Only Windows CI
 exercises the SCM side.

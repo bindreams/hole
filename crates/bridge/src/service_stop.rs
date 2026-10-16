@@ -17,12 +17,17 @@
 //! lock. The control handler does no log I/O at all: the SCM gives `HandlerEx`
 //! 30 s, and the file appender back-pressures, so a log write there could fail
 //! the caller's `ControlService`. It hands the outcome to the main task, which
-//! logs it at its next entry. A Stop control that lands after the last entry
+//! logs it when it wakes from the shutdown signal ([`forward_stop`]). A report
+//! that panics is caught on the handler thread: the handler runs inside
+//! windows-service's `extern "system"` trampoline, where an unwinding panic
+//! aborts the process. A Stop control that lands after the last entry
 //! (`ShutdownRuntime`) is not logged.
 
+use std::any::Any;
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::proxy::Proxy;
 use crate::proxy_manager::ProxyManager;
@@ -33,7 +38,8 @@ use tun_engine::routing::Routing;
 /// order is teardown order. A phase is entered when the previous one has
 /// finished and names the work that is about to run, so a stuck checkpoint
 /// identifies the step that is stuck. Phases whose work is absent in a given
-/// session (no TUN engine in SOCKS-only mode, no plugin chain) are not entered.
+/// session (no TUN engine in SOCKS-only mode, no plugin chain, no ETW consumer)
+/// are not entered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StopPhase {
     /// The Stop (or Shutdown) control has arrived; the main task has not yet
@@ -136,7 +142,16 @@ impl StopPhase {
 /// What the Stop control's attempt to report [`StopPhase::StopRequested`]
 /// came to. Held for the main task to log; see the module doc.
 enum StopControl {
-    Reported(std::io::Result<()>),
+    Reported {
+        outcome: std::io::Result<()>,
+        at: Instant,
+    },
+    /// The report closure panicked. The payload is handed over undropped so no
+    /// drop code runs on the control handler thread.
+    ReportPanicked {
+        payload: Box<dyn Any + Send>,
+        at: Instant,
+    },
     /// Not reported: a later phase was already reported, or another thread was
     /// mid-report (and so is at or past the first phase).
     Superseded,
@@ -144,16 +159,37 @@ enum StopControl {
 
 impl StopControl {
     /// The outcome to hold when `incoming` arrives while `held` is still
-    /// waiting to be logged. A second Stop or Shutdown control is always
-    /// `Superseded` by the first, so the first's report is the one that
-    /// happened and must not be overwritten before it is logged.
+    /// waiting to be logged. A report that happened outranks one that did not,
+    /// and a panic outranks a plain report: it is the one nothing else
+    /// explains.
+    ///
+    /// A second Stop or Shutdown control is `Superseded` by the first, since
+    /// the first set the reported phase before it ran its report. So a second
+    /// `Reported` or `ReportPanicked` never arrives while one is held, and those
+    /// arms keep what was held.
     fn merge(held: StopControl, incoming: StopControl) -> StopControl {
         match (held, incoming) {
-            (StopControl::Reported(held), StopControl::Reported(_)) => StopControl::Reported(held),
-            (StopControl::Reported(held), StopControl::Superseded) => StopControl::Reported(held),
-            (StopControl::Superseded, StopControl::Reported(incoming)) => StopControl::Reported(incoming),
+            (held @ StopControl::ReportPanicked { .. }, StopControl::ReportPanicked { .. }) => held,
+            (held @ StopControl::ReportPanicked { .. }, StopControl::Reported { .. }) => held,
+            (held @ StopControl::ReportPanicked { .. }, StopControl::Superseded) => held,
+            (StopControl::Reported { .. }, incoming @ StopControl::ReportPanicked { .. }) => incoming,
+            (held @ StopControl::Reported { .. }, StopControl::Reported { .. }) => held,
+            (held @ StopControl::Reported { .. }, StopControl::Superseded) => held,
+            (StopControl::Superseded, incoming @ StopControl::ReportPanicked { .. }) => incoming,
+            (StopControl::Superseded, incoming @ StopControl::Reported { .. }) => incoming,
             (StopControl::Superseded, StopControl::Superseded) => StopControl::Superseded,
         }
+    }
+}
+
+/// The text of a panic payload, for the log.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message
+    } else {
+        "non-string panic payload"
     }
 }
 
@@ -180,7 +216,7 @@ impl<F: Fn(StopPhase) -> std::io::Result<()>> StopProgress<F> {
     /// Report `phase` as pending, unless a phase at or after it has already been
     /// reported. Reports reach the SCM in checkpoint order because the lock is
     /// held across each one; the log lines follow it, the Stop control's
-    /// hand-off first.
+    /// hand-off first if [`StopProgress::log_stop_control`] has not taken it.
     pub fn enter(&self, phase: StopPhase) {
         let outcome = {
             let mut last = self.last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -188,7 +224,7 @@ impl<F: Fn(StopPhase) -> std::io::Result<()>> StopProgress<F> {
         };
         self.log_stop_control();
         if let Some(outcome) = outcome {
-            Self::log_reported(phase, outcome);
+            Self::log_reported(phase, outcome, None);
         }
     }
 
@@ -199,14 +235,25 @@ impl<F: Fn(StopPhase) -> std::io::Result<()>> StopProgress<F> {
     /// did not make. The outcome is stored for the main task to log, while the
     /// report lock is still held when there is one: the main task's next `enter`
     /// takes that lock, so it cannot miss the outcome.
+    ///
+    /// Never panics: a panicking report is caught and stored as
+    /// [`StopControl::ReportPanicked`]. Catching it inside the lock also leaves
+    /// the lock unpoisoned.
     fn report_stop_control(&self) {
         let phase = StopPhase::ALL[0];
         // Stored before the guard drops, so the outcome is visible to whoever
         // takes the report lock next.
         let report_and_store = |last: &mut Option<StopPhase>| {
-            let outcome = match self.report_if_advancing(last, phase) {
-                Some(outcome) => StopControl::Reported(outcome),
-                None => StopControl::Superseded,
+            let outcome = match catch_unwind(AssertUnwindSafe(|| self.report_if_advancing(last, phase))) {
+                Ok(Some(outcome)) => StopControl::Reported {
+                    outcome,
+                    at: Instant::now(),
+                },
+                Ok(None) => StopControl::Superseded,
+                Err(payload) => StopControl::ReportPanicked {
+                    payload,
+                    at: Instant::now(),
+                },
             };
             self.store_stop_control(outcome);
         };
@@ -236,14 +283,26 @@ impl<F: Fn(StopPhase) -> std::io::Result<()>> StopProgress<F> {
         Some((self.report)(phase))
     }
 
-    fn log_stop_control(&self) {
+    /// Log the Stop control's outcome, if it is still waiting. The main task
+    /// calls this as soon as it wakes from the shutdown signal, so a stop that
+    /// wedges before its first [`StopProgress::enter`] still leaves the line.
+    /// The line carries how long ago the report happened.
+    pub fn log_stop_control(&self) {
         let taken = self
             .stop_control
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         match taken {
-            Some(StopControl::Reported(outcome)) => Self::log_reported(StopPhase::ALL[0], outcome),
+            Some(StopControl::Reported { outcome, at }) => {
+                Self::log_reported(StopPhase::ALL[0], outcome, Some(at.elapsed().as_millis() as u64))
+            }
+            Some(StopControl::ReportPanicked { payload, at }) => tracing::error!(
+                phase = ?StopPhase::ALL[0],
+                reported_ms_ago = at.elapsed().as_millis() as u64,
+                panic = panic_message(&*payload),
+                "stop control report panicked; the SCM may not have seen StopPending"
+            ),
             Some(StopControl::Superseded) => tracing::debug!(
                 phase = ?StopPhase::ALL[0],
                 "stop control superseded: a later phase was already reported or being reported"
@@ -252,11 +311,12 @@ impl<F: Fn(StopPhase) -> std::io::Result<()>> StopProgress<F> {
         }
     }
 
-    fn log_reported(phase: StopPhase, outcome: std::io::Result<()>) {
+    fn log_reported(phase: StopPhase, outcome: std::io::Result<()>, reported_ms_ago: Option<u64>) {
         tracing::info!(
             ?phase,
             checkpoint = phase.checkpoint(),
             wait_hint_ms = phase.wait_hint().as_millis() as u64,
+            reported_ms_ago,
             "service stop phase"
         );
         if let Err(e) = outcome {
@@ -268,22 +328,26 @@ impl<F: Fn(StopPhase) -> std::io::Result<()>> StopProgress<F> {
 /// The Stop/Shutdown control: report [`StopPhase::StopRequested`], then `signal`
 /// the main task. The report goes first so the SCM never sees `Running` after a
 /// Stop it has delivered; nothing before the signal can wait on another thread,
-/// and nothing here logs (see the module doc). The signal runs even if the
-/// report panics: a lost signal is a lost Stop.
+/// and nothing here logs (see the module doc). Returns normally even if the
+/// report panics (it is caught), so the signal always runs and no panic reaches
+/// the SCM trampoline this runs under.
 pub fn request_stop<F: Fn(StopPhase) -> std::io::Result<()>>(progress: &StopProgress<F>, signal: impl FnOnce()) {
-    let _signal = SignalOnDrop(Some(signal));
     progress.report_stop_control();
+    signal();
 }
 
-/// Runs the closure when dropped, normally or by unwinding.
-struct SignalOnDrop<S: FnOnce()>(Option<S>);
-
-impl<S: FnOnce()> Drop for SignalOnDrop<S> {
-    fn drop(&mut self) {
-        if let Some(signal) = self.0.take() {
-            signal();
-        }
-    }
+/// Wait for the Stop control's signal on `stop_rx`, then `cancel` the shutdown
+/// token, then log the control's hand-off. Cancelling comes first so a log
+/// write that blocks cannot delay the shutdown it reports. The signal's sender
+/// being dropped counts as the signal.
+pub async fn forward_stop<F: Fn(StopPhase) -> std::io::Result<()>>(
+    progress: &StopProgress<F>,
+    stop_rx: tokio::sync::oneshot::Receiver<()>,
+    cancel: impl FnOnce(),
+) {
+    let _ = stop_rx.await;
+    cancel();
+    progress.log_stop_control();
 }
 
 /// [`request_stop`] signalling the main task through `shutdown_tx`, which holds

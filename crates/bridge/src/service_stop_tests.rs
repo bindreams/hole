@@ -423,6 +423,10 @@ fn a_second_stop_control_does_not_replace_the_first_ones_unlogged_report() {
     // Stop then Shutdown (or Stop twice) can both reach the handler before the
     // first StopPending takes effect. The second is superseded, but the first
     // reported and failed, and its trail must survive.
+    // Guarded for completeness, not exercised end to end: windows-service frees
+    // the handler closure after the first Stop/Shutdown, so a second control may
+    // never reach it. The same holds for the
+    // second-control tests below.
     let writer = VecWriter::new();
     let progress = StopProgress::new(refuse_stop_requested);
     request_stop(&progress, || {});
@@ -467,15 +471,119 @@ fn a_stop_control_that_loses_the_report_lock_does_not_replace_the_first_ones_unl
 }
 
 #[skuld::test]
-fn a_stop_control_whose_report_panics_still_signals_the_main_task() {
-    // A lost signal is a lost Stop: the main task would never leave its await.
-    let progress = StopProgress::new(|_| -> std::io::Result<()> { panic!("report closure panicked") });
-    let signalled = std::cell::Cell::new(false);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        request_stop(&progress, || signalled.set(true))
+fn a_stop_control_whose_report_panics_returns_normally_signals_and_is_logged_by_the_main_task() {
+    // The control handler runs inside windows-service's `extern "system"`
+    // trampoline, which aborts the process on an unwinding panic. The handler
+    // thread must therefore return from `request_stop` normally, still signal
+    // the main task, and write no log line; the main task logs the panic.
+    let writer = VecWriter::new();
+    let signalled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let progress = Arc::new(StopProgress::new(|p| -> std::io::Result<()> {
+        if p == StopPhase::StopRequested {
+            panic!("report closure panicked");
+        }
+        Ok(())
     }));
-    assert!(result.is_err(), "the report closure did not panic");
-    assert!(signalled.get(), "the panic skipped the shutdown signal");
+    let handler = {
+        let progress = Arc::clone(&progress);
+        let signalled = Arc::clone(&signalled);
+        let writer = writer.clone();
+        std::thread::spawn(move || {
+            let _guard = garter::tracing_test::set_default_in_current_thread(capture_at(
+                &writer,
+                tracing_subscriber::filter::LevelFilter::TRACE,
+            ));
+            request_stop(&progress, || {
+                signalled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        })
+    };
+    handler.join().expect("the panic unwound out of the control handler");
+    assert_eq!(signalled.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // The process-wide panic hook logs the panic itself on the handler thread;
+    // the stop path adds nothing of its own.
+    assert!(
+        !writer.snapshot_string().contains("StopRequested"),
+        "the handler thread logged the stop control"
+    );
+
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    progress.enter(StopPhase::AcquireProxy);
+    let out = writer.snapshot_string();
+    assert!(
+        out.lines().any(|l| l.contains("ERROR")
+            && l.contains("StopRequested")
+            && l.contains("report closure panicked")
+            && l.contains("reported_ms_ago")),
+        "the panic was not logged by the main task:\n{out}"
+    );
+    assert!(
+        out.contains("AcquireProxy"),
+        "the main task's own phase is missing:\n{out}"
+    );
+}
+
+#[skuld::test]
+fn a_second_stop_control_does_not_replace_a_panicked_report() {
+    let writer = VecWriter::new();
+    let progress = StopProgress::new(|p| -> std::io::Result<()> {
+        if p == StopPhase::StopRequested {
+            panic!("report closure panicked");
+        }
+        Ok(())
+    });
+    request_stop(&progress, || {});
+    request_stop(&progress, || {});
+
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    progress.enter(StopPhase::AcquireProxy);
+    let out = writer.snapshot_string();
+    assert!(
+        out.lines()
+            .any(|l| l.contains("ERROR") && l.contains("StopRequested") && l.contains("reported_ms_ago")),
+        "the panicked report's trail was lost:\n{out}"
+    );
+}
+
+#[skuld::test]
+fn waking_from_the_stop_signal_cancels_then_logs_the_hand_off_before_any_phase_is_entered() {
+    // The main task may wedge in the connection-task join or the marker probe
+    // right after it wakes, before it enters AcquireProxy. The StopRequested
+    // line must already be in the log by then. Cancelling comes first so a log
+    // write that blocks cannot delay the shutdown it reports.
+    let writer = VecWriter::new();
+    let progress = StopProgress::new(refuse_stop_requested);
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    request_stop(&progress, || {
+        tx.send(()).unwrap();
+    });
+
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    let seen_at_cancel = Mutex::new(None);
+    block_on(forward_stop(&progress, rx, || {
+        *seen_at_cancel.lock().unwrap() = Some(writer.snapshot_string());
+    }));
+
+    let seen = seen_at_cancel
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("shutdown was not cancelled");
+    assert_eq!(seen, "", "the hand-off was logged before the shutdown was cancelled");
+    let out = writer.snapshot_string();
+    assert_stop_requested_trail(&out);
+    assert!(out.contains("reported_ms_ago"), "no report-time field:\n{out}");
+    assert!(!out.contains("AcquireProxy"), "a later phase was entered:\n{out}");
+}
+
+#[skuld::test]
+fn a_dropped_stop_sender_still_cancels_the_shutdown() {
+    let progress = StopProgress::new(|_| Ok(()));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    drop(tx);
+    let cancelled = std::cell::Cell::new(false);
+    block_on(forward_stop(&progress, rx, || cancelled.set(true)));
+    assert!(cancelled.get());
 }
 
 #[skuld::test]
