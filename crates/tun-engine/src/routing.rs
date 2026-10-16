@@ -398,11 +398,18 @@ pub(crate) fn log_route_command(phase: &str, cmd: &str) {
 /// Success-oracle section above). The unit both phase runners are built
 /// from.
 fn exec_one<P: Phase>(tool: SystemTool, args: &[String], phase: P) -> Result<(), CommandFailure> {
+    let (built, cmd) = route_command(tool, args);
+    run_built(built, cmd, phase)
+}
+
+/// The `Command` for `tool args…` (or why it cannot be built) and its argv text
+/// for logs.
+fn route_command(tool: SystemTool, args: &[String]) -> (std::io::Result<Command>, String) {
     let built = tool.command().map(|mut command| {
         command.args(args);
         command
     });
-    run_built(built, tool.display_with(args), phase)
+    (built, tool.display_with(args))
 }
 
 /// [`run_command`] for a command that may not have been buildable. A tool with

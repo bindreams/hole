@@ -676,7 +676,10 @@ fn always_exits(code: i32) -> Vec<String> {
 /// target.
 #[allow(clippy::disallowed_methods)] // a shell that only sets an exit code is not an OS route tool
 fn exits_with_its_code<P: Phase>(_tool: SystemTool, args: &[String], phase: P) -> Result<(), CommandFailure> {
-    let code = &args[1];
+    let [verb, code] = args else {
+        panic!("exits_with_its_code runs the arguments `always_exits` builds (`exit <code>`), got {args:?}");
+    };
+    assert_eq!(verb, "exit", "arguments not built by `always_exits`: {args:?}");
     let command = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.args(["/c", &format!("exit {code}")]);
@@ -687,6 +690,24 @@ fn exits_with_its_code<P: Phase>(_tool: SystemTool, args: &[String], phase: P) -
         c
     };
     run_command(command, format!("exit {code}"), phase)
+}
+
+/// What production's [`exec_one`] spawns and logs for a tool and its arguments:
+/// the tool's own absolute path, then exactly the arguments, never a program
+/// name repeated among them. Built without spawning, so no route changes.
+#[skuld::test]
+fn a_route_command_runs_the_tools_path_with_exactly_its_arguments() {
+    let args: Vec<String> = ["add", "-net", "0.0.0.0/1", "10.0.0.1"].map(String::from).to_vec();
+    let (built, logged) = route_command(SystemTool::Route, &args);
+    let command = built.unwrap();
+
+    let path = SystemTool::Route.path().unwrap();
+    assert_eq!(command.get_program(), path.as_os_str());
+    assert_eq!(
+        command.get_args().map(|a| a.to_str().unwrap()).collect::<Vec<_>>(),
+        ["add", "-net", "0.0.0.0/1", "10.0.0.1"]
+    );
+    assert_eq!(logged, format!("{} add -net 0.0.0.0/1 10.0.0.1", path.display()));
 }
 
 fn fatal_exits(code: i32) -> SetupCommand {
