@@ -1,9 +1,8 @@
 use crate::system_tool::SystemTool;
 
-/// Independent oracle: where each variant must resolve to (the whole path on
-/// macOS, the tail under the system directory on Windows). The exhaustive match
-/// makes adding a variant a compile error here until its expectation is written
-/// down.
+/// Where each variant must resolve to (the whole path on macOS, the tail under
+/// the system directory on Windows); exhaustive, so a new variant fails to
+/// compile until listed.
 fn expected_path(tool: SystemTool) -> &'static str {
     #[cfg(target_os = "macos")]
     return match tool {
@@ -109,8 +108,7 @@ fn display_names_the_tool_when_its_path_is_unavailable() {
     }
 }
 
-/// `name` is what a user-facing error says instead of a path: the program's
-/// bare name, which `expected_path` already spells out for every variant.
+/// `name` is the program's bare name, the stem of its expected path.
 #[skuld::test]
 fn name_is_the_bare_program_name() {
     for &tool in SystemTool::ALL {
@@ -137,7 +135,7 @@ fn a_failing_system_directory_call_is_an_error_not_a_panic() {
     // grown case and the equal boundary, where the length written would
     // include a NUL.
     assert!(crate::system_tool::read_system_directory(|buf| if buf.is_none() { 8 } else { 9 }).is_err());
-    assert!(crate::system_tool::read_system_directory(|buf| if buf.is_none() { 8 } else { 8 }).is_err());
+    assert!(crate::system_tool::read_system_directory(|_| 8).is_err());
 }
 
 /// A failure is not cached: the next call asks the OS again, so one transient

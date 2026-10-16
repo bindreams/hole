@@ -92,7 +92,7 @@
 //! `global_net_state` filter matches the `boottime_global_net_state_` prefix —
 //! renaming without updating it drops the test from the group.
 
-#![allow(clippy::disallowed_methods)] // test spawns host tools by name (attended); see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{

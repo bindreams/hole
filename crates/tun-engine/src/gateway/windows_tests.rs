@@ -1,4 +1,4 @@
-#![allow(clippy::disallowed_methods)] // test spawns host tools by name (attended); see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 use super::*;
 use crate::GLOBAL_NET_STATE;
 use std::net::{IpAddr, Ipv4Addr};

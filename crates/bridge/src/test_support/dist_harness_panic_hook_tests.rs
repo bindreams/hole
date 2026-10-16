@@ -20,7 +20,7 @@
 //!
 //! See bindreams/hole#303 (regression gate (b)).
 
-#![allow(clippy::disallowed_methods)] // test spawns host tools by name (attended); see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
 use crate::test_support::dist_fixture::stage_dist_bin_dir;
 use crate::test_support::dist_harness::DistHarness;

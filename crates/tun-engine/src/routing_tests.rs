@@ -55,8 +55,7 @@ fn on_link_gw() -> GatewayInfo {
     }
 }
 
-/// A command as `program arg…`, the program shown by its bare name. The
-/// string-oracle assertions below read the whole command line, tool included.
+/// A command as `program arg…`, the program shown by its bare name.
 fn argv_of(tool: SystemTool, args: &[String]) -> Vec<String> {
     std::iter::once(tool.name().to_string())
         .chain(args.iter().cloned())
@@ -114,10 +113,7 @@ fn mentions_addr(cmds: &[Vec<String>], ip: &str) -> bool {
     cmds.iter().flatten().any(|arg| arg == ip || arg == &slash128)
 }
 
-/// Every route command names its program as a typed absolute-path tool, so
-/// the argument list never starts with a program name of its own. A leftover
-/// `"route"`/`"netsh"` there would run `route route ...` once the tool is
-/// prepended, and would mean a bare name is expressible again.
+/// No route command repeats its program in `args` (it would run `route route ...`).
 #[skuld::test]
 fn route_commands_are_built_with_a_typed_tool() {
     #[cfg(windows)]
@@ -670,10 +666,8 @@ fn always_exits(code: i32) -> Vec<String> {
     vec!["exit".into(), code.to_string()]
 }
 
-/// The real spawn-and-judge path ([`run_command`]) driven by a shell that only
-/// sets an exit code, so the exit code is the OS's, not a mock's, and no `route`
-/// / `netsh` runs. `cfg!` is a runtime branch, so both arms compile on every
-/// target.
+/// Real [`run_command`] driven by a shell that only sets an exit code, so no
+/// `route`/`netsh` runs.
 #[allow(clippy::disallowed_methods)] // a shell that only sets an exit code is not an OS route tool
 fn exits_with_its_code<P: Phase>(_tool: SystemTool, args: &[String], phase: P) -> Result<(), CommandFailure> {
     let [verb, code] = args else {

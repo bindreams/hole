@@ -22,7 +22,7 @@
 //! change in how cargo or std marks handles — the real leg's EOF proves nothing, and
 //! the control says so out loud.
 
-#![allow(clippy::disallowed_methods)] // test fixture: spawns the workspace's own mock-plugin binary, not an OS tool; see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // test fixture: spawns the workspace's own mock-plugin binary, not an OS tool
 
 #[cfg(windows)]
 mod common;

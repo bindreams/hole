@@ -2,7 +2,7 @@
 //! crates/dev-console/src/test_child.rs). When `XTASK_TEST_CHILD` is set,
 //! `maybe_run` takes over the process and never returns.
 
-#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;

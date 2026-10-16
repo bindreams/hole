@@ -9,7 +9,7 @@
 //! kinds. Relying on the terminal to broadcast Ctrl+C to the child's group
 //! instead would cover neither descendants nor a programmatic SIGTERM.
 
-#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
 use std::path::{Path, PathBuf};
 

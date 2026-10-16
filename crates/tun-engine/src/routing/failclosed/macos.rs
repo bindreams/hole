@@ -379,9 +379,7 @@ fn engage_pf_action(pf_enabled: bool, has_persisted: bool) -> PfEngageAction {
 
 const PFCONF: &str = "/etc/pf.conf";
 
-/// Runs `pfctl` through [`SystemTool::Pfctl`]: this runs as root, so a bare
-/// name would resolve against the caller's `PATH` and let an earlier,
-/// attacker-writable directory shadow the real binary.
+/// Runs `pfctl` through [`SystemTool::Pfctl`] (absolute path).
 fn pfctl<P: Phase>(args: &[&str], stdin: Option<&[u8]>, phase: P) -> Result<std::process::Output, RoutingError> {
     run_capturing(SystemTool::Pfctl, args, stdin, phase)
         .map_err(|e| RoutingError::RouteSetup(format!("pfctl spawn failed: {e}")))

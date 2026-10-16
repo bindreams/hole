@@ -3,7 +3,7 @@
 //! Run locally:
 //! `SKULD_LABELS=windows_console cargo nextest run -p dev-console -E 'test(null_stdin_child_cannot_corrupt_console_mode)'`
 
-#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
 use windows::Win32::System::Console::{GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, STD_INPUT_HANDLE};
 

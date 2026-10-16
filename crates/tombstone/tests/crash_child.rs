@@ -26,7 +26,7 @@
 //! Under a plain `cargo build --workspace` (no crash-child) the bin is skipped
 //! and this target compiles down to a bare test runner. See review M1/M2.
 
-#![allow(clippy::disallowed_methods)] // test spawns its own test binaries (attended); see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // test spawns its own test binaries (attended)
 
 // Install the workspace test subscriber + panic hook. See
 // `crates/test-observability/` and bindreams/hole#301.

@@ -1,6 +1,6 @@
 //! The supervision sequence (dev.py main(), with the spec's Deltas).
 
-#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
 use std::path::Path;
 use std::process::ExitCode;

@@ -7,7 +7,7 @@
 //! `FixtureBuilder` builds that shape with sensible defaults matching the
 //! happy path — override only the fields a given test actually varies.
 
-#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

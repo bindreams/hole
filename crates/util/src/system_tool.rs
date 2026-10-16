@@ -9,12 +9,8 @@
 //! `Command` for these tools, and its program is always an absolute path.
 //!
 //! The Windows directory is read from the OS (`GetSystemDirectoryW`), never
-//! assumed to be `C:\Windows`. If that call fails there is no directory to
-//! trust, and falling back to a bare name would reintroduce the search-order
-//! hazard, so [`SystemTool::path`] and [`SystemTool::command`] return the
-//! error; callers carry it as their spawn error. Spawning anything else (Hole's
-//! own executable, dev tooling) is not covered here; the workspace `clippy.toml`
-//! bans every `Command` constructor so each such site must say why it is exempt.
+//! assumed to be `C:\Windows` and never replaced by a bare name when the read
+//! fails.
 
 use std::io;
 use std::path::PathBuf;
@@ -23,15 +19,14 @@ use std::process::Command;
 /// Declares `SystemTool` and its `ALL` from one variant list, so a variant
 /// cannot be left out of `ALL`.
 macro_rules! system_tools {
-    ($doc:literal, $($(#[$vmeta:meta])* $variant:ident),+ $(,)?) => {
+    ($doc:literal, $($variant:ident),+ $(,)?) => {
         #[doc = $doc]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum SystemTool {
-            $($(#[$vmeta])* $variant),+
+            $($variant),+
         }
 
         impl SystemTool {
-            /// Every variant, for tests that must cover the whole set.
             pub const ALL: &'static [SystemTool] = &[$(Self::$variant),+];
         }
     };
@@ -45,32 +40,21 @@ mod tools {
 
     system_tools! {
         "An OS tool the macOS bridge spawns, at its fixed absolute path.",
-        /// `/sbin/route`
         Route,
-        /// `/sbin/ifconfig`
         Ifconfig,
-        /// `/sbin/pfctl`
         Pfctl,
-        /// `/usr/sbin/networksetup`
         Networksetup,
-        /// `/usr/bin/dscacheutil`
         Dscacheutil,
-        /// `/usr/bin/killall`
         Killall,
-        /// `/bin/launchctl`
         Launchctl,
-        /// `/usr/sbin/dseditgroup`
         Dseditgroup,
-        /// `/usr/bin/stat`
         Stat,
-        /// `/usr/bin/logname`
         Logname,
     }
 
     impl SystemTool {
         /// The tool's absolute path. These are SIP-protected locations that are
-        /// stable across the macOS versions Hole supports, so this never fails
-        /// here; the `Result` is the Windows signature.
+        /// stable across the macOS versions Hole supports, so this never fails.
         pub(super) fn resolve_path(self) -> io::Result<PathBuf> {
             Ok(PathBuf::from(match self {
                 Self::Route => "/sbin/route",
@@ -102,7 +86,6 @@ mod tools {
             }
         }
 
-        /// Nothing to pin on macOS.
         pub(super) fn pin_environment(self, _command: &mut Command) -> io::Result<()> {
             Ok(())
         }
@@ -123,15 +106,10 @@ mod tools {
 
     system_tools! {
         "An OS tool the Windows bridge spawns, under the system directory.",
-        /// `System32\route.exe`
         Route,
-        /// `System32\netsh.exe`
         Netsh,
-        /// `System32\net.exe`
         Net,
-        /// `System32\WindowsPowerShell\v1.0\powershell.exe`
         Powershell,
-        /// `System32\pnputil.exe`
         Pnputil,
     }
 
@@ -165,8 +143,6 @@ mod tools {
         /// This pin alone is not enough: PowerShell rebuilds a `PSModulePath`
         /// equal to the machine's, so [`SystemTool::powershell_command`] also
         /// sets it from inside the script.
-        /// The other tools resolve nothing by search order once launched by
-        /// absolute path.
         pub(super) fn pin_environment(self, command: &mut Command) -> io::Result<()> {
             match self {
                 Self::Powershell => {

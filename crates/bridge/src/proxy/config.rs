@@ -561,8 +561,7 @@ pub fn resolve_plugin_path(name: &str) -> String {
 /// user's `PATH`, which commonly has user-writable directories, so a binary a
 /// user-level process drops there under the configured plugin name runs with the
 /// bridge's privileges. `is_valid_plugin_name()` only keeps the name free of path
-/// separators. The behaviour is unchanged pending the product decision in
-/// bindreams/hole#1072.
+/// separators.
 pub(crate) fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>) -> String {
     // Map the config token to its on-disk binary name. A known friendly
     // name (`v2ray-plugin`) resolves to its `binary_name` (`ex-ray`); an

@@ -75,7 +75,7 @@
 //! interrupted, the recovery record written before the first engage names the
 //! platform command to clear it by hand.
 
-#![allow(clippy::disallowed_methods)] // test spawns host tools by name (attended); see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};

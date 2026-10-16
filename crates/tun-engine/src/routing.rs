@@ -412,10 +412,8 @@ fn route_command(tool: SystemTool, args: &[String]) -> (std::io::Result<Command>
     (built, tool.display_with(args))
 }
 
-/// [`run_command`] for a command that may not have been buildable. A tool with
-/// no trustworthy path (Windows system directory unreadable) is the same spawn
-/// failure a missing binary gives, so a best-effort teardown logs it and goes
-/// on; it is never a panic and never a bare-name spawn.
+/// [`run_command`] for a command whose tool path may be unavailable; that is a
+/// spawn failure, not a panic.
 fn run_built<P: Phase>(built: std::io::Result<Command>, cmd: String, phase: P) -> Result<(), CommandFailure> {
     match built {
         Ok(command) => run_command(command, cmd, phase),
@@ -423,8 +421,7 @@ fn run_built<P: Phase>(built: std::io::Result<Command>, cmd: String, phase: P) -
     }
 }
 
-/// Log a route command that never ran and wrap the cause. A missing
-/// `netsh`/`route` is never expected, in any phase.
+/// Log a route command that never ran and wrap the cause.
 fn spawn_failed(phase_name: &str, cmd: &str, e: std::io::Error) -> CommandFailure {
     warn!(phase = phase_name, cmd, error = %e, "route command failed to spawn");
     CommandFailure::Spawn(e)
@@ -2136,19 +2133,8 @@ fn platform_setup_commands(
     // hijack it).
     if !server_ip.to_canonical().is_loopback() {
         let (tool, args) = match (server_ip, gateway.next_hop) {
-            // On-link: no gateway to name, so this names the interface
-            // instead — the same `netsh interface ip` command family the
-            // IPv6 arm below already uses, unlike the gateway form's
-            // classic `route add`.
-            // `store=active`: `netsh interface ip add route`'s own
-            // documented default is `store=persistent` (registry-written,
-            // survives reboot). The gateway-form sibling below (classic
-            // `route add`, no `-p`) is active-only; without this operand
-            // the two forms would give the same logical bypass different
-            // lifetimes, and a persistent on-link route naming an
-            // upstream adapter alias can outlive the session, the
-            // process, and an uninstall — see CONTRIBUTING's Route
-            // ownership section.
+            // `store=active`: netsh defaults to `persistent`, which would outlive the
+            // session and uninstall; see CONTRIBUTING's Route ownership section.
             (IpAddr::V4(_), NextHop::OnLink) => (
                 SystemTool::Netsh,
                 vec![

@@ -1,6 +1,6 @@
 //! Shelling out, with the diagnostics a first CI run needs.
 
-#![allow(clippy::disallowed_methods)] // test spawns host tools by name (attended); see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
 use std::process::{Command, Output};
 
