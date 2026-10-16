@@ -1006,6 +1006,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             None
         };
         if repair_fallback.is_some() {
+            // On macOS the drop reloads `/etc/pf.conf`, so the host is open until the
+            // re-engage below; re-engaging over the live cover instead is bindreams/hole#758.
             self.posture.take_pending();
             warn!(
                 "covered retry: this attempt's resolver permit differs from the held cover's; \
@@ -1108,7 +1110,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         } else if covered {
             // Covered retry after the user enabled lockdown mid-blocked-state:
             // release the held cover. This opens egress until the standing lockdown
-            // cover engages at routing.install — a brief, disclosed open window.
+            // cover engages at routing.install — a brief, disclosed open window
+            // (bindreams/hole#758: not closed by the macOS pf work).
             if self.posture.take_pending().is_some() {
                 warn!(
                     "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \

@@ -19,19 +19,44 @@ pub fn udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
 /// Build a raw IP+TCP SYN packet with no payload and no options, requesting
 /// `dst` from `src` with initial sequence number `seq`.
 pub fn tcp_syn(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
+    tcp_segment(src, dst, TcpControl::Syn, seq, None, &[])
+}
+
+/// Build a raw IP+TCP SYN-ACK: [`tcp_syn`] plus an acknowledgement, which is
+/// what `TcpRepr::emit` turns into both flags (`set_ack(ack_number.is_some())`).
+///
+/// The second half of a handshake completed BY HAND, which a privileged test
+/// driving a real TUN device has to do: it reads the kernel's SYN off the
+/// device and writes this back, and the socket reaches `ESTABLISHED` with no
+/// peer anywhere.
+pub fn tcp_syn_ack(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
+    tcp_segment(src, dst, TcpControl::Syn, seq, Some(ack), &[])
+}
+
+/// The one IP+TCP emitter [`tcp_syn`] and [`tcp_syn_ack`] share, so a second
+/// control-bit combination is a parameter rather than a second copy of the
+/// `Ipv4Repr`/`Ipv6Repr` framing.
+fn tcp_segment(
+    src: SocketAddr,
+    dst: SocketAddr,
+    control: TcpControl,
+    seq: u32,
+    ack: Option<u32>,
+    payload: &[u8],
+) -> Vec<u8> {
     let tcp_repr = TcpRepr {
         src_port: src.port(),
         dst_port: dst.port(),
-        control: TcpControl::Syn,
+        control,
         seq_number: TcpSeqNumber(seq as i32),
-        ack_number: None,
+        ack_number: ack.map(|a| TcpSeqNumber(a as i32)),
         window_len: 65535,
         window_scale: None,
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None; 3],
         timestamp: None,
-        payload: &[],
+        payload,
     };
     let checksums = ChecksumCapabilities::default();
     let tcp_len = tcp_repr.buffer_len();
@@ -71,7 +96,7 @@ pub fn tcp_syn(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
             tcp_repr.emit(&mut tcp_pkt, &IpAddress::Ipv6(s), &IpAddress::Ipv6(d), &checksums);
             buf
         }
-        _ => unreachable!("tcp_syn: src/dst IP family mismatch ({src} / {dst})"),
+        _ => unreachable!("tcp_segment: src/dst IP family mismatch ({src} / {dst})"),
     }
 }
 
