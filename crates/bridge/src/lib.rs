@@ -21,6 +21,7 @@ pub mod reachability;
 pub mod reconciler;
 pub mod route_recovery;
 pub mod server_test;
+pub mod service_ctrl;
 pub mod service_stop;
 pub mod socket;
 pub mod target;

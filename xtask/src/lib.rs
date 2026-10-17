@@ -71,6 +71,12 @@ mod ci_toolchain_pins_tests;
 #[cfg(test)]
 #[path = "schemars_pin_tests.rs"]
 mod schemars_pin_tests;
+#[cfg(test)]
+#[path = "tauri_context_conformance_tests.rs"]
+mod tauri_context_conformance_tests;
+#[cfg(test)]
+#[path = "tauri_context_gating_tests.rs"]
+mod tauri_context_gating_tests;
 // These tests render with the macOS system font (/System/Library/Fonts/SFNS.ttf);
 // the DMG background is a darwin-only feature, so gate them to macOS. They fail
 // loudly on macOS if the font is missing — other platforms simply lack the feature.

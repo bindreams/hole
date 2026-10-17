@@ -1,5 +1,6 @@
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 fn main() {
     let icons_dir = Path::new("icons");
@@ -10,13 +11,19 @@ fn main() {
     // outputs. Watching the directory mtime catches additions/removals
     // that don't touch existing files.
     println!("cargo:rerun-if-changed={}", icons_dir.display());
+    let mut svgs_mtime = SystemTime::UNIX_EPOCH;
     for entry in std::fs::read_dir(icons_dir).expect("failed to read icons dir") {
         let path = entry
             .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", icons_dir.display()))
             .path();
         if path.extension().and_then(|e| e.to_str()) == Some("svg") {
             println!("cargo:rerun-if-changed={}", path.display());
+            svgs_mtime = svgs_mtime.max(mtime(&path));
         }
+    }
+
+    if report_missing_frontend_dist() {
+        return;
     }
 
     let repo_root = git_repo_root();
@@ -24,7 +31,7 @@ fn main() {
     std::fs::create_dir_all(&cache_icons_dir).expect("failed to create .cache/icons/");
 
     emit_version_env(&repo_root);
-    generate_icons(icons_dir, &cache_icons_dir);
+    generate_icons(icons_dir, &cache_icons_dir, svgs_mtime);
     generate_tray_icons(icons_dir);
 
     // Runtime asset acquisition (ex-ray Go build, wintun.dll download)
@@ -33,7 +40,112 @@ fn main() {
 
     println!("cargo:rerun-if-changed=tauri.conf.json");
     ensure_external_bin_stubs(&repo_root);
-    tauri_build::build();
+
+    // Generate the context here so embedded assets are written before any unit
+    // that reads them starts; `xtask::tauri_context_conformance_tests` says why
+    // the macro must not.
+    let attributes = tauri_build::Attributes::new().codegen(tauri_build::CodegenContext::new());
+    tauri_build::try_build(attributes).unwrap_or_else(|e| panic!("tauri-build failed: {e:#}"));
+}
+
+/// Fail the build, naming the remedy, when it must embed `ui/dist` and the
+/// directory is absent. Returns whether it did.
+///
+/// The decision is made over the config `tauri-build` reads: its own loader
+/// for the target being built, then `TAURI_CONFIG` merged over it.
+fn report_missing_frontend_dist() -> bool {
+    let config_dir = std::env::current_dir().expect("failed to read the current directory");
+    let target = tauri_utils::platform::Target::from_triple(
+        &std::env::var("TARGET").expect("cargo sets TARGET for build scripts"),
+    );
+    let (config, _paths) = tauri_utils::config::parse::read_from(target, &config_dir)
+        .unwrap_or_else(|e| panic!("failed to read the Tauri config: {e}"));
+    let tauri_config = std::env::var("TAURI_CONFIG").ok();
+    let missing = xtask_lib::frontend_dist::missing_frontend_dist(
+        tauri_build::is_dev(),
+        config,
+        tauri_config.as_deref(),
+        &config_dir,
+        |dir| dir.exists(),
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    let Some(dir) = missing else { return false };
+    println!(
+        "cargo::error=`frontendDist` {} does not exist. Production mode embeds the frontend: run \
+         `cargo xtask build frontend-build`, or create an empty `ui/dist` (gitignored) for checks that \
+         do not run the GUI, or build with `--no-default-features`",
+        dir.display()
+    );
+    true
+}
+
+fn mtime(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|e| panic!("failed to stat {}: {e}", path.display()))
+}
+
+/// Publish `path` with `bytes`, dated as old as `inputs`.
+///
+/// `tauri-build` watches the icons and sidecar stubs it embeds, and cargo dates
+/// a build-script run from its start, so a file this script writes would stale
+/// `hole` on the next command unless it is dated by its inputs. The files must
+/// stay at the paths `tauri.conf.json` names, so they cannot be written
+/// elsewhere first. The file is written and dated under a temporary name, then
+/// renamed into place: a concurrent reader (another build of this worktree, or
+/// `tauri-build` in it) sees a whole file, and the watched path never carries a
+/// fresh mtime.
+fn write_dated(path: &Path, bytes: &[u8], inputs: SystemTime) {
+    let temp = write_temp(path, bytes, inputs);
+    std::fs::rename(&temp, path).unwrap_or_else(|e| panic!("failed to replace {}: {e}", path.display()));
+}
+
+/// Like [`write_dated`], but only if `path` does not exist, and without ever
+/// overwriting it: whoever created it first (`cargo xtask deps`, a concurrent
+/// build) keeps it and its mtime. Returns whether it created `path`.
+fn create_dated(path: &Path, bytes: &[u8], inputs: SystemTime) -> bool {
+    let temp = write_temp(path, bytes, inputs);
+    let linked = std::fs::hard_link(&temp, path);
+    std::fs::remove_file(&temp).unwrap_or_else(|e| panic!("failed to remove {}: {e}", temp.display()));
+    match linked {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => panic!("failed to create {}: {e}", path.display()),
+    }
+}
+
+/// A complete, dated copy of the file `path` will become, beside it. Named by
+/// process, so two builds never share one.
+fn write_temp(path: &Path, bytes: &[u8], inputs: SystemTime) -> PathBuf {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .expect("published path has a file name")
+        .to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::File::create(&temp)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.set_modified(inputs)
+        })
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", temp.display()));
+    temp
+}
+
+fn tauri_conf() -> serde_json::Value {
+    let conf = std::fs::read_to_string("tauri.conf.json").expect("failed to read tauri.conf.json");
+    serde_json::from_str(&conf).expect("failed to parse tauri.conf.json")
+}
+
+/// The files `tauri.conf.json`'s `bundle.icon` lists, as paths from the crate
+/// directory (the config's directory, where `tauri-build` resolves them).
+fn bundle_icons() -> Vec<PathBuf> {
+    tauri_conf()["bundle"]["icon"]
+        .as_array()
+        .expect("tauri.conf.json bundle.icon must be an array")
+        .iter()
+        .map(|icon| PathBuf::from(icon.as_str().expect("icon entry must be a string")))
+        .collect()
 }
 
 /// Stub every `externalBin` sidecar so `tauri_build::build()` passes
@@ -45,17 +157,15 @@ fn main() {
 fn ensure_external_bin_stubs(repo_root: &Path) {
     let target = std::env::var("TARGET").unwrap();
     let suffix = if target.contains("windows") { ".exe" } else { "" };
-    let conf = std::fs::read_to_string("tauri.conf.json").expect("failed to read tauri.conf.json");
-    let conf: serde_json::Value = serde_json::from_str(&conf).expect("failed to parse tauri.conf.json");
+    let conf = tauri_conf();
     let entries = conf["bundle"]["externalBin"]
         .as_array()
         .expect("tauri.conf.json bundle.externalBin must be an array");
     for entry in entries {
         let base = entry.as_str().expect("externalBin entry must be a string");
         let path = repo_root.join(format!("{base}-{target}{suffix}"));
-        if !path.exists() {
-            std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create sidecar cache dir");
-            std::fs::File::create(&path).expect("failed to create sidecar stub");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create sidecar cache dir");
+        if create_dated(&path, &[], mtime(Path::new("tauri.conf.json"))) {
             println!("cargo:warning=created empty {base} stub — run `cargo xtask deps` for a real build");
         }
     }
@@ -118,7 +228,7 @@ fn build_icns_bytes(tree: &resvg::usvg::Tree) -> Vec<u8> {
     bytes
 }
 
-fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
+fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path, svgs_mtime: SystemTime) {
     // Always produce platform-correct ICO and ICNS regardless of host.
     // ICO is consumed by Windows bundles, ICNS by macOS. Reading the
     // wrong SVG into either would silently ship the wrong design on a
@@ -128,13 +238,18 @@ fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
     let win_tree = parse_svg(&icons_dir.join("icon-windows.svg"));
     let mac_tree = parse_svg(&icons_dir.join("icon-macos.svg"));
 
-    render_ico(&win_tree, &cache_icons_dir.join("icon.ico"));
+    let mut generated: Vec<&str> = Vec::new();
+    let mut publish = |name: &'static str, bytes: &[u8]| {
+        write_dated(&cache_icons_dir.join(name), bytes, svgs_mtime);
+        generated.push(name);
+    };
+
+    publish("icon.ico", &ico_bytes(&win_tree));
 
     // ICNS: same bytes to the bundled .cache copy (tauri.conf.json) and a
-    // cargo-isolated OUT_DIR copy. The test reads the OUT_DIR copy — .cache is a
-    // repo-root shared path a concurrent build could write mid-read.
+    // cargo-isolated OUT_DIR copy. The test reads the OUT_DIR copy.
     let icns = build_icns_bytes(&mac_tree);
-    std::fs::write(cache_icons_dir.join("icon.icns"), &icns).unwrap();
+    publish("icon.icns", &icns);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let icns_out = out_dir.join("icon.icns");
     std::fs::write(&icns_out, &icns).unwrap();
@@ -151,8 +266,25 @@ fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
         "macos" => &mac_tree,
         other => panic!("app icon not provided for target_os={other}"),
     };
-    for size in [32u32, 128] {
-        render_png(host_tree, size, &cache_icons_dir.join(format!("{size}x{size}.png")));
+    publish("32x32.png", &render_png_in_memory(host_tree, 32));
+    publish("128x128.png", &render_png_in_memory(host_tree, 128));
+
+    // `tauri-build` watches every file `tauri.conf.json`'s `bundle.icon` lists,
+    // so one this script does not write (and so does not date) would stale
+    // `hole` on every command. An entry outside the cache is a committed file
+    // this script does not own.
+    let cache = cache_icons_dir.canonicalize().expect("failed to resolve .cache/icons/");
+    for icon in bundle_icons() {
+        let icon = icon
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("bundle.icon entry {} is not on disk: {e}", icon.display()));
+        if let Ok(name) = icon.strip_prefix(&cache) {
+            assert!(
+                generated.iter().any(|g| Path::new(g) == name),
+                "bundle.icon lists {}, which build.rs does not generate: write it with `publish` so it is dated",
+                icon.display()
+            );
+        }
     }
 }
 
@@ -181,15 +313,16 @@ fn render_png_in_memory(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
     buf
 }
 
-fn render_ico(tree: &resvg::usvg::Tree, path: &Path) {
+fn ico_bytes(tree: &resvg::usvg::Tree) -> Vec<u8> {
     let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
     for size in [16u32, 32, 256] {
         let rgba = render_to_rgba(tree, size);
         let image = ico::IconImage::from_rgba_data(size, size, rgba);
         icon_dir.add_entry(ico::IconDirEntry::encode(&image).unwrap());
     }
-    let file = std::fs::File::create(path).unwrap();
-    icon_dir.write(file).unwrap();
+    let mut bytes = Vec::new();
+    icon_dir.write(&mut bytes).unwrap();
+    bytes
 }
 
 // Tray icons ==========================================================================================================

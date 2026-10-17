@@ -82,8 +82,101 @@ fn cutover_global_net_state_running_exe_rename_flips_handle_identity() {
     let _ = child.wait();
 }
 
+/// Waits for the SCM to finish deleting a service: `DeleteService` only marks
+/// one that is still running, and the SCM removes it once its process has exited
+/// and every handle to it has closed.
+#[cfg(target_os = "windows")]
+mod scm_deletion {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows::core::{HRESULT, PCWSTR};
+    use windows::Win32::Foundation::{
+        LocalFree, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING,
+        HLOCAL,
+    };
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, NotifyServiceStatusChangeW, OpenSCManagerW, OpenServiceW, SC_HANDLE, SC_MANAGER_CONNECT,
+        SC_MANAGER_ENUMERATE_SERVICE, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_DELETED, SERVICE_NOTIFY_STATUS_CHANGE,
+        SERVICE_QUERY_STATUS,
+    };
+    use windows::Win32::System::Threading::SleepEx;
+
+    struct ScHandle(SC_HANDLE);
+    impl Drop for ScHandle {
+        fn drop(&mut self) {
+            // SAFETY: the handle is a live one returned by the SCM open calls.
+            // Closing an SCM handle cancels its outstanding notification.
+            let _ = unsafe { CloseServiceHandle(self.0) };
+        }
+    }
+
+    /// Runs as an APC on the thread that waits in `wait_until_deleted`.
+    unsafe extern "system" fn deleted_callback(parameter: *const c_void) {
+        // SAFETY: the SCM passes back the `SERVICE_NOTIFY_2W` armed below, and
+        // its `pContext` is a leaked `AtomicBool`.
+        let notify = unsafe { &*(parameter as *const SERVICE_NOTIFY_2W) };
+        if notify.dwNotificationStatus == 0 && !notify.pszServiceNames.is_null() {
+            // SAFETY: for a created/deleted notification the SCM allocates the
+            // name list and leaves freeing it to the callback.
+            let _ = unsafe { LocalFree(Some(HLOCAL(notify.pszServiceNames.0.cast()))) };
+        }
+        // SAFETY: as above.
+        unsafe { &*(notify.pContext as *const AtomicBool) }.store(true, Ordering::Release);
+    }
+
+    /// Returns once no service named `name` exists. Each pass arms the
+    /// notification, then reads the real state: a deletion that lands in between
+    /// has already queued its callback, so the wait cannot miss it. The wait
+    /// carries no bound: the service goes when its process exits.
+    pub fn wait_until_deleted(name: &str) -> windows::core::Result<()> {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        loop {
+            // Leaked on purpose: an APC queued before the handle closes can still
+            // run at any later alertable wait, and must find live memory.
+            let fired: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+            let notify: &'static SERVICE_NOTIFY_2W = Box::leak(Box::new(SERVICE_NOTIFY_2W {
+                dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
+                pfnNotifyCallback: Some(deleted_callback),
+                pContext: (fired as *const AtomicBool).cast_mut().cast(),
+                ..Default::default()
+            }));
+            // A fresh handle per pass: closing the old one cancels its
+            // notification and clears ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.
+            // SAFETY: plain FFI calls; `wide` is NUL-terminated and outlives them.
+            let scm = ScHandle(unsafe {
+                OpenSCManagerW(
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE,
+                )
+            }?);
+            let rc = unsafe { NotifyServiceStatusChangeW(scm.0, SERVICE_NOTIFY_DELETED, notify) };
+            if rc == ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.0 {
+                continue;
+            }
+            if rc != 0 {
+                return Err(HRESULT::from_win32(rc).into());
+            }
+            match unsafe { OpenServiceW(scm.0, PCWSTR(wide.as_ptr()), SERVICE_QUERY_STATUS) } {
+                Ok(service) => drop(ScHandle(service)),
+                Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_DOES_NOT_EXIST.0) => return Ok(()),
+                // Still listed, with the deletion pending.
+                Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_MARKED_FOR_DELETE.0) => {}
+                Err(e) => return Err(e),
+            }
+            // The APC runs inside this alertable wait; an unrelated APC just
+            // re-enters it.
+            while !fired.load(Ordering::Acquire) {
+                // SAFETY: plain FFI call.
+                unsafe { SleepEx(u32::MAX, true) };
+            }
+        }
+    }
+}
+
 /// A throwaway `HoleBridge` SCM service the test provisions itself, backed by the
-/// no-op `test_service` helper bin. Created on `install`, stopped + deleted on
+/// `test_service` helper bin. Created on `install`, stopped + deleted on
 /// `Drop` (best-effort, so a panic never strands it). Self-contained on purpose:
 /// the test owns its fixture instead of assuming CI installed one — that
 /// assumption is exactly what left the test unrunnable.
@@ -93,18 +186,22 @@ struct ProvisionedService;
 #[cfg(target_os = "windows")]
 impl ProvisionedService {
     fn install(helper: &std::path::Path) -> Self {
+        Self::install_with_args(helper, vec![])
+    }
+
+    /// `install`, with `launch_arguments` appended to the service's ImagePath.
+    fn install_with_args(helper: &std::path::Path, launch_arguments: Vec<std::ffi::OsString>) -> Self {
         use hole_bridge::platform::os::SERVICE_NAME;
         use windows_service::service::{
             ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
         };
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-        // Clear any residue, then create fresh. teardown→create is not atomic
-        // (DeleteService only marks-for-delete until the last handle closes), but
-        // it is safe here: the TUN lane runs on a FRESH GH-hosted runner (no prior
-        // service) and the test runs exactly once (nextest retries=0, serial
-        // group), so there is never a marked-for-delete to collide with. A reused
-        // runner would need a retry on ERROR_SERVICE_MARKED_FOR_DELETE.
+        // Clear any residue, then create fresh. `teardown` returns only once the
+        // service is gone: DeleteService merely marks a service whose process is
+        // still running, and `create_service` fails with
+        // ERROR_SERVICE_MARKED_FOR_DELETE until the process has exited and every
+        // handle has closed.
         Self::teardown();
         let manager = ServiceManager::local_computer(
             None::<&str>,
@@ -118,7 +215,7 @@ impl ProvisionedService {
             start_type: ServiceStartType::OnDemand,
             error_control: ServiceErrorControl::Normal,
             executable_path: helper.to_path_buf(),
-            launch_arguments: vec![],
+            launch_arguments,
             dependencies: vec![],
             account_name: None, // LocalSystem
             account_password: None,
@@ -132,29 +229,50 @@ impl ProvisionedService {
         ProvisionedService
     }
 
-    /// Best-effort stop (if running) + delete of the throwaway service.
+    /// Stops and deletes the throwaway service, returning only once it no longer
+    /// exists. Best-effort: failures are reported on stderr, never panicked on,
+    /// because this also runs from `Drop`.
     fn teardown() {
+        use hole_bridge::cutover::os::windows::WindowsCutoverOs;
+        use hole_bridge::cutover::os::CutoverOs;
         use hole_bridge::platform::os::SERVICE_NAME;
-        use windows_service::service::{ServiceAccess, ServiceState};
+        use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE};
+        use windows_service::service::ServiceAccess;
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+        let open_error_is = |e: &windows_service::Error, code: windows::Win32::Foundation::WIN32_ERROR| matches!(e, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(code.0 as i32));
         let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) else {
             return;
         };
-        let Ok(service) = manager.open_service(
-            SERVICE_NAME,
-            ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
-        ) else {
-            return; // not present — nothing to clean
-        };
-        if service
-            .query_status()
-            .map(|s| s.current_state != ServiceState::Stopped)
-            .unwrap_or(false)
-        {
-            let _ = service.stop();
+        match manager.open_service(SERVICE_NAME, ServiceAccess::DELETE) {
+            Ok(service) => {
+                // A STOPPED notification, not a Stop request alone: deletion
+                // cannot complete while the service process is alive.
+                let mut os = WindowsCutoverOs {
+                    images: vec![],
+                    target_version: "test".into(),
+                };
+                if let Err(e) = os.stop_service_wait_stopped() {
+                    eprintln!("teardown: stopping the throwaway service failed: {e}");
+                }
+                // Any refusal leaves the wait below hanging, so say which it was.
+                if let Err(e) = service.delete() {
+                    eprintln!("teardown: deleting the throwaway service failed (awaiting deletion anyway): {e}");
+                }
+                // An open handle keeps the deletion pending.
+                drop(service);
+            }
+            // Not present: nothing to clean.
+            Err(e) if open_error_is(&e, ERROR_SERVICE_DOES_NOT_EXIST) => return,
+            // Deleted but not yet gone, should the open itself report it: only
+            // the wait below applies.
+            Err(e) if open_error_is(&e, ERROR_SERVICE_MARKED_FOR_DELETE) => {}
+            Err(e) => eprintln!("teardown: opening the throwaway service failed (awaiting deletion anyway): {e}"),
         }
-        let _ = service.delete();
+        drop(manager);
+        if let Err(e) = scm_deletion::wait_until_deleted(SERVICE_NAME) {
+            eprintln!("teardown: waiting for the throwaway service to be deleted failed: {e}");
+        }
     }
 }
 
@@ -170,7 +288,7 @@ impl Drop for ProvisionedService {
 /// This drives the actual production seam (`WindowsCutoverOs::stop_service_wait_stopped`
 /// then `start_service_wait_running`, each opening its own `SystemScmActor` exactly
 /// as the cutover child does) against a SELF-PROVISIONED throwaway service (the
-/// no-op `test_service` helper). The arm-before-start ORDERING is unit-proven
+/// `test_service` helper). The arm-before-start ORDERING is unit-proven
 /// separately against a fake `ScmActor`; this is the real-service integration
 /// half, NOT a full-bridge cutover e2e (no `images`, so the swap never runs).
 #[cfg(target_os = "windows")]
@@ -197,6 +315,239 @@ fn cutover_global_net_state_real_scm_restart_gates_on_running_callback() {
         .expect("SCM stop must reach STOPPED via NotifyServiceStatusChange");
     os.start_service_wait_running()
         .expect("SCM restart must reach RUNNING via NotifyServiceStatusChange");
+}
+
+/// How the throwaway service reacts to a Stop (`test_service --on-stop`).
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum OnStop {
+    ReportStopPending,
+    StayRunning,
+}
+
+#[cfg(target_os = "windows")]
+impl OnStop {
+    fn flag_value(self) -> &'static str {
+        match self {
+            OnStop::ReportStopPending => "stop-pending",
+            OnStop::StayRunning => "stay-running",
+        }
+    }
+
+    /// The state the SCM answers the first Stop with (measured on
+    /// windows-latest, twice): the service's own STOP_PENDING, or, when the
+    /// StopPending report fails, the RUNNING it last reported.
+    fn first_stop_state(self) -> windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE {
+        match self {
+            OnStop::ReportStopPending => windows::Win32::System::Services::SERVICE_STOP_PENDING,
+            OnStop::StayRunning => windows::Win32::System::Services::SERVICE_RUNNING,
+        }
+    }
+}
+
+/// What the SCM delivered to the throwaway service after its first Stop, and
+/// what the service logged and ended with.
+#[cfg(target_os = "windows")]
+struct Delivery {
+    first_stop: windows::Win32::System::Services::SERVICE_STATUS,
+    interrogate: Result<windows::Win32::System::Services::SERVICE_STATUS, windows::core::Error>,
+    second_stop: Result<windows::Win32::System::Services::SERVICE_STATUS, windows::core::Error>,
+    final_status: windows::Win32::System::Services::SERVICE_STATUS,
+    /// The controls the handler logged, in order.
+    observed: Vec<String>,
+}
+
+/// Sends a Stop, an Interrogate and a second Stop to a throwaway service that
+/// holds on a named event after the first Stop, then releases it and returns
+/// what happened. The handler logs each control it receives before returning,
+/// and the SCM answers a control only once the handler has returned, so the log
+/// holds exactly the controls whose `ControlService` call succeeded.
+#[cfg(target_os = "windows")]
+fn deliver_controls_after_first_stop(on_stop: OnStop) -> Delivery {
+    use hole_bridge::cutover::os::windows::WindowsCutoverOs;
+    use hole_bridge::cutover::os::CutoverOs;
+    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_HANDLE,
+        SC_MANAGER_CONNECT, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_STOP, SERVICE_INTERROGATE,
+        SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
+    };
+    use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+
+    struct Event(HANDLE);
+    impl Drop for Event {
+        fn drop(&mut self) {
+            // SAFETY: the handle is the live event `CreateEventW` returned.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+    /// Signals the event on drop so a failed assertion cannot leave the service
+    /// parked (it would break the next serial test's `install`). Declared after
+    /// the service so it drops first.
+    struct Unblock(HANDLE);
+    impl Unblock {
+        fn release(&self) -> windows::core::Result<()> {
+            // SAFETY: the handle is the live event owned by `Event`, which
+            // outlives this guard.
+            unsafe { SetEvent(self.0) }
+        }
+    }
+    impl Drop for Unblock {
+        fn drop(&mut self) {
+            let _ = self.release();
+        }
+    }
+    struct ScHandle(SC_HANDLE);
+    impl Drop for ScHandle {
+        fn drop(&mut self) {
+            // SAFETY: the handle is a live one returned by the SCM open calls.
+            let _ = unsafe { CloseServiceHandle(self.0) };
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("controls.log");
+    let event_name = format!("Global\\HoleServiceCtrlRelease{}", std::process::id());
+    // Manual-reset, unsignalled: the service waits on it after its first Stop.
+    // SAFETY: plain FFI call with no pointers beyond the valid name.
+    let release = Event(
+        unsafe { CreateEventW(None, true, false, &HSTRING::from(event_name.as_str())) }
+            .expect("create the release event (the TUN lane runs elevated)"),
+    );
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install_with_args(
+        helper,
+        vec![
+            "--control-log".into(),
+            log.clone().into_os_string(),
+            "--release-event".into(),
+            event_name.into(),
+            "--on-stop".into(),
+            on_stop.flag_value().into(),
+        ],
+    );
+    let unblock = Unblock(release.0);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    os.start_service_wait_running()
+        .expect("bring the throwaway service up via the production start seam");
+
+    let name: Vec<u16> = SERVICE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: plain FFI calls; `name` is NUL-terminated and outlives them.
+    let scm = ScHandle(unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.unwrap());
+    let service = ScHandle(
+        unsafe {
+            OpenServiceW(
+                scm.0,
+                PCWSTR(name.as_ptr()),
+                SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_INTERROGATE,
+            )
+        }
+        .unwrap(),
+    );
+    let send = |control: u32| -> Result<SERVICE_STATUS, windows::core::Error> {
+        let mut status = SERVICE_STATUS::default();
+        // SAFETY: `service` is a live handle and `status` outlives the call.
+        unsafe { ControlService(service.0, control, &mut status) }.map(|()| status)
+    };
+
+    let first_stop = send(SERVICE_CONTROL_STOP).expect("the first Stop is delivered");
+    let interrogate = send(SERVICE_CONTROL_INTERROGATE);
+    let second_stop = send(SERVICE_CONTROL_STOP);
+
+    unblock.release().unwrap();
+    // Wait for the SCM's STOPPED notification without sending another Stop,
+    // which the handler would log. A service that is still RUNNING fires the
+    // notification at once, so re-arm until STOPPED: each pass re-checks the
+    // real state.
+    let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service for the STOPPED notification");
+    loop {
+        actor.arm(WantState::Stopped).unwrap();
+        if actor.wait_callback().unwrap() == Observed::Stopped {
+            break;
+        }
+    }
+
+    let mut final_status = SERVICE_STATUS::default();
+    // SAFETY: `service` is a live handle and `final_status` outlives the call.
+    unsafe { QueryServiceStatus(service.0, &mut final_status) }.unwrap();
+    let observed = std::fs::read_to_string(&log)
+        .expect("the handler logged the first Stop")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    Delivery {
+        first_stop,
+        interrogate,
+        second_stop,
+        final_status,
+        observed,
+    }
+}
+
+/// Records which controls the SCM delivers after the first Stop and asserts the
+/// handler saw exactly those. The SCM refuses both later controls
+/// (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) whether the service reports STOP_PENDING
+/// or RUNNING, so this cannot catch the freed-handler defect;
+/// `service_ctrl_tests::handler_survives_every_control_the_scm_can_send_after_a_stop`
+/// and the clippy bans pin it. The printed line is the measurement.
+#[cfg(target_os = "windows")]
+fn measure_controls_after_first_stop(on_stop: OnStop) {
+    use windows::Win32::System::Services::{SERVICE_STATUS, SERVICE_STOPPED};
+
+    let delivery = deliver_controls_after_first_stop(on_stop);
+
+    assert_eq!(delivery.first_stop.dwCurrentState, on_stop.first_stop_state());
+    let describe = |result: &Result<SERVICE_STATUS, windows::core::Error>| match result {
+        Ok(status) => format!("delivered (state {})", status.dwCurrentState.0),
+        Err(e) => format!("refused by the SCM ({e})"),
+    };
+    eprintln!(
+        "SCM controls after Stop, service {} (first Stop answered state {}): Interrogate -> {}; second Stop -> {}",
+        on_stop.flag_value(),
+        delivery.first_stop.dwCurrentState.0,
+        describe(&delivery.interrogate),
+        describe(&delivery.second_stop),
+    );
+    assert_eq!(delivery.final_status.dwCurrentState, SERVICE_STOPPED);
+    assert_eq!(
+        delivery.final_status.dwWin32ExitCode, 0,
+        "the service process must exit cleanly, not crash on a control after Stop"
+    );
+
+    let mut expected = vec!["Stop"];
+    if delivery.interrogate.is_ok() {
+        expected.push("Interrogate");
+    }
+    if delivery.second_stop.is_ok() {
+        expected.push("Stop");
+    }
+    assert_eq!(
+        delivery.observed, expected,
+        "the handler must observe exactly the controls the SCM reported delivering"
+    );
+}
+
+/// [`measure_controls_after_first_stop`] for a handler that reports STOP_PENDING,
+/// as the bridge's does.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_service_controls_after_stop_are_measured() {
+    measure_controls_after_first_stop(OnStop::ReportStopPending);
+}
+
+/// [`measure_controls_after_first_stop`] for a handler whose STOP_PENDING report
+/// fails, so the service still reports RUNNING with STOP accepted.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_service_controls_after_stop_are_measured_while_the_service_reports_running() {
+    measure_controls_after_first_stop(OnStop::StayRunning);
 }
 
 /// macOS: renamex_np-swap the `.app` (a dir) + plain-rename the helper (a file)
