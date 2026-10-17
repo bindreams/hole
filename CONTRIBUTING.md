@@ -2689,6 +2689,11 @@ build modifies any tracked file or the binary embeds `<version>.dirty`.
 The `hole-dmg-tests` pytest derives its expected payload from
 `cargo xtask bindir-names --os darwin`, so the Tauri config can't silently drift.
 
+`cargo xtask run hole-dmg-install-e2e` installs the built app's bridge as root
+(`sudo -n`), connects through each bundled plugin with `hole proxy start`, and
+uninstalls. It is CI-only by design: it needs passwordless sudo, refuses to run
+over an existing install, and expects `hole-dmg-tests` to have built the app first.
+
 ## Development
 
 ### Running in dev mode

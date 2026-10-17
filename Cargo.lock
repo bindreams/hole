@@ -5585,6 +5585,7 @@ dependencies = [
  "hole-test-observability",
  "rand 0.10.2",
  "rcgen",
+ "serde_json",
  "shadowsocks",
  "shadowsocks-service",
  "skuld",

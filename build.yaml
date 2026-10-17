@@ -151,6 +151,22 @@ targets:
     platforms: [darwin/amd64, darwin/arm64]
     run: uv run --directory dmg-installer pytest -v
 
+  hole-dmg-install-e2e:
+    # Installs the built Hole.app's bridge as root and connects through each
+    # bundled plugin, on the layout a user's machine has (#1090). It mutates the
+    # host (root daemon, launchd job) and needs passwordless sudo, so it is its
+    # own target: `hole-dmg-tests` stays safe to run locally.
+    #
+    # Run-only, no `depends:`: it consumes the app, `galoshes` and `ex-ray` that
+    # `hole-dmg` built in the same job, so a second cascade here would roll the
+    # flaky bundle_dmg.sh/hdiutil pipeline twice (#446). Run it after
+    # `cargo xtask run hole-dmg-tests`; with nothing built it fails and names
+    # what is missing.
+    platforms: [darwin/amd64, darwin/arm64]
+    run:
+      - cargo build --release -p plugin-e2e --example ss_plugin_server
+      - uv run --directory dmg-installer pytest -v -m install_e2e
+
   frontend-build:
     # Vite bundle of ui/ → ui/dist/. Pure JS/TS toolchain, platform-
     # independent output. The type-check (`cargo xtask run frontend-check`)

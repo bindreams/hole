@@ -1033,6 +1033,12 @@ jobs:
       - name: Build DMG and test signing
         run: cargo xtask run hole-dmg-tests
 
+      # Bound on the wait for the installed bridge to answer (the step ends in
+      # failure with the bridge log, rather than at the job's wall).
+      - name: Install the bridge and connect through the bundled plugins
+        timeout-minutes: 20
+        run: cargo xtask run hole-dmg-install-e2e
+
       # hdiutil DMG creation/mounting is a non-deterministic macOS
       # DiskArbitration race; capture system state on any failure (build or the
       # pytest mount) to diagnose the next occurrence (#446). Note `if: failure()`
