@@ -50,16 +50,25 @@ fn main() {
 
 /// Fail the build, naming the remedy, when it must embed `ui/dist` and the
 /// directory is absent. Returns whether it did.
+///
+/// The decision is made over the config `tauri-build` reads: its own loader
+/// for the target being built, then `TAURI_CONFIG` merged over it.
 fn report_missing_frontend_dist() -> bool {
-    let conf = tauri_conf();
     let config_dir = std::env::current_dir().expect("failed to read the current directory");
+    let target = tauri_utils::platform::Target::from_triple(
+        &std::env::var("TARGET").expect("cargo sets TARGET for build scripts"),
+    );
+    let (config, _paths) = tauri_utils::config::parse::read_from(target, &config_dir)
+        .unwrap_or_else(|e| panic!("failed to read the Tauri config: {e}"));
+    let tauri_config = std::env::var("TAURI_CONFIG").ok();
     let missing = xtask_lib::frontend_dist::missing_frontend_dist(
         tauri_build::is_dev(),
-        !conf["build"]["devUrl"].is_null(),
-        conf["build"]["frontendDist"].as_str(),
+        config,
+        tauri_config.as_deref(),
         &config_dir,
         |dir| dir.exists(),
-    );
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"));
     let Some(dir) = missing else { return false };
     println!(
         "cargo::error=`frontendDist` {} does not exist. Production mode embeds the frontend: run \
