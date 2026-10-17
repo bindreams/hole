@@ -45,7 +45,7 @@ name = "cargo clippy"
 # `--no-default-features` is required to keep Tauri in dev mode for the
 # `hole` crate -- production mode panics at compile time on missing
 # `ui/dist/` because `tauri/custom-protocol` triggers `tauri-codegen`'s
-# embed step. Production lint coverage runs under `clippy-hole` in CI
+# embed step in `hole`'s build.rs. Production lint coverage runs under `clippy-hole` in CI
 # (which uses the same flag). See bindreams/hole#372.
 # `--features garter/test-utils`: garter's fixture bin + feature-gated
 # tests are otherwise silently excluded from `--all-targets`.

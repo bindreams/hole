@@ -131,8 +131,9 @@ path = "tests/elevated_ownership_privileged.rs"
 harness = false
 
 [build-dependencies]
+# `codegen`: build.rs generates the Tauri context (`tauri::tauri_build_context!()` in main.rs).
 # Spelled as the Tauri CLI rewrites it; any other form dirties the tree (and `HOLE_VERSION`) on build.
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = ["codegen"] }
 xtask-lib = { path = "../../xtask-lib", features = ["version"] }
 resvg = "0.47"
 png = "0.18"

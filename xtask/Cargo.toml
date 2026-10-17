@@ -95,6 +95,11 @@ png = "0.18"
 # actually Windows-API-only crates that don't compile elsewhere at all).
 dunce = "1"
 
+# `tauri_context_conformance_tests` finds `tauri::generate_context!()` and
+# `tauri::tauri_build_context!()` invocations by parsing sources, not grepping.
+# Already in the graph through the macro crates (same major).
+syn = { version = "3", features = ["full", "visit"] }
+
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2" # raise()/kill() + SIGINT in signal tests
 

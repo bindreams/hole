@@ -33,7 +33,27 @@ fn main() {
 
     println!("cargo:rerun-if-changed=tauri.conf.json");
     ensure_external_bin_stubs(&repo_root);
-    tauri_build::build();
+
+    // `codegen` generates the context here, so every embedded asset is on disk
+    // before any unit that reads it starts. `tauri::generate_context!()` would
+    // write them during the unit's own rustc run, which cargo dates the unit's
+    // fingerprint before — a fresh `OUT_DIR` would leave it stale for the next
+    // command (see `xtask::tauri_context_conformance_tests`).
+    let attributes = tauri_build::Attributes::new().codegen(tauri_build::CodegenContext::new());
+    tauri_build::try_build(attributes).unwrap_or_else(|e| panic!("tauri-build failed: {e:#}"));
+}
+
+/// Write `bytes` to `path` unless it already holds exactly them.
+///
+/// Every generated file goes through here. `tauri-build` watches the icons
+/// (`rerun-if-changed`), so rewriting one with identical content dates it
+/// after this script's last run and leaves the script dirty for every later
+/// cargo command.
+fn write_if_changed(path: &Path, bytes: &[u8]) {
+    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+        return;
+    }
+    std::fs::write(path, bytes).unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
 }
 
 /// Stub every `externalBin` sidecar so `tauri_build::build()` passes
@@ -137,16 +157,16 @@ fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
     let win_tree = parse_svg(&icons_dir.join("icon-windows.svg"));
     let mac_tree = parse_svg(&icons_dir.join("icon-macos.svg"));
 
-    render_ico(&win_tree, &cache_icons_dir.join("icon.ico"));
+    write_if_changed(&cache_icons_dir.join("icon.ico"), &render_ico(&win_tree));
 
     // ICNS: same bytes to the bundled .cache copy (tauri.conf.json) and a
     // cargo-isolated OUT_DIR copy. The test reads the OUT_DIR copy — .cache is a
     // repo-root shared path a concurrent build could write mid-read.
     let icns = build_icns_bytes(&mac_tree);
-    std::fs::write(cache_icons_dir.join("icon.icns"), &icns).unwrap();
+    write_if_changed(&cache_icons_dir.join("icon.icns"), &icns);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let icns_out = out_dir.join("icon.icns");
-    std::fs::write(&icns_out, &icns).unwrap();
+    write_if_changed(&icns_out, &icns);
     println!("cargo:rustc-env=HOLE_ICNS_PATH={}", icns_out.display());
 
     // Runtime Dock icon (dock_icon.rs).
@@ -175,7 +195,7 @@ fn render_to_rgba(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
 }
 
 fn render_png(tree: &resvg::usvg::Tree, size: u32, path: &Path) {
-    std::fs::write(path, render_png_in_memory(tree, size)).unwrap();
+    write_if_changed(path, &render_png_in_memory(tree, size));
 }
 
 fn render_png_in_memory(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
@@ -190,15 +210,16 @@ fn render_png_in_memory(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
     buf
 }
 
-fn render_ico(tree: &resvg::usvg::Tree, path: &Path) {
+fn render_ico(tree: &resvg::usvg::Tree) -> Vec<u8> {
     let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
     for size in [16u32, 32, 256] {
         let rgba = render_to_rgba(tree, size);
         let image = ico::IconImage::from_rgba_data(size, size, rgba);
         icon_dir.add_entry(ico::IconDirEntry::encode(&image).unwrap());
     }
-    let file = std::fs::File::create(path).unwrap();
-    icon_dir.write(file).unwrap();
+    let mut bytes = Vec::new();
+    icon_dir.write(&mut bytes).unwrap();
+    bytes
 }
 
 // Tray icons ==========================================================================================================
@@ -207,22 +228,10 @@ fn generate_tray_icons(icons_dir: &Path) {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-    // Clean any pre-rename tray rgba files left by a previous incremental
-    // build. include_bytes! cites only the new names, so stale files
-    // would silently bloat OUT_DIR.
-    if let Ok(read) = std::fs::read_dir(&out_dir) {
-        for entry in read.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("tray-") && name.ends_with(".rgba") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-
     // No build-time padding: the SVG is the source of truth for the
     // icon's internal margins. If breathing room is needed, adjust the
     // SVG's viewBox-relative artwork instead of compensating here.
+    let mut outputs: Vec<(String, Vec<u8>)> = Vec::new();
     match target_os.as_str() {
         "windows" => {
             for variant in ["dark", "light"] {
@@ -230,7 +239,7 @@ fn generate_tray_icons(icons_dir: &Path) {
                 let tree = parse_svg(&svg_path);
                 let mut rgba = render_to_rgba(&tree, 32);
                 unpremultiply_rgba(&mut rgba);
-                std::fs::write(out_dir.join(format!("tray-{variant}.rgba")), &rgba).unwrap();
+                outputs.push((format!("tray-{variant}.rgba"), rgba));
             }
         }
         "macos" => {
@@ -238,10 +247,27 @@ fn generate_tray_icons(icons_dir: &Path) {
             let tree = parse_svg(&svg_path);
             let mut rgba = render_to_rgba(&tree, 36);
             unpremultiply_rgba(&mut rgba);
-            let template = luminance_to_alpha(&rgba);
-            std::fs::write(out_dir.join("tray-template.rgba"), &template).unwrap();
+            outputs.push(("tray-template.rgba".to_string(), luminance_to_alpha(&rgba)));
         }
         other => println!("cargo:warning=tray icon generation not implemented for {other}"),
+    }
+
+    // Clean any tray rgba file this run does not produce (a pre-rename name or
+    // another target's) left by a previous incremental build. include_bytes!
+    // cites only the current names, so stale files would silently bloat
+    // OUT_DIR. The current ones are left alone, not removed and rewritten.
+    if let Ok(read) = std::fs::read_dir(&out_dir) {
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let current = outputs.iter().any(|(wanted, _)| wanted == &*name);
+            if name.starts_with("tray-") && name.ends_with(".rgba") && !current {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    for (name, bytes) in &outputs {
+        write_if_changed(&out_dir.join(name), bytes);
     }
 }
 

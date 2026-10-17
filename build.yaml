@@ -185,9 +185,8 @@ targets:
 
   hole-tests:
     # `--no-default-features` matches the `hole` target's debug build: tests
-    # compile main.rs (which expands `tauri::generate_context!()`), and
-    # production-mode generate_context panics at compile time on missing
-    # `ui/dist/`. Tests don't need bundled frontend assets — they exercise
+    # build `hole`, whose build.rs generates the Tauri context, and
+    # production-mode context generation panics on missing `ui/dist/`. Tests don't need bundled frontend assets — they exercise
     # CLI / IPC / bridge paths, not the webview (see the frontend-build note).
     depends: hole
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
@@ -325,8 +324,8 @@ targets:
     # compiles, so `--workspace` is correct.
     #
     # `--no-default-features` matches the `hole` / `hole-tests` targets:
-    # clippy expands `tauri::generate_context!()` like a regular compile,
-    # which would panic on missing `ui/dist/` in production mode. Linting
+    # clippy runs `hole`'s build.rs like a regular compile, which generates
+    # the Tauri context and would panic on missing `ui/dist/` in production mode. Linting
     # the dev-mode codepaths is sufficient — the cfg(dev) gate only affects
     # Tauri-internal URL resolution, not Hole-side code. See #372.
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
