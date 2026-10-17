@@ -257,7 +257,10 @@ impl ProvisionedService {
             eprintln!("teardown: stopping the throwaway service failed: {e}");
         }
         // An already-marked service refuses the delete; it is still awaited below.
-        let _ = service.delete();
+        // Any other refusal leaves the wait below hanging, so say which it was.
+        if let Err(e) = service.delete() {
+            eprintln!("teardown: deleting the throwaway service failed (awaiting deletion anyway): {e}");
+        }
         // An open handle keeps the deletion pending.
         drop(service);
         drop(manager);
