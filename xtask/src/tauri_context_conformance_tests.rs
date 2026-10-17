@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 const FORBIDDEN_MACRO: &str = "generate_context";
 const REQUIRED_MACRO: &str = "tauri_build_context";
 
-/// Directories that hold no first-party source of the workspace.
+/// Build output, dependency and scratch directories: no first-party source.
+/// A nested checkout (a linked worktree, a clone) is not named here; it is
+/// recognised by its own `.git` entry in `rust_sources_under`.
 const SKIPPED_DIRS: &[&str] = &["target", "node_modules", ".git", ".tmp", ".cache", "third_party"];
 
 /// How often a source names a macro, counted over its token stream.
@@ -57,16 +59,18 @@ fn mentions_in(source: &str, name: &str, origin: &Path) -> Result<Mentions, Stri
     Ok(found)
 }
 
-/// First-party `.rs` files under `dir`, sorted.
-fn rust_sources_under(dir: &Path) -> Vec<PathBuf> {
+/// First-party `.rs` files under `root`, sorted. A directory other than `root`
+/// that holds a `.git` entry (file or directory) is another checkout of the
+/// repository, with its own copy of every source: it is not descended into.
+fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
+    let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display())) {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                if !SKIPPED_DIRS.contains(&name) {
+                if !SKIPPED_DIRS.contains(&name) && !path.join(".git").exists() {
                     pending.push(path);
                 }
             } else if path.extension().is_some_and(|e| e == "rs") {
@@ -157,6 +161,30 @@ fn a_source_that_does_not_lex_is_reported_with_its_path() {
     assert!(err.contains("crates/x/src/y.rs"), "{err}");
 }
 
+// Source discovery ----------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_nested_checkout_is_not_first_party_source() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let rs = |rel: &str| {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        path
+    };
+    let own = [rs("crates/a/src/lib.rs"), rs("crates/a/src/deep/er.rs"), rs("main.rs")];
+    // A linked worktree has a `.git` file, a clone a `.git` directory.
+    rs("wt/.git");
+    rs("wt/crates/a/src/lib.rs");
+    rs("clone/.git/HEAD");
+    rs("clone/crates/a/src/lib.rs");
+    rs("wt/inner/crates/b.rs");
+
+    let mut expected = own.to_vec();
+    expected.sort();
+    assert_eq!(rust_sources_under(root.path()), expected);
+}
+
 // Workspace -----------------------------------------------------------------------------------------------------------
 
 /// `repo_root()` rather than `env!("CARGO_MANIFEST_DIR")`: this binary runs
@@ -172,8 +200,8 @@ fn the_tauri_context_comes_from_the_build_script() {
     for path in rust_sources_under(&root) {
         let source = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         // A cheap pre-filter; the token scan below decides.
-        let mentions = |name| source.contains(name);
-        if !mentions(FORBIDDEN_MACRO) && !mentions(REQUIRED_MACRO) {
+        let contains = |name| source.contains(name);
+        if !contains(FORBIDDEN_MACRO) && !contains(REQUIRED_MACRO) {
             continue;
         }
         let scan = |name| mentions_in(&source, name, &path).unwrap_or_else(|e| panic!("{e}"));

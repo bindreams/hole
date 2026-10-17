@@ -99,6 +99,22 @@ fn date_as_input(path: &Path, inputs: SystemTime) {
         .unwrap_or_else(|e| panic!("failed to date {}: {e}", path.display()));
 }
 
+fn tauri_conf() -> serde_json::Value {
+    let conf = std::fs::read_to_string("tauri.conf.json").expect("failed to read tauri.conf.json");
+    serde_json::from_str(&conf).expect("failed to parse tauri.conf.json")
+}
+
+/// The files `tauri.conf.json`'s `bundle.icon` lists, as paths from the crate
+/// directory (the config's directory, where `tauri-build` resolves them).
+fn bundle_icons() -> Vec<PathBuf> {
+    tauri_conf()["bundle"]["icon"]
+        .as_array()
+        .expect("tauri.conf.json bundle.icon must be an array")
+        .iter()
+        .map(|icon| PathBuf::from(icon.as_str().expect("icon entry must be a string")))
+        .collect()
+}
+
 /// Stub every `externalBin` sidecar so `tauri_build::build()` passes
 /// validation even when `cargo xtask deps` has not been run yet. The stub
 /// list derives from `tauri.conf.json`'s `bundle.externalBin`, so a new
@@ -108,8 +124,7 @@ fn date_as_input(path: &Path, inputs: SystemTime) {
 fn ensure_external_bin_stubs(repo_root: &Path) {
     let target = std::env::var("TARGET").unwrap();
     let suffix = if target.contains("windows") { ".exe" } else { "" };
-    let conf = std::fs::read_to_string("tauri.conf.json").expect("failed to read tauri.conf.json");
-    let conf: serde_json::Value = serde_json::from_str(&conf).expect("failed to parse tauri.conf.json");
+    let conf = tauri_conf();
     let entries = conf["bundle"]["externalBin"]
         .as_array()
         .expect("tauri.conf.json bundle.externalBin must be an array");
@@ -228,9 +243,17 @@ fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path, svgs_mtime: SystemTi
         render_png(host_tree, size, &cache_icons_dir.join(format!("{size}x{size}.png")));
     }
 
-    // The files `tauri.conf.json`'s `bundle.icon` lists; `tauri-build` watches them.
-    for name in ["icon.ico", "icon.icns", "32x32.png", "128x128.png"] {
-        date_as_input(&cache_icons_dir.join(name), svgs_mtime);
+    // Every generated file `tauri.conf.json`'s `bundle.icon` lists: `tauri-build`
+    // watches those, so the list is read from there rather than repeated here.
+    // An entry outside the cache is a committed file this script does not own.
+    let cache = cache_icons_dir.canonicalize().expect("failed to resolve .cache/icons/");
+    for icon in bundle_icons() {
+        let icon = icon
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("bundle.icon entry {} is not on disk: {e}", icon.display()));
+        if icon.starts_with(&cache) {
+            date_as_input(&icon, svgs_mtime);
+        }
     }
 }
 
