@@ -228,7 +228,7 @@ jobs:
       - id: archive
         name: Build test archive (ex-Galoshes + tooling crates)
         if: ${{ !cancelled() && steps.provision.outcome == 'success' }}
-        timeout-minutes: 10
+        timeout-minutes: 15
         shell: bash
         run: |
           mkdir -p ci-artifacts
@@ -327,7 +327,8 @@ jobs:
       # `hole-build`. Budget 80 for both assembly steps, held equal by
       # `ci_installer_assembly_steps_share_a_timeout_budget`; sized for a cold
       # sccache (GitHub evicts entries untouched for 7 days). Observed maxima over
-      # 200 runs: MSI 21.8m, DMG 46.4m on darwin/amd64 (cold: 45m45s, 5% hit rate).
+      # 200 runs: MSI 18.8m, DMG 50.8m on darwin/amd64 (a failed run; 46.4m the
+      # slowest green).
 
       # `scripts/*` of the MSI project: unit tests of the assembly, no build.
       - id: installer-pytest
@@ -475,7 +476,7 @@ jobs:
       # profile, so the lanes below re-execute these binaries (see #200 for the
       # NDIS-loopback corruption that motivates running TUN tests last).
       #
-      # Budget 70: worst measured 52.4m on darwin/amd64 (median 28.6m, p90 38.4m).
+      # Budget 70: worst measured 52.4m on darwin/amd64 (median 27.8m, p90 38.4m).
       - id: hole-build
         name: Build hole test binaries
         if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole == true }}
@@ -536,12 +537,13 @@ jobs:
       # STEP-LEVEL BUDGETS (#989). A step that blows its own budget fails
       # normally: the job runs on and the later lanes still report; when the
       # job WALL fires instead, the lanes after the hung step do not run.
-      # Sized off per-step maxima over 200 runs (2026-09-11 -> 2026-10-16):
+      # Sized off per-step maxima over 200 runs (2026-09-23 -> 2026-10-17):
       #
-      #   non-TUN   windows 23.6m   darwin/amd64 24.8m   darwin/arm64 13.7m  -> 35
-      #   TUN       windows  6.4m   darwin/amd64 14.8m   darwin/arm64  7.9m  -> 25
+      #   non-TUN   windows 23.2m   darwin/amd64 32.3m   darwin/arm64 13.7m  -> 45
+      #   TUN       windows  6.4m   darwin/amd64 21.2m   darwin/arm64  8.1m  -> 30
       #
-      # Both keep their earlier budgets (raised only, never tightened).
+      # Slow runs are part of that spread, not outliers: darwin/amd64's 32.3m and
+      # 21.2m are one run. Raised only, never tightened.
       #
       # NO COMPILING. Every cargo step after `hole-build` (the verify steps and the
       # test lanes) runs under `fail-on-compile.sh`, which fails the step if
@@ -558,7 +560,7 @@ jobs:
       - id: hole-test-non-tun
         name: Test (non-TUN)
         if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
-        timeout-minutes: 35
+        timeout-minutes: 45
         shell: bash
         env:
           CARGO_LOG: cargo::core::compiler::fingerprint=info
@@ -846,7 +848,7 @@ jobs:
       - id: hole-test-tun-macos
         name: Test (TUN, macOS — root for pfctl)
         if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'darwin' }}
-        timeout-minutes: 25
+        timeout-minutes: 30
         shell: bash
         env:
           CARGO_LOG: cargo::core::compiler::fingerprint=info
@@ -893,7 +895,7 @@ jobs:
       - id: renovate-config
         name: Validate .github/renovate.json
         if: ${{ !cancelled() && steps.setup-node-lts.outcome == 'success' }}
-        timeout-minutes: 5
+        timeout-minutes: 10
         shell: bash
         run: npx --yes --package renovate renovate-config-validator --strict --no-global .github/renovate.json
 
