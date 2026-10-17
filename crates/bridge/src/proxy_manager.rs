@@ -2303,29 +2303,21 @@ fn promote_adopted_claim(state_dir: Option<&std::path::Path>, owner: Option<(u32
     }
 }
 
-/// The process image paths the Windows lockdown cover permits by App-ID: the
-/// binary the plugin chain was spawned from (if a plugin is configured) and the
-/// bridge's own exe.
-/// Empty on macOS (pf has no per-process matching). Path-keyed so the permit
-/// survives a cutover rename.
+/// The process image paths the lockdown cover is asked to permit by App-ID: the
+/// binary the plugin chain was spawned from (if a plugin is configured), then
+/// the bridge's own exe. Built the same on every platform; only Windows acts on
+/// them (macOS pf has no per-process matching and `engage_lockdown` ignores
+/// them). Path-keyed so the permit survives a cutover rename.
 fn lockdown_app_ids(plugin: Option<&crate::proxy::plugin::PluginChain>) -> Vec<std::path::PathBuf> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = plugin;
-        Vec::new()
+    let mut ids: Vec<std::path::PathBuf> = plugin.map(|c| c.binary().to_path_buf()).into_iter().collect();
+    match std::env::current_exe() {
+        Ok(exe) => ids.push(exe),
+        // The bridge's own egress still rides the server-IP permit, so a
+        // missing exe path narrows but does not break the cover. Warn so a
+        // bug report carries the shrunken-permit-set signal.
+        Err(e) => warn!(error = %e, "lockdown: current_exe() failed; bridge App-ID permit omitted"),
     }
-    #[cfg(target_os = "windows")]
-    {
-        let mut ids: Vec<std::path::PathBuf> = plugin.map(|c| c.binary().to_path_buf()).into_iter().collect();
-        match std::env::current_exe() {
-            Ok(exe) => ids.push(exe),
-            // The bridge's own egress still rides the server-IP permit, so a
-            // missing exe path narrows but does not break the cover. Warn so a
-            // bug report carries the shrunken-permit-set signal.
-            Err(e) => warn!(error = %e, "lockdown: current_exe() failed; bridge App-ID permit omitted"),
-        }
-        ids
-    }
+    ids
 }
 
 #[cfg(test)]
@@ -2335,6 +2327,10 @@ pub(crate) mod proxy_manager_tests;
 #[cfg(test)]
 #[path = "proxy_manager_release_tests.rs"]
 mod proxy_manager_release_tests;
+
+#[cfg(test)]
+#[path = "proxy_manager_lockdown_permit_tests.rs"]
+mod proxy_manager_lockdown_permit_tests;
 
 // E2E test platform policy:
 //

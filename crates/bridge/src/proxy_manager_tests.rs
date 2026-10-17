@@ -202,6 +202,8 @@ pub(crate) struct MockRoutingState {
     /// `tun.alias()` from the last `install_lockdown` call — see
     /// `last_install_tun_alias`.
     last_lockdown_tun_alias: std::sync::Mutex<Option<String>>,
+    /// The `app_ids` the last `install_lockdown` call was handed.
+    pub(crate) last_lockdown_app_ids: std::sync::Mutex<Option<Vec<PathBuf>>>,
     /// Last `server_ip` passed to `install_failclosed_cover`, so a test can assert
     /// the cover permits exactly the resolved server IP.
     last_cover_server_ip: std::sync::Mutex<Option<IpAddr>>,
@@ -251,6 +253,7 @@ impl Default for MockRoutingState {
             last_install_server_ip: std::sync::Mutex::new(None),
             last_install_tun_alias: std::sync::Mutex::new(None),
             last_lockdown_tun_alias: std::sync::Mutex::new(None),
+            last_lockdown_app_ids: std::sync::Mutex::new(None),
             last_cover_server_ip: std::sync::Mutex::new(None),
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -464,11 +467,12 @@ impl Routing for MockRouting {
         &self,
         _server_ip: IpAddr,
         tun: &TunIdentity,
-        _app_ids: &[std::path::PathBuf],
+        app_ids: &[std::path::PathBuf],
     ) -> Result<MockCover, RoutingError> {
         if self.state.fail_lockdown.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock lockdown failure".into()));
         }
+        *self.state.last_lockdown_app_ids.lock().unwrap() = Some(app_ids.to_vec());
         *self.state.last_lockdown_tun_alias.lock().unwrap() = Some(tun.alias().to_owned());
         self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
         // Mirrors the real OS: a successful engage is what a subsequent
@@ -1786,7 +1790,6 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
 //
 /// The permit list holds the binary the chain was spawned from, then the bridge
 /// exe.
-#[cfg(target_os = "windows")]
 #[skuld::test]
 fn lockdown_app_ids_permits_the_chains_binary_and_the_bridge_exe() {
     let dir = tempfile::tempdir().unwrap();
@@ -1807,7 +1810,6 @@ fn lockdown_app_ids_permits_the_chains_binary_and_the_bridge_exe() {
     });
 }
 
-#[cfg(target_os = "windows")]
 #[skuld::test]
 fn lockdown_app_ids_without_a_plugin_holds_only_the_bridge_exe() {
     assert_eq!(lockdown_app_ids(None), vec![std::env::current_exe().unwrap()]);

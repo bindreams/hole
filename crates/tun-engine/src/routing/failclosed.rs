@@ -172,7 +172,7 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// is kind-aware, so dropping it disengages the lockdown cover specifically.
 /// On Windows the LUID is re-resolved here every engage (never persisted). On
 /// failure the host is left uncovered; the bridge's fail-FATAL caller aborts
-/// the start. `app_ids` is empty on macOS (pf has no per-process matching).
+/// the start. `app_ids` is ignored on macOS (pf has no per-process matching).
 ///
 /// On a platform whose standing cover arms boot-time keys
 /// (`platform::STANDING_COVER_ARMS_BOOT_TIME`) the engage also records the
