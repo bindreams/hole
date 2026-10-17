@@ -186,7 +186,7 @@ test-group = 'global_net_state'
 filter = 'test(/failclosed_cover_transition_/)'
 success-output = 'final'
 
-# `cutover_global_net_state_service_controls_after_stop_reach_the_handler` prints
+# `cutover_global_net_state_service_controls_after_stop_are_measured` prints
 # which controls the SCM delivered to a service that is already stopping. That
 # line is the measurement the test exists for, and nextest discards captured
 # output on success. `success-output` only, for the reason given above.

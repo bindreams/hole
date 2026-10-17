@@ -42,3 +42,37 @@ fn a_wait_hint_that_overflows_the_wire_field_is_an_error_not_a_panic() {
     let err = raw_status(&status(ServiceExitCode::NO_ERROR, too_long)).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 }
+
+// winsvc.h: SERVICE_STOPPED 1, SERVICE_START_PENDING 2, SERVICE_STOP_PENDING 3,
+// SERVICE_RUNNING 4, SERVICE_CONTINUE_PENDING 5, SERVICE_PAUSE_PENDING 6,
+// SERVICE_PAUSED 7. Written out per variant so a new `ServiceState` variant
+// breaks this match instead of going unpinned.
+#[skuld::test]
+fn raw_status_reports_every_service_state_as_its_winsvc_constant() {
+    let wire = |state: ServiceState| {
+        let expected = match state {
+            ServiceState::Stopped => 1,
+            ServiceState::StartPending => 2,
+            ServiceState::StopPending => 3,
+            ServiceState::Running => 4,
+            ServiceState::ContinuePending => 5,
+            ServiceState::PausePending => 6,
+            ServiceState::Paused => 7,
+        };
+        let mut reported = status(ServiceExitCode::NO_ERROR, Duration::ZERO);
+        reported.current_state = state;
+        (raw_status(&reported).unwrap().dwCurrentState.0, expected)
+    };
+    for state in [
+        ServiceState::Stopped,
+        ServiceState::StartPending,
+        ServiceState::StopPending,
+        ServiceState::Running,
+        ServiceState::ContinuePending,
+        ServiceState::PausePending,
+        ServiceState::Paused,
+    ] {
+        let (raw, expected) = wire(state);
+        assert_eq!(raw, expected, "{state:?}");
+    }
+}
