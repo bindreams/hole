@@ -2714,7 +2714,9 @@ cargo xtask run hole
 supervisor, which starts Vite and launches bridge + GUI with multiplexed
 color-coded logs. dev-console builds nothing — the xtask cascade builds first
 (#564); `cargo run -p dev-console` works standalone against an already-built
-tree. Frontend changes hot-reload via Vite HMR; Rust changes need Ctrl+C and
+tree. xtask hands dev-console the root it pinned in `HOLE_DEV_REPO_ROOT`, which
+dev-console takes first (an error if it is not a hole root); a standalone run
+uses the checkout it sits in. Frontend changes hot-reload via Vite HMR; Rust changes need Ctrl+C and
 re-run.
 
 - **dev-console runs unprivileged and elevates only the bridge.** On macOS it

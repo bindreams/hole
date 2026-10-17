@@ -229,28 +229,66 @@ fn a_step_launched_binary_outside_the_workspace_finds_the_root_it_was_launched_f
     );
 }
 
-/// The binary's location comes before the launch directory, and only a hole
-/// root counts: a binary under a non-hole workspace must not override the
-/// launch directory, and a launch directory in another hole root must not
-/// override a binary that sits in one.
+/// `cargo xtask run hole` hands the root it pinned to the child explicitly, so a
+/// binary whose location is inside a *different* hole checkout still resolves the
+/// pinned one. Three ways the location gets there, one lookup input: the
+/// executable under another hole root, the working directory the pinned root.
+///
+/// `target/` symlinked into another checkout (a canonical `current_exe`, as on
+/// Linux) and `CARGO_TARGET_DIR` pointed into another checkout:
 #[skuld::test]
-fn a_step_launched_binary_takes_the_first_hole_root_of_its_location_and_launch_directory() {
-    let launched_from = fake_hole_workspace();
-    let sits_in = fake_workspace();
-    let found =
-        root_found_by_a_step_launched_binary(&sits_in.path().join("target").join("debug"), launched_from.path());
-    assert!(
-        same_dir(&found, launched_from.path()),
-        "non-hole binary location: found {found:?}, launched from {:?}",
-        launched_from.path()
-    );
-
-    let sits_in = fake_hole_workspace();
+fn a_step_launched_binary_in_another_hole_checkout_resolves_the_root_xtask_pinned() {
+    let pinned = fake_hole_workspace();
     let other = fake_hole_workspace();
-    let found = root_found_by_a_step_launched_binary(&sits_in.path().join("target").join("debug"), other.path());
+    let found = root_found_by_a_step_launched_binary(&other.path().join("target").join("debug"), pinned.path());
+    assert!(
+        same_dir(&found, pinned.path()),
+        "found {found:?}, pinned {:?}, binary in {:?}",
+        pinned.path(),
+        other.path()
+    );
+}
+
+/// A worktree nested under the main checkout (this project's layout) whose
+/// `target` points at the main checkout's.
+#[skuld::test]
+fn a_step_launched_binary_in_the_checkout_enclosing_the_pinned_worktree_resolves_the_worktree() {
+    let main = fake_hole_workspace();
+    let worktree = main.path().join(".tmp").join("claude").join("wt").join("pinned");
+    std::fs::create_dir_all(worktree.join("crates").join("hole")).expect("create the worktree");
+    std::fs::write(worktree.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("write manifest");
+    let found = root_found_by_a_step_launched_binary(&main.path().join("target").join("debug"), &worktree);
+    assert!(
+        same_dir(&found, &worktree),
+        "found {found:?}, pinned {worktree:?}, binary in {:?}",
+        main.path()
+    );
+}
+
+/// The same binary run by hand (no handoff) belongs to the checkout it sits in,
+/// whatever the working directory: the answer main always gave.
+#[skuld::test]
+fn a_hand_run_binary_resolves_the_checkout_it_sits_in() {
+    let sits_in = fake_hole_workspace();
+    let cwd = fake_hole_workspace();
+    let exe_dir = sits_in.path().join("target").join("debug");
+    std::fs::create_dir_all(&exe_dir).expect("create the binary's dir");
+    let exe = exe_dir.join(std::env::current_exe().expect("current_exe").file_name().unwrap());
+    std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the binary");
+    let out = tempfile::tempdir().expect("tempdir");
+    let out_file = out.path().join("root.txt");
+    let status = std::process::Command::new(&exe)
+        .env(MODE_ENV, "strip-then-handed-down-root")
+        .env(crate::test_child::OUT_ENV, &out_file)
+        .env_remove(xtask_lib::repo_root::DEV_REPO_ROOT_ENV)
+        .current_dir(cwd.path())
+        .status()
+        .expect("spawn the binary");
+    assert!(status.success(), "{status:?}");
+    let found = PathBuf::from(std::fs::read_to_string(&out_file).expect("reported a root").trim());
     assert!(
         same_dir(&found, sits_in.path()),
-        "hole binary location: found {found:?}, binary in {:?}",
+        "found {found:?}, binary in {:?}",
         sits_in.path()
     );
 }

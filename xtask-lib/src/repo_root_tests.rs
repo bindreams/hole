@@ -16,8 +16,9 @@ fn same(found: &Path, expected: &Path) -> bool {
     found.canonicalize().unwrap() == expected.canonicalize().unwrap()
 }
 
+/// A standalone launch: no handoff from xtask.
 fn lookup(manifest: Option<&Path>, exe: Option<&Path>, cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
-    hole_root_for_launch(manifest, exe, cwd)
+    hole_root_for_launch(None, manifest, exe, cwd)
 }
 
 #[skuld::test]
@@ -60,9 +61,9 @@ fn launch_lookup_prefers_the_manifest_dir_over_the_exe_and_cwd() {
 }
 
 #[skuld::test]
-fn launch_lookup_prefers_the_exe_over_a_cwd_inside_another_workspace() {
-    // Where the exe sits in the hole root, a cwd in some other workspace
-    // (hole or not) must not be taken instead.
+fn a_hand_run_prefers_the_exe_over_a_cwd_inside_another_workspace() {
+    // No handoff: where the exe sits in a hole root, a cwd in some other
+    // workspace (hole or not) must not be taken instead.
     let exe = workspace(true);
     for other in [workspace(false), workspace(true)] {
         let found = lookup(None, Some(exe.path()), Some(other.path())).unwrap();
@@ -113,4 +114,66 @@ fn launch_lookup_errors_naming_every_candidate_when_none_is_a_hole_root() {
 #[skuld::test]
 fn launch_lookup_errors_when_no_candidate_exists() {
     assert!(lookup(None, None, None).is_err());
+}
+
+// The handoff from `cargo xtask` --------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn the_handoff_beats_a_manifest_dir_exe_and_cwd_that_are_all_hole_roots() {
+    // The `target/` redirected into another checkout case: the exe (and
+    // manifest dir) sit in hole root A, xtask pinned B.
+    let pinned = workspace(true);
+    let (manifest, exe, cwd) = (workspace(true), workspace(true), workspace(true));
+    let found = hole_root_for_launch(
+        Some(pinned.path()),
+        Some(manifest.path()),
+        Some(exe.path()),
+        Some(cwd.path()),
+    )
+    .unwrap();
+    assert!(same(&found, pinned.path()), "{found:?}");
+}
+
+#[skuld::test]
+fn the_handoff_is_taken_with_no_other_location_available() {
+    let pinned = workspace(true);
+    let found = hole_root_for_launch(Some(pinned.path()), None, None, None).unwrap();
+    assert!(same(&found, pinned.path()), "{found:?}");
+}
+
+#[skuld::test]
+fn the_handoff_resolves_a_worktree_nested_in_the_checkout_the_exe_sits_in() {
+    // This project's layout: worktrees live under the main checkout's `.tmp/`
+    // and share its target directory, so the exe's walk-up reaches the main
+    // checkout while xtask pinned the worktree.
+    let main = workspace(true);
+    let worktree = main.path().join(".tmp").join("claude").join("wt").join("pinned");
+    std::fs::create_dir_all(worktree.join("crates").join("hole")).unwrap();
+    std::fs::write(worktree.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let exe = main.path().join(".tmp").join("shared").join("debug");
+    std::fs::create_dir_all(&exe).unwrap();
+
+    let found = hole_root_for_launch(Some(&worktree), None, Some(&exe), Some(&worktree)).unwrap();
+    assert!(same(&found, &worktree), "{found:?}");
+    // Without the handoff, the exe's walk-up wins: the ambient signals alone
+    // cannot tell this launch from a hand run of the main checkout's binary.
+    let found = lookup(None, Some(&exe), Some(&worktree)).unwrap();
+    assert!(same(&found, main.path()), "{found:?}");
+}
+
+#[skuld::test]
+fn a_handoff_that_is_not_a_hole_root_is_an_error_naming_it_never_a_fallback() {
+    let hole = workspace(true); // a perfectly good exe, manifest dir and cwd
+    let non_hole = workspace(false);
+    let nested = hole.path().join("crates");
+    let missing = hole.path().join("no-such-dir");
+    let relative = Path::new("crates/hole");
+    let empty = Path::new("");
+    for bad in [non_hole.path(), nested.as_path(), missing.as_path(), relative, empty] {
+        let err = hole_root_for_launch(Some(bad), Some(hole.path()), Some(hole.path()), Some(hole.path()))
+            .expect_err(&format!("{bad:?} is not a hole root"))
+            .to_string();
+        assert!(err.contains("HOLE_DEV_REPO_ROOT"), "{bad:?}: {err}");
+        assert!(err.contains(&bad.display().to_string()), "{bad:?}: {err}");
+    }
 }

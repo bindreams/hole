@@ -320,7 +320,9 @@ pub(crate) fn resolve_program(program: &str, repo_root: &Path) -> PathBuf {
 
 /// Execute one [`Step`] from the given working directory.
 ///
-/// CWD is always `repo_root`. The step inherits stdio. On non-zero exit this
+/// CWD is always `repo_root`. A `process:` step also gets `HOLE_DEV_REPO_ROOT`
+/// set to it: the root xtask pinned, which dev-console reads in preference to
+/// guessing from its own location. The step inherits stdio. On non-zero exit this
 /// returns `Err` with a message naming the step and exit code; the caller
 /// (the build driver) propagates that via fail-fast.
 pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
@@ -349,6 +351,8 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
             for (k, v) in environment {
                 cmd.env(k, v);
             }
+            // After the step's own environment: the pin is xtask's, not the manifest's.
+            cmd.env(xtask_lib::repo_root::DEV_REPO_ROOT_ENV, repo_root);
             run(cmd, &format!("process step: {}", args.join(" ")))
         }
     }
