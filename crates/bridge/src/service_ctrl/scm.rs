@@ -1,6 +1,7 @@
 //! Registration with the SCM and status reports, over the `windows` crate.
 
 use std::io;
+use std::sync::atomic::AtomicBool;
 
 use windows::core::HSTRING;
 use windows::Win32::System::Services::{
@@ -10,7 +11,9 @@ use windows::Win32::System::Services::{
 };
 use windows_service::service::{ServiceExitCode, ServiceStatus};
 
-use super::{own, Control, ControlResult, OwnedHandler, CONTROL_INTERROGATE, CONTROL_SHUTDOWN, CONTROL_STOP};
+use super::{
+    claim_registration, own, Control, ControlResult, OwnedHandler, CONTROL_INTERROGATE, CONTROL_SHUTDOWN, CONTROL_STOP,
+};
 
 const _: () = {
     assert!(CONTROL_STOP == SERVICE_CONTROL_STOP);
@@ -41,13 +44,21 @@ impl StatusHandle {
     }
 }
 
+/// Whether this process has registered a handler.
+static REGISTERED: AtomicBool = AtomicBool::new(false);
+
 /// Register `handler` for the service `name` with the SCM, which keeps it for
 /// the rest of the process (see [`own`]). Call it from the service main
-/// function; a service process registers once.
+/// function. A service process registers once: a second call is an
+/// `AlreadyExists` error, and so is any call after a failed registration.
+///
+/// A failed registration leaks the handler. That is accepted: the service
+/// process exits when it cannot register.
 pub fn register<F>(name: &str, handler: F) -> io::Result<StatusHandle>
 where
     F: Fn(Control) -> ControlResult + Send + Sync + 'static,
 {
+    claim_registration(&REGISTERED)?;
     let OwnedHandler { entry, context } = own(handler);
     // SAFETY: `entry` is a valid `LPHANDLER_FUNCTION_EX` for the context
     // `own` paired it with, and that context is never freed.

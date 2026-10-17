@@ -59,31 +59,67 @@ fn service_main(_arguments: Vec<OsString>) {
     }
 }
 
-fn run_service() -> Result<(), Box<dyn std::error::Error>> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let shutdown_tx = std::sync::Mutex::new(Some(shutdown_tx));
+/// What [`register_stop_handler`] registered.
+pub struct RegisteredStop<F> {
+    pub status_handle: StatusHandle,
+    pub progress: std::sync::Arc<StopProgress<F>>,
+}
 
-    // `StopPending` is reported from the control handler (an SCM thread) as well
-    // as from the main task, so the progress is shared and the status handle,
-    // which only exists once `register` returns, is filled in afterwards. The
-    // SCM delivers no Stop before `Running`, which is reported after that.
+/// Register the control handler of a `HoleBridge` service process and return
+/// its status handle with the shared stop progress. A Stop or Shutdown reports
+/// StopPending through `send` first, so the SCM stops seeing `Running` the
+/// moment the Stop lands whatever the main task is still awaiting, then
+/// signals `shutdown_tx`. `observe` sees every control before it is handled.
+///
+/// `StopPending` is reported from the handler (an SCM thread) as well as from
+/// the main task, so the progress is shared and the status handle, which only
+/// exists once `register` returns, is filled in afterwards. The SCM delivers no
+/// Stop before `Running`, which the caller reports after this returns.
+///
+/// Shared with the `test_service` helper, so the privileged tests run this
+/// wiring.
+pub fn register_stop_handler<S>(
+    shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    send: S,
+    observe: impl Fn(Control) + Send + Sync + 'static,
+) -> std::io::Result<RegisteredStop<impl Fn(StopPhase) -> std::io::Result<()>>>
+where
+    S: Fn(&StatusHandle, StopPhase) -> std::io::Result<()> + Send + Sync + 'static,
+{
     let status_cell: std::sync::Arc<OnceLock<StatusHandle>> = std::sync::Arc::new(OnceLock::new());
     let stop = std::sync::Arc::new(StopProgress::new(service_stop::scm_reporter(
         std::sync::Arc::clone(&status_cell),
-        |handle: &StatusHandle, phase| handle.set_service_status(&stop_pending_status(phase)),
+        send,
     )));
 
     let handler_stop = std::sync::Arc::clone(&stop);
-    // `stop_control` reports StopPending first, so the SCM stops seeing `Running`
-    // the moment the Stop lands, whatever the main task is still awaiting. The
-    // handler stays registered for the process lifetime (`service_ctrl::own`),
-    // so a control after the first Stop still reaches it.
     let event_handler = move |control: Control| -> ControlResult {
+        observe(control);
         control.handle(|| service_stop::stop_control(&handler_stop, &shutdown_tx))
     };
 
     let status_handle = service_ctrl::register(SERVICE_NAME, event_handler)?;
     let _ = status_cell.set(status_handle);
+    Ok(RegisteredStop {
+        status_handle,
+        progress: stop,
+    })
+}
+
+/// Report `phase` to the SCM as StopPending: the bridge's `send` for
+/// [`register_stop_handler`].
+pub fn report_stop_pending(handle: &StatusHandle, phase: StopPhase) -> std::io::Result<()> {
+    handle.set_service_status(&stop_pending_status(phase))
+}
+
+fn run_service() -> Result<(), Box<dyn std::error::Error>> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_tx = std::sync::Mutex::new(Some(shutdown_tx));
+
+    let RegisteredStop {
+        status_handle,
+        progress: stop,
+    } = register_stop_handler(shutdown_tx, report_stop_pending, |_| {})?;
 
     // Report StartPending, NOT Running: the cutover child exits on the SCM
     // `Running` edge, so `Running` is deferred until after the socket binds AND

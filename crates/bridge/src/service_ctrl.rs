@@ -3,9 +3,10 @@
 //!
 //! `windows-service` 0.8's `register` hands the handler to the SCM as a raw
 //! pointer and frees it on the first Stop, Shutdown or Preshutdown, though the
-//! SCM keeps the pointer and can deliver another control (an Interrogate, or a
-//! second Stop) afterwards. Here the handler is leaked at registration
-//! ([`own`]) and never freed, so every control reaches live memory.
+//! SCM keeps the pointer registered and promises nothing about later controls.
+//! Measured on windows-latest: a client's Interrogate and second Stop after the
+//! first Stop are refused (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`). Ownership
+//! therefore does not depend on what the SCM delivers: see [`own`].
 //!
 //! The control decoding, the per-control policy and the entry point are
 //! platform-neutral, so they test on any host. Registration and status reports
@@ -46,11 +47,10 @@ impl Control {
         }
     }
 
-    /// The policy for this control: `stop` runs for a Stop or Shutdown, the one
-    /// match on the variants.
+    /// The policy for this control: `stop` runs for a Stop or Shutdown.
     ///
-    /// `stop` may run more than once, since the SCM can deliver a Stop after a
-    /// Shutdown or the reverse; it must tolerate that.
+    /// `stop` may run more than once, since nothing guarantees the SCM sends
+    /// only one stop-like control; it must tolerate that.
     pub fn handle(self, stop: impl FnOnce()) -> ControlResult {
         match self {
             Control::Stop => {
@@ -107,6 +107,20 @@ impl OwnedHandler {
     }
 }
 
+/// Claim the process's one service registration on `claimed`; a second claim
+/// is an error. `register` leaks a handler per call and a service process has
+/// one service, so a repeat is a bug that must not pass silently.
+#[cfg(any(windows, test))]
+fn claim_registration(claimed: &std::sync::atomic::AtomicBool) -> std::io::Result<()> {
+    if claimed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "a service control handler is already registered in this process",
+        ));
+    }
+    Ok(())
+}
+
 /// Hand `handler` to the process for the rest of its life. It is never
 /// dropped, so no control can reach freed memory.
 ///
@@ -122,8 +136,8 @@ pub fn own<F: Fn(Control) -> ControlResult + Send + Sync + 'static>(handler: F) 
 /// The entry point the SCM calls for every control. The event type and data
 /// carry nothing for the controls Hole handles.
 ///
-/// A panic in the handler aborts the process, as it would unwinding into the
-/// SCM's frames: handlers catch their own (see `service_stop`).
+/// A panic in the handler aborts the process (it cannot unwind into the SCM);
+/// handlers catch their own (see `service_stop`).
 unsafe extern "system" fn entry_point<F: Fn(Control) -> ControlResult>(
     control: u32,
     _event_type: u32,

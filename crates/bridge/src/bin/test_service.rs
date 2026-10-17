@@ -13,9 +13,10 @@
 //!   then report STOPPED.
 //! - `--on-stop <stop-pending|stay-running>`: what the held service reports on
 //!   STOP. `stop-pending` (the default) reports STOP_PENDING; `stay-running`
-//!   reports nothing, so the service still reports RUNNING with STOP accepted.
-//!   The SCM refuses later controls in both cases (measured; see
-//!   `measure_controls_after_first_stop`).
+//!   makes that report fail, so the service still reports RUNNING with STOP
+//!   accepted. The control handler is the bridge's own
+//!   (`platform::os::register_stop_handler`); only the report and the control
+//!   log are the helper's.
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;
@@ -85,13 +86,14 @@ windows_service::define_windows_service!(ffi_service_main, service_main);
 #[cfg(target_os = "windows")]
 fn service_main(_arguments: Vec<OsString>) {
     use std::io::Write;
-    use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::sync::Mutex;
     use std::time::Duration;
     use windows::core::HSTRING;
     use windows::Win32::System::Threading::{OpenEventW, WaitForSingleObject, INFINITE, SYNCHRONIZATION_SYNCHRONIZE};
     use windows_service::service::{ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType};
 
-    use hole_bridge::service_ctrl::{self, Control, StatusHandle};
+    use hole_bridge::platform::os::{register_stop_handler, report_stop_pending, RegisteredStop};
+    use hole_bridge::service_ctrl::{Control, StatusHandle};
 
     let args = ARGS.get().expect("set in main");
     let report = |state, accepts, checkpoint, wait_hint| ServiceStatus {
@@ -111,15 +113,17 @@ fn service_main(_arguments: Vec<OsString>) {
             .expect("open the release event")
     });
 
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let stop_tx = Mutex::new(Some(stop_tx));
-    // The handler runs on an SCM thread, and the status handle only exists once
-    // `register` returns; no Stop arrives before RUNNING, which is reported after.
-    let status_cell: Arc<OnceLock<StatusHandle>> = Arc::new(OnceLock::new());
-    let handler_status = Arc::clone(&status_cell);
-    let report_stop_pending = release.is_some() && args.on_stop.reports_stop_pending();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let report_stop_pending_to_scm = release.is_some() && args.on_stop.reports_stop_pending();
+    let send = move |handle: &StatusHandle, phase| {
+        if report_stop_pending_to_scm {
+            report_stop_pending(handle, phase)
+        } else {
+            Err(std::io::Error::other("this service does not report StopPending"))
+        }
+    };
     let control_log = args.control_log.clone();
-    let event_handler = move |control: Control| {
+    let observe = move |control: Control| {
         if let Some(path) = &control_log {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
@@ -128,29 +132,12 @@ fn service_main(_arguments: Vec<OsString>) {
                 .expect("open the control log");
             writeln!(file, "{control:?}").expect("write the control log");
         }
-        control.handle(|| {
-            if report_stop_pending {
-                if let Some(handle) = handler_status.get() {
-                    let _ = handle.set_service_status(&report(
-                        ServiceState::StopPending,
-                        ServiceControlAccept::empty(),
-                        1,
-                        Duration::from_secs(60),
-                    ));
-                }
-            }
-            if let Ok(mut guard) = stop_tx.lock() {
-                if let Some(tx) = guard.take() {
-                    let _ = tx.send(());
-                }
-            }
-        })
     };
 
-    let Ok(status_handle) = service_ctrl::register(hole_bridge::platform::os::SERVICE_NAME, event_handler) else {
+    let Ok(RegisteredStop { status_handle, .. }) = register_stop_handler(Mutex::new(Some(stop_tx)), send, observe)
+    else {
         return;
     };
-    let _ = status_cell.set(status_handle);
     if status_handle
         .set_service_status(&report(
             ServiceState::Running,
@@ -162,7 +149,7 @@ fn service_main(_arguments: Vec<OsString>) {
     {
         return;
     }
-    let _ = stop_rx.recv(); // park until SCM sends STOP
+    let _ = stop_rx.blocking_recv(); // park until SCM sends STOP
     if let Some(release) = release {
         // SAFETY: `release` is the live event handle opened above.
         unsafe { WaitForSingleObject(release, INFINITE) };

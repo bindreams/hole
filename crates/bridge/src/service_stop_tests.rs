@@ -423,9 +423,7 @@ fn a_second_stop_control_does_not_replace_the_first_ones_unlogged_report() {
     // Stop then Shutdown (or Stop twice) can both reach the handler before the
     // first StopPending takes effect. The second is superseded, but the first
     // reported and failed, and its trail must survive.
-    // The SCM can deliver a second control to the handler, which `service_ctrl`
-    // keeps registered for the process lifetime; the same holds for the
-    // second-control tests below.
+    // A second control can reach the handler (also true of the second-control tests below).
     let writer = VecWriter::new();
     let progress = StopProgress::new(refuse_stop_requested);
     request_stop(&progress, || {});

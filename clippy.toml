@@ -217,7 +217,7 @@ allow-invalid = true
 # `windows-service`'s `register` frees the handler on the first Stop, Shutdown
 # or Preshutdown while the SCM keeps the pointer, so a later control reads
 # freed memory. `service_ctrl::register` leaks the handler for the process
-# lifetime instead; the crate's registration must not be typed again.
+# lifetime instead.
 
 [[disallowed-methods]]
 path = "windows_service::service_control_handler::register"

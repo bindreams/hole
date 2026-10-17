@@ -1,6 +1,6 @@
 use super::*;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Control codes and result codes from winsvc.h / winerror.h, written out so the
@@ -50,8 +50,6 @@ fn stop_and_shutdown_request_the_stop_and_nothing_else_does() {
     );
 }
 
-/// Counts its own drops, so a test can tell whether the handler's captured
-/// state was freed.
 struct DropCounter(Arc<AtomicUsize>);
 
 impl Drop for DropCounter {
@@ -106,4 +104,14 @@ fn entry_point_returns_the_handlers_result_code() {
     });
     assert_eq!(owned.deliver(INTERROGATE), NO_ERROR);
     assert_eq!(owned.deliver(PAUSE), ERROR_CALL_NOT_IMPLEMENTED);
+}
+
+#[skuld::test]
+fn a_second_registration_claim_in_one_process_is_refused() {
+    let claimed = AtomicBool::new(false);
+    claim_registration(&claimed).expect("the first claim succeeds");
+    for _ in 0..2 {
+        let err = claim_registration(&claimed).expect_err("every later claim is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
 }
