@@ -26,6 +26,7 @@ tempfile = "3"
 rand = "0.10"
 base64 = "0.22"
 hex = "0.4"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 skuld = { workspace = true }
