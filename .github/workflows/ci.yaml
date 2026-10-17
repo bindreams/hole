@@ -468,8 +468,8 @@ jobs:
 
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
-      # feature set → different fingerprint → fresh build), which expands
-      # `tauri::generate_context!()` in production mode and panics on
+      # feature set → different fingerprint → fresh build), whose build.rs
+      # generates the Tauri context in production mode and fails on
       # missing `ui/dist/`. See bindreams/hole#372. The
       # `--features tombstone/crash-dumps,tombstone/crash-child` + `package(tombstone)`
       # also mirror `hole-tests` so the crash-marker tests `build hole-tests`
