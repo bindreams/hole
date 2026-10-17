@@ -3271,6 +3271,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-log",
  "tauri-plugin-single-instance",
+ "tauri-utils",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -5290,6 +5291,12 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "path-clean"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17359afc20d7ab31fdb42bb844c8b3bb1dabd7dcf7e68428492da7f16966fcef"
 
 [[package]]
 name = "payload-archive"
@@ -7651,10 +7658,12 @@ dependencies = [
  "glob",
  "heck 0.5.0",
  "json-patch",
+ "quote",
  "schemars 0.8.22",
  "semver",
  "serde",
  "serde_json",
+ "tauri-codegen",
  "tauri-utils",
  "tauri-winres",
  "walkdir",
@@ -10520,12 +10529,15 @@ dependencies = [
  "payload-archive",
  "petgraph",
  "png 0.18.1",
+ "proc-macro2",
+ "quote",
  "roxmltree 0.21.1",
  "serde",
  "serde_json",
  "serde_yml 0.0.13",
  "sha2 0.11.0",
  "skuld",
+ "syn 2.0.118",
  "tar",
  "tempfile",
  "toml 1.1.2+spec-1.1.0",
@@ -10546,9 +10558,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "json-patch",
+ "path-clean",
  "semver",
  "serde",
+ "serde_json",
  "skuld",
+ "tauri-utils",
  "tempfile",
  "toml 1.1.2+spec-1.1.0",
 ]

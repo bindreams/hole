@@ -225,7 +225,7 @@ fn launch_gui(show_dashboard: bool) {
             });
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(tauri::tauri_build_context!())
         .expect("error building Hole")
         .run(handle_run_event);
 }

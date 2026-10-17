@@ -28,7 +28,9 @@ ctrlc = "3" # transparent-launcher interrupt handling (#568): a handler (not SIG
 # `bindir::unique_glob_match` locates the single file a BINDIR name maps to
 # under a glob pattern (e.g. the platform-specific ex-ray/galoshes binaries).
 glob = "0.3"
-xtask-lib = { path = "../xtask-lib", features = ["serde", "clap", "version"] }
+# `tauri-config` is for the `frontend_dist` tests: the nextest lanes select `-p xtask-lib` without `hole`,
+# which is the only other consumer that turns the feature on.
+xtask-lib = { path = "../xtask-lib", features = ["serde", "clap", "version", "tauri-config"] }
 hole-common = { path = "../crates/common" } # `gen-ui-constants` reads NETWORK_BLOCKED_MESSAGE
 payload-archive = { path = "../crates/payload-archive" } # `update-archive` packs the per-platform payload via the shared pack_* the bridge unpacks with
 
@@ -94,6 +96,15 @@ png = "0.18"
 # and correct everywhere (unlike the `[target.'cfg(windows)']` dependencies above, which are
 # actually Windows-API-only crates that don't compile elsewhere at all).
 dunce = "1"
+
+# `tauri_context_conformance_tests` lexes sources into token streams to find
+# `generate_context` and `tauri_build_context!()`, so comments and strings are
+# not matches and macro bodies are searched. Already in the graph (same major).
+proc-macro2 = "1"
+# The same test's cfg-gating scan parses `main.rs` (items, statements, expressions)
+# to find the attributes that enclose an invocation. Also already in the graph.
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2" # raise()/kill() + SIGINT in signal tests
