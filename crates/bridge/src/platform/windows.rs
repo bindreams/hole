@@ -69,7 +69,10 @@ pub struct RegisteredStop<F> {
 /// its status handle with the shared stop progress. A Stop or Shutdown reports
 /// StopPending through `send` first, so the SCM stops seeing `Running` the
 /// moment the Stop lands whatever the main task is still awaiting, then
-/// signals `shutdown_tx`. `observe` sees every control before it is handled.
+/// signals `shutdown_tx`. `observe` sees every control before it is handled;
+/// it runs on the SCM's handler thread outside the panic catch, so it must
+/// return promptly and must not panic. A second call in one process is an
+/// `AlreadyExists` error (see `service_ctrl::register`).
 ///
 /// `StopPending` is reported from the handler (an SCM thread) as well as from
 /// the main task, so the progress is shared and the status handle, which only

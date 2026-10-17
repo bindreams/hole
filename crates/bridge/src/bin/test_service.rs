@@ -12,9 +12,9 @@
 //! - `--release-event <name>`: on STOP, hold until the named event is signalled,
 //!   then report STOPPED.
 //! - `--on-stop <stop-pending|stay-running>`: what the held service reports on
-//!   STOP. `stop-pending` (the default) reports STOP_PENDING; `stay-running`
-//!   makes that report fail, so the service still reports RUNNING with STOP
-//!   accepted. The control handler is the bridge's own
+//!   STOP. With `--release-event`, `stop-pending` (the default) reports
+//!   STOP_PENDING; `stay-running`, or no release event, makes that report fail,
+//!   so the service still reports RUNNING with STOP accepted. The control handler is the bridge's own
 //!   (`platform::os::register_stop_handler`); only the report and the control
 //!   log are the helper's.
 

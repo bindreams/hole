@@ -264,9 +264,8 @@ impl ProvisionedService {
             }
             // Not present: nothing to clean.
             Err(e) if open_error_is(&e, ERROR_SERVICE_DOES_NOT_EXIST) => return,
-            // Deleted but not yet gone (a previous run's service still exiting):
-            // it refuses stop and delete, and `create_service` would meet it, so
-            // only the wait below applies.
+            // Deleted but not yet gone, should the open itself report it: only
+            // the wait below applies.
             Err(e) if open_error_is(&e, ERROR_SERVICE_MARKED_FOR_DELETE) => {}
             Err(e) => eprintln!("teardown: opening the throwaway service failed (awaiting deletion anyway): {e}"),
         }

@@ -139,3 +139,20 @@ fn raw_status_reports_every_service_state_as_its_winsvc_constant() {
         assert_eq!(raw, expected, "{state:?}");
     }
 }
+
+// Outside a service the SCM refuses the first registration too; either way it
+// claims the process's one registration, so the second is refused before any
+// SCM call.
+#[skuld::test]
+fn a_second_register_call_in_one_process_is_refused() {
+    let _ = register("hole-test-not-a-service", |_| ControlResult::Handled);
+    let second = register("hole-test-not-a-service", |_| ControlResult::Handled);
+    let Err(err) = second else {
+        panic!("a second registration must be refused");
+    };
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+    assert_eq!(
+        err.to_string(),
+        "a service control handler is already registered in this process"
+    );
+}
