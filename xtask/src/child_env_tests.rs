@@ -172,6 +172,13 @@ fn fake_workspace() -> tempfile::TempDir {
     ws
 }
 
+/// [`fake_workspace`] that is also a hole root (has `crates/hole`).
+fn fake_hole_workspace() -> tempfile::TempDir {
+    let ws = fake_workspace();
+    std::fs::create_dir_all(ws.path().join("crates").join("hole")).expect("create crates/hole");
+    ws
+}
+
 /// Launch a copy of this binary at `exe_dir/<name>` as a `process:` step run
 /// from `step_root`, the way `cargo xtask run hole` launches dev-console, in the
 /// mode that reports the root the lookup dev-console uses finds. Returns it.
@@ -212,7 +219,7 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// out of it resolves to its canonical path on Linux).
 #[skuld::test]
 fn a_step_launched_binary_outside_the_workspace_finds_the_root_it_was_launched_from() {
-    let ws = fake_workspace();
+    let ws = fake_hole_workspace();
     let elsewhere = tempfile::tempdir().expect("tempdir");
     let found = root_found_by_a_step_launched_binary(&elsewhere.path().join("bin"), ws.path());
     assert!(
@@ -222,23 +229,33 @@ fn a_step_launched_binary_outside_the_workspace_finds_the_root_it_was_launched_f
     );
 }
 
-/// The launch directory is the pin; the binary's location is the fallback. A
-/// binary under a different workspace (a `target/` symlinked into another
-/// checkout) must not override it.
+/// The binary's location comes before the launch directory, and only a hole
+/// root counts: a binary under a non-hole workspace must not override the
+/// launch directory, and a launch directory in another hole root must not
+/// override a binary that sits in one.
 #[skuld::test]
-fn a_step_launched_binary_prefers_the_launch_directory_over_the_workspace_it_sits_in() {
-    let launched_from = fake_workspace();
+fn a_step_launched_binary_takes_the_first_hole_root_of_its_location_and_launch_directory() {
+    let launched_from = fake_hole_workspace();
     let sits_in = fake_workspace();
     let found =
         root_found_by_a_step_launched_binary(&sits_in.path().join("target").join("debug"), launched_from.path());
     assert!(
         same_dir(&found, launched_from.path()),
-        "found {found:?}, launched from {:?}",
+        "non-hole binary location: found {found:?}, launched from {:?}",
         launched_from.path()
+    );
+
+    let sits_in = fake_hole_workspace();
+    let other = fake_hole_workspace();
+    let found = root_found_by_a_step_launched_binary(&sits_in.path().join("target").join("debug"), other.path());
+    assert!(
+        same_dir(&found, sits_in.path()),
+        "hole binary location: found {found:?}, binary in {:?}",
+        sits_in.path()
     );
 }
 
-/// dev-console must use that lookup; the plain one prefers the binary's location.
+/// dev-console must use that lookup; the plain one accepts any workspace.
 #[skuld::test]
 fn dev_console_looks_the_root_up_by_the_launch_directory() {
     let src = std::fs::read_to_string(

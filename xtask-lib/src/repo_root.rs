@@ -21,29 +21,58 @@ pub fn repo_root() -> Result<PathBuf> {
     repo_root_from(exe.parent().unwrap_or(Path::new("/")))
 }
 
-/// [`repo_root`] for a binary a build driver launches: `CARGO_MANIFEST_DIR`,
-/// then the working directory, then the executable's location.
+/// The hole checkout a binary a build driver launched belongs to: the first of
+/// `CARGO_MANIFEST_DIR`, the executable's location and the working directory
+/// whose enclosing workspace is a hole root (has `crates/hole`).
 ///
-/// `cargo xtask run hole` starts dev-console with the root it resolved as the
-/// working directory, and strips `CARGO_MANIFEST_DIR` from the environment it
-/// hands on. A walk up from the executable cannot stand in for that: where
-/// `target/` is a symlink out of the workspace, `current_exe` is the canonical
-/// path (on Linux) and the walk-up never meets the workspace, or meets a
-/// different one. The launch directory is the handoff; the executable is the
-/// fallback for a standalone run from outside any workspace.
+/// Only a hole root is accepted, so a launch from inside some other workspace
+/// (or another hole checkout, when the executable is in this one) cannot
+/// redirect the lookup. The executable comes before the working directory,
+/// which is the fallback for a `target/` symlinked out of the tree (on Linux
+/// `current_exe` is then canonical and its walk-up misses the checkout):
+/// `cargo xtask run hole` launches dev-console with the root it pinned as the
+/// working directory and strips `CARGO_MANIFEST_DIR` from the environment.
+///
+/// Errors name each location tried.
 pub fn repo_root_from_launch_dir() -> Result<PathBuf> {
-    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
-        if let Ok(root) = repo_root_from(Path::new(&manifest_dir)) {
-            return Ok(root);
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let cwd = std::env::current_dir().ok();
+    hole_root_for_launch(manifest_dir.as_deref(), exe_dir.as_deref(), cwd.as_deref())
+}
+
+/// [`repo_root_from_launch_dir`] over explicit locations (`None`: unavailable),
+/// so tests need not touch the process environment. The parameter order is the
+/// lookup order.
+pub(crate) fn hole_root_for_launch(
+    manifest_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<PathBuf> {
+    let candidates = [
+        ("CARGO_MANIFEST_DIR", manifest_dir),
+        ("executable", exe_dir),
+        ("working directory", cwd),
+    ];
+    let mut tried = Vec::new();
+    for (what, start) in candidates {
+        let Some(start) = start else {
+            tried.push(format!("{what}: unavailable"));
+            continue;
+        };
+        match repo_root_from(start) {
+            Ok(root) if root.join("crates").join("hole").is_dir() => return Ok(root),
+            Ok(root) => tried.push(format!(
+                "{what} {}: workspace {} is not the hole root (no crates/hole)",
+                start.display(),
+                root.display()
+            )),
+            Err(_) => tried.push(format!("{what} {}: no workspace above it", start.display())),
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(root) = repo_root_from(&cwd) {
-            return Ok(root);
-        }
-    }
-    let exe = std::env::current_exe().context("current_exe")?;
-    repo_root_from(exe.parent().unwrap_or(Path::new("/")))
+    anyhow::bail!("could not locate the hole root; tried {}", tried.join("; "))
 }
 
 /// Walk-up core, separated for tests.

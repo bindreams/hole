@@ -92,17 +92,10 @@ pub async fn main() -> ExitCode {
 }
 
 async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
+    // The lookup only returns a hole root (dev.py:425-428 parity: never
+    // npm-install into some other workspace).
     let repo_root = xtask_lib::repo_root::repo_root_from_launch_dir()
         .context("run from inside the hole workspace (or via `cargo xtask run hole`)")?;
-    // dev.py:425-428 parity: a workspace that isn't hole must be refused
-    // before we npm-install into it.
-    if !repo_root.join("crates").join("hole").is_dir() {
-        eprintln!(
-            "Error: run this from the hole project root (crates/hole not found under {})",
-            repo_root.display()
-        );
-        return Ok(ExitCode::FAILURE);
-    }
     std::env::set_current_dir(&repo_root).context("cd to repo root")?;
 
     // Dev-run capture: <repo>/.tmp/dev-run/<datetime>/ with bridge.log +
