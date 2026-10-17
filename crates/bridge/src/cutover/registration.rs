@@ -1,9 +1,10 @@
 //! Memory an asynchronous callback may still name.
 //!
-//! `NotifyServiceStatusChangeW` keeps the notify buffer until its APC has run,
-//! and closing the service handle recalls only an APC the SCM has not queued
-//! yet. Memory an APC can still name therefore outlives its owner unless the
-//! callback is known to have run, and only the value can know that.
+//! `NotifyServiceStatusChangeW` keeps the notify buffer until its APC has run.
+//! The docs promise only that no *further* APC is queued once the service handle
+//! closes; they do not say an APC already queued is recalled, so it is assumed
+//! not to be. Memory an APC can still name therefore outlives its owner unless
+//! the callback is known to have run, and only the value can know that.
 
 use std::ptr::NonNull;
 
@@ -16,8 +17,8 @@ pub trait Settle {
 /// Heap-pinned owner of a [`Settle`] value whose address was handed out.
 ///
 /// Dropping it frees the value only if it is settled at that moment; otherwise
-/// the value is leaked, for good. A leak is bounded by the registrations dropped
-/// unsettled, one per drop; a freed value that is still named is a use-after-free.
+/// the value is leaked, for good. A leak is one value per registration dropped
+/// unsettled; a freed value that is still named is a use-after-free.
 /// There is no way to free an unsettled value, so no call site can choose to.
 pub struct Registration<T: Settle> {
     ptr: NonNull<T>,

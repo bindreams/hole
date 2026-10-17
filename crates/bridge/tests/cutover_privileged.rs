@@ -425,6 +425,25 @@ fn cutover_global_net_state_dropping_an_actor_after_its_callback_frees_the_notif
     );
 }
 
+/// `wait_callback` with nothing armed has no notification to wait for, so it
+/// errors instead of parking the thread in an alertable wait nothing will end.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_waiting_before_arming_errs_instead_of_hanging() {
+    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+
+    let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the throwaway service");
+    let err = actor.wait_callback().expect_err("nothing is armed");
+    assert!(
+        err.to_string().contains("wait_callback before any arm"),
+        "unexpected error: {err}"
+    );
+}
+
 /// How the throwaway service reacts to a Stop (`test_service --on-stop`).
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy)]

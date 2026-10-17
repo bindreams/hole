@@ -166,8 +166,9 @@ mod system {
     impl Settle for NotifyRecord {
         /// The notification is single-shot, so once its callback has run nothing
         /// can name the record. A callback that has not run may be pending, or
-        /// already queued as an APC that handle close does not recall; the
-        /// registration is then never freed.
+        /// already queued as an APC; closing the handle is not documented to
+        /// recall that, so it is assumed not to, and the registration is then
+        /// never freed.
         fn is_settled(&self) -> bool {
             self.status.fired.load(Ordering::Acquire)
         }
@@ -222,17 +223,62 @@ mod system {
         }
     }
 
+    /// An open SCM or service handle, closed exactly once when this drops.
+    /// No call site closes one by hand, so a closed handle value (which the OS
+    /// may reuse for an unrelated handle) cannot be closed a second time.
+    struct ScHandle(SC_HANDLE);
+
+    impl Drop for ScHandle {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from a successful open call and this is the
+            // only place that closes it.
+            let _ = unsafe { CloseServiceHandle(self.0) };
+        }
+    }
+
+    /// The SCM handle and the service handle opened through it. `service` is
+    /// declared first so it closes first; `_scm` is held only to close.
+    struct Handles {
+        service: ScHandle,
+        _scm: ScHandle,
+    }
+
+    impl Handles {
+        fn open(service_name: &[u16]) -> io::Result<Self> {
+            let scm = ScHandle(
+                unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+                    .map_err(io::Error::other)?,
+            );
+            let service = ScHandle(
+                unsafe {
+                    OpenServiceW(
+                        scm.0,
+                        PCWSTR(service_name.as_ptr()),
+                        SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START,
+                    )
+                }
+                .map_err(io::Error::other)?,
+            );
+            Ok(Self { service, _scm: scm })
+        }
+    }
+
     /// Owns the SCM + service handles and the registration of the latest `arm`.
     ///
     /// Each `arm` builds a fresh [`NotifyRecord`] instead of rewriting one, so a
     /// callback from an earlier arm can never see a buffer a later arm is filling.
-    /// A record is freed only after its callback has run. An actor dropped (or
-    /// re-armed) while a notification is outstanding leaks that one record, at
-    /// most one per such drop, so an APC the SCM already queued still finds live
-    /// memory at the thread's next alertable wait.
+    /// A record is freed only after its callback has run, so an APC the SCM
+    /// already queued still finds live memory at the thread's next alertable
+    /// wait. A record whose callback has not run when its registration goes is
+    /// leaked: one record per `NotifyServiceStatusChangeW` call that did not
+    /// settle, whether it was dropped while pending (a re-arm or the actor's
+    /// drop), failed, or answered `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`. The
+    /// LAGGING retry in `arm` has no cap, so its leak grows with the retries,
+    /// and only inside a loop that was already not terminating.
     pub struct SystemScmActor {
-        scm: SC_HANDLE,
-        service: SC_HANDLE,
+        /// `None` only after a `reopen` that failed part-way; every use then errs.
+        /// Declared before `registration` so the handles close first on drop.
+        handles: Option<Handles>,
         service_name: Vec<u16>,
         registration: Option<Registration<NotifyRecord>>,
         /// The state most recently awaited (for the debug trace).
@@ -246,24 +292,9 @@ mod system {
         /// Open the SCM + service handles with query/stop/start access.
         pub fn open(service_name: &str) -> io::Result<Self> {
             let name: Vec<u16> = service_name.encode_utf16().chain(std::iter::once(0)).collect();
-            let scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
-                .map_err(io::Error::other)?;
-            let service = match unsafe {
-                OpenServiceW(
-                    scm,
-                    PCWSTR(name.as_ptr()),
-                    SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START,
-                )
-            } {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = unsafe { CloseServiceHandle(scm) };
-                    return Err(io::Error::other(e));
-                }
-            };
+            let handles = Handles::open(&name)?;
             Ok(Self {
-                scm,
-                service,
+                handles: Some(handles),
                 service_name: name,
                 registration: None,
                 awaiting: WantState::Stopped,
@@ -276,40 +307,33 @@ mod system {
         /// client missed a notification: the handle's notify queue must be
         /// dropped and re-established.
         fn reopen(&mut self) -> io::Result<()> {
-            unsafe {
-                let _ = CloseServiceHandle(self.service);
-                let _ = CloseServiceHandle(self.scm);
-            }
-            self.scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
-                .map_err(io::Error::other)?;
-            self.service = unsafe {
-                OpenServiceW(
-                    self.scm,
-                    PCWSTR(self.service_name.as_ptr()),
-                    SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START,
-                )
-            }
-            .map_err(io::Error::other)?;
+            // Close first (the documented remedy), by taking the handles out so a
+            // failed open below leaves nothing for `Drop` to close again.
+            self.handles = None;
+            self.handles = Some(Handles::open(&self.service_name)?);
             Ok(())
+        }
+
+        /// The open service handle, or an error after a failed `reopen`.
+        fn service(&self) -> io::Result<SC_HANDLE> {
+            self.handles
+                .as_ref()
+                .map(|h| h.service.0)
+                .ok_or_else(|| io::Error::other("SCM handles closed by a failed reopen"))
         }
     }
 
-    impl Drop for SystemScmActor {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = CloseServiceHandle(self.service);
-                let _ = CloseServiceHandle(self.scm);
-            }
-            // `registration` drops with the fields: freed only if its callback has
-            // run, whatever the close did to a notification still outstanding.
-        }
-    }
+    // No `Drop` impl: the fields drop in order, `handles` then `registration`.
+    // The registration is freed only if its callback has run, whatever the close
+    // did to a notification still outstanding.
 
     impl super::ScmActor for SystemScmActor {
         fn arm(&mut self, want: WantState) -> io::Result<()> {
             self.awaiting = want;
             let mask = want_to_mask(want, self.started);
             loop {
+                // Before the record exists: a failure here registers nothing.
+                let service = self.service()?;
                 // A fresh record per call, adopted before the outcome is known:
                 // whatever the call did, the registration owns the record, and
                 // the one it replaces retires by `Registration`'s rule (a call
@@ -320,7 +344,7 @@ mod system {
                 registration.get().bind_context();
                 let buffer = registration.get().buffer();
                 self.registration = Some(registration);
-                let rc = unsafe { NotifyServiceStatusChangeW(self.service, mask, buffer) };
+                let rc = unsafe { NotifyServiceStatusChangeW(service, mask, buffer) };
                 if rc == 0 {
                     return Ok(());
                 }
@@ -334,7 +358,8 @@ mod system {
 
         fn control_stop(&mut self) -> io::Result<()> {
             let mut status = SERVICE_STATUS::default();
-            match unsafe { ControlService(self.service, SERVICE_CONTROL_STOP, &mut status) } {
+            let service = self.service()?;
+            match unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut status) } {
                 Ok(()) => Ok(()),
                 // The service stopped between the caller's early-return query and
                 // this control. The STOPPED arm has already queued the
@@ -355,7 +380,9 @@ mod system {
         }
 
         fn start(&mut self) -> io::Result<()> {
-            let r = unsafe { StartServiceW(self.service, None) }.map_err(io::Error::other);
+            let r = self
+                .service()
+                .and_then(|service| unsafe { StartServiceW(service, None) }.map_err(io::Error::other));
             // Mark started even if StartServiceW errored: the two-phase arm keys on
             // "start was attempted", and the caller propagates the error anyway.
             self.started = true;
