@@ -13,32 +13,36 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::tauri_context_gating_tests::gated_mentions;
+
 const FORBIDDEN_MACRO: &str = "generate_context";
 const REQUIRED_MACRO: &str = "tauri_build_context";
 
 /// How often a source names a macro, counted over its token stream.
 #[derive(Debug, PartialEq, Eq)]
-struct Mentions {
+pub(crate) struct Mentions {
     /// Every identifier equal to the macro's name: an invocation, a path to it,
     /// a `use` of it (renamed or not), a `macro_rules!` of that name.
-    named: usize,
-    /// The subset directly followed by `!`.
-    invoked: usize,
+    pub(crate) named: usize,
+    pub(crate) invoked: usize,
 }
 
-/// Count the identifiers named `name` in `source`, descending into every group,
-/// so a call inside another macro's body (`vec![..]`, `cfg_if!{..}`, a
-/// `macro_rules!` body) is seen: syn does not parse those bodies. Comments,
-/// doc comments and string literals are not identifiers. `origin` names the
-/// file in the error when `source` does not lex.
-fn mentions_in(source: &str, name: &str, origin: &Path) -> Result<Mentions, String> {
-    use proc_macro2::{Spacing, TokenStream, TokenTree};
+/// Whether `ident` is `name`, however it is spelled: `r#name` is the same
+/// identifier, so `tauri::r#generate_context!()` invokes the macro too.
+pub(crate) fn ident_is(ident: &proc_macro2::Ident, name: &str) -> bool {
+    let text = ident.to_string();
+    text.strip_prefix("r#").unwrap_or(&text) == name
+}
 
-    fn walk(stream: TokenStream, name: &str, found: &mut Mentions) {
+/// Count the identifiers named `name` in `stream`, descending into every group.
+pub(crate) fn mentions_of(stream: proc_macro2::TokenStream, name: &str) -> Mentions {
+    use proc_macro2::{Spacing, TokenTree};
+
+    fn walk(stream: proc_macro2::TokenStream, name: &str, found: &mut Mentions) {
         let mut tokens = stream.into_iter().peekable();
         while let Some(tree) = tokens.next() {
             match tree {
-                TokenTree::Ident(ident) if ident == name => {
+                TokenTree::Ident(ident) if ident_is(&ident, name) => {
                     found.named += 1;
                     let bang = matches!(tokens.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '!' && p.spacing() == Spacing::Alone);
                     found.invoked += usize::from(bang);
@@ -49,10 +53,19 @@ fn mentions_in(source: &str, name: &str, origin: &Path) -> Result<Mentions, Stri
         }
     }
 
-    let stream: TokenStream = source.parse().map_err(|e| format!("lex {}: {e}", origin.display()))?;
     let mut found = Mentions { named: 0, invoked: 0 };
     walk(stream, name, &mut found);
-    Ok(found)
+    found
+}
+
+/// Count the identifiers named `name` in `source`, so a call inside another
+/// macro's body (`vec![..]`, `cfg_if!{..}`, a `macro_rules!` body) is seen: syn
+/// does not parse those bodies. Comments, doc comments and string literals are
+/// not identifiers. `origin` names the file in the error when `source` does not
+/// lex.
+fn mentions_in(source: &str, name: &str, origin: &Path) -> Result<Mentions, String> {
+    let stream = source.parse().map_err(|e| format!("lex {}: {e}", origin.display()))?;
+    Ok(mentions_of(stream, name))
 }
 
 /// The `.rs` files cargo compiles for the workspace at `manifest`, sorted: for
@@ -94,18 +107,23 @@ fn first_party_sources(manifest: &Path) -> Vec<PathBuf> {
     found.into_iter().collect()
 }
 
-/// Where the context macros are named across `sources`.
+/// Where the context macros are named across `sources`. Both are counted by the
+/// same rule, once per mention of the name, so `use`-ing either is seen.
 struct Sites {
-    /// Every file naming the forbidden macro, once per mention.
+    /// Every file naming the forbidden macro.
     forbidden: Vec<PathBuf>,
-    /// Every file invoking the required macro, once per invocation.
+    /// Every file naming the required macro.
     required: Vec<PathBuf>,
+    /// The subset of `required` that is not an invocation compiled in on every
+    /// build: a `use`, a path, a `macro_rules!`, or an invocation under a `cfg`.
+    required_not_live: Vec<PathBuf>,
 }
 
 fn context_macro_sites(sources: &[PathBuf]) -> Sites {
     let mut sites = Sites {
         forbidden: Vec::new(),
         required: Vec::new(),
+        required_not_live: Vec::new(),
     };
     for path in sources {
         let source = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -118,9 +136,16 @@ fn context_macro_sites(sources: &[PathBuf]) -> Sites {
         sites
             .forbidden
             .extend(std::iter::repeat_n(path.clone(), scan(FORBIDDEN_MACRO).named));
+        let required = scan(REQUIRED_MACRO);
+        if required.named == 0 {
+            continue;
+        }
+        let gated = gated_mentions(&source, REQUIRED_MACRO, path).unwrap_or_else(|e| panic!("{e}"));
+        let live = required.invoked.saturating_sub(gated);
+        sites.required.extend(std::iter::repeat_n(path.clone(), required.named));
         sites
-            .required
-            .extend(std::iter::repeat_n(path.clone(), scan(REQUIRED_MACRO).invoked));
+            .required_not_live
+            .extend(std::iter::repeat_n(path.clone(), required.named - live));
     }
     sites
 }
@@ -172,6 +197,17 @@ fn an_invocation_inside_another_macros_body_is_counted() {
 }
 
 #[skuld::test]
+fn a_raw_identifier_spelling_is_counted() {
+    for (source, name) in [
+        ("fn f() { tauri::r#generate_context!(); }", "generate_context"),
+        ("fn f() { r#generate_context!(); }", "generate_context"),
+        ("fn f() { tauri::r#tauri_build_context!(); }", "tauri_build_context"),
+    ] {
+        assert_eq!(mentions(source, name), once_invoked(), "{source}");
+    }
+}
+
+#[skuld::test]
 fn a_renamed_import_is_counted() {
     // The renamed call site `ctx!()` does not repeat the name; the `use` does.
     let source = "use tauri::generate_context as ctx; fn f() { ctx!(); }";
@@ -206,26 +242,24 @@ fn a_source_that_does_not_lex_is_reported_with_its_path() {
 
 // Source discovery ----------------------------------------------------------------------------------------------------
 
-/// A one-member workspace in a temp dir, plus the files that must not count:
-/// a copy of the tree with no `.git` (`cp -R`, a tarball), a stray `.rs` at the
-/// root, and a stray `.rs` inside the member but outside its target trees. Every
-/// file is named after what it holds so the assertions read as a list.
+/// A one-member workspace in a temp dir.
 struct Fixture {
     root: tempfile::TempDir,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_member_manifest("[package]\nname = \"a\"\nversion = \"0.0.0\"\nedition = \"2021\"\n")
+    }
+
+    fn with_member_manifest(member: &str) -> Self {
         let root = tempfile::tempdir().expect("tempdir");
         let fixture = Fixture { root };
         fixture.write(
             "Cargo.toml",
             "[workspace]\nmembers = [\"crates/a\"]\nresolver = \"2\"\n",
         );
-        fixture.write(
-            "crates/a/Cargo.toml",
-            "[package]\nname = \"a\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
-        );
+        fixture.write("crates/a/Cargo.toml", member);
         fixture
     }
 
@@ -252,17 +286,37 @@ fn only_a_members_target_trees_are_first_party_source() {
         fx.write("crates/a/build.rs", "fn main() {}"),
     ];
     expected.sort();
-    // Not part of any build: a copy of the tree (no `.git`), a linked worktree
-    // and a clone (with one), stray files at the root and inside the member.
-    fx.write("copy/crates/a/src/lib.rs", "");
-    fx.write("copy/crates/a/Cargo.toml", "");
-    fx.write("wt/.git", "gitdir: x");
-    fx.write("wt/crates/a/src/lib.rs", "");
-    fx.write("clone/.git/HEAD", "");
-    fx.write("clone/crates/a/src/lib.rs", "");
+    // Not part of any build: a stray file at the root and one inside the member.
     fx.write("old_main.rs", "");
     fx.write("crates/a/scratch/old.rs", "");
     fx.write("crates/a/target/debug/build/gen.rs", "");
+    // Cargo's behaviour, not this code's: a directory the workspace does not list
+    // (a copy of the tree, a nested checkout) is never in cargo's member list, so
+    // it is never scanned.
+    fx.write("copy/crates/a/src/lib.rs", "");
+
+    assert_eq!(first_party_sources(&fx.manifest()), expected);
+}
+
+#[skuld::test]
+fn examples_benches_and_custom_path_targets_are_first_party_source() {
+    let fx = Fixture::with_member_manifest(
+        "[package]\nname = \"a\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+         [[test]]\nname = \"custom\"\npath = \"itests/main.rs\"\n\
+         [[bench]]\nname = \"speed\"\nharness = false\n\
+         [[bin]]\nname = \"tool\"\npath = \"tools/tool.rs\"\n",
+    );
+    let mut expected = vec![
+        fx.write("crates/a/src/lib.rs", ""),
+        fx.write("crates/a/examples/demo.rs", "fn main() {}"),
+        fx.write("crates/a/examples/dir_demo/main.rs", "fn main() {}"),
+        fx.write("crates/a/examples/dir_demo/helper.rs", ""),
+        fx.write("crates/a/benches/speed.rs", "fn main() {}"),
+        fx.write("crates/a/itests/main.rs", "mod support;"),
+        fx.write("crates/a/itests/support.rs", ""),
+        fx.write("crates/a/tools/tool.rs", "fn main() {}"),
+    ];
+    expected.sort();
 
     assert_eq!(first_party_sources(&fx.manifest()), expected);
 }
@@ -280,31 +334,83 @@ fn a_call_in_a_members_nested_module_is_caught_and_one_in_a_copy_is_not() {
     assert!(found.required.is_empty());
 }
 
+#[skuld::test]
+fn only_a_live_invocation_satisfies_the_required_macro() {
+    let main_rs = |source| {
+        let fx = Fixture::new();
+        fx.write("crates/a/src/lib.rs", source);
+        let found = context_macro_sites(&first_party_sources(&fx.manifest()));
+        let lib = fx.root.path().join("crates/a/src/lib.rs");
+        (
+            found.required == vec![lib.clone()],
+            found.required_not_live == vec![lib],
+        )
+    };
+    // (a single mention, and it is not live)
+    assert_eq!(main_rs("fn f() { tauri::tauri_build_context!(); }"), (true, false));
+    for source in [
+        "#[cfg(any())] fn f() { tauri::tauri_build_context!(); }",
+        "fn f() { #[cfg(any())] tauri::tauri_build_context!(); }",
+        "use tauri::tauri_build_context;",
+        "macro_rules! tauri_build_context { () => {}; }",
+    ] {
+        assert_eq!(main_rs(source), (true, true), "{source}");
+    }
+}
+
+#[skuld::test]
+fn a_second_mention_of_the_required_macro_is_counted() {
+    let fx = Fixture::new();
+    let lib = fx.write(
+        "crates/a/src/lib.rs",
+        "use tauri::tauri_build_context; fn f() { tauri_build_context!(); }",
+    );
+    let found = context_macro_sites(&first_party_sources(&fx.manifest()));
+    assert_eq!(found.required, vec![lib.clone(), lib]);
+}
+
 // Workspace -----------------------------------------------------------------------------------------------------------
 
 /// `repo_root()` rather than `env!("CARGO_MANIFEST_DIR")`: this binary runs
 /// from a nextest archive under `--workspace-remap`, where the build-time path
 /// does not exist.
+///
+/// This pins the macro spelling, not the property it exists for (a second
+/// cargo command finds `hole` fresh): the CI platform job's no-compile gate
+/// (`.github/scripts/fail-on-compile.sh`) fails any recompile after the build
+/// step, on a fresh `OUT_DIR`, on every leg. The scan reads each target's
+/// directory tree (just the root file when it sits beside the manifest); a file
+/// pulled in from outside it (`#[path]`, `include!`, a module of a root file
+/// beside the manifest) is not read.
 #[skuld::test]
 fn the_tauri_context_comes_from_the_build_script() {
     let root = crate::repo_root().expect("repo root");
     let main_rs = root.join("crates").join("hole").join("src").join("main.rs");
 
-    let Sites { forbidden, required } = context_macro_sites(&first_party_sources(&root.join("Cargo.toml")));
+    let Sites {
+        forbidden,
+        required,
+        required_not_live,
+    } = context_macro_sites(&first_party_sources(&root.join("Cargo.toml")));
 
     assert!(
         forbidden.is_empty(),
         "`{FORBIDDEN_MACRO}` is named at {forbidden:?} (an invocation, a path or a `use`); the macro writes OUT_DIR assets during its \
-         own unit's compile and leaves that unit stale for the next cargo command \
-         (bindreams/hole#1087). Generate the context in crates/hole/build.rs and use \
-         `tauri::{REQUIRED_MACRO}!()`"
+         own unit's compile and leaves that unit stale for the next cargo command (bindreams/hole#1087). Generate the context in \
+         crates/hole/build.rs and use `tauri::{REQUIRED_MACRO}!()`"
     );
     // The scan's own precondition: it read the file the guard is about. A
     // guard that reads nothing passes forever.
     assert_eq!(
         required,
         vec![main_rs.clone()],
-        "`tauri::{REQUIRED_MACRO}!()` must appear exactly once, in {}",
+        "`{REQUIRED_MACRO}` must be named exactly once, in {}",
+        main_rs.display()
+    );
+    assert!(
+        required_not_live.is_empty(),
+        "`{REQUIRED_MACRO}` in {} must be an invocation that is compiled in on every build, not a `use`, a \
+         `macro_rules!` or an invocation under a `cfg`: without it the unit has no context",
         main_rs.display()
     );
 }

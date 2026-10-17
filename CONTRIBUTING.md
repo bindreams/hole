@@ -2640,9 +2640,7 @@ cargo xtask run hole-tests   # canonical local nextest invocation
 The `hole` crate defaults to `tauri/custom-protocol` (**production mode**:
 `cfg(dev) = false`, webview loads bundled `tauri.localhost`, and `hole`'s build
 script, which generates the Tauri context, embeds `ui/dist/` and fails the
-build if it's missing, for the lib as well as the bin; the error names the
-directory and the remedies: build the frontend, or create an empty gitignored
-`ui/dist` for checks that don't run the GUI). With `--no-default-features`
+build if it's missing, for the lib as well as the bin). With `--no-default-features`
 (**dev mode**) the webview loads Vite's `http://localhost:1420` and `ui/dist/` is
 not required, though a dev build still recompiles `hole` once after `ui/dist`
 changes: tauri-build 2.7.1 always watches `frontendDist`. Production is

@@ -11,6 +11,7 @@
 
 pub mod asset;
 pub mod bindir;
+pub mod frontend_dist;
 pub mod repo_root;
 
 #[cfg(feature = "version")]
@@ -32,6 +33,10 @@ mod ex_ray_version_tests;
 #[cfg(test)]
 #[path = "asset_tests.rs"]
 mod asset_tests;
+
+#[cfg(test)]
+#[path = "frontend_dist_tests.rs"]
+mod frontend_dist_tests;
 
 #[cfg(test)]
 #[path = "repo_root_tests.rs"]

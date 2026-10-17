@@ -99,6 +99,10 @@ dunce = "1"
 # `generate_context` and `tauri_build_context!()`, so comments and strings are
 # not matches and macro bodies are searched. Already in the graph (same major).
 proc-macro2 = "1"
+# The same test's cfg-gating scan parses `main.rs` (items, statements, expressions)
+# to find the attributes that enclose an invocation. Also already in the graph.
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2" # raise()/kill() + SIGINT in signal tests
