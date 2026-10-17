@@ -2853,7 +2853,10 @@ and a rerun repeats the platform's whole job.
   `hole-verify-*` steps and the `hole-test-*` lanes) runs under
   `.github/scripts/fail-on-compile.sh`, which fails the step if cargo prints a
   `Compiling` line or cannot tell (a log it cannot write or scan), with
-  `CARGO_LOG` set so the log says why each unit was dirty. The causes found
+  `CARGO_LOG` set so the log says why each unit was dirty. A gated xtask step
+  runs `cargo run --package xtask --`, not the `cargo xtask` alias, whose
+  `--quiet` hides the `Compiling` line; xtask lets a `cargo nextest list` child's
+  stderr through for the same reason. The causes found
   when it was introduced: `cargo xtask` leaked `cargo run`'s
   `CARGO_MANIFEST_DIR` to its children, whose `ring` build script hashes it
   (xtask now strips the injected variables from its own environment at startup,

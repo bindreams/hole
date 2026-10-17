@@ -2,6 +2,7 @@
 
 use crate::child_env::is_run_injected;
 use crate::test_child::MODE_ENV;
+use std::path::PathBuf;
 
 #[skuld::test]
 fn the_package_environment_cargo_run_injects_is_recognized() {
@@ -115,11 +116,15 @@ fn main_strips_before_anything_else_runs() {
     assert_eq!(first_statement, "xtask::child_env::strip_run_injected();");
 }
 
-/// Run a copy of this binary, placed outside the repository (a `CARGO_TARGET_DIR`
-/// or `build.target-dir` elsewhere), in `strip-then-repo-root` mode from a
-/// directory outside it too, with `CARGO_MANIFEST_DIR` set as `cargo run` sets it.
-fn repo_root_from_a_binary_outside_the_repo(manifest_dir: Option<&std::path::Path>) -> std::process::Output {
-    let outside = tempfile::tempdir().expect("tempdir");
+/// Run a copy of this binary, placed in a throwaway workspace of its own (stand-in
+/// for a `CARGO_TARGET_DIR` or `build.target-dir` elsewhere), in
+/// `strip-then-repo-root` mode from there too, with `CARGO_MANIFEST_DIR` set as
+/// `cargo run` sets it. Returns the root the copy found.
+///
+/// The throwaway workspace has its own manifest, so the walk up from the copy
+/// stops there wherever `TMPDIR` points, even inside this repository.
+fn repo_root_from_a_binary_outside_the_repo(manifest_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+    let outside = fake_workspace();
     let exe = outside
         .path()
         .join(std::env::current_exe().expect("current_exe").file_name().unwrap());
@@ -131,7 +136,16 @@ fn repo_root_from_a_binary_outside_the_repo(manifest_dir: Option<&std::path::Pat
         // The test runner has its own; the control must not inherit it.
         None => cmd.env_remove("CARGO_MANIFEST_DIR"),
     };
-    cmd.output().expect("spawn the copied binary")
+    let out = cmd.output().expect("spawn the copied binary");
+    assert!(
+        out.status.success(),
+        "{:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let found = PathBuf::from(String::from_utf8(out.stdout).expect("utf-8 path").trim());
+    assert!(found.is_dir(), "{found:?}");
+    found.canonicalize().expect("found root exists")
 }
 
 /// `cargo run` tells the program where its crate is, and the strip removes that
@@ -142,23 +156,99 @@ fn the_workspace_root_is_found_after_the_strip_when_the_binary_lives_outside_the
     let xtask_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let expected = xtask_dir.parent().expect("the xtask crate sits in the workspace");
 
-    // Control: with no `CARGO_MANIFEST_DIR` to start from, the copy cannot find the
-    // repository from where it lives, so the next assertion proves the pin.
+    // Control: with no `CARGO_MANIFEST_DIR` to start from, the copy can only find
+    // the workspace it sits in, so the next assertion proves the pin.
     let control = repo_root_from_a_binary_outside_the_repo(None);
-    assert!(!control.status.success(), "control found a root: {control:?}");
+    assert_ne!(control, expected.canonicalize().expect("expected root exists"));
 
-    let out = repo_root_from_a_binary_outside_the_repo(Some(xtask_dir));
+    let found = repo_root_from_a_binary_outside_the_repo(Some(xtask_dir));
+    assert_eq!(found, expected.canonicalize().expect("expected root exists"));
+}
+
+/// A workspace root the test creates: a directory with a `[workspace]` manifest.
+fn fake_workspace() -> tempfile::TempDir {
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::write(ws.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("write manifest");
+    ws
+}
+
+/// Launch a copy of this binary at `exe_dir/<name>` as a `process:` step run
+/// from `step_root`, the way `cargo xtask run hole` launches dev-console, in the
+/// mode that reports the root the lookup dev-console uses finds. Returns it.
+fn root_found_by_a_step_launched_binary(exe_dir: &std::path::Path, step_root: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(exe_dir).expect("create the binary's dir");
+    let exe = exe_dir.join(std::env::current_exe().expect("current_exe").file_name().unwrap());
+    std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the binary");
+    let out = tempfile::tempdir().expect("tempdir");
+    let out_file = out.path().join("root.txt");
+    let step = crate::manifest::Step::Process {
+        args: vec![exe.to_string_lossy().into_owned()],
+        environment: [
+            (MODE_ENV.to_string(), "strip-then-handed-down-root".to_string()),
+            (
+                crate::test_child::OUT_ENV.to_string(),
+                out_file.to_string_lossy().into_owned(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    crate::orchestrate::run_step(&step, step_root).expect("the step runs");
+    PathBuf::from(
+        std::fs::read_to_string(&out_file)
+            .expect("the child reported a root")
+            .trim(),
+    )
+}
+
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.canonicalize().expect("exists") == b.canonicalize().expect("exists")
+}
+
+/// `cargo xtask run hole` launches dev-console as a `process:` step whose
+/// working directory is the root xtask pinned before stripping
+/// `CARGO_MANIFEST_DIR`. The child's own lookup must honour that directory when
+/// its binary does not live under the workspace (a `target/` that is a symlink
+/// out of it resolves to its canonical path on Linux).
+#[skuld::test]
+fn a_step_launched_binary_outside_the_workspace_finds_the_root_it_was_launched_from() {
+    let ws = fake_workspace();
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let found = root_found_by_a_step_launched_binary(&elsewhere.path().join("bin"), ws.path());
     assert!(
-        out.status.success(),
-        "{:?}\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+        same_dir(&found, ws.path()),
+        "found {found:?}, launched from {:?}",
+        ws.path()
     );
-    let found = String::from_utf8(out.stdout).expect("utf-8 path");
-    assert_eq!(
-        std::path::Path::new(found.trim())
-            .canonicalize()
-            .expect("found root exists"),
-        expected.canonicalize().expect("expected root exists")
+}
+
+/// The launch directory is the pin; the binary's location is the fallback. A
+/// binary under a different workspace (a `target/` symlinked into another
+/// checkout) must not override it.
+#[skuld::test]
+fn a_step_launched_binary_prefers_the_launch_directory_over_the_workspace_it_sits_in() {
+    let launched_from = fake_workspace();
+    let sits_in = fake_workspace();
+    let found =
+        root_found_by_a_step_launched_binary(&sits_in.path().join("target").join("debug"), launched_from.path());
+    assert!(
+        same_dir(&found, launched_from.path()),
+        "found {found:?}, launched from {:?}",
+        launched_from.path()
+    );
+}
+
+/// dev-console must use that lookup; the plain one prefers the binary's location.
+#[skuld::test]
+fn dev_console_looks_the_root_up_by_the_launch_directory() {
+    let src = std::fs::read_to_string(
+        crate::repo_root()
+            .expect("repo root")
+            .join("crates/dev-console/src/supervise.rs"),
+    )
+    .expect("read supervise.rs");
+    assert!(
+        src.contains("xtask_lib::repo_root::repo_root_from_launch_dir()"),
+        "dev-console's run() must call repo_root_from_launch_dir"
     );
 }

@@ -46,7 +46,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use indexmap::IndexMap;
@@ -463,15 +463,18 @@ pub(crate) fn run_nextest_list(
         }
     }
 
+    // stderr is inherited, not captured: `nextest list` builds stale test
+    // binaries, and cargo's `Compiling` lines must reach the step's log for the
+    // CI no-compile gate (`.github/scripts/fail-on-compile.sh`) to see them.
     let output = command
+        .stderr(Stdio::inherit())
         .output()
         .with_context(|| format!("running `{}`", list_command.join(" ")))?;
     if !output.status.success() {
         bail!(
-            "`{}` (SKULD_LABELS={skuld_labels:?}) failed: {}\n{}",
+            "`{}` (SKULD_LABELS={skuld_labels:?}) failed: {} (its stderr is in the log above)",
             list_command.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            output.status
         );
     }
     matching_test_names(&String::from_utf8_lossy(&output.stdout))

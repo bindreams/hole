@@ -528,3 +528,23 @@ fn ci_hole_lanes_form_a_complementary_label_pair() {
     let (off, on) = pick_complementary_pair(&candidates).expect("complementary pair");
     assert_eq!((off.label_value.as_str(), on.label_value.as_str()), ("!tun", "tun"));
 }
+
+/// The CI no-compile gate (`.github/scripts/fail-on-compile.sh`) reads the
+/// step's own stdout and stderr, so a `Compiling` line cargo prints to a
+/// captured child's stderr is invisible to it unless xtask forwards it. The
+/// child here is a stand-in that prints one to stderr and a valid listing to
+/// stdout, as a stale `cargo nextest list` does.
+#[skuld::test]
+#[allow(clippy::disallowed_methods)] // dev tooling, never privileged
+fn a_nextest_list_childs_stderr_reaches_the_step_log_on_success() {
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .env(crate::test_child::MODE_ENV, "forward-nextest-list")
+        .output()
+        .expect("spawn the process under test");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{:?}\n{stderr}", out.status);
+    assert!(
+        stderr.contains("Compiling stand-in v0.0.0"),
+        "the child's stderr never reached xtask's own: {stderr:?}"
+    );
+}
