@@ -194,7 +194,7 @@ jobs:
     steps:
       - run: cargo nextest run -p other
 ";
-    let cmds = ci_run_commands_for_job(ci, &fixture_manifest(), "one").expect("scope to job one");
+    let cmds = ci_run_commands_for_job(ci, &fixture_manifest(), "one", None).expect("scope to job one");
     assert_eq!(cmds, vec!["cargo nextest run -p direct".to_string()]);
 }
 
@@ -208,14 +208,47 @@ jobs:
     steps:
       - run: cargo xtask run foo-tests
 ";
-    let cmds = ci_run_commands_for_job(ci, &fixture_manifest(), "e2e").expect("resolve xtask run target");
+    let cmds = ci_run_commands_for_job(ci, &fixture_manifest(), "e2e", None).expect("resolve xtask run target");
     assert_eq!(cmds, vec!["cargo nextest run -p foo".to_string()]);
 }
 
 #[skuld::test]
 fn ci_run_commands_for_job_errors_on_unknown_job() {
     let ci = "jobs:\n  other:\n    steps: []\n";
-    assert!(ci_run_commands_for_job(ci, &fixture_manifest(), "test-hole").is_err());
+    assert!(ci_run_commands_for_job(ci, &fixture_manifest(), "test-hole", None).is_err());
+}
+
+// ===== step_prefix ===================================================================================================
+
+/// One job holds an archive lane (no `SKULD_LABELS`, its own `-E`) beside the
+/// `hole-` lanes; the prefix must keep the audit on the latter.
+const PREFIXED_CI: &str = r"
+jobs:
+  ci:
+    steps:
+      - id: test-garter
+        run: cargo nextest run -p archived
+      - id: hole-test-non-tun
+        run: cargo nextest run -p scoped
+";
+
+#[skuld::test]
+fn step_prefix_scopes_commands_to_matching_step_ids() {
+    let cmds = ci_run_commands_for_job(PREFIXED_CI, &fixture_manifest(), "ci", Some("hole-")).expect("scope");
+    assert_eq!(cmds, vec!["cargo nextest run -p scoped".to_string()]);
+}
+
+#[skuld::test]
+fn no_step_prefix_keeps_every_step() {
+    let cmds = ci_run_commands_for_job(PREFIXED_CI, &fixture_manifest(), "ci", None).expect("all steps");
+    assert_eq!(cmds.len(), 2);
+}
+
+/// A renamed step id must not turn the audit into a vacuous pass.
+#[skuld::test]
+fn an_unknown_prefix_is_an_error_not_an_empty_pass() {
+    let err = ci_run_commands_for_job(PREFIXED_CI, &fixture_manifest(), "ci", Some("nope-")).unwrap_err();
+    assert!(err.to_string().contains("nope-"), "unexpected error: {err}");
 }
 
 // ===== Structural conformance: every workspace crate runs in CI ======================================================

@@ -8,6 +8,8 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 
 pub const MODE_ENV: &str = "XTASK_TEST_CHILD";
+/// File the `strip-then-handed-down-root` mode writes the root it found to.
+pub const OUT_ENV: &str = "XTASK_TEST_OUT";
 pub const CONTROL_ENV: &str = "XTASK_TEST_CONTROL";
 /// Grandchild's clean-release exit code (shared so the test can't drift).
 pub const CHILD_RELEASE_EXIT: i32 = 42;
@@ -20,6 +22,12 @@ pub fn maybe_run() {
     match mode.as_str() {
         "interrupt-parent" => run_interrupt_parent(),
         "interrupt-child" => run_interrupt_child(),
+        "list-env" => list_env(),
+        "strip-then-list-env-in-child" => strip_then_list_env_in_child(),
+        "strip-then-repo-root" => strip_then_repo_root(),
+        "strip-then-handed-down-root" => strip_then_handed_down_root(),
+        "forward-nextest-list" => forward_nextest_list(),
+        "emit-compiling-stderr" => emit_compiling_stderr(),
         other => {
             eprintln!("unknown {MODE_ENV} mode: {other}");
             std::process::exit(2);
@@ -91,4 +99,74 @@ fn run_interrupt_child() -> ! {
             Err(_) => std::process::exit(CHILD_ERROR_EXIT),
         }
     }
+}
+
+/// Print the name of every variable this process has, one per line.
+fn list_env() -> ! {
+    for (name, _) in std::env::vars_os() {
+        println!("{}", name.to_string_lossy());
+    }
+    std::process::exit(0);
+}
+
+/// Strip the way `main` does, then report what a spawned child inherits.
+fn strip_then_list_env_in_child() -> ! {
+    crate::child_env::strip_run_injected();
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .env(MODE_ENV, "list-env")
+        .output()
+        .expect("spawn child");
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    std::process::exit(i32::from(!out.status.success()));
+}
+
+/// Strip the way `main` does, then locate the workspace the way every subcommand does.
+fn strip_then_repo_root() -> ! {
+    crate::child_env::strip_run_injected();
+    match crate::repo_root() {
+        Ok(root) => {
+            println!("{}", root.display());
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run `run_nextest_list` against a stand-in listing child (this binary in
+/// `emit-compiling-stderr` mode), so the test can read what reaches this
+/// process's own stderr.
+fn forward_nextest_list() -> ! {
+    std::env::set_var(MODE_ENV, "emit-compiling-stderr");
+    let exe = std::env::current_exe()
+        .expect("current_exe")
+        .to_string_lossy()
+        .into_owned();
+    let root = crate::repo_root().expect("repo root");
+    match crate::skuld_label_coverage::run_nextest_list(&root, &[exe], None) {
+        Ok(_) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// What a stale `cargo nextest list` does: `Compiling` on stderr, JSON on stdout.
+fn emit_compiling_stderr() -> ! {
+    eprintln!("   Compiling stand-in v0.0.0");
+    println!(r#"{{"rust-suites":{{}}}}"#);
+    std::process::exit(0);
+}
+
+/// Strip the way `main` does, then look the root up the way dev-console does,
+/// and write it to the file named by [`OUT_ENV`].
+fn strip_then_handed_down_root() -> ! {
+    crate::child_env::strip_run_injected();
+    let root = xtask_lib::repo_root::repo_root_from_launch_dir().expect("a root");
+    let out = std::env::var_os(OUT_ENV).expect("out env");
+    std::fs::write(out, root.to_string_lossy().as_bytes()).expect("write the root");
+    std::process::exit(0);
 }

@@ -21,6 +21,31 @@ pub fn repo_root() -> Result<PathBuf> {
     repo_root_from(exe.parent().unwrap_or(Path::new("/")))
 }
 
+/// [`repo_root`] for a binary a build driver launches: `CARGO_MANIFEST_DIR`,
+/// then the working directory, then the executable's location.
+///
+/// `cargo xtask run hole` starts dev-console with the root it resolved as the
+/// working directory, and strips `CARGO_MANIFEST_DIR` from the environment it
+/// hands on. A walk up from the executable cannot stand in for that: where
+/// `target/` is a symlink out of the workspace, `current_exe` is the canonical
+/// path (on Linux) and the walk-up never meets the workspace, or meets a
+/// different one. The launch directory is the handoff; the executable is the
+/// fallback for a standalone run from outside any workspace.
+pub fn repo_root_from_launch_dir() -> Result<PathBuf> {
+    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        if let Ok(root) = repo_root_from(Path::new(&manifest_dir)) {
+            return Ok(root);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(root) = repo_root_from(&cwd) {
+            return Ok(root);
+        }
+    }
+    let exe = std::env::current_exe().context("current_exe")?;
+    repo_root_from(exe.parent().unwrap_or(Path::new("/")))
+}
+
 /// Walk-up core, separated for tests.
 pub fn repo_root_from(start: &Path) -> Result<PathBuf> {
     let mut dir = start.to_path_buf();

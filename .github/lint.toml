@@ -1,0 +1,12 @@
+# Prek hooks whose verdict depends on the machine that runs them. CI runs these
+# on every platform; every other hook in prek.toml runs once (linux/amd64).
+# `cargo xtask prek portable` and `cargo xtask prek platform-dependent` derive the
+# two runs from this list; an id that prek.toml does not have is an error.
+#
+# go-lint: golangci-lint type-checks packages under the host's GOOS. Measured on
+# darwin 2026-10-16: with a self-assignment appended to keepalive_windows.go,
+# `golangci-lint run` reported 0 issues, and GOOS=windows reported the finding,
+# so a `_windows`/`_linux`/`_darwin` file is linted only on its own platform.
+# (go-fmt reads files and applies no build tags: it flagged a line appended to
+# both keepalive_windows.go and keepalive_linux.go, so it is portable.)
+platform-dependent = ["go-lint"]

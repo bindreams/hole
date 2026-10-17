@@ -3,7 +3,9 @@
 
 use std::fs;
 
-use crate::ci_nextest_parity::{target_nextest_run, test_job};
+use crate::ci_nextest_parity::{
+    post_build_cargo_launches, quiet_post_build_cargo_steps, target_nextest_run, test_job, NO_COMPILE_GATE,
+};
 use crate::manifest::Manifest;
 
 // ===== test_job ======================================================================================================
@@ -27,7 +29,7 @@ jobs:
           cargo nextest run --no-default-features \\
             -E 'package(a) + package(b)'
 ";
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     let cmds: Vec<&str> = job.runs.iter().map(|(_, c)| c.as_str()).collect();
     assert_eq!(
         cmds,
@@ -47,11 +49,12 @@ fn a_sudo_env_prefix_is_stripped() {
 jobs:
   j:
     steps:
-      - run: cargo xtask build tests
+      - id: hole-build
+        run: cargo xtask build tests
       - name: root
         run: sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun cargo nextest run -E 'package(a)'
 "#;
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(
         job.runs,
         vec![("root".into(), "cargo nextest run -E 'package(a)'".into())]
@@ -70,7 +73,7 @@ jobs:
       - name: s
         run: cargo nextest run --config-file=x.toml -E 'package(a)'
 ";
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(job.runs[0].1, "cargo nextest run --config-file=x.toml -E 'package(a)'");
 }
 
@@ -87,7 +90,7 @@ jobs:
       - name: build
         run: cargo nextest run --no-run -E 'package(a)'
 ";
-    assert!(test_job(ci, "j").expect("analyze").runs.is_empty());
+    assert!(test_job(ci, "j", None).expect("analyze").runs.is_empty());
 }
 
 /// Several nextest runs in one `run:` block each get their own entry rather than
@@ -104,7 +107,7 @@ jobs:
           cargo nextest run -E 'package(a)'
           cargo nextest run -E 'package(b)'
 ";
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(job.runs.len(), 2);
     assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
     assert_eq!(job.runs[1].1, "cargo nextest run -E 'package(b)'");
@@ -122,7 +125,7 @@ jobs:
         run: cargo nextest run -E 'package(a)'
       - run: cargo nextest run -E 'package(b)'
 ";
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(job.runs[0].0, "has-id");
     assert_eq!(job.runs[1].0, "steps[2]");
 }
@@ -138,7 +141,7 @@ jobs:
       - run: cargo xtask build tests
       - run: cargo nextest run -E 'package(a)'
 ";
-    assert_eq!(test_job(ci, "j").expect("analyze").target, "tests");
+    assert_eq!(test_job(ci, "j", None).expect("analyze").target, "tests");
 }
 
 /// Nothing ties the runs to a build.yaml target, so there is no defensible thing
@@ -151,7 +154,7 @@ jobs:
     steps:
       - run: cargo nextest run -E 'package(a)'
 ";
-    let err = test_job(ci, "j").unwrap_err();
+    let err = test_job(ci, "j", None).unwrap_err();
     assert!(
         format!("{err:#}").contains("no `cargo xtask"),
         "unexpected error: {err:#}"
@@ -168,13 +171,13 @@ jobs:
       - run: cargo xtask build other
       - run: cargo nextest run -E 'package(a)'
 ";
-    let err = test_job(ci, "j").unwrap_err();
+    let err = test_job(ci, "j", None).unwrap_err();
     assert!(format!("{err:#}").contains("ambiguous"), "unexpected error: {err:#}");
 }
 
 #[skuld::test]
 fn a_missing_job_is_an_error() {
-    let err = test_job("jobs:\n  j:\n    steps: []\n", "gone").unwrap_err();
+    let err = test_job("jobs:\n  j:\n    steps: []\n", "gone", None).unwrap_err();
     assert!(
         format!("{err:#}").contains("no job \"gone\""),
         "unexpected error: {err:#}"
@@ -222,7 +225,7 @@ jobs:
         (on_the_build_step, "\"CARGO_TARGET_DIR\""),
         (inline, "\"RUSTC_WRAPPER\""),
     ] {
-        let err = test_job(ci, "j").unwrap_err();
+        let err = test_job(ci, "j", None).unwrap_err();
         assert!(format!("{err:#}").contains(needle), "unexpected error: {err:#}");
     }
 }
@@ -240,7 +243,7 @@ jobs:
           SKULD_LABELS: "!tun"
         run: cargo nextest run -E 'package(a)'
 "#;
-    assert_eq!(test_job(ci, "j").expect("analyze").runs.len(), 1);
+    assert_eq!(test_job(ci, "j", None).expect("analyze").runs.len(), 1);
 }
 
 /// `NEXTEST_PROFILE` picks a per-lane nextest profile (bindreams/hole#999's
@@ -258,20 +261,114 @@ jobs:
           NEXTEST_PROFILE: non-tun
         run: cargo nextest run -E 'package(a)'
 "#;
-    assert_eq!(test_job(step_level, "j").expect("analyze").runs.len(), 1);
+    assert_eq!(test_job(step_level, "j", None).expect("analyze").runs.len(), 1);
 
     let inline = r#"
 jobs:
   j:
     steps:
-      - run: cargo xtask build tests
+      - id: hole-build
+        run: cargo xtask build tests
       - name: root
         run: sudo env "PATH=$PATH" "HOME=$HOME" NEXTEST_PROFILE=tun cargo nextest run -E 'package(a)'
 "#;
     assert_eq!(
-        test_job(inline, "j").expect("analyze").runs,
+        test_job(inline, "j", None).expect("analyze").runs,
         vec![("root".into(), "cargo nextest run -E 'package(a)'".into())]
     );
+}
+
+// ===== launch prefix: the no-compile gate and forwarded variables ====================================================
+
+/// The no-compile gate wraps the command, so it is a launcher like `sudo`: the
+/// compared text is what comes after it.
+#[skuld::test]
+fn the_no_compile_gate_is_stripped_and_reported() {
+    let ci = format!(
+        "
+jobs:
+  j:
+    steps:
+      - run: cargo xtask build tests
+      - name: plain
+        run: cargo nextest run -E 'package(a)'
+      - name: gated
+        run: {NO_COMPILE_GATE} cargo nextest run -E 'package(a)'
+"
+    );
+    let job = test_job(&ci, "j", None).expect("analyze");
+    assert_eq!(job.runs[0].1, job.runs[1].1);
+    assert!(!job.launches[0].1.gated);
+    assert!(job.launches[1].1.gated);
+}
+
+/// Under `sudo` the child's environment is whatever `env` is told, so the
+/// ambient value of a variable is forwarded by naming it. The child then sees
+/// what the compile step saw, which is the property this module guards.
+#[skuld::test]
+fn a_forwarded_variable_is_a_launcher_not_a_change() {
+    let ci = r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" cargo nextest run -E 'package(a)'
+"#;
+    let job = test_job(ci, "j", None).expect("analyze");
+    assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
+    let launch = &job.launches[0].1;
+    assert!(launch.privileged);
+    assert!(launch.forwarded.contains("CARGO_INCREMENTAL"));
+    assert!(
+        !launch.forwarded.contains("PATH"),
+        "PATH is neutral, not a forward of interest"
+    );
+}
+
+/// A literal value is a change (it can differ from what the compile step saw),
+/// and so is a value taken from another variable.
+#[skuld::test]
+fn a_set_or_renamed_variable_is_not_a_forward() {
+    for assignment in [
+        "CARGO_INCREMENTAL=0",
+        "CARGO_INCREMENTAL=$OTHER",
+        "RUSTFLAGS=${CARGO_INCREMENTAL}",
+    ] {
+        let ci = format!(
+            r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env "{assignment}" cargo nextest run -E 'package(a)'
+"#
+        );
+        let err = test_job(&ci, "j", None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("fingerprint-neutral"),
+            "{assignment}: {err:#}"
+        );
+    }
+}
+
+/// `${NAME}` is the same forward as `$NAME`.
+#[skuld::test]
+fn a_braced_forward_is_recognized() {
+    let ci = r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" cargo nextest run -E 'package(a)'
+"#;
+    let job = test_job(ci, "j", None).expect("analyze");
+    assert!(job.launches[0].1.forwarded.contains("CARGO_INCREMENTAL"));
 }
 
 // ===== target_nextest_run ============================================================================================
@@ -343,16 +440,271 @@ fn a_missing_target_is_an_error() {
     );
 }
 
+// ===== step_prefix ===================================================================================================
+
+#[skuld::test]
+fn test_job_ignores_xtask_steps_outside_the_prefix() {
+    let ci = r"
+jobs:
+  ci:
+    steps:
+      - id: test-plugin-e2e
+        run: cargo xtask run plugin-e2e-tests
+      - id: hole-build
+        run: cargo xtask build hole-tests
+      - id: hole-test
+        run: cargo nextest run -E 'package(a)'
+";
+    let job = test_job(ci, "ci", Some("hole-")).expect("analyze");
+    assert_eq!(job.target, "hole-tests");
+    assert_eq!(job.runs.len(), 1);
+
+    // Unscoped, the plugin step is a second compile target, as before.
+    let err = test_job(ci, "ci", None).unwrap_err();
+    assert!(format!("{err:#}").contains("builds both"), "unexpected error: {err:#}");
+}
+
+#[skuld::test]
+fn two_build_steps_inside_the_prefix_are_still_ambiguous() {
+    let ci = r"
+jobs:
+  ci:
+    steps:
+      - id: hole-build
+        run: cargo xtask build hole-tests
+      - id: hole-other
+        run: cargo xtask run other
+";
+    let err = test_job(ci, "ci", Some("hole-")).unwrap_err();
+    assert!(format!("{err:#}").contains("builds both"), "unexpected error: {err:#}");
+}
+
+#[skuld::test]
+fn an_unknown_prefix_is_an_error_not_an_empty_pass() {
+    let ci = "jobs:\n  ci:\n    steps:\n      - id: a\n        run: cargo xtask build t\n";
+    let err = test_job(ci, "ci", Some("hole-")).unwrap_err();
+    assert!(format!("{err:#}").contains("hole-"), "unexpected error: {err:#}");
+}
+
+// ===== post_build_cargo_launches =====================================================================================
+
+/// Every cargo command after the build step is a place cargo can compile, not
+/// just the nextest runs: `nextest list` builds test binaries too.
+#[skuld::test]
+fn a_cargo_xtask_step_after_the_build_is_reported_with_its_gate_state() {
+    let ci = "
+jobs:
+  j:
+    steps:
+      - name: before
+        run: cargo xtask run lint
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: gated
+        run: .github/scripts/fail-on-compile.sh cargo xtask verify-a
+      - name: bare
+        run: cargo xtask verify-b
+      - name: no cargo
+        run: echo done
+";
+    let launches = post_build_cargo_launches(ci, "j", "hole-").expect("analyze");
+    let got: Vec<(&str, bool)> = launches.iter().map(|(l, launch)| (l.as_str(), launch.gated)).collect();
+    assert_eq!(got, vec![("gated", true), ("bare", false)]);
+}
+
+/// A step that mentions cargo only after `sudo env …` is still a cargo step.
+#[skuld::test]
+fn a_privileged_cargo_step_after_the_build_is_reported() {
+    let ci = r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env "PATH=$PATH" cargo xtask verify-b
+"#;
+    let launches = post_build_cargo_launches(ci, "j", "hole-").expect("analyze");
+    assert_eq!(launches.len(), 1);
+    assert!(launches[0].1.privileged && !launches[0].1.gated);
+}
+
+/// Each cargo command of a multi-command step counts on its own.
+#[skuld::test]
+fn every_cargo_command_in_a_step_after_the_build_is_reported() {
+    let ci = "
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: two
+        run: |
+          .github/scripts/fail-on-compile.sh cargo xtask a
+          cargo xtask b
+";
+    let launches = post_build_cargo_launches(ci, "j", "hole-").expect("analyze");
+    let gated: Vec<bool> = launches.iter().map(|(_, l)| l.gated).collect();
+    assert_eq!(gated, vec![true, false]);
+}
+
+#[skuld::test]
+fn a_job_with_no_build_step_is_an_error_for_the_post_build_scan() {
+    let ci = "jobs:\n  j:\n    steps:\n      - run: cargo xtask verify\n";
+    let err = post_build_cargo_launches(ci, "j", "hole-").unwrap_err();
+    assert!(format!("{err:#}").contains("hole-"), "unexpected error: {err:#}");
+}
+
+// ===== quiet_post_build_cargo_steps ==================================================================================
+
+/// A job whose build step is followed by `steps`, each a `(name, run)` pair.
+fn job_with_steps(steps: &[(&str, &str)]) -> String {
+    let mut ci =
+        String::from("jobs:\n  j:\n    steps:\n      - id: hole-build\n        run: cargo xtask build tests\n");
+    for (name, run) in steps {
+        ci.push_str(&format!("      - name: {name}\n        run: {run}\n"));
+    }
+    ci
+}
+
+const QUIET_ALIAS_CONFIG: &str = "[alias]\nxtask = \"run --package xtask --quiet --\"\n";
+
+/// `--quiet` hides cargo's `Compiling` lines, the only thing the gate reads, so
+/// a gated step that runs through an alias carrying it can never fail the gate.
+#[skuld::test]
+fn a_step_through_an_alias_that_carries_quiet_is_reported() {
+    let ci = job_with_steps(&[("via alias", ".github/scripts/fail-on-compile.sh cargo xtask verify-a")]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", QUIET_ALIAS_CONFIG).expect("analyze");
+    assert_eq!(quiet, vec!["via alias"]);
+}
+
+#[skuld::test]
+fn an_alias_given_as_an_array_is_read_too() {
+    let config = "[alias]\nxtask = [\"run\", \"--package\", \"xtask\", \"-q\", \"--\"]\n";
+    let ci = job_with_steps(&[("via alias", ".github/scripts/fail-on-compile.sh cargo xtask verify-a")]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    assert_eq!(quiet, vec!["via alias"]);
+}
+
+/// An alias may name another alias; cargo expands until none is left.
+#[skuld::test]
+fn quiet_reached_through_a_chain_of_aliases_is_reported() {
+    let config = "[alias]\nx = \"xtask\"\nxtask = \"run --package xtask --quiet --\"\n";
+    let ci = job_with_steps(&[("chained", ".github/scripts/fail-on-compile.sh cargo x verify-a")]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    assert_eq!(quiet, vec!["chained"]);
+}
+
+/// An alias that names itself must end the walk, not loop it.
+#[skuld::test]
+fn a_self_referential_alias_terminates() {
+    let config = "[alias]\nloop = \"loop\"\n";
+    let ci = job_with_steps(&[("loops", ".github/scripts/fail-on-compile.sh cargo loop")]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    assert_eq!(quiet, Vec::<String>::new());
+}
+
+#[skuld::test]
+fn quiet_flags_on_the_command_line_are_reported() {
+    let ci = job_with_steps(&[
+        (
+            "long",
+            ".github/scripts/fail-on-compile.sh cargo run --package xtask --quiet -- verify-a",
+        ),
+        (
+            "short",
+            ".github/scripts/fail-on-compile.sh cargo run -q --package xtask -- verify-a",
+        ),
+        (
+            "cluster",
+            ".github/scripts/fail-on-compile.sh cargo run -qq --package xtask -- verify-a",
+        ),
+        (
+            "nextest",
+            ".github/scripts/fail-on-compile.sh cargo nextest run --cargo-quiet",
+        ),
+        (
+            "after the flag terminator",
+            ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a -q",
+        ),
+        (
+            "loud",
+            ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a",
+        ),
+    ]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "").expect("analyze");
+    // `-q` after `--` belongs to the program, not to cargo.
+    assert_eq!(quiet, vec!["long", "short", "cluster", "nextest"]);
+}
+
+/// `[term] quiet = true` quiets every cargo the repository runs.
+#[skuld::test]
+fn quiet_set_for_all_of_cargo_is_reported() {
+    let ci = job_with_steps(&[(
+        "plain",
+        ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a",
+    )]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "[term]\nquiet = true\n").expect("analyze");
+    assert_eq!(quiet, vec!["plain"]);
+}
+
+#[skuld::test]
+fn quiet_set_through_the_environment_is_reported() {
+    let ci = "
+env:
+  CARGO_TERM_QUIET: true
+jobs:
+  j:
+    env:
+      OTHER: 1
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: workflow level
+        run: cargo run --package xtask -- verify-a
+      - name: step level
+        env:
+          CARGO_TERM_QUIET: true
+        run: cargo run --package xtask -- verify-b
+";
+    let quiet = quiet_post_build_cargo_steps(ci, "j", "hole-", "").expect("analyze");
+    assert_eq!(quiet, vec!["workflow level", "step level"]);
+
+    let ci_job = ci
+        .replace("env:\n  CARGO_TERM_QUIET: true\njobs:", "jobs:")
+        .replace("OTHER: 1", "CARGO_TERM_QUIET: true");
+    let quiet = quiet_post_build_cargo_steps(&ci_job, "j", "hole-", "").expect("analyze");
+    assert_eq!(quiet, vec!["workflow level", "step level"]);
+}
+
+#[skuld::test]
+fn a_loud_step_and_an_unrelated_alias_are_not_reported() {
+    let config = "[alias]\nxtask = \"run --package xtask --quiet --\"\n";
+    let ci = job_with_steps(&[
+        (
+            "loud",
+            ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a",
+        ),
+        (
+            "lane",
+            ".github/scripts/fail-on-compile.sh cargo nextest run -E 'package(a)'",
+        ),
+        ("no cargo", "echo xtask --quiet"),
+    ]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    assert_eq!(quiet, Vec::<String>::new());
+}
+
 // ===== conformance ===================================================================================================
 
-/// Steps of `ci.yaml`'s `test-hole` job that we require to be nextest runs.
+/// `hole-` steps of `ci.yaml`'s `ci` job that we require to be nextest runs.
 const TEST_HOLE_RUN_STEPS: [&str; 3] = [
     "Test (non-TUN)",
-    "Test (TUN, runs last for #200)",
+    "Test (TUN, last test lane for #200)",
     "Test (TUN, macOS — root for pfctl)",
 ];
 
-/// Every nextest run in `ci.yaml`'s `test-hole` job invokes exactly the command
+/// Every nextest run in `ci.yaml`'s `hole-` steps invokes exactly the command
 /// build.yaml's `hole-tests` target runs — see [`crate::ci_nextest_parity`] for why.
 ///
 /// `hole-tests` is read off the job's build step rather than assumed, and pinned
@@ -365,10 +717,10 @@ fn ci_test_hole_steps_match_the_hole_tests_target() {
         .expect("parse build.yaml");
     let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
 
-    let job = test_job(&ci_yaml, "test-hole").expect("analyze ci.yaml");
+    let job = test_job(&ci_yaml, "ci", Some("hole-")).expect("analyze ci.yaml");
     assert_eq!(
         job.target, "hole-tests",
-        "ci.yaml test-hole now compiles a different build.yaml target"
+        "ci.yaml's hole- steps now compile a different build.yaml target"
     );
     let expected = target_nextest_run(&manifest, &job.target).expect("resolve the compiled target");
 
@@ -378,16 +730,104 @@ fn ci_test_hole_steps_match_the_hole_tests_target() {
     for step in TEST_HOLE_RUN_STEPS {
         assert!(
             labels.contains(&step),
-            "ci.yaml test-hole step {step:?} no longer resolves as a nextest run (found {labels:?})"
+            "ci.yaml hole- step {step:?} no longer resolves as a nextest run (found {labels:?})"
         );
     }
 
     for (label, cmd) in &job.runs {
         assert_eq!(
             cmd, &expected,
-            "ci.yaml test-hole step {label:?} must run exactly what build.yaml's {:?} target runs \
+            "ci.yaml hole- step {label:?} must run exactly what build.yaml's {:?} target runs \
              (see module docs for why)",
             job.target
         );
+    }
+}
+
+/// A step that compiles after `hole-build` is not re-executing what it built: on
+/// Windows a lane recompiled `hole`, `galoshes` and `garter-bin`, on macOS the
+/// root step recompiled twenty workspace crates as root. And a compile in a
+/// verify step masks drift: the lanes after it find fresh artifacts and pass.
+/// Every cargo command after the build therefore runs under the gate, which
+/// fails the step if cargo prints a `Compiling` line, so the property is checked
+/// on every run rather than remembered.
+#[skuld::test]
+fn every_cargo_step_after_hole_build_runs_under_the_no_compile_gate() {
+    // Guard the guard by MEMBERSHIP: a step renamed out of detection would leave
+    // the scan green while its gate state went unwatched.
+    const MUST_BE_SCANNED: [&str; 6] = [
+        "Verify SKULD_LABELS TUN/non-TUN partition",
+        "Verify global_net_state label matches the nextest.toml filter",
+        "Test (non-TUN)",
+        "Test (TUN, last test lane for #200)",
+        "Verify every global_net_state test executed (windows leg, #999)",
+        "Test (TUN, macOS — root for pfctl)",
+    ];
+    let root = crate::repo_root().expect("repo root");
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
+    let launches = post_build_cargo_launches(&ci_yaml, "ci", "hole-").expect("analyze ci.yaml");
+
+    let scanned: Vec<&str> = launches.iter().map(|(label, _)| label.as_str()).collect();
+    for step in MUST_BE_SCANNED {
+        assert!(
+            scanned.contains(&step),
+            "ci.yaml step {step:?} is no longer scanned as a cargo step after the build (found {scanned:?})"
+        );
+    }
+
+    let ungated: Vec<&str> = launches
+        .iter()
+        .filter(|(_, launch)| !launch.gated)
+        .map(|(label, _)| label.as_str())
+        .collect();
+    assert_eq!(
+        ungated,
+        Vec::<&str>::new(),
+        "these steps run cargo after hole-build and can compile without failing; start them with {NO_COMPILE_GATE}"
+    );
+    assert!(
+        root.join(NO_COMPILE_GATE).is_file(),
+        "{NO_COMPILE_GATE} is referenced by ci.yaml but missing"
+    );
+}
+
+/// The gate reads cargo's `Compiling` lines, and `--quiet` (here via the
+/// `cargo xtask` alias) is exactly what hides them: a quiet step recompiles and
+/// passes. Gated steps must therefore invoke cargo loudly.
+#[skuld::test]
+fn no_cargo_step_after_hole_build_hides_cargos_compiling_lines() {
+    let root = crate::repo_root().expect("repo root");
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
+    let cargo_config = fs::read_to_string(root.join(".cargo/config.toml")).expect("read .cargo/config.toml");
+    let quiet = quiet_post_build_cargo_steps(&ci_yaml, "ci", "hole-", &cargo_config).expect("analyze ci.yaml");
+    assert_eq!(
+        quiet,
+        Vec::<String>::new(),
+        "these steps run cargo quietly after hole-build, so the no-compile gate cannot see a compile; \
+         invoke `cargo run --package xtask --` instead of the quiet `cargo xtask` alias"
+    );
+}
+
+/// `sudo env` replaces the environment wholesale. `CARGO_INCREMENTAL` (set to 0
+/// by the toolchain action) is part of every workspace unit's profile, so a root
+/// step that drops it hashes each workspace crate differently and recompiles all
+/// of them (measured: 20 crates, as root). Variables dropped for the same reason
+/// belong in this list, each with its measurement.
+#[skuld::test]
+fn a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint() {
+    const MUST_FORWARD: [&str; 1] = ["CARGO_INCREMENTAL"];
+    let root = crate::repo_root().expect("repo root");
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
+    let job = test_job(&ci_yaml, "ci", Some("hole-")).expect("analyze ci.yaml");
+
+    let privileged: Vec<_> = job.launches.iter().filter(|(_, l)| l.privileged).collect();
+    assert!(!privileged.is_empty(), "no privileged lane found: the guard is vacuous");
+    for (label, launch) in privileged {
+        for var in MUST_FORWARD {
+            assert!(
+                launch.forwarded.contains(var),
+                "privileged lane {label:?} does not forward {var}: add \"{var}=${var}\" after `sudo env`"
+            );
+        }
     }
 }

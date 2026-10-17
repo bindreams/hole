@@ -7,7 +7,7 @@
 //! nextest's filterset DSL has no `test-group(...)` predicate to derive that
 //! membership from anything else. What IS checkable: whether the group's own
 //! *name-substring* filter (`cfg.filter`) and the *label* select the exact
-//! same tests, live, for `job_id`'s test-hole leg — and whether the group's
+//! same tests, live, for the `hole-` lane of `job_id` — and whether the group's
 //! `max-threads` is still `1`, without which the group's whole purpose (cross-
 //! binary serialization of tests that mutate global OS network state) is
 //! silently gone.
@@ -132,12 +132,18 @@ pub(crate) fn group_config(nextest_toml: &str, group_name: &str) -> Result<Group
 // job_list_template ===================================================================================================
 
 /// `job_id`'s shared `cargo nextest list` argv template: every test-running
-/// command `ci_run_commands_for_job` returns for the job, mapped through
+/// command `ci_run_commands_for_job` returns for the job's steps `step_prefix`
+/// selects, mapped through
 /// [`to_list_command`], must resolve to the SAME argv (full, `-E` included —
 /// bindreams/hole#894 round-2 finding F5). Errs on zero commands or any
 /// divergence, rather than silently picking one.
-pub(crate) fn job_list_template(ci_yaml: &str, manifest: &Manifest, job_id: &str) -> Result<Vec<String>> {
-    let raw = ci_coverage::ci_run_commands_for_job(ci_yaml, manifest, job_id)?;
+pub(crate) fn job_list_template(
+    ci_yaml: &str,
+    manifest: &Manifest,
+    job_id: &str,
+    step_prefix: Option<&str>,
+) -> Result<Vec<String>> {
+    let raw = ci_coverage::ci_run_commands_for_job(ci_yaml, manifest, job_id, step_prefix)?;
     ensure!(
         !raw.is_empty(),
         "job {job_id:?} has no test-running nextest commands to derive a list template from"
@@ -268,8 +274,8 @@ pub(crate) fn conformant_membership(
 /// module's doc for why guard 3 does not list it again itself. Written only
 /// once the conformance check above has passed, so the file never carries a
 /// set this guard would have rejected.
-pub fn verify(repo_root: &Path, job_id: &str, record: Option<&Path>) -> Result<()> {
-    verify_with(repo_root, job_id, record, run_nextest_list)
+pub fn verify(repo_root: &Path, job_id: &str, step_prefix: Option<&str>, record: Option<&Path>) -> Result<()> {
+    verify_with(repo_root, job_id, step_prefix, record, run_nextest_list)
 }
 
 /// [`verify`]'s body with its one subprocess call (`cargo nextest list`)
@@ -279,6 +285,7 @@ pub fn verify(repo_root: &Path, job_id: &str, record: Option<&Path>) -> Result<(
 pub(crate) fn verify_with(
     repo_root: &Path,
     job_id: &str,
+    step_prefix: Option<&str>,
     record: Option<&Path>,
     list: impl Fn(&Path, &[String], Option<&str>) -> Result<BTreeMap<String, BTreeSet<String>>>,
 ) -> Result<()> {
@@ -296,7 +303,7 @@ pub(crate) fn verify_with(
         cfg.max_threads
     );
 
-    let template = job_list_template(&ci_yaml, &manifest, job_id)?;
+    let template = job_list_template(&ci_yaml, &manifest, job_id, step_prefix)?;
     let name_matched = list(repo_root, &narrow_filter(&template, &cfg.filter)?, None)?;
     let label_matched = list(repo_root, &template, Some(LABEL_NAME))?;
 

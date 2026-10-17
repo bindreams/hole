@@ -92,7 +92,7 @@ pub async fn main() -> ExitCode {
 }
 
 async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
-    let repo_root = xtask_lib::repo_root::repo_root()
+    let repo_root = xtask_lib::repo_root::repo_root_from_launch_dir()
         .context("run from inside the hole workspace (or via `cargo xtask run hole`)")?;
     // dev.py:425-428 parity: a workspace that isn't hole must be refused
     // before we npm-install into it.
