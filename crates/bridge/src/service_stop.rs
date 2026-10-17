@@ -21,7 +21,7 @@
 //! forwarder task logs it when it wakes from the shutdown signal
 //! ([`forward_stop`]). A report
 //! that panics is caught on the handler thread: the handler runs inside
-//! windows-service's `extern "system"` trampoline, where an unwinding panic
+//! `service_ctrl`'s `extern "system"` entry point, where an unwinding panic
 //! aborts the process. A Stop control that lands after the last entry
 //! (`ShutdownRuntime`) is not logged.
 

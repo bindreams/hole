@@ -423,10 +423,7 @@ fn a_second_stop_control_does_not_replace_the_first_ones_unlogged_report() {
     // Stop then Shutdown (or Stop twice) can both reach the handler before the
     // first StopPending takes effect. The second is superseded, but the first
     // reported and failed, and its trail must survive.
-    // Guarded for completeness, not exercised end to end: windows-service frees
-    // the handler closure after the first Stop/Shutdown, so a second control may
-    // never reach it. The same holds for the
-    // second-control tests below.
+    // A second control can reach the handler (also true of the second-control tests below).
     let writer = VecWriter::new();
     let progress = StopProgress::new(refuse_stop_requested);
     request_stop(&progress, || {});
@@ -472,8 +469,8 @@ fn a_stop_control_that_loses_the_report_lock_does_not_replace_the_first_ones_unl
 
 #[skuld::test]
 fn a_stop_control_whose_report_panics_returns_normally_signals_and_is_logged_by_the_main_task() {
-    // The control handler runs inside windows-service's `extern "system"`
-    // trampoline, which aborts the process on an unwinding panic. The handler
+    // The control handler runs inside `service_ctrl`'s `extern "system"`
+    // entry point, which aborts the process on an unwinding panic. The handler
     // thread must therefore return from `request_stop` normally, still signal
     // the main task, and write no log line; the main task logs the panic.
     let writer = VecWriter::new();

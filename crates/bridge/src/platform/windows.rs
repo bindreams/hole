@@ -8,14 +8,14 @@ use tracing::{error, info, warn};
 use windows::core::HRESULT;
 use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, WIN32_ERROR};
 use windows_service::service::{
-    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl,
-    ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
-    ServiceStatus, ServiceType,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus,
+    ServiceType,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
 use crate::service_stop::{self, StopPhase, StopProgress};
 
 // Constants ===========================================================================================================
@@ -59,47 +59,76 @@ fn service_main(_arguments: Vec<OsString>) {
     }
 }
 
+/// What [`register_stop_handler`] registered.
+pub struct RegisteredStop<F> {
+    pub status_handle: StatusHandle,
+    pub progress: std::sync::Arc<StopProgress<F>>,
+}
+
+/// Register the control handler of a `HoleBridge` service process and return
+/// its status handle with the shared stop progress. A Stop or Shutdown reports
+/// StopPending through `send` first, so the SCM stops seeing `Running` the
+/// moment the Stop lands whatever the main task is still awaiting, then
+/// signals `shutdown_tx`. `observe` sees every control before it is handled;
+/// it runs on the SCM's handler thread outside the panic catch, so it must
+/// return promptly and must not panic. A second call in one process is an
+/// `AlreadyExists` error (see `service_ctrl::register`).
+///
+/// `StopPending` is reported from the handler (an SCM thread) as well as from
+/// the main task, so the progress is shared and the status handle, which only
+/// exists once `register` returns, is filled in afterwards. The SCM delivers no
+/// Stop before `Running`, which the caller reports after this returns.
+///
+/// Shared with the `test_service` helper, so the privileged tests run this
+/// wiring.
+pub fn register_stop_handler<S>(
+    shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    send: S,
+    observe: impl Fn(Control) + Send + Sync + 'static,
+) -> std::io::Result<RegisteredStop<impl Fn(StopPhase) -> std::io::Result<()>>>
+where
+    S: Fn(&StatusHandle, StopPhase) -> std::io::Result<()> + Send + Sync + 'static,
+{
+    let status_cell: std::sync::Arc<OnceLock<StatusHandle>> = std::sync::Arc::new(OnceLock::new());
+    let stop = std::sync::Arc::new(StopProgress::new(service_stop::scm_reporter(
+        std::sync::Arc::clone(&status_cell),
+        send,
+    )));
+
+    let handler_stop = std::sync::Arc::clone(&stop);
+    let event_handler = move |control: Control| -> ControlResult {
+        observe(control);
+        control.handle(|| service_stop::stop_control(&handler_stop, &shutdown_tx))
+    };
+
+    let status_handle = service_ctrl::register(SERVICE_NAME, event_handler)?;
+    let _ = status_cell.set(status_handle);
+    Ok(RegisteredStop {
+        status_handle,
+        progress: stop,
+    })
+}
+
+/// Report `phase` to the SCM as StopPending: the bridge's `send` for
+/// [`register_stop_handler`].
+pub fn report_stop_pending(handle: &StatusHandle, phase: StopPhase) -> std::io::Result<()> {
+    handle.set_service_status(&stop_pending_status(phase))
+}
+
 fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_tx = std::sync::Mutex::new(Some(shutdown_tx));
 
-    // `StopPending` is reported from the control handler (an SCM thread) as well
-    // as from the main task, so the progress is shared and the status handle,
-    // which only exists once `register` returns, is filled in afterwards. The
-    // SCM delivers no Stop before `Running`, which is reported after that.
-    let status_cell: std::sync::Arc<OnceLock<service_control_handler::ServiceStatusHandle>> =
-        std::sync::Arc::new(OnceLock::new());
-    let stop = std::sync::Arc::new(StopProgress::new(service_stop::scm_reporter(
-        std::sync::Arc::clone(&status_cell),
-        |handle: &service_control_handler::ServiceStatusHandle, phase| {
-            handle
-                .set_service_status(stop_pending_status(phase))
-                .map_err(std::io::Error::other)
-        },
-    )));
-
-    let handler_stop = std::sync::Arc::clone(&stop);
-    let event_handler = move |control_event| -> ServiceControlHandlerResult {
-        match control_event {
-            ServiceControl::Stop | ServiceControl::Shutdown => {
-                // StopPending first, so the SCM stops seeing `Running` the moment
-                // the Stop lands, whatever the main task is still awaiting.
-                service_stop::stop_control(&handler_stop, &shutdown_tx);
-                ServiceControlHandlerResult::NoError
-            }
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            _ => ServiceControlHandlerResult::NotImplemented,
-        }
-    };
-
-    let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
-    let _ = status_cell.set(status_handle);
+    let RegisteredStop {
+        status_handle,
+        progress: stop,
+    } = register_stop_handler(shutdown_tx, report_stop_pending, |_| {})?;
 
     // Report StartPending, NOT Running: the cutover child exits on the SCM
     // `Running` edge, so `Running` is deferred until after the socket binds AND
     // the marker is swept (`sweep_marker_then_ready`) — so a healthy update never
     // presents "marker present + dead driver". No controls accepted while starting.
-    status_handle.set_service_status(ServiceStatus {
+    status_handle.set_service_status(&ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::StartPending,
         controls_accepted: ServiceControlAccept::empty(),
@@ -113,7 +142,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build and run the tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
-    // `ServiceStatusHandle` is Copy (a raw SCM handle wrapper); capture it for the
+    // `StatusHandle` is Copy (a raw SCM handle wrapper); capture it for the
     // deferred `Running` report inside the async block.
     let status_handle_ready = status_handle;
     let stop_progress = std::sync::Arc::clone(&stop);
@@ -166,17 +195,15 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                 .await??;
         // Socket is bound: sweep the marker, then report Running (see sweep_marker_then_ready).
         sweep_marker_then_ready(&log_dir, || {
-            status_handle_ready
-                .set_service_status(ServiceStatus {
-                    service_type: ServiceType::OWN_PROCESS,
-                    current_state: ServiceState::Running,
-                    controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-                    exit_code: ServiceExitCode::Win32(0),
-                    checkpoint: 0,
-                    wait_hint: Duration::ZERO,
-                    process_id: None,
-                })
-                .map_err(std::io::Error::other)
+            status_handle_ready.set_service_status(&ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Running,
+                controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 0,
+                wait_hint: Duration::ZERO,
+                process_id: None,
+            })
         })?;
         info!("Windows service started");
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
@@ -280,11 +307,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     service_stop::finish_stop(
         &stop,
         || drop(rt),
-        || {
-            status_handle
-                .set_service_status(stopped_status(exit_code))
-                .map_err(std::io::Error::other)
-        },
+        || status_handle.set_service_status(&stopped_status(exit_code)),
     );
 
     run_result

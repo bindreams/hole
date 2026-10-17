@@ -186,6 +186,13 @@ test-group = 'global_net_state'
 filter = 'test(/failclosed_cover_transition_/)'
 success-output = 'final'
 
+# `cutover_global_net_state_service_controls_after_stop_are_measured` prints
+# which controls the SCM delivered after a Stop. nextest discards captured
+# output on success, and that line is the measurement.
+[[profile.default.overrides]]
+filter = 'test(/cutover_global_net_state_service_controls_after_stop_/)'
+success-output = 'final'
+
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`
 # (crates/tun-engine/src/engine/) drive the whole engine over an in-memory
 # `sim::SimWire` — no real TUN device, no real network, no real timer besides
