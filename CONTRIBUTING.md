@@ -2644,7 +2644,9 @@ build if it's missing, for the lib as well as the bin; the error names the
 directory and the remedies: build the frontend, or create an empty gitignored
 `ui/dist` for checks that don't run the GUI). With `--no-default-features`
 (**dev mode**) the webview loads Vite's `http://localhost:1420` and `ui/dist/` is
-not required. The `hole` / `hole-tests` xtask targets pass
+not required, though a dev build still recompiles `hole` once after `ui/dist`
+changes: tauri-build 2.7.1 always watches `frontendDist`. Production is
+unaffected. The `hole` / `hole-tests` xtask targets pass
 `--no-default-features`; `hole-msi` / `hole-dmg` use the default and depend on
 `frontend-build`. **Running `cargo build -p hole` directly: add
 `--no-default-features` for dev, or `cargo xtask build frontend-build` first.**

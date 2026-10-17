@@ -10,15 +10,11 @@
 //! any unit that reads them starts; `tauri::tauri_build_context!()` only
 //! `include!`s the generated file, so it has no such effect and appears once.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const FORBIDDEN_MACRO: &str = "generate_context";
 const REQUIRED_MACRO: &str = "tauri_build_context";
-
-/// Build output, dependency and scratch directories: no first-party source.
-/// A nested checkout (a linked worktree, a clone) is not named here; it is
-/// recognised by its own `.git` entry in `rust_sources_under`.
-const SKIPPED_DIRS: &[&str] = &["target", "node_modules", ".git", ".tmp", ".cache", "third_party"];
 
 /// How often a source names a macro, counted over its token stream.
 #[derive(Debug, PartialEq, Eq)]
@@ -59,27 +55,74 @@ fn mentions_in(source: &str, name: &str, origin: &Path) -> Result<Mentions, Stri
     Ok(found)
 }
 
-/// First-party `.rs` files under `root`, sorted. A directory other than `root`
-/// that holds a `.git` entry (file or directory) is another checkout of the
-/// repository, with its own copy of every source: it is not descended into.
-fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display())) {
+/// The `.rs` files cargo compiles for the workspace at `manifest`, sorted: for
+/// each member, the directory tree of every target's root file (`src/`,
+/// `tests/`, `src/bin/`, ...), or just the root file when it sits beside the
+/// manifest (`build.rs`). The set comes from cargo's own view of the workspace,
+/// so a copy of the tree, a nested checkout, build output and a stray `.rs` file
+/// outside those trees are never in it.
+fn first_party_sources(manifest: &Path) -> Vec<PathBuf> {
+    fn add_tree(dir: &Path, found: &mut BTreeSet<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display())) {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                if !SKIPPED_DIRS.contains(&name) && !path.join(".git").exists() {
-                    pending.push(path);
-                }
+                add_tree(&path, found);
             } else if path.extension().is_some_and(|e| e == "rs") {
-                found.push(path);
+                found.insert(path);
             }
         }
     }
-    found.sort();
-    found
+
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest)
+        .no_deps()
+        .exec()
+        .expect("cargo metadata");
+    let mut found = BTreeSet::new();
+    for package in metadata.workspace_packages() {
+        let package_dir = package.manifest_path.parent().expect("manifest has a directory");
+        for target in &package.targets {
+            let root_file = target.src_path.as_std_path();
+            let dir = root_file.parent().expect("target root has a directory");
+            if dir == package_dir.as_std_path() {
+                found.insert(root_file.to_path_buf());
+            } else {
+                add_tree(dir, &mut found);
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Where the context macros are named across `sources`.
+struct Sites {
+    /// Every file naming the forbidden macro, once per mention.
+    forbidden: Vec<PathBuf>,
+    /// Every file invoking the required macro, once per invocation.
+    required: Vec<PathBuf>,
+}
+
+fn context_macro_sites(sources: &[PathBuf]) -> Sites {
+    let mut sites = Sites {
+        forbidden: Vec::new(),
+        required: Vec::new(),
+    };
+    for path in sources {
+        let source = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // A cheap pre-filter; the token scan below decides.
+        let contains = |name| source.contains(name);
+        if !contains(FORBIDDEN_MACRO) && !contains(REQUIRED_MACRO) {
+            continue;
+        }
+        let scan = |name| mentions_in(&source, name, path).unwrap_or_else(|e| panic!("{e}"));
+        sites
+            .forbidden
+            .extend(std::iter::repeat_n(path.clone(), scan(FORBIDDEN_MACRO).named));
+        sites
+            .required
+            .extend(std::iter::repeat_n(path.clone(), scan(REQUIRED_MACRO).invoked));
+    }
+    sites
 }
 
 // Scanner -------------------------------------------------------------------------------------------------------------
@@ -163,26 +206,78 @@ fn a_source_that_does_not_lex_is_reported_with_its_path() {
 
 // Source discovery ----------------------------------------------------------------------------------------------------
 
-#[skuld::test]
-fn a_nested_checkout_is_not_first_party_source() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let rs = |rel: &str| {
-        let path = root.path().join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "").unwrap();
-        path
-    };
-    let own = [rs("crates/a/src/lib.rs"), rs("crates/a/src/deep/er.rs"), rs("main.rs")];
-    // A linked worktree has a `.git` file, a clone a `.git` directory.
-    rs("wt/.git");
-    rs("wt/crates/a/src/lib.rs");
-    rs("clone/.git/HEAD");
-    rs("clone/crates/a/src/lib.rs");
-    rs("wt/inner/crates/b.rs");
+/// A one-member workspace in a temp dir, plus the files that must not count:
+/// a copy of the tree with no `.git` (`cp -R`, a tarball), a stray `.rs` at the
+/// root, and a stray `.rs` inside the member but outside its target trees. Every
+/// file is named after what it holds so the assertions read as a list.
+struct Fixture {
+    root: tempfile::TempDir,
+}
 
-    let mut expected = own.to_vec();
+impl Fixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fixture = Fixture { root };
+        fixture.write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/a\"]\nresolver = \"2\"\n",
+        );
+        fixture.write(
+            "crates/a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        );
+        fixture
+    }
+
+    fn write(&self, rel: &str, contents: &str) -> PathBuf {
+        let path = self.root.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn manifest(&self) -> PathBuf {
+        self.root.path().join("Cargo.toml")
+    }
+}
+
+#[skuld::test]
+fn only_a_members_target_trees_are_first_party_source() {
+    let fx = Fixture::new();
+    let mut expected = vec![
+        fx.write("crates/a/src/lib.rs", "pub mod deep;"),
+        fx.write("crates/a/src/deep/er.rs", ""),
+        fx.write("crates/a/src/bin/tool.rs", "fn main() {}"),
+        fx.write("crates/a/tests/it.rs", ""),
+        fx.write("crates/a/build.rs", "fn main() {}"),
+    ];
     expected.sort();
-    assert_eq!(rust_sources_under(root.path()), expected);
+    // Not part of any build: a copy of the tree (no `.git`), a linked worktree
+    // and a clone (with one), stray files at the root and inside the member.
+    fx.write("copy/crates/a/src/lib.rs", "");
+    fx.write("copy/crates/a/Cargo.toml", "");
+    fx.write("wt/.git", "gitdir: x");
+    fx.write("wt/crates/a/src/lib.rs", "");
+    fx.write("clone/.git/HEAD", "");
+    fx.write("clone/crates/a/src/lib.rs", "");
+    fx.write("old_main.rs", "");
+    fx.write("crates/a/scratch/old.rs", "");
+    fx.write("crates/a/target/debug/build/gen.rs", "");
+
+    assert_eq!(first_party_sources(&fx.manifest()), expected);
+}
+
+#[skuld::test]
+fn a_call_in_a_members_nested_module_is_caught_and_one_in_a_copy_is_not() {
+    let fx = Fixture::new();
+    fx.write("crates/a/src/lib.rs", "pub mod deep;");
+    fx.write("crates/a/src/deep/er.rs", "fn f() { tauri::generate_context!(); }");
+    fx.write("copy/crates/a/src/lib.rs", "fn f() { tauri::generate_context!(); }");
+    fx.write("old_main.rs", "fn f() { tauri::generate_context!(); }");
+
+    let found = context_macro_sites(&first_party_sources(&fx.manifest()));
+    assert_eq!(found.forbidden, vec![fx.root.path().join("crates/a/src/deep/er.rs")]);
+    assert!(found.required.is_empty());
 }
 
 // Workspace -----------------------------------------------------------------------------------------------------------
@@ -195,19 +290,7 @@ fn the_tauri_context_comes_from_the_build_script() {
     let root = crate::repo_root().expect("repo root");
     let main_rs = root.join("crates").join("hole").join("src").join("main.rs");
 
-    let mut forbidden = Vec::new();
-    let mut required = Vec::new();
-    for path in rust_sources_under(&root) {
-        let source = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        // A cheap pre-filter; the token scan below decides.
-        let contains = |name| source.contains(name);
-        if !contains(FORBIDDEN_MACRO) && !contains(REQUIRED_MACRO) {
-            continue;
-        }
-        let scan = |name| mentions_in(&source, name, &path).unwrap_or_else(|e| panic!("{e}"));
-        forbidden.extend(std::iter::repeat_n(path.clone(), scan(FORBIDDEN_MACRO).named));
-        required.extend(std::iter::repeat_n(path.clone(), scan(REQUIRED_MACRO).invoked));
-    }
+    let Sites { forbidden, required } = context_macro_sites(&first_party_sources(&root.join("Cargo.toml")));
 
     assert!(
         forbidden.is_empty(),
