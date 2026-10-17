@@ -1,5 +1,6 @@
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 fn main() {
     let icons_dir = Path::new("icons");
@@ -10,12 +11,14 @@ fn main() {
     // outputs. Watching the directory mtime catches additions/removals
     // that don't touch existing files.
     println!("cargo:rerun-if-changed={}", icons_dir.display());
+    let mut svgs_mtime = SystemTime::UNIX_EPOCH;
     for entry in std::fs::read_dir(icons_dir).expect("failed to read icons dir") {
         let path = entry
             .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", icons_dir.display()))
             .path();
         if path.extension().and_then(|e| e.to_str()) == Some("svg") {
             println!("cargo:rerun-if-changed={}", path.display());
+            svgs_mtime = svgs_mtime.max(mtime(&path));
         }
     }
 
@@ -24,7 +27,7 @@ fn main() {
     std::fs::create_dir_all(&cache_icons_dir).expect("failed to create .cache/icons/");
 
     emit_version_env(&repo_root);
-    generate_icons(icons_dir, &cache_icons_dir);
+    generate_icons(icons_dir, &cache_icons_dir, svgs_mtime);
     generate_tray_icons(icons_dir);
 
     // Runtime asset acquisition (ex-ray Go build, wintun.dll download)
@@ -40,20 +43,60 @@ fn main() {
     // fingerprint before — a fresh `OUT_DIR` would leave it stale for the next
     // command (see `xtask::tauri_context_conformance_tests`).
     let attributes = tauri_build::Attributes::new().codegen(tauri_build::CodegenContext::new());
-    tauri_build::try_build(attributes).unwrap_or_else(|e| panic!("tauri-build failed: {e:#}"));
+    // In production mode `ui/dist` must exist; tauri panics when it does not.
+    // Report that as a build error that names the remedy, not a backtrace.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if missing_frontend_dist(info.payload()).is_none() {
+            default_hook(info);
+        }
+    }));
+    match std::panic::catch_unwind(|| tauri_build::try_build(attributes)) {
+        Ok(result) => result.unwrap_or_else(|e| panic!("tauri-build failed: {e:#}")),
+        Err(payload) => match missing_frontend_dist(&*payload) {
+            Some(message) => println!(
+                "cargo::error={message} (relative to {}). Production mode embeds the frontend: \
+                 run `cargo xtask build frontend-build`, or create an empty `ui/dist` (gitignored) for \
+                 checks that do not run the GUI, or build with `--no-default-features`",
+                std::env::current_dir().unwrap().display()
+            ),
+            None => std::panic::resume_unwind(payload),
+        },
+    }
 }
 
-/// Write `bytes` to `path` unless it already holds exactly them.
+/// The message of tauri-codegen's panic for a `frontendDist` directory that
+/// does not exist, if `payload` is that panic.
+fn missing_frontend_dist(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())?;
+    (message.contains("`frontendDist`") && message.contains("doesn't exist")).then_some(message)
+}
+
+fn mtime(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|e| panic!("failed to stat {}: {e}", path.display()))
+}
+
+/// Date `path` as old as the newest input it derives from, `inputs`.
 ///
-/// Every generated file goes through here. `tauri-build` watches the icons
-/// (`rerun-if-changed`), so rewriting one with identical content dates it
-/// after this script's last run and leaves the script dirty for every later
-/// cargo command.
-fn write_if_changed(path: &Path, bytes: &[u8]) {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return;
-    }
-    std::fs::write(path, bytes).unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+/// `tauri-build` lists the icons and sidecar stubs it embeds in
+/// `rerun-if-changed`, and cargo dates a build-script run from its start. A
+/// file this script creates or rewrites is newer than that, so the next cargo
+/// command reruns the script, rewrites the context and recompiles `hole`. The
+/// files must stay at the paths `tauri.conf.json` names (the bundler reads
+/// them), and nothing else can write them before the script starts without
+/// breaking a bare `cargo build -p hole`. Dated by their inputs, an edit to an
+/// input still reruns the script, and the script's own output never does.
+fn date_as_input(path: &Path, inputs: SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(inputs))
+        .unwrap_or_else(|e| panic!("failed to date {}: {e}", path.display()));
 }
 
 /// Stub every `externalBin` sidecar so `tauri_build::build()` passes
@@ -76,6 +119,7 @@ fn ensure_external_bin_stubs(repo_root: &Path) {
         if !path.exists() {
             std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create sidecar cache dir");
             std::fs::File::create(&path).expect("failed to create sidecar stub");
+            date_as_input(&path, mtime(Path::new("tauri.conf.json")));
             println!("cargo:warning=created empty {base} stub — run `cargo xtask deps` for a real build");
         }
     }
@@ -147,7 +191,7 @@ fn build_icns_bytes(tree: &resvg::usvg::Tree) -> Vec<u8> {
     bytes
 }
 
-fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
+fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path, svgs_mtime: SystemTime) {
     // Always produce platform-correct ICO and ICNS regardless of host.
     // ICO is consumed by Windows bundles, ICNS by macOS. Reading the
     // wrong SVG into either would silently ship the wrong design on a
@@ -157,16 +201,16 @@ fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
     let win_tree = parse_svg(&icons_dir.join("icon-windows.svg"));
     let mac_tree = parse_svg(&icons_dir.join("icon-macos.svg"));
 
-    write_if_changed(&cache_icons_dir.join("icon.ico"), &render_ico(&win_tree));
+    render_ico(&win_tree, &cache_icons_dir.join("icon.ico"));
 
     // ICNS: same bytes to the bundled .cache copy (tauri.conf.json) and a
     // cargo-isolated OUT_DIR copy. The test reads the OUT_DIR copy — .cache is a
     // repo-root shared path a concurrent build could write mid-read.
     let icns = build_icns_bytes(&mac_tree);
-    write_if_changed(&cache_icons_dir.join("icon.icns"), &icns);
+    std::fs::write(cache_icons_dir.join("icon.icns"), &icns).unwrap();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let icns_out = out_dir.join("icon.icns");
-    write_if_changed(&icns_out, &icns);
+    std::fs::write(&icns_out, &icns).unwrap();
     println!("cargo:rustc-env=HOLE_ICNS_PATH={}", icns_out.display());
 
     // Runtime Dock icon (dock_icon.rs).
@@ -183,6 +227,11 @@ fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
     for size in [32u32, 128] {
         render_png(host_tree, size, &cache_icons_dir.join(format!("{size}x{size}.png")));
     }
+
+    // The files `tauri.conf.json`'s `bundle.icon` lists; `tauri-build` watches them.
+    for name in ["icon.ico", "icon.icns", "32x32.png", "128x128.png"] {
+        date_as_input(&cache_icons_dir.join(name), svgs_mtime);
+    }
 }
 
 fn render_to_rgba(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
@@ -195,7 +244,7 @@ fn render_to_rgba(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
 }
 
 fn render_png(tree: &resvg::usvg::Tree, size: u32, path: &Path) {
-    write_if_changed(path, &render_png_in_memory(tree, size));
+    std::fs::write(path, render_png_in_memory(tree, size)).unwrap();
 }
 
 fn render_png_in_memory(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
@@ -210,16 +259,15 @@ fn render_png_in_memory(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
     buf
 }
 
-fn render_ico(tree: &resvg::usvg::Tree) -> Vec<u8> {
+fn render_ico(tree: &resvg::usvg::Tree, path: &Path) {
     let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
     for size in [16u32, 32, 256] {
         let rgba = render_to_rgba(tree, size);
         let image = ico::IconImage::from_rgba_data(size, size, rgba);
         icon_dir.add_entry(ico::IconDirEntry::encode(&image).unwrap());
     }
-    let mut bytes = Vec::new();
-    icon_dir.write(&mut bytes).unwrap();
-    bytes
+    let file = std::fs::File::create(path).unwrap();
+    icon_dir.write(file).unwrap();
 }
 
 // Tray icons ==========================================================================================================
@@ -228,10 +276,22 @@ fn generate_tray_icons(icons_dir: &Path) {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
+    // Clean any pre-rename tray rgba files left by a previous incremental
+    // build. include_bytes! cites only the new names, so stale files
+    // would silently bloat OUT_DIR.
+    if let Ok(read) = std::fs::read_dir(&out_dir) {
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("tray-") && name.ends_with(".rgba") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     // No build-time padding: the SVG is the source of truth for the
     // icon's internal margins. If breathing room is needed, adjust the
     // SVG's viewBox-relative artwork instead of compensating here.
-    let mut outputs: Vec<(String, Vec<u8>)> = Vec::new();
     match target_os.as_str() {
         "windows" => {
             for variant in ["dark", "light"] {
@@ -239,7 +299,7 @@ fn generate_tray_icons(icons_dir: &Path) {
                 let tree = parse_svg(&svg_path);
                 let mut rgba = render_to_rgba(&tree, 32);
                 unpremultiply_rgba(&mut rgba);
-                outputs.push((format!("tray-{variant}.rgba"), rgba));
+                std::fs::write(out_dir.join(format!("tray-{variant}.rgba")), &rgba).unwrap();
             }
         }
         "macos" => {
@@ -247,27 +307,10 @@ fn generate_tray_icons(icons_dir: &Path) {
             let tree = parse_svg(&svg_path);
             let mut rgba = render_to_rgba(&tree, 36);
             unpremultiply_rgba(&mut rgba);
-            outputs.push(("tray-template.rgba".to_string(), luminance_to_alpha(&rgba)));
+            let template = luminance_to_alpha(&rgba);
+            std::fs::write(out_dir.join("tray-template.rgba"), &template).unwrap();
         }
         other => println!("cargo:warning=tray icon generation not implemented for {other}"),
-    }
-
-    // Clean any tray rgba file this run does not produce (a pre-rename name or
-    // another target's) left by a previous incremental build. include_bytes!
-    // cites only the current names, so stale files would silently bloat
-    // OUT_DIR. The current ones are left alone, not removed and rewritten.
-    if let Ok(read) = std::fs::read_dir(&out_dir) {
-        for entry in read.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let current = outputs.iter().any(|(wanted, _)| wanted == &*name);
-            if name.starts_with("tray-") && name.ends_with(".rgba") && !current {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    for (name, bytes) in &outputs {
-        write_if_changed(&out_dir.join(name), bytes);
     }
 }
 

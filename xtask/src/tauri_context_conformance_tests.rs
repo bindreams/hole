@@ -12,35 +12,49 @@
 
 use std::path::{Path, PathBuf};
 
-use syn::visit::Visit;
-
 const FORBIDDEN_MACRO: &str = "generate_context";
 const REQUIRED_MACRO: &str = "tauri_build_context";
 
 /// Directories that hold no first-party source of the workspace.
 const SKIPPED_DIRS: &[&str] = &["target", "node_modules", ".git", ".tmp", ".cache", "third_party"];
 
-/// Number of invocations of a macro named `name` (last path segment) in `source`.
-/// Comments, doc comments and string literals are not invocations.
-fn invocations_in(source: &str, name: &str) -> usize {
-    struct Counter<'a> {
-        name: &'a str,
-        count: usize,
-    }
+/// How often a source names a macro, counted over its token stream.
+#[derive(Debug, PartialEq, Eq)]
+struct Mentions {
+    /// Every identifier equal to the macro's name: an invocation, a path to it,
+    /// a `use` of it (renamed or not), a `macro_rules!` of that name.
+    named: usize,
+    /// The subset directly followed by `!`.
+    invoked: usize,
+}
 
-    impl<'ast> Visit<'ast> for Counter<'_> {
-        fn visit_macro(&mut self, node: &'ast syn::Macro) {
-            if node.path.segments.last().is_some_and(|s| s.ident == self.name) {
-                self.count += 1;
+/// Count the identifiers named `name` in `source`, descending into every group,
+/// so a call inside another macro's body (`vec![..]`, `cfg_if!{..}`, a
+/// `macro_rules!` body) is seen: syn does not parse those bodies. Comments,
+/// doc comments and string literals are not identifiers. `origin` names the
+/// file in the error when `source` does not lex.
+fn mentions_in(source: &str, name: &str, origin: &Path) -> Result<Mentions, String> {
+    use proc_macro2::{Spacing, TokenStream, TokenTree};
+
+    fn walk(stream: TokenStream, name: &str, found: &mut Mentions) {
+        let mut tokens = stream.into_iter().peekable();
+        while let Some(tree) = tokens.next() {
+            match tree {
+                TokenTree::Ident(ident) if ident == name => {
+                    found.named += 1;
+                    let bang = matches!(tokens.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '!' && p.spacing() == Spacing::Alone);
+                    found.invoked += usize::from(bang);
+                }
+                TokenTree::Group(group) => walk(group.stream(), name, found),
+                _ => {}
             }
-            syn::visit::visit_macro(self, node);
         }
     }
 
-    let file = syn::parse_file(source).expect("parse Rust source");
-    let mut counter = Counter { name, count: 0 };
-    counter.visit_file(&file);
-    counter.count
+    let stream: TokenStream = source.parse().map_err(|e| format!("lex {}: {e}", origin.display()))?;
+    let mut found = Mentions { named: 0, invoked: 0 };
+    walk(stream, name, &mut found);
+    Ok(found)
 }
 
 /// First-party `.rs` files under `dir`, sorted.
@@ -66,19 +80,27 @@ fn rust_sources_under(dir: &Path) -> Vec<PathBuf> {
 
 // Scanner -------------------------------------------------------------------------------------------------------------
 
+fn mentions(source: &str, name: &str) -> Mentions {
+    mentions_in(source, name, Path::new("fixture.rs")).expect("fixture lexes")
+}
+
+fn once_invoked() -> Mentions {
+    Mentions { named: 1, invoked: 1 }
+}
+
 #[skuld::test]
 fn a_qualified_invocation_is_counted() {
     assert_eq!(
-        invocations_in("fn f() { run(tauri::generate_context!()); }", "generate_context"),
-        1
+        mentions("fn f() { run(tauri::generate_context!()); }", "generate_context"),
+        once_invoked()
     );
 }
 
 #[skuld::test]
 fn a_bare_macro_path_is_counted() {
     assert_eq!(
-        invocations_in("fn f() { run(generate_context!()); }", "generate_context"),
-        1
+        mentions("fn f() { run(generate_context!()); }", "generate_context"),
+        once_invoked()
     );
 }
 
@@ -86,26 +108,53 @@ fn a_bare_macro_path_is_counted() {
 fn every_invocation_is_counted_wherever_it_sits() {
     let source = "#[cfg(not(test))] fn a() { tauri::generate_context!(); } \
                   mod m { fn b() { tauri::generate_context!(); } }";
-    assert_eq!(invocations_in(source, "generate_context"), 2);
+    assert_eq!(mentions(source, "generate_context"), Mentions { named: 2, invoked: 2 });
 }
 
 #[skuld::test]
-fn a_mention_in_a_comment_string_or_doc_is_not_an_invocation() {
+fn an_invocation_inside_another_macros_body_is_counted() {
+    for source in [
+        "fn f() { let _ = vec![tauri::generate_context!()]; }",
+        "fn f() { dbg!(run(tauri::generate_context!())); }",
+        "cfg_if! { if #[cfg(unix)] { fn f() { tauri::generate_context!(); } } }",
+        "macro_rules! m { () => { tauri::generate_context!() }; }",
+        "#[attr(tauri::generate_context!())] fn f() {}",
+    ] {
+        assert_eq!(mentions(source, "generate_context"), once_invoked(), "{source}");
+    }
+}
+
+#[skuld::test]
+fn a_renamed_import_is_counted() {
+    // The renamed call site `ctx!()` does not repeat the name; the `use` does.
+    let source = "use tauri::generate_context as ctx; fn f() { ctx!(); }";
+    assert_eq!(mentions(source, "generate_context"), Mentions { named: 1, invoked: 0 });
+    let braced = "use tauri::{generate_context as ctx, Builder}; fn f() { ctx!(); }";
+    assert_eq!(mentions(braced, "generate_context"), Mentions { named: 1, invoked: 0 });
+}
+
+#[skuld::test]
+fn a_mention_in_a_comment_string_or_doc_is_not_counted() {
     let source =
         "/// `tauri::generate_context!()` here\n// tauri::generate_context!()\nfn f() { let _ = \"generate_context!()\"; }";
-    assert_eq!(invocations_in(source, "generate_context"), 0);
+    assert_eq!(mentions(source, "generate_context"), Mentions { named: 0, invoked: 0 });
 }
 
 #[skuld::test]
-fn other_macros_are_not_invocations() {
-    assert_eq!(
-        invocations_in("fn f() { tauri::generate_handler![a]; }", "generate_context"),
-        0
-    );
-    assert_eq!(
-        invocations_in("fn f() { tauri::tauri_build_context!(); }", "generate_context"),
-        0
-    );
+fn other_macros_are_not_counted() {
+    for (source, name) in [
+        ("fn f() { tauri::generate_handler![a]; }", "generate_context"),
+        ("fn f() { tauri::tauri_build_context!(); }", "generate_context"),
+        ("fn f() { tauri::generate_context!(); }", "tauri_build_context"),
+    ] {
+        assert_eq!(mentions(source, name), Mentions { named: 0, invoked: 0 }, "{source}");
+    }
+}
+
+#[skuld::test]
+fn a_source_that_does_not_lex_is_reported_with_its_path() {
+    let err = mentions_in("fn f( {", "generate_context", Path::new("crates/x/src/y.rs")).unwrap_err();
+    assert!(err.contains("crates/x/src/y.rs"), "{err}");
 }
 
 // Workspace -----------------------------------------------------------------------------------------------------------
@@ -122,21 +171,19 @@ fn the_tauri_context_comes_from_the_build_script() {
     let mut required = Vec::new();
     for path in rust_sources_under(&root) {
         let source = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        // A cheap pre-filter; the parse below decides.
+        // A cheap pre-filter; the token scan below decides.
         let mentions = |name| source.contains(name);
         if !mentions(FORBIDDEN_MACRO) && !mentions(REQUIRED_MACRO) {
             continue;
         }
-        forbidden.extend(std::iter::repeat_n(
-            path.clone(),
-            invocations_in(&source, FORBIDDEN_MACRO),
-        ));
-        required.extend(std::iter::repeat_n(path, invocations_in(&source, REQUIRED_MACRO)));
+        let scan = |name| mentions_in(&source, name, &path).unwrap_or_else(|e| panic!("{e}"));
+        forbidden.extend(std::iter::repeat_n(path.clone(), scan(FORBIDDEN_MACRO).named));
+        required.extend(std::iter::repeat_n(path.clone(), scan(REQUIRED_MACRO).invoked));
     }
 
     assert!(
         forbidden.is_empty(),
-        "`tauri::{FORBIDDEN_MACRO}!()` is invoked at {forbidden:?}; it writes OUT_DIR assets during its \
+        "`{FORBIDDEN_MACRO}` is named at {forbidden:?} (an invocation, a path or a `use`); the macro writes OUT_DIR assets during its \
          own unit's compile and leaves that unit stale for the next cargo command \
          (bindreams/hole#1087). Generate the context in crates/hole/build.rs and use \
          `tauri::{REQUIRED_MACRO}!()`"

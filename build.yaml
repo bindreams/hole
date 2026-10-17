@@ -186,8 +186,9 @@ targets:
   hole-tests:
     # `--no-default-features` matches the `hole` target's debug build: tests
     # build `hole`, whose build.rs generates the Tauri context, and
-    # production-mode context generation panics on missing `ui/dist/`. Tests don't need bundled frontend assets — they exercise
-    # CLI / IPC / bridge paths, not the webview (see the frontend-build note).
+    # production-mode context generation fails on missing `ui/dist/`. Tests
+    # don't need bundled frontend assets — they exercise CLI / IPC / bridge
+    # paths, not the webview (see the frontend-build note).
     depends: hole
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build: >
@@ -325,9 +326,9 @@ targets:
     #
     # `--no-default-features` matches the `hole` / `hole-tests` targets:
     # clippy runs `hole`'s build.rs like a regular compile, which generates
-    # the Tauri context and would panic on missing `ui/dist/` in production mode. Linting
-    # the dev-mode codepaths is sufficient — the cfg(dev) gate only affects
-    # Tauri-internal URL resolution, not Hole-side code. See #372.
+    # the Tauri context and would fail on missing `ui/dist/` in production
+    # mode. Linting the dev-mode codepaths is sufficient — the cfg(dev) gate
+    # only affects Tauri-internal URL resolution, not Hole-side code. See #372.
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     run: cargo clippy --workspace --all-targets --no-default-features --features garter/test-utils -- -D warnings
 
