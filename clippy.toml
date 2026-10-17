@@ -229,6 +229,21 @@ path = "windows::Win32::System::Services::RegisterServiceCtrlHandlerExW"
 reason = "A handler registered here must outlive every control the SCM can send. Register through `service_ctrl::register`, which owns the handler via `service_ctrl::own`."
 allow-invalid = true  # the `windows` crate is a Windows-only dependency; other targets cannot resolve the path.
 
+[[disallowed-methods]]
+path = "windows::Win32::System::Services::RegisterServiceCtrlHandlerExA"
+reason = "A handler registered here must outlive every control the SCM can send. Register through `service_ctrl::register`, which owns the handler via `service_ctrl::own`."
+allow-invalid = true  # the `windows` crate is a Windows-only dependency; other targets cannot resolve the path.
+
+[[disallowed-methods]]
+path = "windows::Win32::System::Services::RegisterServiceCtrlHandlerW"
+reason = "A handler registered here must outlive every control the SCM can send. Register through `service_ctrl::register`, which owns the handler via `service_ctrl::own`."
+allow-invalid = true  # the `windows` crate is a Windows-only dependency; other targets cannot resolve the path.
+
+[[disallowed-methods]]
+path = "windows::Win32::System::Services::RegisterServiceCtrlHandlerA"
+reason = "A handler registered here must outlive every control the SCM can send. Register through `service_ctrl::register`, which owns the handler via `service_ctrl::own`."
+allow-invalid = true  # the `windows` crate is a Windows-only dependency; other targets cannot resolve the path.
+
 # Bridge cancellation contract -----------------------------------------------------------------------------------------
 #
 # Fresh `CancellationToken::new()` inside `crates/bridge/src/` defeats
