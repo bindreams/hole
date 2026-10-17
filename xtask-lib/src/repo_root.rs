@@ -68,9 +68,11 @@ pub(crate) fn hole_root_for_launch(
     cwd: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(root) = handoff {
+        // Absolute only: a relative value would resolve against the cwd here and
+        // again after dev-console changes into it.
         anyhow::ensure!(
-            is_hole_root(root),
-            "{DEV_REPO_ROOT_ENV} is {}, which is not a hole root (needs a [workspace] Cargo.toml and crates/hole)",
+            root.is_absolute() && is_hole_root(root),
+            "{DEV_REPO_ROOT_ENV} is {}, which is not an absolute path to a hole root (needs a [workspace] Cargo.toml and crates/hole)",
             root.display()
         );
         return Ok(root.to_path_buf());

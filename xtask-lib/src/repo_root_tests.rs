@@ -177,3 +177,25 @@ fn a_handoff_that_is_not_a_hole_root_is_an_error_naming_it_never_a_fallback() {
         assert!(err.contains(&bad.display().to_string()), "{bad:?}: {err}");
     }
 }
+
+// Unix only: the relative spelling below assumes one filesystem root.
+#[cfg(unix)]
+#[skuld::test]
+fn a_relative_handoff_is_an_error_even_when_it_names_a_hole_root_from_the_cwd() {
+    let hole = workspace(true);
+    // `hole` spelled relative to the test's cwd, so it does resolve to a hole root.
+    let cwd = std::env::current_dir().unwrap();
+    let mut relative = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(hole.path().strip_prefix("/").unwrap());
+    assert!(
+        relative.join("crates").join("hole").is_dir(),
+        "HARNESS: {relative:?} must name the hole root from the cwd"
+    );
+    let err = hole_root_for_launch(Some(&relative), Some(hole.path()), Some(hole.path()), Some(hole.path()))
+        .expect_err("a relative handoff must be refused")
+        .to_string();
+    assert!(err.contains("HOLE_DEV_REPO_ROOT"), "{err}");
+}
