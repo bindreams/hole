@@ -8,21 +8,20 @@ use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 
 use super::{proxy_err_to_io_err, start_plugin_chain};
-use crate::proxy::config::{PluginPath, PluginResolveError};
+use crate::proxy::config::BundledPlugin;
 use crate::proxy::ProxyError;
 
 /// An absolute path that exists nowhere: a fresh temp dir, never created files.
-fn absent_plugin_path() -> PluginPath {
+fn absent_plugin() -> BundledPlugin {
     let dir = tempfile::tempdir().unwrap();
-    PluginPath::from_absolute(dir.path().join("absent-binary")).unwrap()
+    BundledPlugin::for_test("v2ray-plugin", dir.path().join("absent-binary"))
 }
 
 #[skuld::test]
 async fn start_with_nonexistent_binary_returns_plugin_error() {
     let cancel = CancellationToken::new();
     let result = start_plugin_chain(
-        "v2ray-plugin",
-        &absent_plugin_path(),
+        &absent_plugin(),
         None,
         "127.0.0.1",
         12345,
@@ -38,32 +37,6 @@ async fn start_with_nonexistent_binary_returns_plugin_error() {
     assert!(
         matches!(err, ProxyError::Plugin(_)),
         "expected ProxyError::Plugin, got: {err:?}"
-    );
-}
-
-/// The chain itself refuses a plugin Hole does not ship, before the port
-/// allocation and the spawn: the error is the typed refusal, not the
-/// `ProxyError::Plugin` a failed spawn would produce.
-#[skuld::test]
-async fn start_refuses_an_unbundled_plugin_before_spawning() {
-    let cancel = CancellationToken::new();
-    let err = start_plugin_chain(
-        "kcptun",
-        &absent_plugin_path(),
-        None,
-        "127.0.0.1",
-        12345,
-        None,
-        None,
-        false,
-        &cancel,
-        None,
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        matches!(&err, ProxyError::PluginResolve(PluginResolveError::NotBundled { name }) if name == "kcptun"),
-        "got: {err:?}"
     );
 }
 
@@ -158,6 +131,7 @@ mod identity {
             crate::proxy::plugin_log::PluginLog::new(),
             CancellationToken::new(),
             Some(dir.to_path_buf()),
+            std::path::PathBuf::from("unused"),
         )
     }
 

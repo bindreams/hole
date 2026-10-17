@@ -1784,21 +1784,27 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
 
 // lockdown_app_ids ====================================================================================================
 //
-// The plugin's App-ID permit is derived from the `PluginPath` the plugin chain
-// was spawned from, so there is no unresolvable-plugin case to handle: a bare
-// name is not expressible as a `PluginPath`.
-
-/// The permit list holds the very file the chain spawned, then the bridge exe.
+/// The permit list holds the binary the chain was spawned from, then the bridge
+/// exe.
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn lockdown_app_ids_permits_the_spawned_plugin_binary_and_the_bridge_exe() {
+fn lockdown_app_ids_permits_the_chains_binary_and_the_bridge_exe() {
     let dir = tempfile::tempdir().unwrap();
-    let plugin = crate::proxy::config::PluginPath::from_absolute(dir.path().join("ex-ray.exe")).unwrap();
+    let binary = dir.path().join("ex-ray.exe");
 
-    let ids = lockdown_app_ids(Some(&plugin));
+    rt().block_on(async {
+        let chain = crate::proxy::plugin::PluginChain::for_test(
+            crate::proxy::plugin_log::PluginLog::new(),
+            CancellationToken::new(),
+            None,
+            binary.clone(),
+        );
 
-    assert_eq!(ids.first().map(PathBuf::as_path), Some(plugin.as_path()));
-    assert_eq!(ids.last(), std::env::current_exe().ok().as_ref());
+        let ids = lockdown_app_ids(Some(&chain));
+
+        assert_eq!(ids.first(), Some(&binary));
+        assert_eq!(ids.last(), std::env::current_exe().ok().as_ref());
+    });
 }
 
 #[cfg(target_os = "windows")]
@@ -2749,10 +2755,8 @@ fn bare_ss_dials_doh_resolved_ip_not_hostname() {
 #[skuld::test]
 fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
     // SocksOnly returns early (no routing), but the plugin-chain handoff still
-    // needs the DoH-resolved IP. No `ex-ray` sits next to the test binary so
-    // the plugin cannot be resolved; we assert the FAILURE is the plugin
-    // resolution (the DoH resolve already ran and succeeded) — i.e. NOT a
-    // DohBootstrap error.
+    // needs the DoH-resolved IP; with no `ex-ray` beside the test binary the start
+    // fails at plugin resolution, after DoH succeeded.
     let expected: IpAddr = "203.0.113.7".parse().unwrap();
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
@@ -2910,6 +2914,7 @@ mod self_test {
             log,
             CancellationToken::new(),
             None,
+            PathBuf::from("unused"),
         ));
 
         let writer = VecWriter::new();
@@ -4828,9 +4833,8 @@ mod self_test {
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
                 let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
-                // The real spawn only happens once the plugin resolves: give it an
-                // install dir holding a (non-executable) `ex-ray`, so the spawn is
-                // reached and fails after `inject_plugin_directives` has run.
+                // Fake install dir with a non-executable `ex-ray`: resolution passes,
+                // spawn fails after `inject_plugin_directives`.
                 let install = tempfile::tempdir().unwrap();
                 let exe = install.path().join(if cfg!(windows) { "hole.exe" } else { "hole" });
                 std::fs::write(&exe, b"fake").unwrap();

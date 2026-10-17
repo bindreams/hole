@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use util::port_alloc;
 
-use super::config::{bundled_plugin, PluginPath};
+use super::config::BundledPlugin;
 use super::ProxyError;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,6 +40,8 @@ pub struct PluginChain {
     transports: garter::Transports,
     state_dir: Option<PathBuf>,
     log: Arc<crate::proxy::plugin_log::PluginLog>,
+    /// The file the chain was spawned from.
+    binary: PathBuf,
 }
 
 impl std::fmt::Debug for PluginChain {
@@ -63,6 +65,12 @@ impl PluginChain {
         self.transports
     }
 
+    /// The file the chain was spawned from, for the lockdown App-ID permit: read
+    /// off the chain so the permit names the file that ran.
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+
     /// The chain's kept log lines — see [`crate::proxy::plugin_log`].
     pub fn log(&self) -> &Arc<crate::proxy::plugin_log::PluginLog> {
         &self.log
@@ -81,6 +89,7 @@ impl PluginChain {
         log: Arc<crate::proxy::plugin_log::PluginLog>,
         cancel: CancellationToken,
         state_dir: Option<PathBuf>,
+        binary: PathBuf,
     ) -> Self {
         Self {
             handle: tokio::spawn(async { Ok(()) }),
@@ -89,6 +98,7 @@ impl PluginChain {
             transports: garter::Transports::TCP,
             state_dir,
             log,
+            binary,
         }
     }
 
@@ -116,12 +126,11 @@ impl Drop for PluginChain {
 /// When `None`, no state is tracked (used by `server_test` for one-shot
 /// probes that die with the bridge).
 ///
-/// `plugin_name` selects the protocol set for the local port allocation
+/// `plugin` selects the protocol set for the local port allocation
 /// — UDP-capable plugins (galoshes) need the port verified for both TCP
 /// and UDP so their internal dual bind on the local address can't hit
-/// the Windows cross-protocol excluded-port race. The config name is
-/// first resolved to its on-disk binary name, then mapped via
-/// [`hole_common::plugin::plugin_alloc_protocols`].
+/// the Windows cross-protocol excluded-port race. Its on-disk binary name
+/// is mapped via [`hole_common::plugin::plugin_alloc_protocols`].
 ///
 /// Allocates the handoff port via [`port_alloc::bind_ephemeral`]. The
 /// plugin subprocess binds `local_addr` out-of-process, so its bind
@@ -133,8 +142,7 @@ impl Drop for PluginChain {
 /// probe-drop-to-subprocess-bind TOCTOU is tracked in bindreams/hole#304.
 #[allow(clippy::too_many_arguments)] // bundling into a struct adds more noise than the warning; matches spawn_plugin_runner_at below.
 pub async fn start_plugin_chain(
-    plugin_name: &str,
-    plugin_path: &PluginPath,
+    plugin: &BundledPlugin,
     plugin_opts: Option<&str>,
     server_host: &str,
     server_port: u16,
@@ -144,16 +152,13 @@ pub async fn start_plugin_chain(
     cancel: &CancellationToken,
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> Result<PluginChain, ProxyError> {
-    // Refuse a plugin Hole does not ship before anything is allocated or
-    // spawned, whatever `plugin_path` says: the privileged bridge runs only
-    // bundled plugins.
-    let descriptor = bundled_plugin(plugin_name)?;
+    let plugin_name = plugin.descriptor().name;
     // Inject Hole-owned SIP003 directives — see `inject_plugin_directives`.
     let merged_opts = inject_plugin_directives(plugin_name, plugin_opts, ech_doh)?;
     // Size the handoff port by the on-disk binary name —
     // `plugin_alloc_protocols` is keyed by it, so `v2ray-plugin` (→ `ex-ray`)
     // gets a TCP-only port while galoshes gets a UDP-capable one (#414).
-    let protocols = hole_common::plugin::plugin_alloc_protocols(descriptor.binary_name);
+    let protocols = hole_common::plugin::plugin_alloc_protocols(plugin.descriptor().binary_name);
     // Built before `bind_ephemeral` so every bind-retry attempt feeds the same
     // ring — a losing attempt's output explains the retry.
     let log = crate::proxy::plugin_log::PluginLog::new();
@@ -173,8 +178,7 @@ pub async fn start_plugin_chain(
             async move {
                 let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
                 spawn_plugin_runner_at(
-                    plugin_name,
-                    plugin_path,
+                    plugin,
                     merged_opts.as_deref(),
                     local_addr,
                     server_host,
@@ -214,6 +218,7 @@ pub async fn start_plugin_chain(
         transports,
         state_dir: state_dir.map(Path::to_path_buf),
         log,
+        binary: plugin.path().to_path_buf(),
     })
 }
 
@@ -288,8 +293,7 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// on a fresh port; a `StartError::Fatal` maps to [`ProxyError::Plugin`].
 #[allow(clippy::too_many_arguments)] // 11 args — bundling into a struct adds more noise than the warning.
 async fn spawn_plugin_runner_at(
-    plugin_name: &str,
-    plugin_path: &PluginPath,
+    plugin: &BundledPlugin,
     merged_opts: Option<&str>,
     local_addr: SocketAddr,
     server_host: &str,
@@ -308,8 +312,12 @@ async fn spawn_plugin_runner_at(
     ),
     ProxyError,
 > {
+    let plugin_name = plugin.descriptor().name;
+    // Every shipped plugin speaks sitrep, whose AUTHORITATIVE transports the
+    // UDP-drop policy needs (galoshes' `tcp,udp`); `Probe`'s TCP connect
+    // would discard them (#536).
     let mut plugin =
-        garter::BinaryPlugin::new(plugin_path.as_path(), merged_opts).readiness(readiness_for(plugin_name));
+        garter::BinaryPlugin::new(plugin.path(), merged_opts).readiness(garter::ReadinessMode::ExpectSitrep);
     // Before the tap wrap: `TapPlugin` delegates `run`, so the sink still fires.
     plugin = plugin.log_sink(log.sink());
 
@@ -1277,26 +1285,6 @@ fn inject_plugin_directives(
                 .chain(["loglevel=debug"])
                 .chain(directive.as_deref()),
         )))
-    }
-}
-
-/// Plugin-readiness mode for the spawn.
-///
-/// Bundled plugins (galoshes, ex-ray / v2ray-plugin) speak the sitrep
-/// handshake, so [`ReadinessMode::ExpectSitrep`] reads their AUTHORITATIVE
-/// transports — the UDP-drop policy needs `tcp,udp` from galoshes, which the
-/// `Probe` self-probe (a TCP connect, hardcoded TCP-only) would discard (#536).
-/// A name outside the bundled set (the bridge refuses those before reaching
-/// here — see [`resolve_plugin_path_inner`]) may not speak sitrep, so it keeps the
-/// conservative `Probe` readiness rather than hanging until the readiness
-/// timeout waiting for a sitrep that never comes.
-///
-/// [`ReadinessMode::ExpectSitrep`]: garter::ReadinessMode::ExpectSitrep
-fn readiness_for(plugin_name: &str) -> garter::ReadinessMode {
-    if hole_common::plugin::is_known(plugin_name) {
-        garter::ReadinessMode::ExpectSitrep
-    } else {
-        garter::ReadinessMode::Probe
     }
 }
 
@@ -2994,17 +2982,6 @@ mod inject_tests {
             effective_ech_doh("ex-ray", Some(r"path=/a\"), Some(&e)),
             EffectiveEchDoh::None
         );
-    }
-
-    #[skuld::test]
-    fn readiness_known_plugins_expect_sitrep_unknown_probes() {
-        use garter::ReadinessMode;
-        // Bundled, sitrep-speaking plugins: authoritative transports.
-        assert_eq!(readiness_for("galoshes"), ReadinessMode::ExpectSitrep);
-        assert_eq!(readiness_for("v2ray-plugin"), ReadinessMode::ExpectSitrep);
-        assert_eq!(readiness_for("ex-ray"), ReadinessMode::ExpectSitrep);
-        // Arbitrary PATH plugin (may not speak sitrep): conservative probe.
-        assert_eq!(readiness_for("some-future-plugin"), ReadinessMode::Probe);
     }
 }
 

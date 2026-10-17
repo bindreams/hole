@@ -486,7 +486,8 @@ pub fn build_ss_config(
 }
 
 /// Typed, side-effect-free validation of everything [`build_ss_config`]
-/// checks: listener invariants, plugin-name format, cipher method.
+/// checks: listener invariants, plugin-name format and that the plugin ships,
+/// cipher method.
 /// `proxy_manager::start_inner` runs this before the Full-mode preamble
 /// when the config can only be built later (pure-VPN: the internal
 /// SOCKS5 port arrives from `bind_ephemeral`), so rejects stay fast and
@@ -497,7 +498,7 @@ pub fn validate_proxy_config(config: &ProxyConfig) -> Result<(), ProxyError> {
         if !is_valid_plugin_name(p) {
             return Err(ProxyError::InvalidPluginName(p.clone()));
         }
-        bundled_plugin(p)?;
+        bundled_descriptor(p)?;
     }
     config
         .server
@@ -552,42 +553,50 @@ fn build_local_instance(protocol: ProtocolType, addr: SocketAddr, mode: Mode) ->
 
 // Plugin resolution ===================================================================================================
 
-/// The absolute path of a plugin binary Hole ships, the only thing the plugin
-/// spawner accepts.
+/// A plugin Hole ships, bound to the binary the bridge runs for it: the only
+/// thing the plugin spawner accepts.
 ///
 /// The bridge runs as root (or SYSTEM), and a bare name handed to the spawner
-/// is looked up on the inherited `PATH` — user-writable when the bridge is
-/// elevated from the GUI. Holding an absolute path is the type-level proof the
-/// spawner never does that lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginPath(PathBuf);
+/// is looked up on the inherited `PATH`, which is user-writable when the bridge
+/// is elevated from the GUI. Only [`resolve_plugin_path_inner`] builds one (tests
+/// aside), so a value proves `descriptor` is a shipped plugin and `path` is the
+/// absolute file that descriptor's binary name selects beside the executable it
+/// was resolved against. Production resolves against `current_exe()`.
+#[derive(Debug, Clone)]
+pub struct BundledPlugin {
+    descriptor: &'static plugin::PluginDescriptor,
+    path: PathBuf,
+}
 
-impl PluginPath {
-    /// `Some` only for an absolute path; `None` for a bare name or any
-    /// relative path.
-    ///
-    /// Production gets one from [`resolve_plugin_path_inner`]; tests use this to
-    /// point at a stub binary. Absoluteness is checked, not bundledness: the
-    /// bundled-name gate is [`bundled_plugin`].
-    pub fn from_absolute(path: impl Into<PathBuf>) -> Option<Self> {
-        let path = path.into();
-        path.is_absolute().then_some(Self(path))
+impl BundledPlugin {
+    pub fn descriptor(&self) -> &'static plugin::PluginDescriptor {
+        self.descriptor
     }
 
-    pub fn as_path(&self) -> &Path {
-        &self.0
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A shipped plugin pointed at an arbitrary binary, for tests that spawn a
+    /// stub or run without an install dir.
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        assert!(path.is_absolute(), "for_test: {path:?} is not absolute");
+        Self {
+            descriptor: plugin::lookup(name).unwrap_or_else(|| panic!("for_test: {name:?} is not a shipped plugin")),
+            path,
+        }
     }
 }
 
 /// Why a configured plugin cannot be resolved to a binary Hole will run.
 ///
-/// Each variant is a distinct cause with a distinct remedy, so none stands in
-/// for another. Every `Display` names the plugin by its configured name and
-/// never a filesystem path: it reaches the GUI toast verbatim.
+/// Every `Display` names the plugin by its configured name and never a
+/// filesystem path: it reaches the GUI toast verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PluginResolveError {
-    /// The name is not in [`plugin::known_plugin_names`]. The privileged bridge
-    /// runs only the plugins Hole ships.
+    /// The name is not in [`plugin::known_plugin_names`].
     #[error(
         "plugin \"{name}\" is not bundled with Hole, and Hole runs only its bundled plugins. Bundled plugins: {}",
         plugin::known_plugin_names_joined()
@@ -603,9 +612,8 @@ pub enum PluginResolveError {
     ExeUnknown { plugin: String },
 }
 
-/// The single gate for "does Hole ship this plugin": returns its descriptor, or
-/// [`PluginResolveError::NotBundled`].
-pub fn bundled_plugin(name: &str) -> Result<&'static plugin::PluginDescriptor, PluginResolveError> {
+/// The one gate for "does Hole ship this plugin".
+fn bundled_descriptor(name: &str) -> Result<&'static plugin::PluginDescriptor, PluginResolveError> {
     plugin::lookup(name).ok_or_else(|| PluginResolveError::NotBundled { name: name.to_string() })
 }
 
@@ -613,39 +621,39 @@ pub fn bundled_plugin(name: &str) -> Result<&'static plugin::PluginDescriptor, P
 /// passes `std::env::current_exe()`; tests pass a stand-in).
 ///
 /// Refuses any plugin Hole does not ship ([`PluginResolveError::NotBundled`]),
-/// then looks for its binary in the same directory as the bridge executable
-/// (`.exe` appended on Windows). There is no other place to look: the result is
-/// an absolute path or a typed error, never a bare name for the spawner to find
-/// on `PATH`. The bridge is privileged and inherits the invoking user's `PATH`,
-/// so a binary a user-level process drops in a user-writable `PATH` directory
-/// would otherwise run with the bridge's privileges.
-pub(crate) fn resolve_plugin_path_inner(
-    name: &str,
-    bridge_exe: Option<PathBuf>,
-) -> Result<PluginPath, PluginResolveError> {
+/// then looks only in the directory of the bridge executable (`.exe` appended on
+/// Windows). Returns a [`BundledPlugin`] or a typed error, never a bare name.
+pub fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>) -> Result<BundledPlugin, PluginResolveError> {
     // A friendly name (`v2ray-plugin`) resolves to its `binary_name` (`ex-ray`).
     // See bindreams/hole#414.
-    let binary = bundled_plugin(name)?.binary_name;
+    let descriptor = bundled_descriptor(name)?;
     let exe_unknown = || PluginResolveError::ExeUnknown {
         plugin: name.to_string(),
     };
-    let exe = bridge_exe.ok_or_else(exe_unknown)?;
+    // Before canonicalizing: that resolves a relative path against the cwd,
+    // which would put the plugin lookup wherever the process happens to be.
+    let exe = bridge_exe.filter(|exe| exe.is_absolute()).ok_or_else(exe_unknown)?;
     // Canonicalize to resolve symlinks — the bridge may be registered via symlink,
     // but the sibling plugin binary is next to the real binary.
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    let dir = exe.parent().ok_or_else(exe_unknown)?;
-    let file = if cfg!(windows) {
-        format!("{binary}.exe")
-    } else {
-        binary.to_string()
+    let exe = match std::fs::canonicalize(&exe) {
+        Ok(real) => real,
+        Err(e) => {
+            tracing::debug!(error = %e, "bridge executable not canonicalized; resolving the plugin beside it as given");
+            exe
+        }
     };
-    let candidate = PluginPath::from_absolute(dir.join(file)).ok_or_else(exe_unknown)?;
-    if candidate.as_path().is_file() {
-        Ok(candidate)
+    let dir = exe.parent().ok_or_else(exe_unknown)?;
+    let path = dir.join(if cfg!(windows) {
+        format!("{}.exe", descriptor.binary_name)
+    } else {
+        descriptor.binary_name.to_string()
+    });
+    if path.is_file() {
+        Ok(BundledPlugin { descriptor, path })
     } else {
         Err(PluginResolveError::BinaryMissing {
             plugin: name.to_string(),
-            binary,
+            binary: descriptor.binary_name,
         })
     }
 }

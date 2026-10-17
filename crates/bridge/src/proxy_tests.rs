@@ -240,10 +240,6 @@ fn plugin_name_bare_name_accepted() {
 }
 
 // Plugin path resolution tests ========================================================================================
-//
-// The privileged bridge runs only the plugins Hole ships, found next to its own
-// executable. No path through the resolver yields a bare name for the spawner
-// to look up on `PATH`.
 
 /// A directory standing in for the install dir, holding a fake bridge exe.
 struct FakeInstall {
@@ -270,7 +266,7 @@ impl FakeInstall {
         file
     }
 
-    fn resolve(&self, name: &str) -> Result<PluginPath, PluginResolveError> {
+    fn resolve(&self, name: &str) -> Result<BundledPlugin, PluginResolveError> {
         resolve_plugin_path_inner(name, Some(self.exe.clone()))
     }
 }
@@ -285,7 +281,9 @@ fn resolve_v2ray_plugin_name_finds_ex_ray_sibling() {
     let resolved = install.resolve("v2ray-plugin").unwrap();
 
     let canonical = std::fs::canonicalize(&plugin_file).unwrap();
-    assert_eq!(resolved.as_path(), canonical);
+    assert_eq!(resolved.path(), canonical);
+    assert_eq!(resolved.descriptor().name, "v2ray-plugin");
+    assert_eq!(resolved.descriptor().binary_name, "ex-ray");
 }
 
 #[skuld::test]
@@ -297,19 +295,14 @@ fn resolve_finds_every_bundled_plugin_next_to_the_bridge() {
 
         let resolved = install.resolve(name).unwrap();
 
-        assert_eq!(
-            resolved.as_path(),
-            std::fs::canonicalize(&plugin_file).unwrap(),
-            "{name}"
-        );
-        assert!(resolved.as_path().is_absolute(), "{name}");
+        assert_eq!(resolved.path(), std::fs::canonicalize(&plugin_file).unwrap(), "{name}");
+        assert_eq!(resolved.descriptor().name, name, "{name}");
+        assert!(resolved.path().is_absolute(), "{name}");
     }
 }
 
 #[skuld::test]
 fn resolve_refuses_an_unbundled_plugin_even_when_a_sibling_of_that_name_exists() {
-    // The binary is right there next to the bridge: the refusal is about the
-    // name, not about whether the file can be found.
     let install = FakeInstall::new();
     install.add_sibling("some-custom-plugin");
 
@@ -323,8 +316,6 @@ fn resolve_refuses_an_unbundled_plugin_even_when_a_sibling_of_that_name_exists()
 
 #[skuld::test]
 fn resolve_refuses_an_unbundled_plugin_without_a_bridge_exe() {
-    // Unbundled is decided before the executable is consulted, so an unknown
-    // exe cannot turn the refusal into some other error.
     let err = resolve_plugin_path_inner("some-custom-plugin", None).unwrap_err();
     assert!(matches!(err, PluginResolveError::NotBundled { .. }), "got: {err:?}");
 }
@@ -369,18 +360,49 @@ fn resolve_with_a_relative_bridge_exe_is_a_typed_error() {
 }
 
 #[skuld::test]
-fn plugin_path_rejects_a_bare_name_and_a_relative_path() {
-    assert!(PluginPath::from_absolute("ex-ray").is_none());
-    assert!(PluginPath::from_absolute("./ex-ray").is_none());
-    assert!(PluginPath::from_absolute("bin/ex-ray").is_none());
+fn resolve_with_a_relative_bridge_exe_never_looks_in_the_cwd() {
+    // Exists relative to the cwd, with a plugin beside it: canonicalizing would
+    // turn the relative exe into a cwd-rooted absolute path and find it.
+    let cwd = std::env::current_dir().unwrap();
+    let dir = tempfile::tempdir_in(&cwd).unwrap();
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    std::fs::write(dir.path().join(format!("hole{ext}")), b"fake").unwrap();
+    std::fs::write(dir.path().join(format!("galoshes{ext}")), b"fake").unwrap();
+    let relative_exe = dir.path().strip_prefix(&cwd).unwrap().join(format!("hole{ext}"));
+    assert!(relative_exe.is_relative() && relative_exe.exists(), "fixture");
+
+    let err = resolve_plugin_path_inner("galoshes", Some(relative_exe)).unwrap_err();
+
+    assert!(matches!(err, PluginResolveError::ExeUnknown { .. }), "got: {err:?}");
 }
 
 #[skuld::test]
-fn plugin_path_accepts_an_absolute_path() {
+fn resolve_logs_when_the_bridge_exe_cannot_be_canonicalized() {
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
     let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("ex-ray");
-    let path = PluginPath::from_absolute(file.clone()).unwrap();
-    assert_eq!(path.as_path(), file);
+    let exe = dir.path().join("gone").join("hole");
+    let cause = std::fs::canonicalize(&exe).unwrap_err().to_string();
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+
+    let err = {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        resolve_plugin_path_inner("galoshes", Some(exe)).unwrap_err()
+    };
+
+    assert!(matches!(err, PluginResolveError::BinaryMissing { .. }), "got: {err:?}");
+    let log = writer.snapshot_string();
+    assert!(
+        log.contains(&cause),
+        "the canonicalize failure must be logged; got:\n{log}"
+    );
 }
 
 #[skuld::test]
@@ -391,7 +413,13 @@ fn the_not_bundled_message_names_the_plugin_and_lists_the_bundled_ones() {
     let msg = err.to_string();
     assert!(msg.contains("kcptun"), "{msg}");
     assert!(msg.contains("only its bundled plugins"), "{msg}");
-    assert!(msg.contains("Bundled plugins: v2ray-plugin, galoshes"), "{msg}");
+    assert!(
+        msg.contains(&format!(
+            "Bundled plugins: {}",
+            hole_common::plugin::known_plugin_names_joined()
+        )),
+        "{msg}"
+    );
 }
 
 #[skuld::test]

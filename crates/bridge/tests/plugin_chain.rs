@@ -22,19 +22,44 @@ fn main() {
 
 use std::path::PathBuf;
 
-use hole_bridge::proxy::config::PluginPath;
+use hole_bridge::proxy::config::{resolve_plugin_path_inner, BundledPlugin};
 use hole_bridge::proxy::plugin::start_plugin_chain;
 use tokio_util::sync::CancellationToken;
+
+/// An install dir holding a bridge exe and an `ex-ray` beside it, resolved the
+/// way production resolves a bundled plugin.
+struct Install {
+    _dir: tempfile::TempDir,
+    plugin: BundledPlugin,
+}
 
 /// Path to the `test_plugin` fixture bin. The runtime env var wins (nextest
 /// remaps it under `--archive-file`); the compile-time value covers plain
 /// `cargo test`. Never invoke cargo here — a concurrent build's uplift
 /// deletes+recreates `target/debug/<bin>`, racing this spawn.
-fn test_plugin_path() -> PluginPath {
-    let path: PathBuf = std::env::var("CARGO_BIN_EXE_test_plugin")
+fn test_plugin_bin() -> PathBuf {
+    std::env::var("CARGO_BIN_EXE_test_plugin")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_test_plugin").to_string())
-        .into();
-    PluginPath::from_absolute(path).expect("cargo hands out an absolute bin path")
+        .into()
+}
+
+/// `ex_ray` writes the install's `ex-ray`: the stub's bytes, or something that
+/// cannot run.
+fn install_with(ex_ray: impl FnOnce(&std::path::Path)) -> Install {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let exe = dir.path().join(format!("hole{ext}"));
+    std::fs::write(&exe, b"fake").expect("bridge exe");
+    ex_ray(&dir.path().join(format!("ex-ray{ext}")));
+    let plugin = resolve_plugin_path_inner("v2ray-plugin", Some(exe)).expect("the install holds ex-ray");
+    Install { _dir: dir, plugin }
+}
+
+/// A working install: `ex-ray` is the stub plugin.
+fn installed_stub() -> Install {
+    install_with(|ex_ray| {
+        std::fs::copy(test_plugin_bin(), ex_ray).expect("copy the stub plugin");
+    })
 }
 
 /// Two properties in one spawn: the options Hole merges must arrive in the
@@ -43,10 +68,10 @@ fn test_plugin_path() -> PluginPath {
 /// ring.
 #[skuld::test]
 async fn the_merged_options_reach_the_child_and_its_output_reaches_the_ring() {
+    let install = installed_stub();
     let cancel = CancellationToken::new();
     let chain = start_plugin_chain(
-        "v2ray-plugin",
-        &test_plugin_path(),
+        &install.plugin,
         Some("host=example.com;path=/foo"),
         "127.0.0.1",
         9,
@@ -73,6 +98,59 @@ async fn the_merged_options_reach_the_child_and_its_output_reaches_the_ring() {
     drop(chain);
 }
 
+/// The Windows lockdown permit is read off the chain, so the chain must report
+/// the file it ran, not the file it was configured with by name.
+#[skuld::test]
+async fn the_chain_reports_the_file_it_was_spawned_from() {
+    let install = installed_stub();
+    let cancel = CancellationToken::new();
+    let chain = start_plugin_chain(
+        &install.plugin,
+        Some("host=example.com"),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &cancel,
+        None,
+    )
+    .await
+    .expect("the stub plugin becomes ready");
+
+    assert_eq!(chain.binary(), install.plugin.path());
+
+    cancel.cancel();
+    drop(chain);
+}
+
+/// A shipped plugin's transports come from its sitrep `ready`, not from a TCP
+/// self-probe, which could only ever say TCP: the UDP-drop policy needs galoshes'
+/// `tcp,udp`.
+#[skuld::test]
+async fn the_transports_are_the_ones_the_plugin_reports() {
+    let install = installed_stub();
+    let cancel = CancellationToken::new();
+    let chain = start_plugin_chain(
+        &install.plugin,
+        Some("host=example.com;report-udp"),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &cancel,
+        None,
+    )
+    .await
+    .expect("the stub plugin becomes ready");
+
+    assert_eq!(chain.transports(), garter::Transports::TCP | garter::Transports::UDP);
+
+    cancel.cancel();
+    drop(chain);
+}
+
 /// A plugin that loses its local-port race must report `bind_conflict`, the one
 /// class `bind_ephemeral` retries on a fresh port. The stub injects the loss
 /// through its options string (there is no environment seam), so the first
@@ -83,10 +161,10 @@ async fn a_bind_conflict_is_retried_on_a_fresh_port() {
     let sentinel = dir.path().join("bind-once");
     let opts = format!("host=example.com;fail-bind-once={}", sentinel.display());
 
+    let install = installed_stub();
     let cancel = CancellationToken::new();
     let chain = start_plugin_chain(
-        "v2ray-plugin",
-        &test_plugin_path(),
+        &install.plugin,
         Some(&opts),
         "127.0.0.1",
         9,
@@ -156,13 +234,13 @@ async fn a_failed_chain_start_reports_the_plugin_ring() {
             .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
     );
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    // An `ex-ray` that cannot run: the spawn fails and the plugin says nothing.
+    let install = install_with(|ex_ray| std::fs::write(ex_ray, b"not a program").expect("write"));
     let cancel = CancellationToken::new();
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
         let err = start_plugin_chain(
-            "v2ray-plugin",
-            &PluginPath::from_absolute(dir.path().join("plugin-binary")).expect("absolute"),
+            &install.plugin,
             Some("host=example.com"),
             "127.0.0.1",
             9,
@@ -206,12 +284,12 @@ async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
             .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
     );
 
+    let install = installed_stub();
     let cancel = CancellationToken::new();
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
         let err = start_plugin_chain(
-            "v2ray-plugin",
-            &test_plugin_path(),
+            &install.plugin,
             Some("host=example.com;fail-stderr-then-exit=fatal: injected crash on stderr"),
             "127.0.0.1",
             9,

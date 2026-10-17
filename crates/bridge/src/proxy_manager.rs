@@ -284,10 +284,8 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// instead of the production `resolve_via_doh`.
     #[cfg(test)]
     bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
-    /// Test-only override of the executable whose directory holds the bundled
-    /// plugins; `None` resolves against `current_exe()`, as production always
-    /// does. Set by `set_bridge_exe_for_test`.
-    #[cfg(test)]
+    /// Executable whose directory holds the bundled plugins: `current_exe()`,
+    /// or what a test sets.
     bridge_exe: Option<std::path::PathBuf>,
     /// The `ech-doh` URL the most recent start derived. Test-only: the
     /// derivation is otherwise observable only through the plugin it spawns.
@@ -425,8 +423,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             cover_invalidated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             bootstrap_querier: None,
-            #[cfg(test)]
-            bridge_exe: None,
+            bridge_exe: std::env::current_exe().ok(),
             #[cfg(test)]
             last_ech_doh: None,
         }
@@ -441,8 +438,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     }
 
     /// Test seam: resolve bundled plugins next to `exe` instead of next to the
-    /// test binary, so a test can reach the plugin spawn without installing a
-    /// plugin beside the shared test executable.
+    /// test binary.
     #[cfg(test)]
     pub fn set_bridge_exe_for_test(&mut self, exe: std::path::PathBuf) {
         self.bridge_exe = Some(exe);
@@ -1193,11 +1189,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             }
         }
 
-        #[cfg(test)]
-        let bridge_exe = self.bridge_exe.clone().or_else(|| std::env::current_exe().ok());
-        #[cfg(not(test))]
-        let bridge_exe = std::env::current_exe().ok();
-
         debug!("awaiting start_inner");
         let result: Result<RunningState<P, R, D>, ProxyError> = Self::start_inner(
             &self.proxy,
@@ -1210,7 +1201,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             lockdown_on,
             self.state_dir.as_deref(),
             self.state_owner,
-            bridge_exe,
+            self.bridge_exe.clone(),
             cancel,
         )
         .await;
@@ -1377,8 +1368,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         standing_cover_expected: bool,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
-        // The executable bundled plugins are resolved next to — `current_exe()`
-        // in production, derived once by the caller so the seam sits there.
         bridge_exe: Option<std::path::PathBuf>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
@@ -1397,19 +1386,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Phase 1: start plugin chain via Garter if a plugin is configured.
         // `start_plugin_chain` threads `cancel` through to its readiness
         // wait + bind_ephemeral retries.
-        // Resolved here, once, and refused before anything is spawned: the
-        // same `PluginPath` feeds the spawn and the Windows lockdown App-ID
-        // permit, so the permit names the file that actually ran.
         let plugin = config
             .server
             .plugin
             .as_deref()
-            .map(|name| crate::proxy::resolve_plugin_path_inner(name, bridge_exe).map(|path| (name, path)))
+            .map(|name| crate::proxy::resolve_plugin_path_inner(name, bridge_exe))
             .transpose()?;
-        let plugin_chain = if let Some((plugin_name, ref plugin_path)) = plugin {
+        let plugin_chain = if let Some(ref plugin) = plugin {
             let chain = crate::proxy::plugin::start_plugin_chain(
-                plugin_name,
-                plugin_path,
+                plugin,
                 config.server.plugin_opts.as_deref(),
                 &server_host,
                 config.server.server_port,
@@ -1805,8 +1790,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Process image paths for the standing lockdown cover's own
         // App-ID permit (`routing.install_lockdown` below) — see
-        // `lockdown_app_ids`'s doc.
-        let app_ids = lockdown_app_ids(plugin.as_ref().map(|(_, path)| path));
+        // `lockdown_app_ids`'s doc. The plugin's comes off the running chain, so
+        // the permit names the file that ran.
+        let app_ids = lockdown_app_ids(plugin_chain.as_ref());
 
         // Re-read the intent fresh, right before the install it gates:
         // `standing_cover_expected` was snapshotted by the caller before
@@ -2318,10 +2304,11 @@ fn promote_adopted_claim(state_dir: Option<&std::path::Path>, owner: Option<(u32
 }
 
 /// The process image paths the Windows lockdown cover permits by App-ID: the
-/// resolved plugin binary (if a plugin is configured) and the bridge's own exe.
+/// binary the plugin chain was spawned from (if a plugin is configured) and the
+/// bridge's own exe.
 /// Empty on macOS (pf has no per-process matching). Path-keyed so the permit
 /// survives a cutover rename.
-fn lockdown_app_ids(plugin: Option<&crate::proxy::PluginPath>) -> Vec<std::path::PathBuf> {
+fn lockdown_app_ids(plugin: Option<&crate::proxy::plugin::PluginChain>) -> Vec<std::path::PathBuf> {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = plugin;
@@ -2329,7 +2316,7 @@ fn lockdown_app_ids(plugin: Option<&crate::proxy::PluginPath>) -> Vec<std::path:
     }
     #[cfg(target_os = "windows")]
     {
-        let mut ids: Vec<std::path::PathBuf> = plugin.map(|p| p.as_path().to_path_buf()).into_iter().collect();
+        let mut ids: Vec<std::path::PathBuf> = plugin.map(|c| c.binary().to_path_buf()).into_iter().collect();
         match std::env::current_exe() {
             Ok(exe) => ids.push(exe),
             // The bridge's own egress still rides the server-IP permit, so a

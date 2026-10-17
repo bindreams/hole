@@ -398,14 +398,14 @@ in CI (the privileged lanes) is attended and keeps bare names.
 The plugin spawn follows the same rule by a different mechanism: the privileged
 bridge runs only the plugins Hole ships (`hole_common::plugin::KNOWN_PLUGINS`),
 resolved next to the bridge executable and nowhere else. `resolve_plugin_path_inner`
-returns a `PluginPath` (an absolute path, constructible only from one) or a
-`PluginResolveError` (`NotBundled`, `BinaryMissing`, `ExeUnknown`), and
-`start_plugin_chain` takes only that type, so a bare name for `garter::BinaryPlugin`
-to look up on `PATH` cannot be written on the bridge's path. An unbundled name is
-refused with the "Bundled plugins: …" message before anything is spawned; it
-reaches the user as the usual start error (or a `PluginStartFailed` test-server
-outcome). Import already rejects such plugins, so only a hand-edited or old config,
-or a direct IPC call, gets here. Third-party SIP003 plugins are not supported.
+is the only producer of a `BundledPlugin` (a shipped plugin's descriptor bound to
+the absolute path of its binary beside the executable it was given; production
+passes `current_exe()`), and `start_plugin_chain` takes only that, so a bare name
+for `garter::BinaryPlugin` to look up on `PATH` cannot be written on the bridge's
+path. An unbundled name is refused before anything is spawned and reaches the user
+as the usual start error. Import already rejects such plugins, so only a
+hand-edited or old config, or a direct IPC call, gets here. Third-party SIP003
+plugins are not supported.
 
 `Dns` has a two-layer seam — outer (`MockDns` at `ProxyManager::new_with_dns`)
 and inner per-platform backend (`MockBackend` at `SystemDns::new_with_backend`).
