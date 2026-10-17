@@ -51,7 +51,7 @@ arc-swap = "1"
 # Pinned to the same versions shadowsocks-service 1.24 uses transitively
 # (via tun-0.8.6) so cargo deduplicates the crates.
 tun = { version = "0.8", features = ["async"] }
-smoltcp = { version = "0.13", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "alloc",
     "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp",
@@ -65,8 +65,8 @@ libc = "0.2"
 # a synthetic `SCDynamicStore` key. `system-configuration` 0.7 is built
 # against `core-foundation` 0.9, so this crate uses 0.9 too or the CF types
 # will not unify — same pin .
-system-configuration = "0.7"
-core-foundation = "0.9"
+system-configuration = "0.8"
+core-foundation = "0.10"
 # Per-session synthetic-service UUID for `dns_steer`'s session-scoped key
 # (D3). Same major version `hole-common`/`hole` already pin.
 uuid = { version = "1", features = ["v4"] }
