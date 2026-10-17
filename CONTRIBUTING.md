@@ -395,11 +395,17 @@ binary must not call (`handle-holders`' `lsof`) is a `[dev-dependencies]` entry
 of the bridge, not a `[dependencies]` one. Test and tooling code that runs under `sudo`/an admin shell
 in CI (the privileged lanes) is attended and keeps bare names.
 
-The plugin spawn is the one root spawn this does not cover:
-`resolve_plugin_path_inner` returns a bare plugin name when no sibling binary
-exists next to the bridge, and `garter::BinaryPlugin::run` (which carries the
-per-site allow) passes it to cosca, which searches `PATH`. Closing it changes what
-users can configure; it is bindreams/hole#1072.
+The plugin spawn follows the same rule by a different mechanism: the privileged
+bridge runs only the plugins Hole ships (`hole_common::plugin::KNOWN_PLUGINS`),
+resolved next to the bridge executable and nowhere else. `resolve_plugin_path_inner`
+is the only producer of a `BundledPlugin` (a shipped plugin's descriptor bound to
+the absolute path of its binary beside the executable it was given; production
+passes `current_exe()`), and `start_plugin_chain` takes only that, so a bare name
+for `garter::BinaryPlugin` to look up on `PATH` cannot be written on the bridge's
+path. An unbundled name is refused before anything is spawned and reaches the user
+as the usual start error. Import already rejects such plugins, so only a
+hand-edited or old config, or a direct IPC call, gets here. Third-party SIP003
+plugins are not supported.
 
 `Dns` has a two-layer seam — outer (`MockDns` at `ProxyManager::new_with_dns`)
 and inner per-platform backend (`MockBackend` at `SystemDns::new_with_backend`).
@@ -1097,7 +1103,7 @@ macOS this blocks the fetch outright, silently, on every lockdown-on covered
 start with an ECH-effective config — not only a restart-adopt, which merely
 compounds it by also removing the in-process signal a fresh engage still has
 (`effective_ech_doh`, computed before `install_lockdown` runs) but has no API
-to consume. On Windows the App-ID floor (`resolve_plugin_path(plugin)` — the
+to consume. On Windows the App-ID floor (`resolve_plugin_path_inner` — the
 plugin's OWN resolved binary) is sufficient for a direct `ex-ray`/
 `v2ray-plugin` config, but NOT for a chained plugin like `galoshes`: it
 `include_bytes!`s ex-ray and spawns it as a separate process from its own
@@ -2785,8 +2791,8 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 plugin sidecars + `NOTICES.md` + per-platform debug symbols + `wintun.dll` on
 Windows) matching the installed `Program Files\hole\bin\`. The bridge must be
 staged out of the cargo target dir because the running bridge file-locks its own
-exe; the plugin sidecars must be siblings so `resolve_plugin_path_inner` finds
-them. The canonical file list (the single source of truth, per-OS) is
+exe; the plugin sidecars must be siblings, the only place `resolve_plugin_path_inner`
+looks. The canonical file list (the single source of truth, per-OS) is
 [`bindir_dest_names`](xtask-lib/src/bindir.rs); the installer manifests are
 checked against it by conformance tests (`cargo xtask bindir-names`).
 

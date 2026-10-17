@@ -76,9 +76,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    // `report-udp` claims UDP on `ready`, a transport the plugin's own listener
+    // cannot be probed for: only a reader of the sitrep `ready` sees it.
+    let transports = if opts.split(';').any(|s| s == "report-udp") {
+        Transports::TCP | Transports::UDP
+    } else {
+        Transports::TCP
+    };
     emit(&SitrepEvent::Ready {
         listen: local_addr,
-        transports: Transports::TCP,
+        transports,
     });
 
     loop {

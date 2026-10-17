@@ -110,7 +110,7 @@ pub fn bindir_dest_names(os: Os) -> Vec<String> {
 }
 
 /// SIP003 plugin sidecar binaries (no extension) that every installer must ship
-/// next to the bridge so `resolve_plugin_path` finds them. Subset of
+/// next to the bridge so `resolve_plugin_path_inner` finds them. Subset of
 /// [`bindir_dest_names`]; drives the macOS `externalBin` conformance check.
 pub fn plugin_sidecar_names() -> &'static [&'static str] {
     &["ex-ray", "galoshes"]
