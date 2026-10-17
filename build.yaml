@@ -164,7 +164,7 @@ targets:
     # what is missing.
     platforms: [darwin/amd64, darwin/arm64]
     run:
-      - cargo build --release -p plugin-e2e --example ss_plugin_server
+      - cargo build -p plugin-e2e --example ss_plugin_server
       - uv run --directory dmg-installer pytest -v -m install_e2e
 
   frontend-build:

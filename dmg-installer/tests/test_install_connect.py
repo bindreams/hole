@@ -164,8 +164,8 @@ def ss_server(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[dict]:
     """A shadowsocks server fronted by the server-mode plugin, via the plugin-e2e fixture."""
     plugin_binary: str = request.param
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "target"))
-    exe = target_dir / "release" / "examples" / "ss_plugin_server"
-    assert exe.is_file(), f"{exe} missing - run `cargo build --release -p plugin-e2e --example ss_plugin_server`"
+    exe = target_dir / "debug" / "examples" / "ss_plugin_server"
+    assert exe.is_file(), f"{exe} missing - run `cargo build -p plugin-e2e --example ss_plugin_server`"
 
     stderr = (tmp_path / "ss_plugin_server.stderr").open("w+")
     proc = subprocess.Popen([str(exe), plugin_binary],

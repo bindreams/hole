@@ -1033,6 +1033,12 @@ jobs:
       - name: Build DMG and test signing
         run: cargo xtask run hole-dmg-tests
 
+      # The install test's shadowsocks server, built here so the next step's
+      # budget bounds only the wait on the installed bridge.
+      - name: Build the install test's server
+        timeout-minutes: 25
+        run: cargo build -p plugin-e2e --example ss_plugin_server
+
       # Bound on the wait for the installed bridge to answer (the step ends in
       # failure with the bridge log, rather than at the job's wall).
       - name: Install the bridge and connect through the bundled plugins
