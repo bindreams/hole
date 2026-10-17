@@ -10,6 +10,9 @@ pub mod apply;
 pub mod extract;
 pub mod os;
 
+#[cfg(any(target_os = "windows", test))]
+mod registration;
+
 #[cfg(target_os = "windows")]
 pub mod scm_wait;
 

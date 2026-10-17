@@ -317,6 +317,114 @@ fn cutover_global_net_state_real_scm_restart_gates_on_running_callback() {
         .expect("SCM restart must reach RUNNING via NotifyServiceStatusChange");
 }
 
+/// Counts, per thread, the frees of blocks at least as large as the SCM's notify
+/// buffer, so a test can tell whether dropping a `SystemScmActor` released the
+/// buffer an in-flight notification may still name. Nothing about the SCM's
+/// queueing can be observed from outside the process, so the release itself is
+/// the observable.
+#[cfg(target_os = "windows")]
+mod large_frees {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    use windows::Win32::System::Services::SERVICE_NOTIFY_2W;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub struct CountingAlloc;
+
+    // SAFETY: every call forwards to `System`; the counter is a const-initialised
+    // thread-local `Cell` with no destructor, so counting never allocates.
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            if layout.size() >= std::mem::size_of::<SERVICE_NOTIFY_2W>() {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    /// Blocks this thread has freed so far that are at least notify-buffer sized.
+    pub fn so_far() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static ALLOCATOR: large_frees::CountingAlloc = large_frees::CountingAlloc;
+
+/// A `SystemScmActor` dropped between `arm` and its callback must not free the
+/// notify buffer: the SCM may already have queued the APC that names it, and that
+/// APC runs at the thread's next alertable wait. The service is STOPPED and the
+/// arm waits for RUNNING, so nothing fires and the notification stays pending
+/// (SCM calls can themselves wait alertably, which would run an APC that is
+/// already queued and settle the record legitimately; a pending notification
+/// cannot be settled that way).
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_dropping_an_actor_with_a_pending_notification_frees_no_notify_buffer() {
+    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+
+    let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the throwaway service");
+    actor.arm(WantState::Running).expect("arm against the stopped service");
+    let before = large_frees::so_far();
+    drop(actor);
+    assert_eq!(
+        large_frees::so_far(),
+        before,
+        "dropping an actor whose notification has not been delivered freed a notify-buffer-sized block"
+    );
+}
+
+/// The converse: once the callback has run nothing can name the buffer, so
+/// dropping the actor must release it rather than leak one per use.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_dropping_an_actor_after_its_callback_frees_the_notify_buffer() {
+    use hole_bridge::cutover::os::windows::WindowsCutoverOs;
+    use hole_bridge::cutover::os::CutoverOs;
+    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    os.start_service_wait_running()
+        .expect("bring the throwaway service up via the production start seam");
+
+    let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the throwaway service");
+    actor.arm(WantState::Stopped).expect("arm against the running service");
+    assert_eq!(
+        actor.wait_callback().expect("the armed notification fires at once"),
+        Observed::Running
+    );
+    let before = large_frees::so_far();
+    drop(actor);
+    assert!(
+        large_frees::so_far() > before,
+        "dropping an actor whose callback already ran must release its notify buffer"
+    );
+}
+
 /// How the throwaway service reacts to a Stop (`test_service --on-stop`).
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy)]

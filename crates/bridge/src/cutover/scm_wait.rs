@@ -95,6 +95,7 @@ mod system {
     //! isolation contract): the alertable `SleepEx(INFINITE, TRUE)` wait is a
     //! kernel rendezvous for an SCM-delivered APC, not a timeout-poll.
 
+    use std::cell::UnsafeCell;
     use std::ffi::c_void;
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -113,14 +114,63 @@ mod system {
     use windows::Win32::System::Threading::SleepEx;
 
     use super::{Observed, WantState};
+    use crate::cutover::registration::{Registration, Settle};
 
-    /// Receives the callback-reported current state across the `SleepEx` wait.
-    /// Heap-pinned (its address is handed to the SCM as `pContext`). Atomics:
-    /// the APC writes these from the kernel's callback context, so the awaiting
-    /// loop must not treat them as loop-invariant.
+    /// Receives the callback-reported current state across the `SleepEx` wait
+    /// (its address is handed to the SCM as `pContext`). Atomics: the APC writes
+    /// these from the kernel's callback context, so the awaiting loop must not
+    /// treat them as loop-invariant. `fired` is the callback's last access.
     struct LastStatus {
         current_state: AtomicU32,
         fired: AtomicBool,
+    }
+
+    /// Everything one `NotifyServiceStatusChangeW` call hands the SCM: the notify
+    /// buffer and the status slot its `pContext` names. The buffer is in an
+    /// `UnsafeCell` because the SCM writes it from another thread while this
+    /// process holds `&` references to the record.
+    struct NotifyRecord {
+        notify: UnsafeCell<SERVICE_NOTIFY_2W>,
+        status: LastStatus,
+    }
+
+    impl NotifyRecord {
+        fn new() -> Self {
+            Self {
+                notify: UnsafeCell::new(SERVICE_NOTIFY_2W {
+                    dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
+                    pfnNotifyCallback: Some(notify_callback),
+                    ..Default::default()
+                }),
+                status: LastStatus {
+                    current_state: AtomicU32::new(0),
+                    fired: AtomicBool::new(false),
+                },
+            }
+        }
+
+        /// Points the buffer's `pContext` at this record's status slot. Called
+        /// once the record has its final address and before the SCM sees it.
+        fn bind_context(&self) {
+            // SAFETY: the record is not registered yet, so nothing else reads or
+            // writes the buffer.
+            unsafe { (*self.notify.get()).pContext = (&self.status as *const LastStatus).cast_mut().cast() };
+        }
+
+        /// The buffer to pass to `NotifyServiceStatusChangeW`.
+        fn buffer(&self) -> *const SERVICE_NOTIFY_2W {
+            self.notify.get()
+        }
+    }
+
+    impl Settle for NotifyRecord {
+        /// The notification is single-shot, so once its callback has run nothing
+        /// can name the record. A callback that has not run may be pending, or
+        /// already queued as an APC that handle close does not recall; the
+        /// registration is then never freed.
+        fn is_settled(&self) -> bool {
+            self.status.fired.load(Ordering::Acquire)
+        }
     }
 
     /// `NotifyServiceStatusChangeW` delivers the new status via an APC into this
@@ -133,7 +183,8 @@ mod system {
             return;
         }
         // SAFETY: the SCM passes back the exact buffer registered in `arm`,
-        // whose `pContext` is the live `*mut LastStatus` pinned for the wait.
+        // whose `pContext` is the `LastStatus` of a `NotifyRecord` that stays
+        // allocated until this callback has run (see `Settle for NotifyRecord`).
         let slot = unsafe { (*buf).pContext as *mut LastStatus };
         if slot.is_null() {
             return;
@@ -171,15 +222,19 @@ mod system {
         }
     }
 
-    /// Owns the SCM + service handles and the notify buffer. The `LastStatus`
-    /// slot and the `SERVICE_NOTIFY_2W` buffer are heap-pinned (`Box`) so their
-    /// addresses stay stable across `arm` → `SleepEx` → callback.
+    /// Owns the SCM + service handles and the registration of the latest `arm`.
+    ///
+    /// Each `arm` builds a fresh [`NotifyRecord`] instead of rewriting one, so a
+    /// callback from an earlier arm can never see a buffer a later arm is filling.
+    /// A record is freed only after its callback has run. An actor dropped (or
+    /// re-armed) while a notification is outstanding leaks that one record, at
+    /// most one per such drop, so an APC the SCM already queued still finds live
+    /// memory at the thread's next alertable wait.
     pub struct SystemScmActor {
         scm: SC_HANDLE,
         service: SC_HANDLE,
         service_name: Vec<u16>,
-        status: Box<LastStatus>,
-        notify: Box<SERVICE_NOTIFY_2W>,
+        registration: Option<Registration<NotifyRecord>>,
         /// The state most recently awaited (for the debug trace).
         awaiting: WantState,
         /// Whether `start()` has been issued. Gates the two-phase arm: the STOPPED
@@ -210,11 +265,7 @@ mod system {
                 scm,
                 service,
                 service_name: name,
-                status: Box::new(LastStatus {
-                    current_state: AtomicU32::new(0),
-                    fired: AtomicBool::new(false),
-                }),
-                notify: Box::new(SERVICE_NOTIFY_2W::default()),
+                registration: None,
                 awaiting: WantState::Stopped,
                 started: false,
             })
@@ -249,22 +300,27 @@ mod system {
                 let _ = CloseServiceHandle(self.service);
                 let _ = CloseServiceHandle(self.scm);
             }
+            // `registration` drops with the fields: freed only if its callback has
+            // run, whatever the close did to a notification still outstanding.
         }
     }
 
     impl super::ScmActor for SystemScmActor {
         fn arm(&mut self, want: WantState) -> io::Result<()> {
             self.awaiting = want;
-            self.status.fired.store(false, Ordering::Release);
-            *self.notify = SERVICE_NOTIFY_2W {
-                dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
-                pfnNotifyCallback: Some(notify_callback),
-                pContext: (&mut *self.status as *mut LastStatus) as *mut c_void,
-                ..Default::default()
-            };
             let mask = want_to_mask(want, self.started);
             loop {
-                let rc = unsafe { NotifyServiceStatusChangeW(self.service, mask, &*self.notify) };
+                // A fresh record per call, adopted before the outcome is known:
+                // whatever the call did, the registration owns the record, and
+                // the one it replaces retires by `Registration`'s rule (a call
+                // that failed may still have registered, so it is never freed
+                // unfired).
+                let record = NotifyRecord::new();
+                let registration = Registration::new(record);
+                registration.get().bind_context();
+                let buffer = registration.get().buffer();
+                self.registration = Some(registration);
+                let rc = unsafe { NotifyServiceStatusChangeW(self.service, mask, buffer) };
                 if rc == 0 {
                     return Ok(());
                 }
@@ -310,10 +366,14 @@ mod system {
             // Alertable wait: blocks until the SCM delivers the notify APC, which
             // runs `notify_callback` and sets `status.fired`. A spurious early
             // wake (an unrelated APC) re-enters the wait.
-            while !self.status.fired.load(Ordering::Acquire) {
+            let Some(registration) = self.registration.as_ref() else {
+                return Err(io::Error::other("wait_callback before any arm"));
+            };
+            let status = &registration.get().status;
+            while !status.fired.load(Ordering::Acquire) {
                 unsafe { SleepEx(u32::MAX, true) };
             }
-            let state = self.status.current_state.load(Ordering::Acquire);
+            let state = status.current_state.load(Ordering::Acquire);
             // Trace here, NOT in `notify_callback`: that runs in an APC where any
             // allocation/lock (which `tracing` may take) is a hazard.
             tracing::debug!(scm_current_state = state, awaiting = ?self.awaiting, "SCM status callback fired");
