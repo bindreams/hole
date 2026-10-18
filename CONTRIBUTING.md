@@ -2390,6 +2390,15 @@ swap first, then `launchctl kill SIGTERM` rides the graceful shutdown
 (`pm.stop()` → the marker-conditional disarm fires), and `KeepAlive=true`
 respawns the now-swapped binary.
 
+`scm_wait::SystemScmActor` **deliberately leaks** the notify record of a
+`NotifyServiceStatusChangeW` call whose callback has not run (mechanics:
+`cutover::registration`): one 88-byte record (64-bit Windows; `size_of` of the
+record, asserted at compile time) per call that did not settle, including each
+`ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` return. Nothing caps how many such calls
+are made (the LAGGING retry has no cap), so nothing caps the leak. Do not "fix" the leak without a
+Win32 measurement showing that closing the service handle recalls a queued APC
+and that a failed call queues none.
+
 The **marker** (`update-in-progress.json` in the service log dir, world-readable
 0o644 cross-privilege) does triple duty: the GUI holds its last snapshot instead
 of flashing Disconnected while it is set, the bridge shutdown disarms the cover
