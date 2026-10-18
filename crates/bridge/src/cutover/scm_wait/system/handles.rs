@@ -3,12 +3,12 @@
 //! `ScHandle`'s field is private to this module and `CloseServiceHandle` is
 //! imported only here, so no other code can build a handle, copy one out to
 //! close, or close one twice. A closed handle value may be reused by the OS for
-//! an unrelated handle, so a second close is not a reported error but
-//! undefined behaviour.
+//! an unrelated handle, and closing a handle that is not live can fault
+//! (measured for NULL), so a second close is never relied on to report.
 
 use std::io;
 
-use windows::core::PCWSTR;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
     SERVICE_START, SERVICE_STOP,
@@ -37,11 +37,15 @@ pub(super) struct Handles {
 }
 
 impl Handles {
-    pub(super) fn open(service_name: &[u16]) -> io::Result<Self> {
+    pub(super) fn open(service_name: &HSTRING) -> io::Result<Self> {
         let scm = ScHandle(
+            // SAFETY: null machine and database names select the local, active
+            // SCM database; no pointer is read.
             unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.map_err(io::Error::other)?,
         );
         let service = ScHandle(
+            // SAFETY: `scm.0` is live (it closes only when `scm` drops, after
+            // this call), and an `HSTRING` is NUL-terminated and outlives it.
             unsafe {
                 OpenServiceW(
                     scm.0,

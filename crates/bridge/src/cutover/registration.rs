@@ -116,7 +116,8 @@ impl<T: Settle> Arming<T> {
     pub fn confirmed(&self) -> Option<&T> {
         match self {
             Self::Confirmed(registration) => Some(registration.get()),
-            Self::Idle | Self::Unconfirmed(_) => None,
+            Self::Unconfirmed(_) => None,
+            Self::Idle => None,
         }
     }
 }

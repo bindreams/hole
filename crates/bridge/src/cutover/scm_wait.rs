@@ -101,7 +101,7 @@ mod system {
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use windows::core::HRESULT;
+    use windows::core::{HRESULT, HSTRING};
     use windows::Win32::Foundation::{
         ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, ERROR_SERVICE_NOT_ACTIVE,
     };
@@ -302,13 +302,15 @@ mod system {
     /// (88 bytes on 64-bit Windows) per `NotifyServiceStatusChangeW` call that
     /// did not settle, i.e. that dropped pending, failed, or returned
     /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`. The LAGGING retry has no cap, so
-    /// N LAGGING returns before a success leak N records; the leak is unbounded
-    /// only under an unbounded run of LAGGING returns.
+    /// N LAGGING returns before a success leak N records. Per actor the leak is
+    /// unbounded only under an unbounded run of LAGGING returns; across a
+    /// process it is one record per unsettled call, so it also grows with the
+    /// number of actors dropped while pending.
     pub struct SystemScmActor<H: Hooks = NoHooks> {
         /// `None` only after a `reopen` that failed part-way; every use then errs.
         /// Declared before `arming` so the handles close first on drop.
         handles: Option<Handles>,
-        service_name: Vec<u16>,
+        service_name: HSTRING,
         /// What the latest `arm` left behind; only a confirmed one is waited on.
         arming: Arming<NotifyRecord>,
         /// The state most recently awaited (for the debug trace).
@@ -331,7 +333,7 @@ mod system {
         /// outcomes they intercept.
         #[doc(hidden)]
         pub fn open_with(service_name: &str, hooks: H) -> io::Result<Self> {
-            let name: Vec<u16> = service_name.encode_utf16().chain(std::iter::once(0)).collect();
+            let name = HSTRING::from(service_name);
             let handles = Handles::open(&name)?;
             Ok(Self {
                 handles: Some(handles),
