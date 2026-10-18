@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{error, info, warn};
-use windows::core::HRESULT;
-use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, WIN32_ERROR};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
     ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus,
@@ -15,8 +13,14 @@ use windows_service::service::{
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::cutover::scm_wait::call_error::is_absent_service_code;
+use crate::cutover::scm_wait::retire::{retire, Disposition};
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
 use crate::service_stop::{self, StopPhase, StopProgress};
+
+#[path = "windows/retire_session.rs"]
+mod retire_session;
+pub use retire_session::RetireSession;
 
 // Constants ===========================================================================================================
 
@@ -548,13 +552,16 @@ pub fn ensure_failure_actions() -> Result<(), windows_service::Error> {
 /// control ever again and no retry can even find it. The registration is the
 /// only handle a later attempt has; keeping it over a failed stop is what
 /// makes the uninstall retryable instead of terminal (bindreams/hole#1003).
+///
+/// The stop, the delete and the check after it are one SCM session
+/// ([`retire`]), because the service carries restart-on-failure: a service the
+/// SCM is about to restart reads STOPPED, and separate probes and acts each
+/// decided on a state the SCM could change under them (bindreams/hole#1099).
+/// A service that is already gone is deregistered.
 pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
-    stop()?;
-
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE)?;
-    service.delete()?;
-    info!("Windows service uninstalled");
+    if retire_service(Disposition::Deregister)? {
+        info!("Windows service uninstalled");
+    }
     Ok(())
 }
 
@@ -572,41 +579,32 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
 /// the real guarantee; it holds the bridge's own liveness lock and refuses
 /// outright if a bridge is still alive.
 ///
-/// The stop is issued FIRST and its own failure is what gets classified. The
-/// predecessor opened the service to classify SCM's answer, dropped that
-/// handle, and then called [`stop`], which opens again — so the classification
-/// was applied to a handle deliberately thrown away before the act, and the
-/// act's open answered `ERROR_SERVICE_DOES_NOT_EXIST` unclassified whenever
-/// the row went away in between (a concurrent uninstall attempt's
-/// `DeleteService`, or the row being finalised as its last handle closed).
-/// The uninstall then refused to deregister over a service provably not
-/// running. A probe answers about the moment it was taken; only the act's own
-/// error is about the act.
+/// The stop is issued FIRST and its own failure is what gets classified. A
+/// probe answers about the moment it was taken; only the act's own error is
+/// about the act, so the row going away between a probe and the act (a
+/// concurrent uninstall attempt's `DeleteService`, or the row being finalised
+/// as its last handle closed) is read off the stop's error, not off an earlier
+/// look.
 pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
-    match stop() {
-        Ok(()) => Ok(()),
-        Err(e) if stop_error_is_absent(&*e) => {
-            info!("no Windows service registration to stop");
-            Ok(())
+    retire_service(Disposition::StopOnly).map(|_| ())
+}
+
+/// [`retire`] on a fresh session. `Ok(false)` when the SCM has no service to
+/// act on, including one that went away under the stop; `Ok(true)` when the
+/// retirement ran.
+fn retire_service(disposition: Disposition) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(mut session) = RetireSession::open()? else {
+        info!("no Windows service registration to retire");
+        return Ok(false);
+    };
+    match retire(&mut session, disposition) {
+        Ok(()) => Ok(true),
+        Err(e) if e.means_service_is_gone() => {
+            info!("the Windows service went away under the retirement");
+            Ok(false)
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.into()),
     }
-}
-
-/// The SCM status codes that mean there is no service row left to act through.
-/// `ERROR_SERVICE_MARKED_FOR_DELETE` counts: the row survives only until its
-/// last handle closes, and no handle opened through it can carry a control.
-///
-/// One table, two spellings below, because the layers report it in two: a
-/// Win32 status and the `HRESULT` the `windows` bindings widen it to.
-const ABSENT_SERVICE_CODES: [WIN32_ERROR; 2] = [ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE];
-
-fn is_absent_service_code(code: i32) -> bool {
-    ABSENT_SERVICE_CODES.iter().any(|c| c.0 as i32 == code)
-}
-
-fn is_absent_service_hresult(code: HRESULT) -> bool {
-    ABSENT_SERVICE_CODES.iter().any(|c| code == HRESULT::from_win32(c.0))
 }
 
 /// Whether an `open_service` failure means SCM has no service left to act on.
@@ -614,40 +612,9 @@ fn open_error_is_absent(e: &windows_service::Error) -> bool {
     let windows_service::Error::Winapi(io) = e else {
         return false;
     };
-    io.raw_os_error().is_some_and(is_absent_service_code)
-}
-
-/// Whether a failed [`stop`] failed BECAUSE SCM has no service left to act on.
-///
-/// [`stop`] reaches SCM through three layers and each reports that same answer
-/// in its own shape, so the classification has to span all three or it is a
-/// classification of whichever layer happened to speak:
-///
-/// - `windows_service`'s `open_service` raises `Error::Winapi(io)`, carrying
-///   the Win32 status as an OS error;
-/// - `cutover::scm_wait`'s `SystemScmActor::open` calls `OpenServiceW` through
-///   the `windows` bindings and re-wraps their `HRESULT`-carrying error in
-///   `io::Error::other`, where it survives as a nested error and NOT as an OS
-///   code;
-/// - `NotifyServiceStatusChangeW` returns a bare Win32 status, which
-///   `stop_via_notify` turns into `io::Error::from_raw_os_error` (it completes
-///   with `ERROR_SERVICE_MARKED_FOR_DELETE` when the row is deleted under it).
-///
-/// Whichever layer it came from, the fact is the same one
-/// [`open_error_is_absent`] reads, and the consequence for the caller is the
-/// same: nothing SCM could stop, so nothing to fail over.
-fn stop_error_is_absent(e: &(dyn std::error::Error + 'static)) -> bool {
-    if let Some(service) = e.downcast_ref::<windows_service::Error>() {
-        return open_error_is_absent(service);
-    }
-    if let Some(win32) = e.downcast_ref::<windows::core::Error>() {
-        return is_absent_service_hresult(win32.code());
-    }
-    if let Some(io) = e.downcast_ref::<std::io::Error>() {
-        return io.raw_os_error().is_some_and(is_absent_service_code)
-            || io.get_ref().is_some_and(|inner| stop_error_is_absent(inner));
-    }
-    false
+    io.raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .is_some_and(is_absent_service_code)
 }
 
 // Start/stop ==========================================================================================================
@@ -658,24 +625,6 @@ pub fn start() -> Result<(), windows_service::Error> {
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::START)?;
     service.start::<&str>(&[])?;
     info!("Windows service started");
-    Ok(())
-}
-
-/// Send a stop control to the service and wait until it is really stopped via
-/// `NotifyServiceStatusChangeW` — a kernel rendezvous on the STOPPED transition,
-/// not a sleep-poll. Returns immediately when already stopped.
-pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)?;
-    if service.query_status()?.current_state == ServiceState::Stopped {
-        return Ok(());
-    }
-    drop(service);
-
-    info!("stop signal sent, waiting for service to stop");
-    let mut actor = crate::cutover::scm_wait::SystemScmActor::open(SERVICE_NAME)?;
-    crate::cutover::scm_wait::stop_via_notify(&mut actor)?;
-    info!("Windows service stopped");
     Ok(())
 }
 

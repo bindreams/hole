@@ -43,6 +43,11 @@ const TUN: skuld::Label;
 #[skuld::label]
 const GLOBAL_NET_STATE: skuld::Label;
 
+#[cfg(target_os = "windows")]
+use hole_bridge::cutover::os::windows::WindowsCutoverOs;
+#[cfg(target_os = "windows")]
+use hole_bridge::cutover::os::CutoverOs;
+
 /// The on-disk image identity must FLIP across a rename-away-then-move-in swap
 /// (the GUI self-heal precondition: `same_file::Handle` inequality is what makes
 /// `decide_self_heal` return Relaunch), and the swap must succeed WHILE the image
@@ -191,9 +196,23 @@ impl ProvisionedService {
 
     /// `install`, with `launch_arguments` appended to the service's ImagePath.
     fn install_with_args(helper: &std::path::Path, launch_arguments: Vec<std::ffi::OsString>) -> Self {
+        Self::install_with(helper, launch_arguments, None)
+    }
+
+    /// `install_with_args`, and, when `restart_after` is given, the SCM's
+    /// restart-on-failure action with that delay. The delay is configuration the
+    /// SCM acts on, never something a test waits out: a long one keeps a killed
+    /// service in STOPPED for the rest of the test, a short one lets the SCM
+    /// restart it while the test blocks on the helper's parked event.
+    fn install_with(
+        helper: &std::path::Path,
+        launch_arguments: Vec<std::ffi::OsString>,
+        restart_after: Option<std::time::Duration>,
+    ) -> Self {
         use hole_bridge::platform::os::SERVICE_NAME;
         use windows_service::service::{
-            ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+            ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
+            ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceType,
         };
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -220,12 +239,29 @@ impl ProvisionedService {
             account_name: None, // LocalSystem
             account_password: None,
         };
-        manager
+        let service = manager
             .create_service(
                 &info,
-                ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
+                ServiceAccess::START
+                    | ServiceAccess::STOP
+                    | ServiceAccess::QUERY_STATUS
+                    | ServiceAccess::DELETE
+                    | ServiceAccess::CHANGE_CONFIG,
             )
             .expect("create the throwaway HoleBridge service");
+        if let Some(delay) = restart_after {
+            service
+                .update_failure_actions(ServiceFailureActions {
+                    reset_period: ServiceFailureResetPeriod::After(std::time::Duration::from_secs(86_400)),
+                    reboot_msg: None,
+                    command: None,
+                    actions: Some(vec![ServiceAction {
+                        action_type: ServiceActionType::Restart,
+                        delay,
+                    }]),
+                })
+                .expect("configure the throwaway service to restart on failure");
+        }
         ProvisionedService
     }
 
@@ -882,6 +918,620 @@ fn cutover_global_net_state_service_controls_after_stop_are_measured() {
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_service_controls_after_stop_are_measured_while_the_service_reports_running() {
     measure_controls_after_first_stop(OnStop::StayRunning);
+}
+
+/// Named events a `test_service` parks on, and the guard that lets a failing
+/// test release it so it cannot leave the service stuck.
+#[cfg(target_os = "windows")]
+mod named_event {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent, WaitForSingleObject, INFINITE};
+
+    /// A manual-reset event, created unsignalled.
+    pub struct NamedEvent {
+        handle: HANDLE,
+        name: String,
+    }
+
+    impl NamedEvent {
+        pub fn create(tag: &str) -> Self {
+            let name = format!("Global\\Hole{tag}{}", std::process::id());
+            // SAFETY: plain FFI call; the name is a valid HSTRING.
+            let handle = unsafe { CreateEventW(None, true, false, &HSTRING::from(name.as_str())) }
+                .expect("create the named event (the TUN lane runs elevated)");
+            NamedEvent { handle, name }
+        }
+
+        pub fn name(&self) -> &str {
+            &self.name
+        }
+
+        pub fn signal(&self) {
+            // SAFETY: `handle` is the live event this value owns.
+            unsafe { SetEvent(self.handle) }.expect("signal the named event");
+        }
+
+        pub fn reset(&self) {
+            // SAFETY: as above.
+            unsafe { ResetEvent(self.handle) }.expect("reset the named event");
+        }
+
+        /// Blocks until the event is signalled. Unbounded on purpose: the event
+        /// is the helper's own rendezvous, and a helper that never signals is
+        /// bounded by the nextest terminate-after on these tests.
+        pub fn wait(&self) {
+            // SAFETY: as above.
+            unsafe { WaitForSingleObject(self.handle, INFINITE) };
+        }
+
+        /// Signals the event when dropped. Declare it after the service
+        /// fixture, so it drops first and a service parked on this event is
+        /// released before the fixture's teardown waits for it to stop.
+        pub fn release_on_drop(&self) -> ReleaseOnDrop {
+            ReleaseOnDrop(self.handle)
+        }
+    }
+
+    impl Drop for NamedEvent {
+        fn drop(&mut self) {
+            // SAFETY: the handle is the live event created above.
+            let _ = unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    pub struct ReleaseOnDrop(HANDLE);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: the event outlives this guard (it is declared earlier).
+            let _ = unsafe { SetEvent(self.0) };
+        }
+    }
+}
+
+/// Raw SCM access for the tests: sending a control and reading a state without
+/// going through the code under test.
+#[cfg(target_os = "windows")]
+mod scm_probe {
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_HANDLE,
+        SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    struct ScHandle(SC_HANDLE);
+
+    impl Drop for ScHandle {
+        fn drop(&mut self) {
+            // SAFETY: the handle is a live one returned by the SCM open calls.
+            let _ = unsafe { CloseServiceHandle(self.0) };
+        }
+    }
+
+    /// A handle that can send `HoleBridge` a Stop and read its state.
+    pub struct Probe {
+        service: ScHandle,
+        _scm: ScHandle,
+    }
+
+    impl Probe {
+        pub fn open() -> Self {
+            let name: Vec<u16> = SERVICE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: plain FFI calls; `name` is NUL-terminated and outlives them.
+            let scm = ScHandle(unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.unwrap());
+            let service = ScHandle(
+                unsafe { OpenServiceW(scm.0, PCWSTR(name.as_ptr()), SERVICE_QUERY_STATUS | SERVICE_STOP) }.unwrap(),
+            );
+            Probe { service, _scm: scm }
+        }
+
+        /// `ControlService(STOP)`, answered as the SCM answered it.
+        pub fn stop(&self) -> windows::core::Result<SERVICE_STATUS> {
+            let mut status = SERVICE_STATUS::default();
+            // SAFETY: `service` is a live handle and `status` outlives the call.
+            unsafe { ControlService(self.service.0, SERVICE_CONTROL_STOP, &mut status) }.map(|()| status)
+        }
+
+        /// The state the SCM reports now (`SERVICE_STOPPED` is 1, START_PENDING 2,
+        /// STOP_PENDING 3, RUNNING 4).
+        pub fn state(&self) -> u32 {
+            let mut status = SERVICE_STATUS::default();
+            // SAFETY: `service` is a live handle and `status` outlives the call.
+            unsafe { QueryServiceStatus(self.service.0, &mut status) }.unwrap();
+            status.dwCurrentState.0
+        }
+    }
+
+    pub fn state_name(state: u32) -> &'static str {
+        match state {
+            1 => "STOPPED",
+            2 => "START_PENDING",
+            3 => "STOP_PENDING",
+            4 => "RUNNING",
+            _ => "another state",
+        }
+    }
+
+    /// Kills the service's process the way Task Manager would, so the SCM sees
+    /// a failure and applies the service's failure actions.
+    pub fn kill_service_process() {
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).unwrap();
+        let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS).unwrap();
+        let pid = service
+            .query_status()
+            .unwrap()
+            .process_id
+            .expect("a running service has a process");
+        // SAFETY: plain FFI calls on a handle this function opens and closes.
+        unsafe {
+            let process: HANDLE = OpenProcess(PROCESS_TERMINATE, false, pid).expect("open the service process");
+            let killed = TerminateProcess(process, 1);
+            let _ = CloseHandle(process);
+            killed.expect("kill the service process");
+        }
+    }
+}
+
+/// Returns once the throwaway service reports RUNNING, with no Stop sent: each
+/// pass arms for every state and acts on the one it is told.
+#[cfg(target_os = "windows")]
+fn wait_until_running() {
+    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service to wait for RUNNING");
+    loop {
+        actor.arm(WantState::Stopped).unwrap();
+        match actor.wait_callback().unwrap() {
+            Observed::Running => return,
+            Observed::Stopped => panic!("the service stopped while waiting for it to run"),
+            Observed::StartPending | Observed::StopPending => {}
+        }
+    }
+}
+
+/// Returns once the throwaway service reports STOPPED, with no Stop sent.
+#[cfg(target_os = "windows")]
+fn wait_until_stopped() {
+    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service to wait for STOPPED");
+    loop {
+        actor.arm(WantState::Stopped).unwrap();
+        if actor.wait_callback().unwrap() == Observed::Stopped {
+            return;
+        }
+    }
+}
+
+/// Starts the throwaway service on its own thread: `StartService` may not
+/// return while a held helper sits in START_PENDING.
+#[cfg(target_os = "windows")]
+fn start_in_background() -> std::thread::JoinHandle<windows_service::Result<()>> {
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    std::thread::spawn(|| {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        manager
+            .open_service(SERVICE_NAME, ServiceAccess::START)?
+            .start::<&str>(&[])
+    })
+}
+
+/// The stop probe (bindreams/hole#1099): what the SCM answers a Stop sent to a
+/// service in each state a restart passes through, and what an arm for every
+/// state reports there. These are the facts `stop_via_notify`'s policy rests on,
+/// printed so a run states them instead of the code assuming them.
+///
+/// The arm is measured first (it changes nothing), then the Stop. The held
+/// scenarios release the helper after both, so the wait always has a transition
+/// to fire on: if the arm does not report the current state, the result is the
+/// RUNNING the release produces, and the line says so.
+#[cfg(target_os = "windows")]
+mod stop_probe {
+    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    use super::named_event::NamedEvent;
+    use super::scm_probe::{state_name, Probe};
+    use super::ProvisionedService;
+
+    /// What one scenario measured.
+    pub struct Reading {
+        pub state_before: u32,
+        pub stop: windows::core::Result<windows::Win32::System::Services::SERVICE_STATUS>,
+        pub first_report: Observed,
+    }
+
+    pub fn print(scenario: &str, reading: &Reading) {
+        let stop = match &reading.stop {
+            Ok(status) => format!("delivered, answered state {}", state_name(status.dwCurrentState.0)),
+            Err(e) => format!("refused: {e}"),
+        };
+        eprintln!(
+            "SCM stop probe, {scenario}: state {}; ControlService(STOP) -> {stop}; arm for STOPPED|START_PENDING|STOP_PENDING|RUNNING first reported {:?}",
+            state_name(reading.state_before),
+            reading.first_report,
+        );
+    }
+
+    /// Arms for every state on a fresh actor, sends a Stop, and takes the first
+    /// report. `before_wait` runs between the Stop and the wait.
+    fn arm_stop_wait(probe: &Probe, before_wait: impl FnOnce()) -> Reading {
+        let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service to arm on");
+        let state_before = probe.state();
+        actor.arm(WantState::Stopped).expect("arm for every state");
+        let stop = probe.stop();
+        before_wait();
+        let first_report = actor.wait_callback().expect("the armed notification fires");
+        Reading {
+            state_before,
+            stop,
+            first_report,
+        }
+    }
+
+    pub fn running(helper: &std::path::Path) -> Reading {
+        let _service = ProvisionedService::install(helper);
+        let mut os = super::WindowsCutoverOs {
+            images: vec![],
+            target_version: "test".into(),
+        };
+        super::CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+        let probe = Probe::open();
+        let reading = arm_stop_wait(&probe, || {});
+        assert_eq!(reading.state_before, 4, "the scenario is a RUNNING service");
+        reading
+    }
+
+    /// A killed service whose restart is a long way off: STOPPED, restart pending.
+    pub fn stopped_with_a_restart_pending(helper: &std::path::Path) -> Reading {
+        let _service = ProvisionedService::install_with(helper, vec![], Some(std::time::Duration::from_secs(60 * 60)));
+        let mut os = super::WindowsCutoverOs {
+            images: vec![],
+            target_version: "test".into(),
+        };
+        super::CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+        super::scm_probe::kill_service_process();
+        super::wait_until_stopped();
+        let probe = Probe::open();
+        let reading = arm_stop_wait(&probe, || {});
+        assert_eq!(reading.state_before, 1, "the scenario is a STOPPED service");
+        reading
+    }
+
+    /// A service held in START_PENDING by `flag` (`--hold-start`: attached and
+    /// reporting; `--delay-attach`: created, not yet attached).
+    pub fn held_start_pending(helper: &std::path::Path, flag: &str) -> Reading {
+        let parked = NamedEvent::create("ProbeParked");
+        let release = NamedEvent::create("ProbeRelease");
+        let _service = ProvisionedService::install_with(
+            helper,
+            vec![
+                flag.into(),
+                release.name().into(),
+                "--parked-event".into(),
+                parked.name().into(),
+            ],
+            None,
+        );
+        let _release_on_drop = release.release_on_drop();
+        let starter = super::start_in_background();
+        parked.wait();
+        let probe = Probe::open();
+        let reading = arm_stop_wait(&probe, || release.signal());
+        starter.join().unwrap().expect("the held service starts once released");
+        assert_eq!(reading.state_before, 2, "the scenario is a START_PENDING service");
+        reading
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_stop_probe_running() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    stop_probe::print("RUNNING", &stop_probe::running(helper));
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_stop_probe_stopped_with_a_restart_pending() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    stop_probe::print(
+        "STOPPED, restart pending",
+        &stop_probe::stopped_with_a_restart_pending(helper),
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_stop_probe_start_pending_after_attach() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    stop_probe::print(
+        "START_PENDING, attached",
+        &stop_probe::held_start_pending(helper, "--hold-start"),
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_stop_probe_start_pending_before_attach() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    stop_probe::print(
+        "START_PENDING, process not attached",
+        &stop_probe::held_start_pending(helper, "--delay-attach"),
+    );
+}
+
+/// The check after the delete rests on a handle opened before it still working
+/// on a service marked for deletion. Measured here: a state query, an arm, the
+/// first report, a Stop, and `stop_via_notify` to completion, each on that handle.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_stop_probe_handle_of_a_service_marked_for_delete() {
+    use hole_bridge::cutover::scm_wait::retire::ServiceSession;
+    use hole_bridge::cutover::scm_wait::{stop_via_notify, ScmActor, WantState};
+    use hole_bridge::platform::os::RetireSession;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+
+    let mut session = RetireSession::open()
+        .expect("open the session")
+        .expect("the service is registered");
+    session.delete().expect("mark the running service for deletion");
+    let observed = session.observe();
+    let armed = session.arm(WantState::Stopped);
+    let first_report = armed.is_ok().then(|| session.wait_callback());
+    let stop = session.control_stop();
+    let finished = stop_via_notify(&mut session);
+    eprintln!(
+        "SCM stop probe, handle opened before DeleteService on a RUNNING service: query -> {observed:?}; arm -> {armed:?}; first report -> {first_report:?}; Stop -> {stop:?}; stop_via_notify -> {finished:?}"
+    );
+}
+
+/// A `ServiceSession` over the real one that releases a parked helper the
+/// moment the first arm returns, and records what each wait reported. The arm
+/// has by then asked the SCM for the current state, so the first report is the
+/// parked state; the release then lets the helper move on, and the code under
+/// test finds out what it did from the SCM, not from this wrapper.
+#[cfg(target_os = "windows")]
+struct ReleasingSession<'a> {
+    inner: hole_bridge::platform::os::RetireSession,
+    release: &'a named_event::NamedEvent,
+    released: bool,
+    reports: Vec<hole_bridge::cutover::scm_wait::Observed>,
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> ReleasingSession<'a> {
+    fn open(release: &'a named_event::NamedEvent) -> Self {
+        let inner = hole_bridge::platform::os::RetireSession::open()
+            .expect("open the retire session")
+            .expect("the service is registered");
+        Self {
+            inner,
+            release,
+            released: false,
+            reports: vec![],
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl hole_bridge::cutover::scm_wait::ScmActor for ReleasingSession<'_> {
+    fn arm(&mut self, want: hole_bridge::cutover::scm_wait::WantState) -> std::io::Result<()> {
+        self.inner.arm(want)?;
+        if !self.released {
+            self.released = true;
+            self.release.signal();
+        }
+        Ok(())
+    }
+    fn control_stop(&mut self) -> std::io::Result<()> {
+        self.inner.control_stop()
+    }
+    fn start(&mut self) -> std::io::Result<()> {
+        self.inner.start()
+    }
+    fn wait_callback(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::Observed> {
+        let observed = self.inner.wait_callback()?;
+        self.reports.push(observed);
+        Ok(observed)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl hole_bridge::cutover::scm_wait::retire::ServiceSession for ReleasingSession<'_> {
+    fn disable_restart(&mut self) -> std::io::Result<()> {
+        self.inner.disable_restart()
+    }
+    fn restore_restart(&mut self) -> std::io::Result<()> {
+        self.inner.restore_restart()
+    }
+    fn delete(&mut self) -> std::io::Result<()> {
+        self.inner.delete()
+    }
+    fn observe(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::Observed> {
+        self.inner.observe()
+    }
+}
+
+/// Retires a service parked in START_PENDING by `flag`, through the production
+/// `retire`, and checks it ends up deregistered. The first report must be the
+/// parked START_PENDING (the case a blind Stop used to be sent into), and the
+/// Stop must have come only after a later RUNNING.
+#[cfg(target_os = "windows")]
+fn retire_a_parked_service(flag: &str) {
+    use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
+    use hole_bridge::cutover::scm_wait::Observed;
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let parked = named_event::NamedEvent::create("RetireParked");
+    let release = named_event::NamedEvent::create("RetireRelease");
+    let _service = ProvisionedService::install_with(
+        helper,
+        vec![
+            flag.into(),
+            release.name().into(),
+            "--parked-event".into(),
+            parked.name().into(),
+        ],
+        None,
+    );
+    let _release_on_drop = release.release_on_drop();
+    let starter = start_in_background();
+    parked.wait();
+
+    let mut session = ReleasingSession::open(&release);
+    retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
+
+    starter.join().unwrap().expect("the held service starts once released");
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    assert_eq!(
+        session.reports.first(),
+        Some(&Observed::StartPending),
+        "the first report is the parked state: {:?}",
+        session.reports
+    );
+    assert!(
+        session.reports.contains(&Observed::Running),
+        "the held service ran before it was stopped: {:?}",
+        session.reports
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_waits_out_a_service_held_in_start_pending() {
+    retire_a_parked_service("--hold-start");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_waits_out_a_service_not_yet_attached() {
+    retire_a_parked_service("--delay-attach");
+}
+
+/// The #1099 shape: the SCM restarts a killed service (the restart delay is
+/// configuration; the test blocks on the helper's parked event) and the
+/// retirement lands on the restarted, START_PENDING instance.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_lands_on_the_instance_the_scm_just_restarted() {
+    use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
+    use hole_bridge::cutover::scm_wait::Observed;
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let parked = named_event::NamedEvent::create("RestartParked");
+    let release = named_event::NamedEvent::create("RestartRelease");
+    let _service = ProvisionedService::install_with(
+        helper,
+        vec![
+            "--hold-start".into(),
+            release.name().into(),
+            "--parked-event".into(),
+            parked.name().into(),
+        ],
+        Some(std::time::Duration::from_secs(1)),
+    );
+    let _release_on_drop = release.release_on_drop();
+
+    // First instance: let it start, then kill it.
+    let starter = start_in_background();
+    parked.wait();
+    release.signal();
+    starter.join().unwrap().expect("the first instance starts");
+    wait_until_running();
+    release.reset();
+    parked.reset();
+    scm_probe::kill_service_process();
+
+    // The SCM restarts it; the new instance parks in START_PENDING.
+    parked.wait();
+
+    let mut session = ReleasingSession::open(&release);
+    retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    assert_eq!(
+        session.reports.first(),
+        Some(&Observed::StartPending),
+        "the first report is the restarted instance's START_PENDING: {:?}",
+        session.reports
+    );
+}
+
+/// A killed service reads STOPPED while its restart is pending. The production
+/// `uninstall` returns once it is deregistered.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_deregisters_a_killed_service_with_a_restart_pending() {
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install_with(helper, vec![], Some(std::time::Duration::from_secs(60 * 60)));
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    scm_probe::kill_service_process();
+    wait_until_stopped();
+
+    hole_bridge::platform::os::uninstall().expect("uninstall a stopped service with a restart pending");
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+}
+
+/// Unchanged behaviour: a RUNNING service is stopped and deregistered.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_deregisters_a_running_service() {
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+
+    hole_bridge::platform::os::uninstall().expect("uninstall a running service");
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+}
+
+/// `ensure_stopped` stops without deregistering, and puts the restart back.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_ensure_stopped_leaves_the_service_registered() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+
+    hole_bridge::platform::os::ensure_stopped().expect("stop a running service");
+    assert!(hole_bridge::platform::os::is_installed(), "stopped, not deregistered");
+    assert_eq!(scm_probe::Probe::open().state(), 1, "the service is STOPPED");
 }
 
 /// macOS: renamex_np-swap the `.app` (a dir) + plain-rename the helper (a file)

@@ -1875,11 +1875,49 @@ are the whole of #1003's second half:
   concurrent uninstall attempt, an operator's own bootout, the daemon exiting
   and being reaped — after which the act fails over a bridge that is provably
   stopped and the uninstall refuses to deregister it. Windows classifies the
-  failed `stop()` (`windows::stop_error_is_absent`, which spans all three
-  layers the stop reaches SCM through); macOS asks launchd what it has *after*
+  failed stop (`RetireError::means_service_is_gone`, over the typed
+  `ScmCallError` or a bare OS code); macOS asks launchd what it has *after*
   the bootout (`macos::ensure_stopped_verdict`), because launchd's exit code
   for "no such job" differs by subcommand and is not a classification to build
   on.
+
+###### The Windows stop is one SCM session, decided by observation
+
+The service carries restart-on-failure (1 s), so a killed or crashed bridge is
+STOPPED, then START_PENDING, then RUNNING again within a second, and the SCM
+refuses `ControlService(STOP)` in every state but RUNNING. An uninstall that
+lands in that window used to send its Stop blind, fail, and take the product
+down a rollback (bindreams/hole#1099). Two rules close it:
+
+- **A Stop goes out only on a RUNNING observation.** `stop_via_notify` arms for
+  all four states first; the arm reports the current state at once, and
+  `Observed::for_stop_wait` decides: STOPPED ends the wait, RUNNING earns the
+  Stop, START_PENDING and STOP_PENDING are waited out. The 1061/1062 answers
+  stay benign for the state change between observation and control; every
+  other answer from an SCM call is a typed `ScmCallError` naming the call and
+  the Win32 code, and is logged at info (`SCM call failed`) in `gui-cli.log`.
+- **STOPPED is made final, and checked after the delete, on one session.**
+  `scm_wait::retire::retire` (both `ensure_stopped` and `uninstall` run it over
+  `windows::RetireSession`) turns restart-on-failure off, stops, deletes, then
+  reads the state again on a handle opened before the delete and stops it
+  through the same wait if a restart slipped in. If the restart cannot be
+  turned off it warns and goes on (the check covers the same slip); a failure
+  puts it back. An already-vanished service is `Ok`, so a row that leaves
+  between the `is_installed` probe and the act is not a failed uninstall.
+
+What is measured and what is assumed. The privileged `cutover_global_net_state_stop_probe_*`
+tests print, per state (RUNNING; STOPPED with a restart pending; START_PENDING
+attached; START_PENDING with the process not attached), what `ControlService(STOP)`
+answers and what an arm for all four states reports first. Until a Windows run
+has printed them, the code assumes: a Stop in START_PENDING is refused (1061),
+and an arm reports the current state at once, START_PENDING included; the
+privileged uninstall tests assert the latter. The check after the delete
+additionally assumes a handle opened before `DeleteService` still answers a
+state query (the probe `..._handle_of_a_service_marked_for_delete` prints it,
+and whether an arm and a stop work there too); if an arm on a marked service
+fails, the failure surfaces as `RetireError::Drain` instead of being absorbed.
+Not measured: whether changing the failure actions cancels a restart already
+pending, and that a marked service cannot be started again.
 
 Steps do not short-circuit each other and the error names all of them; an early
 `?` on the release swallowed the context that explains why it refused.
@@ -2246,17 +2284,16 @@ Disclosed residuals:
    record there. Deleting nothing is always safe; deleting the wrong thing
    during an uninstall has no in-band recovery.
 
-1. A stop that never returns is not covered at all. `platform::os::stop` waits
-   on a real SCM `STOPPED` callback with no bound, and `ProxyManager`'s
+1. A stop that never returns is not covered at all. The Windows stop wait
+   (`scm_wait::stop_via_notify`) waits on a real SCM `STOPPED` callback with no
+   bound, and `ProxyManager`'s
    teardown is itself unbounded (#556) — so against the known
    windows-installer uninstall hang the release never runs, and the user's end
    state is #1003 minus the deleted binary. The fix here addresses the stop
    that *fails*, not the stop that hangs. What the stop no longer does is
-   fail spuriously against a service that is merely already stopping:
-   `ControlService` answers `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` there, which
-   `stop_via_notify` now treats as benign because its arm already covers
-   `STOPPED`/`STOP_PENDING`/`RUNNING` and it re-issues the control on the
-   `RUNNING` a refused `START_PENDING` resolves to.
+   fail spuriously against a service that is merely already stopping or just
+   restarted: it sends no Stop until it has observed RUNNING (see "The Windows
+   stop is one SCM session" above).
 
 1. On macOS, uninstall only runs when the user takes it: the tray's Uninstall
    Helper shells out to `hole bridge uninstall`. Dragging Hole.app to the

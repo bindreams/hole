@@ -15,6 +15,16 @@ use windows::Win32::System::Services::{
     SERVICE_START, SERVICE_STOP,
 };
 
+use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
+
+fn failed(call: ScmCall, e: windows::core::Error) -> io::Error {
+    ScmCallError {
+        call,
+        code: win32_code_of_hresult(e.code().0),
+    }
+    .into_io()
+}
+
 /// An open SCM or service handle, closed exactly once when this drops.
 struct ScHandle(SC_HANDLE);
 
@@ -42,7 +52,8 @@ impl Handles {
         let scm = ScHandle(
             // SAFETY: null machine and database names select the local, active
             // SCM database; no pointer is read.
-            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.map_err(io::Error::other)?,
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+                .map_err(|e| failed(ScmCall::OpenScManager, e))?,
         );
         let service = ScHandle(
             // SAFETY: `scm.0` is live (it closes only when `scm` drops, after
@@ -54,7 +65,7 @@ impl Handles {
                     SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START,
                 )
             }
-            .map_err(io::Error::other)?,
+            .map_err(|e| failed(ScmCall::OpenService, e))?,
         );
         Ok(Self { service, _scm: scm })
     }

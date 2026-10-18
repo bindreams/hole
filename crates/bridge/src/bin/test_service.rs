@@ -17,6 +17,16 @@
 //!   so the service still reports RUNNING with STOP accepted. The control handler is the bridge's own
 //!   (`platform::os::register_stop_handler`); only the report and the control
 //!   log are the helper's.
+//! - `--hold-start <event>`: after attaching to the SCM, report START_PENDING
+//!   and hold there until the named event is signalled, then report RUNNING.
+//! - `--delay-attach <event>`: before attaching to the SCM at all, hold until
+//!   the named event is signalled. The SCM has created the process and is
+//!   waiting for it, so the service reads START_PENDING with nothing attached.
+//!   The SCM gives up on a process that never attaches (~30 s), so signal it
+//!   promptly.
+//! - `--parked-event <event>`: signalled once the process is parked by one of
+//!   the two flags above, so a test can tell the hold is in force without
+//!   guessing at timing.
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;
@@ -48,6 +58,9 @@ struct Args {
     control_log: Option<PathBuf>,
     release_event: Option<String>,
     on_stop: OnStop,
+    hold_start: Option<String>,
+    delay_attach: Option<String>,
+    parked_event: Option<String>,
 }
 
 #[cfg(target_os = "windows")]
@@ -61,6 +74,9 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
         match flag.to_str() {
             Some("--control-log") => args.control_log = Some(PathBuf::from(value)),
             Some("--release-event") => args.release_event = Some(value.into_string().expect("event name is UTF-8")),
+            Some("--hold-start") => args.hold_start = Some(value.into_string().expect("event name is UTF-8")),
+            Some("--parked-event") => args.parked_event = Some(value.into_string().expect("event name is UTF-8")),
+            Some("--delay-attach") => args.delay_attach = Some(value.into_string().expect("event name is UTF-8")),
             Some("--on-stop") => {
                 args.on_stop = match value.to_str() {
                     Some("stop-pending") => OnStop::ReportStopPending,
@@ -77,7 +93,33 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
 #[cfg(target_os = "windows")]
 fn main() -> Result<(), windows_service::Error> {
     ARGS.set(parse_args(std::env::args_os().skip(1))).ok();
+    let args = ARGS.get().expect("set above");
+    if let Some(name) = args.delay_attach.as_deref() {
+        park_until(args.parked_event.as_deref(), name);
+    }
     windows_service::service_dispatcher::start(hole_bridge::platform::os::SERVICE_NAME, ffi_service_main)
+}
+
+/// Signals `parked` (when given), then blocks until `release` is signalled.
+/// A bad event name panics, which fails the start.
+#[cfg(target_os = "windows")]
+fn park_until(parked: Option<&str>, release: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Threading::{
+        OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE, SYNCHRONIZATION_SYNCHRONIZE,
+    };
+
+    // SAFETY: plain FFI calls; each name is a valid HSTRING that outlives its
+    // call, and each handle is the live one just opened.
+    unsafe {
+        let release =
+            OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(release)).expect("open the release event");
+        if let Some(parked) = parked {
+            let parked = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(parked)).expect("open the parked event");
+            SetEvent(parked).expect("signal the parked event");
+        }
+        WaitForSingleObject(release, INFINITE);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -138,6 +180,20 @@ fn service_main(_arguments: Vec<OsString>) {
     else {
         return;
     };
+    if let Some(name) = &args.hold_start {
+        if status_handle
+            .set_service_status(&report(
+                ServiceState::StartPending,
+                ServiceControlAccept::empty(),
+                1,
+                Duration::from_secs(60),
+            ))
+            .is_err()
+        {
+            return;
+        }
+        park_until(args.parked_event.as_deref(), name);
+    }
     if status_handle
         .set_service_status(&report(
             ServiceState::Running,

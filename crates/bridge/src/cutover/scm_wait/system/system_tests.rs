@@ -28,3 +28,34 @@ fn delivery_stores_the_state_and_settles_the_record() {
     assert!(record.is_settled());
     assert_eq!(record.status.current_state.load(Ordering::Acquire), SERVICE_RUNNING.0);
 }
+
+// The SCM's own numbers (winsvc.h): states 1..=4 and notify bits 0x1..=0x8.
+// Literals, so a wrong constant in the code cannot make these agree with it.
+#[skuld::test]
+fn the_stop_wait_arms_every_state_it_acts_on() {
+    for started in [false, true] {
+        assert_eq!(want_to_mask(WantState::Stopped, started).0, 0x1 | 0x2 | 0x4 | 0x8);
+    }
+}
+
+#[skuld::test]
+fn the_start_wait_arms_start_pending_and_running_and_stopped_only_after_start() {
+    assert_eq!(want_to_mask(WantState::Running, false).0, 0x2 | 0x8);
+    assert_eq!(want_to_mask(WantState::Running, true).0, 0x1 | 0x2 | 0x8);
+}
+
+#[skuld::test]
+fn each_scm_state_a_mask_arms_for_maps_to_its_observation() {
+    assert_eq!(observed_from_state(1), Some(Observed::Stopped));
+    assert_eq!(observed_from_state(2), Some(Observed::StartPending));
+    assert_eq!(observed_from_state(3), Some(Observed::StopPending));
+    assert_eq!(observed_from_state(4), Some(Observed::Running));
+}
+
+#[skuld::test]
+fn the_pause_states_are_not_an_observation() {
+    // CONTINUE_PENDING, PAUSE_PENDING, PAUSED.
+    for state in [5, 6, 7] {
+        assert_eq!(observed_from_state(state), None);
+    }
+}

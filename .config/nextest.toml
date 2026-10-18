@@ -193,6 +193,24 @@ success-output = 'final'
 filter = 'test(/cutover_global_net_state_service_controls_after_stop_/)'
 success-output = 'final'
 
+# `cutover_global_net_state_stop_probe_*` print what the SCM answers a Stop (and
+# an arm for every state) in each state a restart passes through; the code's
+# stop policy rests on those lines, and nextest discards captured output on
+# success.
+[[profile.default.overrides]]
+filter = 'test(/cutover_global_net_state_stop_probe_/)'
+success-output = 'final'
+
+# The stop probes and the uninstall tests wait on the real SCM state with no
+# bound of their own (a bound would be a guess at how long the SCM takes). If a
+# premise they measure is false, the wait never ends, so `terminate-after` turns
+# the hang into a failure carrying the test's name instead of consuming the job
+# budget: the sanctioned "failure bound surfaced to a human" use. A test here
+# takes seconds.
+[[profile.default.overrides]]
+filter = 'test(/cutover_global_net_state_(stop_probe|uninstall|ensure_stopped)_/)'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`
 # (crates/tun-engine/src/engine/) drive the whole engine over an in-memory
 # `sim::SimWire` — no real TUN device, no real network, no real timer besides
