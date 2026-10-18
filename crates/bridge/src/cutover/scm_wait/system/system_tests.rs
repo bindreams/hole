@@ -27,12 +27,3 @@ fn delivery_stores_the_state_and_settles_the_record() {
     assert!(record.is_settled());
     assert_eq!(record.status.current_state.load(Ordering::Acquire), SERVICE_RUNNING.0);
 }
-
-/// A close of a handle that is not live fails; that failure is what a double
-/// close looks like, and `ScHandle::drop` logs exactly this.
-#[skuld::test]
-fn closing_a_handle_that_is_not_live_fails() {
-    // SAFETY: NULL names no live handle, so closing it cannot close an
-    // unrelated one.
-    assert!(unsafe { close_raw(SC_HANDLE(std::ptr::null_mut())) }.is_err());
-}

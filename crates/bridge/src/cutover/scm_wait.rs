@@ -259,23 +259,14 @@ mod system {
     /// reuse for an unrelated handle) cannot be closed a second time.
     struct ScHandle(SC_HANDLE);
 
-    /// Closes `handle`. A failure means it was not a live handle, which is what
-    /// a double close looks like.
-    ///
-    /// # Safety
-    ///
-    /// `handle` is either owned by the caller, who never uses it again, or names
-    /// no live handle at all (NULL).
-    unsafe fn close_raw(handle: SC_HANDLE) -> windows::core::Result<()> {
-        // SAFETY: by the contract above, no handle another owner uses is closed.
-        unsafe { CloseServiceHandle(handle) }
-    }
-
     impl Drop for ScHandle {
         fn drop(&mut self) {
             // SAFETY: `ScHandle` owns the handle from its open call, and `drop`
-            // runs once. No panic here: one during unwinding aborts the process.
-            if let Err(e) = unsafe { close_raw(self.0) } {
+            // runs once. A second close is not a reported error but undefined
+            // behaviour: closing a handle that is not live can fault (measured:
+            // `CloseServiceHandle(NULL)` raises an access violation on Windows).
+            // No panic here: one during unwinding aborts the process.
+            if let Err(e) = unsafe { CloseServiceHandle(self.0) } {
                 tracing::error!(error = %e, "CloseServiceHandle failed on a handle this process opened");
             }
         }
