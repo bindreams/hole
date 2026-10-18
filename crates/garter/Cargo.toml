@@ -22,9 +22,8 @@ workspace = true
 
 [features]
 # Exposes the `test_utils` public module. Off by default — enabled
-# only when running garter's own tests (set on the [[test]] entries
-# below via `required-features`) or by external consumers that want
-# to use `WaitableWriter` in their own tests. Production builds of
+# only by external consumers that want to use `WaitableWriter` in their
+# own tests (garter's own lib tests get it via `cfg(test)`). Production builds of
 # downstream crates (e.g. `hole`) do NOT enable this and therefore
 # do NOT pull in `tracing-subscriber`.
 test-utils = ["dep:tracing-subscriber"]
@@ -68,8 +67,6 @@ harness = false
 name = "tap_integration"
 path = "tests/tap_integration.rs"
 harness = false
-# Pulls in `WaitableWriter` via the `test-utils` feature.
-required-features = ["test-utils"]
 
 # The shutdown pins live in an integration target because they spawn the
 # `mock-plugin` fixture, and `CARGO_BIN_EXE_*` is defined only for integration

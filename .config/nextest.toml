@@ -226,9 +226,9 @@ filter = 'test(/^(a_port_53_datagram_reaches_the_interceptor|an_intercepted_repl
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 # `crates/garter/src/tap_tests.rs`'s `run_with_tap` harness (and its inline
-# twin in `shutdown_cancels_in_flight_connection_without_panic`) parks on two
-# intra-process signals ("tap ready", "tap closed") emitted by `TapPlugin`/
-# `StubPlugin` tasks the test itself spawns — not an out-of-process op, so
+# twin in `shutdown_cancels_in_flight_connection_without_panic`) parks on an
+# intra-process signal ("tap closed") emitted by `TapPlugin`/`StubPlugin`
+# tasks the test itself spawns — not an out-of-process op, so
 # CONTRIBUTING.md's no-synchronizing-via-time rule does not sanction a
 # per-await `tokio::time::timeout` there (see that file's module doc). A
 # regression that stops one of those signals from firing is bounded here
@@ -238,12 +238,14 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 # reaches `run_with_tap` or the inline twin is listed; the full file (7
 # tests, including `counting_stream_smoke`, the one that never calls either)
 # runs in well under 1s here, so a 20s period is a large multiple of that.
+# `crates/garter/tests/tap_integration.rs` is listed too: it spawns a real
+# `mock-plugin` and reads from the tap, which a regression can leave silent.
 #
 # COUPLED NAMES, same caveat as the two groups above: these are bare function
 # names. Add any new `run_with_tap`-driven test in this file here too, or it
 # hangs the job on a regression instead of failing fast.
 [[profile.default.overrides]]
-filter = 'test(/^(echo_records_round_trip_byte_counts_and_ttfb|silent_drop_records_zero_bytes_and_no_ttfb|silent_after_read_matches_248_shape|rst_close_classified_as_rst_with_os_errno|shutdown_cancels_in_flight_connection_without_panic|cross_check_inbound_and_upstream_counters_match)$/)'
+filter = 'test(/^(echo_records_round_trip_byte_counts_and_ttfb|silent_drop_records_zero_bytes_and_no_ttfb|silent_after_read_matches_248_shape|rst_close_classified_as_rst_with_os_errno|shutdown_cancels_in_flight_connection_without_panic|cross_check_inbound_and_upstream_counters_match|tap_relays_data_through_binary_plugin_to_echo_server)$/)'
 slow-timeout = { period = "20s", terminate-after = 2 }
 
 # See `drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed`'s

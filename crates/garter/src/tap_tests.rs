@@ -13,13 +13,16 @@
 //! [bindreams/hole#302](https://github.com/bindreams/hole/issues/302).
 //! `#[skuld::test] async fn` builds a current-thread runtime by default.
 //!
-//! `run_with_tap` parks on two intra-process signals ("tap ready", "tap
-//! closed") emitted by `TapPlugin`/`StubPlugin` tasks this test spawns and
-//! fully controls — not an out-of-process op — so CONTRIBUTING.md's
-//! no-synchronizing-via-time rule does not sanction a per-await
-//! `tokio::time::timeout` here (that exception is scoped to a remote or
-//! child-process op that might never succeed). A regression that stops one
-//! of those signals from firing is instead bounded at the nextest-config
+//! `run_with_tap` takes the tap's public address from the real `ready`
+//! channel (the tap binds port 0 itself), so a start failure panics with
+//! `run()`'s return value instead of parking. The "tap closed" wait is the
+//! one remaining park, on a tracing event emitted by a task this test
+//! spawns and fully controls — not an out-of-process op — so
+//! CONTRIBUTING.md's no-synchronizing-via-time rule does not sanction a
+//! per-await `tokio::time::timeout` here (that exception is scoped to a
+//! remote or child-process op that might never succeed). It is raced against
+//! the plugin task, so a tap that exits first fails the test; a close line
+//! that never comes while the tap stays up is bounded at the nextest-config
 //! level — `.config/nextest.toml`'s override naming every test in this file
 //! that calls `run_with_tap` (or its inline twin in
 //! `shutdown_cancels_in_flight_connection_without_panic`) — the same
@@ -148,13 +151,6 @@ fn unused_remote() -> SocketAddr {
     "127.0.0.1:1".parse().unwrap()
 }
 
-async fn pick_local() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    drop(l);
-    addr
-}
-
 // Test runner =========================================================================================================
 
 /// Run a test scenario: spawn the tap-wrapped plugin, run `client_body`,
@@ -168,43 +164,40 @@ where
     let (subscriber, writer) = make_subscriber();
     let _g = set_default_in_current_thread(subscriber);
 
-    let local = pick_local().await;
     let remote = unused_remote();
     let shutdown = CancellationToken::new();
     let inner = Box::new(StubPlugin { behavior }) as Box<dyn ChainPlugin>;
     let tap = Box::new(TapPlugin::wrap(inner));
 
-    // Register event waits BEFORE spawning the plugin so an unusually
-    // fast emit can't race past us.
-    let ready_rx = writer.wait_for("plugin tap: ready");
     let closed_rx = writer.wait_for("plugin tap: closed");
 
+    // Port 0: the tap binds its public listener itself and reports the
+    // address it got, so no port is picked, freed and re-bound.
+    let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let plugin_shutdown = shutdown.clone();
-    // These tests synchronize on the "plugin tap: ready" tracing event rather
-    // than the readiness channel, so a throwaway oneshot is passed for the
-    // unused `ready` param.
-    let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
-    let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let mut plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
 
-    // Park until tap signals ready via tracing event. `StubPlugin`/`TapPlugin`
-    // are in-process tasks the test wrote both sides of, not an external
-    // process — CONTRIBUTING.md's no-synchronizing-via-time rule reserves a
-    // per-await timeout for an out-of-process op, so a never-firing event
-    // here is bounded at the nextest-config level instead (see this file's
-    // module doc and `.config/nextest.toml`'s `tap_tests.rs` override),
-    // exactly as the tun-engine driver tests are.
-    tokio::task::spawn_blocking(move || ready_rx.recv().expect("tap never signaled ready"))
-        .await
-        .unwrap();
+    // Every exit path of `run` either sends on `ready` or drops it, so this
+    // resolves on a start failure too.
+    let local = match ready_rx.await {
+        Ok(Ok(ready)) => ready.listen,
+        other => panic!(
+            "tap did not become ready: {other:?}; run() returned {:?}\nlog:\n{}",
+            plugin_handle.await,
+            writer.snapshot()
+        ),
+    };
 
-    // Run the user-supplied client interaction.
     client_body(local).await;
 
-    // Park until the tap logs "closed" for the connection — same rationale
-    // as the "ready" park above.
-    tokio::task::spawn_blocking(move || closed_rx.recv().expect("tap never signaled close"))
-        .await
-        .unwrap();
+    // The close line comes from a task inside the tap; if the tap itself
+    // exits first, that line will never come.
+    let closed = tokio::task::spawn_blocking(move || closed_rx.recv());
+    tokio::select! {
+        r = closed => r.unwrap().expect("tap never logged close"),
+        j = &mut plugin_handle => panic!("tap exited before logging close: {j:?}\nlog:\n{}", writer.snapshot()),
+    }
 
     shutdown.cancel();
     let _ = plugin_handle.await;
@@ -347,10 +340,9 @@ async fn rst_close_classified_as_rst_with_os_errno() {
 
 #[skuld::test]
 async fn shutdown_cancels_in_flight_connection_without_panic() {
-    let (subscriber, writer) = make_subscriber();
+    let (subscriber, _writer) = make_subscriber();
     let _g = set_default_in_current_thread(subscriber);
 
-    let local = pick_local().await;
     let remote = unused_remote();
     let shutdown = CancellationToken::new();
 
@@ -360,28 +352,24 @@ async fn shutdown_cancels_in_flight_connection_without_panic() {
     }) as Box<dyn ChainPlugin>;
     let tap = Box::new(TapPlugin::wrap(inner));
 
-    let ready_rx = writer.wait_for("plugin tap: ready");
-
     let plugin_shutdown = shutdown.clone();
-    // These tests synchronize on the "plugin tap: ready" tracing event rather
-    // than the readiness channel, so a throwaway oneshot is passed for the
-    // unused `ready` param.
-    let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
 
-    // Park until tap signals ready via tracing event — see `run_with_tap`'s
-    // matching park for why this has no per-await timeout.
-    tokio::task::spawn_blocking(move || ready_rx.recv().expect("tap never signaled ready"))
-        .await
-        .unwrap();
+    let local = match ready_rx.await {
+        Ok(Ok(ready)) => ready.listen,
+        other => panic!(
+            "tap did not become ready: {other:?}; run() returned {:?}",
+            plugin_handle.await
+        ),
+    };
 
     // Open a connection that the echo plugin will hold (waiting on
     // read_exact for 4096 bytes — we send only 1).
     let _client = TcpStream::connect(local).await.unwrap();
 
-    // Cancel shutdown and await the plugin exit. The plugin's own
-    // shutdown bookkeeping bounds time; if it hangs the test
-    // framework's timeout surfaces a clear failure.
+    // Cancel shutdown and await the plugin exit.
     shutdown.cancel();
     plugin_handle
         .await
