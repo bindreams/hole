@@ -180,13 +180,15 @@ fn the_same_variable_in_the_parents_baseline_is_not_an_addition() {
     assert!(ok, "{stderr}");
 }
 
-/// The case F1 found: a name that is not a shell identifier is in the child's
-/// environment and so must be in the baseline.
+/// A name that is not a shell identifier (Windows' `ProgramFiles(x86)` is one)
+/// is in the child's environment and so must be in the baseline. The name is
+/// one no host sets, so the test's own environment cannot supply it.
 #[skuld::test]
 fn a_parent_variable_whose_name_is_not_a_shell_identifier_is_not_an_addition() {
-    let (ok, stderr) = verify_in_child(&[("ProgramFiles(x86)", "C:\\x")], &["ProgramFiles(x86)"]);
+    const NAME: &str = "HOLE_TEST_NOT_AN_IDENTIFIER(x86)";
+    let (ok, stderr) = verify_in_child(&[(NAME, "C:\\x")], &[NAME]);
     assert!(ok, "{stderr}");
-    let (ok, stderr) = verify_in_child(&[("ProgramFiles(x86)", "C:\\x")], &[]);
+    let (ok, stderr) = verify_in_child(&[(NAME, "C:\\x")], &[]);
     assert!(!ok, "must fail without the baseline entry");
-    assert!(stderr.contains("ProgramFiles(x86)"), "{stderr}");
+    assert!(stderr.contains(NAME), "{stderr}");
 }
