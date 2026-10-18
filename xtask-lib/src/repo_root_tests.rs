@@ -12,6 +12,19 @@ fn workspace(hole: bool) -> tempfile::TempDir {
     ws
 }
 
+/// A directory with no workspace above it, wherever `TMPDIR` points: directly
+/// under the filesystem root, so the walk up passes nothing but the root itself.
+/// A `tempdir()` cannot promise that, since `TMPDIR` may sit inside a checkout.
+/// Not created: the lookups only read `Cargo.toml` files, and a missing one is
+/// "no workspace".
+fn outside_every_workspace() -> PathBuf {
+    std::env::temp_dir()
+        .ancestors()
+        .last()
+        .expect("a path has an ancestor")
+        .join("hole-xtask-lib-test-outside-every-workspace")
+}
+
 fn same(found: &Path, expected: &Path) -> bool {
     found.canonicalize().unwrap() == expected.canonicalize().unwrap()
 }
@@ -34,8 +47,7 @@ fn finds_workspace_root_from_nested_member() {
 
 #[skuld::test]
 fn rejects_tree_without_workspace_manifest() {
-    let dir = tempfile::tempdir().unwrap();
-    assert!(repo_root_from(dir.path()).is_err());
+    assert!(repo_root_from(&outside_every_workspace()).is_err());
 }
 
 #[skuld::test]
@@ -74,10 +86,10 @@ fn a_hand_run_prefers_the_exe_over_a_cwd_inside_another_workspace() {
 #[skuld::test]
 fn launch_lookup_falls_back_to_the_cwd_when_the_exe_is_outside_every_hole_root() {
     let cwd = workspace(true);
-    let no_workspace = tempfile::tempdir().unwrap();
+    let no_workspace = outside_every_workspace();
     let non_hole = workspace(false);
     // Exe outside any workspace, and exe in a non-hole workspace: both fall through.
-    for exe in [no_workspace.path(), non_hole.path()] {
+    for exe in [no_workspace.as_path(), non_hole.path()] {
         let found = lookup(None, Some(exe), Some(cwd.path())).unwrap();
         assert!(same(&found, cwd.path()), "{found:?}");
     }
@@ -95,8 +107,8 @@ fn launch_lookup_skips_a_manifest_dir_that_is_not_a_hole_root() {
 fn launch_lookup_errors_naming_every_candidate_when_none_is_a_hole_root() {
     let manifest = workspace(false);
     let cwd = workspace(false);
-    let exe = tempfile::tempdir().unwrap();
-    let err = lookup(Some(manifest.path()), Some(exe.path()), Some(cwd.path()))
+    let exe = outside_every_workspace();
+    let err = lookup(Some(manifest.path()), Some(&exe), Some(cwd.path()))
         .unwrap_err()
         .to_string();
     for needle in [
@@ -104,7 +116,7 @@ fn launch_lookup_errors_naming_every_candidate_when_none_is_a_hole_root() {
         "executable",
         "working directory",
         &manifest.path().display().to_string(),
-        &exe.path().display().to_string(),
+        &exe.display().to_string(),
         &cwd.path().display().to_string(),
     ] {
         assert!(err.contains(needle), "{needle:?} missing from: {err}");
@@ -266,8 +278,8 @@ fn the_workspace_lookup_prefers_an_absolute_manifest_dir_and_falls_back_to_the_e
     assert!(same(&found, manifest.path()), "{found:?}");
 
     // An absolute manifest dir outside every workspace, or none at all: the exe.
-    let none = tempfile::tempdir().unwrap();
-    for manifest in [Some(none.path()), None] {
+    let none = outside_every_workspace();
+    for manifest in [Some(none.as_path()), None] {
         let found = workspace_root_for(manifest, || Ok(Some(exe.path().to_path_buf()))).unwrap();
         assert!(same(&found, exe.path()), "{found:?}");
     }
@@ -283,8 +295,8 @@ fn the_workspace_lookup_asks_for_the_exe_only_when_the_manifest_dir_does_not_ans
     assert!(same(&found, manifest.path()), "{found:?}");
 
     // Asked, and failing: its error is the answer, as when `current_exe` fails.
-    let none = tempfile::tempdir().unwrap();
-    for manifest in [Some(none.path()), None] {
+    let none = outside_every_workspace();
+    for manifest in [Some(none.as_path()), None] {
         let err =
             workspace_root_for(manifest, || Err(anyhow::anyhow!("no exe here"))).expect_err("the exe lookup failed");
         let err = format!("{err:#}");
@@ -301,12 +313,12 @@ fn the_workspace_lookup_asks_for_the_exe_only_when_the_manifest_dir_does_not_ans
 
 #[skuld::test]
 fn the_workspace_lookup_names_the_manifest_dir_when_the_exe_finds_no_workspace_either() {
-    let manifest = tempfile::tempdir().unwrap();
-    let exe = tempfile::tempdir().unwrap();
-    let err = workspace_root_for(Some(manifest.path()), || Ok(Some(exe.path().to_path_buf())))
+    let manifest = outside_every_workspace().join("manifest");
+    let exe = outside_every_workspace().join("exe");
+    let err = workspace_root_for(Some(&manifest), || Ok(Some(exe.clone())))
         .expect_err("no workspace anywhere")
         .to_string();
-    for dir in [manifest.path(), exe.path()] {
+    for dir in [&manifest, &exe] {
         assert!(err.contains(&dir.display().to_string()), "{dir:?} missing from: {err}");
     }
     assert!(err.contains("CARGO_MANIFEST_DIR"), "{err}");
