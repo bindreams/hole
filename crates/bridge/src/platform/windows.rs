@@ -13,7 +13,7 @@ use windows_service::service::{
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use crate::cutover::scm_wait::call_error::is_absent_service_code;
+use crate::cutover::scm_wait::call_error::{is_absent_service_code, ScmCall};
 use crate::cutover::scm_wait::retire::{retire, Disposition};
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
 use crate::service_stop::{self, StopPhase, StopProgress};
@@ -21,6 +21,8 @@ use crate::service_stop::{self, StopPhase, StopProgress};
 #[path = "windows/retire_session.rs"]
 mod retire_session;
 pub use retire_session::RetireSession;
+#[path = "windows/service_processes.rs"]
+mod service_processes;
 
 // Constants ===========================================================================================================
 
@@ -44,7 +46,7 @@ static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 static VERSION_OVERRIDE: OnceLock<String> = OnceLock::new();
 
 /// Run as a Windows Service (called by the service control manager).
-pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) -> Result<(), windows_service::Error> {
+pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) -> std::io::Result<()> {
     let default = hole_common::protocol::default_bridge_socket_path();
     if socket_path != default {
         SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();
@@ -53,6 +55,18 @@ pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) 
     LOG_DIR_OVERRIDE.set(log_dir.to_owned()).ok();
     VERSION_OVERRIDE.set(version.to_owned()).ok();
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+        .map_err(|e| scm_failure(ScmCall::StartServiceCtrlDispatcher, e))
+}
+
+/// `error`, which a `windows_service` call returned, as `call`'s typed failure.
+/// `windows_service::Error::Winapi` displays only as "IO error in winapi call",
+/// keeping the OS error as its source, so a failure that reaches a log through
+/// `{e}` loses both the call and the Win32 code unless it is re-typed here.
+fn scm_failure(call: ScmCall, error: windows_service::Error) -> std::io::Error {
+    match error {
+        windows_service::Error::Winapi(os) => call.failed_with(&os),
+        other => std::io::Error::other(format!("{} failed: {other}", call.name())),
+    }
 }
 
 windows_service::define_windows_service!(ffi_service_main, service_main);
@@ -461,11 +475,12 @@ fn service_state_dir() -> PathBuf {
 /// refresh (see `cutover::run_detached`), which also brings an install base that
 /// predates this config up to date — so a bare `install()` is not the only path
 /// that provisions it.
-pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
+pub fn install(binary_path: &Path) -> std::io::Result<()> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
-    )?;
+    )
+    .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
 
     let log_dir = service_log_dir();
     let state_dir = service_state_dir();
@@ -495,9 +510,13 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
         account_password: None,
     };
 
-    let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
+    let service = manager
+        .create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+        .map_err(|e| scm_failure(ScmCall::CreateService, e))?;
 
-    service.set_description(SERVICE_DESCRIPTION)?;
+    service
+        .set_description(SERVICE_DESCRIPTION)
+        .map_err(|e| scm_failure(ScmCall::ChangeServiceConfig2, e))?;
     // Auto-restart is hardening, applied on the just-created handle (no re-open,
     // which can race SCM propagation right after create_service). Best-effort: the
     // service is installed regardless — failing the whole install (an MSI custom
@@ -528,18 +547,23 @@ fn restart_failure_actions() -> ServiceFailureActions {
 /// `CHANGE_CONFIG`): the `Restart` action plus the non-crash-failures flag (so a
 /// graceful `Stopped(1)` from a failed bind is restarted too, while a clean
 /// `Stopped(0)` user/cutover stop is not).
-fn apply_failure_actions(service: &windows_service::service::Service) -> Result<(), windows_service::Error> {
-    service.update_failure_actions(restart_failure_actions())?;
-    service.set_failure_actions_on_non_crash_failures(true)
+fn apply_failure_actions(service: &windows_service::service::Service) -> std::io::Result<()> {
+    service
+        .update_failure_actions(restart_failure_actions())
+        .and_then(|()| service.set_failure_actions_on_non_crash_failures(true))
+        .map_err(|e| scm_failure(ScmCall::ChangeServiceConfig2, e))
 }
 
 /// Open the installed `HoleBridge` service and apply the restart-on-failure
 /// config. Idempotent (a re-apply re-writes the same config). Called by the
 /// cutover child so an install base predating this config is brought up to date
 /// as part of the update itself.
-pub fn ensure_failure_actions() -> Result<(), windows_service::Error> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)?;
+pub fn ensure_failure_actions() -> std::io::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+        .map_err(|e| scm_failure(ScmCall::OpenService, e))?;
     apply_failure_actions(&service)
 }
 
@@ -620,10 +644,15 @@ fn open_error_is_absent(e: &windows_service::Error) -> bool {
 // Start/stop ==========================================================================================================
 
 /// Start the Windows Service via SCM.
-pub fn start() -> Result<(), windows_service::Error> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::START)?;
-    service.start::<&str>(&[])?;
+pub fn start() -> std::io::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::START)
+        .map_err(|e| scm_failure(ScmCall::OpenService, e))?;
+    service
+        .start::<&str>(&[])
+        .map_err(|e| scm_failure(ScmCall::StartService, e))?;
     info!("Windows service started");
     Ok(())
 }

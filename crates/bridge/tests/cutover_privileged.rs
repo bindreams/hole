@@ -466,7 +466,9 @@ fn cutover_global_net_state_dropping_an_actor_with_a_pending_notification_frees_
     let (mut script, records) = Script::new();
     script.watch_call = Some(0);
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
-    actor.arm(WantState::Running).expect("arm against the stopped service");
+    actor
+        .arm(WantState::Running, None)
+        .expect("arm against the stopped service");
     assert_eq!(records.borrow().len(), 1);
     drop(actor);
     assert!(
@@ -496,7 +498,9 @@ fn cutover_global_net_state_dropping_an_actor_after_its_callback_frees_the_notif
     let (mut script, records) = Script::new();
     script.watch_call = Some(0);
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
-    actor.arm(WantState::Stopped).expect("arm against the running service");
+    actor
+        .arm(WantState::Stopped, None)
+        .expect("arm against the running service");
     assert_eq!(
         actor.wait_callback().expect("the armed notification fires at once"),
         Observed::Running
@@ -528,10 +532,10 @@ fn cutover_global_net_state_re_arming_while_a_notification_is_pending_frees_no_n
     script.watch_call = Some(0);
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
     actor
-        .arm(WantState::Running)
+        .arm(WantState::Running, None)
         .expect("first arm against the stopped service");
     actor
-        .arm(WantState::Running)
+        .arm(WantState::Running, None)
         .expect("second arm while the first is pending");
     assert_eq!(records.borrow().len(), 2);
     assert!(!freed_watch::was_freed(), "the pending record was freed by the re-arm");
@@ -571,7 +575,7 @@ fn cutover_global_net_state_waiting_after_a_failed_arm_errs_instead_of_hanging()
         .notify
         .push_back(std::num::NonZeroU32::new(ERROR_SERVICE_DOES_NOT_EXIST.0));
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
-    actor.arm(WantState::Running).expect_err("the injected failure");
+    actor.arm(WantState::Running, None).expect_err("the injected failure");
     let err = actor.wait_callback().expect_err("the last arm failed");
     assert!(
         err.to_string().contains("without a successful arm"),
@@ -598,9 +602,9 @@ fn cutover_global_net_state_waiting_after_an_arm_that_failed_over_a_good_one_err
         .push_back(std::num::NonZeroU32::new(ERROR_SERVICE_DOES_NOT_EXIST.0));
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
     actor
-        .arm(WantState::Running)
+        .arm(WantState::Running, None)
         .expect("first arm against the stopped service");
-    actor.arm(WantState::Running).expect_err("the injected failure");
+    actor.arm(WantState::Running, None).expect_err("the injected failure");
     let err = actor.wait_callback().expect_err("the last arm failed");
     assert!(
         err.to_string().contains("without a successful arm"),
@@ -635,7 +639,7 @@ fn cutover_global_net_state_a_lagging_client_reopens_and_arms_again() {
     script.watch_call = Some(0);
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
     actor
-        .arm(WantState::Stopped)
+        .arm(WantState::Stopped, None)
         .expect("the retry arms on the reopened handles");
     assert_eq!(records.borrow().len(), 2, "the lagging call is retried once");
     assert_eq!(
@@ -671,12 +675,12 @@ fn cutover_global_net_state_a_failed_reopen_leaves_every_use_erring() {
     script.watch_call = Some(0);
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
 
-    let err = actor.arm(WantState::Running).expect_err("the reopen fails");
+    let err = actor.arm(WantState::Running, None).expect_err("the reopen fails");
     assert!(
         err.to_string().contains("injected open failure"),
         "unexpected error: {err}"
     );
-    actor.arm(WantState::Running).expect_err("no handles to arm on");
+    actor.arm(WantState::Running, None).expect_err("no handles to arm on");
     actor.control_stop().expect_err("no handles to stop through");
     actor.start().expect_err("no handles to start through");
     actor.wait_callback().expect_err("the last arm failed");
@@ -834,14 +838,17 @@ fn deliver_controls_after_first_stop(on_stop: OnStop) -> Delivery {
     unblock.release().unwrap();
     // Wait for the SCM's STOPPED notification without sending another Stop,
     // which the handler would log. A service that is still RUNNING fires the
-    // notification at once, so re-arm until STOPPED: each pass re-checks the
-    // real state.
+    // notification at once, so each re-arm leaves out the state it was just
+    // told, and the loop re-checks the real state on every report.
     let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service for the STOPPED notification");
+    let mut told = None;
     loop {
-        actor.arm(WantState::Stopped).unwrap();
-        if actor.wait_callback().unwrap() == Observed::Stopped {
+        actor.arm(WantState::Stopped, told).unwrap();
+        let observed = actor.wait_callback().unwrap();
+        if observed == Observed::Stopped {
             break;
         }
+        told = Some(observed);
     }
 
     let mut final_status = SERVICE_STATUS::default();
@@ -990,6 +997,67 @@ mod named_event {
     }
 }
 
+/// Which of the processes the helper logged (`--pid-log`) are still running.
+/// The SCM reports a service STOPPED before its process has exited, so this, not
+/// the SCM, is what says nothing of the service is left.
+#[cfg(target_os = "windows")]
+mod left_behind {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::path::Path;
+
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    /// The logged ids whose process is still running.
+    pub fn still_running(pid_log: &Path) -> Vec<u32> {
+        std::fs::read_to_string(pid_log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| is_running_helper(*pid))
+            .collect()
+    }
+
+    /// Fails unless every process the helper logged has exited.
+    pub fn assert_none(pid_log: &Path) {
+        let running = still_running(pid_log);
+        assert!(
+            running.is_empty(),
+            "service processes still running after the call returned: {running:?}"
+        );
+    }
+
+    fn is_running_helper(pid: u32) -> bool {
+        // SAFETY: plain FFI call; no pointer is passed.
+        let Ok(process) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+        else {
+            // No process has this id: it has exited and been released.
+            return false;
+        };
+        // SAFETY: `OpenProcess` returned a new handle this value now owns.
+        let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+        let handle = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&process));
+        // SAFETY: `handle` is the live handle `process` owns.
+        if unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0 {
+            // Exited, kept in existence only by someone's handle.
+            return false;
+        }
+        // Running. An id the OS has since given to another program is not the helper.
+        let mut buffer = [0u16; 1024];
+        let mut length = buffer.len() as u32;
+        // SAFETY: `buffer` and `length` outlive the call and describe the same storage.
+        unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut length) }
+            .expect("read the image of a running process");
+        String::from_utf16_lossy(&buffer[..length as usize])
+            .to_ascii_lowercase()
+            .ends_with("test_service.exe")
+    }
+}
+
 /// Raw SCM access for the tests: sending a control and reading a state without
 /// going through the code under test.
 #[cfg(target_os = "windows")]
@@ -1087,12 +1155,14 @@ fn wait_until_running() {
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service to wait for RUNNING");
+    let mut told = None;
     loop {
-        actor.arm(WantState::Stopped).unwrap();
-        match actor.wait_callback().unwrap() {
+        actor.arm(WantState::Stopped, told).unwrap();
+        let observed = actor.wait_callback().unwrap();
+        match observed {
             Observed::Running => return,
             Observed::Stopped => panic!("the service stopped while waiting for it to run"),
-            Observed::StartPending | Observed::StopPending => {}
+            Observed::StartPending | Observed::StopPending => told = Some(observed),
         }
     }
 }
@@ -1104,11 +1174,14 @@ fn wait_until_stopped() {
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service to wait for STOPPED");
+    let mut told = None;
     loop {
-        actor.arm(WantState::Stopped).unwrap();
-        if actor.wait_callback().unwrap() == Observed::Stopped {
+        actor.arm(WantState::Stopped, told).unwrap();
+        let observed = actor.wait_callback().unwrap();
+        if observed == Observed::Stopped {
             return;
         }
+        told = Some(observed);
     }
 }
 
@@ -1170,7 +1243,7 @@ mod stop_probe {
     fn arm_stop_wait(probe: &Probe, before_wait: impl FnOnce()) -> Reading {
         let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service to arm on");
         let state_before = probe.state();
-        actor.arm(WantState::Stopped).expect("arm for every state");
+        actor.arm(WantState::Stopped, None).expect("arm for every state");
         let stop = probe.stop();
         before_wait();
         let first_report = actor.wait_callback().expect("the armed notification fires");
@@ -1296,7 +1369,7 @@ fn cutover_global_net_state_stop_probe_handle_of_a_service_marked_for_delete() {
         .expect("the service is registered");
     session.delete().expect("mark the running service for deletion");
     let observed = session.observe();
-    let armed = session.arm(WantState::Stopped);
+    let armed = session.arm(WantState::Stopped, None);
     let first_report = armed.is_ok().then(|| session.wait_callback());
     let stop = session.control_stop();
     let finished = stop_via_notify(&mut session);
@@ -1335,8 +1408,12 @@ impl<'a> ReleasingSession<'a> {
 
 #[cfg(target_os = "windows")]
 impl hole_bridge::cutover::scm_wait::ScmActor for ReleasingSession<'_> {
-    fn arm(&mut self, want: hole_bridge::cutover::scm_wait::WantState) -> std::io::Result<()> {
-        self.inner.arm(want)?;
+    fn arm(
+        &mut self,
+        want: hole_bridge::cutover::scm_wait::WantState,
+        except: Option<hole_bridge::cutover::scm_wait::Observed>,
+    ) -> std::io::Result<()> {
+        self.inner.arm(want, except)?;
         if !self.released {
             self.released = true;
             self.release.signal();
@@ -1369,6 +1446,12 @@ impl hole_bridge::cutover::scm_wait::retire::ServiceSession for ReleasingSession
     }
     fn observe(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::Observed> {
         self.inner.observe()
+    }
+    fn hold_process(&mut self) -> std::io::Result<()> {
+        self.inner.hold_process()
+    }
+    fn await_exits(&mut self) -> std::io::Result<()> {
+        self.inner.await_exits()
     }
 }
 
@@ -1486,7 +1569,13 @@ fn cutover_global_net_state_uninstall_deregisters_a_killed_service_with_a_restar
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let _service = ProvisionedService::install_with(helper, vec![], Some(std::time::Duration::from_secs(60 * 60)));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let _service = ProvisionedService::install_with(
+        helper,
+        pid_log_args(&pid_log),
+        Some(std::time::Duration::from_secs(60 * 60)),
+    );
     let mut os = WindowsCutoverOs {
         images: vec![],
         target_version: "test".into(),
@@ -1496,6 +1585,7 @@ fn cutover_global_net_state_uninstall_deregisters_a_killed_service_with_a_restar
     wait_until_stopped();
 
     hole_bridge::platform::os::uninstall().expect("uninstall a stopped service with a restart pending");
+    left_behind::assert_none(&pid_log);
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
 }
 
@@ -1506,7 +1596,9 @@ fn cutover_global_net_state_uninstall_deregisters_a_running_service() {
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let _service = ProvisionedService::install(helper);
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let _service = ProvisionedService::install_with_args(helper, pid_log_args(&pid_log));
     let mut os = WindowsCutoverOs {
         images: vec![],
         target_version: "test".into(),
@@ -1514,6 +1606,9 @@ fn cutover_global_net_state_uninstall_deregisters_a_running_service() {
     CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
 
     hole_bridge::platform::os::uninstall().expect("uninstall a running service");
+    // Before the deletion is awaited: the uninstall itself returns with no
+    // service process left.
+    left_behind::assert_none(&pid_log);
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
 }
 
@@ -1522,7 +1617,9 @@ fn cutover_global_net_state_uninstall_deregisters_a_running_service() {
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_ensure_stopped_leaves_the_service_registered() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let _service = ProvisionedService::install(helper);
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let _service = ProvisionedService::install_with_args(helper, pid_log_args(&pid_log));
     let mut os = WindowsCutoverOs {
         images: vec![],
         target_version: "test".into(),
@@ -1530,8 +1627,119 @@ fn cutover_global_net_state_ensure_stopped_leaves_the_service_registered() {
     CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
 
     hole_bridge::platform::os::ensure_stopped().expect("stop a running service");
+    left_behind::assert_none(&pid_log);
     assert!(hole_bridge::platform::os::is_installed(), "stopped, not deregistered");
     assert_eq!(scm_probe::Probe::open().state(), 1, "the service is STOPPED");
+}
+
+/// The helper's `--pid-log <path>` arguments.
+#[cfg(target_os = "windows")]
+fn pid_log_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+    vec!["--pid-log".into(), path.as_os_str().to_owned()]
+}
+
+/// How many times the race below is run. The race is the SCM's restart timer
+/// against the uninstall; each round is a fresh draw, none is a retry of
+/// another, and every round must pass.
+#[cfg(target_os = "windows")]
+const RACE_ROUNDS: usize = 5;
+
+/// The #1099 race itself: restart-on-failure with no delay, the service
+/// process killed, the uninstall started at once. Whichever side wins each
+/// round (the uninstall lands before the restart, between the stop and the
+/// delete, or after the delete), it must succeed and leave neither a service
+/// row nor a service process.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_leaves_nothing_whichever_side_of_the_scm_restart_wins() {
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    for round in 0..RACE_ROUNDS {
+        let pid_log = dir.path().join(format!("pids-{round}.log"));
+        let _service =
+            ProvisionedService::install_with(helper, pid_log_args(&pid_log), Some(std::time::Duration::ZERO));
+        let mut os = WindowsCutoverOs {
+            images: vec![],
+            target_version: "test".into(),
+        };
+        CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+
+        scm_probe::kill_service_process();
+        hole_bridge::platform::os::uninstall().unwrap_or_else(|e| panic!("round {round}: the uninstall failed: {e}"));
+
+        left_behind::assert_none(&pid_log);
+        scm_deletion::wait_until_deleted(SERVICE_NAME).unwrap_or_else(|e| panic!("round {round}: {e}"));
+    }
+}
+
+/// The drain on a service already marked for deletion while RUNNING: the state
+/// the restart slip produces, made directly. The Stop and the wait for the
+/// process use no notification, so this passes whether or not an arm works on a
+/// marked service (the probe below prints that), and returns with the process gone.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_drain_stops_and_awaits_a_running_service_marked_for_delete() {
+    use hole_bridge::cutover::scm_wait::retire::{drain, ServiceSession};
+    use hole_bridge::platform::os::{RetireSession, SERVICE_NAME};
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let _service = ProvisionedService::install_with_args(helper, pid_log_args(&pid_log));
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+
+    let mut session = RetireSession::open()
+        .expect("open the session")
+        .expect("the service is registered");
+    session.hold_process().expect("hold the running service's process");
+    session.delete().expect("mark the running service for deletion");
+    drain(&mut session).expect("drain the marked service");
+    left_behind::assert_none(&pid_log);
+    drop(session);
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+}
+
+/// What the drain does with a service marked for deletion while START_PENDING,
+/// where a Stop is refused and the process will not exit by itself: the one state
+/// that goes through an arm. Prints the outcome (it is the measurement of what
+/// an arm does on a marked service in that state); it asserts nothing about it.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_stop_probe_drain_of_a_start_pending_service_marked_for_delete() {
+    use hole_bridge::cutover::scm_wait::retire::{drain, ServiceSession};
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let parked = named_event::NamedEvent::create("MarkedParked");
+    let release = named_event::NamedEvent::create("MarkedRelease");
+    let _service = ProvisionedService::install_with(
+        helper,
+        vec![
+            "--hold-start".into(),
+            release.name().into(),
+            "--parked-event".into(),
+            parked.name().into(),
+        ],
+        None,
+    );
+    let _release_on_drop = release.release_on_drop();
+    let starter = start_in_background();
+    parked.wait();
+
+    let mut session = ReleasingSession::open(&release);
+    session.hold_process().expect("hold the starting service's process");
+    session.delete().expect("mark the starting service for deletion");
+    let drained = drain(&mut session);
+    eprintln!(
+        "SCM stop probe, drain of a service marked for deletion while START_PENDING: {drained:?}; reports {:?}",
+        session.reports
+    );
+    let _ = starter.join();
 }
 
 /// macOS: renamex_np-swap the `.app` (a dir) + plain-rename the helper (a file)

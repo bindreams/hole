@@ -207,8 +207,15 @@ success-output = 'final'
 # the hang into a failure carrying the test's name instead of consuming the job
 # budget: the sanctioned "failure bound surfaced to a human" use. A test here
 # takes seconds.
+#
+# The race test runs five rounds, each a fresh service install, kill and uninstall,
+# so it gets five times the budget (first match wins, so it is listed first).
 [[profile.default.overrides]]
-filter = 'test(/cutover_global_net_state_(stop_probe|uninstall|ensure_stopped)_/)'
+filter = 'test(/cutover_global_net_state_uninstall_leaves_nothing_whichever_side_of_the_scm_restart_wins/)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = 'test(/cutover_global_net_state_(stop_probe|uninstall|ensure_stopped|drain)_/)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

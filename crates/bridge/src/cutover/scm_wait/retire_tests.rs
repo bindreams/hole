@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use super::*;
+use crate::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
 use crate::cutover::scm_wait::WantState;
 
 type Log = RefCell<Vec<&'static str>>;
@@ -12,7 +13,9 @@ struct FakeSession<'a> {
     log: &'a Log,
     waits: VecDeque<Observed>,
     observations: VecDeque<Observed>,
-    fail: Vec<&'static str>,
+    /// `(call, n)`: the n-th (1-based) occurrence of `call` fails.
+    fail: Vec<(&'static str, usize)>,
+    seen: Vec<&'static str>,
 }
 
 impl<'a> FakeSession<'a> {
@@ -22,18 +25,27 @@ impl<'a> FakeSession<'a> {
             waits: waits.into(),
             observations: observations.into(),
             fail: vec![],
+            seen: vec![],
         }
     }
 
-    fn failing(mut self, call: &'static str) -> Self {
-        self.fail.push(call);
+    /// The first `call` fails.
+    fn failing(self, call: &'static str) -> Self {
+        self.failing_nth(call, 1)
+    }
+
+    /// The `n`-th (1-based) `call` fails.
+    fn failing_nth(mut self, call: &'static str, n: usize) -> Self {
+        self.fail.push((call, n));
         self
     }
 
-    /// Logs `call`, then fails if it was scripted to.
-    fn call(&self, call: &'static str) -> io::Result<()> {
+    /// Logs `call`, then fails if this occurrence was scripted to.
+    fn call(&mut self, call: &'static str) -> io::Result<()> {
         self.log.borrow_mut().push(call);
-        if self.fail.contains(&call) {
+        self.seen.push(call);
+        let occurrence = self.seen.iter().filter(|seen| **seen == call).count();
+        if self.fail.contains(&(call, occurrence)) {
             Err(io::Error::other(call))
         } else {
             Ok(())
@@ -42,7 +54,7 @@ impl<'a> FakeSession<'a> {
 }
 
 impl ScmActor for FakeSession<'_> {
-    fn arm(&mut self, _want: WantState) -> io::Result<()> {
+    fn arm(&mut self, _want: WantState, _except: Option<Observed>) -> io::Result<()> {
         self.call("arm")
     }
     fn control_stop(&mut self) -> io::Result<()> {
@@ -71,53 +83,135 @@ impl ServiceSession for FakeSession<'_> {
         self.call("observe")?;
         Ok(self.observations.pop_front().expect("observation script ran dry"))
     }
+    fn hold_process(&mut self) -> io::Result<()> {
+        self.call("hold")
+    }
+    fn await_exits(&mut self) -> io::Result<()> {
+        self.call("await_exits")
+    }
 }
 
 const STOPS_FROM_RUNNING: [Observed; 3] = [Observed::Running, Observed::StopPending, Observed::Stopped];
 
+fn position(log: &[&str], call: &str) -> usize {
+    log.iter()
+        .position(|c| *c == call)
+        .unwrap_or_else(|| panic!("{call} in {log:?}"))
+}
+
+fn count(log: &[&str], call: &str) -> usize {
+    log.iter().filter(|c| **c == call).count()
+}
+
 #[skuld::test]
-fn deregistering_disables_the_restart_stops_deletes_then_confirms() {
+fn deregistering_holds_the_process_stops_deletes_then_waits_it_out() {
     let log = Log::default();
-    let mut session = FakeSession::new(&log, STOPS_FROM_RUNNING.into(), vec![Observed::Stopped]);
+    // The first look finds it running; the look after the delete and the one
+    // after the wait find it stopped.
+    let mut session = FakeSession::new(
+        &log,
+        STOPS_FROM_RUNNING.into(),
+        vec![Observed::Running, Observed::Stopped, Observed::Stopped],
+    );
     retire(&mut session, Disposition::Deregister).unwrap();
     assert_eq!(
         *log.borrow(),
         vec![
+            // the process is held before anything is changed
+            "observe",
             "disable_restart",
-            // the stop wait: Running earns the one Stop
+            // the stop wait: Running earns the one Stop; a process-carrying callback is held
             "arm",
             "wait",
+            "hold",
             "control_stop",
             "arm",
             "wait",
+            "hold",
             "arm",
             "wait",
-            // then the delete, then the confirmation on the same session
+            // then the delete, the look at the same session, and the wait for the process
             "delete",
+            "observe",
+            "await_exits",
+            // time spent waiting is time the SCM could have started another
             "observe",
         ]
     );
 }
 
-/// The #1099 slip: the SCM restarts the service between the stop and the
-/// delete, so the delete marks a live service. The confirmation reads that and
-/// stops it again, after the delete.
+/// What the uninstall promises: it returns with no service process left. The
+/// last thing it does is wait one out and look again.
 #[skuld::test]
-fn a_restart_that_slipped_in_before_the_delete_is_stopped_after_it() {
+fn deregistering_returns_only_after_the_last_process_exit_is_awaited() {
     let log = Log::default();
-    let waits = [STOPS_FROM_RUNNING.to_vec(), STOPS_FROM_RUNNING.to_vec()].concat();
-    let mut session = FakeSession::new(&log, waits, vec![Observed::Running]);
+    let mut session = FakeSession::new(
+        &log,
+        STOPS_FROM_RUNNING.into(),
+        vec![Observed::Stopped, Observed::Stopped, Observed::Stopped],
+    );
     retire(&mut session, Disposition::Deregister).unwrap();
     let log = log.borrow();
-    let delete = log.iter().position(|c| *c == "delete").unwrap();
-    let last_control = log.iter().rposition(|c| *c == "control_stop").unwrap();
-    assert!(delete < last_control, "{log:?}");
-    assert_eq!(log.iter().filter(|c| **c == "control_stop").count(), 2);
-    assert!(!log.contains(&"restore_restart"), "{log:?}");
+    assert_eq!(log[log.len() - 2..], ["await_exits", "observe"], "{log:?}");
+    assert!(position(&log, "delete") < log.iter().rposition(|c| *c == "await_exits").unwrap());
 }
 
+/// The #1099 slip: the SCM restarts the service between the stop and the
+/// delete, so the delete marks a live service. The drain stops it after the
+/// delete and waits for its process to exit, with no notification armed: whether
+/// one can be armed on a marked service has not been measured.
 #[skuld::test]
-fn a_service_that_is_still_starting_after_the_delete_is_waited_out_then_stopped() {
+fn a_restart_that_slipped_in_before_the_delete_is_stopped_and_awaited_without_an_arm() {
+    let log = Log::default();
+    let mut session = FakeSession::new(
+        &log,
+        STOPS_FROM_RUNNING.into(),
+        vec![
+            Observed::Stopped,
+            Observed::Running,
+            Observed::Stopped,
+            Observed::Stopped,
+        ],
+    );
+    retire(&mut session, Disposition::Deregister).unwrap();
+    let log = log.borrow();
+    let delete = position(&log, "delete");
+    assert_eq!(count(&log, "control_stop"), 2, "{log:?}");
+    assert!(log[delete..].contains(&"control_stop"), "{log:?}");
+    assert!(!log[delete..].contains(&"arm"), "{log:?}");
+    assert!(!log.contains(&"restore_restart"), "{log:?}");
+    // The Stop is followed by the wait for the process, not by another look first.
+    let stop_after = delete + log[delete..].iter().position(|c| *c == "control_stop").unwrap();
+    assert_eq!(log[stop_after + 1], "await_exits", "{log:?}");
+}
+
+/// A process already on its way out is waited on, not signalled and not armed for.
+#[skuld::test]
+fn a_service_stopping_after_the_delete_is_awaited_without_a_stop_or_an_arm() {
+    let log = Log::default();
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Stopped],
+        vec![
+            Observed::Stopped,
+            Observed::StopPending,
+            Observed::Stopped,
+            Observed::Stopped,
+        ],
+    );
+    retire(&mut session, Disposition::Deregister).unwrap();
+    let log = log.borrow();
+    let after = &log[position(&log, "delete")..];
+    assert!(!after.contains(&"arm"), "{log:?}");
+    assert!(!after.contains(&"control_stop"), "{log:?}");
+    assert_eq!(count(after, "await_exits"), 2, "{log:?}");
+}
+
+/// The one state with no wait that avoids a notification: nothing can be
+/// signalled in START_PENDING and the process will not exit by itself, so the
+/// stop wait takes it, and a failure to arm there is reported, not hidden.
+#[skuld::test]
+fn a_service_still_starting_after_the_delete_is_waited_out_then_stopped() {
     let log = Log::default();
     let waits = vec![
         // first stop
@@ -128,16 +222,45 @@ fn a_service_that_is_still_starting_after_the_delete_is_waited_out_then_stopped(
         Observed::StopPending,
         Observed::Stopped,
     ];
-    let mut session = FakeSession::new(&log, waits, vec![Observed::StartPending]);
+    let mut session = FakeSession::new(
+        &log,
+        waits,
+        vec![
+            Observed::Stopped,
+            Observed::StartPending,
+            Observed::Stopped,
+            Observed::Stopped,
+        ],
+    );
     retire(&mut session, Disposition::Deregister).unwrap();
     let log = log.borrow();
-    assert_eq!(log.iter().filter(|c| **c == "control_stop").count(), 1);
+    assert_eq!(count(&log, "control_stop"), 1, "{log:?}");
+}
+
+#[skuld::test]
+fn a_service_still_starting_after_the_delete_that_cannot_be_armed_is_a_reported_failure() {
+    let log = Log::default();
+    // The first arm is the stop before the delete; the second is the drain's.
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Stopped],
+        vec![Observed::Stopped, Observed::StartPending],
+    )
+    .failing_nth("arm", 2);
+    let err = retire(&mut session, Disposition::Deregister).expect_err("the drain's arm was refused");
+    assert!(matches!(err, RetireError::Drain(_)), "{err}");
 }
 
 #[skuld::test]
 fn a_failed_stop_restores_the_restart_and_never_deletes() {
     let log = Log::default();
-    let mut session = FakeSession::new(&log, vec![Observed::Running], vec![]).failing("control_stop");
+    // Still RUNNING when looked at again after the refusal.
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Running, Observed::Running],
+        vec![Observed::Running],
+    )
+    .failing("control_stop");
     let err = retire(&mut session, Disposition::Deregister).expect_err("the stop failed");
     assert!(matches!(err, RetireError::Stop(_)), "{err}");
     let log = log.borrow();
@@ -148,7 +271,7 @@ fn a_failed_stop_restores_the_restart_and_never_deletes() {
 #[skuld::test]
 fn a_failed_delete_restores_the_restart() {
     let log = Log::default();
-    let mut session = FakeSession::new(&log, vec![Observed::Stopped], vec![]).failing("delete");
+    let mut session = FakeSession::new(&log, vec![Observed::Stopped], vec![Observed::Stopped]).failing("delete");
     let err = retire(&mut session, Disposition::Deregister).expect_err("the delete failed");
     assert!(matches!(err, RetireError::Delete(_)), "{err}");
     assert_eq!(log.borrow().last(), Some(&"restore_restart"));
@@ -157,32 +280,122 @@ fn a_failed_delete_restores_the_restart() {
 /// Past the delete the service is gone or going, so there is no hardening left
 /// to put back.
 #[skuld::test]
-fn a_failed_confirmation_after_the_delete_restores_nothing() {
+fn a_failed_look_after_the_delete_restores_nothing() {
     let log = Log::default();
-    let mut session = FakeSession::new(&log, vec![Observed::Stopped], vec![]).failing("observe");
-    let err = retire(&mut session, Disposition::Deregister).expect_err("the confirmation failed");
+    // The first "observe" is the look before anything changes; the second, after the delete, fails.
+    let mut session =
+        FakeSession::new(&log, vec![Observed::Stopped], vec![Observed::Stopped]).failing_nth("observe", 2);
+    let err = retire(&mut session, Disposition::Deregister).expect_err("the look failed");
     assert!(matches!(err, RetireError::Drain(_)), "{err}");
     assert!(!log.borrow().contains(&"restore_restart"));
 }
 
+/// F6, after the delete: a Stop refused to a service that has since stopped is
+/// not a failure.
 #[skuld::test]
-fn a_failed_second_stop_after_the_delete_is_reported_as_the_confirmation_failing() {
+fn a_refused_stop_after_the_delete_on_a_service_that_has_since_stopped_is_not_a_failure() {
     let log = Log::default();
     let mut session = FakeSession::new(
         &log,
-        vec![Observed::Stopped, Observed::Running],
-        vec![Observed::Running],
+        vec![Observed::Stopped],
+        vec![
+            Observed::Stopped,
+            Observed::Running,
+            Observed::Stopped,
+            Observed::Stopped,
+        ],
     )
     .failing("control_stop");
-    let err = retire(&mut session, Disposition::Deregister).expect_err("the second stop failed");
+    retire(&mut session, Disposition::Deregister).unwrap();
+}
+
+#[skuld::test]
+fn a_refused_stop_after_the_delete_on_a_service_still_running_is_the_drains_failure() {
+    let log = Log::default();
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Stopped],
+        vec![Observed::Stopped, Observed::Running, Observed::Running],
+    )
+    .failing("control_stop");
+    let err = retire(&mut session, Disposition::Deregister).expect_err("still running");
     assert!(matches!(err, RetireError::Drain(_)), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "the deleted service could not be confirmed stopped: control_stop"
+    );
+}
+
+/// The process outlives the STOPPED the SCM reports, so the process is awaited
+/// BEFORE the restart is put back: a process that fails on its way out must not
+/// be restarted by the hardening this session is restoring.
+#[skuld::test]
+fn stopping_only_waits_the_process_out_then_puts_the_restart_back() {
+    let log = Log::default();
+    let mut session = FakeSession::new(&log, STOPS_FROM_RUNNING.into(), vec![Observed::Running]);
+    retire(&mut session, Disposition::StopOnly).unwrap();
+    let log = log.borrow();
+    assert!(!log.contains(&"delete"), "{log:?}");
+    assert_eq!(log[0], "observe");
+    assert_eq!(log[1], "disable_restart");
+    assert_eq!(log[log.len() - 2..], ["await_exits", "restore_restart"], "{log:?}");
+}
+
+#[skuld::test]
+fn a_failed_wait_for_the_process_in_a_stop_only_still_puts_the_restart_back() {
+    let log = Log::default();
+    let mut session = FakeSession::new(&log, vec![Observed::Stopped], vec![Observed::Stopped]).failing("await_exits");
+    let err = retire(&mut session, Disposition::StopOnly).expect_err("the wait failed");
+    assert!(matches!(err, RetireError::Exit(_)), "{err}");
+    assert_eq!(log.borrow().last(), Some(&"restore_restart"));
+}
+
+#[skuld::test]
+fn a_failed_wait_for_the_process_after_the_delete_is_reported_by_its_step() {
+    let log = Log::default();
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Stopped],
+        vec![Observed::Stopped, Observed::Stopped],
+    )
+    .failing("await_exits");
+    let err = retire(&mut session, Disposition::Deregister).expect_err("the wait failed");
+    assert!(matches!(err, RetireError::Exit(_)), "{err}");
+    assert!(!log.borrow().contains(&"restore_restart"));
+}
+
+/// Waiting for a process out is time in which the SCM could have started
+/// another; the look after it is what finds that.
+#[skuld::test]
+fn a_service_started_again_while_its_process_was_awaited_is_drained_again() {
+    let log = Log::default();
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Stopped],
+        vec![
+            Observed::Stopped,
+            Observed::Stopped,
+            // after the wait: running again
+            Observed::Running,
+            Observed::Stopped,
+            Observed::Stopped,
+        ],
+    );
+    retire(&mut session, Disposition::Deregister).unwrap();
+    let log = log.borrow();
+    assert_eq!(count(&log, "control_stop"), 1, "{log:?}");
+    assert_eq!(count(&log, "await_exits"), 3, "{log:?}");
 }
 
 #[skuld::test]
 fn a_restart_that_cannot_be_disabled_does_not_stop_the_retirement() {
     let log = Log::default();
-    let mut session =
-        FakeSession::new(&log, vec![Observed::Stopped], vec![Observed::Stopped]).failing("disable_restart");
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Stopped],
+        vec![Observed::Stopped, Observed::Stopped, Observed::Stopped],
+    )
+    .failing("disable_restart");
     retire(&mut session, Disposition::Deregister).unwrap();
     assert!(log.borrow().contains(&"delete"));
 }
@@ -191,42 +404,63 @@ fn a_restart_that_cannot_be_disabled_does_not_stop_the_retirement() {
 #[skuld::test]
 fn a_restart_that_was_never_disabled_is_not_restored() {
     let log = Log::default();
-    let mut session = FakeSession::new(&log, vec![Observed::Running], vec![])
-        .failing("disable_restart")
-        .failing("control_stop");
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Running, Observed::Running],
+        vec![Observed::Running],
+    )
+    .failing("disable_restart")
+    .failing("control_stop");
     retire(&mut session, Disposition::Deregister).expect_err("the stop failed");
     assert!(!log.borrow().contains(&"restore_restart"));
 }
 
 #[skuld::test]
-fn stopping_only_leaves_the_service_registered_and_the_restart_back_on() {
+fn a_restart_that_cannot_be_restored_after_a_good_stop_is_not_a_failed_stop() {
     let log = Log::default();
-    let mut session = FakeSession::new(&log, STOPS_FROM_RUNNING.into(), vec![]);
+    let mut session =
+        FakeSession::new(&log, vec![Observed::Stopped], vec![Observed::Stopped]).failing("restore_restart");
     retire(&mut session, Disposition::StopOnly).unwrap();
-    let log = log.borrow();
-    assert!(!log.contains(&"delete"), "{log:?}");
-    assert_eq!(log.first(), Some(&"disable_restart"));
-    assert_eq!(log.last(), Some(&"restore_restart"));
 }
 
 #[skuld::test]
-fn a_restart_that_cannot_be_restored_after_a_good_stop_is_not_a_failed_stop() {
+fn a_look_that_fails_before_anything_changes_changes_nothing() {
     let log = Log::default();
-    let mut session = FakeSession::new(&log, vec![Observed::Stopped], vec![]).failing("restore_restart");
+    let mut session = FakeSession::new(&log, vec![], vec![]).failing("observe");
+    let err = retire(&mut session, Disposition::Deregister).expect_err("the first look failed");
+    assert!(matches!(err, RetireError::Observe(_)), "{err}");
+    assert_eq!(*log.borrow(), vec!["observe"]);
+}
+
+/// A process held on a callback is held for every state that has one, and for
+/// no other: the callback that says STOPPED has no process to name.
+#[skuld::test]
+fn every_callback_naming_a_process_holds_it_and_a_stopped_one_does_not() {
+    let log = Log::default();
+    let waits = vec![
+        Observed::StartPending,
+        Observed::Running,
+        Observed::StopPending,
+        Observed::Stopped,
+    ];
+    let mut session = FakeSession::new(&log, waits, vec![Observed::Running]);
     retire(&mut session, Disposition::StopOnly).unwrap();
+    let log = log.borrow();
+    assert_eq!(count(&log, "hold"), 3, "{log:?}");
+    let last_wait = log.iter().rposition(|c| *c == "wait").unwrap();
+    assert_ne!(log[last_wait + 1], "hold", "{log:?}");
 }
 
 fn os_error(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
 }
 
-fn scm_error(call: crate::cutover::scm_wait::call_error::ScmCall, code: u32) -> io::Error {
-    crate::cutover::scm_wait::call_error::ScmCallError { call, code }.into_io()
+fn scm_error(call: ScmCall, code: u32) -> io::Error {
+    ScmCallError { call, code }.into_io()
 }
 
 #[skuld::test]
-fn only_a_stop_that_failed_over_a_vanished_service_means_the_service_is_gone() {
-    use crate::cutover::scm_wait::call_error::ScmCall;
+fn only_a_failure_over_a_vanished_service_before_the_delete_means_the_service_is_gone() {
     // ERROR_SERVICE_DOES_NOT_EXIST 1060, ERROR_SERVICE_MARKED_FOR_DELETE 1072,
     // ERROR_ACCESS_DENIED 5.
     assert!(RetireError::Stop(scm_error(ScmCall::OpenService, 1060)).means_service_is_gone());
@@ -234,8 +468,25 @@ fn only_a_stop_that_failed_over_a_vanished_service_means_the_service_is_gone() {
     assert!(RetireError::Stop(os_error(1060)).means_service_is_gone());
     assert!(!RetireError::Stop(scm_error(ScmCall::ControlService, 5)).means_service_is_gone());
     assert!(!RetireError::Stop(io::Error::other("plain")).means_service_is_gone());
-    // A delete or a confirmation that fails over a missing service is not the
-    // service already being gone: the delete is this session's own act.
-    assert!(!RetireError::Delete(scm_error(ScmCall::OpenService, 1060)).means_service_is_gone());
-    assert!(!RetireError::Drain(scm_error(ScmCall::OpenService, 1072)).means_service_is_gone());
+    // The first look is a step of the stop: the service going away under it is
+    // the service already being gone.
+    assert!(RetireError::Observe(scm_error(ScmCall::QueryServiceStatusEx, 1060)).means_service_is_gone());
+    assert!(!RetireError::Observe(scm_error(ScmCall::QueryServiceStatusEx, 5)).means_service_is_gone());
+    // A delete, a drain or a wait that fails over a missing service is not the
+    // service already being gone: each is this session's own act.
+    assert!(!RetireError::Delete(scm_error(ScmCall::DeleteService, 1060)).means_service_is_gone());
+    assert!(!RetireError::Drain(scm_error(ScmCall::QueryServiceStatusEx, 1072)).means_service_is_gone());
+    assert!(!RetireError::Exit(scm_error(ScmCall::WaitForSingleObject, 1060)).means_service_is_gone());
+}
+
+/// The error a caller prints must name the call and the code (F1): the
+/// retirement's step wraps it, and neither hides it.
+#[skuld::test]
+fn a_failed_step_reads_with_its_call_and_its_code() {
+    let message = RetireError::Delete(scm_error(ScmCall::DeleteService, 5)).to_string();
+    assert!(
+        message.starts_with("the service could not be deleted: DeleteService failed"),
+        "{message}"
+    );
+    assert!(message.contains('5'), "{message}");
 }

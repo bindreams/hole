@@ -1887,37 +1887,76 @@ The service carries restart-on-failure (1 s), so a killed or crashed bridge is
 STOPPED, then START_PENDING, then RUNNING again within a second, and the SCM
 refuses `ControlService(STOP)` in every state but RUNNING. An uninstall that
 lands in that window used to send its Stop blind, fail, and take the product
-down a rollback (bindreams/hole#1099). Two rules close it:
+down a rollback (bindreams/hole#1099). Three rules close it:
 
 - **A Stop goes out only on a RUNNING observation.** `stop_via_notify` arms for
-  all four states first; the arm reports the current state at once, and
+  all four states first; the arm reports the current state at once (the
+  `NotifyServiceStatusChangeW` level-triggered behaviour that
+  `..._service_controls_after_stop_are_measured_while_the_service_reports_running`
+  already relies on: a service still RUNNING fires the notification at once), and
   `Observed::for_stop_wait` decides: STOPPED ends the wait, RUNNING earns the
-  Stop, START_PENDING and STOP_PENDING are waited out. The 1061/1062 answers
-  stay benign for the state change between observation and control; every
-  other answer from an SCM call is a typed `ScmCallError` naming the call and
-  the Win32 code, and is logged at info (`SCM call failed`) in `gui-cli.log`.
-- **STOPPED is made final, and checked after the delete, on one session.**
+  Stop, START_PENDING and STOP_PENDING are waited out. **A re-arm leaves out
+  the state it was just told** (`states_to_arm`), because an arm that still
+  asked for it would be told it again at once, for as long as the state lasted:
+  a busy loop of SCM calls. A Stop that fails is read against a fresh arm for
+  every state: the failure belongs to the RUNNING observation it was sent on,
+  and only a service still RUNNING makes it an error (any other state was a
+  race with the service's own state change, whatever code the SCM or the dying
+  process answered with). Every failing SCM call, including the
+  `windows_service` ones whose own error displays only as "IO error in winapi
+  call", is a typed `ScmCallError` naming the call and the Win32 code, and
+  reaches `gui-cli.log` that way.
+- **STOPPED is made final, and the delete is drained, on one session.**
   `scm_wait::retire::retire` (both `ensure_stopped` and `uninstall` run it over
-  `windows::RetireSession`) turns restart-on-failure off, stops, deletes, then
-  reads the state again on a handle opened before the delete and stops it
-  through the same wait if a restart slipped in. If the restart cannot be
-  turned off it warns and goes on (the check covers the same slip); a failure
-  puts it back. An already-vanished service is `Ok`, so a row that leaves
-  between the `is_installed` probe and the act is not a failed uninstall.
+  `windows::RetireSession`) turns restart-on-failure off, stops, and for
+  `uninstall` deletes. If the restart cannot be turned off it warns and goes on
+  (the drain covers the same slip); a failure puts it back. An already-vanished
+  service is `Ok`, so a row that leaves between the `is_installed` probe and the
+  act is not a failed uninstall.
+- **The process, not the state, is what is waited out.** The SCM reports STOPPED
+  before the process has exited, and `dwProcessId` is 0 once it has, so every
+  process the service shows (the first look, and every stop-wait callback that
+  names one) is opened for `SYNCHRONIZE` while it is named, and `retire` ends
+  with a wait on all of them: `uninstall` and `ensure_stopped` return with no
+  service process left. The wait has no bound: it is the exit of a process the
+  SCM has been told to stop, and a bridge that never exits is the same
+  documented gap as one that hangs in STOP_PENDING. The service *row* is not
+  waited for; the SCM removes it once the handles close. The open of a held
+  process rests on the SCM's own latency in noticing the exit (a process the SCM
+  names cannot have its id reused while the SCM tracks it).
+
+After the delete the service may be live (a restart slipped in between the stop
+and the delete). `Observed::for_drain_step` decides, and **none of the steps for
+a state with a process arms a notification**, because whether an arm works on a
+service marked for deletion has not been measured: RUNNING is sent a Stop and its
+process awaited; STOP_PENDING is awaited; STOPPED is awaited and looked at again
+(the wait is time in which the SCM may have started another). START_PENDING is
+the one state with no other way to wait (a Stop is refused, and the process will
+not exit by itself), so it goes through the stop wait, and if that cannot arm on
+the marked service the failure surfaces as `RetireError::Drain` rather than being
+absorbed. Waiting out a process the SCM still reports (a state that lags the
+exit by the SCM's own latency) re-looks until the SCM catches up; that is bounded
+by the SCM, not by a count.
 
 What is measured and what is assumed. The privileged `cutover_global_net_state_stop_probe_*`
 tests print, per state (RUNNING; STOPPED with a restart pending; START_PENDING
 attached; START_PENDING with the process not attached), what `ControlService(STOP)`
-answers and what an arm for all four states reports first. Until a Windows run
-has printed them, the code assumes: a Stop in START_PENDING is refused (1061),
-and an arm reports the current state at once, START_PENDING included; the
-privileged uninstall tests assert the latter. The check after the delete
-additionally assumes a handle opened before `DeleteService` still answers a
-state query (the probe `..._handle_of_a_service_marked_for_delete` prints it,
-and whether an arm and a stop work there too); if an arm on a marked service
-fails, the failure surfaces as `RetireError::Drain` instead of being absorbed.
-Not measured: whether changing the failure actions cancels a restart already
-pending, and that a marked service cannot be started again.
+answers and what an arm for all four states reports first; the probe
+`..._handle_of_a_service_marked_for_delete` prints a state query, an arm, a Stop and
+the stop wait on a handle opened before `DeleteService`, and
+`..._drain_of_a_start_pending_service_marked_for_delete` prints how the one
+arm-dependent drain state ends. Until a Windows run has printed them, the code
+assumes: a Stop in START_PENDING is refused (1061), and an arm reports the
+current state at once, START_PENDING included (the privileged uninstall tests
+assert the latter). The drain assumes only that a handle opened before
+`DeleteService` still answers a state query and carries a Stop; the privileged
+test `..._drain_stops_and_awaits_a_running_service_marked_for_delete` passes
+whatever an arm does there, and
+`..._uninstall_leaves_nothing_whichever_side_of_the_scm_restart_wins` runs the
+timer race itself (restart delay 0, process killed, uninstall at once) five times
+and asserts no row and no process remains. Not measured: whether changing the
+failure actions cancels a restart already pending, and that a marked service
+cannot be started again; the drain is correct for either answer.
 
 Steps do not short-circuit each other and the error names all of them; an early
 `?` on the release swallowed the context that explains why it refused.

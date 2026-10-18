@@ -1,4 +1,6 @@
-use super::*;
+use windows_service::service::{ServiceActionType, ServiceFailureResetPeriod};
+
+use super::no_restart_failure_actions;
 
 #[skuld::test]
 fn the_disabled_restart_restarts_nothing_and_keeps_the_reset_period() {
@@ -10,35 +12,4 @@ fn the_disabled_restart_restarts_nothing_and_keeps_the_reset_period() {
         actions.reset_period,
         ServiceFailureResetPeriod::After(d) if d == std::time::Duration::from_secs(86_400)
     ));
-}
-
-#[skuld::test]
-fn every_state_the_bridge_can_be_in_is_an_observation() {
-    assert_eq!(
-        observed_from_service_state(ServiceState::Running),
-        Some(Observed::Running)
-    );
-    assert_eq!(
-        observed_from_service_state(ServiceState::Stopped),
-        Some(Observed::Stopped)
-    );
-    assert_eq!(
-        observed_from_service_state(ServiceState::StartPending),
-        Some(Observed::StartPending)
-    );
-    assert_eq!(
-        observed_from_service_state(ServiceState::StopPending),
-        Some(Observed::StopPending)
-    );
-}
-
-#[skuld::test]
-fn the_pause_states_are_not_an_observation() {
-    for state in [
-        ServiceState::ContinuePending,
-        ServiceState::PausePending,
-        ServiceState::Paused,
-    ] {
-        assert_eq!(observed_from_service_state(state), None);
-    }
 }

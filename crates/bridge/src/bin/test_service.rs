@@ -24,6 +24,9 @@
 //!   waiting for it, so the service reads START_PENDING with nothing attached.
 //!   The SCM gives up on a process that never attaches (~30 s), so signal it
 //!   promptly.
+//! - `--pid-log <path>`: append this process's id to `<path>` at start, one per
+//!   line, so a test can tell afterwards whether any process the service ran is
+//!   still alive.
 //! - `--parked-event <event>`: signalled once the process is parked by one of
 //!   the two flags above, so a test can tell the hold is in force without
 //!   guessing at timing.
@@ -61,6 +64,7 @@ struct Args {
     hold_start: Option<String>,
     delay_attach: Option<String>,
     parked_event: Option<String>,
+    pid_log: Option<PathBuf>,
 }
 
 #[cfg(target_os = "windows")]
@@ -74,6 +78,7 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
         match flag.to_str() {
             Some("--control-log") => args.control_log = Some(PathBuf::from(value)),
             Some("--release-event") => args.release_event = Some(value.into_string().expect("event name is UTF-8")),
+            Some("--pid-log") => args.pid_log = Some(PathBuf::from(value)),
             Some("--hold-start") => args.hold_start = Some(value.into_string().expect("event name is UTF-8")),
             Some("--parked-event") => args.parked_event = Some(value.into_string().expect("event name is UTF-8")),
             Some("--delay-attach") => args.delay_attach = Some(value.into_string().expect("event name is UTF-8")),
@@ -94,6 +99,15 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
 fn main() -> Result<(), windows_service::Error> {
     ARGS.set(parse_args(std::env::args_os().skip(1))).ok();
     let args = ARGS.get().expect("set above");
+    if let Some(path) = &args.pid_log {
+        use std::io::Write;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open the pid log");
+        writeln!(log, "{}", std::process::id()).expect("write the pid log");
+    }
     if let Some(name) = args.delay_attach.as_deref() {
         park_until(args.parked_event.as_deref(), name);
     }

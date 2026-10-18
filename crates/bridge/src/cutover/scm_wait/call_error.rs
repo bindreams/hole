@@ -2,7 +2,8 @@
 
 use std::io;
 
-/// An SCM entry point whose failure is reported by name.
+/// An SCM entry point (or the process wait that goes with a service) whose
+/// failure is reported by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScmCall {
     OpenScManager,
@@ -10,6 +11,13 @@ pub enum ScmCall {
     NotifyServiceStatusChange,
     ControlService,
     StartService,
+    ChangeServiceConfig2,
+    DeleteService,
+    QueryServiceStatusEx,
+    OpenProcess,
+    WaitForSingleObject,
+    CreateService,
+    StartServiceCtrlDispatcher,
 }
 
 impl ScmCall {
@@ -20,6 +28,24 @@ impl ScmCall {
             ScmCall::NotifyServiceStatusChange => "NotifyServiceStatusChange",
             ScmCall::ControlService => "ControlService",
             ScmCall::StartService => "StartService",
+            ScmCall::ChangeServiceConfig2 => "ChangeServiceConfig2",
+            ScmCall::DeleteService => "DeleteService",
+            ScmCall::QueryServiceStatusEx => "QueryServiceStatusEx",
+            ScmCall::OpenProcess => "OpenProcess",
+            ScmCall::WaitForSingleObject => "WaitForSingleObject",
+            ScmCall::CreateService => "CreateService",
+            ScmCall::StartServiceCtrlDispatcher => "StartServiceCtrlDispatcher",
+        }
+    }
+
+    /// `failure`, the OS error a `windows_service` call carries inside its
+    /// `Error::Winapi` (which displays only as "IO error in winapi call"), as
+    /// this call's typed failure with the Win32 code.
+    pub fn failed_with(self, failure: &io::Error) -> io::Error {
+        match failure.raw_os_error().and_then(|code| u32::try_from(code).ok()) {
+            Some(code) => ScmCallError { call: self, code }.into_io(),
+            // Nothing to carry but the text.
+            None => io::Error::other(format!("{} failed: {failure}", self.name())),
         }
     }
 }
@@ -45,10 +71,6 @@ impl ScmCallError {
 pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 /// `ERROR_SERVICE_MARKED_FOR_DELETE`.
 pub const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
-/// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`.
-pub const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: u32 = 1061;
-/// `ERROR_SERVICE_NOT_ACTIVE`.
-pub const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
 
 /// Whether `code` says the SCM has no service left to act through: never
 /// registered, or marked for deletion, which no handle opened afterwards can
@@ -78,26 +100,6 @@ pub fn win32_code_of_hresult(hresult: i32) -> u32 {
         bits & 0xFFFF
     } else {
         bits
-    }
-}
-
-/// How `ControlService(STOP)` answered, given its error code.
-///
-/// Two answers are about a race with the state the caller observed, and are
-/// not failures: the stop wait's own arm is already queued, so the STOPPED it
-/// waits for still arrives. Every other code is a real failure and is returned
-/// by name.
-pub fn classify_control_stop(code: u32) -> Result<(), ScmCallError> {
-    match code {
-        // The service stopped between the observation and this control.
-        ERROR_SERVICE_NOT_ACTIVE => Ok(()),
-        // The service left RUNNING between the observation and this control
-        // (STOP_PENDING, or a restart's START_PENDING).
-        ERROR_SERVICE_CANNOT_ACCEPT_CTRL => Ok(()),
-        code => Err(ScmCallError {
-            call: ScmCall::ControlService,
-            code,
-        }),
     }
 }
 

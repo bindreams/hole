@@ -17,30 +17,6 @@ fn an_hresult_outside_the_win32_facility_is_kept_whole() {
 }
 
 #[skuld::test]
-fn a_control_answer_that_is_a_race_is_not_a_failure() {
-    // 1062: stopped between the observation and the control. 1061: no longer
-    // in a state that takes a Stop.
-    assert_eq!(classify_control_stop(1062), Ok(()));
-    assert_eq!(classify_control_stop(1061), Ok(()));
-}
-
-#[skuld::test]
-fn every_other_control_answer_is_a_failure_naming_the_call_and_the_code() {
-    // 1053: the service did not respond to the start or control request in
-    // time. 1052: the requested control is not valid for this service. 5:
-    // access denied.
-    for code in [1053, 1052, 5] {
-        assert_eq!(
-            classify_control_stop(code),
-            Err(ScmCallError {
-                call: ScmCall::ControlService,
-                code
-            })
-        );
-    }
-}
-
-#[skuld::test]
 fn a_failure_reads_with_the_call_name_and_the_code() {
     let message = ScmCallError {
         call: ScmCall::NotifyServiceStatusChange,
@@ -73,6 +49,13 @@ fn each_call_has_its_win32_name() {
         (ScmCall::NotifyServiceStatusChange, "NotifyServiceStatusChange"),
         (ScmCall::ControlService, "ControlService"),
         (ScmCall::StartService, "StartService"),
+        (ScmCall::ChangeServiceConfig2, "ChangeServiceConfig2"),
+        (ScmCall::DeleteService, "DeleteService"),
+        (ScmCall::QueryServiceStatusEx, "QueryServiceStatusEx"),
+        (ScmCall::OpenProcess, "OpenProcess"),
+        (ScmCall::WaitForSingleObject, "WaitForSingleObject"),
+        (ScmCall::CreateService, "CreateService"),
+        (ScmCall::StartServiceCtrlDispatcher, "StartServiceCtrlDispatcher"),
     ];
     for (call, name) in table {
         assert_eq!(call.name(), name);
@@ -101,4 +84,51 @@ fn an_io_error_is_an_absent_service_in_either_shape() {
     ));
     assert!(!io_error_is_absent_service(&io::Error::from_raw_os_error(5)));
     assert!(!io_error_is_absent_service(&io::Error::other("1060")));
+}
+
+/// `windows_service::Error::Winapi` displays as "IO error in winapi call" and
+/// keeps the OS error only as its source, so a call that returns one reaches a
+/// log with neither its name nor its code unless it is re-typed here.
+#[skuld::test]
+fn a_winapi_failure_reads_with_its_call_and_its_code() {
+    // 5: access denied. 1072: marked for delete. 1722: the RPC server is unavailable.
+    for (call, name, code) in [
+        (ScmCall::ChangeServiceConfig2, "ChangeServiceConfig2", 5),
+        (ScmCall::DeleteService, "DeleteService", 1072),
+        (ScmCall::QueryServiceStatusEx, "QueryServiceStatusEx", 1722),
+        (ScmCall::OpenService, "OpenService", 5),
+        (ScmCall::OpenScManager, "OpenSCManager", 5),
+    ] {
+        let error = call.failed_with(&io::Error::from_raw_os_error(code));
+        let message = error.to_string();
+        assert!(message.starts_with(&format!("{name} failed")), "{message}");
+        assert!(message.contains(&code.to_string()), "{message}");
+        let typed = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ScmCallError>())
+            .expect("the failure is typed");
+        assert_eq!((typed.call, typed.code), (call, code as u32));
+    }
+}
+
+#[skuld::test]
+fn a_winapi_failure_still_says_the_service_is_gone_when_its_code_does() {
+    assert!(io_error_is_absent_service(
+        &ScmCall::OpenService.failed_with(&io::Error::from_raw_os_error(1060))
+    ));
+    assert!(io_error_is_absent_service(
+        &ScmCall::QueryServiceStatusEx.failed_with(&io::Error::from_raw_os_error(1072))
+    ));
+    assert!(!io_error_is_absent_service(
+        &ScmCall::DeleteService.failed_with(&io::Error::from_raw_os_error(5))
+    ));
+}
+
+#[skuld::test]
+fn a_failure_without_a_win32_code_still_names_its_call() {
+    let message = ScmCall::DeleteService
+        .failed_with(&io::Error::other("no code"))
+        .to_string();
+    assert!(message.contains("DeleteService"), "{message}");
+    assert!(message.contains("no code"), "{message}");
 }

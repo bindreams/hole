@@ -32,16 +32,25 @@ fn delivery_stores_the_state_and_settles_the_record() {
 // The SCM's own numbers (winsvc.h): states 1..=4 and notify bits 0x1..=0x8.
 // Literals, so a wrong constant in the code cannot make these agree with it.
 #[skuld::test]
-fn the_stop_wait_arms_every_state_it_acts_on() {
-    for started in [false, true] {
-        assert_eq!(want_to_mask(WantState::Stopped, started).0, 0x1 | 0x2 | 0x4 | 0x8);
-    }
+fn each_state_has_its_notify_bit() {
+    assert_eq!(notify_bit(Observed::Stopped).0, 0x1);
+    assert_eq!(notify_bit(Observed::StartPending).0, 0x2);
+    assert_eq!(notify_bit(Observed::StopPending).0, 0x4);
+    assert_eq!(notify_bit(Observed::Running).0, 0x8);
 }
 
 #[skuld::test]
-fn the_start_wait_arms_start_pending_and_running_and_stopped_only_after_start() {
-    assert_eq!(want_to_mask(WantState::Running, false).0, 0x2 | 0x8);
-    assert_eq!(want_to_mask(WantState::Running, true).0, 0x1 | 0x2 | 0x8);
+fn a_mask_is_the_union_of_its_states_bits() {
+    assert_eq!(states_to_mask(&[]).0, 0);
+    assert_eq!(states_to_mask(&[Observed::Stopped, Observed::Running]).0, 0x1 | 0x8);
+    assert_eq!(
+        states_to_mask(&states_to_arm(WantState::Stopped, false, None)).0,
+        0x1 | 0x2 | 0x4 | 0x8
+    );
+    assert_eq!(
+        states_to_mask(&states_to_arm(WantState::Stopped, false, Some(Observed::StartPending))).0,
+        0x1 | 0x4 | 0x8
+    );
 }
 
 #[skuld::test]

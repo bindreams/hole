@@ -13,6 +13,35 @@ pub enum WantState {
     Running,
 }
 
+/// The states an arm for `want` asks to be told about, before `except` is left
+/// out; `started` is whether `start()` has been issued.
+///
+/// An arm reports the service's CURRENT state at once if it is one of these
+/// (the `NotifyServiceStatusChangeW` behaviour the first arm of every wait
+/// relies on; see [`Observed::for_stop_wait`]). A re-arm that
+/// still asked for the state it was just told would be told it again at once,
+/// for as long as the state lasted: a busy loop of SCM calls. So a re-arm names
+/// the state it just acted on as `except`, and waits for the service to leave
+/// it.
+///
+/// A start wait includes STOPPED only after `start()`: the service is STOPPED
+/// before it, and the arm would report that as a failed start.
+pub fn states_to_arm(want: WantState, started: bool, except: Option<Observed>) -> Vec<Observed> {
+    let base: &[Observed] = match want {
+        WantState::Stopped => &[
+            Observed::Stopped,
+            Observed::StartPending,
+            Observed::StopPending,
+            Observed::Running,
+        ],
+        WantState::Running if started => &[Observed::Stopped, Observed::StartPending, Observed::Running],
+        WantState::Running => &[Observed::StartPending, Observed::Running],
+    };
+    let states: Vec<Observed> = base.iter().copied().filter(|state| Some(*state) != except).collect();
+    debug_assert!(!states.is_empty(), "an arm for no state never fires");
+    states
+}
+
 /// The service state a `wait_callback` observed. Distinct from `WantState`: a
 /// callback can report a state that is neither what the caller wants nor its
 /// opposite. What each state means for a waiter is decided once, on this type
@@ -35,6 +64,22 @@ pub enum StopStep {
     SendStop,
     /// Nothing to send: the service is between states and the wait re-arms.
     KeepWaiting,
+}
+
+/// What the drain of a service marked for deletion does on seeing a state. It
+/// waits on the service's process, not on a notification: whether an arm works
+/// on a marked service has not been measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStep {
+    /// The service is stopped.
+    Finished,
+    /// Running: send the Stop, then wait for the process to exit.
+    StopThenAwaitExit,
+    /// The process is already leaving: wait for it to exit.
+    AwaitExit,
+    /// No Stop is accepted yet and no process exit is near: wait for the
+    /// service to leave START_PENDING through the stop wait.
+    AwaitRunning,
 }
 
 /// What a start wait does on seeing a state.
@@ -67,6 +112,28 @@ impl Observed {
         }
     }
 
+    /// The drain's policy for this state.
+    pub fn for_drain_step(self) -> DrainStep {
+        match self {
+            Observed::Stopped => DrainStep::Finished,
+            Observed::Running => DrainStep::StopThenAwaitExit,
+            Observed::StopPending => DrainStep::AwaitExit,
+            Observed::StartPending => DrainStep::AwaitRunning,
+        }
+    }
+
+    /// Whether a service in this state has a process behind it. A process
+    /// outlives the STOPPED the SCM reports for it, so the process, not the
+    /// state, is what an uninstall waits out.
+    pub fn names_a_process(self) -> bool {
+        match self {
+            Observed::Stopped => false,
+            Observed::StartPending => true,
+            Observed::Running => true,
+            Observed::StopPending => true,
+        }
+    }
+
     /// The start wait's policy for this state.
     pub fn for_start_wait(self) -> StartStep {
         match self {
@@ -82,9 +149,10 @@ impl Observed {
 /// The granular SCM operations the restart sequence needs, isolated so the
 /// ordering can be unit-tested with a fake.
 pub trait ScmActor {
-    /// Register a status-change notification for `want`. `NotifyServiceStatusChangeW`
-    /// is single-shot, so the sequence re-arms after every callback.
-    fn arm(&mut self, want: WantState) -> std::io::Result<()>;
+    /// Register a status-change notification for `want`, leaving out `except`
+    /// (see [`states_to_arm`]). `NotifyServiceStatusChangeW` is single-shot, so
+    /// the sequence re-arms after every callback.
+    fn arm(&mut self, want: WantState, except: Option<Observed>) -> std::io::Result<()>;
     fn control_stop(&mut self) -> std::io::Result<()>;
     fn start(&mut self) -> std::io::Result<()>;
     /// Block in an alertable wait until the armed notification fires; return the
@@ -104,15 +172,21 @@ pub trait ScmActor {
 /// fails or is lost, which is how an uninstall landing on a restart used to
 /// fail (bindreams/hole#1099). A START_PENDING service is waited out until it
 /// is RUNNING (and gets its Stop then) or STOPPED. The wait re-arms after every
-/// callback, since the notification is single-shot, and carries no bound: the
-/// SCM bounds START_PENDING itself, and a service that hangs in STOP_PENDING is
-/// the documented gap in CONTRIBUTING.md.
+/// callback, since the notification is single-shot, leaving out the state it
+/// just acted on ([`states_to_arm`]), and carries no bound: the SCM bounds
+/// START_PENDING itself, and a service that hangs in STOP_PENDING, or keeps
+/// running after accepting a Stop, is the documented gap in CONTRIBUTING.md.
+///
+/// A Stop that fails is read against a fresh arm for every state: the failure
+/// is about the RUNNING state it was sent on, and the service may have left it
+/// since (stopped, or begun to) in a way that answers with any code. Only a
+/// service still RUNNING makes the failure the wait's own.
 ///
 /// The cutover's `stop_service_wait_stopped` and the `retire` session use this.
 pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
-    a.arm(WantState::Stopped)?;
+    a.arm(WantState::Stopped, None)?;
+    let mut observed = a.wait_callback()?;
     loop {
-        let observed = a.wait_callback()?;
         match observed.for_stop_wait() {
             StopStep::Finished => {
                 tracing::info!(?observed, "SCM stop wait: service is stopped");
@@ -120,11 +194,29 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
             }
             StopStep::SendStop => {
                 tracing::info!(?observed, "SCM stop wait: sending Stop");
-                a.control_stop()?;
+                match a.control_stop() {
+                    Ok(()) => a.arm(WantState::Stopped, Some(observed))?,
+                    Err(refused) => {
+                        a.arm(WantState::Stopped, None)?;
+                        observed = a.wait_callback()?;
+                        if observed.for_stop_wait() == StopStep::SendStop {
+                            return Err(refused);
+                        }
+                        tracing::info!(
+                            ?observed,
+                            error = %refused,
+                            "SCM stop wait: the Stop was refused, but the service is no longer running"
+                        );
+                        continue;
+                    }
+                }
             }
-            StopStep::KeepWaiting => tracing::info!(?observed, "SCM stop wait: not sending Stop, waiting"),
+            StopStep::KeepWaiting => {
+                tracing::info!(?observed, "SCM stop wait: not sending Stop, waiting");
+                a.arm(WantState::Stopped, Some(observed))?;
+            }
         }
-        a.arm(WantState::Stopped)?;
+        observed = a.wait_callback()?;
     }
 }
 
@@ -134,10 +226,11 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
 /// fires on the NEXT entry into RUNNING — a hang. The cutover's
 /// `start_service_wait_running` uses this.
 pub fn start_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
-    a.arm(WantState::Running)?;
+    a.arm(WantState::Running, None)?;
     a.start()?;
     loop {
-        match a.wait_callback()?.for_start_wait() {
+        let observed = a.wait_callback()?;
+        match observed.for_start_wait() {
             StartStep::Finished => return Ok(()),
             // Give up (the cutover child then clears the marker + exits; the
             // SCM's restart-on-failure re-drives a transient failure).
@@ -146,7 +239,7 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
                     "service stopped before reaching Running (failed start)",
                 ))
             }
-            StartStep::KeepWaiting => a.arm(WantState::Running)?,
+            StartStep::KeepWaiting => a.arm(WantState::Running, Some(observed))?,
         }
     }
 }
@@ -165,8 +258,7 @@ mod system {
 
     use windows::core::HSTRING;
     use windows::Win32::Foundation::{
-        ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE,
-        ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, ERROR_SERVICE_NOT_ACTIVE,
+        ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING,
     };
     use windows::Win32::System::Services::{
         ControlService, NotifyServiceStatusChangeW, StartServiceW, SC_HANDLE, SERVICE_CONTROL_STOP, SERVICE_NOTIFY,
@@ -176,14 +268,12 @@ mod system {
     };
     use windows::Win32::System::Threading::SleepEx;
 
-    use super::call_error::{self, classify_control_stop, win32_code_of_hresult, ScmCall, ScmCallError};
-    use super::{Observed, WantState};
+    use super::call_error::{self, win32_code_of_hresult, ScmCall, ScmCallError};
+    use super::{states_to_arm, Observed, WantState};
     use crate::cutover::registration::{Arming, Registration, Settle};
 
     // `call_error` classifies the control answers by number so its tests run on
     // any host; the numbers must be the Win32 ones.
-    const _: () = assert!(ERROR_SERVICE_CANNOT_ACCEPT_CTRL.0 == call_error::ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
-    const _: () = assert!(ERROR_SERVICE_NOT_ACTIVE.0 == call_error::ERROR_SERVICE_NOT_ACTIVE);
     const _: () = assert!(ERROR_SERVICE_DOES_NOT_EXIST.0 == call_error::ERROR_SERVICE_DOES_NOT_EXIST);
     const _: () = assert!(ERROR_SERVICE_MARKED_FOR_DELETE.0 == call_error::ERROR_SERVICE_MARKED_FOR_DELETE);
 
@@ -314,41 +404,29 @@ mod system {
         Ok(())
     }
 
-    /// The `NotifyServiceStatusChangeW` mask for `want`, given whether `start()`
-    /// has already been issued (`started`).
+    /// The `NotifyServiceStatusChangeW` mask that asks for `states`.
     ///
-    /// For a start wait the STOPPED bit is included ONLY after `start()`: the
-    /// service is `Stopped` at the initial arm (the cutover ran
-    /// `stop_service_wait_stopped` first), and `NotifyServiceStatusChangeW`
-    /// immediate-fires on the current state — so arming STOPPED before `start()`
-    /// would misclassify that pre-start `Stopped` as a failed start. After
-    /// `start()` the service has entered `StartPending`, so a later
-    /// `StartPending -> Stopped` (or an already-`Stopped` immediate-fire) delivers
-    /// a real `Stopped` callback that terminates the wait with `Err`.
-    ///
-    /// The stop wait arms every state a service can be in, because it decides
-    /// what to do from the state the arm reports (see `stop_via_notify`): STOPPED
-    /// ends it, RUNNING is the one state a Stop is sent in, and START_PENDING
-    /// (a service the SCM has just restarted) and STOP_PENDING are waited out.
-    /// Leaving a state out would leave the wait blind to it.
-    fn want_to_mask(want: WantState, started: bool) -> SERVICE_NOTIFY {
-        match want {
-            WantState::Stopped => {
-                SERVICE_NOTIFY_STOPPED
-                    | SERVICE_NOTIFY_START_PENDING
-                    | SERVICE_NOTIFY_STOP_PENDING
-                    | SERVICE_NOTIFY_RUNNING
-            }
-            WantState::Running if started => {
-                SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING
-            }
-            WantState::Running => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_START_PENDING,
+    /// Which states a wait asks for is decided in [`super::states_to_arm`], where
+    /// it is tested on every host; this is only the SCM's bit for each.
+    fn states_to_mask(states: &[Observed]) -> SERVICE_NOTIFY {
+        states
+            .iter()
+            .fold(SERVICE_NOTIFY(0), |mask, state| mask | notify_bit(*state))
+    }
+
+    /// The SCM's notify bit for entering `state`.
+    fn notify_bit(state: Observed) -> SERVICE_NOTIFY {
+        match state {
+            Observed::Stopped => SERVICE_NOTIFY_STOPPED,
+            Observed::StartPending => SERVICE_NOTIFY_START_PENDING,
+            Observed::StopPending => SERVICE_NOTIFY_STOP_PENDING,
+            Observed::Running => SERVICE_NOTIFY_RUNNING,
         }
     }
 
     /// The observation for a raw `SERVICE_STATUS.dwCurrentState`, or `None` for
     /// a state the masks never arm (the pause states).
-    fn observed_from_state(state: u32) -> Option<Observed> {
+    pub(crate) fn observed_from_state(state: u32) -> Option<Observed> {
         match state {
             s if s == SERVICE_RUNNING.0 => Some(Observed::Running),
             s if s == SERVICE_STOPPED.0 => Some(Observed::Stopped),
@@ -403,7 +481,7 @@ mod system {
         /// The state most recently awaited (for the debug trace).
         awaiting: WantState,
         /// Whether `start()` has been issued. Gates the two-phase arm: the STOPPED
-        /// notify bit is added only after start (see `want_to_mask`).
+        /// notify bit is added only after start (see [`super::states_to_arm`]).
         started: bool,
         hooks: H,
     }
@@ -460,9 +538,9 @@ mod system {
     // No `Drop` impl: field order is the drop order.
 
     impl<H: Hooks> super::ScmActor for SystemScmActor<H> {
-        fn arm(&mut self, want: WantState) -> io::Result<()> {
+        fn arm(&mut self, want: WantState, except: Option<Observed>) -> io::Result<()> {
             self.awaiting = want;
-            let mask = want_to_mask(want, self.started);
+            let mask = states_to_mask(&states_to_arm(want, self.started, except));
             // Whatever this arm does, the previous one is no longer what a wait
             // may rely on.
             self.arming.unconfirm();
@@ -502,7 +580,11 @@ mod system {
             let service = self.service()?;
             match unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut status) } {
                 Ok(()) => Ok(()),
-                Err(e) => classify_control_stop(win32_code_of_hresult(e.code().0)).map_err(ScmCallError::into_io),
+                Err(e) => Err(ScmCallError {
+                    call: ScmCall::ControlService,
+                    code: win32_code_of_hresult(e.code().0),
+                }
+                .into_io()),
             }
         }
 
@@ -550,6 +632,9 @@ mod system {
     }
 }
 
+/// The observation for a raw `SERVICE_STATUS.dwCurrentState`.
+#[cfg(target_os = "windows")]
+pub(crate) use system::observed_from_state;
 #[cfg(target_os = "windows")]
 pub use system::{Hooks, NoHooks, SystemScmActor};
 

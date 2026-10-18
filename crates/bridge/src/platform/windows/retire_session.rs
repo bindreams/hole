@@ -1,19 +1,23 @@
 //! The real SCM session behind [`retire`](crate::cutover::scm_wait::retire):
 //! one open `HoleBridge` service, used for the restart toggle, the stop wait,
-//! the delete and the check after it.
+//! the delete, the state query and the wait for the service's process.
 
 use std::io;
+use std::mem::MaybeUninit;
 
+use windows::Win32::System::Services::{
+    QueryServiceStatusEx, SC_HANDLE, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+};
 use windows_service::service::{
     Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
-    ServiceState,
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use super::{apply_failure_actions, SERVICE_NAME};
-use crate::cutover::scm_wait::call_error::io_error_is_absent_service;
+use super::service_processes::ServiceProcesses;
+use super::{apply_failure_actions, scm_failure, SERVICE_NAME};
+use crate::cutover::scm_wait::call_error::{io_error_is_absent_service, win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::retire::ServiceSession;
-use crate::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
+use crate::cutover::scm_wait::{observed_from_state, Observed, ScmActor, SystemScmActor, WantState};
 
 /// Both handles are opened before anything is changed, so the delete, which
 /// only marks the service, cannot take either away: a handle opened earlier
@@ -23,33 +27,69 @@ pub struct RetireSession {
     service: Service,
     /// The stop wait.
     actor: SystemScmActor,
+    /// The processes the service has shown.
+    processes: ServiceProcesses,
 }
 
 impl RetireSession {
     /// Opens the session, or `None` when the SCM has no `HoleBridge` to act on
     /// (never registered, or already marked for deletion).
     pub fn open() -> Result<Option<Self>, Box<dyn std::error::Error>> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
         let service = match manager.open_service(
             SERVICE_NAME,
             ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG | ServiceAccess::DELETE,
         ) {
             Ok(service) => service,
             Err(e) if super::open_error_is_absent(&e) => return Ok(None),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(scm_failure(ScmCall::OpenService, e).into()),
         };
         match SystemScmActor::open(SERVICE_NAME) {
-            Ok(actor) => Ok(Some(Self { service, actor })),
+            Ok(actor) => Ok(Some(Self {
+                service,
+                actor,
+                processes: ServiceProcesses::default(),
+            })),
             // Deleted between the two opens.
             Err(e) if io_error_is_absent_service(&e) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
+
+    /// The service's state and process id, in one query. The id is 0 when
+    /// there is no process.
+    fn query(&self) -> io::Result<(u32, u32)> {
+        let mut status = MaybeUninit::<SERVICE_STATUS_PROCESS>::zeroed();
+        let mut needed = 0u32;
+        // SAFETY: the buffer is `status`'s own storage, of exactly its size.
+        let queried = unsafe {
+            QueryServiceStatusEx(
+                SC_HANDLE(self.service.raw_handle()),
+                SC_STATUS_PROCESS_INFO,
+                Some(std::slice::from_raw_parts_mut(
+                    status.as_mut_ptr().cast::<u8>(),
+                    std::mem::size_of::<SERVICE_STATUS_PROCESS>(),
+                )),
+                &mut needed,
+            )
+        };
+        queried.map_err(|e| {
+            ScmCallError {
+                call: ScmCall::QueryServiceStatusEx,
+                code: win32_code_of_hresult(e.code().0),
+            }
+            .into_io()
+        })?;
+        // SAFETY: the SCM filled the buffer, and a zeroed one is valid too.
+        let status = unsafe { status.assume_init() };
+        Ok((status.dwCurrentState.0, status.dwProcessId))
+    }
 }
 
 impl ScmActor for RetireSession {
-    fn arm(&mut self, want: WantState) -> io::Result<()> {
-        self.actor.arm(want)
+    fn arm(&mut self, want: WantState, except: Option<Observed>) -> io::Result<()> {
+        self.actor.arm(want, except)
     }
     fn control_stop(&mut self) -> io::Result<()> {
         self.actor.control_stop()
@@ -66,24 +106,41 @@ impl ServiceSession for RetireSession {
     fn disable_restart(&mut self) -> io::Result<()> {
         self.service
             .update_failure_actions(no_restart_failure_actions())
-            .map_err(io::Error::other)
+            .map_err(|e| scm_failure(ScmCall::ChangeServiceConfig2, e))
     }
 
     fn restore_restart(&mut self) -> io::Result<()> {
-        apply_failure_actions(&self.service).map_err(io::Error::other)
+        apply_failure_actions(&self.service)
     }
 
     fn delete(&mut self) -> io::Result<()> {
-        self.service.delete().map_err(io::Error::other)
+        self.service
+            .delete()
+            .map_err(|e| scm_failure(ScmCall::DeleteService, e))
     }
 
     fn observe(&mut self) -> io::Result<Observed> {
-        let state = self.service.query_status().map_err(io::Error::other)?.current_state;
-        observed_from_service_state(state).ok_or_else(|| {
+        let (state, pid) = self.query()?;
+        if pid != 0 {
+            self.processes.hold(pid)?;
+        }
+        observed_from_state(state).ok_or_else(|| {
             io::Error::other(format!(
-                "the service reported state {state:?}, which is not one it can retire from"
+                "the service reported state {state}, which is not one it can retire from"
             ))
         })
+    }
+
+    fn hold_process(&mut self) -> io::Result<()> {
+        let (_, pid) = self.query()?;
+        if pid != 0 {
+            self.processes.hold(pid)?;
+        }
+        Ok(())
+    }
+
+    fn await_exits(&mut self) -> io::Result<()> {
+        self.processes.await_exits()
     }
 }
 
@@ -99,18 +156,6 @@ pub(super) fn no_restart_failure_actions() -> ServiceFailureActions {
             action_type: ServiceActionType::None,
             delay: std::time::Duration::ZERO,
         }]),
-    }
-}
-
-/// The observation for a queried service state, or `None` for the pause states
-/// the bridge never enters.
-pub(super) fn observed_from_service_state(state: ServiceState) -> Option<Observed> {
-    match state {
-        ServiceState::Running => Some(Observed::Running),
-        ServiceState::Stopped => Some(Observed::Stopped),
-        ServiceState::StartPending => Some(Observed::StartPending),
-        ServiceState::StopPending => Some(Observed::StopPending),
-        ServiceState::ContinuePending | ServiceState::PausePending | ServiceState::Paused => None,
     }
 }
 
