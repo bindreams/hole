@@ -165,6 +165,34 @@ fn the_workspace_root_is_found_after_the_strip_when_the_binary_lives_outside_the
     assert_eq!(found, expected.canonicalize().expect("expected root exists"));
 }
 
+/// A relative or empty `CARGO_MANIFEST_DIR` is refused with an error naming it,
+/// even after the strip removed the variable and even where the binary sits in
+/// a workspace that would otherwise answer: the strip must not launder it into
+/// the exe-based lookup.
+#[skuld::test]
+fn a_relative_or_empty_manifest_dir_is_reported_after_the_strip_not_replaced_by_the_exe_lookup() {
+    let outside = fake_workspace();
+    let exe = outside
+        .path()
+        .join(std::env::current_exe().expect("current_exe").file_name().unwrap());
+    std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the binary");
+    for bad in ["crates/xtask", ""] {
+        let out = std::process::Command::new(&exe)
+            .env(MODE_ENV, "strip-then-repo-root")
+            .env("CARGO_MANIFEST_DIR", bad)
+            .current_dir(outside.path())
+            .output()
+            .expect("spawn the copied binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{bad:?} must be refused, found {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(stderr.contains("CARGO_MANIFEST_DIR"), "{bad:?}: {stderr}");
+    }
+}
+
 /// A workspace root the test creates: a directory with a `[workspace]` manifest.
 fn fake_workspace() -> tempfile::TempDir {
     let ws = tempfile::tempdir().expect("tempdir");

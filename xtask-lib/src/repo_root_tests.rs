@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::repo_root::{hole_root_for_launch, repo_root_from};
+use crate::repo_root::{hole_root_for_launch, repo_root_from, workspace_root_for};
 
 /// A directory with a `[workspace]` manifest; `crates/hole` too when `hole`.
 fn workspace(hole: bool) -> tempfile::TempDir {
@@ -244,4 +244,54 @@ fn a_valid_handoff_is_unaffected_by_a_relative_manifest_dir() {
     let pinned = workspace(true);
     let found = hole_root_for_launch(Some(pinned.path()), Some(Path::new("crates/foo")), None, None).unwrap();
     assert!(same(&found, pinned.path()), "{found:?}");
+}
+
+// `repo_root` (any workspace) -----------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn the_workspace_lookup_prefers_an_absolute_manifest_dir_and_falls_back_to_the_exe() {
+    let manifest = workspace(false);
+    let exe = workspace(false);
+    let found = workspace_root_for(Some(manifest.path()), Some(exe.path())).unwrap();
+    assert!(same(&found, manifest.path()), "{found:?}");
+
+    // An absolute manifest dir outside every workspace, or none at all: the exe.
+    let none = tempfile::tempdir().unwrap();
+    for manifest in [Some(none.path()), None] {
+        let found = workspace_root_for(manifest, Some(exe.path())).unwrap();
+        assert!(same(&found, exe.path()), "{found:?}");
+    }
+}
+
+#[skuld::test]
+fn the_workspace_lookup_refuses_a_relative_or_empty_manifest_dir_naming_the_variable() {
+    let ws = workspace(false); // the exe would answer if the bad value were skipped
+    for bad in [Path::new("crates/foo"), Path::new("")] {
+        let err = workspace_root_for(Some(bad), Some(ws.path()))
+            .expect_err(&format!("{bad:?} is not absolute"))
+            .to_string();
+        assert!(err.contains("CARGO_MANIFEST_DIR"), "{bad:?}: {err}");
+        assert!(err.contains(&bad.display().to_string()), "{bad:?}: {err}");
+    }
+}
+
+// Unix only: the relative spelling below assumes one filesystem root.
+#[cfg(unix)]
+#[skuld::test]
+fn the_workspace_lookup_refuses_a_relative_manifest_dir_that_names_a_workspace_from_the_cwd() {
+    let ws = workspace(false);
+    let cwd = std::env::current_dir().unwrap();
+    let mut relative = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(ws.path().strip_prefix("/").unwrap());
+    assert!(
+        relative.join("Cargo.toml").is_file(),
+        "HARNESS: {relative:?} must name the workspace from the cwd"
+    );
+    let err = workspace_root_for(Some(&relative), Some(ws.path()))
+        .expect_err("a relative CARGO_MANIFEST_DIR must be refused")
+        .to_string();
+    assert!(err.contains("CARGO_MANIFEST_DIR"), "{err}");
 }

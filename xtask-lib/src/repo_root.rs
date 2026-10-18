@@ -15,14 +15,37 @@ pub const DEV_REPO_ROOT_ENV: &str = "HOLE_DEV_REPO_ROOT";
 ///
 /// Deliberately no `git rev-parse --show-toplevel` — this must work where
 /// git is unavailable (CI minimal images, source tarballs).
+///
+/// A relative or empty `CARGO_MANIFEST_DIR` is an error naming it.
 pub fn repo_root() -> Result<PathBuf> {
-    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
-        if let Ok(root) = repo_root_from(Path::new(&manifest_dir)) {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let exe = std::env::current_exe().context("current_exe")?;
+    workspace_root_for(manifest_dir.as_deref(), exe.parent())
+}
+
+/// [`repo_root`] over explicit locations, so tests need not touch the process
+/// environment. A relative or empty `CARGO_MANIFEST_DIR` is an error, not a
+/// skipped candidate: the root it yields is relative to the cwd, and callers
+/// `join` onto it after changing directory.
+pub(crate) fn workspace_root_for(manifest_dir: Option<&Path>, exe_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = manifest_dir {
+        ensure_absolute_manifest_dir(dir)?;
+        if let Ok(root) = repo_root_from(dir) {
             return Ok(root);
         }
     }
-    let exe = std::env::current_exe().context("current_exe")?;
-    repo_root_from(exe.parent().unwrap_or(Path::new("/")))
+    repo_root_from(exe_dir.unwrap_or(Path::new("/")))
+}
+
+/// Cargo always sets `CARGO_MANIFEST_DIR` absolute, so only a hand-set value
+/// trips this; the exe and cwd come from the OS and are absolute.
+fn ensure_absolute_manifest_dir(dir: &Path) -> Result<()> {
+    anyhow::ensure!(
+        dir.is_absolute(),
+        "CARGO_MANIFEST_DIR is {}, which is not an absolute path",
+        dir.display()
+    );
+    Ok(())
 }
 
 /// The hole checkout a binary a build driver launched belongs to.
@@ -78,14 +101,8 @@ pub(crate) fn hole_root_for_launch(
         );
         return Ok(root.to_path_buf());
     }
-    // Same reason as the handoff. Cargo always sets it absolute, so only a hand-set
-    // value trips this; the exe and cwd come from the OS and are absolute.
     if let Some(dir) = manifest_dir {
-        anyhow::ensure!(
-            dir.is_absolute(),
-            "CARGO_MANIFEST_DIR is {}, which is not an absolute path",
-            dir.display()
-        );
+        ensure_absolute_manifest_dir(dir)?;
     }
     let candidates = [
         ("CARGO_MANIFEST_DIR", manifest_dir),

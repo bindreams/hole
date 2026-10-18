@@ -24,15 +24,19 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 
-/// The workspace root, resolved by [`strip_run_injected`] before it removed
-/// the variables the lookup reads.
-static WORKSPACE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+/// The workspace root, or why there is none, as resolved by
+/// [`strip_run_injected`] before it removed the variables the lookup reads. The
+/// failure is kept (as text: `anyhow::Error` is not `Clone`) because a lookup
+/// repeated after the strip cannot see a bad `CARGO_MANIFEST_DIR` and would
+/// answer from the executable's location instead.
+static WORKSPACE_ROOT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
 
-/// The workspace root. After [`strip_run_injected`] this is the root it
-/// resolved at startup; before it (tests, library callers) it is looked up now.
+/// The workspace root. After [`strip_run_injected`] this is what it resolved at
+/// startup; before it (tests, library callers) it is looked up now.
 pub fn repo_root() -> Result<PathBuf> {
     match WORKSPACE_ROOT.get() {
-        Some(root) => Ok(root.clone()),
+        Some(Ok(root)) => Ok(root.clone()),
+        Some(Err(why)) => Err(anyhow::anyhow!("{why}")),
         None => xtask_lib::repo_root::repo_root(),
     }
 }
@@ -48,15 +52,13 @@ pub fn is_run_injected(name: &str) -> bool {
 
 /// Remove the variables `cargo run` injected from this process's environment,
 /// after resolving the workspace root from them (see the module doc). A root
-/// that cannot be found here is not an error yet: [`repo_root`] looks again
-/// and reports it to the subcommand that needs it.
+/// that cannot be found here is not an error yet: [`repo_root`] reports it to
+/// the subcommand that needs it.
 ///
 /// Call it first thing in `main`, before any thread exists: `remove_var` races
 /// with every concurrent environment read.
 pub fn strip_run_injected() {
-    if let Ok(root) = xtask_lib::repo_root::repo_root() {
-        let _ = WORKSPACE_ROOT.set(root);
-    }
+    let _ = WORKSPACE_ROOT.set(xtask_lib::repo_root::repo_root().map_err(|e| format!("{e:#}")));
     let injected: Vec<OsString> = std::env::vars_os()
         .map(|(name, _)| name)
         .filter(|name| name.to_str().is_some_and(is_run_injected))
