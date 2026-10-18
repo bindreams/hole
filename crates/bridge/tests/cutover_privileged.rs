@@ -216,12 +216,10 @@ impl ProvisionedService {
         };
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-        // Clear any residue, then create fresh. `teardown` returns only once the
-        // service is gone: DeleteService merely marks a service whose process is
-        // still running, and `create_service` fails with
-        // ERROR_SERVICE_MARKED_FOR_DELETE until the process has exited and every
-        // handle has closed.
-        Self::teardown();
+        // Every test's `Drop` returns only once the service is gone, so a
+        // registered one here is a leftover of a run that was killed before its
+        // `Drop`. Waiting it out could never end (see `require_no_leftover`).
+        Self::require_no_leftover();
         let manager = ServiceManager::local_computer(
             None::<&str>,
             ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -265,6 +263,55 @@ impl ProvisionedService {
         ProvisionedService
     }
 
+    /// Whether `e` is the SCM's refusal to open a service with `code`.
+    fn open_error_is(e: &windows_service::Error, code: windows::Win32::Foundation::WIN32_ERROR) -> bool {
+        matches!(e, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(code.0 as i32))
+    }
+
+    /// Panics, naming the service and its state, if a `HoleBridge` service is
+    /// registered.
+    ///
+    /// A leftover can only come from a run whose process was killed before its
+    /// `Drop` (a nextest `terminate-after`), because `teardown` returns only
+    /// once the service is gone. Its service process is then still alive, and a
+    /// service marked for deletion stays registered for as long as that process
+    /// does, so waiting for the deletion would wait on an exit nothing in this
+    /// test will cause, and an arm on it may not report at all. Every later test
+    /// would hang at `starting`, with nothing naming why (bindreams/hole#1099).
+    fn require_no_leftover() {
+        use hole_bridge::platform::os::SERVICE_NAME;
+        use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE};
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .expect("open the SCM to look for a leftover service");
+        let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+            Ok(service) => service,
+            Err(e) if Self::open_error_is(&e, ERROR_SERVICE_DOES_NOT_EXIST) => return,
+            Err(e) if Self::open_error_is(&e, ERROR_SERVICE_MARKED_FOR_DELETE) => panic!(
+                "a leftover {SERVICE_NAME} service is marked for deletion: an earlier run was killed before it \
+                 cleaned up, and the deletion cannot finish while that run's service process is alive. \
+                 Stop or kill test_service.exe and run again"
+            ),
+            Err(e) => panic!("opening {SERVICE_NAME} to look for a leftover failed: {e}"),
+        };
+        match service.query_status() {
+            Ok(status) => panic!(
+                "a leftover {SERVICE_NAME} service is registered (state {:?}, process id {:?}; it may be marked \
+                 for deletion): an earlier run was killed before it cleaned up, and waiting for it to go would \
+                 wait on a process this test does not control. Stop or kill test_service.exe and delete the \
+                 service, then run again",
+                status.current_state, status.process_id
+            ),
+            Err(e) => panic!(
+                "a leftover {SERVICE_NAME} service is registered and its state could not be read ({e}): an \
+                 earlier run was killed before it cleaned up. Stop or kill test_service.exe and delete the \
+                 service, then run again"
+            ),
+        }
+    }
+
     /// Stops and deletes the throwaway service, returning only once it no longer
     /// exists. Best-effort: failures are reported on stderr, never panicked on,
     /// because this also runs from `Drop`.
@@ -276,7 +323,6 @@ impl ProvisionedService {
         use windows_service::service::ServiceAccess;
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-        let open_error_is = |e: &windows_service::Error, code: windows::Win32::Foundation::WIN32_ERROR| matches!(e, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(code.0 as i32));
         let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) else {
             return;
         };
@@ -299,10 +345,10 @@ impl ProvisionedService {
                 drop(service);
             }
             // Not present: nothing to clean.
-            Err(e) if open_error_is(&e, ERROR_SERVICE_DOES_NOT_EXIST) => return,
+            Err(e) if Self::open_error_is(&e, ERROR_SERVICE_DOES_NOT_EXIST) => return,
             // Deleted but not yet gone, should the open itself report it: only
             // the wait below applies.
-            Err(e) if open_error_is(&e, ERROR_SERVICE_MARKED_FOR_DELETE) => {}
+            Err(e) if Self::open_error_is(&e, ERROR_SERVICE_MARKED_FOR_DELETE) => {}
             Err(e) => eprintln!("teardown: opening the throwaway service failed (awaiting deletion anyway): {e}"),
         }
         drop(manager);
@@ -1012,18 +1058,32 @@ mod left_behind {
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
 
-    /// The logged ids whose process is still running.
-    pub fn still_running(pid_log: &Path) -> Vec<u32> {
+    /// The ids the helper logged.
+    fn logged(pid_log: &Path) -> Vec<u32> {
         std::fs::read_to_string(pid_log)
             .unwrap_or_default()
             .lines()
             .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    }
+
+    /// The logged ids whose process is still running.
+    pub fn still_running(pid_log: &Path) -> Vec<u32> {
+        logged(pid_log)
+            .into_iter()
             .filter(|pid| is_running_helper(*pid))
             .collect()
     }
 
-    /// Fails unless every process the helper logged has exited.
+    /// Fails unless every process the helper logged has exited. A log that
+    /// names no process also fails: it would pass for any service, started or
+    /// not.
     pub fn assert_none(pid_log: &Path) {
+        assert!(
+            !logged(pid_log).is_empty(),
+            "the helper logged no process in {}: this check would prove nothing",
+            pid_log.display()
+        );
         let running = still_running(pid_log);
         assert!(
             running.is_empty(),
@@ -1124,19 +1184,23 @@ mod scm_probe {
         }
     }
 
-    /// Kills the service's process the way Task Manager would, so the SCM sees
-    /// a failure and applies the service's failure actions.
-    pub fn kill_service_process() {
+    /// The id of the running service's process. Read before the service is
+    /// marked for deletion: a marked service may refuse a new open.
+    pub fn service_process_id() -> u32 {
         use windows_service::service::ServiceAccess;
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).unwrap();
         let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS).unwrap();
-        let pid = service
+        service
             .query_status()
             .unwrap()
             .process_id
-            .expect("a running service has a process");
+            .expect("a running service has a process")
+    }
+
+    /// Kills process `pid` the way Task Manager would.
+    pub fn terminate_process(pid: u32) {
         // SAFETY: plain FFI calls on a handle this function opens and closes.
         unsafe {
             let process: HANDLE = OpenProcess(PROCESS_TERMINATE, false, pid).expect("open the service process");
@@ -1144,6 +1208,12 @@ mod scm_probe {
             let _ = CloseHandle(process);
             killed.expect("kill the service process");
         }
+    }
+
+    /// Kills the service's process, so the SCM sees a failure and applies the
+    /// service's failure actions.
+    pub fn kill_service_process() {
+        terminate_process(service_process_id());
     }
 }
 
@@ -1346,15 +1416,76 @@ fn cutover_global_net_state_stop_probe_start_pending_before_attach() {
     );
 }
 
+/// A `RetireSession` that sends the service a Stop the moment its first arm
+/// returns, and kills the service's process if the Stop is refused, so the wait
+/// that follows always has an event to fire on: the state change the Stop (or
+/// the kill) causes, or the arm's own report of the current state. Every call is
+/// printed as it returns, so a wait that never ends (the nextest bound) still
+/// leaves what was measured before it.
+#[cfg(target_os = "windows")]
+struct StopsOnFirstArm {
+    inner: hole_bridge::platform::os::RetireSession,
+    process: u32,
+    stopped: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl hole_bridge::cutover::scm_wait::ScmActor for StopsOnFirstArm {
+    fn arm(
+        &mut self,
+        want: hole_bridge::cutover::scm_wait::WantState,
+        except: Option<hole_bridge::cutover::scm_wait::Observed>,
+    ) -> std::io::Result<()> {
+        let armed = self.inner.arm(want, except);
+        eprintln!("  NotifyServiceStatusChange arm -> {armed:?}");
+        if !self.stopped {
+            // After an arm that failed too: no wait follows it, and the service
+            // still has to go.
+            self.stopped = true;
+            let stop = self.inner.control_stop();
+            eprintln!("  ControlService(STOP) -> {stop:?}");
+            if stop.is_err() {
+                scm_probe::terminate_process(self.process);
+                eprintln!("  the Stop was refused: killed the service process");
+            }
+        }
+        armed
+    }
+    fn control_stop(&mut self) -> std::io::Result<()> {
+        let stop = self.inner.control_stop();
+        eprintln!("  ControlService(STOP) by stop_via_notify -> {stop:?}");
+        stop
+    }
+    fn start(&mut self) -> std::io::Result<()> {
+        self.inner.start()
+    }
+    fn wait_callback(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::Observed> {
+        let observed = self.inner.wait_callback()?;
+        eprintln!("  wait_callback reported {observed:?}");
+        Ok(observed)
+    }
+    fn process_fate(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::ProcessFate> {
+        self.inner.process_fate()
+    }
+}
+
 /// The drain after the delete rests on a handle opened before it still
-/// working on a service marked for deletion. Measured here, one line per call,
-/// each on that handle: a state query, an arm and its first report, a Stop, and
-/// `stop_via_notify` to completion.
+/// working on a service marked for deletion. Measured on that handle: a state
+/// query, an arm and the first report, a Stop, and `stop_via_notify`.
+///
+/// Every call returns on an event the probe has already caused. The Stop goes
+/// out right after the arm (see [`StopsOnFirstArm`]) instead of after a wait
+/// for a report: an arm on a marked service may not report the state it finds
+/// (that is the question), and nothing else would then ever fire it.
+/// `stop_via_notify` runs only if that first report was the RUNNING the arm
+/// found: its own arms come after the Stop, and the transition they wait for
+/// can already be over, so they return only if an arm on a marked service
+/// reports the current state at once.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_stop_probe_handle_of_a_service_marked_for_delete() {
     use hole_bridge::cutover::scm_wait::retire::ServiceSession;
-    use hole_bridge::cutover::scm_wait::{stop_via_notify, ScmActor, WantState};
+    use hole_bridge::cutover::scm_wait::{stop_via_notify, Observed, ScmActor, WantState};
     use hole_bridge::platform::os::RetireSession;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
@@ -1365,28 +1496,39 @@ fn cutover_global_net_state_stop_probe_handle_of_a_service_marked_for_delete() {
     };
     CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
 
-    let mut session = RetireSession::open()
-        .expect("open the session")
-        .expect("the service is registered");
-    session.delete().expect("mark the running service for deletion");
-    let observed = session.observe();
+    let process = scm_probe::service_process_id();
+    let mut session = StopsOnFirstArm {
+        inner: RetireSession::open()
+            .expect("open the session")
+            .expect("the service is registered"),
+        process,
+        stopped: false,
+    };
+    session.inner.delete().expect("mark the running service for deletion");
+    eprintln!("SCM stop probe, handle opened before DeleteService on a RUNNING service:");
+    let observed = session.inner.observe();
+    eprintln!("  QueryServiceStatusEx -> {observed:?}");
     let armed = session.arm(WantState::Stopped, None);
     let first_report = armed.is_ok().then(|| session.wait_callback());
-    let stop = session.control_stop();
-    let finished = stop_via_notify(&mut session);
+    let finished = if matches!(first_report, Some(Ok(Observed::Running))) {
+        Some(stop_via_notify(&mut session))
+    } else {
+        None
+    };
+    // The Stop (or the kill) ends the process; its exit is the event.
+    let exited = session.inner.await_exits();
     eprintln!(
-        "SCM stop probe, handle opened before DeleteService on a RUNNING service:\n  \
-         QueryServiceStatusEx -> {observed:?}\n  \
-         NotifyServiceStatusChange arm -> {armed:?}; first report -> {first_report:?}\n  \
-         ControlService(STOP) -> {stop:?}\n  \
-         stop_via_notify -> {finished:?}\n  \
+        "  first report -> {first_report:?}; stop_via_notify -> {finished:?} (None: not run, the first report was not \
+         the RUNNING the arm found); process exit awaited -> {exited:?}\n  \
          MEANS: the drain (retire.rs `drain`) depends on the query and the Stop only. \
          If the query is Ok the drain's looks work; if it is Err every drain look fails as \
          RetireError::Drain and a service the SCM restarted between the stop and the delete \
          cannot be uninstalled (the drain needs another way to read the service). \
          If the Stop is Ok the drain's Stop for a live marked service is delivered; if it is Err \
          the drain fails with the Stop's code (RUNNING) and needs TerminateProcess or another route. \
-         The arm and stop_via_notify lines say only whether the START_PENDING drain state \
+         The first report says what an arm does on a marked RUNNING service: Running means it \
+         reports the current state at once, StopPending or Stopped means it reported only the \
+         change the Stop caused. The arm line says only whether the START_PENDING drain state \
          (`DrainStep::AwaitRunning`, the one that arms) can work: an arm Err there is a loud \
          RetireError::Drain, and the deputy's Q1 (TerminateProcess fallback) applies."
     );
