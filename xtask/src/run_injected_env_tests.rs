@@ -74,18 +74,47 @@ fn names_differing_only_in_case_match_where_the_platform_folds_case() {
     assert_eq!(unexplained_additions_with(&launch, &parent, false), ["PATH"]);
 }
 
+/// The baseline is `env -0`: NUL-terminated `NAME=value`. A value may hold a
+/// newline or `=`, and a name need not be a shell identifier (`ProgramFiles(x86)`
+/// is always set on a Windows runner), which is why no shell builtin records it.
 #[skuld::test]
-fn a_baseline_is_one_name_per_line_blank_lines_and_crlf_ignored() {
-    assert_eq!(parse_parent_names("PATH\r\n\nHOME\n").unwrap(), set(&["HOME", "PATH"]));
+fn a_baseline_is_nul_separated_entries_named_by_the_text_before_the_first_equals() {
+    let text = b"PATH=/bin\0ProgramFiles(x86)=C:\\x\0MULTI=a\nb=c\0EMPTY=\0";
+    assert_eq!(
+        parse_parent_names(text).unwrap(),
+        set(&["EMPTY", "MULTI", "PATH", "ProgramFiles(x86)"])
+    );
+}
+
+/// A leading `=` belongs to the name (Windows keeps `=C:` drive variables).
+#[skuld::test]
+fn a_leading_equals_belongs_to_the_name() {
+    assert_eq!(
+        parse_parent_names(b"=C:=C:\\x\0PATH=/bin\0").unwrap(),
+        set(&["=C:", "PATH"])
+    );
+}
+
+/// Trailing and doubled NULs are not entries.
+#[skuld::test]
+fn empty_entries_are_not_names() {
+    assert_eq!(parse_parent_names(b"\0PATH=/bin\0\0\0").unwrap(), set(&["PATH"]));
 }
 
 /// A baseline recorded inside `cargo run` already holds the injected names and
-/// would hide every one of them; one recorded from nothing would explain nothing.
+/// would hide every one of them; one recorded from nothing would explain nothing;
+/// one that is not `env -0` output (a newline-separated name list) would read as
+/// a single nameless entry and is refused rather than guessed at.
 #[skuld::test]
 fn a_baseline_that_cannot_be_a_parent_environment_is_refused() {
-    let injected = parse_parent_names("PATH\nCARGO_PKG_NAME\n").unwrap_err().to_string();
+    let injected = parse_parent_names(b"PATH=/bin\0CARGO_PKG_NAME=x\0")
+        .unwrap_err()
+        .to_string();
     assert!(injected.contains("CARGO_PKG_NAME"), "{injected}");
-    assert!(parse_parent_names("\n\r\n").is_err());
+    assert!(parse_parent_names(b"").is_err());
+    assert!(parse_parent_names(b"\0\0").is_err());
+    let not_env = parse_parent_names(b"PATH\nHOME\n").unwrap_err().to_string();
+    assert!(not_env.contains("env -0"), "{not_env}");
 }
 
 /// Run `verify-run-injected-env`'s check in a child that strips first (as
@@ -110,7 +139,8 @@ fn verify_in_child(added: &[(&str, &str)], extra_baseline: &[&str]) -> (bool, St
             baseline.insert(name);
         }
     }
-    std::fs::write(&baseline_file, baseline.into_iter().collect::<Vec<_>>().join("\n")).expect("write baseline");
+    let text: String = baseline.iter().map(|name| format!("{name}=\0")).collect();
+    std::fs::write(&baseline_file, text).expect("write baseline");
     cmd.env(MODE_ENV, "strip-then-verify-run-injected-env")
         .env(OUT_ENV, &baseline_file);
     for (k, v) in added {
@@ -148,4 +178,15 @@ fn a_variable_cargo_added_that_nothing_explains_fails_naming_it() {
 fn the_same_variable_in_the_parents_baseline_is_not_an_addition() {
     let (ok, stderr) = verify_in_child(&[("CARGO_BRAND_NEW", "1")], &["CARGO_BRAND_NEW"]);
     assert!(ok, "{stderr}");
+}
+
+/// The case F1 found: a name that is not a shell identifier is in the child's
+/// environment and so must be in the baseline.
+#[skuld::test]
+fn a_parent_variable_whose_name_is_not_a_shell_identifier_is_not_an_addition() {
+    let (ok, stderr) = verify_in_child(&[("ProgramFiles(x86)", "C:\\x")], &["ProgramFiles(x86)"]);
+    assert!(ok, "{stderr}");
+    let (ok, stderr) = verify_in_child(&[("ProgramFiles(x86)", "C:\\x")], &[]);
+    assert!(!ok, "must fail without the baseline entry");
+    assert!(stderr.contains("ProgramFiles(x86)"), "{stderr}");
 }

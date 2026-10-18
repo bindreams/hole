@@ -2855,14 +2855,20 @@ and a rerun repeats the platform's whole job.
   leg; `cargo xtask prek portable` runs every other hook once, in linux/amd64.
   A new hook is portable unless it is listed; a listed id that `prek.toml` lacks
   is an error.
-- **Test lanes compile nothing.** Every cargo step after `hole-build` (the
-  `hole-verify-*` steps and the `hole-test-*` lanes) runs under
-  `.github/scripts/fail-on-compile.sh`, which fails the step if cargo prints a
-  `Compiling` line or cannot tell (a log it cannot write or scan), with
-  `CARGO_LOG` set so the log says why each unit was dirty. A gated xtask step
-  runs `cargo run --package xtask --`, not the `cargo xtask` alias, whose
-  `--quiet` hides the `Compiling` line; xtask lets a `cargo nextest list` child's
-  stderr through for the same reason. The causes found
+- **Test lanes compile nothing.** `hole-build-state` records the build state
+  right after `hole-build`; `hole-verify-no-compile`, after the last lane (the
+  macOS root lane included; it only reads), fails if it differs. The state is the
+  `.fingerprint` and `build` directories under `target/`, which cargo rewrites on
+  any compile or build-script run and leaves alone when every unit is fresh
+  (`.github/scripts/target-state.py`: path, size and nanosecond mtime). That
+  holds for any spelling that launched cargo, `--quiet` or `CARGO_TERM_QUIET`
+  included. Cargo steps run under `.github/scripts/fail-on-compile.sh`, which
+  compares the same state around its command and also names the units from
+  cargo's `Compiling` lines, with `CARGO_LOG` set so the log says why each was
+  dirty; a gated xtask step runs `cargo run --package xtask --`, since the
+  `cargo xtask` alias's `--quiet` hides those lines (xtask lets a `cargo nextest list` child's stderr through for the same reason). A state that cannot be read
+  fails the check rather than passing it. The checks watch the target directory
+  named by `CARGO_TARGET_DIR`, else `target`. The causes found
   when it was introduced: `cargo xtask` leaked `cargo run`'s
   `CARGO_MANIFEST_DIR` to its children, whose `ring` build script hashes it
   (xtask now strips the injected variables from its own environment at startup,
@@ -2870,9 +2876,11 @@ and a rerun repeats the platform's whole job.
   or a packed branch ref in `rerun-if-changed`, and a missing path reruns the
   script on every invocation (`xtask-lib/src/git_rerun.rs`); and `sudo env`
   dropped `CARGO_INCREMENTAL`, which is part of every workspace unit's profile.
-  The strip is a prefix rule, so `hole-verify-run-env` runs under a real
-  `cargo run` and fails on any variable cargo started adding that is neither the
-  parent's, stripped, nor on `KEPT_TOOLCHAIN` (`xtask/src/run_injected_env.rs`).
+  The strip is a prefix rule, so `hole-verify-run-env` records its environment
+  with `env -0` (an external process sees names a shell builtin omits, such as
+  `ProgramFiles(x86)`), runs under a real `cargo run`, and fails on any variable
+  cargo started adding that is neither the parent's, stripped, nor on
+  `KEPT_TOOLCHAIN` (`xtask/src/run_injected_env.rs`).
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 

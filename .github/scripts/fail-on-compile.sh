@@ -20,7 +20,20 @@ fi
 
 log="$(mktemp)"
 plain="$(mktemp)"
-trap 'rm -f "$log" "$plain"' EXIT
+# Inside the target directory and addressed relative to the working directory:
+# a native Windows Python cannot open a Git Bash `/tmp` path.
+state_dir="${CARGO_TARGET_DIR:-target}"
+state="$(mktemp "$state_dir/compile-gate.XXXXXX")" || {
+    echo "::error title=Compile gate blind::could not create a state file in ${state_dir}; cannot tell whether anything compiled"
+    exit 1
+}
+trap 'rm -f "$log" "$plain" "$state"' EXIT
+
+state_script="$(dirname "${BASH_SOURCE[0]}")/target-state.sh"
+if ! "$state_script" snapshot "$state" "$state_dir"; then
+    echo "::error title=Compile gate blind::could not snapshot the build state in ${state_dir}; cannot tell whether anything compiled"
+    exit 1
+fi
 
 # Both pipeline stages count: a `tee` that cannot write the log (a full disk)
 # leaves a truncated log that would read as "nothing compiled".
@@ -48,6 +61,20 @@ compiled="$(LC_ALL=C grep -a -E '^[[:space:]]*Compiling [^[:space:]]+ v[0-9]' "$
 if [[ "$grep_status" -gt 1 ]]; then
     echo "::error title=Compile gate blind::grep failed (exit ${grep_status}); cannot tell whether anything compiled"
     exit 1
+fi
+
+state_status=0
+changed="$("$state_script" compare "$state" "$state_dir")" || state_status=$?
+if [[ "$state_status" -gt 1 ]]; then
+    echo "::error title=Compile gate blind::could not compare the build state in ${state_dir} (exit ${state_status}); cannot tell whether anything compiled"
+    exit 1
+fi
+if [[ "$state_status" -eq 1 ]]; then
+    echo "::error title=A test lane changed the build state::cargo compiled or ran a build script while the lane ran, whether or not it printed so; the lane must only re-execute what the build step compiled"
+    printf '%s\n' "$changed"
+    if [[ "$status" -eq 0 ]]; then
+        status=1
+    fi
 fi
 
 if [[ -n "$compiled" ]]; then

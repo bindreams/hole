@@ -714,6 +714,8 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
         "hole-verify-labels",
         "hole-verify-run-env",
         "hole-test-non-tun",
+        "hole-build-state",
+        "hole-verify-no-compile",
     ] {
         g.insert(id, HOLE_LEGS.to_vec());
     }
@@ -789,10 +791,32 @@ fn every_ci_step_is_either_in_the_mapping_or_failure_only() {
     );
 }
 
+/// The step that compares the build state after the last lane. It runs a Python
+/// script that reads `target/`; it writes nothing and runs no toolchain, so it
+/// may follow lanes that must be last.
+const READ_ONLY_CHECK: &str = "hole-verify-no-compile";
+
+/// The exemption above is by id, so the step must stay what it is exempted as:
+/// one comparison script, no cargo and no `sudo`.
+#[skuld::test]
+fn the_read_only_check_only_compares_the_build_state() {
+    let run = step_runs(&read_repo(".github/workflows/ci.yaml"))
+        .remove(READ_ONLY_CHECK)
+        .expect("the read-only check step has a run:");
+    assert!(run.contains("target-state.sh compare"), "{run}");
+    for word in run.split(|c: char| !c.is_alphanumeric()) {
+        assert!(
+            !["cargo", "sudo", "rustc", "go", "npm", "npx"].contains(&word),
+            "{word} in {run}"
+        );
+    }
+}
+
 /// #200: the Windows TUN lane corrupts NDIS loopback, so every loopback user
 /// (compiles through sccache, tests, the installer E2E) runs before it. What may
 /// follow on the Windows leg is the #999 proof step, a set diff over two files,
-/// and artifact uploads (`uses:` steps, no `run:`). A script step is not allowed
+/// the build-state comparison (`hole-verify-no-compile`, which only reads
+/// `target/`), and artifact uploads (`uses:` steps, no `run:`). A script step is not allowed
 /// by default: the installer E2E drives WebDriver over loopback and invokes no
 /// toolchain, so a toolchain-word check would not catch it.
 #[skuld::test]
@@ -802,7 +826,7 @@ fn nothing_but_the_proof_step_and_uploads_follows_the_windows_tun_lane() {
     let offenders: Vec<String> = non_upload_steps_after(&ci_yaml, "ci", "hole-test-tun", &on_windows)
         .expect("order")
         .into_iter()
-        .filter(|id| id != "hole-verify-executed")
+        .filter(|id| id != "hole-verify-executed" && id != READ_ONLY_CHECK)
         .collect();
     assert!(
         offenders.is_empty(),
@@ -813,13 +837,19 @@ fn nothing_but_the_proof_step_and_uploads_follows_the_windows_tun_lane() {
 /// The macOS TUN lane runs as root and leaves root-owned files in `target/` that
 /// no later unprivileged step could overwrite, so nothing but an artifact upload
 /// follows it on a macOS leg — no script step, and no `uses:` step that runs a
-/// toolchain (`./.github/actions/setup-build`, `setup-node`, ...).
+/// toolchain (`./.github/actions/setup-build`, `setup-node`, ...). The one
+/// exception is `hole-verify-no-compile`, which only reads `target/` and has to
+/// follow the last lane to see what it did.
 #[skuld::test]
 fn the_macos_root_lane_is_the_last_script_step_on_macos() {
     let ci_yaml = read_repo(".github/workflows/ci.yaml");
     for name in ["darwin/amd64", "darwin/arm64"] {
         let ran = steps_on_leg(&ci_yaml, name);
-        let offenders = non_upload_steps_after(&ci_yaml, "ci", "hole-test-tun-macos", &ran).expect("order");
+        let offenders: Vec<String> = non_upload_steps_after(&ci_yaml, "ci", "hole-test-tun-macos", &ran)
+            .expect("order")
+            .into_iter()
+            .filter(|id| id != READ_ONLY_CHECK)
+            .collect();
         assert!(
             offenders.is_empty(),
             "{name}: steps other than an artifact upload after the macOS root lane: {offenders:?}"

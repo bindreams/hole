@@ -3,8 +3,8 @@
 //!
 //! [`is_run_injected`] is a prefix rule, so a test that feeds it a list of
 //! names only restates it. This check runs in a real `cargo run --package
-//! xtask`, from a CI step that first records the names of its own environment
-//! (`compgen -e`, before cargo is involved). Every name xtask was launched with
+//! xtask`, from a CI step that first records its own environment with an
+//! external `env -0`, before cargo is involved. Every name xtask was launched with
 //! that the step did not have must be stripped ([`is_run_injected`]) or be on
 //! [`KEPT_TOOLCHAIN`]; anything else is a variable cargo started injecting that
 //! the strip does not know about, and fails the step by name.
@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::child_env::{is_run_injected, launch_env_names};
 
-/// Variables `cargo run` (cargo 1.99.0, via the rustup proxy) adds that the
+/// Variables `cargo run` (cargo 1.98.0, the pinned toolchain, via the rustup proxy) adds that the
 /// strip must keep. None is package environment: each is toolchain state that
 /// does not depend on which package is run, and a child that runs cargo or
 /// loads the toolchain's libraries needs it. Each is `(name, why it stays)`.
@@ -83,16 +83,27 @@ pub fn unexplained_additions_with(
         .collect()
 }
 
-/// The names a baseline file holds: one per line, blank lines ignored. A
-/// baseline that holds a run-injected name was recorded inside `cargo run` and
-/// would hide it; one with no names explains nothing.
-pub fn parse_parent_names(text: &str) -> Result<BTreeSet<String>> {
-    let names: BTreeSet<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect();
+/// The names a baseline file holds. The file is `env -0` output: NUL-terminated
+/// `NAME=value` entries, each named by the text before its first `=` (after a
+/// leading one, which Windows keeps in `=C:`). An external `env` records what a
+/// child sees, including names that are not shell identifiers
+/// (`ProgramFiles(x86)`) which a shell builtin leaves out. A baseline that
+/// holds a run-injected name was recorded inside `cargo run` and would hide it;
+/// one with no names explains nothing; an entry with no `=` is not `env -0`
+/// output.
+pub fn parse_parent_names(text: &[u8]) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for entry in text.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let skip = usize::from(entry[0] == b'=');
+        let Some(eq) = entry[skip..].iter().position(|&b| b == b'=') else {
+            bail!(
+                "the parent-environment baseline has an entry with no `=` ({:?}): \
+                 it must be the output of `env -0`",
+                String::from_utf8_lossy(entry)
+            );
+        };
+        names.insert(String::from_utf8_lossy(&entry[..skip + eq]).into_owned());
+    }
     if names.is_empty() {
         bail!("the parent-environment baseline holds no names");
     }
@@ -110,7 +121,7 @@ pub fn parse_parent_names(text: &str) -> Result<BTreeSet<String>> {
 /// names in `parent_names`), stripped, or kept.
 pub fn verify(parent_names: &Path) -> Result<()> {
     let launch = launch_env_names().context("the startup strip has not recorded the launch environment")?;
-    let text = std::fs::read_to_string(parent_names)
+    let text = std::fs::read(parent_names)
         .with_context(|| format!("reading the parent-environment baseline {}", parent_names.display()))?;
     let parent = parse_parent_names(&text).with_context(|| format!("in {}", parent_names.display()))?;
     let unexplained = unexplained_additions_with(launch, &parent, cfg!(windows));

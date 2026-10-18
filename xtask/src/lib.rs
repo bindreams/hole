@@ -428,9 +428,9 @@ pub enum Command {
     /// `cargo run --package xtask -- verify-run-injected-env ...`, not through
     /// the `cargo xtask` alias, after recording the parent's names.
     VerifyRunInjectedEnv {
-        /// The names of the environment `cargo run` was started from, one per
-        /// line (`compgen -e > FILE` in bash, before the `cargo run`), relative
-        /// to the repo root unless absolute.
+        /// The environment `cargo run` was started from, as `env -0 > FILE`
+        /// writes it (NUL-terminated `NAME=value`, recorded before the `cargo
+        /// run`), relative to the repo root unless absolute.
         #[arg(long)]
         parent_env_names: PathBuf,
     },

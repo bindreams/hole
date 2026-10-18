@@ -485,6 +485,15 @@ jobs:
           cargo xtask build hole-tests
           df -h .
 
+      # The build state every later step is held to. `hole-verify-no-compile`
+      # (after the last lane) compares it with the state then.
+      - id: hole-build-state
+        name: Record the build state after hole-build
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: bash
+        run: .github/scripts/target-state.sh snapshot target/build-state-after-hole-build.json
+
       # A SKULD_LABELS value that stops matching anything leaves its step a
       # silent no-op: the complementary one absorbs the whole suite and both
       # stay green. This asserts, before either runs, that the "!tun"/"tun"
@@ -527,11 +536,12 @@ jobs:
       # through it and make `ring`'s build script rerun. `verify-run-injected-env`
       # runs under a real `cargo run` and fails on any variable it was launched
       # with that is neither this step's own, nor stripped, nor on its list of
-      # kept toolchain names. The names cargo's parent had are recorded here,
-      # before cargo is involved. `compgen -e` lists exported names (values with
-      # newlines cannot corrupt it); `_` is added by hand because bash puts it in
-      # the environment of every external command it runs, `fail-on-compile.sh`
-      # included, but it is not exported while the builtin runs.
+      # kept toolchain names. The environment cargo's parent had is recorded here,
+      # before cargo is involved, by an external `env -0`: it lists what a child
+      # sees, including names that are not shell identifiers (`ProgramFiles(x86)`)
+      # which a shell builtin leaves out, and its NUL separators keep values with
+      # newlines from corrupting the file. `env` has its own `_`, which bash puts
+      # in the environment of every external command it runs.
       - id: hole-verify-run-env
         name: Verify the startup strip covers what cargo run injects
         if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
@@ -541,8 +551,8 @@ jobs:
           CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: |
           mkdir -p target
-          { compgen -e; echo _; } > target/run-parent-env-names.txt
-          .github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-run-injected-env --parent-env-names target/run-parent-env-names.txt
+          env -0 > target/run-parent-env.bin
+          .github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-run-injected-env --parent-env-names target/run-parent-env.bin
 
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
@@ -569,18 +579,18 @@ jobs:
       # Slow runs are part of that spread, not outliers: darwin/amd64's 32.3m and
       # 21.2m are one run. Raised only, never tightened.
       #
-      # NO COMPILING. Every cargo step after `hole-build` (the verify steps and the
-      # test lanes) runs under `fail-on-compile.sh`, which fails the step if
-      # cargo prints a `Compiling` line: they only re-execute what `hole-build`
-      # compiled, and one that compiles has a different
-      # fingerprint from the build (a leaked environment variable, a build script
-      # that reruns on every invocation) while still passing. `CARGO_LOG` makes
-      # cargo log why each unit was dirty, so a failure names its cause.
-      #
-      # The gate reads cargo's `Compiling` lines and `--quiet` hides them, which
-      # the `cargo xtask` alias carries, so a gated xtask step runs
-      # `cargo run --package xtask --` instead (same build, same fingerprints).
-      # `no_cargo_step_after_hole_build_hides_cargos_compiling_lines` holds it.
+      # NO COMPILING. Nothing after `hole-build` may compile or run a build script:
+      # the steps only re-execute what it compiled, and one that compiles has a
+      # different fingerprint from the build (a leaked environment variable, a
+      # build script that reruns on every invocation) while still passing.
+      # `hole-verify-no-compile`, after the last lane, compares the build state
+      # (`.github/scripts/target-state.py`: the files cargo rewrites on any
+      # compile) with the one `hole-build-state` recorded, so it catches a
+      # compile however cargo was launched and whether or not it printed.
+      # `fail-on-compile.sh` around a step compares the same state per step and
+      # names the units from cargo's `Compiling` lines; `CARGO_LOG` makes cargo
+      # log why each was dirty. A gated xtask step runs `cargo run --package
+      # xtask --`, since the `cargo xtask` alias's `--quiet` hides those lines.
       - id: hole-test-non-tun
         name: Test (non-TUN)
         if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
@@ -884,6 +894,23 @@ jobs:
               + package(dump) + package(dump-macros)
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
+
+      # The job-level half of NO COMPILING (see the comment above `hole-test-non-tun`).
+      # Reads only, so it may follow the macOS root lane. It runs whenever
+      # `hole-build` succeeded, so a failed lane does not hide a compile; a missing
+      # baseline (its step failed) is an error, not a pass.
+      - id: hole-verify-no-compile
+        name: Verify nothing compiled after hole-build
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          status=0
+          .github/scripts/target-state.sh compare target/build-state-after-hole-build.json || status=$?
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error title=Compiled after hole-build::a step after hole-build compiled or ran a build script (units above), or the build state could not be read (exit ${status})"
+            exit 1
+          fi
 
       # Renovate config =================================================================================================
       # `.github/renovate.json` is only ever executed by Renovate's own bot, so a
