@@ -82,7 +82,9 @@ impl<T: Settle> Arming<T> {
     /// Records that the latest attempt's call succeeded.
     pub fn confirm(&mut self) {
         match std::mem::replace(self, Self::Idle) {
-            Self::Unconfirmed(registration) | Self::Confirmed(registration) => *self = Self::Confirmed(registration),
+            Self::Unconfirmed(registration) => *self = Self::Confirmed(registration),
+            // Already confirmed: nothing to change.
+            Self::Confirmed(registration) => *self = Self::Confirmed(registration),
             Self::Idle => debug_assert!(false, "confirm without a begun attempt"),
         }
     }
@@ -90,7 +92,9 @@ impl<T: Settle> Arming<T> {
     /// Withdraws the wait on a confirmed registration, which stays owned.
     pub fn unconfirm(&mut self) {
         match std::mem::replace(self, Self::Idle) {
-            Self::Unconfirmed(registration) | Self::Confirmed(registration) => *self = Self::Unconfirmed(registration),
+            Self::Confirmed(registration) => *self = Self::Unconfirmed(registration),
+            // Already unconfirmed: nothing to change.
+            Self::Unconfirmed(registration) => *self = Self::Unconfirmed(registration),
             Self::Idle => {}
         }
     }

@@ -374,8 +374,8 @@ static ALLOCATOR: freed_watch::WatchingAlloc = freed_watch::WatchingAlloc;
 struct Script {
     /// The address of each record, in the order `arm` created them.
     records: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
-    /// Per `NotifyServiceStatusChangeW` call: `Some(rc)` replaces the call.
-    notify: std::collections::VecDeque<Option<u32>>,
+    /// Per `NotifyServiceStatusChangeW` call: `Some(rc)` replaces the call with a failure.
+    notify: std::collections::VecDeque<Option<std::num::NonZeroU32>>,
     /// Per `reopen`: `Some(error)` makes the handles fail to open.
     open: std::collections::VecDeque<Option<std::io::Error>>,
     /// The call whose record to hand to `freed_watch` as it is created.
@@ -398,7 +398,7 @@ impl Script {
 
 #[cfg(target_os = "windows")]
 impl hole_bridge::cutover::scm_wait::Hooks for Script {
-    fn intercept_notify(&mut self, record: usize) -> Option<u32> {
+    fn intercept_notify(&mut self, record: usize) -> Option<std::num::NonZeroU32> {
         let call = {
             let mut records = self.records.borrow_mut();
             records.push(record);
@@ -531,7 +531,9 @@ fn cutover_global_net_state_waiting_after_a_failed_arm_errs_instead_of_hanging()
     let _service = ProvisionedService::install(helper);
 
     let (mut script, _records) = Script::new();
-    script.notify.push_back(Some(ERROR_SERVICE_DOES_NOT_EXIST.0));
+    script
+        .notify
+        .push_back(std::num::NonZeroU32::new(ERROR_SERVICE_DOES_NOT_EXIST.0));
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
     actor.arm(WantState::Running).expect_err("the injected failure");
     let err = actor.wait_callback().expect_err("the last arm failed");
@@ -555,7 +557,9 @@ fn cutover_global_net_state_waiting_after_an_arm_that_failed_over_a_good_one_err
 
     let (mut script, _records) = Script::new();
     script.notify.push_back(None);
-    script.notify.push_back(Some(ERROR_SERVICE_DOES_NOT_EXIST.0));
+    script
+        .notify
+        .push_back(std::num::NonZeroU32::new(ERROR_SERVICE_DOES_NOT_EXIST.0));
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
     actor
         .arm(WantState::Running)
@@ -589,7 +593,9 @@ fn cutover_global_net_state_a_lagging_client_reopens_and_arms_again() {
         .expect("bring the throwaway service up via the production start seam");
 
     let (mut script, records) = Script::new();
-    script.notify.push_back(Some(ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.0));
+    script
+        .notify
+        .push_back(std::num::NonZeroU32::new(ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.0));
     script.watch_call = Some(0);
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
     actor
@@ -608,7 +614,7 @@ fn cutover_global_net_state_a_lagging_client_reopens_and_arms_again() {
 }
 
 /// A failed reopen leaves the actor without handles: every later use errs, and
-/// dropping it closes nothing twice (`ScHandle::drop` asserts on a failed close).
+/// dropping it closes nothing twice (`ScHandle::drop` logs a failed close).
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_a_failed_reopen_leaves_every_use_erring() {
@@ -620,7 +626,9 @@ fn cutover_global_net_state_a_failed_reopen_leaves_every_use_erring() {
     let _service = ProvisionedService::install(helper);
 
     let (mut script, _records) = Script::new();
-    script.notify.push_back(Some(ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.0));
+    script
+        .notify
+        .push_back(std::num::NonZeroU32::new(ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.0));
     script
         .open
         .push_back(Some(std::io::Error::other("injected open failure")));

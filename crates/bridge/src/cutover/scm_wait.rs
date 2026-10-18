@@ -98,6 +98,7 @@ mod system {
     use std::cell::UnsafeCell;
     use std::ffi::c_void;
     use std::io;
+    use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use windows::core::{HRESULT, PCWSTR};
@@ -254,25 +255,28 @@ mod system {
     }
 
     /// An open SCM or service handle, closed exactly once when this drops.
-    /// No call site closes one by hand, so a closed handle value (which the OS
-    /// may reuse for an unrelated handle) cannot be closed a second time.
+    /// Nothing else closes one, so a closed handle value (which the OS may
+    /// reuse for an unrelated handle) cannot be closed a second time.
     struct ScHandle(SC_HANDLE);
 
-    impl ScHandle {
-        /// Closes the handle. A failure means it was not a live handle, which is
-        /// what a double close looks like.
-        fn close(&mut self) -> windows::core::Result<()> {
-            // SAFETY: the handle came from a successful open call and `drop` is
-            // the only caller outside tests.
-            unsafe { CloseServiceHandle(self.0) }
-        }
+    /// Closes `handle`. A failure means it was not a live handle, which is what
+    /// a double close looks like.
+    ///
+    /// # Safety
+    ///
+    /// `handle` is either owned by the caller, who never uses it again, or names
+    /// no live handle at all (NULL).
+    unsafe fn close_raw(handle: SC_HANDLE) -> windows::core::Result<()> {
+        // SAFETY: by the contract above, no handle another owner uses is closed.
+        unsafe { CloseServiceHandle(handle) }
     }
 
     impl Drop for ScHandle {
         fn drop(&mut self) {
-            if let Err(e) = self.close() {
+            // SAFETY: `ScHandle` owns the handle from its open call, and `drop`
+            // runs once. No panic here: one during unwinding aborts the process.
+            if let Err(e) = unsafe { close_raw(self.0) } {
                 tracing::error!(error = %e, "CloseServiceHandle failed on a handle this process opened");
-                debug_assert!(false, "CloseServiceHandle failed on a handle this process opened: {e}");
             }
         }
     }
@@ -310,8 +314,9 @@ mod system {
     pub trait Hooks {
         /// Called with the address of each fresh record just before
         /// `NotifyServiceStatusChangeW`. `Some(rc)` skips the call and acts as its
-        /// return code.
-        fn intercept_notify(&mut self, _record: usize) -> Option<u32> {
+        /// failure code. Success is not injectable: it would leave an armed
+        /// wait with nothing registered at the SCM, which never wakes.
+        fn intercept_notify(&mut self, _record: usize) -> Option<NonZeroU32> {
             None
         }
 
@@ -420,7 +425,7 @@ mod system {
                 // Stored before the call: a failed call may still have registered the record.
                 self.arming.begin(registration);
                 let rc = match self.hooks.intercept_notify(address) {
-                    Some(rc) => rc,
+                    Some(rc) => rc.get(),
                     // SAFETY: `service` is a live handle and `buffer` points at the
                     // record `arming` now owns, which is freed only once settled.
                     None => unsafe { NotifyServiceStatusChangeW(service, mask, buffer) },
