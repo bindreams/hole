@@ -15,6 +15,10 @@ struct FakeScm<'a> {
     /// What `control_stop` fails with, for its first `control_errors_left` calls.
     control_error: Option<&'static str>,
     control_errors_left: usize,
+    /// The fate each `wait_callback` leaves behind, front to back; `Unheld`
+    /// once they run out.
+    fates: std::collections::VecDeque<ProcessFate>,
+    last_fate: ProcessFate,
 }
 
 impl<'a> FakeScm<'a> {
@@ -26,7 +30,15 @@ impl<'a> FakeScm<'a> {
             arm_error: None,
             control_error: None,
             control_errors_left: 0,
+            fates: Default::default(),
+            last_fate: ProcessFate::Unheld,
         }
+    }
+
+    /// The process behind each callback has these fates, in order.
+    fn with_fates(mut self, fates: Vec<ProcessFate>) -> Self {
+        self.fates = fates.into();
+        self
     }
 
     /// `control_stop` fails with `error` on its first `times` calls.
@@ -66,6 +78,7 @@ impl ScmActor for FakeScm<'_> {
     fn wait_callback(&mut self) -> std::io::Result<Observed> {
         self.log.borrow_mut().push("wait");
         let state = self.waits.pop_front().expect("script ran dry");
+        self.last_fate = self.fates.pop_front().unwrap_or(ProcessFate::Unheld);
         self.log.borrow_mut().push(match state {
             Observed::Stopped => "got_stopped",
             Observed::Running => "got_running",
@@ -73,6 +86,9 @@ impl ScmActor for FakeScm<'_> {
             Observed::StopPending => "got_stop_pending",
         });
         Ok(state)
+    }
+    fn process_fate(&mut self) -> std::io::Result<ProcessFate> {
+        Ok(self.last_fate)
     }
 }
 
@@ -118,6 +134,9 @@ impl ScmActor for ScriptedScm {
     }
     fn wait_callback(&mut self) -> std::io::Result<Observed> {
         Ok(self.waits.pop_front().expect("script ran dry"))
+    }
+    fn process_fate(&mut self) -> std::io::Result<ProcessFate> {
+        Ok(ProcessFate::Unheld)
     }
 }
 
@@ -442,6 +461,75 @@ fn no_arm_is_left_with_no_state_to_report() {
     }
 }
 
+/// The bridge dies at the moment the Stop is sent: the Stop fails, and the
+/// SCM still reports RUNNING for the process it has not yet noticed gone. The
+/// held process says it has exited, so the service is stopped.
+#[skuld::test]
+fn a_refused_stop_on_a_running_status_whose_process_has_exited_is_not_a_failure() {
+    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
+    let mut fake = FakeScm::new(&log, [Observed::Running, Observed::Running].into())
+        .failing_control("broken pipe", 1)
+        .with_fates(vec![ProcessFate::Alive, ProcessFate::Exited]);
+    stop_via_notify(&mut fake).unwrap();
+    assert_eq!(
+        *log.borrow(),
+        vec![
+            "arm_stopped",
+            "wait",
+            "got_running",
+            "control_stop",
+            "arm_stopped",
+            "wait",
+            "got_running",
+        ]
+    );
+}
+
+/// The refusal is the wait's own only while the process is there to have taken
+/// the Stop.
+#[skuld::test]
+fn a_refused_stop_on_a_running_status_whose_process_is_alive_is_still_a_failure() {
+    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
+    let mut fake = FakeScm::new(&log, [Observed::Running, Observed::Running].into())
+        .failing_control("refused", 1)
+        .with_fates(vec![ProcessFate::Alive, ProcessFate::Alive]);
+    let err = stop_via_notify(&mut fake).expect_err("the Stop was refused by a live service");
+    assert_eq!(err.to_string(), "refused");
+}
+
+/// A status that lags a process's exit is not waited on: STOP_PENDING for a
+/// process that has gone ends the wait with no further arm, instead of blocking
+/// on the SCM's own bookkeeping.
+#[skuld::test]
+fn a_stop_pending_status_whose_process_has_exited_ends_the_wait() {
+    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
+    let mut fake = FakeScm::new(&log, [Observed::Running, Observed::StopPending].into())
+        .with_fates(vec![ProcessFate::Alive, ProcessFate::Exited]);
+    stop_via_notify(&mut fake).unwrap();
+    assert_eq!(
+        *log.borrow(),
+        vec![
+            "arm_stopped",
+            "wait",
+            "got_running",
+            "control_stop",
+            "arm_stopped_except_running",
+            "wait",
+            "got_stop_pending",
+        ]
+    );
+}
+
+/// The first report can already be stale: a RUNNING status over a dead process
+/// earns no Stop.
+#[skuld::test]
+fn a_running_status_whose_process_has_exited_is_sent_no_stop() {
+    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
+    let mut fake = FakeScm::new(&log, [Observed::Running].into()).with_fates(vec![ProcessFate::Exited]);
+    stop_via_notify(&mut fake).unwrap();
+    assert_eq!(*log.borrow(), vec!["arm_stopped", "wait", "got_running"]);
+}
+
 #[skuld::test]
 fn stop_surfaces_an_arm_error_before_waiting() {
     let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
@@ -463,23 +551,76 @@ fn each_state_has_the_stop_policy_its_cause_gives_it() {
         (Observed::StopPending, StopStep::KeepWaiting),
     ];
     for (observed, step) in table {
-        assert_eq!(observed.for_stop_wait(), step, "{observed:?}");
+        for fate in [ProcessFate::Unheld, ProcessFate::Alive] {
+            assert_eq!(observed.for_stop_wait(fate), step, "{observed:?} {fate:?}");
+        }
+    }
+}
+
+/// A process that has exited is gone whatever the SCM still says: its status
+/// can lag the exit, and a Stop sent into it can only fail.
+#[skuld::test]
+fn an_exited_process_ends_the_stop_wait_whatever_state_the_scm_still_reports() {
+    for observed in [
+        Observed::Stopped,
+        Observed::Running,
+        Observed::StartPending,
+        Observed::StopPending,
+    ] {
+        assert_eq!(
+            observed.for_stop_wait(ProcessFate::Exited),
+            StopStep::Finished,
+            "{observed:?}"
+        );
     }
 }
 
 /// Written from what the SCM does with a service marked for deletion, not from
 /// the code: a Stop is accepted in RUNNING only, a process in STOP_PENDING is
 /// already leaving, and a START_PENDING one cannot be stopped until it runs.
+/// With no process held to wait on, the only event left is the SCM's own.
 #[skuld::test]
 fn each_state_has_the_drain_policy_its_cause_gives_it() {
-    let table = [
-        (Observed::Stopped, DrainStep::Finished),
+    let alive = [
         (Observed::Running, DrainStep::StopThenAwaitExit),
         (Observed::StopPending, DrainStep::AwaitExit),
         (Observed::StartPending, DrainStep::AwaitRunning),
     ];
-    for (observed, step) in table {
-        assert_eq!(observed.for_drain_step(), step, "{observed:?}");
+    for (observed, step) in alive {
+        assert_eq!(
+            observed.for_drain_step(ProcessFate::Alive),
+            step,
+            "{observed:?} with a live process"
+        );
+    }
+    for observed in [Observed::Running, Observed::StopPending, Observed::StartPending] {
+        assert_eq!(
+            observed.for_drain_step(ProcessFate::Unheld),
+            DrainStep::AwaitStatus,
+            "{observed:?} with no process held"
+        );
+    }
+    assert_eq!(
+        Observed::Stopped.for_drain_step(ProcessFate::Unheld),
+        DrainStep::Finished
+    );
+}
+
+/// The process is ground truth for whether a look is current: one that has
+/// exited leaves nothing to drain, whatever the SCM still reports.
+#[skuld::test]
+fn an_exited_process_leaves_nothing_to_drain_whatever_state_the_scm_still_reports() {
+    for observed in [
+        Observed::Stopped,
+        Observed::Running,
+        Observed::StartPending,
+        Observed::StopPending,
+    ] {
+        assert_eq!(
+            observed.for_drain_step(ProcessFate::Exited),
+            DrainStep::Finished,
+            "{observed:?}"
+        );
     }
 }
 

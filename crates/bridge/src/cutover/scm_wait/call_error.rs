@@ -38,6 +38,26 @@ impl ScmCall {
         }
     }
 
+    /// Whether a failure of this call is the refusal to open the service's
+    /// process, which belongs to no step of a retirement: the step that was
+    /// running only needed the process held.
+    pub fn is_opening_the_service_process(self) -> bool {
+        match self {
+            ScmCall::OpenProcess => true,
+            ScmCall::OpenScManager => false,
+            ScmCall::OpenService => false,
+            ScmCall::NotifyServiceStatusChange => false,
+            ScmCall::ControlService => false,
+            ScmCall::StartService => false,
+            ScmCall::ChangeServiceConfig2 => false,
+            ScmCall::DeleteService => false,
+            ScmCall::QueryServiceStatusEx => false,
+            ScmCall::WaitForSingleObject => false,
+            ScmCall::CreateService => false,
+            ScmCall::StartServiceCtrlDispatcher => false,
+        }
+    }
+
     /// `failure`, the OS error a `windows_service` call carries inside its
     /// `Error::Winapi` (which displays only as "IO error in winapi call"), as
     /// this call's typed failure with the Win32 code.
@@ -90,6 +110,15 @@ pub fn io_error_is_absent_service(error: &io::Error) -> bool {
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<ScmCallError>())
         .is_some_and(|typed| is_absent_service_code(typed.code))
+}
+
+/// Whether `error` is a [`ScmCallError`] of the call that opens the service's
+/// process (see [`ScmCall::is_opening_the_service_process`]).
+pub fn io_error_is_a_refused_process_open(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ScmCallError>())
+        .is_some_and(|typed| typed.call.is_opening_the_service_process())
 }
 
 /// The Win32 code inside an `HRESULT` the `windows` bindings report, when it is

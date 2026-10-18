@@ -1929,25 +1929,47 @@ down a rollback (bindreams/hole#1099). Three rules close it:
   service non-STOPPED with that pid, so the pid cannot be reused under a
   confirmed open.
 
+A held process is also the ground truth for whether the status is current: the
+SCM's status can lag a process's exit by its own latency, so a process that has
+exited (a zero-timeout wait on the held handle, or an id no process has) counts
+as gone **whatever state the SCM still reports**. The stop wait treats it as
+stopped (`Observed::for_stop_wait(ProcessFate)`): a Stop that failed because the
+process died under it is explained, not an error, and a RUNNING or STOP_PENDING
+status over a dead process is not waited on. The failure that remains is a Stop
+refused by a process that is still alive. A refusal to open the process at all
+(`OpenProcess` access denied, say) is its own `RetireError::Hold` naming the call
+and the code; it is not "the service did not stop".
+
 After the delete the service may be live (a restart slipped in between the stop
-and the delete). `Observed::for_drain_step` decides, and **none of the steps for
-a state with a process arms a notification**, because whether an arm works on a
-service marked for deletion has not been measured: RUNNING is sent a Stop and its
-process awaited; STOP_PENDING is awaited; STOPPED is awaited and looked at again
-(the wait is time in which the SCM may have started another). START_PENDING is
-the one state with no other way to wait (a Stop is refused, and the process will
-not exit by itself), so it goes through the stop wait, and if that cannot arm on
-the marked service the failure surfaces as `RetireError::Drain` rather than being
-absorbed. Waiting out a process the SCM still reports (a state that lags the
-exit by the SCM's own latency) re-looks until the SCM catches up; that is bounded
-by the SCM, not by a count.
+and the delete). `Observed::for_drain_step(ProcessFate)` decides, and **no
+step that has a process to wait on arms a notification**, because whether an arm
+works on a service marked for deletion has not been measured: RUNNING with a live
+process is sent a Stop and the process awaited; STOP_PENDING with a live process
+is awaited; a look whose process has exited, or that is STOPPED, leaves nothing
+live (every held process is awaited, then one more look decides). START_PENDING
+with a live process, and any live state with no process held, have no process exit
+to wait on (a Stop is refused in START_PENDING and the process will not exit by
+itself; with no process held there is nothing to block on), so they go through the
+stop wait, and if that cannot arm on the marked service the failure surfaces as
+`RetireError::Drain` rather than being absorbed. Every iteration of the drain ends
+in a real event (a process exit, or an SCM notification), never in a re-query of
+a state that has not changed. The drain ends on a look that finds nothing live
+after the last wait.
 
 What is measured and what is assumed. The privileged `cutover_global_net_state_stop_probe_*`
 tests print, per state (RUNNING; STOPPED with a restart pending; START_PENDING
 attached; START_PENDING with the process not attached), what `ControlService(STOP)`
 answers and what an arm for all four states reports first; the probe
 `..._handle_of_a_service_marked_for_delete` prints a state query, an arm, a Stop and
-the stop wait on a handle opened before `DeleteService`, and
+the stop wait on a handle opened before `DeleteService`, each with what the
+answer means for the drain; `..._open_process_synchronize_on_the_service_process`
+prints whether `OpenProcess(PROCESS_SYNCHRONIZE)` on the service process succeeds
+from an elevated administrator (a SYSTEM caller, the MSI custom action, cannot be
+reproduced by a test; its first answer is the CI installer test's uninstall);
+`..._restart_timer_after_delete_on_a_marked_service` keeps a pre-opened handle
+across a short restart timer and prints whether a restart arrives after
+`DeleteService` (its negative answer is that test timing out, since the timer
+not firing has no event); and
 `..._drain_of_a_start_pending_service_marked_for_delete` prints how the one
 arm-dependent drain state ends. Until a Windows run has printed them, the code
 assumes: a Stop in START_PENDING is refused (1061), and an arm reports the
@@ -1958,9 +1980,16 @@ test `..._drain_stops_and_awaits_a_running_service_marked_for_delete` passes
 whatever an arm does there, and
 `..._uninstall_leaves_nothing_whichever_side_of_the_scm_restart_wins` runs the
 timer race itself (restart delay 0, process killed, uninstall at once) five times
-and asserts no row and no process remains. Not measured: whether changing the
-failure actions cancels a restart already pending, and that a marked service
-cannot be started again; the drain is correct for either answer.
+and asserts no row and no process remains.
+
+Not measured, and depended on: a restart timer that fires between `DeleteService`
+and the close of the last handle. The drain's last look is taken before that
+close, so a start after it is covered only if the SCM refuses to start a service
+marked for deletion (`StartService` documents `ERROR_SERVICE_MARKED_FOR_DELETE`;
+whether the SCM's own recovery restart applies the same check is the restart-timer
+probe's question) or if changing the failure actions cancels a restart already
+pending. The drain is not correct for both of those being false; the probe above
+says which holds.
 
 Steps do not short-circuit each other and the error names all of them; an early
 `?` on the release swallowed the context that explains why it refused.

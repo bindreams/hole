@@ -8,6 +8,8 @@ pub mod call_error;
 pub mod hold;
 pub mod retire;
 
+use hold::ProcessFate;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WantState {
     Stopped,
@@ -72,7 +74,8 @@ pub enum StopStep {
 /// on a marked service has not been measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainStep {
-    /// The service is stopped.
+    /// Nothing live is named: the service is stopped, or the process it names
+    /// has exited. Wait out every held process and look once more.
     Finished,
     /// Running: send the Stop, then wait for the process to exit.
     StopThenAwaitExit,
@@ -81,6 +84,9 @@ pub enum DrainStep {
     /// No Stop is accepted yet and no process exit is near: wait for the
     /// service to leave START_PENDING through the stop wait.
     AwaitRunning,
+    /// A live state with no process held to wait on: the only event left is
+    /// the SCM's own notification, so the stop wait.
+    AwaitStatus,
 }
 
 /// What a start wait does on seeing a state.
@@ -102,7 +108,19 @@ impl Observed {
     /// RUNNING is the one state that accepts it. A START_PENDING service is
     /// waited out and reaches RUNNING (or STOPPED), whose observation then
     /// decides.
-    pub fn for_stop_wait(self) -> StopStep {
+    ///
+    /// The process is ground truth for whether the state is current: one that
+    /// has exited is gone whatever the SCM still reports, so the service counts
+    /// as stopped. The SCM's status can lag the exit.
+    pub fn for_stop_wait(self, process: ProcessFate) -> StopStep {
+        match process {
+            ProcessFate::Exited => StopStep::Finished,
+            ProcessFate::Unheld => self.for_stop_wait_by_state(),
+            ProcessFate::Alive => self.for_stop_wait_by_state(),
+        }
+    }
+
+    fn for_stop_wait_by_state(self) -> StopStep {
         match self {
             Observed::Stopped => StopStep::Finished,
             Observed::Running => StopStep::SendStop,
@@ -113,13 +131,26 @@ impl Observed {
         }
     }
 
-    /// The drain's policy for this state.
-    pub fn for_drain_step(self) -> DrainStep {
-        match self {
-            Observed::Stopped => DrainStep::Finished,
-            Observed::Running => DrainStep::StopThenAwaitExit,
-            Observed::StopPending => DrainStep::AwaitExit,
-            Observed::StartPending => DrainStep::AwaitRunning,
+    /// The drain's policy for this state and the fate of the process it names.
+    ///
+    /// The process, not the status, says whether anything is left: one that has
+    /// exited leaves nothing, and a live state with no process held leaves only
+    /// the SCM's own notification to wait on, so neither re-looks in a loop.
+    pub fn for_drain_step(self, process: ProcessFate) -> DrainStep {
+        match process {
+            ProcessFate::Exited => DrainStep::Finished,
+            ProcessFate::Alive => match self {
+                Observed::Stopped => DrainStep::Finished,
+                Observed::Running => DrainStep::StopThenAwaitExit,
+                Observed::StopPending => DrainStep::AwaitExit,
+                Observed::StartPending => DrainStep::AwaitRunning,
+            },
+            ProcessFate::Unheld => match self {
+                Observed::Stopped => DrainStep::Finished,
+                Observed::Running => DrainStep::AwaitStatus,
+                Observed::StopPending => DrainStep::AwaitStatus,
+                Observed::StartPending => DrainStep::AwaitStatus,
+            },
         }
     }
 
@@ -159,6 +190,9 @@ pub trait ScmActor {
     /// Block in an alertable wait until the armed notification fires; return the
     /// service's observed state from the callback buffer.
     fn wait_callback(&mut self) -> std::io::Result<Observed>;
+    /// The fate of the process behind the state `wait_callback` last reported.
+    /// An actor that holds no process answers [`ProcessFate::Unheld`].
+    fn process_fate(&mut self) -> std::io::Result<ProcessFate>;
 }
 
 /// Stop the service, gated strictly on a real STOPPED callback from
@@ -181,14 +215,16 @@ pub trait ScmActor {
 /// A Stop that fails is read against a fresh arm for every state: the failure
 /// is about the RUNNING state it was sent on, and the service may have left it
 /// since (stopped, or begun to) in a way that answers with any code. Only a
-/// service still RUNNING makes the failure the wait's own.
+/// service still RUNNING, over a process that has not exited, makes the failure
+/// the wait's own: the actor's [`ScmActor::process_fate`] is the ground truth
+/// when the SCM's status lags the process.
 ///
 /// The cutover's `stop_service_wait_stopped` and the `retire` session use this.
 pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
     a.arm(WantState::Stopped, None)?;
     let mut observed = a.wait_callback()?;
     loop {
-        match observed.for_stop_wait() {
+        match observed.for_stop_wait(a.process_fate()?) {
             StopStep::Finished => {
                 tracing::info!(?observed, "SCM stop wait: service is stopped");
                 return Ok(());
@@ -200,7 +236,7 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
                     Err(refused) => {
                         a.arm(WantState::Stopped, None)?;
                         observed = a.wait_callback()?;
-                        if observed.for_stop_wait() == StopStep::SendStop {
+                        if observed.for_stop_wait(a.process_fate()?) == StopStep::SendStop {
                             return Err(refused);
                         }
                         tracing::info!(
@@ -270,7 +306,7 @@ mod system {
     use windows::Win32::System::Threading::SleepEx;
 
     use super::call_error::{self, win32_code_of_hresult, ScmCall, ScmCallError};
-    use super::{states_to_arm, Observed, WantState};
+    use super::{states_to_arm, Observed, ProcessFate, WantState};
     use crate::cutover::registration::{Arming, Registration, Settle};
 
     // `call_error` classifies the control answers by number so its tests run on
@@ -629,6 +665,10 @@ mod system {
                     "the SCM reported service state {state}, which no wait here arms for"
                 ))
             })
+        }
+
+        fn process_fate(&mut self) -> io::Result<ProcessFate> {
+            Ok(ProcessFate::Unheld)
         }
     }
 }

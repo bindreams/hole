@@ -25,6 +25,8 @@ struct Script {
     log: Log,
     reads: VecDeque<Reading>,
     gone: Vec<u32>,
+    /// Ids of processes that are open but already signalled.
+    exited: Vec<u32>,
 }
 
 impl Script {
@@ -33,6 +35,7 @@ impl Script {
             log: log.clone(),
             reads: reads.into(),
             gone: vec![],
+            exited: vec![],
         }
     }
 }
@@ -54,6 +57,10 @@ impl ProcessSource for Script {
             pid,
             log: self.log.clone(),
         }))
+    }
+
+    fn has_exited(&mut self, process: &Handle) -> io::Result<bool> {
+        Ok(self.exited.contains(&process.pid))
     }
 }
 
@@ -247,6 +254,9 @@ fn a_failed_read_after_the_open_is_an_error_and_the_handle_is_let_go() {
         fn open(&mut self, pid: u32) -> io::Result<Option<Handle>> {
             self.0.open(pid)
         }
+        fn has_exited(&mut self, process: &Handle) -> io::Result<bool> {
+            self.0.has_exited(process)
+        }
     }
     let log = Log::default();
     let mut source = FailsSecondRead(Script::new(&log, vec![reading(Observed::Running, 100)]), 0);
@@ -270,4 +280,114 @@ fn only_a_state_with_a_process_names_one_to_hold() {
 
 fn count(log: &Log, entry: &str) -> usize {
     log.borrow().iter().filter(|e| *e == entry).count()
+}
+
+fn look_of(source: &mut Script) -> (Look, ProcessHolds<Handle>) {
+    let mut holds = ProcessHolds::default();
+    let got = holds.look(source).unwrap();
+    (got, holds)
+}
+
+fn steady(observed: Observed, pid: u32) -> Vec<Reading> {
+    vec![reading(observed, pid), reading(observed, pid)]
+}
+
+#[skuld::test]
+fn a_held_process_that_has_not_exited_is_alive_whatever_the_state() {
+    for live in [Observed::StartPending, Observed::Running, Observed::StopPending] {
+        let log = Log::default();
+        let mut source = Script::new(&log, steady(live, 100));
+        let (got, _) = look_of(&mut source);
+        assert_eq!(
+            got,
+            Look {
+                observed: live,
+                fate: ProcessFate::Alive
+            },
+            "{live:?}"
+        );
+    }
+}
+
+/// The SCM can still say RUNNING or STOP_PENDING for a process that has gone;
+/// the held handle is the ground truth.
+#[skuld::test]
+fn a_held_process_that_has_exited_is_exited_whatever_the_state_still_says() {
+    for stale in [Observed::StartPending, Observed::Running, Observed::StopPending] {
+        let log = Log::default();
+        let mut source = Script::new(&log, steady(stale, 100));
+        source.exited.push(100);
+        let (got, holds) = look_of(&mut source);
+        assert_eq!(
+            got,
+            Look {
+                observed: stale,
+                fate: ProcessFate::Exited
+            },
+            "{stale:?}"
+        );
+        // Still held: the final wait is on it.
+        assert_eq!(held_pids(&holds), vec![100], "{stale:?}");
+    }
+}
+
+#[skuld::test]
+fn a_named_id_no_process_has_is_exited() {
+    let log = Log::default();
+    let mut source = Script::new(&log, vec![reading(Observed::StopPending, 100)]);
+    source.gone.push(100);
+    let (got, holds) = look_of(&mut source);
+    assert_eq!(got.fate, ProcessFate::Exited);
+    assert!(held_pids(&holds).is_empty());
+}
+
+#[skuld::test]
+fn a_look_that_names_no_process_has_an_unheld_fate() {
+    for (observed, pid) in [
+        (Observed::Stopped, 0),
+        (Observed::Stopped, 7),
+        (Observed::Running, 0),
+        (Observed::StartPending, 0),
+        (Observed::StopPending, 0),
+    ] {
+        let log = Log::default();
+        let mut source = Script::new(&log, vec![reading(observed, pid)]);
+        let (got, _) = look_of(&mut source);
+        assert_eq!(got.fate, ProcessFate::Unheld, "{observed:?} pid {pid}");
+    }
+}
+
+/// A process held from an earlier look is the ground truth for a later look
+/// that names the same id.
+#[skuld::test]
+fn a_process_held_earlier_and_since_exited_is_exited_on_a_later_look() {
+    let log = Log::default();
+    let mut source = Script::new(&log, steady(Observed::Running, 100));
+    let mut holds = ProcessHolds::default();
+    assert_eq!(holds.look(&mut source).unwrap().fate, ProcessFate::Alive);
+    source.exited.push(100);
+    source.reads.push_back(reading(Observed::StopPending, 100));
+    let got = holds.look(&mut source).unwrap();
+    assert_eq!(got.observed, Observed::StopPending);
+    assert_eq!(got.fate, ProcessFate::Exited);
+}
+
+#[skuld::test]
+fn a_failed_exit_check_is_an_error() {
+    struct FailsCheck(Script);
+    impl ProcessSource for FailsCheck {
+        type Process = Handle;
+        fn read(&mut self) -> io::Result<Reading> {
+            self.0.read()
+        }
+        fn open(&mut self, pid: u32) -> io::Result<Option<Handle>> {
+            self.0.open(pid)
+        }
+        fn has_exited(&mut self, _: &Handle) -> io::Result<bool> {
+            Err(io::Error::other("wait failed"))
+        }
+    }
+    let log = Log::default();
+    let mut source = FailsCheck(Script::new(&log, steady(Observed::Running, 100)));
+    assert!(ProcessHolds::default().look(&mut source).is_err());
 }

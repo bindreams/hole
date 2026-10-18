@@ -13,10 +13,10 @@ use windows_service::service::{
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use super::service_processes::{open_process, ServiceProcesses};
+use super::service_processes::{has_exited, open_process, ServiceProcesses};
 use super::{apply_failure_actions, scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{io_error_is_absent_service, win32_code_of_hresult, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{ProcessSource, Reading};
+use crate::cutover::scm_wait::hold::{Look, ProcessFate, ProcessSource, Reading};
 use crate::cutover::scm_wait::retire::ServiceSession;
 use crate::cutover::scm_wait::{observed_from_state, Observed, ScmActor, SystemScmActor, WantState};
 
@@ -58,10 +58,11 @@ impl RetireSession {
         }
     }
 
-    /// Reads the service and holds the process it names; the look returned is
-    /// the one the hold was confirmed against.
-    fn hold_current(&mut self) -> io::Result<Reading> {
-        self.processes.hold_current(&mut ServiceProbe(&self.service))
+    /// Reads the service, holds the process it names, and says whether that
+    /// process is still alive; the state returned is the one the hold was
+    /// confirmed against.
+    fn look(&mut self) -> io::Result<Look> {
+        self.processes.look(&mut ServiceProbe(&self.service))
     }
 }
 
@@ -84,6 +85,10 @@ impl ProcessSource for ServiceProbe<'_> {
 
     fn open(&mut self, pid: u32) -> io::Result<Option<Self::Process>> {
         open_process(pid)
+    }
+
+    fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool> {
+        has_exited(process)
     }
 }
 
@@ -131,6 +136,10 @@ impl ScmActor for RetireSession {
     fn wait_callback(&mut self) -> io::Result<Observed> {
         self.actor.wait_callback()
     }
+    /// A bare session holds nothing on a callback; `retire` wraps it to.
+    fn process_fate(&mut self) -> io::Result<ProcessFate> {
+        Ok(ProcessFate::Unheld)
+    }
 }
 
 impl ServiceSession for RetireSession {
@@ -150,12 +159,12 @@ impl ServiceSession for RetireSession {
             .map_err(|e| scm_failure(ScmCall::DeleteService, e))
     }
 
-    fn observe(&mut self) -> io::Result<Observed> {
-        Ok(self.hold_current()?.observed)
+    fn observe(&mut self) -> io::Result<Look> {
+        self.look()
     }
 
-    fn hold_process(&mut self) -> io::Result<()> {
-        self.hold_current().map(|_| ())
+    fn hold_process(&mut self) -> io::Result<ProcessFate> {
+        Ok(self.look()?.fate)
     }
 
     fn await_exits(&mut self) -> io::Result<()> {

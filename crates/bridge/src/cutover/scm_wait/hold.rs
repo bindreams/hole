@@ -26,7 +26,28 @@ impl Reading {
     }
 }
 
-/// The two OS reads holding a process needs.
+/// Whether the process a look names is alive, by the process itself and not by
+/// what the SCM says about it: the SCM's status can lag a process's exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessFate {
+    /// The look names no process to hold (STOPPED, or a live state with no id),
+    /// or the holder keeps none.
+    Unheld,
+    /// A held process that has not exited.
+    Alive,
+    /// The named process has exited: a held one that is signalled, or an id no
+    /// process has. Whatever state the SCM still reports.
+    Exited,
+}
+
+/// A look at a service with the fate of the process it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Look {
+    pub observed: Observed,
+    pub fate: ProcessFate,
+}
+
+/// The OS reads holding a process needs.
 pub trait ProcessSource {
     /// An open process; closes when dropped.
     type Process;
@@ -34,6 +55,8 @@ pub trait ProcessSource {
     fn read(&mut self) -> io::Result<Reading>;
     /// Open process `pid`; `None` when no process has that id.
     fn open(&mut self, pid: u32) -> io::Result<Option<Self::Process>>;
+    /// Whether `process` has exited. A state read, never a wait.
+    fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool>;
 }
 
 /// The processes held so far, each with the id it was opened under.
@@ -84,6 +107,36 @@ impl<P> ProcessHolds<P> {
             }
             reading = again;
         }
+    }
+
+    /// [`hold_current`](Self::hold_current), and the fate of the process the
+    /// last look names, read off the process itself: the SCM's status can lag
+    /// a process's exit, a process handle cannot.
+    ///
+    /// A look that names a process this holds is `Alive` or `Exited` by a
+    /// state read of that handle; one that names an id no process has (the open
+    /// found none) is `Exited`; one that names no process is `Unheld`.
+    pub fn look<S: ProcessSource<Process = P>>(&mut self, source: &mut S) -> io::Result<Look> {
+        let reading = self.hold_current(source)?;
+        let fate = match reading.process_to_hold() {
+            None => ProcessFate::Unheld,
+            Some(pid) => match self.held.iter().find(|(held, _)| *held == pid) {
+                Some((_, process)) => {
+                    if source.has_exited(process)? {
+                        ProcessFate::Exited
+                    } else {
+                        ProcessFate::Alive
+                    }
+                }
+                // `hold_current` returned without holding a named process only
+                // because no process has that id.
+                None => ProcessFate::Exited,
+            },
+        };
+        Ok(Look {
+            observed: reading.observed,
+            fate,
+        })
     }
 }
 

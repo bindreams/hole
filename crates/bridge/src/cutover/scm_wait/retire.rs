@@ -6,7 +6,8 @@ use std::io;
 
 use tracing::{info, warn};
 
-use super::call_error::io_error_is_absent_service;
+use super::call_error::{io_error_is_a_refused_process_open, io_error_is_absent_service};
+use super::hold::{Look, ProcessFate};
 use super::{stop_via_notify, DrainStep, Observed, ScmActor, WantState};
 
 /// What a retirement leaves behind once the service is stopped.
@@ -30,11 +31,12 @@ pub trait ServiceSession: ScmActor {
     /// The service's state, read now with a query (not an arm: a handle opened
     /// before the delete answers a query, and whether it can be armed has not
     /// been measured). Holds the process it names, as
-    /// [`hold_process`](Self::hold_process).
-    fn observe(&mut self) -> io::Result<Observed>;
+    /// [`hold_process`](Self::hold_process), and says whether that process is
+    /// still alive.
+    fn observe(&mut self) -> io::Result<Look>;
     /// Hold the process the service has now, if it has one, so that its exit
-    /// can be awaited after the SCM stops reporting it.
-    fn hold_process(&mut self) -> io::Result<()>;
+    /// can be awaited after the SCM stops reporting it. Returns its fate.
+    fn hold_process(&mut self) -> io::Result<ProcessFate>;
     /// Block until every held process has exited. An external event, so no
     /// bound: the process of a service the SCM reports STOPPED can outlive it.
     fn await_exits(&mut self) -> io::Result<()>;
@@ -47,6 +49,8 @@ pub enum RetireError {
     Observe(io::Error),
     #[error("the service did not stop: {0}")]
     Stop(io::Error),
+    #[error("the service's process could not be opened to wait for its exit: {0}")]
+    Hold(io::Error),
     #[error("the service could not be deleted: {0}")]
     Delete(io::Error),
     #[error("the deleted service could not be confirmed stopped: {0}")]
@@ -56,6 +60,18 @@ pub enum RetireError {
 }
 
 impl RetireError {
+    /// `error` as the failure of the step `step` names, unless it is the
+    /// refusal to open the service's process: that is [`RetireError::Hold`]
+    /// whichever step needed the process held, and is not the service failing
+    /// to stop, to be read or to be drained.
+    pub(super) fn of_step(step: fn(io::Error) -> RetireError, error: io::Error) -> RetireError {
+        if io_error_is_a_refused_process_open(&error) {
+            RetireError::Hold(error)
+        } else {
+            step(error)
+        }
+    }
+
     /// Whether the retirement failed because the SCM has no service left to
     /// act on. Only the first look and the stop can mean that: the service went
     /// away under them, which is what the caller wanted. A delete, a drain or a
@@ -64,6 +80,7 @@ impl RetireError {
         match self {
             RetireError::Observe(error) => io_error_is_absent_service(error),
             RetireError::Stop(error) => io_error_is_absent_service(error),
+            RetireError::Hold(_) => false,
             RetireError::Delete(_) => false,
             RetireError::Drain(_) => false,
             RetireError::Exit(_) => false,
@@ -74,24 +91,42 @@ impl RetireError {
 /// The session as the stop wait sees it, holding the process behind every
 /// state a callback reports that has one. A restart can bring up a process the
 /// first look never saw, and the stop wait is where it is seen.
-struct Holding<'a, S>(&'a mut S);
+struct Holding<'a, S> {
+    session: &'a mut S,
+    /// The fate of the process behind the latest callback.
+    fate: ProcessFate,
+}
+
+impl<'a, S> Holding<'a, S> {
+    fn new(session: &'a mut S) -> Self {
+        Self {
+            session,
+            fate: ProcessFate::Unheld,
+        }
+    }
+}
 
 impl<S: ServiceSession> ScmActor for Holding<'_, S> {
     fn arm(&mut self, want: WantState, except: Option<Observed>) -> io::Result<()> {
-        self.0.arm(want, except)
+        self.session.arm(want, except)
     }
     fn control_stop(&mut self) -> io::Result<()> {
-        self.0.control_stop()
+        self.session.control_stop()
     }
     fn start(&mut self) -> io::Result<()> {
-        self.0.start()
+        self.session.start()
     }
     fn wait_callback(&mut self) -> io::Result<Observed> {
-        let observed = self.0.wait_callback()?;
-        if observed.names_a_process() {
-            self.0.hold_process()?;
-        }
+        let observed = self.session.wait_callback()?;
+        self.fate = if observed.names_a_process() {
+            self.session.hold_process()?
+        } else {
+            ProcessFate::Unheld
+        };
         Ok(observed)
+    }
+    fn process_fate(&mut self) -> io::Result<ProcessFate> {
+        Ok(self.fate)
     }
 }
 
@@ -114,7 +149,9 @@ impl<S: ServiceSession> ScmActor for Holding<'_, S> {
 ///
 /// **The delete is followed by a drain on the same session** ([`drain`]).
 pub fn retire<S: ServiceSession>(session: &mut S, disposition: Disposition) -> Result<(), RetireError> {
-    session.observe().map_err(RetireError::Observe)?;
+    session
+        .observe()
+        .map_err(|e| RetireError::of_step(RetireError::Observe, e))?;
     let restart_disabled = match session.disable_restart() {
         Ok(()) => true,
         Err(error) => {
@@ -130,9 +167,9 @@ pub fn retire<S: ServiceSession>(session: &mut S, disposition: Disposition) -> R
         }
     };
 
-    if let Err(error) = stop_via_notify(&mut Holding(session)) {
+    if let Err(error) = stop_via_notify(&mut Holding::new(session)) {
         restore(session);
-        return Err(RetireError::Stop(error));
+        return Err(RetireError::of_step(RetireError::Stop, error));
     }
 
     match disposition {
@@ -154,62 +191,84 @@ pub fn retire<S: ServiceSession>(session: &mut S, disposition: Disposition) -> R
     }
 }
 
-/// Bring a service marked for deletion to STOPPED with its process gone.
+/// Bring a service marked for deletion to STOPPED, or to a process that has
+/// exited, with every process it showed gone.
 ///
 /// A service the SCM restarted between the stop and the delete is marked while
 /// live; a handle opened before the delete still carries controls and queries.
-/// What this does about each state is [`Observed::for_drain_step`], and none of
-/// the steps for a state that has a process arms a notification: whether
-/// `NotifyServiceStatusChangeW` works on a marked service has not been measured
-/// (the stop probe in `tests/cutover_privileged.rs` prints it), so the drain does not
-/// rest on it. The one state with no other way to wait is START_PENDING, where a
-/// Stop is refused and the process will not exit by itself: it goes through the
-/// stop wait, and if that cannot arm the failure comes back as
-/// [`RetireError::Drain`] rather than being hidden.
+/// What this does about each look is [`Observed::for_drain_step`], which reads
+/// the process as well as the status, because the status can lag the process's
+/// exit: a look whose process has exited leaves nothing to drain whatever the
+/// SCM still says. None of the steps that have a process to wait on arms a
+/// notification: whether `NotifyServiceStatusChangeW` works on a marked service
+/// has not been measured (the stop probe in `tests/cutover_privileged.rs` prints
+/// it), so the drain does not rest on it. START_PENDING with a live process, and
+/// a live state with no process held, have no exit to wait on (a Stop is refused
+/// in START_PENDING, and with no process held there is nothing to block on): they
+/// go through the stop wait, and if that cannot arm the failure comes back as
+/// [`RetireError::Drain`] rather than being hidden. Every iteration ends in a real
+/// event, a process exit or a notification, so the drain never re-queries a
+/// state that has not changed.
 ///
 /// Public so the privileged tests can run it on a service they marked
 /// themselves; `retire` is its one production caller.
 ///
 /// Every wait for a process is followed by a fresh look, because the time it
 /// takes is time in which the SCM could start another; the drain ends on a look
-/// that finds the service STOPPED after the last wait.
+/// that finds nothing live after the last wait.
 pub fn drain<S: ServiceSession>(session: &mut S) -> Result<(), RetireError> {
-    let mut observed = session.observe().map_err(RetireError::Drain)?;
+    let mut look = session
+        .observe()
+        .map_err(|e| RetireError::of_step(RetireError::Drain, e))?;
     loop {
-        match observed.for_drain_step() {
+        match look.observed.for_drain_step(look.fate) {
             DrainStep::Finished => {
                 session.await_exits().map_err(RetireError::Exit)?;
-                observed = session.observe().map_err(RetireError::Drain)?;
-                if observed.for_drain_step() == DrainStep::Finished {
+                look = session
+                    .observe()
+                    .map_err(|e| RetireError::of_step(RetireError::Drain, e))?;
+                if look.observed.for_drain_step(look.fate) == DrainStep::Finished {
                     return Ok(());
                 }
             }
             DrainStep::StopThenAwaitExit => {
-                info!(?observed, "service is live after the delete; stopping it");
+                info!(?look, "service is live after the delete; stopping it");
                 if let Err(refused) = session.control_stop() {
                     // Refused on a RUNNING observation the service may have left
                     // since; only a service still RUNNING makes it a failure.
-                    observed = session.observe().map_err(RetireError::Drain)?;
-                    if observed.for_drain_step() == DrainStep::StopThenAwaitExit {
+                    look = session
+                        .observe()
+                        .map_err(|e| RetireError::of_step(RetireError::Drain, e))?;
+                    if look.observed.for_drain_step(look.fate) == DrainStep::StopThenAwaitExit {
                         return Err(RetireError::Drain(refused));
                     }
                     continue;
                 }
                 session.await_exits().map_err(RetireError::Exit)?;
-                observed = session.observe().map_err(RetireError::Drain)?;
+                look = session
+                    .observe()
+                    .map_err(|e| RetireError::of_step(RetireError::Drain, e))?;
             }
             DrainStep::AwaitExit => {
-                info!(?observed, "service is stopping after the delete; awaiting its process");
+                info!(?look, "service is stopping after the delete; awaiting its process");
                 session.await_exits().map_err(RetireError::Exit)?;
-                observed = session.observe().map_err(RetireError::Drain)?;
+                look = session
+                    .observe()
+                    .map_err(|e| RetireError::of_step(RetireError::Drain, e))?;
             }
             DrainStep::AwaitRunning => {
-                info!(
-                    ?observed,
-                    "service is starting after the delete; stopping it once it runs"
-                );
-                stop_via_notify(&mut Holding(session)).map_err(RetireError::Drain)?;
-                observed = session.observe().map_err(RetireError::Drain)?;
+                info!(?look, "service is starting after the delete; stopping it once it runs");
+                stop_via_notify(&mut Holding::new(session)).map_err(|e| RetireError::of_step(RetireError::Drain, e))?;
+                look = session
+                    .observe()
+                    .map_err(|e| RetireError::of_step(RetireError::Drain, e))?;
+            }
+            DrainStep::AwaitStatus => {
+                info!(?look, "service is live after the delete with no process to wait on");
+                stop_via_notify(&mut Holding::new(session)).map_err(|e| RetireError::of_step(RetireError::Drain, e))?;
+                look = session
+                    .observe()
+                    .map_err(|e| RetireError::of_step(RetireError::Drain, e))?;
             }
         }
     }

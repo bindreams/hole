@@ -5,14 +5,39 @@ use super::*;
 use crate::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
 use crate::cutover::scm_wait::WantState;
 
+/// A look at a live service whose process is still running, or at a stopped one.
+fn look(observed: Observed) -> Look {
+    Look {
+        observed,
+        fate: if observed.names_a_process() {
+            ProcessFate::Alive
+        } else {
+            ProcessFate::Unheld
+        },
+    }
+}
+
+/// A look at a service the SCM still reports in `observed` whose process has gone.
+fn stale(observed: Observed) -> Look {
+    Look {
+        observed,
+        fate: ProcessFate::Exited,
+    }
+}
+
 type Log = RefCell<Vec<&'static str>>;
 
 /// A session whose every call is logged in order and whose answers are
-/// scripted: `waits` feed `wait_callback`, `observations` feed `observe`.
+/// scripted: `waits` feed `wait_callback` (each held process answers with the
+/// next of `wait_fates`, `Alive` once they run out), `observations` feed `observe`.
 struct FakeSession<'a> {
     log: &'a Log,
     waits: VecDeque<Observed>,
-    observations: VecDeque<Observed>,
+    wait_fates: VecDeque<ProcessFate>,
+    observations: VecDeque<Look>,
+    /// The `(call, n)` whose n-th (1-based) occurrence fails as an `OpenProcess`
+    /// refusal does.
+    process_open_refused_at: Option<(&'static str, usize)>,
     /// `(call, n)`: the n-th (1-based) occurrence of `call` fails.
     fail: Vec<(&'static str, usize)>,
     seen: Vec<&'static str>,
@@ -23,10 +48,31 @@ impl<'a> FakeSession<'a> {
         Self {
             log,
             waits: waits.into(),
-            observations: observations.into(),
+            wait_fates: VecDeque::new(),
+            observations: observations.into_iter().map(look).collect(),
+            process_open_refused_at: None,
             fail: vec![],
             seen: vec![],
         }
+    }
+
+    /// The observations are these exact looks.
+    fn with_looks(mut self, looks: Vec<Look>) -> Self {
+        self.observations = looks.into();
+        self
+    }
+
+    /// The processes held on callbacks answer with these fates, in order.
+    fn with_wait_fates(mut self, fates: Vec<ProcessFate>) -> Self {
+        self.wait_fates = fates.into();
+        self
+    }
+
+    /// The n-th (1-based) `call` ("hold" or "observe") fails as a refused
+    /// process open does.
+    fn refusing_the_process_open_at(mut self, call: &'static str, n: usize) -> Self {
+        self.process_open_refused_at = Some((call, n));
+        self
     }
 
     /// The first `call` fails.
@@ -45,7 +91,13 @@ impl<'a> FakeSession<'a> {
         self.log.borrow_mut().push(call);
         self.seen.push(call);
         let occurrence = self.seen.iter().filter(|seen| **seen == call).count();
-        if self.fail.contains(&(call, occurrence)) {
+        if self.process_open_refused_at == Some((call, occurrence)) {
+            Err(ScmCallError {
+                call: ScmCall::OpenProcess,
+                code: 5,
+            }
+            .into_io())
+        } else if self.fail.contains(&(call, occurrence)) {
             Err(io::Error::other(call))
         } else {
             Ok(())
@@ -67,6 +119,9 @@ impl ScmActor for FakeSession<'_> {
         self.call("wait")?;
         Ok(self.waits.pop_front().expect("wait script ran dry"))
     }
+    fn process_fate(&mut self) -> io::Result<ProcessFate> {
+        unreachable!("the retirement reads a fate through `Holding`, never off the session")
+    }
 }
 
 impl ServiceSession for FakeSession<'_> {
@@ -79,12 +134,13 @@ impl ServiceSession for FakeSession<'_> {
     fn delete(&mut self) -> io::Result<()> {
         self.call("delete")
     }
-    fn observe(&mut self) -> io::Result<Observed> {
+    fn observe(&mut self) -> io::Result<Look> {
         self.call("observe")?;
         Ok(self.observations.pop_front().expect("observation script ran dry"))
     }
-    fn hold_process(&mut self) -> io::Result<()> {
-        self.call("hold")
+    fn hold_process(&mut self) -> io::Result<ProcessFate> {
+        self.call("hold")?;
+        Ok(self.wait_fates.pop_front().unwrap_or(ProcessFate::Alive))
     }
     fn await_exits(&mut self) -> io::Result<()> {
         self.call("await_exits")
@@ -489,4 +545,156 @@ fn a_failed_step_reads_with_its_call_and_its_code() {
         "{message}"
     );
     assert!(message.contains('5'), "{message}");
+}
+
+/// The SCM can keep reporting a live state for a process that has gone. The
+/// drain acts on the process, not the status: it waits the held processes out,
+/// looks once more, and is done, with no Stop, no arm and no re-query loop.
+#[skuld::test]
+fn a_status_that_lags_the_process_exit_is_drained_without_polling() {
+    for lagging in [Observed::StartPending, Observed::Running, Observed::StopPending] {
+        let log = Log::default();
+        let mut session = FakeSession::new(&log, vec![Observed::Stopped], vec![Observed::Stopped]).with_looks(vec![
+            look(Observed::Stopped),
+            stale(lagging),
+            stale(lagging),
+        ]);
+        retire(&mut session, Disposition::Deregister).unwrap_or_else(|e| panic!("{lagging:?}: {e}"));
+        let log = log.borrow();
+        let after = &log[position(&log, "delete")..];
+        assert_eq!(
+            after,
+            ["delete", "observe", "await_exits", "observe"],
+            "{lagging:?}: {log:?}"
+        );
+    }
+}
+
+/// The bridge dies as the drain's Stop is sent: the Stop fails and the status
+/// still says RUNNING. The process has exited, so the failure is explained.
+#[skuld::test]
+fn a_refused_stop_after_the_delete_on_a_status_that_lags_the_process_exit_is_not_a_failure() {
+    let log = Log::default();
+    let mut session = FakeSession::new(&log, vec![Observed::Stopped], vec![Observed::Stopped])
+        .with_looks(vec![
+            look(Observed::Stopped),
+            look(Observed::Running),
+            stale(Observed::Running),
+            stale(Observed::Running),
+        ])
+        .failing("control_stop");
+    retire(&mut session, Disposition::Deregister).unwrap();
+    let log = log.borrow();
+    assert_eq!(count(&log, "control_stop"), 1, "{log:?}");
+}
+
+/// With a live process the refusal stands: the process is there to have taken it.
+#[skuld::test]
+fn a_refused_stop_after_the_delete_on_a_live_process_is_still_the_drains_failure() {
+    let log = Log::default();
+    let mut session = FakeSession::new(&log, vec![Observed::Stopped], vec![Observed::Stopped])
+        .with_looks(vec![
+            look(Observed::Stopped),
+            look(Observed::Running),
+            look(Observed::Running),
+        ])
+        .failing("control_stop");
+    let err = retire(&mut session, Disposition::Deregister).expect_err("still running");
+    assert!(matches!(err, RetireError::Drain(_)), "{err}");
+}
+
+/// A live state with no process held leaves no process exit to wait on. The
+/// only event left is the SCM's own, so the drain takes the stop wait rather
+/// than looking again in a loop.
+#[skuld::test]
+fn a_live_state_with_no_process_held_after_the_delete_waits_on_the_scm_not_on_a_loop() {
+    let log = Log::default();
+    let mut session = FakeSession::new(
+        &log,
+        // the first stop, then the drain's stop wait
+        vec![Observed::Stopped, Observed::Stopped],
+        vec![],
+    )
+    .with_looks(vec![
+        look(Observed::Stopped),
+        Look {
+            observed: Observed::StopPending,
+            fate: ProcessFate::Unheld,
+        },
+        look(Observed::Stopped),
+        look(Observed::Stopped),
+    ]);
+    retire(&mut session, Disposition::Deregister).unwrap();
+    let log = log.borrow();
+    let after = &log[position(&log, "delete")..];
+    assert_eq!(count(after, "arm"), 1, "{log:?}");
+    assert_eq!(count(after, "observe"), 3, "{log:?}");
+}
+
+/// A refused open of the service's process is not the service failing to stop
+/// (or to be read, or to drain): it names its own step, and the call and code.
+#[skuld::test]
+fn a_refused_process_open_in_the_stop_wait_is_its_own_failure_not_the_stop() {
+    let log = Log::default();
+    let mut session = FakeSession::new(&log, vec![Observed::Running], vec![Observed::Running])
+        .refusing_the_process_open_at("hold", 1);
+    let err = retire(&mut session, Disposition::Deregister).expect_err("the open was refused");
+    assert!(matches!(err, RetireError::Hold(_)), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("OpenProcess failed"), "{message}");
+    assert!(!err.means_service_is_gone());
+    assert!(!log.borrow().contains(&"delete"), "{:?}", log.borrow());
+}
+
+#[skuld::test]
+fn a_refused_process_open_on_the_first_look_is_its_own_failure_not_a_failed_read() {
+    let log = Log::default();
+    let mut session = FakeSession::new(&log, vec![], vec![]).refusing_the_process_open_at("observe", 1);
+    let err = retire(&mut session, Disposition::Deregister).expect_err("the open was refused");
+    assert!(matches!(err, RetireError::Hold(_)), "{err}");
+    assert_eq!(*log.borrow(), vec!["observe"]);
+}
+
+#[skuld::test]
+fn a_refused_process_open_in_the_drain_is_its_own_failure_not_a_failed_confirmation() {
+    let log = Log::default();
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Stopped],
+        vec![Observed::Stopped, Observed::Stopped],
+    )
+    .refusing_the_process_open_at("observe", 2);
+    let err = retire(&mut session, Disposition::Deregister).expect_err("the open was refused");
+    assert!(matches!(err, RetireError::Hold(_)), "{err}");
+}
+
+/// Only the open of the process has its own step: any other SCM call failing
+/// in a step is that step's failure.
+#[skuld::test]
+fn other_scm_failures_stay_with_their_step() {
+    let log = Log::default();
+    let mut session = FakeSession::new(&log, vec![Observed::Stopped], vec![Observed::Stopped]).failing("delete");
+    let err = retire(&mut session, Disposition::Deregister).expect_err("the delete failed");
+    assert!(matches!(err, RetireError::Delete(_)), "{err}");
+    assert!(!matches!(
+        RetireError::of_step(RetireError::Stop, scm_error(ScmCall::ControlService, 5)),
+        RetireError::Hold(_)
+    ));
+}
+
+/// The stop wait reads each callback's process through the session: a
+/// callback over a process that has already exited earns no Stop.
+#[skuld::test]
+fn a_callback_over_a_process_that_has_exited_ends_the_stop_wait_with_no_stop() {
+    let log = Log::default();
+    let mut session = FakeSession::new(
+        &log,
+        vec![Observed::Running],
+        vec![Observed::Running, Observed::Stopped, Observed::Stopped],
+    )
+    .with_wait_fates(vec![ProcessFate::Exited]);
+    retire(&mut session, Disposition::Deregister).unwrap();
+    let log = log.borrow();
+    assert!(!log.contains(&"control_stop"), "{log:?}");
+    assert_eq!(count(&log, "hold"), 1, "{log:?}");
 }

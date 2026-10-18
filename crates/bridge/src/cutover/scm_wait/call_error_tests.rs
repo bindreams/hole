@@ -132,3 +132,45 @@ fn a_failure_without_a_win32_code_still_names_its_call() {
     assert!(message.contains("DeleteService"), "{message}");
     assert!(message.contains("no code"), "{message}");
 }
+
+/// Written from the calls themselves: only `OpenProcess` opens a process.
+#[skuld::test]
+fn only_opening_the_process_is_opening_the_service_process() {
+    let others = [
+        ScmCall::OpenScManager,
+        ScmCall::OpenService,
+        ScmCall::NotifyServiceStatusChange,
+        ScmCall::ControlService,
+        ScmCall::StartService,
+        ScmCall::ChangeServiceConfig2,
+        ScmCall::DeleteService,
+        ScmCall::QueryServiceStatusEx,
+        ScmCall::WaitForSingleObject,
+        ScmCall::CreateService,
+        ScmCall::StartServiceCtrlDispatcher,
+    ];
+    assert!(ScmCall::OpenProcess.is_opening_the_service_process());
+    for call in others {
+        assert!(!call.is_opening_the_service_process(), "{call:?}");
+    }
+}
+
+#[skuld::test]
+fn a_refused_process_open_is_told_from_any_other_failure_by_its_type() {
+    let refused = ScmCallError {
+        call: ScmCall::OpenProcess,
+        code: 5,
+    }
+    .into_io();
+    assert!(io_error_is_a_refused_process_open(&refused));
+    let other = ScmCallError {
+        call: ScmCall::ControlService,
+        code: 5,
+    }
+    .into_io();
+    assert!(!io_error_is_a_refused_process_open(&other));
+    assert!(!io_error_is_a_refused_process_open(&io::Error::other(
+        "OpenProcess failed"
+    )));
+    assert!(!io_error_is_a_refused_process_open(&io::Error::from_raw_os_error(5)));
+}

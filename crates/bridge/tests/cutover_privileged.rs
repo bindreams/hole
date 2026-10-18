@@ -1346,9 +1346,10 @@ fn cutover_global_net_state_stop_probe_start_pending_before_attach() {
     );
 }
 
-/// The check after the delete rests on a handle opened before it still working
-/// on a service marked for deletion. Measured here: a state query, an arm, the
-/// first report, a Stop, and `stop_via_notify` to completion, each on that handle.
+/// The drain after the delete rests on a handle opened before it still
+/// working on a service marked for deletion. Measured here, one line per call,
+/// each on that handle: a state query, an arm and its first report, a Stop, and
+/// `stop_via_notify` to completion.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_stop_probe_handle_of_a_service_marked_for_delete() {
@@ -1374,8 +1375,157 @@ fn cutover_global_net_state_stop_probe_handle_of_a_service_marked_for_delete() {
     let stop = session.control_stop();
     let finished = stop_via_notify(&mut session);
     eprintln!(
-        "SCM stop probe, handle opened before DeleteService on a RUNNING service: query -> {observed:?}; arm -> {armed:?}; first report -> {first_report:?}; Stop -> {stop:?}; stop_via_notify -> {finished:?}"
+        "SCM stop probe, handle opened before DeleteService on a RUNNING service:\n  \
+         QueryServiceStatusEx -> {observed:?}\n  \
+         NotifyServiceStatusChange arm -> {armed:?}; first report -> {first_report:?}\n  \
+         ControlService(STOP) -> {stop:?}\n  \
+         stop_via_notify -> {finished:?}\n  \
+         MEANS: the drain (retire.rs `drain`) depends on the query and the Stop only. \
+         If the query is Ok the drain's looks work; if it is Err every drain look fails as \
+         RetireError::Drain and a service the SCM restarted between the stop and the delete \
+         cannot be uninstalled (the drain needs another way to read the service). \
+         If the Stop is Ok the drain's Stop for a live marked service is delivered; if it is Err \
+         the drain fails with the Stop's code (RUNNING) and needs TerminateProcess or another route. \
+         The arm and stop_via_notify lines say only whether the START_PENDING drain state \
+         (`DrainStep::AwaitRunning`, the one that arms) can work: an arm Err there is a loud \
+         RetireError::Drain, and the deputy's Q1 (TerminateProcess fallback) applies."
     );
+}
+
+/// `OpenProcess(PROCESS_SYNCHRONIZE)` on the service process from the caller's
+/// token: the open every held process rests on. The caller here is an elevated
+/// administrator (the TUN lane runs elevated, which `create_service` needs). A
+/// SYSTEM caller (the MSI custom action) cannot be reproduced by a test without a
+/// second SYSTEM process; its first real answer is the CI installer test's
+/// uninstall, whose `gui-cli.log` dump names `OpenProcess` and its code if it was
+/// refused.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_stop_probe_open_process_synchronize_on_the_service_process() {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).unwrap();
+    let service = manager
+        .open_service(hole_bridge::platform::os::SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .unwrap();
+    let pid = service
+        .query_status()
+        .unwrap()
+        .process_id
+        .expect("a running service has a process");
+
+    // SAFETY: plain FFI calls on a handle this test opens and closes.
+    let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) };
+    let outcome = match &opened {
+        Ok(handle) => {
+            let waited = unsafe { WaitForSingleObject(*handle, 0) };
+            let state = if waited == WAIT_TIMEOUT {
+                "not signalled (the process is running)"
+            } else if waited == WAIT_OBJECT_0 {
+                "signalled (the process has exited)"
+            } else {
+                "another answer"
+            };
+            let _ = unsafe { CloseHandle(*handle) };
+            format!("Ok; zero-timeout wait -> {state}")
+        }
+        Err(e) => format!("Err {e} (win32 code {})", e.code().0 & 0xFFFF),
+    };
+    eprintln!(
+        "SCM stop probe, OpenProcess(PROCESS_SYNCHRONIZE) on the LocalSystem service process (pid {pid}) from an elevated administrator: {outcome}\n  \
+         MEANS: Ok => the process hold (scm_wait/hold.rs, service_processes.rs) works for `hole bridge uninstall` run elevated, and \
+         the zero-timeout wait is the exit check `ProcessFate` reads. Err 5 (ACCESS_DENIED) => every uninstall by an elevated \
+         administrator fails with RetireError::Hold (\"the service's process could not be opened ...: OpenProcess failed\"), \
+         where it worked before the hold existed, and the exit has to be awaited another way (an owner question). \
+         SYSTEM (the MSI custom action) is not measured here."
+    );
+}
+
+/// The drain ends on a look. A restart timer the SCM still has pending when
+/// the look is taken would start the service after it only if (a) changing the
+/// failure actions does not cancel an already-scheduled restart and (b) the SCM
+/// starts a service marked for deletion. This keeps a handle opened before the
+/// delete across the timer and prints whether a restart arrives.
+///
+/// The restart delay is the SCM's own timer, observed through the helper's
+/// parked event, never waited out here. There is no event for the timer NOT
+/// firing, so that answer is this test's timeout (nextest `terminate-after`,
+/// the failure bound surfaced to a human): a job that reports this test as
+/// timed out after the "awaiting a restart" line means the SCM did not start
+/// the marked service.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_stop_probe_restart_timer_after_delete_on_a_marked_service() {
+    use hole_bridge::cutover::scm_wait::retire::{drain, ServiceSession};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    const RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let parked = named_event::NamedEvent::create("MarkedRestartParked");
+    let release = named_event::NamedEvent::create("MarkedRestartRelease");
+    let _service = ProvisionedService::install_with(
+        helper,
+        vec![
+            "--hold-start".into(),
+            release.name().into(),
+            "--parked-event".into(),
+            parked.name().into(),
+        ],
+        Some(RESTART_DELAY),
+    );
+    let _release_on_drop = release.release_on_drop();
+
+    // First instance: let it start and run.
+    let starter = start_in_background();
+    parked.wait();
+    release.signal();
+    starter.join().unwrap().expect("the first instance starts");
+    wait_until_running();
+    release.reset();
+    parked.reset();
+
+    // The handle that outlives the delete, then the kill that arms the timer.
+    let mut session = ReleasingSession::open(&release);
+    scm_probe::kill_service_process();
+    wait_until_stopped();
+    session.disable_restart().expect("turn restart-on-failure off");
+    let before_delete = session.observe();
+    session.delete().expect("mark the killed service for deletion");
+    eprintln!(
+        "SCM restart probe: killed, restart delay {RESTART_DELAY:?}, restart-on-failure turned off, look before DeleteService -> {before_delete:?}, \
+         DeleteService done on the pre-opened handle; awaiting a restart (a timeout of this test here means NO restart arrived). \
+         If the look before the delete was not STOPPED the restart fired first and this run measures nothing."
+    );
+
+    // Arrives only if the SCM starts the marked service: the restarted
+    // instance parks in START_PENDING and signals.
+    parked.wait();
+    let after = session.observe();
+    eprintln!(
+        "SCM restart probe: a restart FIRED after DeleteService on a pre-opened handle; look now -> {after:?}\n  \
+         MEANS: neither (a) changing the failure actions cancelled the pending restart nor (b) is a marked service refused a start: \
+         the window between DeleteService and the last handle close can see a start. The drain's final look covers a start that \
+         lands BEFORE that look (it drains it again) and not one after it; the printed drain result below shows the covered case. \
+         CONTRIBUTING.md's sentence on the restart timer must then state that the residual is real."
+    );
+    let drained = drain(&mut session);
+    eprintln!(
+        "SCM restart probe: drain of the restarted marked service -> {drained:?}; reports {:?}",
+        session.reports
+    );
+    drop(session);
+    let _ = scm_deletion::wait_until_deleted(SERVICE_NAME);
 }
 
 /// A `ServiceSession` over the real one that releases a parked helper the
@@ -1431,6 +1581,9 @@ impl hole_bridge::cutover::scm_wait::ScmActor for ReleasingSession<'_> {
         self.reports.push(observed);
         Ok(observed)
     }
+    fn process_fate(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::ProcessFate> {
+        self.inner.process_fate()
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1444,10 +1597,10 @@ impl hole_bridge::cutover::scm_wait::retire::ServiceSession for ReleasingSession
     fn delete(&mut self) -> std::io::Result<()> {
         self.inner.delete()
     }
-    fn observe(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::Observed> {
+    fn observe(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::Look> {
         self.inner.observe()
     }
-    fn hold_process(&mut self) -> std::io::Result<()> {
+    fn hold_process(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::ProcessFate> {
         self.inner.hold_process()
     }
     fn await_exits(&mut self) -> std::io::Result<()> {
