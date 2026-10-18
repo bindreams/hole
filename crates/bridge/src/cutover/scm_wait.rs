@@ -101,21 +101,22 @@ mod system {
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use windows::core::{HRESULT, PCWSTR};
+    use windows::core::HRESULT;
     use windows::Win32::Foundation::{
         ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, ERROR_SERVICE_NOT_ACTIVE,
     };
     use windows::Win32::System::Services::{
-        CloseServiceHandle, ControlService, NotifyServiceStatusChangeW, OpenSCManagerW, OpenServiceW, StartServiceW,
-        SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING,
-        SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOPPED,
-        SERVICE_NOTIFY_STOP_PENDING, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS,
-        SERVICE_STOP, SERVICE_STOPPED,
+        ControlService, NotifyServiceStatusChangeW, StartServiceW, SC_HANDLE, SERVICE_CONTROL_STOP, SERVICE_NOTIFY,
+        SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE,
+        SERVICE_NOTIFY_STOPPED, SERVICE_NOTIFY_STOP_PENDING, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STOPPED,
     };
     use windows::Win32::System::Threading::SleepEx;
 
     use super::{Observed, WantState};
     use crate::cutover::registration::{Arming, Registration, Settle};
+
+    mod handles;
+    use handles::Handles;
 
     #[cfg(test)]
     #[path = "system_tests.rs"]
@@ -139,27 +140,40 @@ mod system {
         status: LastStatus,
     }
 
-    impl NotifyRecord {
-        fn new() -> Self {
-            Self {
-                notify: UnsafeCell::new(SERVICE_NOTIFY_2W {
-                    dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
-                    pfnNotifyCallback: Some(notify_callback),
-                    ..Default::default()
-                }),
-                status: LastStatus {
-                    current_state: AtomicU32::new(0),
-                    fired: AtomicBool::new(false),
-                },
-            }
-        }
+    // The notify record is 88 bytes on 64-bit Windows: the 80-byte
+    // `SERVICE_NOTIFY_2W` plus the 8-byte `LastStatus`. Every leak figure in
+    // these docs rests on it, so a layout change must fail the build.
+    #[cfg(target_pointer_width = "64")]
+    const _: () = assert!(std::mem::size_of::<NotifyRecord>() == 88);
 
-        /// Points the buffer's `pContext` at this record's status slot. Called
-        /// once the record has its final address and before the SCM sees it.
-        fn bind_context(&self) {
-            // SAFETY: the record is not registered yet, so nothing else reads or
-            // writes the buffer.
-            unsafe { (*self.notify.get()).pContext = (&self.status as *const LastStatus).cast_mut().cast() };
+    impl NotifyRecord {
+        /// A fresh record owned by a [`Registration`], its buffer's `pContext`
+        /// already pointing at its own status slot. The only way to make one:
+        /// the binding happens before the registration exists, so no record the
+        /// SCM may already see is ever rebound.
+        fn registered() -> Registration<Self> {
+            Registration::new_with(
+                Self {
+                    notify: UnsafeCell::new(SERVICE_NOTIFY_2W {
+                        dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
+                        pfnNotifyCallback: Some(notify_callback),
+                        ..Default::default()
+                    }),
+                    status: LastStatus {
+                        current_state: AtomicU32::new(0),
+                        fired: AtomicBool::new(false),
+                    },
+                },
+                |record| {
+                    // SAFETY: `Registration::new_with` runs this on the record's
+                    // final address before the registration exists, so nothing
+                    // else has the record and nothing else reads or writes the
+                    // buffer.
+                    unsafe {
+                        (*record.notify.get()).pContext = (&record.status as *const LastStatus).cast_mut().cast()
+                    };
+                },
+            )
         }
 
         /// The buffer to pass to `NotifyServiceStatusChangeW`.
@@ -254,51 +268,6 @@ mod system {
         }
     }
 
-    /// An open SCM or service handle, closed exactly once when this drops.
-    /// Nothing else closes one, so a closed handle value (which the OS may
-    /// reuse for an unrelated handle) cannot be closed a second time.
-    struct ScHandle(SC_HANDLE);
-
-    impl Drop for ScHandle {
-        fn drop(&mut self) {
-            // SAFETY: `ScHandle` owns the handle from its open call, and `drop`
-            // runs once. A second close is not a reported error but undefined
-            // behaviour: closing a handle that is not live can fault (measured:
-            // `CloseServiceHandle(NULL)` raises an access violation on Windows).
-            // No panic here: one during unwinding aborts the process.
-            if let Err(e) = unsafe { CloseServiceHandle(self.0) } {
-                tracing::error!(error = %e, "CloseServiceHandle failed on a handle this process opened");
-            }
-        }
-    }
-
-    /// The SCM handle and the service handle opened through it. `service` is
-    /// declared first so it closes first.
-    struct Handles {
-        service: ScHandle,
-        _scm: ScHandle,
-    }
-
-    impl Handles {
-        fn open(service_name: &[u16]) -> io::Result<Self> {
-            let scm = ScHandle(
-                unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
-                    .map_err(io::Error::other)?,
-            );
-            let service = ScHandle(
-                unsafe {
-                    OpenServiceW(
-                        scm.0,
-                        PCWSTR(service_name.as_ptr()),
-                        SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START,
-                    )
-                }
-                .map_err(io::Error::other)?,
-            );
-            Ok(Self { service, _scm: scm })
-        }
-    }
-
     /// Test seam for the two SCM outcomes a live SCM will not produce on demand.
     /// Production runs [`NoHooks`].
     #[doc(hidden)]
@@ -329,10 +298,12 @@ mod system {
     /// callback from an earlier arm can never see a buffer a later arm is filling.
     /// A record is freed only after its callback has run, so an APC the SCM
     /// already queued still finds live memory at the thread's next alertable
-    /// wait. An unsettled record is leaked (see CONTRIBUTING.md): per
-    /// `NotifyServiceStatusChangeW` call that dropped pending, failed, or got
-    /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`; the uncapped LAGGING retry grows it
-    /// only inside a loop that was already not terminating.
+    /// wait. An unsettled record is leaked (see CONTRIBUTING.md): one record
+    /// (88 bytes on 64-bit Windows) per `NotifyServiceStatusChangeW` call that
+    /// did not settle, i.e. that dropped pending, failed, or returned
+    /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`. The LAGGING retry has no cap, so
+    /// N LAGGING returns before a success leak N records; the leak is unbounded
+    /// only under an unbounded run of LAGGING returns.
     pub struct SystemScmActor<H: Hooks = NoHooks> {
         /// `None` only after a `reopen` that failed part-way; every use then errs.
         /// Declared before `arming` so the handles close first on drop.
@@ -392,7 +363,7 @@ mod system {
         fn service(&self) -> io::Result<SC_HANDLE> {
             self.handles
                 .as_ref()
-                .map(|h| h.service.0)
+                .map(Handles::service)
                 .ok_or_else(|| io::Error::other("SCM handles closed by a failed reopen"))
         }
     }
@@ -409,8 +380,7 @@ mod system {
             loop {
                 // Before the record exists: a failure here registers nothing.
                 let service = self.service()?;
-                let registration = Registration::new(NotifyRecord::new());
-                registration.get().bind_context();
+                let registration = NotifyRecord::registered();
                 let buffer = registration.get().buffer();
                 let address = registration.get() as *const NotifyRecord as usize;
                 // Stored before the call: a failed call may still have registered the record.

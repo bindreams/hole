@@ -149,3 +149,18 @@ fn beginning_over_a_confirmed_arming_retires_it_by_the_registration_rule() {
         "the new call is not yet known to have succeeded"
     );
 }
+
+#[skuld::test]
+fn the_initializer_runs_on_the_final_address_before_the_registration_exists() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut seen = 0usize;
+    let registration = Registration::new_with(Probe::new(false, &drops), |value| {
+        seen = value as *const Probe as usize;
+    });
+    assert_ne!(seen, 0, "the initializer did not run");
+    assert_eq!(
+        seen,
+        registration.get() as *const Probe as usize,
+        "the initializer saw a different address than the one handed out"
+    );
+}

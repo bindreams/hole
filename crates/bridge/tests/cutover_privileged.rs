@@ -614,8 +614,7 @@ fn cutover_global_net_state_a_lagging_client_reopens_and_arms_again() {
 }
 
 /// A failed reopen leaves the actor without handles: every later use errs, and
-/// dropping it closes nothing twice (a second close would be undefined
-/// behaviour, not a logged error).
+/// the lagging call's record, whose callback never ran, is not freed on drop.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_a_failed_reopen_leaves_every_use_erring() {

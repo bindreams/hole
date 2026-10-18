@@ -17,9 +17,10 @@ fn a_notification_without_a_context_is_a_contract_breach() {
 
 #[skuld::test]
 fn delivery_stores_the_state_and_settles_the_record() {
-    let record = NotifyRecord::new();
-    record.bind_context();
-    // SAFETY: the record is unregistered, so nothing else touches the buffer.
+    let registration = NotifyRecord::registered();
+    let record = registration.get();
+    // SAFETY: nothing registered the record with the SCM, so nothing else
+    // touches the buffer.
     unsafe { (*record.notify.get()).ServiceStatus.dwCurrentState = SERVICE_RUNNING };
     assert!(!record.is_settled());
     // SAFETY: the buffer is the record's own, bound to its status slot.
