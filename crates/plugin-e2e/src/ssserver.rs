@@ -188,9 +188,10 @@ impl Drop for PluginServer {
 /// probe socket and the plugin subprocess binding the port is closed by retrying
 /// on the in-band `StartError::BindConflict` signal with a fresh port — the same
 /// unbounded "no budget" discipline as `port_alloc::bind_ephemeral` (terminates
-/// only on ready or a non-race error; the failure-to-human bound is `ci.yaml`'s
-/// 45-minute job timeout, which reports as `cancelled`, not a test failure — the
-/// milestone logging below leaves evidence if that fires).
+/// only on ready or a non-race error; the failure-to-human bound is the
+/// `test-plugin-e2e` step's 45-minute `timeout-minutes` in `ci.yaml`, which fails
+/// the step with its log kept — the milestone logging below leaves evidence if
+/// that fires).
 async fn spawn_ss_with_plugin(
     method: CipherKind,
     password: &str,

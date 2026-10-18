@@ -20,7 +20,7 @@ def canonical_windows_bindir() -> set[str]:
 
     Runs `cargo xtask bindir-names` so the installer manifest is checked
     against `bindir::bindir_dest_names`, not a hand-restated copy. Hard-depends
-    on cargo (the `test-installer` lane installs Rust and runs `cargo xtask
+    on cargo (the `installer-*` CI steps install Rust and runs `cargo xtask
     deps` before pytest); `check=True` surfaces a missing toolchain loudly
     rather than silently skipping.
     """

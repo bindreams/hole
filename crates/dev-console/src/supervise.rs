@@ -46,6 +46,14 @@ pub(crate) fn has_exited(child: &mut Child) -> bool {
     matches!(child.try_wait(), Ok(Some(_)))
 }
 
+/// The hole checkout this dev run belongs to: the root `cargo xtask run hole`
+/// pinned, else the one the binary sits in. Only a hole root is returned, so we
+/// never npm-install into some other workspace.
+pub(crate) fn hole_root() -> Result<std::path::PathBuf> {
+    xtask_lib::repo_root::repo_root_from_launch_dir()
+        .context("run from inside the hole workspace (or via `cargo xtask run hole`)")
+}
+
 /// Create the per-run dir `<parent>/<name>`. On a same-second collision (the
 /// dir already exists — a concurrent run the Vite-port guard will reject), fall
 /// back to `<name>-<pid>` so the doomed run can't truncate the live run's logs.
@@ -92,17 +100,7 @@ pub async fn main() -> ExitCode {
 }
 
 async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
-    let repo_root = xtask_lib::repo_root::repo_root()
-        .context("run from inside the hole workspace (or via `cargo xtask run hole`)")?;
-    // dev.py:425-428 parity: a workspace that isn't hole must be refused
-    // before we npm-install into it.
-    if !repo_root.join("crates").join("hole").is_dir() {
-        eprintln!(
-            "Error: run this from the hole project root (crates/hole not found under {})",
-            repo_root.display()
-        );
-        return Ok(ExitCode::FAILURE);
-    }
+    let repo_root = hole_root()?;
     std::env::set_current_dir(&repo_root).context("cd to repo root")?;
 
     // Dev-run capture: <repo>/.tmp/dev-run/<datetime>/ with bridge.log +

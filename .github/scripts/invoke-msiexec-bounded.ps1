@@ -27,9 +27,9 @@ param(
 
     # No direct cold-run measurement exists for this job -- CI here runs
     # often enough that sccache has never been observed to go fully cold --
-    # so this is derived, not measured: the sibling `test-dmg-signing` job
+    # so this is derived, not measured: the sibling `dmg` step
     # (same `timeout-minutes`, held equal by
-    # `ci_installer_assembly_jobs_share_a_timeout_budget`) recorded its
+    # `ci_installer_assembly_steps_share_a_timeout_budget`) recorded its
     # darwin/amd64 leg at 1.83x slower cold than warm (45m45s vs ~25min).
     # Applied to this job's observed ~17-27min warm range, a cold run could
     # reach ~49min, leaving the rest of the job wall if both Install and

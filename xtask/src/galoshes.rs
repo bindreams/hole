@@ -19,7 +19,8 @@ use anyhow::{anyhow, bail, Context, Result};
 /// is what `cargo xtask deps` does just before calling this).
 pub fn build(repo_root: &Path) -> Result<PathBuf> {
     let args = build_args(std::env::var_os("HOLE_CRASH_DUMPS").is_some(), cfg!(windows));
-    let status = Command::new("cargo")
+    let mut cmd = Command::new("cargo");
+    let status = cmd
         .args(&args)
         .current_dir(repo_root)
         .status()

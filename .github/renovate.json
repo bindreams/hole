@@ -92,7 +92,7 @@
       "automerge": true
     },
     {
-      "description": "gsudo (installer-E2E de-elevation): auto-merge; the required Test installer check gates it.",
+      "description": "gsudo (installer-E2E de-elevation): auto-merge; the installer lane of the required Build, lint, test (windows/amd64) check gates it.",
       "matchDepNames": ["gerardog/gsudo"],
       "automerge": true
     },
@@ -102,7 +102,7 @@
       "groupName": "Tauri"
     },
     {
-      "description": "Vendored git-subrepo deps (v2ray-core, utls): auto-merge armed for every update type — a routine bump is typically minor/patch, not major, so the file's major-only rule above doesn't reach these. Safety is entirely the required checks' job (Test ex-ray (Go), and check-vendoring-integrity riding inside Lint), not this rule.",
+      "description": "Vendored git-subrepo deps (v2ray-core, utls): auto-merge armed for every update type — a routine bump is typically minor/patch, not major, so the file's major-only rule above doesn't reach these. Safety is entirely the required checks' job (the ex-ray Go tests and check-vendoring-integrity, both inside the required Build, lint, test checks), not this rule.",
       "matchFileNames": ["crates/ex-ray/third_party/*/.gitrepo"],
       "automerge": true
     },
