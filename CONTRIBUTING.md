@@ -2858,7 +2858,9 @@ and a rerun repeats the platform's whole job.
 - **Test lanes compile nothing.** `hole-build-state` records the build state
   right after `hole-build`; `hole-verify-no-compile`, after the last lane (the
   macOS root lane included; it only reads), fails if it differs. The state is the
-  `.fingerprint` and `build` directories under `target/`, which cargo rewrites on
+  `.fingerprint` and `build` directories of `target/<profile>` and
+  `target/<triple>/<profile>` (not deeper: trybuild keeps its own build tree
+  under `target/tests/trybuild/`), which cargo rewrites on
   any compile or build-script run and leaves alone when every unit is fresh
   (`.github/scripts/target-state.py`: path, size and nanosecond mtime). That
   holds for any spelling that launched cargo, `--quiet` or `CARGO_TERM_QUIET`
@@ -2866,7 +2868,9 @@ and a rerun repeats the platform's whole job.
   compares the same state around its command and also names the units from
   cargo's `Compiling` lines, with `CARGO_LOG` set so the log says why each was
   dirty; a gated xtask step runs `cargo run --package xtask --`, since the
-  `cargo xtask` alias's `--quiet` hides those lines (xtask lets a `cargo nextest list` child's stderr through for the same reason). A state that cannot be read
+  `cargo xtask` alias's `--quiet` hides those lines (xtask lets a
+  `cargo nextest list` child's stderr through for the same reason). A state that
+  cannot be read
   fails the check rather than passing it. The checks watch the target directory
   named by `CARGO_TARGET_DIR`, else `target`. The causes found
   when it was introduced: `cargo xtask` leaked `cargo run`'s
