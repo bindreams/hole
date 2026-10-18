@@ -1921,9 +1921,13 @@ down a rollback (bindreams/hole#1099). Three rules close it:
   service process left. The wait has no bound: it is the exit of a process the
   SCM has been told to stop, and a bridge that never exits is the same
   documented gap as one that hangs in STOP_PENDING. The service *row* is not
-  waited for; the SCM removes it once the handles close. The open of a held
-  process rests on the SCM's own latency in noticing the exit (a process the SCM
-  names cannot have its id reused while the SCM tracks it).
+  waited for; the SCM removes it once the handles close. A process is opened
+  by id and confirmed (`ProcessHolds::hold_current`): read the service, open the
+  pid it names, read again, and keep the handle only if the second read names the
+  same pid in a non-STOPPED state; otherwise drop it and act on the second read.
+  The premise is that the SCM keeps the process's handle while it reports the
+  service non-STOPPED with that pid, so the pid cannot be reused under a
+  confirmed open.
 
 After the delete the service may be live (a restart slipped in between the stop
 and the delete). `Observed::for_drain_step` decides, and **none of the steps for

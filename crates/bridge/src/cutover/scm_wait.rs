@@ -5,6 +5,7 @@
 //! the raw `windows`-crate SCM FFI behind it.
 
 pub mod call_error;
+pub mod hold;
 pub mod retire;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

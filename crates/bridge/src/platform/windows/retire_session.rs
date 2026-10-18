@@ -13,9 +13,10 @@ use windows_service::service::{
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use super::service_processes::ServiceProcesses;
+use super::service_processes::{open_process, ServiceProcesses};
 use super::{apply_failure_actions, scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{io_error_is_absent_service, win32_code_of_hresult, ScmCall, ScmCallError};
+use crate::cutover::scm_wait::hold::{ProcessSource, Reading};
 use crate::cutover::scm_wait::retire::ServiceSession;
 use crate::cutover::scm_wait::{observed_from_state, Observed, ScmActor, SystemScmActor, WantState};
 
@@ -57,6 +58,36 @@ impl RetireSession {
         }
     }
 
+    /// Reads the service and holds the process it names; the look returned is
+    /// the one the hold was confirmed against.
+    fn hold_current(&mut self) -> io::Result<Reading> {
+        self.processes.hold_current(&mut ServiceProbe(&self.service))
+    }
+}
+
+/// The service as [`ProcessHolds`](crate::cutover::scm_wait::hold::ProcessHolds)
+/// reads it: one query for the state and the process id, and an open by id.
+struct ServiceProbe<'a>(&'a Service);
+
+impl ProcessSource for ServiceProbe<'_> {
+    type Process = std::os::windows::io::OwnedHandle;
+
+    fn read(&mut self) -> io::Result<Reading> {
+        let (state, pid) = self.query()?;
+        let observed = observed_from_state(state).ok_or_else(|| {
+            io::Error::other(format!(
+                "the service reported state {state}, which is not one it can retire from"
+            ))
+        })?;
+        Ok(Reading { observed, pid })
+    }
+
+    fn open(&mut self, pid: u32) -> io::Result<Option<Self::Process>> {
+        open_process(pid)
+    }
+}
+
+impl ServiceProbe<'_> {
     /// The service's state and process id, in one query. The id is 0 when
     /// there is no process.
     fn query(&self) -> io::Result<(u32, u32)> {
@@ -65,7 +96,7 @@ impl RetireSession {
         // SAFETY: the buffer is `status`'s own storage, of exactly its size.
         let queried = unsafe {
             QueryServiceStatusEx(
-                SC_HANDLE(self.service.raw_handle()),
+                SC_HANDLE(self.0.raw_handle()),
                 SC_STATUS_PROCESS_INFO,
                 Some(std::slice::from_raw_parts_mut(
                     status.as_mut_ptr().cast::<u8>(),
@@ -120,23 +151,11 @@ impl ServiceSession for RetireSession {
     }
 
     fn observe(&mut self) -> io::Result<Observed> {
-        let (state, pid) = self.query()?;
-        if pid != 0 {
-            self.processes.hold(pid)?;
-        }
-        observed_from_state(state).ok_or_else(|| {
-            io::Error::other(format!(
-                "the service reported state {state}, which is not one it can retire from"
-            ))
-        })
+        Ok(self.hold_current()?.observed)
     }
 
     fn hold_process(&mut self) -> io::Result<()> {
-        let (_, pid) = self.query()?;
-        if pid != 0 {
-            self.processes.hold(pid)?;
-        }
-        Ok(())
+        self.hold_current().map(|_| ())
     }
 
     fn await_exits(&mut self) -> io::Result<()> {
