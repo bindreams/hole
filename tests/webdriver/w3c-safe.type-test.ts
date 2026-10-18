@@ -1,5 +1,5 @@
 // Type-level tests for the `W3cSafe` guard in ui-ready.ts. There is nothing
-// to run: `tsc --noEmit -p tests/webdriver` (the `Frontend check` CI job) is
+// to run: `tsc --noEmit -p tests/webdriver` (the `frontend-check` CI step) is
 // the assertion, and an `@ts-expect-error` that stops erroring fails it as an
 // unused directive. specs/webdriverio-contract.spec.ts covers what the
 // rejected payloads do at runtime.

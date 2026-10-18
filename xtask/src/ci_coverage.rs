@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
@@ -75,7 +75,7 @@ fn is_package_name(s: &str) -> bool {
 }
 
 // Minimal `ci.yaml` shape — serde ignores every field we don't name, so this
-// tracks only `jobs.<id>.steps[].run`.
+// tracks only `jobs.<id>.steps[].{id,run}`.
 
 #[derive(Deserialize)]
 struct CiYaml {
@@ -91,7 +91,38 @@ struct Job {
 #[derive(Deserialize)]
 struct CiStep {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     run: Option<String>,
+}
+
+/// The steps of `job_id` an audit applies to: all of them when `prefix` is
+/// `None`, else those whose `id` starts with it.
+///
+/// The unified `ci` job holds lanes that different audits must not see (the
+/// archive lanes carry no `SKULD_LABELS`; the installer steps are a second
+/// compile target), so each audit names the lane it governs by step-id prefix.
+/// A prefix that matches nothing is an error rather than an empty set: a
+/// renamed step id would otherwise turn the audit into a vacuous pass. Each step
+/// comes with its position in the job, for failure messages.
+pub(crate) fn scoped_steps<'a, S>(
+    job_id: &str,
+    steps: &'a [S],
+    step_id: impl Fn(&S) -> Option<&str>,
+    prefix: Option<&str>,
+) -> Result<Vec<(usize, &'a S)>> {
+    let Some(prefix) = prefix else {
+        return Ok(steps.iter().enumerate().collect());
+    };
+    let scoped: Vec<(usize, &S)> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| step_id(s).is_some_and(|id| id.starts_with(prefix)))
+        .collect();
+    if scoped.is_empty() {
+        bail!("ci.yaml job {job_id:?} has no step whose id starts with {prefix:?}");
+    }
+    Ok(scoped)
 }
 
 /// The set of packages CI actually RUNS tests for. Each step's `run:` script is
@@ -101,7 +132,7 @@ pub fn ci_run_packages(ci_yaml: &str, manifest: &Manifest) -> Result<BTreeSet<St
     let mut covered = BTreeSet::new();
 
     for job_id in ci.jobs.keys() {
-        for cmd in ci_run_commands_for_job(ci_yaml, manifest, job_id)? {
+        for cmd in ci_run_commands_for_job(ci_yaml, manifest, job_id, None)? {
             covered.extend(package_tokens(&cmd));
         }
     }
@@ -110,9 +141,15 @@ pub fn ci_run_packages(ci_yaml: &str, manifest: &Manifest) -> Result<BTreeSet<St
 }
 
 /// The raw, fully xtask-run-target-resolved test-running command strings for
-/// one named `ci.yaml` job, in step order. Errs if `job_id` is not a job
-/// `ci.yaml` declares.
-pub(crate) fn ci_run_commands_for_job(ci_yaml: &str, manifest: &Manifest, job_id: &str) -> Result<Vec<String>> {
+/// one named `ci.yaml` job, in step order, restricted to the steps `step_prefix`
+/// selects (see [`scoped_steps`]). Errs if `job_id` is not a job `ci.yaml`
+/// declares.
+pub(crate) fn ci_run_commands_for_job(
+    ci_yaml: &str,
+    manifest: &Manifest,
+    job_id: &str,
+    step_prefix: Option<&str>,
+) -> Result<Vec<String>> {
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let job = ci
         .jobs
@@ -120,7 +157,7 @@ pub(crate) fn ci_run_commands_for_job(ci_yaml: &str, manifest: &Manifest, job_id
         .with_context(|| format!("ci.yaml declares no job {job_id:?}"))?;
 
     let mut out = Vec::new();
-    for step in &job.steps {
+    for (_, step) in scoped_steps(job_id, &job.steps, |s| s.id.as_deref(), step_prefix)? {
         let Some(run) = &step.run else { continue };
         let joined = join_line_continuations(run);
         for cmd in split_commands(&joined) {

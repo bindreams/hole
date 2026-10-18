@@ -187,20 +187,11 @@ fn git_repo_root() -> PathBuf {
 // Version =============================================================================================================
 
 fn emit_version_env(repo_root: &Path) {
-    let git_dir = repo_root.join(".git");
-
-    // Rerun triggers: branch ref changes, tag changes, packed-refs. The
-    // version computation itself lives in xtask-lib so it's testable and
-    // shared with `cargo xtask version` (which the prek hook + release CI
-    // workflow use). See xtask-lib/src/version.rs.
-    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-    if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
-        if let Some(refpath) = head.trim().strip_prefix("ref: ") {
-            println!("cargo:rerun-if-changed={}", git_dir.join(refpath).display());
-        }
-    }
-    println!("cargo:rerun-if-changed={}", git_dir.join("refs").join("tags").display());
-    println!("cargo:rerun-if-changed={}", git_dir.join("packed-refs").display());
+    // Rerun triggers (HEAD, its branch ref, tags, packed-refs); the version
+    // computation lives in xtask-lib so it's testable and shared with `cargo xtask
+    // version` (which the prek hook + release CI workflow use). See
+    // xtask-lib/src/version.rs and git_rerun.rs.
+    xtask_lib::git_rerun::emit_rerun_if_changed(repo_root);
 
     let version = xtask_lib::version::display_version(repo_root, xtask_lib::version::Group::Hole);
     println!("cargo:rustc-env=HOLE_VERSION={version}");

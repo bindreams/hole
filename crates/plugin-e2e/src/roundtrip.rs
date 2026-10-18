@@ -118,10 +118,10 @@ pub async fn run_roundtrip(
     // ephemeral-port saturation (per #300, no budget should mask it). Every
     // other outcome (ready, a non-conflict `StartError`, a dropped sender, or
     // the per-attempt `cfg.ready_timeout` firing) ends the loop, so an
-    // ambiguous or wedged child cannot spin. The outer bound is
-    // `ci.yaml`'s 45-minute job timeout, which reports as `cancelled` rather
-    // than a failure; the milestone logging below leaves evidence in the
-    // captured log if that fires.
+    // ambiguous or wedged child cannot spin. The outer bound is the
+    // `test-plugin-e2e` step's 45-minute `timeout-minutes` in `ci.yaml`, which
+    // fails the step with its log kept; the milestone logging below leaves
+    // evidence in that log if it fires.
     let mut attempt: u64 = 1;
     let (listen, cancel, handle) = loop {
         // SS_LOCAL: reserved TCP+UDP, not because SS_LOCAL is universally

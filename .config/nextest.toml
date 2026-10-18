@@ -286,7 +286,7 @@ slow-timeout = { period = "20s", terminate-after = 2 }
 # `cargo xtask verify-global-net-state-executed` (bindreams/hole#999) reads
 # this profile's JUnit report to confirm the `global_net_state` group's tests
 # didn't just get *selected* (guard 2, #894) but actually *ran*. The group
-# spans both of `test-hole`'s `SKULD_LABELS` lanes, so it needs one profile
+# spans both of the `hole-` CI lane's `SKULD_LABELS` steps, so it needs one profile
 # per lane instead of this single shared path — see
 # `xtask::global_net_state_conformance` for why.
 [profile.default.junit]

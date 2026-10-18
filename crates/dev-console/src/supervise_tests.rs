@@ -232,3 +232,37 @@ async fn wait_tree_drains_the_grandchild_after_the_cooperative_signal() {
     }
     child.wait().await.unwrap();
 }
+
+/// A hole root: a `[workspace]` manifest and `crates/hole`.
+fn fake_hole_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    std::fs::create_dir_all(root.path().join("crates").join("hole")).unwrap();
+    root
+}
+
+/// `cargo xtask run hole` pins a root and hands it to dev-console in
+/// `HOLE_DEV_REPO_ROOT`. The test binary's own `CARGO_MANIFEST_DIR` and
+/// executable sit in this checkout, and the working directory in a third root,
+/// so only the handoff can yield the pinned one; a lookup that ignored it
+/// (`repo_root`, which takes any workspace from `CARGO_MANIFEST_DIR`) would
+/// answer with this checkout.
+#[skuld::test]
+fn the_dev_console_root_is_the_one_xtask_pinned() {
+    let pinned = fake_hole_root();
+    let cwd = fake_hole_root();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .env(test_child::MODE_ENV, "hole-root")
+        .env(xtask_lib::repo_root::DEV_REPO_ROOT_ENV, pinned.path())
+        .current_dir(cwd.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let found = std::path::PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+    assert_eq!(found.canonicalize().unwrap(), pinned.path().canonicalize().unwrap());
+}

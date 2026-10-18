@@ -23,6 +23,8 @@
 //!   `ADDR/TOKEN`, dial, echo the token) and then parks forever.
 //! - `echo-argv` — print this process's own argv, one entry per line, to
 //!   stdout and exit 0. Lets a test observe exactly what a spawn delivered.
+//! - `hole-root` — print the root `supervise::hole_root` resolves, or the error
+//!   to stderr and exit 1.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
@@ -40,6 +42,7 @@ pub fn maybe_run() {
         "spawn-grandchild-same-group" => run_spawn_grandchild(false),
         "fake-bridge" => run_fake_bridge(),
         "echo-argv" => run_echo_argv(),
+        "hole-root" => run_hole_root(),
         other => {
             eprintln!("unknown {MODE_ENV} mode: {other}");
             std::process::exit(2);
@@ -74,6 +77,19 @@ fn run_echo_argv() -> ! {
     }
     out.flush().expect("flush argv");
     std::process::exit(0)
+}
+
+fn run_hole_root() -> ! {
+    match crate::supervise::hole_root() {
+        Ok(root) => {
+            println!("{}", root.display());
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1)
+        }
+    }
 }
 
 fn run_fake_bridge() -> ! {

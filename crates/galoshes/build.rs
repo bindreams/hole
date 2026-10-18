@@ -34,15 +34,7 @@ fn main() {
 }
 
 fn emit_version_env(repo_root: &std::path::Path) {
-    let git_dir = repo_root.join(".git");
-    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-    if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
-        if let Some(refpath) = head.trim().strip_prefix("ref: ") {
-            println!("cargo:rerun-if-changed={}", git_dir.join(refpath).display());
-        }
-    }
-    println!("cargo:rerun-if-changed={}", git_dir.join("refs").join("tags").display());
-    println!("cargo:rerun-if-changed={}", git_dir.join("packed-refs").display());
+    xtask_lib::git_rerun::emit_rerun_if_changed(repo_root);
 
     let version = xtask_lib::version::display_version(repo_root, xtask_lib::version::Group::Galoshes);
     println!("cargo:rustc-env=GALOSHES_VERSION={version}");
