@@ -49,8 +49,8 @@ pub(crate) fn workspace_root_for(
 fn ensure_absolute_manifest_dir(dir: &Path) -> Result<()> {
     anyhow::ensure!(
         dir.is_absolute(),
-        "CARGO_MANIFEST_DIR is {:?}, which is not an absolute path",
-        dir.display().to_string()
+        "CARGO_MANIFEST_DIR is \"{}\", which is not an absolute path",
+        dir.display()
     );
     Ok(())
 }
@@ -103,7 +103,7 @@ pub(crate) fn hole_root_for_launch(
         // again after dev-console changes into it.
         anyhow::ensure!(
             root.is_absolute() && is_hole_root(root),
-            "{DEV_REPO_ROOT_ENV} is {:?}, which is not an absolute path to a hole root (needs a [workspace] Cargo.toml and crates/hole)",
+            "{DEV_REPO_ROOT_ENV} is \"{}\", which is not an absolute path to a hole root (needs a [workspace] Cargo.toml and crates/hole)",
             root.display()
         );
         return Ok(root.to_path_buf());

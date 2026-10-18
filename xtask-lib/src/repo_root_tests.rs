@@ -169,7 +169,17 @@ fn a_handoff_that_is_not_a_hole_root_is_an_error_naming_it_never_a_fallback() {
     let missing = hole.path().join("no-such-dir");
     let relative = Path::new("crates/hole");
     let empty = Path::new("");
-    for bad in [non_hole.path(), nested.as_path(), missing.as_path(), relative, empty] {
+    // A backslash must reach the message as typed (Windows paths carry them;
+    // `{:?}` would double it), so pin that on every host.
+    let backslash = Path::new(r"crates\hole");
+    for bad in [
+        non_hole.path(),
+        nested.as_path(),
+        missing.as_path(),
+        relative,
+        empty,
+        backslash,
+    ] {
         let err = hole_root_for_launch(Some(bad), Some(hole.path()), Some(hole.path()), Some(hole.path()))
             .expect_err(&format!("{bad:?} is not a hole root"))
             .to_string();
@@ -208,7 +218,7 @@ fn a_relative_handoff_is_an_error_even_when_it_names_a_hole_root_from_the_cwd() 
 #[skuld::test]
 fn a_relative_or_empty_manifest_dir_is_an_error_naming_the_variable_never_a_fallback() {
     let hole = workspace(true); // a perfectly good exe and cwd
-    for bad in [Path::new("crates/foo"), Path::new("")] {
+    for bad in [Path::new("crates/foo"), Path::new(""), Path::new(r"crates\foo")] {
         let err = lookup(Some(bad), Some(hole.path()), Some(hole.path()))
             .expect_err(&format!("{bad:?} is not absolute"))
             .to_string();
@@ -285,7 +295,7 @@ fn the_workspace_lookup_asks_for_the_exe_only_when_the_manifest_dir_does_not_ans
 #[skuld::test]
 fn the_workspace_lookup_refuses_a_relative_or_empty_manifest_dir_naming_the_variable() {
     let ws = workspace(false); // the exe would answer if the bad value were skipped
-    for bad in [Path::new("crates/foo"), Path::new("")] {
+    for bad in [Path::new("crates/foo"), Path::new(""), Path::new(r"crates\foo")] {
         let err = workspace_root_for(Some(bad), || Ok(Some(ws.path().to_path_buf())))
             .expect_err(&format!("{bad:?} is not absolute"))
             .to_string();
