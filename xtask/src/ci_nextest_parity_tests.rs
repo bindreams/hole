@@ -574,7 +574,7 @@ const QUIET_ALIAS_CONFIG: &str = "[alias]\nxtask = \"run --package xtask --quiet
 #[skuld::test]
 fn a_step_through_an_alias_that_carries_quiet_is_reported() {
     let ci = job_with_steps(&[("via alias", ".github/scripts/fail-on-compile.sh cargo xtask verify-a")]);
-    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", QUIET_ALIAS_CONFIG).expect("analyze");
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", QUIET_ALIAS_CONFIG, &[]).expect("analyze");
     assert_eq!(quiet, vec!["via alias"]);
 }
 
@@ -582,7 +582,7 @@ fn a_step_through_an_alias_that_carries_quiet_is_reported() {
 fn an_alias_given_as_an_array_is_read_too() {
     let config = "[alias]\nxtask = [\"run\", \"--package\", \"xtask\", \"-q\", \"--\"]\n";
     let ci = job_with_steps(&[("via alias", ".github/scripts/fail-on-compile.sh cargo xtask verify-a")]);
-    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config, &[]).expect("analyze");
     assert_eq!(quiet, vec!["via alias"]);
 }
 
@@ -591,7 +591,7 @@ fn an_alias_given_as_an_array_is_read_too() {
 fn quiet_reached_through_a_chain_of_aliases_is_reported() {
     let config = "[alias]\nx = \"xtask\"\nxtask = \"run --package xtask --quiet --\"\n";
     let ci = job_with_steps(&[("chained", ".github/scripts/fail-on-compile.sh cargo x verify-a")]);
-    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config, &[]).expect("analyze");
     assert_eq!(quiet, vec!["chained"]);
 }
 
@@ -600,7 +600,7 @@ fn quiet_reached_through_a_chain_of_aliases_is_reported() {
 fn a_self_referential_alias_terminates() {
     let config = "[alias]\nloop = \"loop\"\n";
     let ci = job_with_steps(&[("loops", ".github/scripts/fail-on-compile.sh cargo loop")]);
-    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config, &[]).expect("analyze");
     assert_eq!(quiet, Vec::<String>::new());
 }
 
@@ -632,7 +632,7 @@ fn quiet_flags_on_the_command_line_are_reported() {
             ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a",
         ),
     ]);
-    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "").expect("analyze");
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "", &[]).expect("analyze");
     // `-q` after `--` belongs to the program, not to cargo.
     assert_eq!(quiet, vec!["long", "short", "cluster", "nextest"]);
 }
@@ -644,7 +644,7 @@ fn quiet_set_for_all_of_cargo_is_reported() {
         "plain",
         ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a",
     )]);
-    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "[term]\nquiet = true\n").expect("analyze");
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "[term]\nquiet = true\n", &[]).expect("analyze");
     assert_eq!(quiet, vec!["plain"]);
 }
 
@@ -667,13 +667,13 @@ jobs:
           CARGO_TERM_QUIET: true
         run: cargo run --package xtask -- verify-b
 ";
-    let quiet = quiet_post_build_cargo_steps(ci, "j", "hole-", "").expect("analyze");
+    let quiet = quiet_post_build_cargo_steps(ci, "j", "hole-", "", &[]).expect("analyze");
     assert_eq!(quiet, vec!["workflow level", "step level"]);
 
     let ci_job = ci
         .replace("env:\n  CARGO_TERM_QUIET: true\njobs:", "jobs:")
         .replace("OTHER: 1", "CARGO_TERM_QUIET: true");
-    let quiet = quiet_post_build_cargo_steps(&ci_job, "j", "hole-", "").expect("analyze");
+    let quiet = quiet_post_build_cargo_steps(&ci_job, "j", "hole-", "", &[]).expect("analyze");
     assert_eq!(quiet, vec!["workflow level", "step level"]);
 }
 
@@ -691,8 +691,146 @@ fn a_loud_step_and_an_unrelated_alias_are_not_reported() {
         ),
         ("no cargo", "echo xtask --quiet"),
     ]);
-    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config, &[]).expect("analyze");
     assert_eq!(quiet, Vec::<String>::new());
+}
+
+/// `cargo-nextest nextest run` is cargo's own launcher spelling (ci.yaml's archive
+/// lanes use it) and builds through cargo when it has no archive.
+#[skuld::test]
+fn a_cargo_nextest_launcher_after_the_build_is_reported_ungated() {
+    let ci = job_with_steps(&[("launcher", "cargo-nextest nextest run -E 'package(hole)'")]);
+    let launches = post_build_cargo_launches(&ci, "j", "hole-").expect("analyze");
+    let got: Vec<(&str, bool)> = launches.iter().map(|(l, launch)| (l.as_str(), launch.gated)).collect();
+    assert_eq!(got, vec![("launcher", false)]);
+}
+
+#[skuld::test]
+fn a_quiet_cargo_nextest_launcher_is_reported_quiet() {
+    let ci = job_with_steps(&[
+        (
+            "quiet launcher",
+            ".github/scripts/fail-on-compile.sh cargo-nextest nextest run --cargo-quiet",
+        ),
+        (
+            "loud launcher",
+            ".github/scripts/fail-on-compile.sh cargo-nextest nextest run",
+        ),
+    ]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "", &[]).expect("analyze");
+    assert_eq!(quiet, vec!["quiet launcher"]);
+}
+
+/// `--color`, `-C`, `--config` and `-Z` take a value; it is not the subcommand.
+#[skuld::test]
+fn cargos_global_options_with_values_do_not_hide_the_subcommand() {
+    for prefix in [
+        "--color always",
+        "-C .",
+        "--config net.retry=2",
+        "--config=net.retry=2",
+        "-Z unstable-options",
+        "+nightly --color never --config net.retry=2",
+    ] {
+        let run = format!(".github/scripts/fail-on-compile.sh cargo {prefix} xtask verify-a");
+        let ci = job_with_steps(&[("via alias", &run)]);
+        let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", QUIET_ALIAS_CONFIG, &[]).expect("analyze");
+        assert_eq!(quiet, vec!["via alias"], "for `cargo {prefix} xtask`");
+    }
+}
+
+#[skuld::test]
+fn a_config_option_that_sets_term_quiet_is_reported() {
+    for option in ["--config term.quiet=true", "--config=term.quiet=true"] {
+        for run in [
+            format!(".github/scripts/fail-on-compile.sh cargo {option} run --package xtask -- verify-a"),
+            format!(".github/scripts/fail-on-compile.sh cargo run {option} --package xtask -- verify-a"),
+        ] {
+            let ci = job_with_steps(&[("configured", &run)]);
+            let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "", &[]).expect("analyze");
+            assert_eq!(quiet, vec!["configured"], "for {run}");
+        }
+    }
+}
+
+#[skuld::test]
+fn a_config_option_that_leaves_cargo_loud_is_not_reported() {
+    for option in [
+        "--config term.quiet=false",
+        "--config net.retry=2",
+        "--config build.jobs=1",
+    ] {
+        let run = format!(".github/scripts/fail-on-compile.sh cargo {option} run --package xtask -- verify-a");
+        let ci = job_with_steps(&[("loud", &run)]);
+        let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "", &[]).expect("analyze");
+        assert_eq!(quiet, Vec::<String>::new(), "for {run}");
+    }
+}
+
+/// A `--config` the audit cannot judge (a file, a quoted value with spaces, an alias, a `term` table, a
+/// non-bool `term.quiet`) must not read as loud.
+#[skuld::test]
+fn a_config_option_the_audit_cannot_judge_is_an_error() {
+    for option in [
+        "--config extra.toml",
+        "--config 'term.quiet = true'",
+        "--config alias.xtask='run -q --'",
+        "--config term={quiet=true}",
+        "--config term.quiet=1",
+    ] {
+        let run = format!(".github/scripts/fail-on-compile.sh cargo {option} run --package xtask -- verify-a");
+        let ci = job_with_steps(&[("opaque", &run)]);
+        let err = quiet_post_build_cargo_steps(&ci, "j", "hole-", "", &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("--config"), "for {run}: {err:#}");
+    }
+}
+
+/// A step that appends `CARGO_TERM_QUIET` to `$GITHUB_ENV` quiets every cargo
+/// after it, in the workflow or in a composite action it uses.
+#[skuld::test]
+fn quiet_exported_through_github_env_is_reported() {
+    let plain = job_with_steps(&[("plain", "cargo run --package xtask -- verify-a")]);
+    let quiet = quiet_post_build_cargo_steps(&plain, "j", "hole-", "", &[]).expect("analyze");
+    assert_eq!(quiet, Vec::<String>::new());
+
+    let in_workflow = plain.replace(
+        "      - id: hole-build",
+        "      - run: echo \"CARGO_TERM_QUIET=true\" >> \"$GITHUB_ENV\"\n      - id: hole-build",
+    );
+    let quiet = quiet_post_build_cargo_steps(&in_workflow, "j", "hole-", "", &[]).expect("analyze");
+    assert_eq!(quiet, vec!["plain"]);
+
+    let action = "runs:\n  steps:\n    - run: |\n        echo \"CARGO_TERM_QUIET=true\" >> \"$GITHUB_ENV\"\n";
+    let quiet = quiet_post_build_cargo_steps(&plain, "j", "hole-", "", &[action]).expect("analyze");
+    assert_eq!(quiet, vec!["plain"]);
+
+    let unrelated = "runs:\n  steps:\n    - run: echo \"CARGO_TERM_COLOR=always\" >> \"$GITHUB_ENV\"\n";
+    let quiet = quiet_post_build_cargo_steps(&plain, "j", "hole-", "", &[unrelated]).expect("analyze");
+    assert_eq!(quiet, Vec::<String>::new());
+}
+
+#[skuld::test]
+fn a_non_string_alias_array_element_is_an_error_naming_it() {
+    let ci = job_with_steps(&[("any", "cargo run")]);
+    let err = quiet_post_build_cargo_steps(&ci, "j", "hole-", "[alias]\nquiet = [\"-q\", 1]\n", &[]).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("quiet") && msg.contains("integer"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[skuld::test]
+fn a_malformed_term_or_alias_table_is_an_error() {
+    let ci = job_with_steps(&[("any", "cargo run")]);
+    for (config, needle) in [
+        ("[term]\nquiet = \"yes\"\n", "term.quiet"),
+        ("term = 3\n", "[term]"),
+        ("alias = \"x\"\n", "[alias]"),
+    ] {
+        let err = quiet_post_build_cargo_steps(&ci, "j", "hole-", config, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains(needle), "for {config:?}: {err:#}");
+    }
 }
 
 // ===== conformance ===================================================================================================
@@ -799,7 +937,19 @@ fn no_cargo_step_after_hole_build_hides_cargos_compiling_lines() {
     let root = crate::repo_root().expect("repo root");
     let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
     let cargo_config = fs::read_to_string(root.join(".cargo/config.toml")).expect("read .cargo/config.toml");
-    let quiet = quiet_post_build_cargo_steps(&ci_yaml, "ci", "hole-", &cargo_config).expect("analyze ci.yaml");
+    let actions: Vec<String> = fs::read_dir(root.join(".github/actions"))
+        .expect("read .github/actions")
+        .map(|entry| entry.expect("read .github/actions entry").path().join("action.yaml"))
+        .filter(|path| path.is_file())
+        .map(|path| fs::read_to_string(&path).expect("read action.yaml"))
+        .collect();
+    assert!(
+        !actions.is_empty(),
+        "no local actions found: the GITHUB_ENV scan is vacuous"
+    );
+    let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
+    let quiet =
+        quiet_post_build_cargo_steps(&ci_yaml, "ci", "hole-", &cargo_config, &actions).expect("analyze ci.yaml");
     assert_eq!(
         quiet,
         Vec::<String>::new(),

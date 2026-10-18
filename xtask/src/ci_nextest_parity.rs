@@ -164,7 +164,7 @@ pub fn test_job(ci_yaml: &str, job_id: &str, step_prefix: Option<&str>) -> Resul
 ///
 /// Not only nextest runs: `nextest list` and `cargo xtask` build too, and a
 /// compile in a verify step leaves fresh artifacts that mask the drift from
-/// every lane after it. A command mentioning `cargo` as a token is one.
+/// every lane after it. A command mentioning a cargo program as a token is one.
 pub fn post_build_cargo_launches(ci_yaml: &str, job_id: &str, step_prefix: &str) -> Result<Vec<(String, Launch)>> {
     post_build_cargo_commands(ci_yaml, job_id, step_prefix)?
         .into_iter()
@@ -201,7 +201,7 @@ fn post_build_cargo_commands(ci_yaml: &str, job_id: &str, step_prefix: &str) -> 
                 built = xtask_target(&command)? == Some(target.as_str());
                 continue;
             }
-            if command.split_whitespace().map(unquote).any(|t| t == "cargo") {
+            if command.split_whitespace().map(unquote).any(is_cargo_program) {
                 out.push(PostBuildCommand {
                     label: step_label(step, i),
                     command,
@@ -213,37 +213,61 @@ fn post_build_cargo_commands(ci_yaml: &str, job_id: &str, step_prefix: &str) -> 
     Ok(out)
 }
 
+/// `cargo`, or a `cargo-<subcommand>` binary such as `cargo-nextest`, which cargo
+/// itself would launch for `cargo <subcommand>`.
+fn is_cargo_program(token: &str) -> bool {
+    token == "cargo" || token.starts_with("cargo-")
+}
+
 /// The steps whose cargo commands after the build step print no `Compiling`
 /// lines, so [`NO_COMPILE_GATE`], which reads only those lines, cannot see them
 /// compile.
 ///
 /// A command is quiet when cargo's `--quiet`/`-q` (nextest's `--cargo-quiet`)
-/// reaches it before the `--` that ends cargo's own arguments: written out,
-/// carried by an alias in `cargo_config` (the text of `.cargo/config.toml`,
-/// followed through aliases that name aliases), or implied by `[term] quiet` or
-/// [`QUIET_ENV`] anywhere in the workflow. Over-reporting is loud and costs one
+/// or a `--config` setting `term.quiet` reaches it before the `--` that ends
+/// cargo's own arguments: written out, carried by an alias in `cargo_config`
+/// (the text of `.cargo/config.toml`, followed through aliases that name
+/// aliases), or implied by `[term] quiet`, [`QUIET_ENV`] in an `env:` map, or an
+/// `echo` of it into `$GITHUB_ENV`, anywhere in the workflow or in
+/// `local_actions` (the texts of the composite actions it uses). A `--config`
+/// the audit cannot judge is an error. Over-reporting is loud and costs one
 /// edit; missing a quiet command silently un-gates its step.
 pub fn quiet_post_build_cargo_steps(
     ci_yaml: &str,
     job_id: &str,
     step_prefix: &str,
     cargo_config: &str,
+    local_actions: &[&str],
 ) -> Result<Vec<String>> {
     let config = CargoConfig::parse(cargo_config)?;
+    let github_env_quiet = std::iter::once(ci_yaml)
+        .chain(local_actions.iter().copied())
+        .any(exports_quiet_to_github_env);
     let mut quiet = Vec::new();
     for c in post_build_cargo_commands(ci_yaml, job_id, step_prefix)? {
         let remainder = split_launch(&c.command)?.1;
         let args: Vec<&str> = remainder
             .split_whitespace()
             .map(unquote)
-            .skip_while(|t| *t != "cargo")
+            .skip_while(|t| !is_cargo_program(t))
             .skip(1)
             .collect();
-        if (c.env_quiet || config.quiet || config.is_quiet(&args, &mut BTreeSet::new())) && !quiet.contains(&c.label) {
+        let is_quiet = c.env_quiet
+            || github_env_quiet
+            || config.quiet
+            || config
+                .is_quiet(&args, &mut BTreeSet::new())
+                .with_context(|| format!("step {:?}", c.label))?;
+        if is_quiet && !quiet.contains(&c.label) {
             quiet.push(c.label);
         }
     }
     Ok(quiet)
+}
+
+/// Does any line of `text` write [`QUIET_ENV`] to `$GITHUB_ENV`?
+fn exports_quiet_to_github_env(text: &str) -> bool {
+    text.lines().any(|l| l.contains(QUIET_ENV) && l.contains("GITHUB_ENV"))
 }
 
 /// The environment variable that quiets every cargo it reaches.
@@ -261,47 +285,102 @@ impl CargoConfig {
     fn parse(text: &str) -> Result<Self> {
         let table: toml::Table = text.parse().context("parsing .cargo/config.toml")?;
         let mut aliases = BTreeMap::new();
-        if let Some(toml::Value::Table(declared)) = table.get("alias") {
-            for (name, value) in declared {
-                let args = match value {
-                    toml::Value::String(s) => s.split_whitespace().map(str::to_string).collect(),
-                    toml::Value::Array(items) => items.iter().filter_map(|v| v.as_str()).map(str::to_string).collect(),
-                    other => bail!(
-                        "alias {name:?} is a {}, expected a string or an array",
-                        other.type_str()
-                    ),
-                };
-                aliases.insert(name.clone(), args);
+        match table.get("alias") {
+            None => {}
+            Some(toml::Value::Table(declared)) => {
+                for (name, value) in declared {
+                    let args = match value {
+                        toml::Value::String(s) => s.split_whitespace().map(str::to_string).collect(),
+                        toml::Value::Array(items) => items
+                            .iter()
+                            .map(|item| match item {
+                                toml::Value::String(s) => Ok(s.clone()),
+                                other => bail!("alias {name:?} has a {} element, expected a string", other.type_str()),
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                        other => bail!(
+                            "alias {name:?} is a {}, expected a string or an array",
+                            other.type_str()
+                        ),
+                    };
+                    aliases.insert(name.clone(), args);
+                }
             }
+            Some(other) => bail!("[alias] is a {}, expected a table", other.type_str()),
         }
-        let quiet = table
-            .get("term")
-            .and_then(|t| t.get("quiet"))
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(false);
+        let quiet = match table.get("term") {
+            None => false,
+            Some(toml::Value::Table(term)) => match term.get("quiet") {
+                None => false,
+                Some(toml::Value::Boolean(b)) => *b,
+                Some(other) => bail!("term.quiet is a {}, expected a bool", other.type_str()),
+            },
+            Some(other) => bail!("[term] is a {}, expected a table", other.type_str()),
+        };
         Ok(Self { aliases, quiet })
     }
 
-    /// Does cargo, given `args` (everything after the word `cargo`), run quietly?
+    /// Does cargo, given `args` (everything after the cargo program), run quietly?
     /// `seen` holds the aliases already expanded on this path: cargo rejects a
     /// cycle, and the walk ends there too.
-    fn is_quiet(&self, args: &[&str], seen: &mut BTreeSet<String>) -> bool {
-        let own: Vec<&str> = args.iter().copied().take_while(|t| *t != "--").collect();
-        if own.iter().any(|t| is_quiet_flag(t)) {
-            return true;
+    fn is_quiet(&self, args: &[&str], seen: &mut BTreeSet<String>) -> Result<bool> {
+        let mut subcommand = None;
+        let mut tokens = args.iter().copied().take_while(|t| *t != "--");
+        while let Some(tok) = tokens.next() {
+            if is_quiet_flag(tok) {
+                return Ok(true);
+            }
+            let config = if tok == "--config" {
+                Some(tokens.next().context("`--config` has no value")?)
+            } else {
+                tok.strip_prefix("--config=")
+            };
+            if let Some(setting) = config {
+                if config_setting_is_quiet(setting)? {
+                    return Ok(true);
+                }
+            } else if subcommand.is_none() {
+                if GLOBAL_OPTIONS_WITH_VALUE.contains(&tok) {
+                    tokens.next();
+                } else if !tok.starts_with('-') && !tok.starts_with('+') {
+                    subcommand = Some(tok);
+                }
+            }
         }
-        let Some(subcommand) = own.iter().find(|t| !t.starts_with('-') && !t.starts_with('+')) else {
-            return false;
+        let Some(subcommand) = subcommand else { return Ok(false) };
+        let Some(expansion) = self.aliases.get(subcommand) else {
+            return Ok(false);
         };
-        let Some(expansion) = self.aliases.get(*subcommand) else {
-            return false;
-        };
-        if !seen.insert((*subcommand).to_string()) {
-            return false;
+        if !seen.insert(subcommand.to_string()) {
+            return Ok(false);
         }
         let expanded: Vec<&str> = expansion.iter().map(String::as_str).collect();
         self.is_quiet(&expanded, seen)
     }
+}
+
+/// Cargo's global options that take a separate value (`cargo --help`): the value
+/// is not the subcommand. `--config` is handled on its own.
+const GLOBAL_OPTIONS_WITH_VALUE: [&str; 3] = ["--color", "-C", "-Z"];
+
+/// Does one `--config` argument make cargo quiet? Only `term.quiet` decides it;
+/// a setting that could carry quiet some other way (a config file, `alias.*`,
+/// the `term` table) cannot be judged here and is an error.
+fn config_setting_is_quiet(setting: &str) -> Result<bool> {
+    let Some((key, value)) = setting.split_once('=') else {
+        bail!("`--config {setting}` is not KEY=VALUE (a config file, or a quoted value the audit splits on spaces), which it cannot judge");
+    };
+    let key = key.trim();
+    if key == "term.quiet" {
+        return match value.trim().parse::<toml::Value>() {
+            Ok(toml::Value::Boolean(b)) => Ok(b),
+            _ => bail!("`--config {setting}` sets term.quiet to something other than a bool"),
+        };
+    }
+    if key.contains("term") || key.contains("alias") {
+        bail!("`--config {setting}` sets {key:?}, which can carry quiet in a way the audit cannot judge");
+    }
+    Ok(false)
 }
 
 /// `--quiet`, nextest's `--cargo-quiet`, or a short-flag cluster holding `q`.
