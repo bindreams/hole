@@ -3,16 +3,37 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::git_rerun::{read_head, rerun_paths, tracked_or_nearest_ancestor, write_rerun_if_changed};
+use crate::git_rerun::{read_head, rerun_paths_with, tracked_or_nearest_ancestor, write_rerun_if_changed};
+
+/// Make `cmd` see only the repository at or below its working directory: no
+/// inherited `GIT_*` (a `GIT_DIR` from a git hook, say), and no search above
+/// the directory's parent (a `TMPDIR` inside a checkout would otherwise find it).
+fn isolate_git(cmd: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|n| n.starts_with("GIT_")) {
+            cmd.env_remove(name);
+        }
+    }
+    let ceiling = cmd
+        .get_current_dir()
+        .expect("git runs in an explicit directory")
+        .parent()
+        .expect("a directory with a parent")
+        .to_path_buf();
+    cmd.env("GIT_CEILING_DIRECTORIES", ceiling);
+}
+
+fn rerun_paths(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    rerun_paths_with(root, &isolate_git)
+}
 
 fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .args(["-c", "user.email=t@example.invalid", "-c", "user.name=T"])
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "user.email=t@example.invalid", "-c", "user.name=T"])
         .args(args)
-        .current_dir(dir)
-        .status()
-        .unwrap()
-        .success();
+        .current_dir(dir);
+    isolate_git(&mut cmd);
+    let ok = cmd.status().unwrap().success();
     assert!(ok, "git {} failed in {}", args.join(" "), dir.display());
 }
 
@@ -167,7 +188,7 @@ fn only_a_missing_head_is_absent() {
 
 fn emitted(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    write_rerun_if_changed(root, &mut out).unwrap();
+    write_rerun_if_changed(root, &mut out, &isolate_git).unwrap();
     String::from_utf8(out).unwrap().lines().map(str::to_string).collect()
 }
 

@@ -18,21 +18,37 @@ use anyhow::{bail, Context, Result};
 /// Paths whose change can change the version stamp: `HEAD`, the branch ref it
 /// points to, the tags, and `packed-refs`. Every returned path exists.
 pub fn rerun_paths(repo_root: &Path) -> Result<Vec<PathBuf>> {
-    let refs = git_path(repo_root, "refs")?;
+    rerun_paths_with(repo_root, &|_| {})
+}
+
+/// Adjusts the `git` command before it runs, e.g. to isolate it from the
+/// ambient `GIT_*` environment.
+pub(crate) type ConfigureGit<'a> = &'a dyn Fn(&mut Command);
+
+/// [`rerun_paths`] with `configure` applied to every `git` it starts, so tests
+/// can pin the environment git sees without touching the process's own.
+pub(crate) fn rerun_paths_with(repo_root: &Path, configure: ConfigureGit) -> Result<Vec<PathBuf>> {
+    let refs = git_path(repo_root, "refs", configure)?;
     let mut out = Vec::new();
 
-    let head = git_path(repo_root, "HEAD")?;
+    let head = git_path(repo_root, "HEAD", configure)?;
     if let Some(head_text) = read_head(&head)? {
         out.push(head);
         if let Some(branch) = head_text.trim().strip_prefix("ref: ") {
-            out.extend(tracked_or_nearest_ancestor(&git_path(repo_root, branch)?, &refs));
+            out.extend(tracked_or_nearest_ancestor(
+                &git_path(repo_root, branch, configure)?,
+                &refs,
+            ));
         }
     }
-    out.extend(tracked_or_nearest_ancestor(&git_path(repo_root, "refs/tags")?, &refs));
+    out.extend(tracked_or_nearest_ancestor(
+        &git_path(repo_root, "refs/tags", configure)?,
+        &refs,
+    ));
 
     // Absent until something packs refs; a pack removes loose refs, which
     // changes the directories tracked above.
-    let packed = git_path(repo_root, "packed-refs")?;
+    let packed = git_path(repo_root, "packed-refs", configure)?;
     if packed.exists() {
         out.push(packed);
     }
@@ -55,12 +71,17 @@ pub(crate) fn read_head(path: &Path) -> Result<Option<String>> {
 /// ask git is a warning, not an error: the version stamp itself degrades the
 /// same way (`display_version`), and a build script must not panic over it.
 pub fn emit_rerun_if_changed(repo_root: &Path) {
-    write_rerun_if_changed(repo_root, &mut std::io::stdout().lock()).expect("writing cargo directives to stdout");
+    write_rerun_if_changed(repo_root, &mut std::io::stdout().lock(), &|_| {})
+        .expect("writing cargo directives to stdout");
 }
 
 /// [`emit_rerun_if_changed`] into `out`.
-pub(crate) fn write_rerun_if_changed(repo_root: &Path, out: &mut impl std::io::Write) -> std::io::Result<()> {
-    match rerun_paths(repo_root) {
+pub(crate) fn write_rerun_if_changed(
+    repo_root: &Path,
+    out: &mut impl std::io::Write,
+    configure: ConfigureGit,
+) -> std::io::Result<()> {
+    match rerun_paths_with(repo_root, configure) {
         Ok(paths) => {
             for p in paths {
                 writeln!(out, "cargo:rerun-if-changed={}", p.display())?;
@@ -84,10 +105,12 @@ pub fn tracked_or_nearest_ancestor(path: &Path, floor: &Path) -> Option<PathBuf>
         .map(Path::to_path_buf)
 }
 
-fn git_path(repo_root: &Path, name: &str) -> Result<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-path", name])
-        .current_dir(repo_root)
+fn git_path(repo_root: &Path, name: &str, configure: ConfigureGit) -> Result<PathBuf> {
+    let mut git = Command::new("git");
+    git.args(["rev-parse", "--path-format=absolute", "--git-path", name])
+        .current_dir(repo_root);
+    configure(&mut git);
+    let output = git
         .output()
         .context("running `git rev-parse --git-path` (is git installed?)")?;
     if !output.status.success() {
