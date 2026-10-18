@@ -1451,79 +1451,66 @@ fn cutover_global_net_state_stop_probe_open_process_synchronize_on_the_service_p
     );
 }
 
-/// The drain ends on a look. A restart timer the SCM still has pending when
-/// the look is taken would start the service after it only if (a) changing the
-/// failure actions does not cancel an already-scheduled restart and (b) the SCM
-/// starts a service marked for deletion. This keeps a handle opened before the
-/// delete across the timer and prints whether a restart arrives.
-///
-/// The restart delay is the SCM's own timer, observed through the helper's
-/// parked event, never waited out here. There is no event for the timer NOT
-/// firing, so that answer is this test's timeout (nextest `terminate-after`,
-/// the failure bound surfaced to a human): a job that reports this test as
-/// timed out after the "awaiting a restart" line means the SCM did not start
-/// the marked service.
+/// The drain ends on a look taken before the last handle closes, so a start
+/// after it is covered only if the SCM refuses to start a service marked for
+/// deletion. This calls `StartService`, on the handle opened before the delete,
+/// on a STOPPED service with a restart pending and prints the answer. The
+/// restart is the SCM starting the service itself; `StartService` is the same
+/// start asked for by a client, so the answer says whether a marked service can
+/// be started at all. The restart delay is far off and never waited out.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_stop_probe_restart_timer_after_delete_on_a_marked_service() {
+fn cutover_global_net_state_stop_probe_start_of_a_stopped_service_marked_for_delete() {
+    use hole_bridge::cutover::scm_wait::call_error::{ScmCall, ScmCallError, ERROR_SERVICE_MARKED_FOR_DELETE};
     use hole_bridge::cutover::scm_wait::retire::{drain, ServiceSession};
+    use hole_bridge::cutover::scm_wait::ScmActor;
     use hole_bridge::platform::os::SERVICE_NAME;
 
-    const RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
-
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let parked = named_event::NamedEvent::create("MarkedRestartParked");
-    let release = named_event::NamedEvent::create("MarkedRestartRelease");
-    let _service = ProvisionedService::install_with(
-        helper,
-        vec![
-            "--hold-start".into(),
-            release.name().into(),
-            "--parked-event".into(),
-            parked.name().into(),
-        ],
-        Some(RESTART_DELAY),
-    );
-    let _release_on_drop = release.release_on_drop();
+    let _service = ProvisionedService::install_with(helper, vec![], Some(std::time::Duration::from_secs(60 * 60)));
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
 
-    // First instance: let it start and run.
-    let starter = start_in_background();
-    parked.wait();
-    release.signal();
-    starter.join().unwrap().expect("the first instance starts");
-    wait_until_running();
-    release.reset();
-    parked.reset();
-
-    // The handle that outlives the delete, then the kill that arms the timer.
-    let mut session = ReleasingSession::open(&release);
+    // The handle that outlives the delete, then the kill that leaves the
+    // service STOPPED with its restart pending.
+    let mut session = hole_bridge::platform::os::RetireSession::open()
+        .expect("open the session")
+        .expect("the service is registered");
     scm_probe::kill_service_process();
     wait_until_stopped();
-    session.disable_restart().expect("turn restart-on-failure off");
     let before_delete = session.observe();
     session.delete().expect("mark the killed service for deletion");
+    let started = session.start();
+    let refused_as_marked = started.as_ref().err().is_some_and(|e| {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<ScmCallError>())
+            .is_some_and(|e| e.call == ScmCall::StartService && e.code == ERROR_SERVICE_MARKED_FOR_DELETE)
+    });
+    let meaning = match (&started, refused_as_marked) {
+        (Err(_), true) => {
+            "the SCM refuses to start a marked service: a start after the drain's last look cannot happen, \
+             and the drain's restart coverage holds"
+        }
+        (Err(_), false) => {
+            "StartService failed for another reason: this run does not say whether a marked service can be \
+             started (check that the look before the delete was STOPPED)"
+        }
+        (Ok(()), _) => {
+            "the SCM STARTS a marked service: a start after the drain's last look is possible, and the \
+             drain's restart coverage does not hold (the owner decides what covers that window)"
+        }
+    };
     eprintln!(
-        "SCM restart probe: killed, restart delay {RESTART_DELAY:?}, restart-on-failure turned off, look before DeleteService -> {before_delete:?}, \
-         DeleteService done on the pre-opened handle; awaiting a restart (a timeout of this test here means NO restart arrived). \
-         If the look before the delete was not STOPPED the restart fired first and this run measures nothing."
+        "SCM start probe, StartService on a handle opened before DeleteService of a STOPPED service with a restart pending: \
+         look before the delete -> {before_delete:?}; StartService -> {started:?}\n  MEANS: {meaning}"
     );
 
-    // Arrives only if the SCM starts the marked service: the restarted
-    // instance parks in START_PENDING and signals.
-    parked.wait();
-    let after = session.observe();
-    eprintln!(
-        "SCM restart probe: a restart FIRED after DeleteService on a pre-opened handle; look now -> {after:?}\n  \
-         MEANS: neither (a) changing the failure actions cancelled the pending restart nor (b) is a marked service refused a start: \
-         the window between DeleteService and the last handle close can see a start. The drain's final look covers a start that \
-         lands BEFORE that look (it drains it again) and not one after it; the printed drain result below shows the covered case. \
-         CONTRIBUTING.md's sentence on the restart timer must then state that the residual is real."
-    );
+    // Success left a live service; the drain stops it and awaits its process.
     let drained = drain(&mut session);
-    eprintln!(
-        "SCM restart probe: drain of the restarted marked service -> {drained:?}; reports {:?}",
-        session.reports
-    );
+    eprintln!("SCM start probe: drain -> {drained:?}");
     drop(session);
     let _ = scm_deletion::wait_until_deleted(SERVICE_NAME);
 }
