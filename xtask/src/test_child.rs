@@ -25,6 +25,8 @@ pub fn maybe_run() {
         "list-env" => list_env(),
         "strip-then-list-env-in-child" => strip_then_list_env_in_child(),
         "strip-then-repo-root" => strip_then_repo_root(),
+        "strip-then-list-launch-env" => strip_then_list_launch_env(),
+        "strip-then-verify-run-injected-env" => strip_then_verify_run_injected_env(),
         "strip-then-handed-down-root" => strip_then_handed_down_root(),
         "forward-nextest-list" => forward_nextest_list(),
         "emit-compiling-stderr" => emit_compiling_stderr(),
@@ -118,6 +120,33 @@ fn strip_then_list_env_in_child() -> ! {
         .expect("spawn child");
     print!("{}", String::from_utf8_lossy(&out.stdout));
     std::process::exit(i32::from(!out.status.success()));
+}
+
+/// Strip the way `main` does, then report the names recorded at launch (`launch
+/// NAME`) and the names still in the environment (`live NAME`).
+fn strip_then_list_launch_env() -> ! {
+    crate::child_env::strip_run_injected();
+    for name in crate::child_env::launch_env_names().expect("recorded by the strip") {
+        println!("launch {}", name.to_string_lossy());
+    }
+    for (name, _) in std::env::vars_os() {
+        println!("live {}", name.to_string_lossy());
+    }
+    std::process::exit(0);
+}
+
+/// Strip the way `main` does, then run `verify-run-injected-env` against the
+/// baseline file named by `OUT_ENV`; a failure is printed as `main` prints it.
+fn strip_then_verify_run_injected_env() -> ! {
+    crate::child_env::strip_run_injected();
+    let baseline = std::env::var_os(OUT_ENV).expect("baseline path");
+    match crate::run_injected_env::verify(std::path::Path::new(&baseline)) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("xtask: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Strip the way `main` does, then locate the workspace the way every subcommand does.

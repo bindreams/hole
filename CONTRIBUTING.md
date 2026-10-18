@@ -2870,6 +2870,9 @@ and a rerun repeats the platform's whole job.
   or a packed branch ref in `rerun-if-changed`, and a missing path reruns the
   script on every invocation (`xtask-lib/src/git_rerun.rs`); and `sudo env`
   dropped `CARGO_INCREMENTAL`, which is part of every workspace unit's profile.
+  The strip is a prefix rule, so `hole-verify-run-env` runs under a real
+  `cargo run` and fails on any variable cargo started adding that is neither the
+  parent's, stripped, nor on `KEPT_TOOLCHAIN` (`xtask/src/run_injected_env.rs`).
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 

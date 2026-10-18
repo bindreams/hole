@@ -37,6 +37,7 @@ pub mod manifest;
 pub mod orchestrate;
 pub mod prek_split;
 pub mod pull_subrepo;
+pub mod run_injected_env;
 pub mod schemars_pin;
 pub mod skuld_label_coverage;
 pub mod stage;
@@ -422,6 +423,17 @@ pub enum Command {
         #[arg(long = "junit", required = true)]
         junits: Vec<PathBuf>,
     },
+    /// Verify that the startup strip covers every variable a real `cargo run`
+    /// added to xtask's environment — see `xtask::run_injected_env`. Run it as
+    /// `cargo run --package xtask -- verify-run-injected-env ...`, not through
+    /// the `cargo xtask` alias, after recording the parent's names.
+    VerifyRunInjectedEnv {
+        /// The names of the environment `cargo run` was started from, one per
+        /// line (`compgen -e > FILE` in bash, before the `cargo run`), relative
+        /// to the repo root unless absolute.
+        #[arg(long)]
+        parent_env_names: PathBuf,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -514,6 +526,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => global_net_state_conformance::verify(&repo_root()?, &job, Some(&step_prefix), record.as_deref()),
         Command::VerifyGlobalNetStateExecuted { expected, junits } => {
             global_net_state_conformance::verify_executed(&repo_root()?, &expected, &junits)
+        }
+        Command::VerifyRunInjectedEnv { parent_env_names } => {
+            run_injected_env::verify(&repo_root()?.join(parent_env_names))
         }
     }
 }

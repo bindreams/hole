@@ -712,6 +712,7 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
         "hole-build",
         "hole-verify-partition",
         "hole-verify-labels",
+        "hole-verify-run-env",
         "hole-test-non-tun",
     ] {
         g.insert(id, HOLE_LEGS.to_vec());

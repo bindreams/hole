@@ -4,25 +4,14 @@ use crate::child_env::is_run_injected;
 use crate::test_child::MODE_ENV;
 use std::path::PathBuf;
 
+/// What `cargo run` really adds is checked by `verify-run-injected-env` in CI
+/// (see `run_injected_env`); here the prefix rule's boundary is pinned.
 #[skuld::test]
-fn the_package_environment_cargo_run_injects_is_recognized() {
-    // Measured: `cargo run` (cargo 1.99.0) exports exactly these to the program it launches.
+fn the_package_environment_names_are_recognized() {
     for name in [
         "CARGO_MANIFEST_DIR",
         "CARGO_MANIFEST_PATH",
-        "CARGO_PKG_AUTHORS",
-        "CARGO_PKG_DESCRIPTION",
-        "CARGO_PKG_HOMEPAGE",
-        "CARGO_PKG_LICENSE",
-        "CARGO_PKG_LICENSE_FILE",
         "CARGO_PKG_NAME",
-        "CARGO_PKG_README",
-        "CARGO_PKG_REPOSITORY",
-        "CARGO_PKG_RUST_VERSION",
-        "CARGO_PKG_VERSION",
-        "CARGO_PKG_VERSION_MAJOR",
-        "CARGO_PKG_VERSION_MINOR",
-        "CARGO_PKG_VERSION_PATCH",
         "CARGO_PKG_VERSION_PRE",
     ] {
         assert!(is_run_injected(name), "{name}");
@@ -95,6 +84,29 @@ fn a_child_spawned_after_the_startup_strip_does_not_inherit_the_injected_variabl
         .filter(|n| crate::child_env::is_run_injected(n))
         .collect();
     assert!(leaked.is_empty(), "children inherited {leaked:?}");
+}
+
+/// The strip removes the injected variables from the environment but records
+/// the names it was launched with, for `verify-run-injected-env` (the check reads
+/// what `cargo run` really added, which the strip must not hide from it).
+#[skuld::test]
+fn the_launch_names_outlive_the_strip_and_none_exist_before_it() {
+    // Only a process that stripped has a record; this test process never does.
+    assert!(crate::child_env::launch_env_names().is_none());
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .env(MODE_ENV, "strip-then-list-launch-env")
+        .env("CARGO_MANIFEST_DIR", "/injected")
+        .env("CARGO_INCREMENTAL", "0")
+        .output()
+        .expect("spawn the process under test");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8(out.stdout).expect("utf-8");
+    let launch: Vec<&str> = report.lines().filter_map(|l| l.strip_prefix("launch ")).collect();
+    let live: Vec<&str> = report.lines().filter_map(|l| l.strip_prefix("live ")).collect();
+    assert!(launch.contains(&"CARGO_MANIFEST_DIR"), "{report}");
+    assert!(launch.contains(&"CARGO_INCREMENTAL"), "{report}");
+    assert!(!live.contains(&"CARGO_MANIFEST_DIR"), "{report}");
+    assert!(live.contains(&"CARGO_INCREMENTAL"), "{report}");
 }
 
 /// The strip is sound only while `main` is single-threaded, and `ctrlc` (behind

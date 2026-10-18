@@ -522,6 +522,28 @@ jobs:
           .github/scripts/fail-on-compile.sh
           cargo run --package xtask -- verify-global-net-state-labels --record target/global-net-state-expected.json
 
+      # The startup strip (`child_env::strip_run_injected`) removes what `cargo
+      # run` injects by a prefix rule, so a variable cargo adds later would slip
+      # through it and make `ring`'s build script rerun. `verify-run-injected-env`
+      # runs under a real `cargo run` and fails on any variable it was launched
+      # with that is neither this step's own, nor stripped, nor on its list of
+      # kept toolchain names. The names cargo's parent had are recorded here,
+      # before cargo is involved. `compgen -e` lists exported names (values with
+      # newlines cannot corrupt it); `_` is added by hand because bash puts it in
+      # the environment of every external command it runs, `fail-on-compile.sh`
+      # included, but it is not exported while the builtin runs.
+      - id: hole-verify-run-env
+        name: Verify the startup strip covers what cargo run injects
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: bash
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
+        run: |
+          mkdir -p target
+          { compgen -e; echo _; } > target/run-parent-env-names.txt
+          .github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-run-injected-env --parent-env-names target/run-parent-env-names.txt
+
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
       # feature set -> different fingerprint -> fresh build), whose build.rs

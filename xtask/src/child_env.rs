@@ -10,7 +10,9 @@
 //! that depends on `ring` (the whole shadowsocks and quinn stack) recompiles.
 //! [`strip_run_injected`] removes the variables from xtask's own environment
 //! once, at startup, so no spawn can inherit them and both spellings of a build
-//! share one set of fingerprints.
+//! share one set of fingerprints. It first records the names it was launched with
+//! ([`launch_env_names`]), which `verify-run-injected-env` checks against a real
+//! `cargo run` (see `run_injected_env`).
 //!
 //! `CARGO_MANIFEST_DIR` is also how [`xtask_lib::repo_root::repo_root`] finds
 //! the workspace when the binary does not live under it (a `CARGO_TARGET_DIR`
@@ -31,6 +33,10 @@ use anyhow::Result;
 /// answer from the executable's location instead.
 static WORKSPACE_ROOT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
 
+/// The names this process was launched with, recorded by [`strip_run_injected`]
+/// before it removed any.
+static LAUNCH_ENV_NAMES: OnceLock<Vec<OsString>> = OnceLock::new();
+
 /// The workspace root. After [`strip_run_injected`] this is what it resolved at
 /// startup; before it (tests, library callers) it is looked up now.
 pub fn repo_root() -> Result<PathBuf> {
@@ -39,6 +45,12 @@ pub fn repo_root() -> Result<PathBuf> {
         Some(Err(why)) => Err(anyhow::anyhow!("{why}")),
         None => xtask_lib::repo_root::repo_root(),
     }
+}
+
+/// The names this process was launched with, as [`strip_run_injected`] saw them
+/// before it removed any; `None` until it has run.
+pub fn launch_env_names() -> Option<&'static [OsString]> {
+    LAUNCH_ENV_NAMES.get().map(Vec::as_slice)
 }
 
 /// Is `name` one of the variables `cargo run` sets for the program it launches?
@@ -59,10 +71,13 @@ pub fn is_run_injected(name: &str) -> bool {
 /// with every concurrent environment read.
 pub fn strip_run_injected() {
     let _ = WORKSPACE_ROOT.set(xtask_lib::repo_root::repo_root().map_err(|e| format!("{e:#}")));
-    let injected: Vec<OsString> = std::env::vars_os()
-        .map(|(name, _)| name)
+    let launch: Vec<OsString> = std::env::vars_os().map(|(name, _)| name).collect();
+    let injected: Vec<OsString> = launch
+        .iter()
         .filter(|name| name.to_str().is_some_and(is_run_injected))
+        .cloned()
         .collect();
+    let _ = LAUNCH_ENV_NAMES.set(launch);
     for name in injected {
         // SAFETY: single-threaded by the caller's contract (see above), so no other
         // thread can be reading or writing the environment. In `xtask`'s `main`
