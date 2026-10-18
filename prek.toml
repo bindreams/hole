@@ -214,7 +214,9 @@ hooks = [
 repo = "https://github.com/google/yapf"
 rev = "v0.43.0"
 hooks = [
-  { id = "yapf" },
+  # yapf writes its lib2to3 grammar pickle on first use in a hook environment;
+  # prek's parallel slices race on it (EOFError: Ran out of input).
+  { id = "yapf", require_serial = true },
 ]
 
 # Two mdformat envs: gfm escapes MyST footnote definitions (`[^1]:` -> `\[^1\]:`),
