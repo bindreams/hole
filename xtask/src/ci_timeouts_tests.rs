@@ -1,12 +1,14 @@
 //! Unit tests for the installer-assembly detectors, the per-step timeout
-//! audit, and the `ci_installer_assembly_steps_share_a_timeout_budget` and
-//! `ci_steps_declare_a_literal_timeout` structural conformance tests.
+//! audits, and the `ci_installer_assembly_steps_share_a_timeout_budget`,
+//! `ci_steps_declare_a_literal_timeout` and
+//! `ci_step_budgets_sit_on_the_five_minute_grid` structural conformance tests.
 
 use std::collections::BTreeSet;
 use std::fs;
 
 use crate::ci_timeouts::{
-    assembles_installer, installer_assembly_step_timeouts, steps_without_literal_timeout, xtask_target,
+    assembles_installer, installer_assembly_step_timeouts, steps_off_the_budget_grid, steps_without_literal_timeout,
+    xtask_target,
 };
 use crate::manifest::Manifest;
 
@@ -421,6 +423,63 @@ fn an_unknown_job_is_an_error_for_the_timeout_audit() {
     assert!(format!("{err:#}").contains("\"ci\""), "unexpected error: {err:#}");
 }
 
+// ===== steps_off_the_budget_grid =====================================================================================
+
+/// The header rule rounds a step budget up to 5m and gives a step under 4m 5m,
+/// so a literal below 5 or not a multiple of 5 contradicts it. Expressions and
+/// absent bounds are `steps_without_literal_timeout`'s business, not this one's.
+#[skuld::test]
+fn budgets_below_five_or_off_the_five_minute_grid_are_named() {
+    let ci = r#"
+jobs:
+  ci:
+    steps:
+      - uses: actions/checkout@v7
+      - id: five
+        timeout-minutes: 5
+        run: echo
+      - id: three
+        timeout-minutes: 3
+        run: echo
+      - id: twelve
+        timeout-minutes: 12
+        run: echo
+      - id: zero
+        timeout-minutes: 0
+        run: echo
+      - id: quoted-seven
+        timeout-minutes: "7"
+        run: echo
+      - id: eighty
+        timeout-minutes: 80
+        run: echo
+      - id: templated
+        timeout-minutes: ${{ matrix.timeout }}
+        run: echo
+  other:
+    steps:
+      - id: elsewhere
+        timeout-minutes: 3
+        run: echo
+"#;
+    let off = steps_off_the_budget_grid(ci, "ci").expect("analyze");
+    assert_eq!(
+        off,
+        vec![
+            ("three".to_string(), 3),
+            ("twelve".to_string(), 12),
+            ("zero".to_string(), 0),
+            ("quoted-seven".to_string(), 7),
+        ]
+    );
+}
+
+#[skuld::test]
+fn an_unknown_job_is_an_error_for_the_budget_grid_audit() {
+    let err = steps_off_the_budget_grid("jobs:\n  a:\n    steps: []\n", "ci").unwrap_err();
+    assert!(format!("{err:#}").contains("\"ci\""), "unexpected error: {err:#}");
+}
+
 // ===== conformance ===================================================================================================
 
 /// Every `ci.yaml` step that assembles a release installer carries the same
@@ -478,5 +537,20 @@ fn ci_steps_declare_a_literal_timeout() {
         missing.is_empty(),
         "these steps of the `ci` job declare no literal timeout-minutes, so a hang runs to the job wall \
          and the wall destroys the step's log: {missing:?}"
+    );
+}
+
+/// Every literal step budget of the `ci` job follows the header rule in
+/// `ci.yaml`: a multiple of 5, never below 5.
+#[skuld::test]
+fn ci_step_budgets_sit_on_the_five_minute_grid() {
+    let root = crate::repo_root().expect("repo root");
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
+
+    let off = steps_off_the_budget_grid(&ci_yaml, "ci").expect("analyze ci.yaml");
+    assert!(
+        off.is_empty(),
+        "these steps of the `ci` job have a timeout-minutes that is below 5 or not a multiple of 5, \
+         against the step-budget rule in ci.yaml's header: {off:?}"
     );
 }

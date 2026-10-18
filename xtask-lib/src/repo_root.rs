@@ -32,15 +32,16 @@ pub fn repo_root() -> Result<PathBuf> {
 /// Only xtask knows that root; no ambient signal can stand in for it, because
 /// a hand run of one checkout's binary from another checkout and a launch
 /// with `target/` redirected into another checkout present the same
-/// executable and working directory. A set value must itself be a hole root
-/// (`[workspace]` manifest and `crates/hole`); anything else is an error
-/// naming it, never a fallback.
+/// executable and working directory. A set value must itself be an absolute
+/// path to a hole root (`[workspace]` manifest and `crates/hole`); anything
+/// else is an error naming it, never a fallback.
 ///
 /// Unset (a standalone run), it is the first of `CARGO_MANIFEST_DIR`, the
 /// executable's location and the working directory whose enclosing workspace
 /// is a hole root. Only a hole root is accepted, so a launch from inside some
 /// other workspace cannot redirect the lookup, and a binary run by hand
-/// belongs to the checkout it sits in.
+/// belongs to the checkout it sits in. A relative or empty `CARGO_MANIFEST_DIR`
+/// is an error naming it.
 ///
 /// Errors name each location tried.
 pub fn repo_root_from_launch_dir() -> Result<PathBuf> {
@@ -76,6 +77,15 @@ pub(crate) fn hole_root_for_launch(
             root.display()
         );
         return Ok(root.to_path_buf());
+    }
+    // Same reason as the handoff. Cargo always sets it absolute, so only a hand-set
+    // value trips this; the exe and cwd come from the OS and are absolute.
+    if let Some(dir) = manifest_dir {
+        anyhow::ensure!(
+            dir.is_absolute(),
+            "CARGO_MANIFEST_DIR is {}, which is not an absolute path",
+            dir.display()
+        );
     }
     let candidates = [
         ("CARGO_MANIFEST_DIR", manifest_dir),

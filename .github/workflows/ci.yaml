@@ -813,7 +813,7 @@ jobs:
       - id: hole-verify-executed
         name: "Verify every global_net_state test executed (windows leg, #999)"
         if: ${{ !cancelled() && steps.hole-test-non-tun.outcome == 'success' && steps.hole-test-tun.outcome == 'success' }}
-        timeout-minutes: 3
+        timeout-minutes: 5
         shell: bash
         env:
           CARGO_LOG: cargo::core::compiler::fingerprint=info

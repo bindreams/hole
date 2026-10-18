@@ -2,8 +2,9 @@
 //! timeout budget does each carry, and does every step of the unified `ci` job
 //! carry one?
 //!
-//! Backs the `ci_installer_assembly_steps_share_a_timeout_budget` and
-//! `ci_steps_declare_a_literal_timeout` conformance tests. Assembling an
+//! Backs the `ci_installer_assembly_steps_share_a_timeout_budget`,
+//! `ci_steps_declare_a_literal_timeout` and
+//! `ci_step_budgets_sit_on_the_five_minute_grid` conformance tests. Assembling an
 //! installer is the most expensive thing CI does — a full release build of
 //! `hole`, then the bundler, then the package's own test suite — so those steps
 //! sit closest to their `timeout-minutes`. When two of them do that same work
@@ -178,16 +179,21 @@ pub fn installer_assembly_step_timeouts(
 /// Step label → declared `timeout-minutes`, for the steps of `job_id` that
 /// declare a literal one.
 pub fn step_timeouts(ci_yaml: &str, job_id: &str) -> Result<BTreeMap<String, u64>> {
+    Ok(step_timeouts_in_order(ci_yaml, job_id)?.into_iter().collect())
+}
+
+/// [`step_timeouts`] in file order.
+fn step_timeouts_in_order(ci_yaml: &str, job_id: &str) -> Result<Vec<(String, u64)>> {
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let job = ci
         .jobs
         .get(job_id)
         .with_context(|| format!("ci.yaml declares no job {job_id:?}"))?;
-    let mut out = BTreeMap::new();
+    let mut out = Vec::new();
     for (i, step) in job.steps.iter().enumerate() {
         let label = step.label(i);
         if let Some(Ok(minutes)) = step.timeout_minutes.as_ref().map(|v| resolve_timeout(&label, v)) {
-            out.insert(label, minutes);
+            out.push((label, minutes));
         }
     }
     Ok(out)
@@ -216,6 +222,21 @@ pub fn steps_without_literal_timeout(ci_yaml: &str, job_id: &str) -> Result<Vec<
                 .is_some_and(|v| resolve_timeout(&label, v).is_ok())
         })
         .map(|(i, step)| step.label(i))
+        .collect())
+}
+
+/// The step-budget granule in `ci.yaml`'s header: budgets round up to it, and a
+/// step measured under four minutes gets one granule.
+const BUDGET_GRID: u64 = 5;
+
+/// (label, minutes) of the steps of `job_id` whose literal `timeout-minutes`
+/// is below [`BUDGET_GRID`] or not a multiple of it, against the step-budget
+/// rule in `ci.yaml`'s header. A step with no literal budget is not named here;
+/// [`steps_without_literal_timeout`] reports it.
+pub fn steps_off_the_budget_grid(ci_yaml: &str, job_id: &str) -> Result<Vec<(String, u64)>> {
+    Ok(step_timeouts_in_order(ci_yaml, job_id)?
+        .into_iter()
+        .filter(|(_, minutes)| *minutes < BUDGET_GRID || minutes % BUDGET_GRID != 0)
         .collect())
 }
 

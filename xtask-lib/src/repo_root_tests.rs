@@ -199,3 +199,49 @@ fn a_relative_handoff_is_an_error_even_when_it_names_a_hole_root_from_the_cwd() 
         .to_string();
     assert!(err.contains("HOLE_DEV_REPO_ROOT"), "{err}");
 }
+
+// A relative `CARGO_MANIFEST_DIR` -------------------------------------------------------------------------------------
+
+/// A hand-set value is judged against the cwd here and again after
+/// dev-console changes into the root, so it is refused rather than skipped:
+/// the exe and cwd would otherwise mask it in some launches and not others.
+#[skuld::test]
+fn a_relative_or_empty_manifest_dir_is_an_error_naming_the_variable_never_a_fallback() {
+    let hole = workspace(true); // a perfectly good exe and cwd
+    for bad in [Path::new("crates/foo"), Path::new("")] {
+        let err = lookup(Some(bad), Some(hole.path()), Some(hole.path()))
+            .expect_err(&format!("{bad:?} is not absolute"))
+            .to_string();
+        assert!(err.contains("CARGO_MANIFEST_DIR"), "{bad:?}: {err}");
+        assert!(err.contains(&bad.display().to_string()), "{bad:?}: {err}");
+    }
+}
+
+// Unix only: the relative spelling below assumes one filesystem root.
+#[cfg(unix)]
+#[skuld::test]
+fn a_relative_manifest_dir_is_an_error_even_when_it_names_a_hole_root_from_the_cwd() {
+    let hole = workspace(true);
+    let cwd = std::env::current_dir().unwrap();
+    let mut relative = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(hole.path().strip_prefix("/").unwrap());
+    assert!(
+        relative.join("crates").join("hole").is_dir(),
+        "HARNESS: {relative:?} must name the hole root from the cwd"
+    );
+    let err = lookup(Some(&relative), Some(hole.path()), Some(hole.path()))
+        .expect_err("a relative CARGO_MANIFEST_DIR must be refused")
+        .to_string();
+    assert!(err.contains("CARGO_MANIFEST_DIR"), "{err}");
+}
+
+/// The handoff is checked first, so a valid one never reaches the manifest dir.
+#[skuld::test]
+fn a_valid_handoff_is_unaffected_by_a_relative_manifest_dir() {
+    let pinned = workspace(true);
+    let found = hole_root_for_launch(Some(pinned.path()), Some(Path::new("crates/foo")), None, None).unwrap();
+    assert!(same(&found, pinned.path()), "{found:?}");
+}
