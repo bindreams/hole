@@ -19,22 +19,29 @@ pub const DEV_REPO_ROOT_ENV: &str = "HOLE_DEV_REPO_ROOT";
 /// A relative or empty `CARGO_MANIFEST_DIR` is an error naming it.
 pub fn repo_root() -> Result<PathBuf> {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
-    let exe = std::env::current_exe().context("current_exe")?;
-    workspace_root_for(manifest_dir.as_deref(), exe.parent())
+    workspace_root_for(manifest_dir.as_deref(), || {
+        let exe = std::env::current_exe().context("current_exe")?;
+        Ok(exe.parent().map(Path::to_path_buf))
+    })
 }
 
 /// [`repo_root`] over explicit locations, so tests need not touch the process
 /// environment. A relative or empty `CARGO_MANIFEST_DIR` is an error, not a
 /// skipped candidate: the root it yields is relative to the cwd, and callers
-/// `join` onto it after changing directory.
-pub(crate) fn workspace_root_for(manifest_dir: Option<&Path>, exe_dir: Option<&Path>) -> Result<PathBuf> {
+/// `join` onto it after changing directory. `exe_dir` is asked only when the
+/// manifest dir does not answer, so a host where `current_exe` fails still
+/// resolves through it.
+pub(crate) fn workspace_root_for(
+    manifest_dir: Option<&Path>,
+    exe_dir: impl FnOnce() -> Result<Option<PathBuf>>,
+) -> Result<PathBuf> {
     if let Some(dir) = manifest_dir {
         ensure_absolute_manifest_dir(dir)?;
         if let Ok(root) = repo_root_from(dir) {
             return Ok(root);
         }
     }
-    repo_root_from(exe_dir.unwrap_or(Path::new("/")))
+    repo_root_from(exe_dir()?.as_deref().unwrap_or(Path::new("/")))
 }
 
 /// Cargo always sets `CARGO_MANIFEST_DIR` absolute, so only a hand-set value
@@ -42,8 +49,8 @@ pub(crate) fn workspace_root_for(manifest_dir: Option<&Path>, exe_dir: Option<&P
 fn ensure_absolute_manifest_dir(dir: &Path) -> Result<()> {
     anyhow::ensure!(
         dir.is_absolute(),
-        "CARGO_MANIFEST_DIR is {}, which is not an absolute path",
-        dir.display()
+        "CARGO_MANIFEST_DIR is {:?}, which is not an absolute path",
+        dir.display().to_string()
     );
     Ok(())
 }
@@ -96,7 +103,7 @@ pub(crate) fn hole_root_for_launch(
         // again after dev-console changes into it.
         anyhow::ensure!(
             root.is_absolute() && is_hole_root(root),
-            "{DEV_REPO_ROOT_ENV} is {}, which is not an absolute path to a hole root (needs a [workspace] Cargo.toml and crates/hole)",
+            "{DEV_REPO_ROOT_ENV} is {:?}, which is not an absolute path to a hole root (needs a [workspace] Cargo.toml and crates/hole)",
             root.display()
         );
         return Ok(root.to_path_buf());

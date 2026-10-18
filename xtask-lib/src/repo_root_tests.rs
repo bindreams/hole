@@ -252,14 +252,33 @@ fn a_valid_handoff_is_unaffected_by_a_relative_manifest_dir() {
 fn the_workspace_lookup_prefers_an_absolute_manifest_dir_and_falls_back_to_the_exe() {
     let manifest = workspace(false);
     let exe = workspace(false);
-    let found = workspace_root_for(Some(manifest.path()), Some(exe.path())).unwrap();
+    let found = workspace_root_for(Some(manifest.path()), || Ok(Some(exe.path().to_path_buf()))).unwrap();
     assert!(same(&found, manifest.path()), "{found:?}");
 
     // An absolute manifest dir outside every workspace, or none at all: the exe.
     let none = tempfile::tempdir().unwrap();
     for manifest in [Some(none.path()), None] {
-        let found = workspace_root_for(manifest, Some(exe.path())).unwrap();
+        let found = workspace_root_for(manifest, || Ok(Some(exe.path().to_path_buf()))).unwrap();
         assert!(same(&found, exe.path()), "{found:?}");
+    }
+}
+
+#[skuld::test]
+fn the_workspace_lookup_asks_for_the_exe_only_when_the_manifest_dir_does_not_answer() {
+    let manifest = workspace(false);
+    let found = workspace_root_for(Some(manifest.path()), || {
+        panic!("the exe was looked up although the manifest dir answered")
+    })
+    .unwrap();
+    assert!(same(&found, manifest.path()), "{found:?}");
+
+    // Asked, and failing: its error is the answer, as when `current_exe` fails.
+    let none = tempfile::tempdir().unwrap();
+    for manifest in [Some(none.path()), None] {
+        let err = workspace_root_for(manifest, || Err(anyhow::anyhow!("no exe here")))
+            .expect_err("the exe lookup failed")
+            .to_string();
+        assert!(err.contains("no exe here"), "{err}");
     }
 }
 
@@ -267,7 +286,7 @@ fn the_workspace_lookup_prefers_an_absolute_manifest_dir_and_falls_back_to_the_e
 fn the_workspace_lookup_refuses_a_relative_or_empty_manifest_dir_naming_the_variable() {
     let ws = workspace(false); // the exe would answer if the bad value were skipped
     for bad in [Path::new("crates/foo"), Path::new("")] {
-        let err = workspace_root_for(Some(bad), Some(ws.path()))
+        let err = workspace_root_for(Some(bad), || Ok(Some(ws.path().to_path_buf())))
             .expect_err(&format!("{bad:?} is not absolute"))
             .to_string();
         assert!(err.contains("CARGO_MANIFEST_DIR"), "{bad:?}: {err}");
@@ -290,7 +309,7 @@ fn the_workspace_lookup_refuses_a_relative_manifest_dir_that_names_a_workspace_f
         relative.join("Cargo.toml").is_file(),
         "HARNESS: {relative:?} must name the workspace from the cwd"
     );
-    let err = workspace_root_for(Some(&relative), Some(ws.path()))
+    let err = workspace_root_for(Some(&relative), || Ok(Some(ws.path().to_path_buf())))
         .expect_err("a relative CARGO_MANIFEST_DIR must be refused")
         .to_string();
     assert!(err.contains("CARGO_MANIFEST_DIR"), "{err}");
