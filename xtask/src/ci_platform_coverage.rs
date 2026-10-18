@@ -183,7 +183,6 @@ fn run_job(leg: &Leg, ci_yaml: &str, job_id: &str, failing: Option<&str>) -> Res
     for (i, step) in job.steps.iter().enumerate() {
         let id = step_id(step, i)?;
         let runs = match &step.if_ {
-            // No `if:` is an implicit `success()`.
             None => failed.is_none(),
             Some(cond) => {
                 let text = condition_text(cond).with_context(|| format!("step {id:?}"))?;

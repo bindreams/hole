@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   # One job per platform, each building, linting and testing everything that
-  # platform ships: six runners per PR instead of forty-odd, two of them macOS.
+  # platform ships.
   #
   # A leg checks out and provisions once, then runs the lanes its matrix flags
   # select, in a fixed order, on one target dir and one sccache. Every lane step
@@ -80,8 +80,8 @@ jobs:
       # Provisioning ===================================================================================================
       # Step budgets: 1.25 x the worst measured step, rounded up to 5m; a step
       # that was a whole job keeps that job's budget. Steps measured under 4m get
-      # 5m. One number per step, the slowest leg's, as for the old per-step
-      # budgets: the spread within a step is smaller than the margin.
+      # 5m. One number per step, the slowest leg's: the spread within a step is
+      # smaller than the margin.
 
       - id: checkout
         uses: actions/checkout@v7
@@ -326,9 +326,8 @@ jobs:
       # Release builds; they re-run the sidecar cascade, so they precede
       # `hole-build`. Budget 80 for both assembly steps, held equal by
       # `ci_installer_assembly_steps_share_a_timeout_budget`; sized for a cold
-      # sccache (GitHub evicts entries untouched for 7 days). Observed maxima over
-      # 200 runs: MSI 18.8m, DMG 50.8m on darwin/amd64 (a failed run; 46.4m the
-      # slowest green).
+      # sccache (GitHub evicts entries untouched for 7 days); the maxima are in
+      # STEP-LEVEL BUDGETS below.
 
       # `scripts/*` of the MSI project: unit tests of the assembly, no build.
       - id: installer-pytest
@@ -476,7 +475,7 @@ jobs:
       # profile, so the lanes below re-execute these binaries (see #200 for the
       # NDIS-loopback corruption that motivates running TUN tests last).
       #
-      # Budget 70: worst measured 52.4m on darwin/amd64 (median 27.8m, p90 38.4m).
+      # Budget 70 (STEP-LEVEL BUDGETS below).
       - id: hole-build
         name: Build hole test binaries
         if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole == true }}
@@ -541,6 +540,9 @@ jobs:
       #
       #   non-TUN   windows 23.2m   darwin/amd64 32.3m   darwin/arm64 13.7m  -> 45
       #   TUN       windows  6.4m   darwin/amd64 21.2m   darwin/arm64  8.1m  -> 30
+      #   hole-build   darwin/amd64 52.4m (median 27.8m, p90 38.4m)               -> 70
+      #   installers   MSI 18.8m (windows)   DMG 50.8m (darwin/amd64, a failed
+      #                run; 46.4m the slowest green)                              -> 80
       #
       # Slow runs are part of that spread, not outliers: darwin/amd64's 32.3m and
       # 21.2m are one run. Raised only, never tightened.
@@ -800,8 +802,7 @@ jobs:
       # WINDOWS LEG ONLY, and the name says so: the darwin legs would need their
       # own pair of `non-tun`/`tun` profiles too, but their walls are the scarce
       # resource this repo protects, so extending the proof there is a
-      # separately-measured decision. Nothing here claims the group is proven
-      # executed anywhere else.
+      # separately-measured decision.
       #
       # Gated on both lanes passing rather than on `success()`: the proof answers
       # "did everything run", which is only interesting once "did everything
@@ -835,16 +836,14 @@ jobs:
       # rebuilds instead of reusing the prebuilt binaries, and so must every
       # variable cargo hashes. `sudo env` replaces the whole environment: without
       # `CARGO_INCREMENTAL` (0, from the toolchain action; it is part of every
-      # workspace unit's profile) all twenty workspace crates were recompiled as
-      # root, so it is forwarded (`a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint`).
+      # workspace unit's profile) every workspace unit is recompiled as root, so it
+      # is forwarded (`a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint`).
       # NEXTEST_PROFILE=tun (see the windows TUN step's comment above): this
       # step runs under `sudo`, so without a lane-specific profile it would
       # write a ROOT-owned `target/nextest/default/junit.xml` that no
       # subsequent unprivileged `cargo nextest run` in this checkout could
       # overwrite or clean up (exit 110) even though the tests themselves had
-      # already passed. It is
-      # the ONLY step here that runs privileged, and the last that runs a
-      # toolchain.
+      # already passed.
       - id: hole-test-tun-macos
         name: Test (TUN, macOS — root for pfctl)
         if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'darwin' }}
