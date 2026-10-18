@@ -2394,11 +2394,8 @@ respawns the now-swapped binary.
 `NotifyServiceStatusChangeW` call whose callback has not run (mechanics:
 `cutover::registration`): one 88-byte record (64-bit Windows; `size_of` of the
 record, asserted at compile time) per call that did not settle, including each
-`ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` return. The LAGGING retry has no cap, so N
-finite LAGGING returns before a success leak N records. Per actor the leak is
-unbounded only under an unbounded run of LAGGING returns; across a process it is
-one record per unsettled call, so it also grows with each actor dropped while
-pending. Do not "fix" the leak without a
+`ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` return. Nothing caps how many such calls
+are made (the LAGGING retry has no cap), so nothing caps the leak. Do not "fix" the leak without a
 Win32 measurement showing that closing the service handle recalls a queued APC
 and that a failed call queues none.
 

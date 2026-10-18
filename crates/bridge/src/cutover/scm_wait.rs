@@ -301,11 +301,8 @@ mod system {
     /// wait. An unsettled record is leaked (see CONTRIBUTING.md): one record
     /// (88 bytes on 64-bit Windows) per `NotifyServiceStatusChangeW` call that
     /// did not settle, i.e. that dropped pending, failed, or returned
-    /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`. The LAGGING retry has no cap, so
-    /// N LAGGING returns before a success leak N records. Per actor the leak is
-    /// unbounded only under an unbounded run of LAGGING returns; across a
-    /// process it is one record per unsettled call, so it also grows with the
-    /// number of actors dropped while pending.
+    /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`. Nothing caps how many such calls
+    /// are made (the LAGGING retry has no cap), so nothing caps the leak.
     pub struct SystemScmActor<H: Hooks = NoHooks> {
         /// `None` only after a `reopen` that failed part-way; every use then errs.
         /// Declared before `arming` so the handles close first on drop.

@@ -1,8 +1,9 @@
 //! The SCM and service handles, closed by `Drop` and nowhere else.
 //!
 //! `ScHandle`'s field is private to this module and `CloseServiceHandle` is
-//! imported only here, so no other code can build a handle, copy one out to
-//! close, or close one twice. A closed handle value may be reused by the OS for
+//! imported only here, so no other code can build an `ScHandle` or close one
+//! through it. `Handles::service` hands out the raw `SC_HANDLE` for SCM calls;
+//! closing that copy is the one thing callers must not do. A closed handle value may be reused by the OS for
 //! an unrelated handle, and closing a handle that is not live can fault
 //! (measured for NULL), so a second close is never relied on to report.
 
