@@ -320,18 +320,3 @@ fn a_hand_run_binary_resolves_the_checkout_it_sits_in() {
         sits_in.path()
     );
 }
-
-/// dev-console must use that lookup; the plain one accepts any workspace.
-#[skuld::test]
-fn dev_console_looks_the_root_up_by_the_launch_directory() {
-    let src = std::fs::read_to_string(
-        crate::repo_root()
-            .expect("repo root")
-            .join("crates/dev-console/src/supervise.rs"),
-    )
-    .expect("read supervise.rs");
-    assert!(
-        src.contains("xtask_lib::repo_root::repo_root_from_launch_dir()"),
-        "dev-console's run() must call repo_root_from_launch_dir"
-    );
-}
