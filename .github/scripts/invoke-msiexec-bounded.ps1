@@ -297,6 +297,21 @@ if ($proc.ExitCode -ne 0) {
     } catch {
         Write-Host "(failed to read ${LogPath}: $($_.Exception.Message))"
     }
+    # The custom actions' own `hole bridge ...` log (they have no console; the
+    # MSI log above records only their exit codes), written under the SYSTEM
+    # profile. Printed here so the cause is in the job log, not only in an
+    # artifact.
+    $cliLogDir = Join-Path $env:SystemRoot 'System32\config\systemprofile\AppData\Local\hole\logs'
+    try {
+        if (Test-Path $cliLogDir) {
+            foreach ($cliLog in Get-ChildItem $cliLogDir -File) {
+                Write-Host "--- $($cliLog.FullName) ---"
+                Get-Content $cliLog.FullName -Tail 100 -ErrorAction Stop
+            }
+        }
+    } catch {
+        Write-Host "(failed to read ${cliLogDir}: $($_.Exception.Message))"
+    }
     $message = "msiexec $Verb failed with exit code $($proc.ExitCode)"
     if ($FailOnNonZeroExit) { throw $message } else { Write-Warning $message }
 }
