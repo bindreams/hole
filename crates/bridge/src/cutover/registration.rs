@@ -7,9 +7,8 @@
 //! therefore outlives its owner unless the callback is known to have run, and
 //! only the value can know that.
 //!
-//! The leak is bounded by the callers, not here: each [`Registration`] that
-//! drops unsettled costs one value, so the total is one per call that did not
-//! settle, and unbounded only if a caller keeps making such calls without limit.
+//! Each [`Registration`] that drops unsettled leaks its value. Nothing in this
+//! module limits how many are made.
 
 use std::ptr::NonNull;
 
