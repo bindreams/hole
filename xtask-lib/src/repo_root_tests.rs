@@ -285,10 +285,93 @@ fn the_workspace_lookup_asks_for_the_exe_only_when_the_manifest_dir_does_not_ans
     // Asked, and failing: its error is the answer, as when `current_exe` fails.
     let none = tempfile::tempdir().unwrap();
     for manifest in [Some(none.path()), None] {
-        let err = workspace_root_for(manifest, || Err(anyhow::anyhow!("no exe here")))
-            .expect_err("the exe lookup failed")
-            .to_string();
+        let err =
+            workspace_root_for(manifest, || Err(anyhow::anyhow!("no exe here"))).expect_err("the exe lookup failed");
+        let err = format!("{err:#}");
         assert!(err.contains("no exe here"), "{err}");
+        // The manifest dir was tried too, and the error says so.
+        if let Some(dir) = manifest {
+            assert!(
+                err.contains(&dir.display().to_string()),
+                "manifest dir missing from: {err}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn the_workspace_lookup_names_the_manifest_dir_when_the_exe_finds_no_workspace_either() {
+    let manifest = tempfile::tempdir().unwrap();
+    let exe = tempfile::tempdir().unwrap();
+    let err = workspace_root_for(Some(manifest.path()), || Ok(Some(exe.path().to_path_buf())))
+        .expect_err("no workspace anywhere")
+        .to_string();
+    for dir in [manifest.path(), exe.path()] {
+        assert!(err.contains(&dir.display().to_string()), "{dir:?} missing from: {err}");
+    }
+    assert!(err.contains("CARGO_MANIFEST_DIR"), "{err}");
+}
+
+// A `Cargo.toml` that exists but cannot be read -----------------------------------------------------------------------
+
+/// `outer` is a workspace; `outer/inner/Cargo.toml` is what `unreadable` makes of it.
+fn nest_unreadable_manifest(unreadable: fn(&Path)) -> (tempfile::TempDir, PathBuf) {
+    let outer = workspace(true);
+    let inner = outer.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    unreadable(&inner.join("Cargo.toml"));
+    (outer, inner)
+}
+
+/// Makes the manifest path unreadable.
+type Unreadable = (&'static str, fn(&Path));
+
+fn unreadable_manifests() -> [Unreadable; 2] {
+    [
+        ("a directory", |p| std::fs::create_dir(p).unwrap()),
+        ("invalid UTF-8", |p| std::fs::write(p, [0xff, 0xfe, 0x00]).unwrap()),
+    ]
+}
+
+/// Walking past an unreadable manifest would return the outer workspace, or a
+/// "not found" that never mentions the read failure.
+#[skuld::test]
+fn an_unreadable_manifest_on_the_way_up_is_an_error_naming_its_path() {
+    for (what, make) in unreadable_manifests() {
+        let (_outer, inner) = nest_unreadable_manifest(make);
+        let err = repo_root_from(&inner).expect_err(what);
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(&inner.join("Cargo.toml").display().to_string()),
+            "{what}: {err}"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_unreadable_manifest_is_an_error_for_the_launch_lookup_too() {
+    for (what, make) in unreadable_manifests() {
+        let (_outer, inner) = nest_unreadable_manifest(make);
+        let err = lookup(Some(&inner), None, None).expect_err(what);
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(&inner.join("Cargo.toml").display().to_string()),
+            "{what}: {err}"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_unreadable_handoff_manifest_is_an_error_naming_its_path() {
+    for (what, make) in unreadable_manifests() {
+        let (_outer, inner) = nest_unreadable_manifest(make);
+        std::fs::create_dir_all(inner.join("crates").join("hole")).unwrap();
+        let err = hole_root_for_launch(Some(&inner), None, None, None).expect_err(what);
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(&inner.join("Cargo.toml").display().to_string()),
+            "{what}: {err}"
+        );
     }
 }
 
