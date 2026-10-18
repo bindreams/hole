@@ -1968,8 +1968,10 @@ from an elevated administrator (a SYSTEM caller, the MSI custom action, cannot b
 reproduced by a test; its first answer is the CI installer test's uninstall);
 `..._start_of_a_stopped_service_marked_for_delete` calls `StartService` on a
 pre-opened handle after `DeleteService` of a STOPPED service with a restart
-pending and prints the answer (`ERROR_SERVICE_MARKED_FOR_DELETE` or a start), each
-with what it means for the drain; and
+pending and prints the answer with the start type read before and after the delete
+(a start, or a refusal: 1072 `ERROR_SERVICE_MARKED_FOR_DELETE`, or 1058
+`ERROR_SERVICE_DISABLED`, which a CI run measured), each with what it means for the
+drain; and
 `..._drain_of_a_start_pending_service_marked_for_delete` prints how the one
 arm-dependent drain state ends. Until a Windows run has printed them, the code
 assumes: a Stop in START_PENDING is refused (1061), and an arm reports the
@@ -1985,11 +1987,13 @@ and asserts no row and no process remains.
 Not measured, and depended on: a restart timer that fires between `DeleteService`
 and the close of the last handle. The drain's last look is taken before that
 close, so a start after it is covered only if the SCM refuses to start a service
-marked for deletion (`StartService` documents `ERROR_SERVICE_MARKED_FOR_DELETE`;
-the start-of-a-marked-service probe above measures it for a client's start, and
-the SCM's own recovery restart is assumed to apply the same check) or if changing
-the failure actions cancels a restart already pending. The drain is not correct
-for both of those being false; a probe that prints a successful start says so.
+marked for deletion, or if changing the failure actions cancels a restart already
+pending. A client's `StartService` on a marked, STOPPED service was measured
+refused with 1058 (disabled), not the documented 1072 (marked); the drain relies
+on a start being refused, whichever code, since nothing in the retirement writes
+the start type. The SCM's own recovery restart is assumed to apply the same check,
+which no probe measures. The drain is not correct for both of those being false; a
+probe that prints a successful start says so.
 
 Steps do not short-circuit each other and the error names all of them; an early
 `?` on the release swallowed the context that explains why it refused.
