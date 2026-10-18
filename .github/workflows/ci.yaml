@@ -34,7 +34,8 @@ jobs:
   #     and on macOS as root.
   #   - Windows: every user of loopback (compiles through sccache, tests, the
   #     installer E2E) runs before the TUN lane, which corrupts NDIS loopback
-  #     (#200). Only the #999 proof step, and uploads, follow it.
+  #     (#200). Only the #999 proof step, the job-level no-compile check, and
+  #     uploads follow it.
   #   - macOS: the TUN lane runs as root and leaves root-owned files in
   #     `target/`, so it is the last step that runs a toolchain.
   #

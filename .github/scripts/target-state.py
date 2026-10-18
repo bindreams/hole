@@ -33,13 +33,24 @@ def fail(err):
 
 
 def profile_dirs(target):
-    """Every directory under `target` that holds a `.fingerprint` directory
-    (`target/debug`, `target/<triple>/release`, ...)."""
+    """The profile directories cargo builds into: `target/<profile>` and
+    `target/<triple>/<profile>`, each holding a `.fingerprint` directory.
+
+    Only those two depths: a test that drives its own cargo (trybuild, under
+    `target/tests/trybuild/`) keeps a separate build tree deeper down, which is
+    not what the build step built and changes on every run."""
     found = []
-    for directory, subdirs, _ in os.walk(target, onerror=fail):
-        if ".fingerprint" in subdirs:
-            found.append(directory)
-            subdirs[:] = []
+    for first in sorted(os.listdir(target)):
+        level1 = os.path.join(target, first)
+        if not os.path.isdir(level1):
+            continue
+        if os.path.isdir(os.path.join(level1, ".fingerprint")):
+            found.append(level1)
+            continue
+        for second in sorted(os.listdir(level1)):
+            level2 = os.path.join(level1, second)
+            if os.path.isdir(os.path.join(level2, ".fingerprint")):
+                found.append(level2)
     return sorted(found)
 
 
