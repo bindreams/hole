@@ -38,6 +38,10 @@ pub const KEPT_TOOLCHAIN: &[(&str, &str)] = &[
         "macOS search path for the toolchain's dylibs, which the programs cargo runs load",
     ),
     (
+        "LD_LIBRARY_PATH",
+        "search path for the toolchain's shared libraries; cargo sets it on Windows too (CI-measured)",
+    ),
+    (
         "RUST_RECURSION_COUNT",
         "rustup proxy's loop guard; dropping it lets a mis-set proxy recurse unbounded",
     ),
