@@ -23,9 +23,8 @@ workspace = true
 [features]
 # Exposes the `test_utils` public module. Off by default — enabled
 # only by external consumers that want to use `WaitableWriter` in their
-# own tests (garter's own lib tests get it via `cfg(test)`). Production builds of
-# downstream crates (e.g. `hole`) do NOT enable this and therefore
-# do NOT pull in `tracing-subscriber`.
+# own tests. Production builds of downstream crates (e.g. `hole`) do NOT
+# enable this and therefore do NOT pull in `tracing-subscriber`.
 test-utils = ["dep:tracing-subscriber"]
 
 [dependencies]

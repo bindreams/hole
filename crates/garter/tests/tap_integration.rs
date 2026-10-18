@@ -65,16 +65,18 @@ async fn tap_relays_data_through_binary_plugin_to_echo_server() {
         .expect("connect to tap public listener");
 
     client.write_all(b"hello through tap+mock").await.unwrap();
-    let mut buf = [0u8; 1024];
-    let n = client.read(&mut buf).await.expect("read from tap returned error");
-    assert_eq!(&buf[..n], b"hello through tap+mock");
+    // A relay hop may split the echo, so a single `read` can return a prefix.
+    let mut buf = [0u8; b"hello through tap+mock".len()];
+    client.read_exact(&mut buf).await.expect("read from tap returned error");
+    assert_eq!(&buf, b"hello through tap+mock");
 
     drop(client);
     echo_task.abort();
     shutdown.cancel();
-    // Await the plugin task; if it hangs, the test framework's timeout
-    // surfaces a clear "test took too long" failure.
-    let _ = plugin_handle.await;
+    plugin_handle
+        .await
+        .expect("tap task panicked")
+        .expect("tap returned error");
 }
 
 // Install the workspace test subscriber + panic hook. See

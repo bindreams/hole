@@ -13,22 +13,24 @@
 //! [bindreams/hole#302](https://github.com/bindreams/hole/issues/302).
 //! `#[skuld::test] async fn` builds a current-thread runtime by default.
 //!
-//! `run_with_tap` takes the tap's public address from the real `ready`
-//! channel (the tap binds port 0 itself), so a start failure panics with
-//! `run()`'s return value instead of parking. The "tap closed" wait is the
-//! one remaining park, on a tracing event emitted by a task this test
-//! spawns and fully controls — not an out-of-process op — so
+//! `run_with_tap` takes the tap's public address from the `ready` channel
+//! (port 0); a start failure panics with `run()`'s result.
+//!
+//! Three waits remain unbounded in-process: the "tap closed" line,
+//! `client_body`, and the `plugin_handle.await` after `shutdown.cancel()`
+//! (the only park of
+//! `shutdown_cancels_in_flight_connection_without_panic`). Each waits on a
+//! task this test spawns and controls, not an out-of-process op, so
 //! CONTRIBUTING.md's no-synchronizing-via-time rule does not sanction a
-//! per-await `tokio::time::timeout` here (that exception is scoped to a
-//! remote or child-process op that might never succeed). It is raced against
-//! the plugin task, so a tap that exits first fails the test; a close line
-//! that never comes while the tap stays up is bounded at the nextest-config
-//! level — `.config/nextest.toml`'s override naming every test in this file
-//! that calls `run_with_tap` (or its inline twin in
-//! `shutdown_cancels_in_flight_connection_without_panic`) — the same
-//! `slow-timeout`/`terminate-after` mechanism already used for the
-//! `tun-engine` driver tests, for the identical reason: the wait has no
-//! happens-before edge to bound it any other way.
+//! per-await `tokio::time::timeout` (that exception is scoped to a remote or
+//! child-process op that might never succeed). The close wait is raced
+//! against the plugin task, so a tap that exits first fails the test. The
+//! rest are bounded at the nextest-config level: `.config/nextest.toml`'s
+//! override names every test in this file that calls `run_with_tap` or
+//! `shutdown_cancels_in_flight_connection_without_panic` -- the same
+//! `slow-timeout`/`terminate-after` mechanism as the `tun-engine` driver
+//! tests, for the identical reason: the waits have no happens-before edge to
+//! bound them any other way.
 
 // `CancellationToken::new` is the cancel-test harness root; module-level
 // allow per the hole workspace clippy.toml's "Bridge cancellation contract"
@@ -171,8 +173,7 @@ where
 
     let closed_rx = writer.wait_for("plugin tap: closed");
 
-    // Port 0: the tap binds its public listener itself and reports the
-    // address it got, so no port is picked, freed and re-bound.
+    // Port 0: the tap reports the address it bound via `ready`.
     let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let plugin_shutdown = shutdown.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -191,8 +192,7 @@ where
 
     client_body(local).await;
 
-    // The close line comes from a task inside the tap; if the tap itself
-    // exits first, that line will never come.
+    // The close line comes from a task inside the tap.
     let closed = tokio::task::spawn_blocking(move || closed_rx.recv());
     tokio::select! {
         r = closed => r.unwrap().expect("tap never logged close"),
@@ -200,7 +200,10 @@ where
     }
 
     shutdown.cancel();
-    let _ = plugin_handle.await;
+    plugin_handle
+        .await
+        .expect("tap task panicked")
+        .expect("tap returned error");
 
     writer.snapshot()
 }
