@@ -317,33 +317,30 @@ fn cutover_global_net_state_real_scm_restart_gates_on_running_callback() {
         .expect("SCM restart must reach RUNNING via NotifyServiceStatusChange");
 }
 
-/// Counts, per thread, the frees of blocks at least as large as the SCM's notify
-/// buffer, so a test can tell whether dropping a `SystemScmActor` released the
-/// buffer an in-flight notification may still name. Nothing about the SCM's
-/// queueing can be observed from outside the process, so the release itself is
-/// the observable.
+/// Reports whether this thread freed one watched block. The SCM's queueing is
+/// not observable from outside the process, so the release of the notify record
+/// itself is the observable.
 #[cfg(target_os = "windows")]
-mod large_frees {
+mod freed_watch {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
-    use windows::Win32::System::Services::SERVICE_NOTIFY_2W;
-
     thread_local! {
-        static COUNT: Cell<usize> = const { Cell::new(0) };
+        static WATCHED: Cell<usize> = const { Cell::new(0) };
+        static FREED: Cell<bool> = const { Cell::new(false) };
     }
 
-    pub struct CountingAlloc;
+    pub struct WatchingAlloc;
 
-    // SAFETY: every call forwards to `System`; the counter is a const-initialised
-    // thread-local `Cell` with no destructor, so counting never allocates.
-    unsafe impl GlobalAlloc for CountingAlloc {
+    // SAFETY: every call forwards to `System`; the watch state is const-initialised
+    // thread-local `Cell`s with no destructor, so watching never allocates.
+    unsafe impl GlobalAlloc for WatchingAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             unsafe { System.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            if layout.size() >= std::mem::size_of::<SERVICE_NOTIFY_2W>() {
-                COUNT.with(|c| c.set(c.get() + 1));
+            if ptr as usize == WATCHED.with(Cell::get) {
+                FREED.with(|f| f.set(true));
             }
             unsafe { System.dealloc(ptr, layout) }
         }
@@ -355,48 +352,97 @@ mod large_frees {
         }
     }
 
-    /// Blocks this thread has freed so far that are at least notify-buffer sized.
-    pub fn so_far() -> usize {
-        COUNT.with(Cell::get)
+    /// Starts watching the live block at `address`, forgetting any earlier watch.
+    pub fn watch(address: usize) {
+        WATCHED.with(|w| w.set(address));
+        FREED.with(|f| f.set(false));
+    }
+
+    /// Whether the watched block has been freed on this thread since `watch`.
+    pub fn was_freed() -> bool {
+        FREED.with(Cell::get)
     }
 }
 
 #[cfg(target_os = "windows")]
 #[global_allocator]
-static ALLOCATOR: large_frees::CountingAlloc = large_frees::CountingAlloc;
+static ALLOCATOR: freed_watch::WatchingAlloc = freed_watch::WatchingAlloc;
 
-/// A `SystemScmActor` dropped between `arm` and its callback must not free the
-/// notify buffer: the SCM may already have queued the APC that names it, and that
-/// APC runs at the thread's next alertable wait. The service is STOPPED and the
-/// arm waits for RUNNING, so nothing fires and the notification stays pending
-/// (SCM calls can themselves wait alertably, which would run an APC that is
-/// already queued and settle the record legitimately; a pending notification
-/// cannot be settled that way).
+/// Scripts the two SCM outcomes a live SCM will not produce on demand and
+/// records the address of every notify record a `SystemScmActor` creates.
+#[cfg(target_os = "windows")]
+struct Script {
+    /// The address of each record, in the order `arm` created them.
+    records: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    /// Per `NotifyServiceStatusChangeW` call: `Some(rc)` replaces the call.
+    notify: std::collections::VecDeque<Option<u32>>,
+    /// Per `reopen`: `Some(error)` makes the handles fail to open.
+    open: std::collections::VecDeque<Option<std::io::Error>>,
+    /// The call whose record to hand to `freed_watch` as it is created.
+    watch_call: Option<usize>,
+}
+
+#[cfg(target_os = "windows")]
+impl Script {
+    fn new() -> (Self, std::rc::Rc<std::cell::RefCell<Vec<usize>>>) {
+        let records = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let script = Self {
+            records: std::rc::Rc::clone(&records),
+            notify: Default::default(),
+            open: Default::default(),
+            watch_call: None,
+        };
+        (script, records)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl hole_bridge::cutover::scm_wait::Hooks for Script {
+    fn intercept_notify(&mut self, record: usize) -> Option<u32> {
+        let call = {
+            let mut records = self.records.borrow_mut();
+            records.push(record);
+            records.len() - 1
+        };
+        if self.watch_call == Some(call) {
+            freed_watch::watch(record);
+        }
+        self.notify.pop_front().flatten()
+    }
+
+    fn fail_open(&mut self) -> Option<std::io::Error> {
+        self.open.pop_front().flatten()
+    }
+}
+
+/// The service is STOPPED and the arm waits for RUNNING, so the notification stays
+/// pending; a pending notification cannot be settled by an alertable SCM call
+/// running a queued APC, which would legitimately free the record.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_dropping_an_actor_with_a_pending_notification_frees_no_notify_buffer() {
+fn cutover_global_net_state_dropping_an_actor_with_a_pending_notification_frees_no_notify_record() {
     use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let _service = ProvisionedService::install(helper);
 
-    let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the throwaway service");
+    let (mut script, records) = Script::new();
+    script.watch_call = Some(0);
+    let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
     actor.arm(WantState::Running).expect("arm against the stopped service");
-    let before = large_frees::so_far();
+    assert_eq!(records.borrow().len(), 1);
     drop(actor);
-    assert_eq!(
-        large_frees::so_far(),
-        before,
-        "dropping an actor whose notification has not been delivered freed a notify-buffer-sized block"
+    assert!(
+        !freed_watch::was_freed(),
+        "dropping an actor whose notification has not been delivered freed its notify record"
     );
 }
 
-/// The converse: once the callback has run nothing can name the buffer, so
-/// dropping the actor must release it rather than leak one per use.
+/// The converse of the test above.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_dropping_an_actor_after_its_callback_frees_the_notify_buffer() {
+fn cutover_global_net_state_dropping_an_actor_after_its_callback_frees_the_notify_record() {
     use hole_bridge::cutover::os::windows::WindowsCutoverOs;
     use hole_bridge::cutover::os::CutoverOs;
     use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
@@ -411,22 +457,50 @@ fn cutover_global_net_state_dropping_an_actor_after_its_callback_frees_the_notif
     os.start_service_wait_running()
         .expect("bring the throwaway service up via the production start seam");
 
-    let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the throwaway service");
+    let (mut script, records) = Script::new();
+    script.watch_call = Some(0);
+    let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
     actor.arm(WantState::Stopped).expect("arm against the running service");
     assert_eq!(
         actor.wait_callback().expect("the armed notification fires at once"),
         Observed::Running
     );
-    let before = large_frees::so_far();
+    assert_eq!(records.borrow().len(), 1);
+    assert!(
+        !freed_watch::was_freed(),
+        "the record is freed while the actor holds it"
+    );
     drop(actor);
     assert!(
-        large_frees::so_far() > before,
-        "dropping an actor whose callback already ran must release its notify buffer"
+        freed_watch::was_freed(),
+        "dropping an actor whose callback already ran must release its notify record"
     );
 }
 
-/// `wait_callback` with nothing armed has no notification to wait for, so it
-/// errors instead of parking the thread in an alertable wait nothing will end.
+/// Re-arming replaces the registration; the replaced record is still pending, so
+/// it must not be freed.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_re_arming_while_a_notification_is_pending_frees_no_notify_record() {
+    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+
+    let (mut script, records) = Script::new();
+    script.watch_call = Some(0);
+    let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
+    actor
+        .arm(WantState::Running)
+        .expect("first arm against the stopped service");
+    actor
+        .arm(WantState::Running)
+        .expect("second arm while the first is pending");
+    assert_eq!(records.borrow().len(), 2);
+    assert!(!freed_watch::was_freed(), "the pending record was freed by the re-arm");
+}
+
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_waiting_before_arming_errs_instead_of_hanging() {
@@ -439,8 +513,133 @@ fn cutover_global_net_state_waiting_before_arming_errs_instead_of_hanging() {
     let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the throwaway service");
     let err = actor.wait_callback().expect_err("nothing is armed");
     assert!(
-        err.to_string().contains("wait_callback before any arm"),
+        err.to_string().contains("without a successful arm"),
         "unexpected error: {err}"
+    );
+}
+
+/// A failed `NotifyServiceStatusChangeW` registers nothing the callback can ever
+/// settle, so waiting on it would park the thread for good.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_waiting_after_a_failed_arm_errs_instead_of_hanging() {
+    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+
+    let (mut script, _records) = Script::new();
+    script.notify.push_back(Some(ERROR_SERVICE_DOES_NOT_EXIST.0));
+    let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
+    actor.arm(WantState::Running).expect_err("the injected failure");
+    let err = actor.wait_callback().expect_err("the last arm failed");
+    assert!(
+        err.to_string().contains("without a successful arm"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The earlier arm succeeded, but the last one did not: the earlier registration
+/// is no longer the one to wait on.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_waiting_after_an_arm_that_failed_over_a_good_one_errs_instead_of_hanging() {
+    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+
+    let (mut script, _records) = Script::new();
+    script.notify.push_back(None);
+    script.notify.push_back(Some(ERROR_SERVICE_DOES_NOT_EXIST.0));
+    let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
+    actor
+        .arm(WantState::Running)
+        .expect("first arm against the stopped service");
+    actor.arm(WantState::Running).expect_err("the injected failure");
+    let err = actor.wait_callback().expect_err("the last arm failed");
+    assert!(
+        err.to_string().contains("without a successful arm"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` reopens the handles and arms again on
+/// the fresh ones. The lagging call's record is leaked, not freed.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_a_lagging_client_reopens_and_arms_again() {
+    use hole_bridge::cutover::os::windows::WindowsCutoverOs;
+    use hole_bridge::cutover::os::CutoverOs;
+    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    os.start_service_wait_running()
+        .expect("bring the throwaway service up via the production start seam");
+
+    let (mut script, records) = Script::new();
+    script.notify.push_back(Some(ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.0));
+    script.watch_call = Some(0);
+    let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
+    actor
+        .arm(WantState::Stopped)
+        .expect("the retry arms on the reopened handles");
+    assert_eq!(records.borrow().len(), 2, "the lagging call is retried once");
+    assert_eq!(
+        actor.wait_callback().expect("the retried notification fires at once"),
+        Observed::Running
+    );
+    drop(actor);
+    assert!(
+        !freed_watch::was_freed(),
+        "the lagging call's record was freed although its callback never ran"
+    );
+}
+
+/// A failed reopen leaves the actor without handles: every later use errs, and
+/// dropping it closes nothing twice (`ScHandle::drop` asserts on a failed close).
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_a_failed_reopen_leaves_every_use_erring() {
+    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+
+    let (mut script, _records) = Script::new();
+    script.notify.push_back(Some(ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.0));
+    script
+        .open
+        .push_back(Some(std::io::Error::other("injected open failure")));
+    script.watch_call = Some(0);
+    let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
+
+    let err = actor.arm(WantState::Running).expect_err("the reopen fails");
+    assert!(
+        err.to_string().contains("injected open failure"),
+        "unexpected error: {err}"
+    );
+    actor.arm(WantState::Running).expect_err("no handles to arm on");
+    actor.control_stop().expect_err("no handles to stop through");
+    actor.start().expect_err("no handles to start through");
+    actor.wait_callback().expect_err("the last arm failed");
+    drop(actor);
+    assert!(
+        !freed_watch::was_freed(),
+        "the lagging call's record was freed although its callback never ran"
     );
 }
 

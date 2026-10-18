@@ -2391,14 +2391,10 @@ swap first, then `launchctl kill SIGTERM` rides the graceful shutdown
 respawns the now-swapped binary.
 
 `scm_wait::SystemScmActor` **deliberately leaks** the notify record of a
-`NotifyServiceStatusChangeW` call whose callback has not run (dropped while
-pending, failed, or answered `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`; one record per
-such call, and the uncapped LAGGING retry grows it only inside a loop that was
-already not terminating). The docs do not say closing the service handle recalls
-an APC already queued, nor that a failed call queued none, so freeing the record
-could leave an APC naming freed memory; `cutover::registration::Registration`
-frees one only after its callback has run. Do not "fix" the leak without a Win32
-measurement that closes that gap.
+`NotifyServiceStatusChangeW` call whose callback has not run (mechanics:
+`cutover::registration`). Do not "fix" the leak without a Win32 measurement
+showing that closing the service handle recalls a queued APC and that a failed
+call queues none.
 
 The **marker** (`update-in-progress.json` in the service log dir, world-readable
 0o644 cross-privilege) does triple duty: the GUI holds its last snapshot instead
