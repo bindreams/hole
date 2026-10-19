@@ -55,7 +55,9 @@ use tokio_util::sync::CancellationToken;
 use crate::counting::CountingStream;
 use crate::plugin::ChainPlugin;
 use crate::sitrep::{PluginReady, StartError};
-use crate::tap::{allocate_inner_port_with, is_port_race, retry_connect_with, TapPlugin};
+use crate::tap::{
+    allocate_inner_port_with, connect_target, is_port_race, reports_the_given_address, retry_connect_with, TapPlugin,
+};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -781,7 +783,9 @@ async fn an_inner_that_loses_its_port_once_is_started_again_on_a_fresh_one() {
         .unwrap_or_else(|m| panic!("{m}"));
 
     let given = thefts.given.lock().unwrap().clone();
-    assert_eq!(given.len(), 2, "one lost start, one that readied: {given:?}");
+    // At least the stolen start and the one that readied; another process may
+    // take a later probed port too, which only adds starts.
+    assert!(given.len() >= 2, "one lost start, one that readied: {given:?}");
     assert!(public.port() != 0, "the tap readied on a real public address");
 
     shutdown.cancel();
@@ -1125,6 +1129,31 @@ async fn an_inner_that_reports_the_taps_public_port_is_fatal() {
         "want Fatal, got {ready:?}"
     );
     assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+fn the_reported_address_must_be_the_given_one() {
+    let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+    assert!(reports_the_given_address(a("127.0.0.1:5000"), a("127.0.0.1:5000")));
+    assert!(!reports_the_given_address(a("127.0.0.1:5001"), a("127.0.0.1:5000")));
+    assert!(!reports_the_given_address(a("10.0.0.1:5000"), a("127.0.0.1:5000")));
+    // A mapped IPv6 report of the given IPv4 address is the same address.
+    assert!(reports_the_given_address(
+        a("[::ffff:127.0.0.1]:5000"),
+        a("127.0.0.1:5000")
+    ));
+    // A wildcard accepts any ip of its family on the given port, nothing else.
+    assert!(reports_the_given_address(a("192.0.2.7:5000"), a("0.0.0.0:5000")));
+    assert!(!reports_the_given_address(a("192.0.2.7:5001"), a("0.0.0.0:5000")));
+    assert!(!reports_the_given_address(a("[::1]:5000"), a("0.0.0.0:5000")));
+}
+
+#[skuld::test]
+fn forwarders_never_connect_to_an_address_the_inner_chose() {
+    let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+    assert_eq!(connect_target(a("127.0.0.1:5000")), a("127.0.0.1:5000"));
+    assert_eq!(connect_target(a("0.0.0.0:5000")), a("127.0.0.1:5000"));
+    assert_eq!(connect_target(a("[::]:5000")), a("[::1]:5000"));
 }
 
 // Inner connect retry =================================================================================================

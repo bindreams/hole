@@ -26,10 +26,10 @@
 //! 3. Wait for the inner plugin's own readiness report, racing the inner
 //!    task's `JoinHandle` so an early inner failure unblocks us. The report
 //!    is the only readiness signal: a TCP probe cannot tell the inner from
-//!    another process that took the probed port. The report's `listen` is
-//!    authoritative: forwarders connect there, provided it keeps the ip the
-//!    inner was given (sitrep: a host must validate `listen` before connecting),
-//!    else the start is `Fatal`. A typed failure the inner
+//!    another process that took the probed port. The report's `listen` must be
+//!    the address the inner was given (sitrep: a host must validate `listen`
+//!    before connecting), else the start is `Fatal`; forwarders connect to the
+//!    given address (its loopback for a wildcard ip). A typed failure the inner
 //!    reports (`BindConflict` when another process took the internal port,
 //!    `Fatal`) becomes the tap's own, so the caller sees the same retryable
 //!    or terminal class. Only an inner that speaks sitrep reports a typed
@@ -192,12 +192,7 @@ impl ChainPlugin for TapPlugin {
         let inner_target = match reported {
             // The port must be the one the inner was given: any other could be
             // the tap's own listener (a self-connect cascade) or another service.
-            Ok(Ok(Ok(report)))
-                if report.listen.port() == inner_local.port()
-                    && (report.listen.ip() == inner_local.ip() || inner_local.ip().is_unspecified()) =>
-            {
-                report.listen
-            }
+            Ok(Ok(Ok(report))) if reports_the_given_address(report.listen, inner_local) => connect_target(inner_local),
             // The inner reported a listener outside the address it was given.
             Ok(Ok(Ok(report))) => {
                 inner_handle.abort();
@@ -357,6 +352,29 @@ async fn drain_inner(plugin_name: &str, inner_handle: tokio::task::JoinHandle<cr
         Ok(result) => result,
         Err(je) if je.is_cancelled() => Ok(()),
         Err(je) => Err(crate::Error::Chain(format!("tap[{plugin_name}]: inner task: {je}"))),
+    }
+}
+
+/// Whether the inner reported the address it was given. A wildcard given ip
+/// accepts any reported ip of its family (the inner listens on all of them);
+/// a mapped IPv6 address equals its IPv4 form.
+pub(crate) fn reports_the_given_address(reported: SocketAddr, given: SocketAddr) -> bool {
+    let (reported_ip, given_ip) = (reported.ip().to_canonical(), given.ip().to_canonical());
+    reported.port() == given.port()
+        && (reported_ip == given_ip || (given_ip.is_unspecified() && reported_ip.is_ipv4() == given_ip.is_ipv4()))
+}
+
+/// Where forwarders connect: the given address, or its family's loopback when
+/// the given ip is a wildcard, never an address the inner chose.
+pub(crate) fn connect_target(given: SocketAddr) -> SocketAddr {
+    match given.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), given.port())
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), given.port())
+        }
+        _ => given,
     }
 }
 
