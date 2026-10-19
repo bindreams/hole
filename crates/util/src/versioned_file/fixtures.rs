@@ -155,12 +155,14 @@ pub(crate) fn dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
-/// The sorted names in `dir`: what a test asserts on to prove nothing else
-/// (a temp file, a backup) was left behind.
+/// The sorted names in `dir`, without the `.lock` files the type keeps for
+/// good: what a test asserts on to prove nothing else (a temp file, a backup)
+/// was left behind.
 pub(crate) fn names(dir: &tempfile::TempDir) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir.path())
         .expect("read_dir")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.ends_with(".lock"))
         .collect();
     names.sort();
     names

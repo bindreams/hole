@@ -3,8 +3,7 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Barrier};
 
 use tempfile::NamedTempFile;
 
@@ -161,131 +160,38 @@ fn remove_and_move_aside_also_take_the_next_free_name() {
     );
 }
 
-/// A rendezvous that a participant can also leave, so a writer that fails
-/// before it arrives releases the others instead of stranding them.
-struct Gate {
-    state: Mutex<(usize, usize)>, // (participants still expected, arrived)
-    all_here: Condvar,
-}
-
-impl Gate {
-    fn new(participants: usize) -> Self {
-        Self {
-            state: Mutex::new((participants, 0)),
-            all_here: Condvar::new(),
-        }
-    }
-
-    fn arrive(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.1 += 1;
-        self.all_here.notify_all();
-        while state.1 < state.0 {
-            state = self.all_here.wait(state).unwrap();
-        }
-    }
-
-    fn leave(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.0 -= 1;
-        self.all_here.notify_all();
-    }
-}
-
-/// Holds every writer at two points so the interleaving that matters is the
-/// only one possible: all of them have probed an unreadable file and are
-/// about to link before any of them links, and every link is done before any
-/// publish.
-struct Gated {
-    before_link: Arc<Gate>,
-    before_publish: Arc<Gate>,
-    publish: Arc<Mutex<()>>,
-    at_link: AtomicBool,
-    at_publish: AtomicBool,
-}
-
-impl Gated {
-    /// The writer is done, however it ended: whatever gate it never reached
-    /// must not wait for it.
-    fn leave(&self) {
-        if !self.at_link.swap(true, Ordering::SeqCst) {
-            self.before_link.leave();
-        }
-        if !self.at_publish.swap(true, Ordering::SeqCst) {
-            self.before_publish.leave();
-        }
-    }
-}
-
-struct Leaves(Arc<Gated>);
-
-impl Drop for Leaves {
-    fn drop(&mut self) {
-        self.0.leave();
-    }
-}
-
-impl Fs for Gated {
-    fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
-        // Only the first attempt: a taken name retries without waiting again.
-        if !self.at_link.swap(true, Ordering::SeqCst) {
-            self.before_link.arrive();
-        }
-        std::fs::hard_link(original, link)
-    }
-
-    fn publish(&self, tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
-        if !self.at_publish.swap(true, Ordering::SeqCst) {
-            self.before_publish.arrive();
-        }
-        // Concurrent renames onto one name are not what is under test, and
-        // Windows refuses some of them; the backup names are decided before this.
-        let _one_at_a_time = self.publish.lock().unwrap();
-        tmp.persist(dest).map(|_| ()).map_err(|e| e.error)
-    }
-}
-
+/// Many writers at once over one unreadable decision file. Each probe and its
+/// write is one step under the file's lock, so the first writer backs the
+/// original up and every later one finds the file it wrote.
 #[skuld::test]
-fn racing_stores_take_distinct_backup_names() {
+fn racing_stores_back_the_original_up_once() {
     const WRITERS: usize = 8;
     let dir = dir();
     let original = unreadable_bytes(CannotRead::Newer);
     put(&dir, "decision.json", original);
-
-    let before_link = Arc::new(Gate::new(WRITERS));
-    let before_publish = Arc::new(Gate::new(WRITERS));
-    let publish = Arc::new(Mutex::new(()));
+    let start = Barrier::new(WRITERS);
 
     std::thread::scope(|scope| {
         for i in 0..WRITERS {
-            let gated = Arc::new(Gated {
-                before_link: before_link.clone(),
-                before_publish: before_publish.clone(),
-                publish: publish.clone(),
-                at_link: AtomicBool::new(false),
-                at_publish: AtomicBool::new(false),
-            });
-            let path = dir.path();
+            let (path, start) = (dir.path(), &start);
             scope.spawn(move || {
-                let _leaves = Leaves(gated.clone());
-                VersionedFile::<DecisionFile>::with_fs(path, gated)
+                start.wait();
+                VersionedFile::<DecisionFile>::new(path)
                     .store(&decision(&format!("writer {i}")), &plain())
                     .expect("every writer stores");
             });
         }
     });
 
-    let mut expected = vec!["decision.json".to_string(), "decision.json.unreadable.bak".to_string()];
-    expected.extend((2..=WRITERS).map(|n| format!("decision.json.unreadable.{n}.bak")));
-    expected.sort();
-    assert_eq!(names(&dir), expected, "one backup per writer, no name taken twice");
-    for name in expected.iter().filter(|n| n.ends_with(".bak")) {
-        assert_eq!(
-            std::fs::read(dir.path().join(name)).unwrap(),
-            original,
-            "{name} must hold the original bytes"
-        );
-    }
+    assert_eq!(
+        names(&dir),
+        ["decision.json", "decision.json.unreadable.bak"],
+        "one backup, of the file that was unreadable"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("decision.json.unreadable.bak")).unwrap(),
+        original
+    );
     assert!(matches!(
         VersionedFile::<DecisionFile>::new(dir.path()).load(),
         Loaded::Current { .. }

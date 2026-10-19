@@ -387,8 +387,7 @@ fn move_aside_has_nothing_to_move_when_there_is_no_file() {
 
 #[skuld::test]
 fn move_aside_works_whatever_the_role() {
-    // The role decides what an ordinary write or remove may do; the pf release
-    // path moves an OS record aside on purpose.
+    // `move_aside` ignores the role: the caller has decided.
     let dir = dir();
     let original = put_unreadable::<OsRecordFile>(&dir, CannotRead::Newer);
     let file = VersionedFile::<OsRecordFile>::new(dir.path());
@@ -439,6 +438,13 @@ impl Placement for Recorder<'_> {
         std::fs::create_dir_all(dir)
     }
 
+    fn prepare_lock(&self, _lock: &Path) -> io::Result<()> {
+        self.events
+            .borrow_mut()
+            .push(format!("prepare_lock[{}]", self.on_disk()));
+        Ok(())
+    }
+
     fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
         let tmp_bytes = std::fs::read(tmp)?;
         assert!(
@@ -486,11 +492,59 @@ fn placement_runs_around_the_publish_in_order() {
         *placement.events.borrow(),
         [
             "prepare_dir[old]",
+            "prepare_lock[old]",
             "prepare_tmp[old]",
             "after_publish[new]",
             "sync_dir[new]"
         ]
     );
+}
+
+/// A failure after the rename is not "nothing was written": the new value is
+/// the file's content, and the error must say so.
+#[skuld::test]
+fn a_failure_after_the_rename_says_the_file_was_replaced() {
+    struct FailsAfter {
+        in_after_publish: bool,
+    }
+    impl Placement for FailsAfter {
+        fn after_publish(&self, _path: &Path) -> io::Result<()> {
+            match self.in_after_publish {
+                true => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                false => Ok(()),
+            }
+        }
+        fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+            match self.in_after_publish {
+                true => Ok(()),
+                false => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            }
+        }
+    }
+
+    for in_after_publish in [true, false] {
+        let dir = dir();
+        put(&dir, "decision.json", br#"{"version":1,"value":"old"}"#);
+        let file = VersionedFile::<DecisionFile>::new(dir.path());
+
+        let err = file
+            .store(
+                &DecisionFile {
+                    value: "new".to_string(),
+                },
+                &FailsAfter { in_after_publish },
+            )
+            .unwrap_err();
+
+        let StoreError::PublishedNotFinalized(cause) = &err else {
+            panic!("after_publish={in_after_publish}: {err:?}");
+        };
+        assert_eq!(cause.kind(), io::ErrorKind::PermissionDenied);
+        match file.load() {
+            Loaded::Current { value, .. } => assert_eq!(value.value, "new", "the file holds the new value"),
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 #[skuld::test]

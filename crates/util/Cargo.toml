@@ -34,7 +34,9 @@ aho-corasick = "1"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_SystemInformation"] }
+# `Win32_Foundation`, `Win32_Storage_FileSystem`: `versioned_file`'s write-through
+# replace, no-clobber rename and file lock.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 skuld = { workspace = true }

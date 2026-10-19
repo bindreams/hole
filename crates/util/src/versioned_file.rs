@@ -5,7 +5,8 @@
 //! [`Schema::Prev`], so [`VersionedFile::load`] reads any version it knows
 //! into the current one and a missing step does not build. A file it cannot
 //! read, whether newer than this release or corrupt, meets one rule per
-//! [`Role`].
+//! [`Role`]. `store`, `remove` and `move_aside` hold an exclusive lock on
+//! `<name>.lock`, a file the type creates and never deletes; `load` takes none.
 //!
 //! # Compatibility
 //!
@@ -36,8 +37,10 @@ mod chain;
 mod fixtures;
 mod frame;
 mod loaded;
+mod lock;
 mod role;
 mod store;
+mod sys;
 
 pub use chain::{Chain, ChainError, Obsolete, Schema};
 pub use loaded::{CannotRead, Loaded, Raw};
