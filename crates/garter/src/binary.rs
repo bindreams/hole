@@ -673,7 +673,7 @@ pub(crate) async fn drain_readers_after_exit(
             if tokio::time::timeout(bound, both).await.is_err() {
                 tracing::warn!(
                     plugin = %plugin,
-                    "the plugin's output pipes were still open {bound:?} after it exited (a process it started                      holds them); its output after this point was cut"
+                    "the plugin's output pipes were still open {bound:?} after it exited (a process it started holds them); its output after this point was cut"
                 );
                 stdout.abort();
                 stderr.abort();
@@ -698,7 +698,7 @@ pub(crate) async fn await_stderr_after_stdout_eof(
             if tokio::time::timeout(bound, stderr_done.notified()).await.is_err() {
                 tracing::warn!(
                     plugin = %plugin,
-                    "the plugin closed stdout but its stderr was still open {bound:?} later; reporting it as exited                      before ready"
+                    "the plugin closed stdout but its stderr was still open {bound:?} later; reporting it as exited before ready"
                 );
             }
         }

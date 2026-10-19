@@ -337,6 +337,10 @@ async fn a_weak_containment_join_ends_at_the_bound_with_a_warning_and_aborts_the
             log.contains("WARN") && log.contains("held-plugin") && log.contains("cut"),
             "{containment:?}: the warning must name the plugin and say the output was cut:\n{log}"
         );
+        assert!(
+            log.contains("(a process it started holds them); its output"),
+            "{containment:?}: the warning text is mangled:\n{log}"
+        );
     }
 }
 
@@ -426,6 +430,10 @@ async fn the_stderr_wait_on_a_weak_containment_ends_at_the_bound_with_a_warning(
     assert!(
         log.contains("WARN") && log.contains("stderr-held-plugin"),
         "the warning must name the plugin:\n{log}"
+    );
+    assert!(
+        log.contains("later; reporting it as exited before ready"),
+        "the warning text is mangled:\n{log}"
     );
 }
 
