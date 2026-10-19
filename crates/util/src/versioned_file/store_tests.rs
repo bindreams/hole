@@ -692,7 +692,7 @@ fn a_failed_after_publish_still_flushes_the_directory() {
         }
         fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
             self.flushed.set(true);
-            Ok(())
+            Err(io::Error::from(io::ErrorKind::Other))
         }
     }
     let dir = dir();
@@ -704,7 +704,11 @@ fn a_failed_after_publish_still_flushes_the_directory() {
         .store(&DecisionFile { value: "v".to_string() }, &place)
         .unwrap_err();
 
-    assert!(matches!(err, StoreError::PublishedNotFinalized(_)), "{err:?}");
+    // Both failed; the first one is reported.
+    assert!(
+        matches!(&err, StoreError::PublishedNotFinalized(e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
     assert!(
         place.flushed.get(),
         "the rename happened, so the directory is still flushed"

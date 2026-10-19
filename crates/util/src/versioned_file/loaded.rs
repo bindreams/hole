@@ -70,7 +70,14 @@ impl<S> Loaded<S> {
         match self {
             Loaded::Newer { .. } => Some(CannotRead::Newer),
             Loaded::Corrupt { .. } => Some(CannotRead::Corrupt),
-            Loaded::Absent | Loaded::Unreadable(_) | Loaded::Obsolete { .. } | Loaded::Current { .. } => None,
+            // No file: nothing to read.
+            Loaded::Absent => None,
+            // The read failed; the bytes are unknown, not unreadable.
+            Loaded::Unreadable(_) => None,
+            // Read and dropped on purpose by the chain's floor.
+            Loaded::Obsolete { .. } => None,
+            // Read.
+            Loaded::Current { .. } => None,
         }
     }
 }
