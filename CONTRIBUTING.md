@@ -2642,7 +2642,12 @@ cargo xtask deps             # build ex-ray (Go) + download/verify wintun.dll (c
 cargo xtask build hole       # deps + cargo build (debug) + stage to target/debug/dist
 cargo xtask run hole         # dev mode (build cascade, then dev-console supervises)
 cargo xtask run hole-tests   # canonical local nextest invocation
+cargo xtask run doc-hole     # rustdoc, warnings denied (`doc-ex-galoshes` on Linux and Windows/arm64)
 ```
+
+CI runs the doc targets on every leg after clippy. A public doc may not link a
+private item, and a link to a `cfg`-gated item breaks on the targets that omit it:
+write such a reference in backticks without brackets.
 
 ### Tauri dev/prod feature toggle
 

@@ -337,6 +337,26 @@ targets:
     platforms: [linux/amd64, linux/arm64, windows/arm64]
     run: cargo clippy -p garter -p garter-bin -p galoshes -p plugin-e2e -p util -p stepstool -p dev-console --all-targets --features garter/test-utils -- -D warnings
 
+  doc-hole:
+    # rustdoc with warnings denied, so a broken intra-doc link fails CI. Links to
+    # `cfg`-gated or private items break per target, hence one doc target per
+    # clippy target, on the same legs. Public items only: a link from a public
+    # doc to a private item is itself the error. Same flags as `clippy-hole`.
+    platforms: [windows/amd64, darwin/amd64, darwin/arm64]
+    run:
+      - bash:
+          command: cargo doc --workspace --no-deps --no-default-features --features garter/test-utils
+          environment: { RUSTDOCFLAGS: "-D warnings" }
+
+  doc-ex-galoshes:
+    # `clippy-ex-galoshes`'s legs. The crate set is the ones that compile there:
+    # clippy's `-p` list plus the tooling crates the test archive builds there.
+    platforms: [linux/amd64, linux/arm64, windows/arm64]
+    run:
+      - bash:
+          command: cargo doc --no-deps -p garter -p garter-bin -p galoshes -p plugin-e2e -p util -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive --features garter/test-utils
+          environment: { RUSTDOCFLAGS: "-D warnings" }
+
   prek:
     # cargo-fmt + repo-wide hooks, for a developer's own machine. SKIP=cargo-clippy
     # because clippy lives in the per-platform clippy-* targets above. Platforms
