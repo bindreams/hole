@@ -76,7 +76,9 @@ fn only_renameat2_answers_that_mean_it_is_unavailable_fall_back_to_the_link() {
 mod windows_fallback {
     use std::cell::Cell;
 
-    use super::super::windows_impl::{posix_rename_unsupported, publish_with, rename_replace_legacy};
+    use super::super::windows_impl::{
+        posix_rename_unsupported, publish_with, rename_replace_legacy, without_temporary,
+    };
     use super::*;
 
     fn tmp_with(dir: &tempfile::TempDir, bytes: &[u8]) -> tempfile::NamedTempFile {
@@ -112,6 +114,21 @@ mod windows_fallback {
             assert!(!posix_rename_unsupported(&os(code)), "code {code}");
         }
         assert!(!posix_rename_unsupported(&io::Error::other("no os code")));
+    }
+
+    /// `HIDDEN` 0x2, `ARCHIVE` 0x20, `TEMPORARY` 0x100, `NORMAL` 0x80 (valid
+    /// only alone: the call ignores a write of 0, so an empty set is `NORMAL`).
+    #[skuld::test]
+    fn without_temporary_clears_that_bit_and_keeps_the_others() {
+        assert_eq!(without_temporary(0x100 | 0x2 | 0x20), 0x2 | 0x20);
+        assert_eq!(without_temporary(0x2 | 0x20), 0x2 | 0x20);
+        assert_eq!(without_temporary(0x100 | 0x20), 0x20);
+    }
+
+    #[skuld::test]
+    fn without_temporary_never_yields_an_empty_set() {
+        assert_eq!(without_temporary(0x100), 0x80);
+        assert_eq!(without_temporary(0), 0x80);
     }
 
     #[skuld::test]

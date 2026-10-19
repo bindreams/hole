@@ -20,11 +20,13 @@
 //! POSIX semantics, so a reader that has it open neither fails nor makes the
 //! store fail. That holds for a reader that opens the file with delete
 //! sharing, as `load` and `std` do; one that does not (some editors and
-//! scanners) makes the store fail with a sharing violation. A volume that lacks POSIX rename (FAT, exFAT, some network
-//! shares) gets a plain replace, where a reader can make the store fail; see
-//! [`VersionedFile::store`]. Windows durability of the replace rests on
-//! flushing the directory handle, which Microsoft does not document as
-//! committing a rename (`Placement::sync_dir`).
+//! scanners) makes the store fail with a sharing violation. A volume that
+//! lacks POSIX rename (FAT, exFAT, some network shares) gets a plain replace,
+//! where a reader can make the store fail; see [`VersionedFile::store`].
+//! Windows durability of the replace rests on flushing the directory handle,
+//! which Microsoft does not document as committing a rename, and which a
+//! volume without a directory flush (SMB, 9P) does not offer at all
+//! (`Placement::sync_dir`).
 //!
 //! # Compatibility
 //!

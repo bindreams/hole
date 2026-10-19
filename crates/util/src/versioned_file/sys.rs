@@ -113,8 +113,9 @@ mod windows_impl {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        FileBasicInfo, FileRenameInfoEx, MoveFileExW, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_NORMAL,
-        FILE_BASIC_INFO, FILE_RENAME_INFO, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        FileBasicInfo, FileRenameInfoEx, GetFileInformationByHandleEx, MoveFileExW, SetFileInformationByHandle, DELETE,
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO, FILE_RENAME_INFO, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH,
     };
 
     /// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and `FILE_RENAME_FLAG_POSIX_SEMANTICS`
@@ -172,8 +173,8 @@ mod windows_impl {
     /// is returned, and the temp file is removed on every failure.
     ///
     /// The temp file is created `FILE_ATTRIBUTE_TEMPORARY`, which tells the file
-    /// system it may keep the data in cache; `tempfile`'s own `persist` resets
-    /// the attributes to normal before it renames, and so does this.
+    /// system it may keep the data in cache, and `Placement::prepare_tmp` may
+    /// have set more. The renamed file keeps every attribute but that one.
     pub(super) fn publish_with(
         tmp: NamedTempFile,
         dest: &Path,
@@ -202,21 +203,41 @@ mod windows_impl {
             .any(|unsupported| unsupported.0 as i32 == code)
     }
 
-    /// Sets the file's attributes to `FILE_ATTRIBUTE_NORMAL` through its handle.
+    /// `attributes` without `FILE_ATTRIBUTE_TEMPORARY`. `FILE_ATTRIBUTE_NORMAL`
+    /// when nothing else is left: a write of no attributes is ignored.
+    pub(super) fn without_temporary(attributes: u32) -> u32 {
+        match attributes & !FILE_ATTRIBUTE_TEMPORARY.0 {
+            0 => FILE_ATTRIBUTE_NORMAL.0,
+            kept => kept,
+        }
+    }
+
+    /// Clears `FILE_ATTRIBUTE_TEMPORARY` through the file's handle and leaves
+    /// every other attribute, which a `Placement` may have set, as it is.
     /// A zero time in `FILE_BASIC_INFO` leaves that time as it is.
     fn clear_temporary_attribute(file: &std::fs::File) -> io::Result<()> {
-        let info = FILE_BASIC_INFO {
-            CreationTime: 0,
-            LastAccessTime: 0,
-            LastWriteTime: 0,
-            ChangeTime: 0,
-            FileAttributes: FILE_ATTRIBUTE_NORMAL.0,
-        };
+        let handle = HANDLE(file.as_raw_handle());
+        let mut info = FILE_BASIC_INFO::default();
         // SAFETY: `info` is a valid `FILE_BASIC_INFO` of the size passed, and
-        // the handle is open for writing (and so for writing attributes).
+        // the handle is open for reading and writing (so for its attributes).
+        unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                (&raw mut info).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        }
+        .map_err(io_error)?;
+        info.FileAttributes = without_temporary(info.FileAttributes);
+        info.CreationTime = 0;
+        info.LastAccessTime = 0;
+        info.LastWriteTime = 0;
+        info.ChangeTime = 0;
+        // SAFETY: as above.
         unsafe {
             SetFileInformationByHandle(
-                HANDLE(file.as_raw_handle()),
+                handle,
                 FileBasicInfo,
                 (&raw const info).cast(),
                 size_of::<FILE_BASIC_INFO>() as u32,

@@ -35,7 +35,10 @@ fn while_loading<T>(file: &VersionedFile<OsRecordFile>, write: impl FnOnce() -> 
     let (loading, loaded_once) = mpsc::sync_channel(1);
 
     std::thread::scope(|scope| {
-        let loader = scope.spawn(|| {
+        let written = &written;
+        // `move`: a loader that panics drops `loading`, so `recv` below fails
+        // the test instead of waiting for a first load that never comes.
+        let loader = scope.spawn(move || {
             let (mut loads, mut torn) = (0usize, Vec::new());
             while !written.load(Ordering::Acquire) {
                 match file.load() {
@@ -50,7 +53,7 @@ fn while_loading<T>(file: &VersionedFile<OsRecordFile>, write: impl FnOnce() -> 
         });
 
         loaded_once.recv().expect("the loader has read once");
-        let done = Done(&written);
+        let done = Done(written);
         let out = write();
         drop(done);
 

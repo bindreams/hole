@@ -69,7 +69,9 @@ pub trait Placement {
     /// Windows that is `FlushFileBuffers` on a handle to the directory, and
     /// Microsoft does not document it as committing a rename: the durability
     /// of the replace there rests on that reading, not on a documented
-    /// guarantee.
+    /// guarantee. A volume with no directory flush (an SMB share, a 9P
+    /// volume) answers `ERROR_INVALID_FUNCTION` or `ERROR_NOT_SUPPORTED`; that
+    /// is `Ok`, and the durability there is whatever the volume gives.
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         sync_dir(dir)
     }
@@ -80,6 +82,10 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// Flushes the directory. A volume that offers no directory flush (see
+/// [`no_directory_flush`]) is not an error: the replace there is as durable as
+/// the volume makes it. Failing to open the directory still is.
+///
 /// `FlushFileBuffers` needs a handle with `GENERIC_WRITE`, and opening a
 /// directory needs `FILE_FLAG_BACKUP_SEMANTICS`.
 #[cfg(windows)]
@@ -87,11 +93,31 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    std::fs::OpenOptions::new()
+    let handle = std::fs::OpenOptions::new()
         .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(dir)?
-        .sync_all()
+        .open(dir)?;
+    tolerate_missing_directory_flush(handle.sync_all())
+}
+
+#[cfg(windows)]
+fn tolerate_missing_directory_flush(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if no_directory_flush(&e) => Ok(()),
+        result => result,
+    }
+}
+
+/// The volume has no directory flush: `ERROR_INVALID_FUNCTION` (measured on an
+/// SMB share and on a 9P volume) or `ERROR_NOT_SUPPORTED`.
+#[cfg(windows)]
+fn no_directory_flush(e: &io::Error) -> bool {
+    use windows::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED};
+
+    let Some(code) = e.raw_os_error() else { return false };
+    [ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED]
+        .iter()
+        .any(|unsupported| unsupported.0 as i32 == code)
 }
 
 /// [`Placement`] with only an owner.
@@ -226,8 +252,10 @@ impl<S: VersionedState> VersionedFile<S> {
     /// some network shares) gets `MoveFileExW` instead, where any reader that
     /// has the file open at the instant of the replace can make the store fail
     /// with the OS error (`PermissionDenied`). The old file is then still in
-    /// place. The file is published without `FILE_ATTRIBUTE_TEMPORARY`, and a
-    /// state directory path longer than `MAX_PATH` works.
+    /// place. The file is published without `FILE_ATTRIBUTE_TEMPORARY` and
+    /// with every other attribute `place.prepare_tmp` set, and a state
+    /// directory path longer than `MAX_PATH` works. A volume with no directory
+    /// flush does not fail the store (see [`Placement::sync_dir`]).
     ///
     /// Blocks the calling thread on file I/O: from async code call it where
     /// blocking is allowed. `serde_json` writes a non-finite float as `null`, so an
