@@ -232,6 +232,65 @@ impl VersionedState for Nested {
     const ROLE: Role = Role::OsRecord;
 }
 
+/// A payload with a float: NaN and the infinities serialize as `null`, which a
+/// `f64` field does not read back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WithFloat {
+    pub x: f64,
+}
+
+impl Schema for WithFloat {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+impl VersionedState for WithFloat {
+    const FILE_NAME: &'static str = "with-float.json";
+    const ROLE: Role = Role::OsRecord;
+}
+
+/// A payload whose top level is an externally tagged enum: flattened beside
+/// `version`, the tag would be the key `version` itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) enum TopEnum {
+    Tagged { label: String },
+}
+
+impl Schema for TopEnum {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+impl VersionedState for TopEnum {
+    const FILE_NAME: &'static str = "top-enum.json";
+    const ROLE: Role = Role::Decision;
+}
+
+/// An integer wider than `u64`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Wide {
+    pub n: u128,
+}
+
+impl Schema for Wide {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+impl VersionedState for Wide {
+    const FILE_NAME: &'static str = "wide.json";
+    const ROLE: Role = Role::Config;
+}
+
 /// The highest version a schema can have.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct MaxVersionFile {

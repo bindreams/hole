@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::loaded::{CannotRead, Loaded};
-use super::{RemoveOver, StoreOver, VersionedState};
+use super::{frame, Chain, ChainError, RemoveOver, StoreOver, VersionedState};
+use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
 /// without touching the rest. Every method defaults to the real call.
@@ -93,7 +94,8 @@ pub enum StoreError {
     /// before it reaches a toast.
     #[error("{} cannot be read ({cause}); it is left as it is", path.display())]
     Unreadable { path: PathBuf, cause: CannotRead },
-    /// The value cannot be framed. The reason is a fixed label, never content.
+    /// The value cannot be framed, or would not read back as `S`. The reason
+    /// is a fixed label, never content; the error's category is logged.
     #[error("cannot encode the state file: {0}")]
     Encode(&'static str),
     #[error(transparent)]
@@ -284,7 +286,10 @@ fn file_name(path: &Path) -> std::borrow::Cow<'_, str> {
     path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
 }
 
-/// The value as one flat JSON object with `"version"` first.
+/// The value as one flat JSON object with `"version"` first, proven to read
+/// back as `S` before it is returned: anything `load` would call corrupt
+/// (a float that serializes as `null`, a top-level enum whose tag lands beside
+/// `version`, a payload with a `version` key of its own) is refused here.
 fn encode<S: VersionedState>(value: &S) -> Result<Vec<u8>, StoreError> {
     #[derive(serde::Serialize)]
     struct Framed<'a, S> {
@@ -293,21 +298,33 @@ fn encode<S: VersionedState>(value: &S) -> Result<Vec<u8>, StoreError> {
         payload: &'a S,
     }
 
-    const FAILED: StoreError = StoreError::Encode("the payload failed to serialize");
-    let as_value = serde_json::to_value(value).map_err(|_| FAILED)?;
-    let serde_json::Value::Object(fields) = &as_value else {
-        return Err(StoreError::Encode("the payload is not a JSON object"));
-    };
-    if fields.contains_key("version") {
-        return Err(StoreError::Encode(
-            "the payload declares a version key, which the framing owns",
-        ));
-    }
-    serde_json::to_vec_pretty(&Framed {
+    let bytes = serde_json::to_vec_pretty(&Framed {
         version: S::VERSION,
         payload: value,
     })
-    .map_err(|_| FAILED)
+    .map_err(|e| refuse::<S>("the payload failed to serialize", ParseFailure::from(&e)))?;
+    read_back::<S>(&bytes)
+        .map_err(|failure| refuse::<S>("the framed payload does not read back as its schema", failure))?;
+    Ok(bytes)
+}
+
+fn refuse<S: VersionedState>(label: &'static str, failure: ParseFailure) -> StoreError {
+    tracing::warn!(file = S::FILE_NAME, %failure, "{label}");
+    StoreError::Encode(label)
+}
+
+/// What `load` would make of `bytes`: the current version and a payload of the
+/// current schema.
+fn read_back<S: VersionedState>(bytes: &[u8]) -> Result<(), ParseFailure> {
+    match frame::read_version(bytes, None)? {
+        frame::Version::Known(version) if version == S::VERSION => {}
+        _ => return Err(ParseFailure::framing("version does not read back")),
+    }
+    match <S as Chain>::decode(S::VERSION, bytes) {
+        Ok(_) => Ok(()),
+        Err(ChainError::Shape(failure)) => Err(failure),
+        Err(ChainError::Obsolete) => unreachable!("the current version is never at or below the floor"),
+    }
 }
 
 #[cfg(test)]

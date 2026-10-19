@@ -5,7 +5,7 @@ use std::path::Path;
 use super::{DefaultPlacement, Placement, Removal, StoreError, VersionedFile};
 use crate::versioned_file::fixtures::{
     dir, names, put, unreadable_bytes, ConfigFile, DecisionFile, DroppedFile, LegacyRecordFile, NotAnObject, NoteV3,
-    OsRecordFile, OwnsVersionKey,
+    OsRecordFile, OwnsVersionKey, TopEnum, Wide, WithFloat,
 };
 use crate::versioned_file::{CannotRead, Loaded, VersionedState};
 
@@ -92,6 +92,62 @@ fn a_payload_that_is_not_an_object_is_refused_by_store() {
         .unwrap_err();
     assert!(matches!(err, StoreError::Encode(_)), "{err:?}");
     assert!(names(&dir).is_empty());
+}
+
+/// `store` returns `Ok` only for a file its own `load` reads back.
+#[skuld::test]
+fn a_payload_that_would_read_back_corrupt_is_refused_and_leaves_the_file_alone() {
+    let dir = dir();
+    let old = br#"{"version":1,"x":1.5}"#;
+    put(&dir, "with-float.json", old);
+    let file = VersionedFile::<WithFloat>::new(dir.path());
+    for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let err = file.store(&WithFloat { x }, &plain()).unwrap_err();
+        assert!(matches!(err, StoreError::Encode(_)), "{x}: {err:?}");
+        assert_eq!(read(&dir, "with-float.json"), old, "{x}");
+    }
+
+    let tagged = VersionedFile::<TopEnum>::new(dir.path());
+    let err = tagged
+        .store(&TopEnum::Tagged { label: "l".into() }, &plain())
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Encode(_)), "{err:?}");
+    assert!(
+        matches!(tagged.load(), Loaded::Absent),
+        "nothing may be written for a payload that cannot be read back"
+    );
+    assert_eq!(names(&dir), ["with-float.json"]);
+}
+
+#[skuld::test]
+fn an_integer_wider_than_u64_is_stored_and_read_back() {
+    let dir = dir();
+    let file = VersionedFile::<Wide>::new(dir.path());
+    file.store(&Wide { n: u128::MAX }, &plain()).unwrap();
+    match file.load() {
+        Loaded::Current { value, .. } => assert_eq!(value, Wide { n: u128::MAX }),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[skuld::test]
+fn a_refusal_to_encode_logs_the_category_and_never_the_value() {
+    use garter::test_utils::WaitableWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+
+    let writer = WaitableWriter::new();
+    let _guard = set_default_in_current_thread(
+        tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let dir = dir();
+    let _ = VersionedFile::<OwnsVersionKey>::new(dir.path()).store(&OwnsVersionKey { version: 424_242 }, &plain());
+
+    let log = writer.snapshot();
+    assert!(log.contains("data error"), "the category: {log}");
+    assert!(!log.contains("424242"), "a value: {log}");
 }
 
 #[skuld::test]
