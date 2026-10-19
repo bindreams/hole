@@ -575,6 +575,20 @@ fn a_failed_prepare_tmp_leaves_no_temp_and_the_original() {
     assert_eq!(names(&dir), ["decision.json"]);
 }
 
+/// The directory sync reaches the directory: a directory that is not there
+/// fails it, on every platform.
+#[skuld::test]
+fn sync_dir_of_a_missing_directory_fails() {
+    let dir = dir();
+    let err = plain().sync_dir(&dir.path().join("missing")).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
+}
+
+#[skuld::test]
+fn sync_dir_of_a_directory_succeeds() {
+    plain().sync_dir(dir().path()).unwrap();
+}
+
 // Redaction ===========================================================================================================
 
 #[skuld::test]

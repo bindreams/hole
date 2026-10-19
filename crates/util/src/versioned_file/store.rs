@@ -65,7 +65,7 @@ pub trait Placement {
         Ok(())
     }
 
-    /// Makes the rename itself durable.
+    /// Makes the rename durable: the directory's buffers are flushed.
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         sync_dir(dir)
     }
@@ -76,11 +76,18 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// A directory cannot be opened for a sync through `std` on Windows; the
-/// replace is written through instead (`sys::publish`).
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
+/// `FlushFileBuffers` needs a handle with `GENERIC_WRITE`, and opening a
+/// directory needs `FILE_FLAG_BACKUP_SEMANTICS`.
+#[cfg(windows)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?
+        .sync_all()
 }
 
 /// [`Placement`] with only an owner.
@@ -248,10 +255,13 @@ impl<S: VersionedState> VersionedFile<S> {
     /// The type probes the file and then acts on what it found. The caller
     /// must ensure that no other process or task writes, removes or moves
     /// aside this file in between; see [`store`](Self::store), "Exclusion".
+    ///
+    /// The directory is the caller's to write: where it cannot, `remove` of a
+    /// file this role removes or moves aside fails with the OS error.
     pub fn remove(&self) -> io::Result<Removal> {
         match remove_over(&self.load()) {
             RemoveOver::Keep => Ok(Removal::Kept),
-            RemoveOver::MoveAside => Ok(match self.move_aside_unchecked()? {
+            RemoveOver::MoveAside => Ok(match self.move_aside()? {
                 Some(backup) => Removal::MovedAside(backup),
                 None => Removal::Absent,
             }),
@@ -275,10 +285,6 @@ impl<S: VersionedState> VersionedFile<S> {
     /// loses its file. The caller must ensure there is none; see
     /// [`store`](Self::store), "Exclusion".
     pub fn move_aside(&self) -> io::Result<Option<PathBuf>> {
-        self.move_aside_unchecked()
-    }
-
-    fn move_aside_unchecked(&self) -> io::Result<Option<PathBuf>> {
         let mut attempt = 1u64;
         loop {
             let backup = self.backup_path(attempt);
@@ -452,3 +458,7 @@ mod store_backup_tests;
 #[cfg(test)]
 #[path = "store_link_tests.rs"]
 mod store_link_tests;
+
+#[cfg(test)]
+#[path = "store_reader_tests.rs"]
+mod store_reader_tests;

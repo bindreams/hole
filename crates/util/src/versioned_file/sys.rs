@@ -1,17 +1,17 @@
 //! The platform calls `versioned_file` needs and `std` does not offer: a
-//! durable replace and a rename that never replaces.
+//! replace that an open reader cannot block and a rename that never replaces.
 
 use std::io;
 use std::path::Path;
 
 use tempfile::NamedTempFile;
 
-/// Renames the temp file over `dest`. On Windows the move is written through,
-/// so the rename is durable when this returns; on unix the caller syncs the
-/// directory.
+/// Renames the temp file over `dest`, even while another handle has `dest`
+/// open: that reader keeps the old file, and the next open gets the new one.
+/// The caller syncs the directory to make the rename durable.
 pub(super) fn publish(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
     #[cfg(windows)]
-    return windows_impl::replace_write_through(tmp, dest);
+    return windows_impl::replace_posix(tmp, dest);
     #[cfg(not(windows))]
     return tmp.persist(dest).map(|_| ()).map_err(|e| e.error);
 }
@@ -100,15 +100,27 @@ mod unix_impl {
 
 #[cfg(windows)]
 mod windows_impl {
+    use std::fs::OpenOptions;
     use std::io;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
 
     use tempfile::NamedTempFile;
     use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MOVE_FILE_FLAGS,
+        FileRenameInfoEx, MoveFileExW, SetFileInformationByHandle, DELETE, FILE_RENAME_INFO, MOVEFILE_WRITE_THROUGH,
     };
+
+    /// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and `FILE_RENAME_FLAG_POSIX_SEMANTICS`
+    /// of `FILE_RENAME_INFO::Flags`. With both, the target is replaced even
+    /// while it has open handles: they keep the replaced file, and every later
+    /// open of the name gets the renamed one. Needs Windows 10 version 1607 and
+    /// NTFS; elsewhere the call fails and so does the store, rather than
+    /// falling back to a replace that a reader's open handle can refuse.
+    const REPLACE_POSIX: u32 = 0x1 | 0x2;
 
     /// A `windows` error as the `io::Error` of the Win32 code inside it.
     fn io_error(e: windows::core::Error) -> io::Error {
@@ -119,25 +131,51 @@ mod windows_impl {
         }
     }
 
-    fn move_file(from: &Path, to: &Path, flags: MOVE_FILE_FLAGS) -> io::Result<()> {
-        let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
-        let (from, to) = (wide(from), wide(to));
-        // SAFETY: both buffers are NUL-terminated and outlive the call.
-        unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), flags) }.map_err(io_error)
-    }
-
-    /// `MOVEFILE_WRITE_THROUGH` is what makes the move durable before the call
-    /// returns; the replace itself is what `persist` does.
-    pub(super) fn replace_write_through(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
+    pub(super) fn replace_posix(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
         let mut from = tmp.into_temp_path();
-        move_file(&from, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)?;
+        rename_posix(&from, dest)?;
         // Moved: the temp name is no longer ours to delete.
         from.disable_cleanup(true);
         Ok(())
     }
 
-    /// Without `MOVEFILE_REPLACE_EXISTING` the move fails when `to` exists.
+    fn rename_posix(from: &Path, to: &Path) -> io::Result<()> {
+        // `DELETE` is the access a rename needs; `std` shares read, write and
+        // delete, so an existing reader of `from` does not conflict.
+        let file = OpenOptions::new().access_mode(DELETE.0).open(from)?;
+
+        let name: Vec<u16> = to.as_os_str().encode_wide().collect();
+        let name_bytes = name.len() * 2;
+        let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let size = header + name_bytes;
+        // `u64` units: the buffer is aligned for `FILE_RENAME_INFO`'s handle.
+        let mut buf = vec![0u64; size.div_ceil(8)];
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `buf` is zeroed, 8-aligned and at least `header + name_bytes`
+        // long; the name is copied after the header, where `FileName` starts.
+        unsafe {
+            (*info).Anonymous.Flags = REPLACE_POSIX;
+            (*info).FileNameLength = name_bytes as u32;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                buf.as_mut_ptr().cast::<u8>().add(header).cast::<u16>(),
+                name.len(),
+            );
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileRenameInfoEx,
+                info.cast_const().cast(),
+                size as u32,
+            )
+        }
+        .map_err(io_error)
+    }
+
+    /// Fails with `AlreadyExists` when `to` exists, and is written through.
     pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-        move_file(from, to, MOVEFILE_WRITE_THROUGH)
+        let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+        let (from, to) = (wide(from), wide(to));
+        // SAFETY: both buffers are NUL-terminated and outlive the call.
+        unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVEFILE_WRITE_THROUGH) }.map_err(io_error)
     }
 }

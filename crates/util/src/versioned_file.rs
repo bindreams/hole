@@ -10,10 +10,15 @@
 //!
 //! # Exclusion
 //!
-//! The type takes no lock. `store`, `remove` and `move_aside` probe the file
-//! and then act on what they found, so the caller must ensure that no other
-//! process or task writes the same file in between (see
-//! [`VersionedFile::store`]). `load` needs no exclusion.
+//! The type takes no lock. `store` and `remove` probe the file and then act on
+//! what they found, and `move_aside` falls back to a link and then a delete
+//! where the platform has no no-replace rename. The caller must ensure that no
+//! other process or task writes the same file in between (see
+//! [`VersionedFile::store`]).
+//!
+//! `load` needs no exclusion, on Windows too: `store` replaces the file with
+//! POSIX semantics, so a reader that has it open neither fails nor makes the
+//! store fail.
 //!
 //! # Compatibility
 //!
