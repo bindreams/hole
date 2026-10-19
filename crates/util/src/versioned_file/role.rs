@@ -1,0 +1,91 @@
+//! What a file that cannot be read means, per kind of file.
+
+use super::loaded::CannotRead;
+
+/// What a file is for, and so what it means when this release cannot read it.
+///
+/// Every decision is one exhaustive `match` over the role and the cause with
+/// every pair spelled out (no `A | B =>`, no wildcard), so a new role or cause
+/// must choose in each function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The user's latest decision, with a safe default to fall back on.
+    Decision,
+    /// What this bridge did to the OS, needed for cleanup.
+    OsRecord,
+    /// An OS record a past release wrote and no release writes any more:
+    /// kept, never overwritten, and it never blocks a connect.
+    LegacyRecord,
+    /// The user's own data.
+    Config,
+}
+
+/// What `store` does over a file that cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOver {
+    /// Back it up, then write.
+    MoveAside,
+    /// Write nothing.
+    Refuse,
+    /// Replace it.
+    Overwrite,
+}
+
+/// What `remove` does to a file that cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOver {
+    /// Back it up, then remove the original.
+    MoveAside,
+    /// Leave it.
+    Keep,
+    /// Delete it.
+    Remove,
+}
+
+impl Role {
+    pub fn on_store(self, why: CannotRead) -> StoreOver {
+        match (self, why) {
+            (Role::Decision, CannotRead::Newer) => StoreOver::MoveAside,
+            (Role::Decision, CannotRead::Corrupt) => StoreOver::MoveAside,
+            (Role::OsRecord, CannotRead::Newer) => StoreOver::Refuse,
+            (Role::OsRecord, CannotRead::Corrupt) => StoreOver::Refuse,
+            (Role::LegacyRecord, CannotRead::Newer) => StoreOver::Refuse,
+            (Role::LegacyRecord, CannotRead::Corrupt) => StoreOver::Refuse,
+            (Role::Config, CannotRead::Newer) => StoreOver::Refuse,
+            // Interim, open question Q5: a corrupt `config.json` is replaced by the next save, as today.
+            (Role::Config, CannotRead::Corrupt) => StoreOver::Overwrite,
+        }
+    }
+
+    pub fn on_remove(self, why: CannotRead) -> RemoveOver {
+        match (self, why) {
+            (Role::Decision, CannotRead::Newer) => RemoveOver::MoveAside,
+            (Role::Decision, CannotRead::Corrupt) => RemoveOver::MoveAside,
+            (Role::OsRecord, CannotRead::Newer) => RemoveOver::Keep,
+            (Role::OsRecord, CannotRead::Corrupt) => RemoveOver::Keep,
+            (Role::LegacyRecord, CannotRead::Newer) => RemoveOver::Keep,
+            (Role::LegacyRecord, CannotRead::Corrupt) => RemoveOver::Keep,
+            (Role::Config, CannotRead::Newer) => RemoveOver::Keep,
+            (Role::Config, CannotRead::Corrupt) => RemoveOver::Keep,
+        }
+    }
+
+    /// Whether a file of this role that cannot be read stops the bridge from
+    /// connecting.
+    pub fn unreadable_blocks_connect(self, why: CannotRead) -> bool {
+        match (self, why) {
+            (Role::Decision, CannotRead::Newer) => false,
+            (Role::Decision, CannotRead::Corrupt) => false,
+            (Role::OsRecord, CannotRead::Newer) => true,
+            (Role::OsRecord, CannotRead::Corrupt) => true,
+            (Role::LegacyRecord, CannotRead::Newer) => false,
+            (Role::LegacyRecord, CannotRead::Corrupt) => false,
+            (Role::Config, CannotRead::Newer) => false,
+            (Role::Config, CannotRead::Corrupt) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "role_tests.rs"]
+mod role_tests;

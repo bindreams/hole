@@ -1,0 +1,389 @@
+//! The order of `store`'s steps, proven by failing each one, plus the backup
+//! names and what a failed read does to them.
+
+use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+use tempfile::NamedTempFile;
+
+use super::{DefaultPlacement, Fs, Removal, StoreError, VersionedFile};
+use crate::versioned_file::fixtures::{dir, names, put, unreadable_bytes, DecisionFile, NoteV3};
+use crate::versioned_file::{CannotRead, Loaded};
+
+fn plain() -> DefaultPlacement {
+    DefaultPlacement::default()
+}
+
+fn decision(value: &str) -> DecisionFile {
+    DecisionFile {
+        value: value.to_string(),
+    }
+}
+
+// Failing each step ===================================================================================================
+
+/// Fails the publish (step 4), as a rename that does not happen.
+struct FailsPublish;
+
+impl Fs for FailsPublish {
+    fn publish(&self, _tmp: NamedTempFile, _dest: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
+/// Fails the backup link (step 3) for a reason other than a taken name.
+struct FailsLink;
+
+impl Fs for FailsLink {
+    fn hard_link(&self, _original: &Path, _link: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
+#[skuld::test]
+fn decision_store_never_exposes_an_absent_file() {
+    for cause in [CannotRead::Newer, CannotRead::Corrupt] {
+        let dir = dir();
+        let original = unreadable_bytes(cause);
+        put(&dir, "decision.json", original);
+        let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsPublish));
+
+        let err = file.store(&decision("new"), &plain()).unwrap_err();
+
+        assert!(matches!(err, StoreError::Io(_)), "{cause:?}: {err:?}");
+        // The original is still at its name, with its bytes, and the temp is gone.
+        // The backup made before the failed publish is a second name for the same
+        // bytes: nothing is lost.
+        assert_eq!(std::fs::read(dir.path().join("decision.json")).unwrap(), original);
+        assert_eq!(
+            names(&dir),
+            ["decision.json", "decision.json.unreadable.bak"],
+            "{cause:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("decision.json.unreadable.bak")).unwrap(),
+            original
+        );
+    }
+}
+
+#[skuld::test]
+fn decision_store_aborts_untouched_when_the_backup_link_fails() {
+    for cause in [CannotRead::Newer, CannotRead::Corrupt] {
+        let dir = dir();
+        let original = unreadable_bytes(cause);
+        put(&dir, "decision.json", original);
+        let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsLink));
+
+        let err = file.store(&decision("new"), &plain()).unwrap_err();
+
+        assert!(matches!(err, StoreError::Io(_)), "{cause:?}: {err:?}");
+        assert_eq!(std::fs::read(dir.path().join("decision.json")).unwrap(), original);
+        assert_eq!(names(&dir), ["decision.json"], "no temp and no backup: {cause:?}");
+    }
+}
+
+#[skuld::test]
+fn store_is_atomic_under_a_failed_rename() {
+    // An ordinary overwrite of a readable file: the old bytes survive.
+    let dir = dir();
+    let old = br#"{"version":3,"title":"old","tags":[],"pinned":false}"#;
+    put(&dir, "note.json", old);
+    let file = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(FailsPublish));
+
+    let new = NoteV3 {
+        title: "new".to_string(),
+        tags: vec![],
+        pinned: true,
+    };
+    assert!(file.store(&new, &plain()).is_err());
+
+    assert_eq!(std::fs::read(dir.path().join("note.json")).unwrap(), old);
+    assert_eq!(names(&dir), ["note.json"]);
+}
+
+// Backup names ========================================================================================================
+
+#[skuld::test]
+fn second_unreadable_file_gets_the_next_free_bak_name() {
+    let dir = dir();
+    let file = VersionedFile::<DecisionFile>::new(dir.path());
+    let unreadable = [
+        &br#"{"version":99,"value":"first"}"#[..],
+        br#"{"version":1,"value":"second"#,
+        br#"{"version":98,"value":"third"}"#,
+    ];
+
+    for (i, bytes) in unreadable.iter().enumerate() {
+        put(&dir, "decision.json", bytes);
+        file.store(&decision(&format!("v{i}")), &plain()).unwrap();
+    }
+
+    assert_eq!(
+        names(&dir),
+        [
+            "decision.json",
+            "decision.json.unreadable.2.bak",
+            "decision.json.unreadable.3.bak",
+            "decision.json.unreadable.bak",
+        ]
+    );
+    for (name, bytes) in [
+        ("decision.json.unreadable.bak", unreadable[0]),
+        ("decision.json.unreadable.2.bak", unreadable[1]),
+        ("decision.json.unreadable.3.bak", unreadable[2]),
+    ] {
+        assert_eq!(
+            std::fs::read(dir.path().join(name)).unwrap(),
+            bytes,
+            "{name}: an earlier backup must survive untouched"
+        );
+    }
+}
+
+#[skuld::test]
+fn remove_and_move_aside_also_take_the_next_free_name() {
+    let dir = dir();
+    put(&dir, "decision.json.unreadable.bak", b"first");
+    put(&dir, "decision.json", unreadable_bytes(CannotRead::Newer));
+
+    let removal = VersionedFile::<DecisionFile>::new(dir.path()).remove().unwrap();
+
+    assert_eq!(
+        removal,
+        Removal::MovedAside(dir.path().join("decision.json.unreadable.2.bak"))
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("decision.json.unreadable.bak")).unwrap(),
+        b"first"
+    );
+}
+
+/// A rendezvous that a participant can also leave, so a writer that fails
+/// before it arrives releases the others instead of stranding them.
+struct Gate {
+    state: Mutex<(usize, usize)>, // (participants still expected, arrived)
+    all_here: Condvar,
+}
+
+impl Gate {
+    fn new(participants: usize) -> Self {
+        Self {
+            state: Mutex::new((participants, 0)),
+            all_here: Condvar::new(),
+        }
+    }
+
+    fn arrive(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.1 += 1;
+        self.all_here.notify_all();
+        while state.1 < state.0 {
+            state = self.all_here.wait(state).unwrap();
+        }
+    }
+
+    fn leave(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 -= 1;
+        self.all_here.notify_all();
+    }
+}
+
+/// Holds every writer at two points so the interleaving that matters is the
+/// only one possible: all of them have probed an unreadable file and are
+/// about to link before any of them links, and every link is done before any
+/// publish.
+struct Gated {
+    before_link: Arc<Gate>,
+    before_publish: Arc<Gate>,
+    publish: Arc<Mutex<()>>,
+    at_link: AtomicBool,
+    at_publish: AtomicBool,
+}
+
+impl Gated {
+    /// The writer is done, however it ended: whatever gate it never reached
+    /// must not wait for it.
+    fn leave(&self) {
+        if !self.at_link.swap(true, Ordering::SeqCst) {
+            self.before_link.leave();
+        }
+        if !self.at_publish.swap(true, Ordering::SeqCst) {
+            self.before_publish.leave();
+        }
+    }
+}
+
+struct Leaves(Arc<Gated>);
+
+impl Drop for Leaves {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
+
+impl Fs for Gated {
+    fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
+        // Only the first attempt: a taken name retries without waiting again.
+        if !self.at_link.swap(true, Ordering::SeqCst) {
+            self.before_link.arrive();
+        }
+        std::fs::hard_link(original, link)
+    }
+
+    fn publish(&self, tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
+        if !self.at_publish.swap(true, Ordering::SeqCst) {
+            self.before_publish.arrive();
+        }
+        // Concurrent renames onto one name are not what is under test, and
+        // Windows refuses some of them; the backup names are decided before this.
+        let _one_at_a_time = self.publish.lock().unwrap();
+        tmp.persist(dest).map(|_| ()).map_err(|e| e.error)
+    }
+}
+
+#[skuld::test]
+fn racing_stores_take_distinct_backup_names() {
+    const WRITERS: usize = 8;
+    let dir = dir();
+    let original = unreadable_bytes(CannotRead::Newer);
+    put(&dir, "decision.json", original);
+
+    let before_link = Arc::new(Gate::new(WRITERS));
+    let before_publish = Arc::new(Gate::new(WRITERS));
+    let publish = Arc::new(Mutex::new(()));
+
+    std::thread::scope(|scope| {
+        for i in 0..WRITERS {
+            let gated = Arc::new(Gated {
+                before_link: before_link.clone(),
+                before_publish: before_publish.clone(),
+                publish: publish.clone(),
+                at_link: AtomicBool::new(false),
+                at_publish: AtomicBool::new(false),
+            });
+            let path = dir.path();
+            scope.spawn(move || {
+                let _leaves = Leaves(gated.clone());
+                VersionedFile::<DecisionFile>::with_fs(path, gated)
+                    .store(&decision(&format!("writer {i}")), &plain())
+                    .expect("every writer stores");
+            });
+        }
+    });
+
+    let mut expected = vec!["decision.json".to_string(), "decision.json.unreadable.bak".to_string()];
+    expected.extend((2..=WRITERS).map(|n| format!("decision.json.unreadable.{n}.bak")));
+    expected.sort();
+    assert_eq!(names(&dir), expected, "one backup per writer, no name taken twice");
+    for name in expected.iter().filter(|n| n.ends_with(".bak")) {
+        assert_eq!(
+            std::fs::read(dir.path().join(name)).unwrap(),
+            original,
+            "{name} must hold the original bytes"
+        );
+    }
+    assert!(matches!(
+        VersionedFile::<DecisionFile>::new(dir.path()).load(),
+        Loaded::Current { .. }
+    ));
+}
+
+// I/O failures on read ================================================================================================
+
+struct DeniedRead;
+
+impl Fs for DeniedRead {
+    fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
+#[skuld::test]
+fn store_over_an_io_failed_probe_writes_and_makes_no_backup() {
+    // The bytes would read as corrupt, but nothing proved that: the read failed.
+    let dir = dir();
+    put(&dir, "decision.json", b"not even json");
+    let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(DeniedRead));
+
+    file.store(&decision("new"), &plain()).unwrap();
+
+    assert_eq!(names(&dir), ["decision.json"], "no backup of a file nobody read");
+    let written = std::fs::read_to_string(dir.path().join("decision.json")).unwrap();
+    assert!(written.contains("\"new\""), "{written}");
+}
+
+#[skuld::test]
+fn remove_over_an_io_failed_probe_removes() {
+    let dir = dir();
+    put(&dir, "decision.json", unreadable_bytes(CannotRead::Newer));
+    let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(DeniedRead));
+
+    assert_eq!(file.remove().unwrap(), Removal::Removed);
+
+    assert!(names(&dir).is_empty(), "removed, not moved aside: {:?}", names(&dir));
+}
+
+// A backup is the same file ===========================================================================================
+
+/// `(volume, file index)` of whatever `path` names.
+#[cfg(unix)]
+fn identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).unwrap();
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(windows)]
+fn identity(path: &Path) -> (u64, u64) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+    let file = std::fs::File::open(path).unwrap();
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is open for the call and `info` is a valid out-parameter.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.unwrap();
+    (
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    )
+}
+
+/// A `.unreadable.bak` of a decision file holds the server password, so it
+/// must carry exactly the protection the original had: a hard link is the same
+/// file object under a second name, a copy would be a new file with whatever
+/// the directory hands out.
+#[skuld::test]
+fn backup_preserves_mode_and_dacl() {
+    let dir = dir();
+    let path = put(&dir, "decision.json", unreadable_bytes(CannotRead::Newer));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let before = identity(&path);
+
+    VersionedFile::<DecisionFile>::new(dir.path())
+        .store(&decision("new"), &plain())
+        .unwrap();
+
+    let backup = dir.path().join("decision.json.unreadable.bak");
+    assert_eq!(
+        identity(&backup),
+        before,
+        "the backup must be the original file, not a copy"
+    );
+    assert_ne!(identity(&path), before, "the new file is a different one");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&backup), 0o600);
+        assert_eq!(mode(&path), 0o600, "the written file is private too");
+    }
+}

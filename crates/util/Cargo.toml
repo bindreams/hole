@@ -16,6 +16,11 @@ harness = false
 bitflags = { workspace = true }
 # `parse_error`: classifying a parse failure needs the error type it classifies.
 serde_json = { workspace = true }
+# `versioned_file`: schema chain decoding, plus the atomic temp-file write and
+# the typed errors around it.
+serde = { workspace = true }
+tempfile = "3"
+thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 tracing = "0.1"
 # Redaction registry: lock-free snapshot reads so no logging call can block
@@ -41,5 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # `retry_tests` uses `tokio::time::pause()` to auto-advance the mock clock
 # instead of burning wall-clock seconds on exponential backoff.
 tokio = { version = "1", features = ["test-util"] }
-# `parse_error_tests` derives `Deserialize` on its probe struct.
-serde = { workspace = true }
+# `versioned_file`'s compile-fail fixtures pin that a gap in a migration chain
+# does not build.
+trybuild = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+# `versioned_file` store tests compare a backup's file identity with the original's.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
