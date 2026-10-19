@@ -680,3 +680,40 @@ fn a_real_directory_without_fsync_is_not_a_failed_flush() {
     // procfs answers a directory fsync with EINVAL.
     super::sync_dir(std::path::Path::new("/proc")).unwrap();
 }
+
+#[skuld::test]
+fn a_failed_after_publish_still_flushes_the_directory() {
+    struct FailsAfterPublish {
+        flushed: std::cell::Cell<bool>,
+    }
+    impl Placement for FailsAfterPublish {
+        fn after_publish(&self, _path: &Path) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+        fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+            self.flushed.set(true);
+            Ok(())
+        }
+    }
+    let dir = dir();
+    let place = FailsAfterPublish {
+        flushed: std::cell::Cell::new(false),
+    };
+
+    let err = VersionedFile::<DecisionFile>::new(dir.path())
+        .store(&DecisionFile { value: "v".to_string() }, &place)
+        .unwrap_err();
+
+    assert!(matches!(err, StoreError::PublishedNotFinalized(_)), "{err:?}");
+    assert!(
+        place.flushed.get(),
+        "the rename happened, so the directory is still flushed"
+    );
+}
+
+#[skuld::test]
+fn an_empty_directory_is_the_current_directory() {
+    // `Path::new("state.json").parent()` is `""`.
+    let file = VersionedFile::<DecisionFile>::new(Path::new(""));
+    assert_eq!(file.path(), Path::new(".").join("decision.json"));
+}

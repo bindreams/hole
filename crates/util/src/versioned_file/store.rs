@@ -207,8 +207,15 @@ pub struct VersionedFile<S: VersionedState> {
 }
 
 impl<S: VersionedState> VersionedFile<S> {
+    /// `dir` may be empty (the parent of a bare file name): that is the
+    /// current directory.
     pub fn new(dir: &Path) -> Self {
         const { assert_unversioned_as_valid::<S>() };
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
         Self {
             path: dir.join(S::FILE_NAME),
             fs: Arc::new(StdFs),
@@ -302,11 +309,11 @@ impl<S: VersionedState> VersionedFile<S> {
         }
 
         self.fs.publish(tmp, &self.path)?;
-        place
-            .after_publish(&self.path)
-            .map_err(StoreError::PublishedNotFinalized)?;
-        place.sync_dir(dir).map_err(StoreError::PublishedNotFinalized)?;
-        Ok(())
+        // The directory is flushed even when `after_publish` failed: the rename
+        // happened either way. The first failure is the one reported.
+        let finalized = place.after_publish(&self.path);
+        let flushed = place.sync_dir(dir);
+        finalized.and(flushed).map_err(StoreError::PublishedNotFinalized)
     }
 
     /// Removes the file, or does what `S::ROLE` says for one that cannot be
@@ -424,7 +431,12 @@ fn store_over<S: VersionedState>(path: &Path, loaded: &Loaded<S>) -> Result<bool
                 kind: e.kind(),
             },
         ),
-        Loaded::Absent | Loaded::Obsolete { .. } | Loaded::Current { .. } => return Ok(false),
+        // Nothing a release cannot read is at the name: nothing to protect.
+        Loaded::Absent => return Ok(false),
+        // Dropped on purpose by the chain's floor.
+        Loaded::Obsolete { .. } => return Ok(false),
+        // This release reads it; the store replaces it with the newer value.
+        Loaded::Current { .. } => return Ok(false),
         Loaded::Newer { .. } => (
             S::ROLE.on_store(CannotRead::Newer),
             StoreError::Unreadable {
@@ -451,7 +463,12 @@ fn store_over<S: VersionedState>(path: &Path, loaded: &Loaded<S>) -> Result<bool
 fn remove_over<S: VersionedState>(loaded: &Loaded<S>) -> RemoveOver {
     match loaded {
         Loaded::Unreadable(_) => S::ROLE.on_remove_io_failure(),
-        Loaded::Absent | Loaded::Obsolete { .. } | Loaded::Current { .. } => RemoveOver::Remove,
+        // Removing nothing is still the decision to remove.
+        Loaded::Absent => RemoveOver::Remove,
+        // Dropped on purpose by the chain's floor.
+        Loaded::Obsolete { .. } => RemoveOver::Remove,
+        // This release reads it and asked for it gone.
+        Loaded::Current { .. } => RemoveOver::Remove,
         Loaded::Newer { .. } => S::ROLE.on_remove(CannotRead::Newer),
         Loaded::Corrupt { .. } => S::ROLE.on_remove(CannotRead::Corrupt),
     }
