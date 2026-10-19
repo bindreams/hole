@@ -20,8 +20,9 @@
 //!    of those, or refuses as a bind race (`AddrInUse`, `PermissionDenied`,
 //!    `AddrNotAvailable`: the Windows excluded-port-range classes), is picked
 //!    again with no attempt cap, paced by a backoff and ended by `shutdown`; a
-//!    race that fails the same way twice running is warned about once. A mapped
-//!    IPv6 `local` is probed as its IPv4 form. Any other error fails the start.
+//!    race that fails the same way twice running is warned about once. Any other
+//!    error fails the start. A mapped IPv6 `local` is used as its IPv4 form
+//!    throughout: probed, bound and reported so.
 //! 2. Spawn the inner plugin's `run` future in a task, configured to bind
 //!    that internal port.
 //! 3. Wait for the inner plugin's own readiness report, racing the inner
@@ -146,28 +147,33 @@ impl ChainPlugin for TapPlugin {
         ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         let plugin_name = self.inner.name().to_string();
+        // A mapped IPv6 `local` is its IPv4 form everywhere (probe, public bind, reports): Windows refuses to bind the mapped one.
+        let local = SocketAddr::new(local.ip().to_canonical(), local.port());
 
         // 1. Allocate inner port (probe-and-drop, with bind-race retry).
-        // A mapped IPv6 `local` is probed as its IPv4 form: Windows refuses to bind the mapped one.
-        let probe_ip = local.ip().to_canonical();
-        let probe = self.take_probe().unwrap_or_else(|| os_probe(probe_ip));
-        let inner_local =
-            match allocate_inner_port_with(&plugin_name, probe_ip, &[local.port(), remote.port()], probe, &shutdown)
-                .await
-            {
-                Ok(Some(addr)) => addr,
-                // Shutdown before ready: drop `ready` unsent, as the readiness wait does.
-                Ok(None) => return Ok(()),
-                Err(e) => {
-                    let _ = ready.send(Err(StartError::Fatal {
-                        detail: format!("tap[{plugin_name}]: alloc inner port: {e}"),
-                        errno: e.raw_os_error(),
-                    }));
-                    return Err(crate::Error::Chain(format!(
-                        "tap[{plugin_name}]: alloc inner port: {e}"
-                    )));
-                }
-            };
+        let probe = self.take_probe().unwrap_or_else(|| os_probe(local.ip()));
+        let inner_local = match allocate_inner_port_with(
+            &plugin_name,
+            local.ip(),
+            &[local.port(), remote.port()],
+            probe,
+            &shutdown,
+        )
+        .await
+        {
+            Ok(Some(addr)) => addr,
+            // Shutdown before ready: drop `ready` unsent, as the readiness wait does.
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                let _ = ready.send(Err(StartError::Fatal {
+                    detail: format!("tap[{plugin_name}]: alloc inner port: {e}"),
+                    errno: e.raw_os_error(),
+                }));
+                return Err(crate::Error::Chain(format!(
+                    "tap[{plugin_name}]: alloc inner port: {e}"
+                )));
+            }
+        };
 
         // 2. Spawn the inner plugin against `inner_local`.
         let inner_shutdown = shutdown.clone();

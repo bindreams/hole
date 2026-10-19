@@ -1176,6 +1176,32 @@ async fn a_tap_on_a_mapped_ipv6_address_gives_the_inner_its_ipv4_form() {
     assert_eq!(given.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
 }
 
+#[skuld::test]
+async fn a_tap_on_a_mapped_ipv6_address_starts_and_relays_as_its_ipv4_form() {
+    // Windows refuses `bind([::ffff:127.0.0.1]:0)` (10049) for the tap's public listener as for the
+    // inner's: the whole start must treat the address as its IPv4 form.
+    let shutdown = CancellationToken::new();
+    let local: SocketAddr = "[::ffff:127.0.0.1]:0".parse().unwrap();
+    let inner = || {
+        Box::new(StubPlugin {
+            behavior: Behavior::Echo { read_bytes: 5 },
+        }) as Box<dyn ChainPlugin>
+    };
+    let (public, handle) = start_tap(inner, local, unused_remote(), &shutdown)
+        .await
+        .unwrap_or_else(|m| panic!("{m}"));
+
+    assert_eq!(public.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+    let mut s = TcpStream::connect(public).await.unwrap();
+    s.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello");
+
+    shutdown.cancel();
+    handle.await.expect("tap task panicked").expect("tap returned error");
+}
+
 /// The module doc's readiness bound for an inner plugin, written out so a change to it fails here.
 const READINESS_BOUND: Duration = Duration::from_secs(30);
 
