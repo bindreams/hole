@@ -22,8 +22,17 @@ fn record(n: usize) -> OsRecordFile {
 /// loads the file in a loop, until `write` is done. Returns what `write`
 /// collected, the number of loads, and the loads that were not `Current`.
 fn while_loading<T>(file: &VersionedFile<OsRecordFile>, write: impl FnOnce() -> T) -> (T, usize, Vec<String>) {
+    /// Sets the flag when dropped, so a panicking `write` still stops the loader.
+    struct Done<'a>(&'a AtomicBool);
+
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     let written = AtomicBool::new(false);
-    let (loading, loaded_once) = mpsc::channel();
+    let (loading, loaded_once) = mpsc::sync_channel(1);
 
     std::thread::scope(|scope| {
         let loader = scope.spawn(|| {
@@ -34,15 +43,16 @@ fn while_loading<T>(file: &VersionedFile<OsRecordFile>, write: impl FnOnce() -> 
                     other => torn.push(format!("{other:?}")),
                 }
                 loads += 1;
-                // Only the first send is read; later ones find the receiver gone.
-                let _ = loading.send(());
+                // Only the first send is read; a full queue drops the rest.
+                let _ = loading.try_send(());
             }
             (loads, torn)
         });
 
         loaded_once.recv().expect("the loader has read once");
+        let done = Done(&written);
         let out = write();
-        written.store(true, Ordering::Release);
+        drop(done);
 
         let (loads, torn) = loader.join().expect("the loader did not panic");
         (out, loads, torn)

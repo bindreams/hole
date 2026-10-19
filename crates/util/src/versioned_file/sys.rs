@@ -113,8 +113,8 @@ mod windows_impl {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        FileRenameInfoEx, MoveFileExW, SetFileInformationByHandle, DELETE, FILE_RENAME_INFO, MOVEFILE_REPLACE_EXISTING,
-        MOVEFILE_WRITE_THROUGH,
+        FileBasicInfo, FileRenameInfoEx, MoveFileExW, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_NORMAL,
+        FILE_BASIC_INFO, FILE_RENAME_INFO, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
     /// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and `FILE_RENAME_FLAG_POSIX_SEMANTICS`
@@ -134,6 +134,35 @@ mod windows_impl {
         }
     }
 
+    /// `path` made absolute (`.`, `..` and `/` resolved) and in verbatim form,
+    /// `\\?\` or `\\?\UNC\`, which a Win32 path call reads at any length: a
+    /// plain path of `MAX_PATH` characters or more fails them. `std` does the
+    /// same inside its own calls, so a path `std` accepts is accepted here.
+    /// No terminating NUL; a NUL inside the path is `InvalidInput`.
+    pub(super) fn verbatim(path: &Path) -> io::Result<Vec<u16>> {
+        let absolute: Vec<u16> = std::path::absolute(path)?.as_os_str().encode_wide().collect();
+        let starts_with = |prefix: &str| absolute.starts_with(&prefix.encode_utf16().collect::<Vec<u16>>());
+
+        // Verbatim and device paths are already in a form the calls read as is.
+        if starts_with(r"\\?\") || starts_with(r"\\.\") {
+            return Ok(absolute);
+        }
+        let (prefix, rest) = match starts_with(r"\\") {
+            true => (r"\\?\UNC\", &absolute[2..]),
+            false => (r"\\?\", &absolute[..]),
+        };
+        let mut wide: Vec<u16> = prefix.encode_utf16().collect();
+        wide.extend_from_slice(rest);
+        Ok(wide)
+    }
+
+    /// [`verbatim`] with the terminating NUL a `PCWSTR` needs.
+    fn verbatim_nul(path: &Path) -> io::Result<Vec<u16>> {
+        let mut wide = verbatim(path)?;
+        wide.push(0);
+        Ok(wide)
+    }
+
     pub(super) fn replace(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
         publish_with(tmp, dest, rename_posix, rename_replace_legacy)
     }
@@ -141,12 +170,17 @@ mod windows_impl {
     /// Renames the temp file over `dest` with `posix`, or with `legacy` when
     /// `posix` answers that the volume does not support it. Any other error
     /// is returned, and the temp file is removed on every failure.
+    ///
+    /// The temp file is created `FILE_ATTRIBUTE_TEMPORARY`, which tells the file
+    /// system it may keep the data in cache; `tempfile`'s own `persist` resets
+    /// the attributes to normal before it renames, and so does this.
     pub(super) fn publish_with(
         tmp: NamedTempFile,
         dest: &Path,
         posix: impl FnOnce(&Path, &Path) -> io::Result<()>,
         legacy: impl FnOnce(&Path, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
+        clear_temporary_attribute(tmp.as_file())?;
         let mut from = tmp.into_temp_path();
         match posix(&from, dest) {
             Err(e) if posix_rename_unsupported(&e) => legacy(&from, dest)?,
@@ -168,9 +202,31 @@ mod windows_impl {
             .any(|unsupported| unsupported.0 as i32 == code)
     }
 
+    /// Sets the file's attributes to `FILE_ATTRIBUTE_NORMAL` through its handle.
+    /// A zero time in `FILE_BASIC_INFO` leaves that time as it is.
+    fn clear_temporary_attribute(file: &std::fs::File) -> io::Result<()> {
+        let info = FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: 0,
+            FileAttributes: FILE_ATTRIBUTE_NORMAL.0,
+        };
+        // SAFETY: `info` is a valid `FILE_BASIC_INFO` of the size passed, and
+        // the handle is open for writing (and so for writing attributes).
+        unsafe {
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileBasicInfo,
+                (&raw const info).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        }
+        .map_err(io_error)
+    }
+
     pub(super) fn rename_replace_legacy(from: &Path, to: &Path) -> io::Result<()> {
-        let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
-        let (from, to) = (wide(from), wide(to));
+        let (from, to) = (verbatim_nul(from)?, verbatim_nul(to)?);
         // SAFETY: both buffers are NUL-terminated and outlive the call.
         unsafe {
             MoveFileExW(
@@ -187,8 +243,7 @@ mod windows_impl {
         // delete, so an existing reader of `from` does not conflict.
         let file = OpenOptions::new().access_mode(DELETE.0).open(from)?;
 
-        let name: Vec<u16> = to.as_os_str().encode_wide().collect();
-        let (buf, size) = rename_info(&name);
+        let (buf, size) = rename_info(&verbatim(to)?);
         // SAFETY: `rename_info` returns an 8-aligned buffer of at least `size`
         // bytes holding a `FILE_RENAME_INFO` whose name is NUL-terminated.
         unsafe {
@@ -230,8 +285,7 @@ mod windows_impl {
 
     /// Fails with `AlreadyExists` when `to` exists, and is written through.
     pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-        let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
-        let (from, to) = (wide(from), wide(to));
+        let (from, to) = (verbatim_nul(from)?, verbatim_nul(to)?);
         // SAFETY: both buffers are NUL-terminated and outlive the call.
         unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVEFILE_WRITE_THROUGH) }.map_err(io_error)
     }

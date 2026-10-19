@@ -85,6 +85,8 @@ mod windows_fallback {
         tmp
     }
 
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+
     fn os(code: u32) -> io::Error {
         io::Error::from_raw_os_error(code as i32)
     }
@@ -132,6 +134,19 @@ mod windows_fallback {
         assert_eq!(legacy_calls.get(), 1);
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         assert_eq!(names(&dir), ["dest"]);
+    }
+
+    #[skuld::test]
+    fn the_legacy_move_does_not_leave_the_file_marked_temporary() {
+        use std::os::windows::fs::MetadataExt;
+
+        let dir = dir();
+        let dest = put(&dir, "dest", b"old");
+
+        publish_with(tmp_with(&dir, b"new"), &dest, |_, _| Err(os(87)), rename_replace_legacy).unwrap();
+
+        let attributes = std::fs::metadata(&dest).unwrap().file_attributes();
+        assert_eq!(attributes & FILE_ATTRIBUTE_TEMPORARY, 0, "attributes {attributes:#x}");
     }
 
     #[skuld::test]
@@ -219,6 +234,123 @@ mod windows_rename_info {
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             assert_eq!(named, name, "len {len}: the name is copied after the header");
+
+            // SAFETY: `buf` is 8-aligned and holds a `FILE_RENAME_INFO` header.
+            let info = unsafe {
+                &*buf
+                    .as_ptr()
+                    .cast::<windows::Win32::Storage::FileSystem::FILE_RENAME_INFO>()
+            };
+            // REPLACE_IF_EXISTS | POSIX_SEMANTICS, from the `FILE_RENAME_FLAG_*` values.
+            assert_eq!(
+                unsafe { info.Anonymous.Flags },
+                0x3,
+                "len {len}: replace with POSIX semantics"
+            );
+            assert_eq!(
+                info.FileNameLength as usize,
+                len * 2,
+                "len {len}: the length excludes the NUL"
+            );
         }
+    }
+}
+
+#[cfg(windows)]
+mod windows_long_paths {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    use super::super::windows_impl::{rename_replace_legacy, verbatim};
+    use super::*;
+    use crate::versioned_file::fixtures::long_dir;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    fn verbatim_of(s: &str) -> Vec<u16> {
+        verbatim(&PathBuf::from(s)).unwrap()
+    }
+
+    #[skuld::test]
+    fn a_drive_path_gets_the_verbatim_prefix_with_dots_and_slashes_resolved() {
+        assert_eq!(verbatim_of("C:/a/../b/./c"), wide(r"\\?\C:\b\c"));
+    }
+
+    #[skuld::test]
+    fn a_unc_path_gets_the_verbatim_unc_prefix() {
+        assert_eq!(verbatim_of(r"\\srv\share\x\..\y"), wide(r"\\?\UNC\srv\share\y"));
+    }
+
+    #[skuld::test]
+    fn a_verbatim_path_is_passed_through_untouched() {
+        assert_eq!(verbatim_of(r"\\?\C:\a\..\b"), wide(r"\\?\C:\a\..\b"));
+        assert_eq!(verbatim_of(r"\\?\UNC\srv\share\y"), wide(r"\\?\UNC\srv\share\y"));
+    }
+
+    #[skuld::test]
+    fn a_relative_path_is_made_absolute_first() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut expected = wide(r"\\?\");
+        expected.extend(cwd.join("rel").as_os_str().encode_wide());
+        assert_eq!(verbatim_of("rel"), expected);
+    }
+
+    #[skuld::test]
+    fn a_path_with_a_nul_is_invalid_input() {
+        let err = verbatim(&PathBuf::from("C:\\a\0b")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err:?}");
+    }
+
+    #[skuld::test]
+    fn rename_noreplace_works_in_a_directory_of_260_characters_or_more() {
+        let root = dir();
+        let long = long_dir(root.path());
+        std::fs::write(long.join("a"), b"bytes").unwrap();
+
+        rename_noreplace(&long.join("a"), &long.join("b")).unwrap();
+        let err = rename_noreplace(&long.join("a"), &long.join("b")).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
+        assert_eq!(std::fs::read(long.join("b")).unwrap(), b"bytes");
+    }
+
+    #[skuld::test]
+    fn rename_noreplace_never_replaces_in_a_directory_of_260_characters_or_more() {
+        let root = dir();
+        let long = long_dir(root.path());
+        std::fs::write(long.join("a"), b"from").unwrap();
+        std::fs::write(long.join("b"), b"to").unwrap();
+
+        let err = rename_noreplace(&long.join("a"), &long.join("b")).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err:?}");
+    }
+
+    #[skuld::test]
+    fn the_legacy_move_works_in_a_directory_of_260_characters_or_more() {
+        let root = dir();
+        let long = long_dir(root.path());
+        std::fs::write(long.join("from"), b"new").unwrap();
+        std::fs::write(long.join("to"), b"old").unwrap();
+
+        rename_replace_legacy(&long.join("from"), &long.join("to")).unwrap();
+
+        assert_eq!(std::fs::read(long.join("to")).unwrap(), b"new");
+    }
+
+    #[skuld::test]
+    fn publish_works_in_a_directory_of_260_characters_or_more() {
+        let root = dir();
+        let long = long_dir(root.path());
+        let dest = long.join("dest");
+        std::fs::write(&dest, b"old").unwrap();
+        let mut tmp = tempfile::Builder::new().tempfile_in(&long).unwrap();
+        io::Write::write_all(&mut tmp, b"new").unwrap();
+
+        publish(tmp, &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
     }
 }

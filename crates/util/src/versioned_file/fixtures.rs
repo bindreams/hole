@@ -1,6 +1,8 @@
 //! Schema chains the `versioned_file` tests run against.
 
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::path::{Path, PathBuf};
 
 use super::{Obsolete, Role, Schema, VersionedState};
 
@@ -153,6 +155,19 @@ impl VersionedState for OwnsVersionKey {
 
 pub(crate) fn dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
+}
+
+/// A directory under `root` whose plain `C:\...` path is longer than 260
+/// characters, created through `std`, which prefixes the long path itself.
+#[cfg(windows)]
+pub(crate) fn long_dir(root: &Path) -> PathBuf {
+    let mut path = root.to_owned();
+    while path.as_os_str().len() <= 300 {
+        path.push("d".repeat(60));
+    }
+    std::fs::create_dir_all(&path).expect("create the long directory");
+    assert!(!path.to_string_lossy().starts_with(r"\\?\"), "guard: a plain path");
+    path
 }
 
 /// The sorted names in `dir`: what a test asserts on to prove nothing else (a

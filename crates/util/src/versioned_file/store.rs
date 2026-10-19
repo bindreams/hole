@@ -219,10 +219,15 @@ impl<S: VersionedState> VersionedFile<S> {
     /// and does not defend against a name changed under it.
     /// [`load`](Self::load) needs none of this and reads either file whole.
     ///
-    /// On Windows a volume that rejects POSIX rename (FAT, exFAT, some network
-    /// shares) gets `MoveFileExW` instead. There a reader that has the file
-    /// open at the instant of the replace can make the store fail with the OS
-    /// error (`PermissionDenied`); the old file is then still in place.
+    /// On Windows the replace is a POSIX-semantics rename, which a reader that
+    /// shares delete (every [`load`](Self::load), and `std`) cannot block; one
+    /// that does not share delete makes the store fail with the OS error
+    /// (a sharing violation). A volume that rejects POSIX rename (FAT, exFAT,
+    /// some network shares) gets `MoveFileExW` instead, where any reader that
+    /// has the file open at the instant of the replace can make the store fail
+    /// with the OS error (`PermissionDenied`). The old file is then still in
+    /// place. The file is published without `FILE_ATTRIBUTE_TEMPORARY`, and a
+    /// state directory path longer than `MAX_PATH` works.
     ///
     /// Blocks the calling thread on file I/O: from async code call it where
     /// blocking is allowed. `serde_json` writes a non-finite float as `null`, so an
@@ -471,3 +476,7 @@ mod store_link_tests;
 #[cfg(test)]
 #[path = "store_reader_tests.rs"]
 mod store_reader_tests;
+
+#[cfg(all(test, windows))]
+#[path = "store_windows_tests.rs"]
+mod store_windows_tests;
