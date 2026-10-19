@@ -18,6 +18,11 @@ pub(crate) trait Fs: Send + Sync {
         super::sys::lock_exclusive(file)
     }
 
+    /// Called once for a lock file this call has just made, before anything
+    /// else is done to it, so a test can read the access it has at its first
+    /// instant.
+    fn after_lock_created(&self, _file: &std::fs::File) {}
+
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
@@ -438,6 +443,10 @@ mod store_faults_tests;
 #[cfg(test)]
 #[path = "store_lock_tests.rs"]
 mod store_lock_tests;
+
+#[cfg(test)]
+#[path = "store_odd_lock_tests.rs"]
+mod store_odd_lock_tests;
 
 #[cfg(all(test, unix))]
 #[path = "store_access_unix_tests.rs"]

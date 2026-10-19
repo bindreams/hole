@@ -2,24 +2,45 @@
 //! needs. Each allow ACE that gives write is kept for its principal as read
 //! and write; each deny ACE is kept; nothing else is, and nothing is
 //! inherited. The owner always keeps the lock, through OWNER RIGHTS.
+//!
+//! The lock is created by `CreateFileW(CREATE_NEW)` carrying that DACL, so
+//! access is checked against it at every open there ever is, and the normal
+//! share mode is enough: no one can hold a handle the DACL would not have
+//! given them. A file made first and narrowed after would leave the
+//! directory's inherited DACL in force for the first opener, and Windows checks
+//! access at open time, so that handle would keep it.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows::Win32::Security::{
-    AclSizeInformation, AddAce, GetAce, GetAclInformation, InitializeAcl, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
-    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    AclSizeInformation, AddAce, GetAce, GetAclInformation, InitializeAcl, InitializeSecurityDescriptor,
+    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
 };
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE,
+};
+
+use crate::versioned_file::sys::io_error;
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 /// The ACE does not apply to the object itself, only to what is created in it.
 const INHERIT_ONLY_ACE: u8 = 0x08;
+
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const GENERIC_READ_WRITE: u32 = 0x8000_0000 | 0x4000_0000;
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 
 const FILE_WRITE_DATA: u32 = 0x2;
 const FILE_APPEND_DATA: u32 = 0x4;
@@ -47,9 +68,16 @@ pub(in crate::versioned_file) struct Writers {
 }
 
 impl Writers {
-    /// Those of `reference`, the file being guarded or about to be.
+    /// Those of `reference`, the file being guarded or about to be. `NotFound`
+    /// when there is no such entry; a link is an entry, and its writers are its
+    /// owner alone: `store` replaces the link, and `remove` and `move_aside`
+    /// act on the name, whatever it points at.
     pub(in crate::versioned_file) fn of(reference: &Path) -> io::Result<Self> {
         let mut aces = Vec::new();
+        if std::fs::symlink_metadata(reference)?.is_symlink() {
+            aces.push(allow(&OWNER_RIGHTS, LOCK_RIGHTS | WRITE_DAC));
+            return Ok(Self { aces });
+        }
         match read_aces(reference)? {
             // No DACL at all grants every access to everyone.
             None => aces.push(allow(&EVERYONE, LOCK_RIGHTS)),
@@ -59,19 +87,84 @@ impl Writers {
         Ok(Self { aces })
     }
 
+    /// Makes the lock file at `path` with exactly this DACL: `AlreadyExists`
+    /// when anything is there, a link included. `after_creation` runs at the
+    /// first instant, before anything is changed.
+    pub(in crate::versioned_file) fn create(
+        &self,
+        path: &Path,
+        after_creation: impl FnOnce(&File),
+    ) -> io::Result<File> {
+        let acl = build_acl(&self.aces)?;
+        let mut descriptor = std::mem::MaybeUninit::<SECURITY_DESCRIPTOR>::zeroed();
+        let descriptor_ptr = PSECURITY_DESCRIPTOR(descriptor.as_mut_ptr() as *mut _);
+        // SAFETY: `descriptor` is zeroed storage of the size the struct names,
+        // and `acl` outlives the call that makes the file, the only reader.
+        unsafe {
+            InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION).map_err(io_error)?;
+            SetSecurityDescriptorDacl(descriptor_ptr, true, Some(acl.as_ptr() as *const ACL), false)
+                .map_err(io_error)?;
+            // Unprotected, the directory's inheritable ACEs would join it.
+            SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED).map_err(io_error)?;
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor_ptr.0,
+            bInheritHandle: false.into(),
+        };
+        let name = wide(path);
+        // SAFETY: `name` is NUL-terminated and `attributes` names a valid
+        // descriptor, both alive for the call.
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                GENERIC_READ_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                Some(&attributes),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(io_error)?;
+        // SAFETY: a handle `CreateFileW` just returned, owned by nothing else.
+        let file = unsafe { File::from_raw_handle(handle.0) };
+        after_creation(&file);
+        Ok(file)
+    }
+
     /// Gives the file at `path` exactly this DACL, whatever it has now.
-    pub(in crate::versioned_file) fn apply(&self, _file: &File, path: &Path) -> io::Result<()> {
+    fn apply(&self, path: &Path) -> io::Result<()> {
         set_aces(path, &self.aces)
     }
 
     /// [`apply`](Self::apply), unless the file already has it: a writer that
     /// is not the owner can open the lock but could not change it.
-    pub(in crate::versioned_file) fn conform(&self, file: &File, path: &Path) -> io::Result<()> {
+    pub(in crate::versioned_file) fn conform(&self, _file: &File, path: &Path) -> io::Result<()> {
         if read_aces(path)?.as_deref() == Some(&self.aces[..]) {
             return Ok(());
         }
-        self.apply(file, path)
+        self.apply(path)
     }
+}
+
+/// Opens the lock file at `path` for reading and writing. `NotFound` only when
+/// there is nothing at `path`: a link, even a dangling one, is opened as the
+/// link and refused. A directory is refused by the open itself.
+pub(in crate::versioned_file) fn open_existing(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)?;
+    let attributes = file.metadata()?.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the lock path is a symbolic link or other reparse point",
+        ));
+    }
+    Ok(file)
 }
 
 fn allow(sid: &[u8], mask: u32) -> Vec<u8> {
@@ -170,10 +263,9 @@ fn copy_aces(dacl: *mut ACL) -> io::Result<Vec<Vec<u8>>> {
     Ok(aces)
 }
 
-/// Replaces `path`'s DACL with exactly `aces`, and stops it inheriting.
-fn set_aces(path: &Path, aces: &[Vec<u8>]) -> io::Result<()> {
+/// An ACL of exactly `aces`, as `u32`s: an ACL is DWORD-aligned.
+fn build_acl(aces: &[Vec<u8>]) -> io::Result<Vec<u32>> {
     let total = 8 + aces.iter().map(Vec::len).sum::<usize>();
-    // `u32` elements: an ACL is DWORD-aligned.
     let mut buffer = vec![0u32; total.div_ceil(4)];
     let acl = buffer.as_mut_ptr() as *mut ACL;
     // SAFETY: `buffer` is `total` aligned bytes, the room for the header and every ACE.
@@ -183,6 +275,12 @@ fn set_aces(path: &Path, aces: &[Vec<u8>]) -> io::Result<()> {
         unsafe { AddAce(acl, ACL_REVISION, u32::MAX, ace.as_ptr() as *const _, ace.len() as u32) }
             .map_err(io::Error::other)?;
     }
+    Ok(buffer)
+}
+
+/// Replaces `path`'s DACL with exactly `aces`, and stops it inheriting.
+fn set_aces(path: &Path, aces: &[Vec<u8>]) -> io::Result<()> {
+    let acl = build_acl(aces)?;
     let name = wide(path);
     // SAFETY: `name` is NUL-terminated and `acl` is a valid ACL.
     let rc = unsafe {
@@ -192,7 +290,7 @@ fn set_aces(path: &Path, aces: &[Vec<u8>]) -> io::Result<()> {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             None,
             None,
-            Some(acl),
+            Some(acl.as_ptr() as *const ACL),
             None,
         )
     };

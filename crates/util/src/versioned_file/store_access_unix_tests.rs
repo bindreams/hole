@@ -7,7 +7,7 @@
 
 use std::io;
 
-use super::{DefaultPlacement, Removal, VersionedFile};
+use super::{DefaultPlacement, Fs, Removal, VersionedFile};
 use crate::versioned_file::fixtures::{dir, put, DecisionFile};
 
 fn decision(value: &str) -> DecisionFile {
@@ -103,7 +103,7 @@ mod read_only_directory {
 
 #[cfg(unix)]
 mod unix_mode {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
     use super::*;
@@ -221,6 +221,36 @@ mod unix_mode {
         VersionedFile::<DecisionFile>::new(dir.path()).move_aside().unwrap();
 
         assert_eq!(mode_of(&dir, "decision.json.lock"), 0o600);
+    }
+
+    /// Records the lock file's access at the instant it exists.
+    struct AtCreation(std::sync::Mutex<Vec<(u32, u32)>>);
+
+    impl Fs for AtCreation {
+        fn after_lock_created(&self, file: &std::fs::File) {
+            let meta = file.metadata().unwrap();
+            self.0.lock().unwrap().push((meta.mode() & 0o777, meta.uid()));
+        }
+    }
+
+    // The lock gets its wider mode after it exists, so for that instant it must
+    // be no wider than its creator alone.
+    #[skuld::test]
+    fn a_new_lock_is_closed_to_everyone_but_its_creator_when_it_first_exists() {
+        let dir = dir();
+        let fs = std::sync::Arc::new(AtCreation(Default::default()));
+        let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), fs.clone());
+
+        file.store(&decision("v"), &Mode(0o666)).unwrap();
+
+        // SAFETY: `geteuid` has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(*fs.0.lock().unwrap(), [(0o600, me)], "one lock, made owner-only");
+        assert_eq!(
+            mode_of(&dir, "decision.json.lock"),
+            0o666,
+            "and then given the writers' mode"
+        );
     }
 
     #[skuld::test]

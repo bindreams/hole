@@ -2,11 +2,11 @@
 //! decision each: held on a sibling file, `<name>.lock`, from the probe of the
 //! file to the last write.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use super::lock_access::Writers;
+use super::lock_access::{open_existing, Writers};
 use super::store::Fs;
 use super::sys;
 
@@ -31,7 +31,7 @@ impl Lock {
     /// `reference` is `NotFound`, before the lock file is looked at: nothing
     /// is created for a file that is not there.
     pub(super) fn acquire(fs: &dyn Fs, path: &Path, reference: &Path) -> io::Result<Self> {
-        let file = open_or_create(path, &Writers::of(reference)?)?;
+        let file = open_or_create(path, &Writers::of(reference)?, fs)?;
         fs.lock(&file)?;
         Ok(Self { file })
     }
@@ -45,33 +45,36 @@ impl Drop for Lock {
 
 /// Opened for writing as well as reading: on some network file systems a lock
 /// needs write access to its file.
-fn open_or_create(path: &Path, writers: &Writers) -> io::Result<File> {
-    let dir = path.parent().expect("a lock file is always inside a directory");
-    let name = path.file_name().expect("a lock file has a name").to_string_lossy();
-    loop {
-        match OpenOptions::new().read(true).write(true).open(path) {
-            Ok(file) => {
-                writers.conform(&file, path)?;
-                return Ok(file);
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        // Complete before it has its name, so no one can open it with the
-        // access a new file gets by default. It is published by a link that
-        // fails when another writer got there first.
-        let tmp = tempfile::Builder::new()
-            .prefix(&format!(".{name}."))
-            .suffix(".tmp")
-            .tempfile_in(dir)?;
-        writers.apply(tmp.as_file(), tmp.path())?;
-        match tmp.persist_noclobber(path) {
-            Ok(file) => return Ok(file),
-            // The lock file is never deleted, so the next open finds it.
-            Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.error),
-        }
+///
+/// Straight-line, with no loop: open what is there, else create it, and if
+/// that lost to another creator open what it made. The type never removes a
+/// lock file, so the last open can only find nothing if something outside it
+/// removed the file in between, and that is an error, not a reason to go
+/// round again. A link or anything but a regular file at the name is an error
+/// at the first open, and the create refuses a name that is taken.
+fn open_or_create(path: &Path, writers: &Writers, fs: &dyn Fs) -> io::Result<File> {
+    match open_existing(path) {
+        Ok(file) => return conformed(writers, file, path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
+    match writers.create(path, |file| fs.after_lock_created(file)) {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let file = open_existing(path).map_err(|e| match e.kind() {
+                // `NotFound` means "no state file" to the callers; this is not that.
+                io::ErrorKind::NotFound => io::Error::other("the lock file was removed while it was being opened"),
+                _ => e,
+            })?;
+            conformed(writers, file, path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn conformed(writers: &Writers, file: File, path: &Path) -> io::Result<File> {
+    writers.conform(&file, path)?;
+    Ok(file)
 }
 
 #[cfg(test)]

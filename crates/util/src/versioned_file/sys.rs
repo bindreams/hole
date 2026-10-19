@@ -53,6 +53,9 @@ pub(super) fn unlock(file: &File) {
     unix_impl::unlock(file);
 }
 
+#[cfg(windows)]
+pub(super) use windows_impl::io_error;
+
 #[cfg(test)]
 #[path = "sys_tests.rs"]
 mod sys_tests;
@@ -168,7 +171,7 @@ mod windows_impl {
     const LOCK_VIOLATION: i32 = 33;
 
     /// A `windows` error as the `io::Error` of the Win32 code inside it.
-    fn io_error(e: windows::core::Error) -> io::Error {
+    pub(in crate::versioned_file) fn io_error(e: windows::core::Error) -> io::Error {
         // An `HRESULT_FROM_WIN32` value keeps the Win32 code in its low word.
         match e.code().0 as u32 >> 16 {
             0x8007 => io::Error::from_raw_os_error((e.code().0 as u32 & 0xFFFF) as i32),

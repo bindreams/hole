@@ -14,7 +14,7 @@ use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
 };
 
-use super::{DefaultPlacement, Placement, Removal, VersionedFile};
+use super::{DefaultPlacement, Fs, Placement, Removal, VersionedFile};
 use crate::versioned_file::fixtures::{dir, put, DecisionFile};
 
 fn decision(value: &str) -> DecisionFile {
@@ -28,7 +28,7 @@ fn plain() -> DefaultPlacement {
 }
 
 /// `S-1-1-0` and `S-1-3-4` (OWNER RIGHTS), as SID bytes.
-const EVERYONE: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+pub(super) const EVERYONE: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
 const OWNER_RIGHTS: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
 
 const FILE_WRITE_DATA: u32 = 0x2;
@@ -43,10 +43,10 @@ const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
 /// One ACE as its bytes: header (type, flags, size), mask, SID.
 #[derive(Clone, PartialEq, Eq)]
-struct Ace(Vec<u8>);
+pub(super) struct Ace(Vec<u8>);
 
 impl Ace {
-    fn allow(sid: &[u8], mask: u32) -> Self {
+    pub(super) fn allow(sid: &[u8], mask: u32) -> Self {
         let size = (8 + sid.len()) as u16;
         let mut bytes = vec![0u8, 0];
         bytes.extend(size.to_le_bytes());
@@ -55,7 +55,7 @@ impl Ace {
         Self(bytes)
     }
 
-    fn deny(sid: &[u8], mask: u32) -> Self {
+    pub(super) fn deny(sid: &[u8], mask: u32) -> Self {
         let mut ace = Self::allow(sid, mask);
         ace.0[0] = ACCESS_DENIED_ACE_TYPE;
         ace
@@ -106,7 +106,7 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
-fn aces(path: &Path) -> Vec<Ace> {
+pub(super) fn aces(path: &Path) -> Vec<Ace> {
     let name = wide(path);
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -154,7 +154,7 @@ fn aces(path: &Path) -> Vec<Ace> {
 }
 
 /// Replaces `path`'s DACL with exactly `aces`, inheriting nothing.
-fn set_aces(path: &Path, aces: &[Ace]) {
+pub(super) fn set_aces(path: &Path, aces: &[Ace]) {
     let total = 8 + aces.iter().map(|a| a.0.len()).sum::<usize>();
     let mut buffer = vec![0u32; total.div_ceil(4)];
     let acl = buffer.as_mut_ptr() as *mut ACL;
@@ -327,6 +327,43 @@ fn the_lock_has_its_own_dacl_with_nothing_inherited() {
     for ace in lock_aces {
         assert_eq!(ace.flags() & INHERITED_ACE, 0, "{ace:?}");
     }
+}
+
+/// Records the lock file's ACEs at the instant it exists.
+struct AtCreation {
+    lock: PathBuf,
+    seen: std::sync::Mutex<Vec<Vec<Ace>>>,
+}
+
+impl Fs for AtCreation {
+    fn after_lock_created(&self, _file: &std::fs::File) {
+        self.seen.lock().unwrap().push(aces(&self.lock));
+    }
+}
+
+// A lock that is narrowed after it is made can be opened, in between, by any
+// principal the directory's DACL names, and that handle keeps its access.
+#[skuld::test]
+fn a_new_lock_has_its_final_dacl_when_it_first_exists() {
+    let (dir, _state, lock) = paths();
+    // New files here are readable by everyone, as under a shared install root.
+    let mut open_dir = aces(dir.path());
+    open_dir.push(Ace::allow(&EVERYONE, FILE_GENERIC_READ).inheritable());
+    set_aces(dir.path(), &open_dir);
+    let fs = std::sync::Arc::new(AtCreation {
+        lock: lock.clone(),
+        seen: Default::default(),
+    });
+
+    VersionedFile::<DecisionFile>::with_fs(dir.path(), fs.clone())
+        .store(&decision("v"), &plain())
+        .unwrap();
+
+    let seen = fs.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one lock was made");
+    assert_eq!(seen[0], aces(&lock), "the DACL it was made with is the one it keeps");
+    assert!(everyone(&seen[0]).is_empty(), "{:?}", seen[0]);
+    assert!(seen[0].iter().all(|a| a.flags() & INHERITED_ACE == 0), "{:?}", seen[0]);
 }
 
 #[skuld::test]
