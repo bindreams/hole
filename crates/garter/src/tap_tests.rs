@@ -14,7 +14,11 @@
 //! `#[skuld::test] async fn` builds a current-thread runtime by default.
 //!
 //! `run_with_tap` takes the tap's public address from the `ready` channel
-//! (port 0); a start failure panics with `run()`'s result.
+//! (port 0); a start failure panics with `run()`'s result. Stubs bind the
+//! address the tap gave them and report it: the tap forwards only to the
+//! address it gave. A stub that loses that bind to another process reports a
+//! typed `BindConflict`, and `start_tap` starts a new tap (a fresh port), as the
+//! bridge's bind retry does.
 //!
 //! Three waits remain unbounded in-process: the "tap closed" line,
 //! `client_body`, and the `plugin_handle.await` after `shutdown.cancel()`
@@ -51,7 +55,7 @@ use tokio_util::sync::CancellationToken;
 use crate::counting::CountingStream;
 use crate::plugin::ChainPlugin;
 use crate::sitrep::{PluginReady, StartError};
-use crate::tap::{allocate_inner_port_with, retry_connect_with, TapPlugin};
+use crate::tap::{allocate_inner_port_with, is_port_race, retry_connect_with, TapPlugin};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -98,16 +102,11 @@ impl ChainPlugin for StubPlugin {
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
-        ready: tokio::sync::oneshot::Sender<Result<crate::sitrep::PluginReady, crate::sitrep::StartError>>,
+        ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        // Port 0, reported on `ready`: the tap forwards to the reported address, so
-        // the stub need not win the port the tap probed and dropped.
-        let listener = TcpListener::bind(SocketAddr::new(local.ip(), 0))
-            .await
-            .map_err(|e| crate::Error::Chain(format!("stub bind {local}: {e}")))?;
-        let actual = listener.local_addr().unwrap_or(local);
+        let (listener, ready) = bind_given(local, ready).await?;
         let _ = ready.send(Ok(crate::sitrep::PluginReady {
-            listen: actual,
+            listen: listener.local_addr().unwrap_or(local),
             transports: crate::sitrep::Transports::TCP,
         }));
         let behavior = self.behavior;
@@ -160,6 +159,71 @@ fn unused_remote() -> SocketAddr {
     "127.0.0.1:1".parse().unwrap()
 }
 
+/// Binds `local`, the address the tap gave the stub. A bind lost to another
+/// process is reported on `ready` as the typed `BindConflict` a sitrep plugin
+/// sends, so the tap's caller starts over with a fresh port.
+async fn bind_given(
+    local: SocketAddr,
+    ready: oneshot::Sender<Ready>,
+) -> crate::Result<(TcpListener, oneshot::Sender<Ready>)> {
+    match TcpListener::bind(local).await {
+        Ok(listener) => Ok((listener, ready)),
+        Err(e) => Err(report_bind_failure(local, &e, ready)),
+    }
+}
+
+/// Reports a failed bind of `local` as a sitrep plugin does: a race class as
+/// `BindConflict` (retryable), anything else as `Fatal`.
+fn report_bind_failure(local: SocketAddr, e: &io::Error, ready: oneshot::Sender<Ready>) -> crate::Error {
+    let errno = e.raw_os_error();
+    let _ = ready.send(Err(if is_port_race(e) {
+        StartError::BindConflict {
+            errno: errno.unwrap_or(0),
+            addr: local,
+        }
+    } else {
+        StartError::Fatal {
+            detail: format!("stub bind {local}: {e}"),
+            errno,
+        }
+    }));
+    crate::Error::Chain(format!("stub bind {local}: {e}"))
+}
+
+/// Starts a tap over an inner from `make_inner` on `local`, and returns the
+/// public address it reported with its still-running task.
+///
+/// An inner that lost its port to another process makes the start fail with
+/// `BindConflict` on a port other than `local`; the start then repeats with a
+/// new inner and a new tap, which picks a fresh port, with no attempt cap. Any
+/// other outcome is the `Err` description.
+async fn start_tap(
+    mut make_inner: impl FnMut() -> Box<dyn ChainPlugin>,
+    local: SocketAddr,
+    remote: SocketAddr,
+    shutdown: &CancellationToken,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<crate::Result<()>>), String> {
+    loop {
+        let tap = Box::new(TapPlugin::wrap(make_inner()));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let shutdown = shutdown.clone();
+        let handle = tokio::spawn(async move { tap.run(local, remote, shutdown, ready_tx).await });
+        // Every exit path of `run` sends on `ready` or drops it.
+        match ready_rx.await {
+            Ok(Ok(ready)) => return Ok((ready.listen, handle)),
+            Ok(Err(StartError::BindConflict { addr, .. })) if addr != local => {
+                let _ = handle.await;
+            }
+            other => {
+                return Err(format!(
+                    "tap did not become ready: {other:?}; run() returned {:?}",
+                    handle.await
+                ))
+            }
+        }
+    }
+}
+
 // Test runner =========================================================================================================
 
 /// Run a test scenario: spawn the tap-wrapped plugin, run `client_body`,
@@ -175,27 +239,20 @@ where
 
     let remote = unused_remote();
     let shutdown = CancellationToken::new();
-    let inner = Box::new(StubPlugin { behavior }) as Box<dyn ChainPlugin>;
-    let tap = Box::new(TapPlugin::wrap(inner));
 
     let closed_rx = writer.wait_for("plugin tap: closed");
 
     // Port 0: the tap reports the address it bound via `ready`.
     let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let plugin_shutdown = shutdown.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let mut plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
-
-    // Every exit path of `run` either sends on `ready` or drops it, so this
-    // resolves on a start failure too.
-    let local = match ready_rx.await {
-        Ok(Ok(ready)) => ready.listen,
-        other => panic!(
-            "tap did not become ready: {other:?}; run() returned {:?}\nlog:\n{}",
-            plugin_handle.await,
+    let inner = || Box::new(StubPlugin { behavior }) as Box<dyn ChainPlugin>;
+    let (local, mut plugin_handle) = start_tap(inner, local, remote, &shutdown).await.unwrap_or_else(|m| {
+        panic!(
+            "{m}
+log:
+{}",
             writer.snapshot()
-        ),
-    };
+        )
+    });
 
     client_body(local).await;
 
@@ -357,23 +414,15 @@ async fn shutdown_cancels_in_flight_connection_without_panic() {
     let shutdown = CancellationToken::new();
 
     // Echo plugin so the connection stays open while client holds it.
-    let inner = Box::new(StubPlugin {
-        behavior: Behavior::Echo { read_bytes: 4096 },
-    }) as Box<dyn ChainPlugin>;
-    let tap = Box::new(TapPlugin::wrap(inner));
-
-    let plugin_shutdown = shutdown.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
-
-    let local = match ready_rx.await {
-        Ok(Ok(ready)) => ready.listen,
-        other => panic!(
-            "tap did not become ready: {other:?}; run() returned {:?}",
-            plugin_handle.await
-        ),
+    let inner = || {
+        Box::new(StubPlugin {
+            behavior: Behavior::Echo { read_bytes: 4096 },
+        }) as Box<dyn ChainPlugin>
     };
+    let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (local, plugin_handle) = start_tap(inner, local, remote, &shutdown)
+        .await
+        .unwrap_or_else(|m| panic!("{m}"));
 
     // Open a connection that the echo plugin will hold (waiting on
     // read_exact for 4096 bytes — we send only 1).
@@ -467,7 +516,8 @@ async fn failed_start_of(
     (ready, handle.await.expect("tap task panicked"))
 }
 
-/// Serves like `StubPlugin` and counts how many times the tap started it.
+/// Serves like `StubPlugin` and counts the starts that bound their port, not
+/// those that lost it to another process.
 struct CountingStub {
     runs: Arc<AtomicUsize>,
 }
@@ -485,10 +535,8 @@ impl ChainPlugin for CountingStub {
         shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
+        let (listener, ready) = bind_given(local, ready).await?;
         self.runs.fetch_add(1, Ordering::SeqCst);
-        let listener = TcpListener::bind(SocketAddr::new(local.ip(), 0))
-            .await
-            .map_err(|e| crate::Error::Chain(format!("stub bind {local}: {e}")))?;
         let _ = ready.send(Ok(PluginReady {
             listen: listener.local_addr().unwrap_or(local),
             transports: crate::sitrep::Transports::TCP,
@@ -627,8 +675,16 @@ async fn a_public_bind_conflict_is_reported_and_the_inner_is_not_restarted() {
     let public = holder.local_addr().unwrap();
 
     let runs = Arc::new(AtomicUsize::new(0));
-    let inner = Box::new(CountingStub { runs: runs.clone() });
-    let (ready, result) = failed_start(inner, public).await;
+    let (ready, result) = loop {
+        let inner = Box::new(CountingStub { runs: runs.clone() });
+        let (ready, result) = failed_start(inner, public).await;
+        // An inner that lost its port reports a conflict on that port, not the
+        // public one under test, and was never counted: start over.
+        if matches!(&ready, Ok(Err(StartError::BindConflict { addr, .. })) if *addr != public) {
+            continue;
+        }
+        break (ready, result);
+    };
 
     assert!(
         matches!(&ready, Ok(Err(StartError::BindConflict { addr, errno })) if *addr == public && *errno != 0),
@@ -638,7 +694,7 @@ async fn a_public_bind_conflict_is_reported_and_the_inner_is_not_restarted() {
     assert_eq!(
         runs.load(Ordering::SeqCst),
         1,
-        "a public conflict never restarts the inner"
+        "a public conflict never restarts an inner that bound"
     );
     drop(holder);
 }
@@ -664,6 +720,72 @@ async fn a_typed_bind_conflict_from_the_inner_is_reported_not_swallowed() {
         torn_down.load(Ordering::SeqCst),
         "the inner must be gone once run returns"
     );
+}
+
+/// Every stub of a scenario shares this: the addresses the tap gave the stubs,
+/// in order, and the listeners that took the first one.
+#[derive(Default)]
+struct Thefts {
+    given: Mutex<Vec<SocketAddr>>,
+    thieves: Mutex<Vec<std::net::TcpListener>>,
+}
+
+/// The first stub of a scenario finds its port taken by another listener, which
+/// stays up; later stubs serve the address they were given.
+struct StealOnceStub {
+    thefts: Arc<Thefts>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for StealOnceStub {
+    fn name(&self) -> &str {
+        "steal-once-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        let first = {
+            let mut given = self.thefts.given.lock().unwrap();
+            given.push(local);
+            given.len() == 1
+        };
+        if first {
+            // A port someone else already holds is the same loss as one taken here.
+            match std::net::TcpListener::bind(local) {
+                Ok(thief) => self.thefts.thieves.lock().unwrap().push(thief),
+                Err(e) => return Err(report_bind_failure(local, &e, ready)),
+            }
+        }
+        let (_listener, ready) = bind_given(local, ready).await?;
+        let _ = ready.send(Ok(PluginReady {
+            listen: local,
+            transports: crate::sitrep::Transports::TCP,
+        }));
+        shutdown.cancelled().await;
+        Ok(())
+    }
+}
+
+#[skuld::test]
+async fn an_inner_that_loses_its_port_once_is_started_again_on_a_fresh_one() {
+    let thefts = Arc::new(Thefts::default());
+    let shutdown = CancellationToken::new();
+    let inner = || Box::new(StealOnceStub { thefts: thefts.clone() }) as Box<dyn ChainPlugin>;
+    let (public, handle) = start_tap(inner, loopback(), unused_remote(), &shutdown)
+        .await
+        .unwrap_or_else(|m| panic!("{m}"));
+
+    let given = thefts.given.lock().unwrap().clone();
+    assert_eq!(given.len(), 2, "one lost start, one that readied: {given:?}");
+    assert!(public.port() != 0, "the tap readied on a real public address");
+
+    shutdown.cancel();
+    handle.await.expect("tap task panicked").expect("tap returned error");
 }
 
 #[skuld::test]
@@ -888,7 +1010,7 @@ async fn a_tap_on_an_address_the_host_does_not_own_keeps_picking_until_shutdown(
         async move { tap.run(local, unused_remote(), shutdown, ready_tx).await }
     });
     // Virtual time: the paused clock advances only through the pick's own backoff.
-    tokio::time::sleep(Duration::from_secs(3600)).await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
     shutdown.cancel();
 
     assert!(run.await.unwrap().is_ok(), "a clean shutdown is not an error");
@@ -938,6 +1060,65 @@ impl ChainPlugin for ForeignListenStub {
 async fn an_inner_that_reports_a_listener_outside_its_own_ip_is_fatal() {
     // sitrep: a host connecting to a loopback listener must validate `listen` first.
     let (ready, result) = failed_start(Box::new(ForeignListenStub), loopback()).await;
+
+    assert!(
+        matches!(&ready, Ok(Err(StartError::Fatal { .. }))),
+        "want Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+/// Reports a listener on the address it was given but another port (`port`, or
+/// the one after its own), then waits for shutdown.
+struct OtherPortStub {
+    port: Option<u16>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for OtherPortStub {
+    fn name(&self) -> &str {
+        "other-port-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        let listen = SocketAddr::new(local.ip(), self.port.unwrap_or(local.port().wrapping_add(1)));
+        let _ = ready.send(Ok(PluginReady {
+            listen,
+            transports: crate::sitrep::Transports::TCP,
+        }));
+        shutdown.cancelled().await;
+        Ok(())
+    }
+}
+
+#[skuld::test]
+async fn an_inner_that_reports_another_port_is_fatal() {
+    // The tap must never forward to a port it did not give the inner: its own
+    // public port would make every forwarder connect back to the tap.
+    let (ready, result) = failed_start(Box::new(OtherPortStub { port: None }), loopback()).await;
+
+    assert!(
+        matches!(&ready, Ok(Err(StartError::Fatal { .. }))),
+        "want Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn an_inner_that_reports_the_taps_public_port_is_fatal() {
+    // Accepted, every client connection would make a forwarder connect back to
+    // the tap's own listener, and so on without bound.
+    let public = std::net::TcpListener::bind(loopback()).unwrap().local_addr().unwrap();
+    let inner = Box::new(OtherPortStub {
+        port: Some(public.port()),
+    });
+    let (ready, result) = failed_start(inner, public).await;
 
     assert!(
         matches!(&ready, Ok(Err(StartError::Fatal { .. }))),
@@ -1008,9 +1189,9 @@ async fn shutdown_ends_the_inner_connect_retry() {
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
-/// Reports ready on port 1, where nothing listens (the OS never hands port 1 out
-/// as an ephemeral port), so every connect to it is refused; exits with an error
-/// once `die` fires.
+/// Reports ready on the address it was given, which it holds bound but never
+/// listens on, so every connect to it is refused and no other process can take
+/// the port; exits with an error once `die` fires.
 struct ClosedListenerStub {
     die: oneshot::Receiver<()>,
 }
@@ -1028,8 +1209,12 @@ impl ChainPlugin for ClosedListenerStub {
         _shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
+        let socket = tokio::net::TcpSocket::new_v4().map_err(|e| crate::Error::Chain(format!("stub socket: {e}")))?;
+        if let Err(e) = socket.bind(local) {
+            return Err(report_bind_failure(local, &e, ready));
+        }
         let _ = ready.send(Ok(PluginReady {
-            listen: SocketAddr::new(local.ip(), 1),
+            listen: socket.local_addr().unwrap_or(local),
             transports: crate::sitrep::Transports::TCP,
         }));
         let _ = self.die.await;
@@ -1043,17 +1228,18 @@ async fn the_inner_exiting_ends_a_forwarder_still_retrying_its_connect() {
     let _g = set_default_in_current_thread(subscriber);
 
     let accepted_rx = writer.wait_for("plugin tap: accepted");
-    let (die_tx, die_rx) = oneshot::channel();
-    let tap = Box::new(TapPlugin::wrap(Box::new(ClosedListenerStub { die: die_rx })));
-    let (ready_tx, ready_rx) = oneshot::channel();
+    // The sender of the start that readied; a start that lost its port is replaced.
+    let mut die_tx = None;
+    let inner = || {
+        let (tx, rx) = oneshot::channel();
+        die_tx = Some(tx);
+        Box::new(ClosedListenerStub { die: rx }) as Box<dyn ChainPlugin>
+    };
     // Never cancelled: only the inner's exit may end the tap and its forwarder.
     let shutdown = CancellationToken::new();
-    let handle = tokio::spawn(async move { tap.run(loopback(), unused_remote(), shutdown, ready_tx).await });
-
-    let public = match ready_rx.await {
-        Ok(Ok(ready)) => ready.listen,
-        other => panic!("tap did not become ready: {other:?}"),
-    };
+    let (public, handle) = start_tap(inner, loopback(), unused_remote(), &shutdown)
+        .await
+        .unwrap_or_else(|m| panic!("{m}"));
     let _client = TcpStream::connect(public).await.unwrap();
     // The forwarder is spawned: its connect to the closed inner is refused until the inner exits.
     tokio::task::spawn_blocking(move || accepted_rx.recv())
@@ -1061,7 +1247,7 @@ async fn the_inner_exiting_ends_a_forwarder_still_retrying_its_connect() {
         .unwrap()
         .expect("tap never accepted the client");
 
-    die_tx.send(()).unwrap();
+    die_tx.expect("a start readied").send(()).unwrap();
     let result = handle.await.expect("tap task panicked");
 
     let err = result.expect_err("the inner's exit error is the tap's");

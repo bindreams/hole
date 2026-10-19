@@ -190,15 +190,21 @@ impl ChainPlugin for TapPlugin {
             }
         };
         let inner_target = match reported {
-            Ok(Ok(Ok(report))) if report.listen.ip() == inner_local.ip() => report.listen,
+            // The port must be the one the inner was given: any other could be
+            // the tap's own listener (a self-connect cascade) or another service.
+            Ok(Ok(Ok(report)))
+                if report.listen.port() == inner_local.port()
+                    && (report.listen.ip() == inner_local.ip() || inner_local.ip().is_unspecified()) =>
+            {
+                report.listen
+            }
             // The inner reported a listener outside the address it was given.
             Ok(Ok(Ok(report))) => {
                 inner_handle.abort();
                 let _ = inner_handle.await;
                 let detail = format!(
-                    "tap[{plugin_name}]: inner reported its listener at {}, outside the address {} it was given",
-                    report.listen,
-                    inner_local.ip()
+                    "tap[{plugin_name}]: inner reported its listener at {}, not the address {} it was given",
+                    report.listen, inner_local
                 );
                 let _ = ready.send(Err(StartError::Fatal {
                     detail: detail.clone(),
@@ -392,7 +398,7 @@ pub(crate) async fn allocate_inner_port_with(
 /// `AddrNotAvailable` when the excluded-port-range tables disagree about the
 /// port it was handed. An address the host does not own fails the same way on
 /// every pick, so such a start never readies; `shutdown` ends it.
-fn is_port_race(err: &io::Error) -> bool {
+pub(crate) fn is_port_race(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied | io::ErrorKind::AddrNotAvailable
