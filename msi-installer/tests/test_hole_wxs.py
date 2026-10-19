@@ -34,12 +34,12 @@ UUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]
 def test_guids_are_unique(package: ET.Element) -> None:
     pairs = _collect_component_guids(package)
     guids = [g for _, g in pairs]
-    assert len(guids) == len(set(guids)), (f"Duplicate component GUIDs: {[g for g in guids if guids.count(g) > 1]}")
+    assert len(guids) == len(set(guids)), f"Duplicate component GUIDs: {[g for g in guids if guids.count(g) > 1]}"
 
 
 def test_guids_are_valid_format(package: ET.Element) -> None:
     for comp_id, guid in _collect_component_guids(package):
-        assert UUID_RE.match(guid), (f"Component '{comp_id}' has invalid GUID format: {guid}")
+        assert UUID_RE.match(guid), f"Component '{comp_id}' has invalid GUID format: {guid}"
 
 
 # Directory reference tests ============================================================================================
@@ -61,7 +61,7 @@ def test_custom_action_directories_defined(package: ET.Element) -> None:
     for ca in package.iter(f"{{{NS['wix']}}}CustomAction"):
         dir_ref = ca.get("Directory")
         if dir_ref is not None:
-            assert dir_ref in defined, (f"CustomAction '{ca.get('Id')}' references undefined directory '{dir_ref}'")
+            assert dir_ref in defined, f"CustomAction '{ca.get('Id')}' references undefined directory '{dir_ref}'"
 
 
 def _collect_file_ids(package: ET.Element) -> set[str]:
@@ -84,15 +84,14 @@ def test_custom_actions_use_fileref(package: ET.Element) -> None:
         )
         file_ref = ca.get("FileRef")
         if file_ref is not None:
-            assert file_ref in file_ids, (f"CustomAction '{ca_id}' references undefined File '{file_ref}'")
+            assert file_ref in file_ids, f"CustomAction '{ca_id}' references undefined File '{file_ref}'"
 
 
 def test_install_dir_is_64bit(package: ET.Element) -> None:
     """Binary components must install under ProgramFiles64Folder, not ProgramFilesFolder."""
     std_dirs = [elem.get("Id") for elem in package.iter(f"{{{NS['wix']}}}StandardDirectory")]
     assert "ProgramFiles64Folder" in std_dirs, (
-        "Installation root must use ProgramFiles64Folder for 64-bit binaries. "
-        f"Found StandardDirectory IDs: {std_dirs}"
+        f"Installation root must use ProgramFiles64Folder for 64-bit binaries. Found StandardDirectory IDs: {std_dirs}"
     )
     assert "ProgramFilesFolder" not in std_dirs, (
         "ProgramFilesFolder (32-bit) must not be used; use ProgramFiles64Folder"
@@ -202,10 +201,7 @@ def test_install_cas_sequenced_after_install_files(package: ET.Element) -> None:
                 break
             current = target
 
-        assert found, (
-            f"Install CA '{action}' is not transitively After='InstallFiles'. "
-            f"Chain: {' -> '.join(visited)}"
-        )
+        assert found, f"Install CA '{action}' is not transitively After='InstallFiles'. Chain: {' -> '.join(visited)}"
 
 
 def test_launch_ca_after_install_finalize(package: ET.Element) -> None:
@@ -217,11 +213,12 @@ def test_launch_ca_after_install_finalize(package: ET.Element) -> None:
         action = custom.get("Action", "")
         if action not in _LAUNCH_CAS:
             continue
-        assert custom.get("After") == "InstallFinalize", (f"Launch CA '{action}' must be After='InstallFinalize'")
+        assert custom.get("After") == "InstallFinalize", f"Launch CA '{action}' must be After='InstallFinalize'"
         ca = cas[action]
-        assert ca.get("Return") == "asyncNoWait", (f"Launch CA '{action}' must have Return='asyncNoWait'")
-        assert ca.get("Impersonate"
-                      ) == "yes", (f"Launch CA '{action}' must have Impersonate='yes' to run as the installing user")
+        assert ca.get("Return") == "asyncNoWait", f"Launch CA '{action}' must have Return='asyncNoWait'"
+        assert ca.get("Impersonate") == "yes", (
+            f"Launch CA '{action}' must have Impersonate='yes' to run as the installing user"
+        )
 
 
 def test_launch_ca_passes_no_arguments(package: ET.Element) -> None:
@@ -230,7 +227,7 @@ def test_launch_ca_passes_no_arguments(package: ET.Element) -> None:
     cas = _ca_map(package)
     for action in _LAUNCH_CAS:
         ca = cas[action]
-        assert not ca.get("ExeCommand"), (f"Launch CA '{action}' must pass no arguments; the dashboard is the default")
+        assert not ca.get("ExeCommand"), f"Launch CA '{action}' must pass no arguments; the dashboard is the default"
 
 
 def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> None:
@@ -247,8 +244,7 @@ def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> Non
 
     for action, before in before_map.items():
         assert before is not None, (
-            f"Uninstall CA '{action}' has no Before attribute "
-            "(must be directly anchored before a standard action)"
+            f"Uninstall CA '{action}' has no Before attribute (must be directly anchored before a standard action)"
         )
 
         visited: set[str] = set()
@@ -269,7 +265,7 @@ def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> Non
 
 def test_package_version_is_preprocessor_variable(package: ET.Element) -> None:
     version = package.get("Version")
-    assert version == "$(ProductVersion)", (f"Package Version should be '$(ProductVersion)', got '{version}'")
+    assert version == "$(ProductVersion)", f"Package Version should be '$(ProductVersion)', got '{version}'"
 
 
 def test_major_upgrade_exists(package: ET.Element) -> None:
@@ -323,8 +319,7 @@ def test_media_template_embeds_cab(package: ET.Element) -> None:
         "downloaded alone."
     )
     assert template.get("EmbedCab") == "yes", (
-        f"<MediaTemplate> must set EmbedCab='yes', got "
-        f"EmbedCab='{template.get('EmbedCab')}'."
+        f"<MediaTemplate> must set EmbedCab='yes', got EmbedCab='{template.get('EmbedCab')}'."
     )
 
 
@@ -401,8 +396,7 @@ def test_deferred_cas_not_impersonated(package: ET.Element) -> None:
     for ca in package.iter(f"{{{NS['wix']}}}CustomAction"):
         if ca.get("Execute") == "deferred":
             assert ca.get("Impersonate") == "no", (
-                f"Deferred CA '{ca.get('Id')}' must have Impersonate='no' "
-                "to run with elevated privileges"
+                f"Deferred CA '{ca.get('Id')}' must have Impersonate='no' to run with elevated privileges"
             )
 
 
@@ -421,8 +415,7 @@ def test_install_cas_return_check(package: ET.Element) -> None:
             ca = cas.get(action)
             assert ca is not None, f"Custom references undefined CA '{action}'"
             assert ca.get("Return") == "check", (
-                f"Install CA '{action}' should have Return='check' "
-                "to fail the install on error"
+                f"Install CA '{action}' should have Return='check' to fail the install on error"
             )
 
 
@@ -446,8 +439,7 @@ def test_uninstall_cas_return_ignore(package: ET.Element) -> None:
             ca = cas.get(action)
             assert ca is not None, f"Custom references undefined CA '{action}'"
             assert ca.get("Return") == "ignore", (
-                f"Uninstall CA '{action}' should have Return='ignore' "
-                "to avoid blocking uninstall"
+                f"Uninstall CA '{action}' should have Return='ignore' to avoid blocking uninstall"
             )
 
 
@@ -574,8 +566,7 @@ def test_bridge_uninstall_runs_on_upgrade_and_keeps_covers(package: ET.Element) 
     teardown = entries.get("BridgeUninstall")
     assert teardown is not None, "BridgeUninstall must be sequenced"
     assert "UPGRADINGPRODUCTCODE" not in teardown.get("Condition", ""), (
-        "BridgeUninstall must run during RemoveExistingProducts so the old service "
-        "stops before its image is replaced"
+        "BridgeUninstall must run during RemoveExistingProducts so the old service stops before its image is replaced"
     )
     ca = _ca_map(package).get("BridgeUninstall")
     assert ca is not None
@@ -624,7 +615,7 @@ def test_bridge_uninstall_has_a_rollback_partner(package: ET.Element) -> None:
 
     ca = _ca_map(package).get("BridgeUninstallRollback")
     assert ca is not None, "BridgeUninstallRollback CA must be defined"
-    assert ca.get("Execute") == "rollback", (f"must run in the rollback script, got Execute='{ca.get('Execute')}'")
+    assert ca.get("Execute") == "rollback", f"must run in the rollback script, got Execute='{ca.get('Execute')}'"
     assert ca.get("Impersonate") == "no", "re-registering a service needs the elevated server context"
     assert ca.get("ExeCommand") == _ca_map(package)["BridgeInstall"].get("ExeCommand"), (
         "the rollback must re-run exactly what the install CA runs, or the restored state "
@@ -681,8 +672,7 @@ def test_every_component_has_key_path(package: ET.Element) -> None:
         comp_id = comp.get("Id", "<anonymous>")
         key_path_children = [child for child in comp if child.get("KeyPath") == "yes"]
         assert len(key_path_children) == 1, (
-            f"Component '{comp_id}' must have exactly one child with KeyPath='yes', "
-            f"found {len(key_path_children)}"
+            f"Component '{comp_id}' must have exactly one child with KeyPath='yes', found {len(key_path_children)}"
         )
 
 
@@ -722,8 +712,7 @@ def test_install_desktop_icon_default_is_off(package: ET.Element) -> None:
     prop = _find_property(package, "INSTALL_DESKTOP_ICON")
     assert prop is not None, "Property INSTALL_DESKTOP_ICON is required"
     assert prop.get("Value") == "0", (
-        f"INSTALL_DESKTOP_ICON must default to '0' for upgrade safety; "
-        f"got '{prop.get('Value')}'"
+        f"INSTALL_DESKTOP_ICON must default to '0' for upgrade safety; got '{prop.get('Value')}'"
     )
     assert prop.get("Secure") == "yes", (
         "Public properties driving Component conditions must be Secure='yes' to "
@@ -777,7 +766,7 @@ def test_ui_extension_referenced(package: ET.Element) -> None:
     """WixUI_InstallDir dialog set must be activated via <ui:WixUI>."""
     wixui = package.find(f"{{{UI_NS}}}WixUI")
     assert wixui is not None, "<ui:WixUI> element is required to activate the dialog set"
-    assert wixui.get("Id") == "WixUI_InstallDir", (f"Expected WixUI Id='WixUI_InstallDir'; got '{wixui.get('Id')}'")
+    assert wixui.get("Id") == "WixUI_InstallDir", f"Expected WixUI Id='WixUI_InstallDir'; got '{wixui.get('Id')}'"
     assert wixui.get("InstallDirectory") == "INSTALLFOLDER", (
         f"InstallDirectory must bind picker to INSTALLFOLDER; got '{wixui.get('InstallDirectory')}'"
     )
@@ -791,7 +780,7 @@ def test_wixui_license_rtf_bindpath(package: ET.Element) -> None:
             assert "!(bindpath.LicenseDir)" in value, (
                 f"WixUILicenseRtf must reference !(bindpath.LicenseDir); got '{value}'"
             )
-            assert value.endswith("license.rtf"), (f"WixUILicenseRtf must point to license.rtf; got '{value}'")
+            assert value.endswith("license.rtf"), f"WixUILicenseRtf must point to license.rtf; got '{value}'"
             return
     raise AssertionError("WixVariable Id='WixUILicenseRtf' is required for the License dialog")
 
@@ -805,7 +794,7 @@ def test_main_feature_wraps_all_component_groups(package: ET.Element) -> None:
     assert feature is not None, "<Feature Id='Main'> is required"
     refs = {ref.get("Id") for ref in feature.iter(f"{{{NS['wix']}}}ComponentGroupRef")}
     expected = {"BinaryComponents", "ShortcutComponents", "DesktopShortcutComponents"}
-    assert refs == expected, (f"Feature 'Main' must reference exactly {expected}; got {refs}")
+    assert refs == expected, f"Feature 'Main' must reference exactly {expected}; got {refs}"
 
 
 # Attribution file tests ===============================================================================================
@@ -825,7 +814,7 @@ def test_notices_md_component_exists(package: ET.Element) -> None:
     )
     assert file_elem is not None, "NoticesMd component must contain <File Id='NOTICES.md'>"
     source = file_elem.get("Source", "")
-    assert "!(bindpath.BinDir)" in source, (f"NOTICES.md File Source must resolve via BinDir bindpath; got '{source}'")
+    assert "!(bindpath.BinDir)" in source, f"NOTICES.md File Source must resolve via BinDir bindpath; got '{source}'"
 
 
 # BINDIR conformance tests =============================================================================================
@@ -856,8 +845,7 @@ def test_wxs_files_match_canonical_bindir(package: ET.Element) -> None:
     expected = canonical_windows_bindir()
     actual = _wxs_bindir_file_basenames(package)
     assert actual == expected, (
-        "hole.wxs <File> set diverges from bindir_files(): "
-        f"missing={expected - actual}, extra={actual - expected}"
+        f"hole.wxs <File> set diverges from bindir_files(): missing={expected - actual}, extra={actual - expected}"
     )
 
 
@@ -893,8 +881,9 @@ def test_start_menu_registry_search_exists(package: ET.Element) -> None:
     search = next(prop.iter(f"{{{NS['wix']}}}RegistrySearch"))
     assert search.get("Root") == "HKCU", "Sticky-preference search must be HKCU (matches shortcut KeyPath)"
     assert search.get("Key") == "Software\\Hole"
-    assert search.get("Name"
-                      ) == "Installed", ("Must search for the same regkey Name written by StartMenuShortcut's KeyPath")
+    assert search.get("Name") == "Installed", (
+        "Must search for the same regkey Name written by StartMenuShortcut's KeyPath"
+    )
 
 
 def test_desktop_registry_search_exists(package: ET.Element) -> None:
@@ -922,17 +911,16 @@ def test_sticky_start_menu_setproperty(package: ET.Element) -> None:
     would silently re-enable it on the next auto-update (defaults apply).
     """
     sp = _find_set_property(package, "INSTALL_START_MENU")
-    assert sp is not None, ("<SetProperty Id='INSTALL_START_MENU'> is required to make the choice sticky on upgrade")
-    assert sp.get("Value"
-                  ) == "0", (f"Sticky override must set value to '0' (preserve un-checked); got '{sp.get('Value')}'")
+    assert sp is not None, "<SetProperty Id='INSTALL_START_MENU'> is required to make the choice sticky on upgrade"
+    assert sp.get("Value") == "0", (
+        f"Sticky override must set value to '0' (preserve un-checked); got '{sp.get('Value')}'"
+    )
     assert sp.get("After") == "AppSearch", (
-        f"SetProperty must run After='AppSearch' so RegistrySearch results are populated; "
-        f"got After='{sp.get('After')}'"
+        f"SetProperty must run After='AppSearch' so RegistrySearch results are populated; got After='{sp.get('After')}'"
     )
     condition = sp.get("Condition", "")
     assert "WIX_UPGRADE_DETECTED" in condition, (
-        f"Condition must gate on WIX_UPGRADE_DETECTED so fresh installs keep defaults; "
-        f"got Condition='{condition}'"
+        f"Condition must gate on WIX_UPGRADE_DETECTED so fresh installs keep defaults; got Condition='{condition}'"
     )
     assert "NOT HOLE_START_MENU_INSTALLED" in condition, (
         f"Condition must fire only when prior install lacked the regkey; got '{condition}'"
@@ -946,15 +934,13 @@ def test_sticky_desktop_setproperty(package: ET.Element) -> None:
     silently lose its icon on the next auto-update (defaults apply, 0=off).
     """
     sp = _find_set_property(package, "INSTALL_DESKTOP_ICON")
-    assert sp is not None, ("<SetProperty Id='INSTALL_DESKTOP_ICON'> is required to make the choice sticky on upgrade")
-    assert sp.get("Value"
-                  ) == "1", (f"Sticky override must set value to '1' (preserve checked); got '{sp.get('Value')}'")
+    assert sp is not None, "<SetProperty Id='INSTALL_DESKTOP_ICON'> is required to make the choice sticky on upgrade"
+    assert sp.get("Value") == "1", f"Sticky override must set value to '1' (preserve checked); got '{sp.get('Value')}'"
     assert sp.get("After") == "AppSearch"
     condition = sp.get("Condition", "")
     assert "WIX_UPGRADE_DETECTED" in condition
     assert "HOLE_DESKTOP_INSTALLED" in condition and "NOT HOLE_DESKTOP_INSTALLED" not in condition, (
-        f"Condition must fire only when prior install HAD the regkey (positive check); "
-        f"got '{condition}'"
+        f"Condition must fire only when prior install HAD the regkey (positive check); got '{condition}'"
     )
 
 
@@ -974,9 +960,9 @@ def test_shortcutsdlg_has_three_pushbuttons(package: ET.Element) -> None:
     assert dlg is not None, "<Dialog Id='ShortcutsDlg'> is required"
     buttons = [c for c in dlg.iter(f"{{{NS['wix']}}}Control") if c.get("Type") == "PushButton"]
     button_ids = sorted(b.get("Id", "") for b in buttons)
-    assert button_ids == [
-        "Back", "Cancel", "Next"
-    ], (f"ShortcutsDlg must have exactly three PushButtons (Back, Cancel, Next); got {button_ids}")
+    assert button_ids == ["Back", "Cancel", "Next"], (
+        f"ShortcutsDlg must have exactly three PushButtons (Back, Cancel, Next); got {button_ids}"
+    )
 
 
 def test_shortcutsdlg_cancel_spawns_canceldlg(package: ET.Element) -> None:
@@ -1000,7 +986,8 @@ def test_shortcutsdlg_has_two_checkboxes(package: ET.Element) -> None:
     assert dlg is not None
     checkboxes = {
         c.get("Property"): c.get("CheckBoxValue")
-        for c in dlg.iter(f"{{{NS['wix']}}}Control") if c.get("Type") == "CheckBox"
+        for c in dlg.iter(f"{{{NS['wix']}}}Control")
+        if c.get("Type") == "CheckBox"
     }
     assert checkboxes == {"INSTALL_START_MENU": "1", "INSTALL_DESKTOP_ICON": "1"}, (
         "ShortcutsDlg must have two CheckBox controls bound to INSTALL_START_MENU "
@@ -1024,7 +1011,9 @@ def _ui_publishes(package: ET.Element) -> list[ET.Element]:
 def _find_publish(publishes: list[ET.Element], dialog: str, control: str, event: str, value: str) -> ET.Element | None:
     for p in publishes:
         if (
-            p.get("Dialog") == dialog and p.get("Control") == control and p.get("Event") == event
+            p.get("Dialog") == dialog
+            and p.get("Control") == control
+            and p.get("Event") == event
             and p.get("Value") == value
         ):
             return p

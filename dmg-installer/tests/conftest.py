@@ -79,8 +79,7 @@ def installed_app(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
         shutil.copytree(src_app, dst_app, symlinks=True)
 
         subprocess.run(
-            ["xattr", "-w", "com.apple.quarantine", QUARANTINE_VALUE,
-             str(dst_app)],
+            ["xattr", "-w", "com.apple.quarantine", QUARANTINE_VALUE, str(dst_app)],
             check=True,
         )
 
@@ -115,9 +114,7 @@ def mounted_dmg(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
 
     mount_dir = tmp_path_factory.mktemp("layout-mount")
     subprocess.run(
-        ["hdiutil", "attach", "-nobrowse", "-readonly", "-noverify", "-quiet", "-mountpoint",
-         str(mount_dir),
-         str(dmg)],
+        ["hdiutil", "attach", "-nobrowse", "-readonly", "-noverify", "-quiet", "-mountpoint", str(mount_dir), str(dmg)],
         check=True,
     )
     try:

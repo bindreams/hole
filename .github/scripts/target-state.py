@@ -20,6 +20,7 @@ TARGET_DIR defaults to $CARGO_TARGET_DIR, else `target`. Exit 0: nothing
 differs. Exit 1: the snapshots differ (the units are listed). Exit 2: the state
 could not be read, so nothing is known.
 """
+
 import json
 import os
 import sys
@@ -84,7 +85,7 @@ def unit(profiles, path):
         for name in WATCHED:
             prefix = f"{profile}/{name}/"
             if path.startswith(prefix):
-                return prefix + path[len(prefix):].split("/", 1)[0]
+                return prefix + path[len(prefix) :].split("/", 1)[0]
     return path
 
 

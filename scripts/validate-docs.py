@@ -11,6 +11,7 @@ left unrendered.
 Usage:
     uv run scripts/validate-docs.py
 """
+
 import re
 import subprocess
 import sys
@@ -75,10 +76,20 @@ def main() -> int:
         # would silence the warnings this script exists to surface.
         build = subprocess.run(
             [
-                "uv", "run", "--no-project", "--python", "3.13", "--with-requirements",
-                str(REPO_ROOT / "docs" / "requirements.txt"), "--", "sphinx-build", "-W", "-b", "html",
+                "uv",
+                "run",
+                "--no-project",
+                "--python",
+                "3.13",
+                "--with-requirements",
+                str(REPO_ROOT / "docs" / "requirements.txt"),
+                "--",
+                "sphinx-build",
+                "-W",
+                "-b",
+                "html",
                 str(REPO_ROOT / "docs"),
-                str(out_dir)
+                str(out_dir),
             ],
             cwd=REPO_ROOT,
         )
@@ -109,6 +120,7 @@ def test_manifest_versions_reads_all_four_manifests() -> None:
 
 def test_manifest_versions_raises_on_missing_manifest(tmp_path: Path) -> None:
     import pytest
+
     with pytest.raises(FileNotFoundError):
         manifest_versions(tmp_path)
 
