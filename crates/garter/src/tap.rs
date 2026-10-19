@@ -26,9 +26,11 @@
 //!    another process that took the probed port. A typed failure the inner
 //!    reports (`BindConflict` when another process took the internal port,
 //!    `Fatal`) becomes the tap's own, so the caller sees the same retryable
-//!    or terminal class. An inner that exits without reporting says nothing
-//!    about why and is `Fatal`. Bounded at 30s; on timeout the inner task is
-//!    aborted and `Error::Chain` propagates.
+//!    or terminal class. Only an inner that speaks sitrep reports a typed
+//!    failure, so only it gets the stolen-inner-port retry: an inner that exits
+//!    without reporting says nothing about why, and its exit is `Fatal`.
+//!    Bounded at 30s; on timeout the inner task is aborted and `Error::Chain`
+//!    propagates.
 //! 4. Bind the tap's public listener on `local` (only after step 3, so the
 //!    public bind happens only once the data plane is actually wired
 //!    through), then report the tap's OWN readiness on the `ready` channel
@@ -74,6 +76,14 @@ const INNER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// described in the module docs. The inner plugin is moved by value;
 /// `pid_sink` and other configuration on `BinaryPlugin` are preserved
 /// (the tap delegates to `inner.run`).
+///
+/// A bind conflict on the inner port is retryable ([`StartError::BindConflict`])
+/// only when the inner plugin reports it, which takes sitrep
+/// ([`ReadinessMode::ExpectSitrep`](crate::binary::ReadinessMode::ExpectSitrep)
+/// or `Auto`). An inner that does not speak sitrep exits untyped, and the tap
+/// reports that exit as [`StartError::Fatal`]. With `Probe` readiness a process
+/// that took the inner port can also answer the probe: the inner then reports
+/// ready and dies on its own failed bind.
 pub struct TapPlugin {
     inner: Box<dyn ChainPlugin>,
 }
