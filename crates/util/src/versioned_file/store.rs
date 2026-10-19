@@ -53,7 +53,8 @@ pub trait Placement {
     }
 
     /// The temp file is complete, synced and not yet published: set its mode,
-    /// owner and ACL here.
+    /// owner and ACL here. On Windows do not set `FILE_ATTRIBUTE_READONLY`:
+    /// no later `store` could replace the file.
     fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
         crate::ownership::chown_if_some(tmp, self.owner());
         Ok(())
@@ -82,7 +83,14 @@ pub trait Placement {
 /// still is.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    tolerate_missing_directory_flush(std::fs::File::open(dir)?.sync_all())
+    sync_dir_with(dir, std::fs::File::sync_all)
+}
+
+/// [`sync_dir`] over an injectable flush, so the tolerance is tested where it
+/// is wired.
+#[cfg(unix)]
+fn sync_dir_with(dir: &Path, flush: impl FnOnce(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
+    tolerate_missing_directory_flush(flush(&std::fs::File::open(dir)?))
 }
 
 /// Flushes the directory. A volume that offers no directory flush (see
@@ -93,6 +101,13 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 /// directory needs `FILE_FLAG_BACKUP_SEMANTICS`.
 #[cfg(windows)]
 fn sync_dir(dir: &Path) -> io::Result<()> {
+    sync_dir_with(dir, std::fs::File::sync_all)
+}
+
+/// [`sync_dir`] over an injectable flush, so the tolerance is tested where it
+/// is wired.
+#[cfg(windows)]
+fn sync_dir_with(dir: &Path, flush: impl FnOnce(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -100,7 +115,7 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
         .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(dir)?;
-    tolerate_missing_directory_flush(handle.sync_all())
+    tolerate_missing_directory_flush(flush(&handle))
 }
 
 fn tolerate_missing_directory_flush(result: io::Result<()>) -> io::Result<()> {

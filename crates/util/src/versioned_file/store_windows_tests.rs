@@ -8,12 +8,13 @@ use std::path::Path;
 
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{
-    SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_TEMPORARY,
+    SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY,
+    FILE_ATTRIBUTE_TEMPORARY,
 };
 
 use super::{
-    no_directory_flush, tolerate_missing_directory_flush, CannotRead, DefaultPlacement, Loaded, Placement, Removal,
-    VersionedFile,
+    no_directory_flush, sync_dir_with, tolerate_missing_directory_flush, CannotRead, DefaultPlacement, Loaded,
+    Placement, Removal, VersionedFile,
 };
 use crate::versioned_file::fixtures::{dir, long_dir, unreadable_bytes, DecisionFile, OsRecordFile};
 
@@ -194,4 +195,49 @@ fn remove_moves_a_corrupt_decision_file_aside_in_a_directory_of_260_characters_o
 
     assert_eq!(removal, Removal::MovedAside(long.join("decision.json.unreadable.bak")));
     assert_eq!(listing(&long), ["decision.json.unreadable.bak"]);
+}
+
+#[skuld::test]
+fn the_directory_flush_tolerates_a_volume_without_one_where_it_is_wired() {
+    use windows::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_IO_DEVICE};
+    let dir = dir();
+    let os = |code: u32| io::Error::from_raw_os_error(code as i32);
+
+    sync_dir_with(dir.path(), |_| Err(os(ERROR_INVALID_FUNCTION.0))).unwrap();
+    let err = sync_dir_with(dir.path(), |_| Err(os(ERROR_IO_DEVICE.0))).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(ERROR_IO_DEVICE.0 as i32));
+}
+
+/// Sets `FILE_ATTRIBUTE_READONLY`, which `prepare_tmp`'s contract forbids.
+struct ReadOnly;
+
+impl Placement for ReadOnly {
+    fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
+        let wide: Vec<u16> = tmp.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: `wide` is NUL-terminated and outlives the call.
+        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_READONLY) }.map_err(io::Error::other)
+    }
+}
+
+#[skuld::test]
+fn a_read_only_placement_makes_the_next_store_fail_and_keeps_the_old_value() {
+    // Pins the documented contract of `Placement::prepare_tmp`.
+    let dir = dir();
+    let file = VersionedFile::<OsRecordFile>::new(dir.path());
+    file.store(&record("one"), &ReadOnly).unwrap();
+
+    let err = file.store(&record("two"), &ReadOnly).unwrap_err();
+
+    assert!(format!("{err:?}").contains("PermissionDenied"), "{err:?}");
+    assert!(matches!(file.load(), Loaded::Current { value, .. } if value == record("one")));
+    // Clean up so the temp dir can be removed.
+    let wide: Vec<u16> = file.path().as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    unsafe {
+        SetFileAttributesW(
+            PCWSTR(wide.as_ptr()),
+            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+        )
+    }
+    .unwrap();
 }

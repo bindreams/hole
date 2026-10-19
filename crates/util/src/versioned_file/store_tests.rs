@@ -662,3 +662,21 @@ mod unix_directory_flush {
         assert!(!no_directory_flush(&io::Error::other("no os code")));
     }
 }
+
+#[cfg(unix)]
+#[skuld::test]
+fn the_directory_flush_tolerates_a_filesystem_without_one_where_it_is_wired() {
+    let dir = crate::versioned_file::fixtures::dir();
+    let os = |code: i32| std::io::Error::from_raw_os_error(code);
+
+    super::sync_dir_with(dir.path(), |_| Err(os(libc::EINVAL))).unwrap();
+    let err = super::sync_dir_with(dir.path(), |_| Err(os(libc::EIO))).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_real_directory_without_fsync_is_not_a_failed_flush() {
+    // procfs answers a directory fsync with EINVAL.
+    super::sync_dir(std::path::Path::new("/proc")).unwrap();
+}
