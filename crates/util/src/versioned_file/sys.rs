@@ -188,14 +188,34 @@ mod windows_impl {
         let file = OpenOptions::new().access_mode(DELETE.0).open(from)?;
 
         let name: Vec<u16> = to.as_os_str().encode_wide().collect();
-        let name_bytes = name.len() * 2;
+        let (buf, size) = rename_info(&name);
+        // SAFETY: `rename_info` returns an 8-aligned buffer of at least `size`
+        // bytes holding a `FILE_RENAME_INFO` whose name is NUL-terminated.
+        unsafe {
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileRenameInfoEx,
+                buf.as_ptr().cast(),
+                size,
+            )
+        }
+        .map_err(io_error)
+    }
+
+    /// A `FILE_RENAME_INFO` for `name` with the POSIX replace flags, and the
+    /// size to pass. The name is followed by a NUL inside the buffer: the call
+    /// reads it as a NUL-terminated string whatever `FileNameLength` says.
+    pub(super) fn rename_info(name: &[u16]) -> (Vec<u64>, u32) {
         let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let size = header + name_bytes;
-        // `u64` units: the buffer is aligned for `FILE_RENAME_INFO`'s handle.
+        let name_bytes = name.len() * 2;
+        let size = header + name_bytes + 2;
+        // `u64` units: the buffer is aligned for `FILE_RENAME_INFO`'s handle,
+        // and zeroed, so the terminator is already in place.
         let mut buf = vec![0u64; size.div_ceil(8)];
         let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        // SAFETY: `buf` is zeroed, 8-aligned and at least `header + name_bytes`
-        // long; the name is copied after the header, where `FileName` starts.
+        // SAFETY: `buf` is zeroed, 8-aligned and `size` bytes or longer; the
+        // name is copied after the header, where `FileName` starts, and leaves
+        // the two bytes after it zero.
         unsafe {
             (*info).Anonymous.Flags = REPLACE_POSIX;
             (*info).FileNameLength = name_bytes as u32;
@@ -204,14 +224,8 @@ mod windows_impl {
                 buf.as_mut_ptr().cast::<u8>().add(header).cast::<u16>(),
                 name.len(),
             );
-            SetFileInformationByHandle(
-                HANDLE(file.as_raw_handle()),
-                FileRenameInfoEx,
-                info.cast_const().cast(),
-                size as u32,
-            )
         }
-        .map_err(io_error)
+        (buf, size as u32)
     }
 
     /// Fails with `AlreadyExists` when `to` exists, and is written through.

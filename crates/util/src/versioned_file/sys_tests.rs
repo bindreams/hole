@@ -192,3 +192,33 @@ mod windows_fallback {
         assert_eq!(names(&dir), ["dest"]);
     }
 }
+
+#[cfg(windows)]
+mod windows_rename_info {
+    use super::super::windows_impl::rename_info;
+
+    #[skuld::test]
+    fn the_rename_name_is_nul_terminated_inside_the_buffer_for_every_length() {
+        let header = std::mem::offset_of!(windows::Win32::Storage::FileSystem::FILE_RENAME_INFO, FileName);
+        // Every residue of the name length against the buffer's 8-byte units.
+        for len in 0..=8 {
+            let name = vec![u16::from(b'a'); len];
+            let (buf, size) = rename_info(&name);
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * 8) };
+            let end = header + len * 2;
+
+            assert_eq!(
+                size as usize,
+                end + 2,
+                "len {len}: size covers the name and its terminator"
+            );
+            assert!(bytes.len() >= size as usize, "len {len}: buffer holds `size` bytes");
+            assert_eq!(&bytes[end..end + 2], &[0, 0], "len {len}: a NUL follows the name");
+            let named: Vec<u16> = bytes[header..end]
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            assert_eq!(named, name, "len {len}: the name is copied after the header");
+        }
+    }
+}
