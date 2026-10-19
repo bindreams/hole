@@ -27,6 +27,11 @@ pub trait Chain: Sized + sealed::Sealed {
     /// Highest version this chain decodes.
     const TOP: u32;
 
+    /// Compile-time proof that every link from here down is contiguous. The
+    /// trait is sealed, so no schema can replace it.
+    #[doc(hidden)]
+    const LINKED: ();
+
     #[doc(hidden)]
     fn decode(version: u32, bytes: &[u8]) -> Result<Self, ChainError>;
 }
@@ -35,10 +40,10 @@ pub trait Chain: Sized + sealed::Sealed {
 ///
 /// Each version is its own frozen type. The link makes a chain contiguous by
 /// construction: a gap, a duplicate number, or a floor that leaves a version
-/// neither dropped nor described fails to build. Only a build reports it: a
-/// bare `cargo check` stops before the constant is evaluated, so name each
-/// current type once with [`assert_contiguous!`](crate::assert_contiguous) in
-/// a test.
+/// neither dropped nor described fails to build, wherever in the chain it is.
+/// Only a build reports it: a bare `cargo check` stops before the check is
+/// evaluated, so name each current type once with
+/// [`assert_contiguous!`](crate::assert_contiguous) in a test.
 ///
 /// A schema never declares `deny_unknown_fields` (readers ignore what they do
 /// not know) and never carries the `version` key itself: the framing owns it.
@@ -53,13 +58,6 @@ pub trait Schema: Sized + DeserializeOwned {
 
     /// Infallible: a version that cannot be migrated raises the floor instead.
     fn upgrade(prev: Self::Prev) -> Self;
-
-    /// Compile-time proof that `VERSION` directly follows the previous
-    /// schema's. Do not override.
-    const CONTIGUOUS: () = assert!(
-        Self::VERSION == <Self::Prev as Chain>::TOP + 1,
-        "migration chain has a gap"
-    );
 }
 
 impl<const N: u32> sealed::Sealed for Obsolete<N> {}
@@ -67,6 +65,7 @@ impl<S: Schema> sealed::Sealed for S {}
 
 impl<const N: u32> Chain for Obsolete<N> {
     const TOP: u32 = N;
+    const LINKED: () = ();
 
     fn decode(version: u32, _bytes: &[u8]) -> Result<Self, ChainError> {
         debug_assert!(version <= N, "version {version} is above this chain's floor {N}");
@@ -76,10 +75,14 @@ impl<const N: u32> Chain for Obsolete<N> {
 
 impl<S: Schema> Chain for S {
     const TOP: u32 = S::VERSION;
+    const LINKED: () = {
+        assert!(S::VERSION == <S::Prev as Chain>::TOP + 1, "migration chain has a gap");
+        <S::Prev as Chain>::LINKED
+    };
 
     fn decode(version: u32, bytes: &[u8]) -> Result<Self, ChainError> {
         // Evaluated for every schema that is ever decoded.
-        let () = S::CONTIGUOUS;
+        let () = <S as Chain>::LINKED;
         if version == S::VERSION {
             return serde_json::from_slice(bytes).map_err(|e| ChainError::Shape(ParseFailure::from(&e)));
         }

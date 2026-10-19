@@ -231,3 +231,22 @@ impl VersionedState for Nested {
     const FILE_NAME: &'static str = "nested.json";
     const ROLE: Role = Role::OsRecord;
 }
+
+/// The highest version a schema can have: a saturated `found` would equal it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MaxVersionFile {
+    pub value: String,
+}
+
+impl Schema for MaxVersionFile {
+    const VERSION: u32 = u32::MAX;
+    type Prev = Obsolete<{ u32::MAX - 1 }>;
+    fn upgrade(prev: Obsolete<{ u32::MAX - 1 }>) -> Self {
+        match prev {}
+    }
+}
+
+impl VersionedState for MaxVersionFile {
+    const FILE_NAME: &'static str = "max-version.json";
+    const ROLE: Role = Role::Config;
+}

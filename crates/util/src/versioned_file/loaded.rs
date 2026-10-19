@@ -38,7 +38,8 @@ pub enum Loaded<S> {
     Corrupt { failure: ParseFailure, raw: Raw },
     /// At or below the chain's floor: dropped on purpose.
     Obsolete { found: u32, raw: Raw },
-    /// Above this release's version: never interpreted.
+    /// Above this release's version: never interpreted. `found` saturates at
+    /// `u32::MAX` for a version too large for a `u32`.
     Newer { found: u32, raw: Raw },
     /// Read into the current schema; `found < S::VERSION` means it was
     /// migrated in memory.
@@ -86,8 +87,8 @@ impl<S: VersionedState> Loaded<S> {
                 return Loaded::Unreadable(e);
             }
         };
-        let found = match frame::read_version(&bytes, S::UNVERSIONED_AS) {
-            Ok(found) => found,
+        let version = match frame::read_version(&bytes, S::UNVERSIONED_AS) {
+            Ok(version) => version,
             Err(failure) => {
                 tracing::warn!(file, %failure, "state file is corrupt");
                 return Loaded::Corrupt {
@@ -96,18 +97,21 @@ impl<S: VersionedState> Loaded<S> {
                 };
             }
         };
-        if found > S::VERSION {
-            tracing::warn!(
-                file,
-                found,
-                supported = S::VERSION,
-                "state file is from a newer release"
-            );
-            return Loaded::Newer {
-                found,
-                raw: Raw::new(bytes),
-            };
-        }
+        let found = match version.within(S::VERSION) {
+            Ok(found) => found,
+            Err(found) => {
+                tracing::warn!(
+                    file,
+                    found,
+                    supported = S::VERSION,
+                    "state file is from a newer release"
+                );
+                return Loaded::Newer {
+                    found,
+                    raw: Raw::new(bytes),
+                };
+            }
+        };
         match <S as Chain>::decode(found, &bytes) {
             Ok(value) => Loaded::Current { value, found },
             Err(ChainError::Obsolete) => {

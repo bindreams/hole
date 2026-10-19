@@ -25,43 +25,12 @@
 //! [`VersionedState`] at `FooV2`. A version that cannot be migrated is not a
 //! fallible step: raise the floor (`Obsolete<N>`) instead.
 //!
-//! # Example
+//! # Template
 //!
-//! The shape of an OS record: what the bridge laid on disk and needs to undo,
-//! so a copy this release cannot read stops it from connecting.
-//!
-//! ```
-//! use serde::{Deserialize, Serialize};
-//! use util::versioned_file::{DefaultPlacement, Loaded, Obsolete, Role, Schema, VersionedFile, VersionedState};
-//!
-//! #[derive(Debug, PartialEq, Serialize, Deserialize)]
-//! struct Layout {
-//!     plugin_dir: String,
-//! }
-//!
-//! impl Schema for Layout {
-//!     const VERSION: u32 = 1;
-//!     type Prev = Obsolete<0>; // nothing came before version 1
-//!     fn upgrade(prev: Obsolete<0>) -> Self {
-//!         match prev {}
-//!     }
-//! }
-//!
-//! impl VersionedState for Layout {
-//!     const FILE_NAME: &'static str = "layout.json";
-//!     const ROLE: Role = Role::OsRecord;
-//! }
-//!
-//! // A gap in the chain fails here, even under `cargo check`.
-//! util::assert_contiguous!(Layout);
-//!
-//! let dir = std::env::temp_dir().join(format!("versioned-file-doc-{}", std::process::id()));
-//! let file = VersionedFile::<Layout>::new(&dir);
-//! file.store(&Layout { plugin_dir: "plugins".into() }, &DefaultPlacement::default())?;
-//! assert!(matches!(file.load(), Loaded::Current { found: 1, .. }));
-//! # std::fs::remove_dir_all(&dir)?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
+//! `versioned_file_tests.rs` is a complete `Role::OsRecord` schema (what the
+//! bridge laid on disk and needs to undo, so a copy this release cannot read
+//! stops it from connecting) with `assert_contiguous!`, a store and a load.
+//! It is a test, so CI runs it: copy it, not a snippet that can rot.
 
 mod chain;
 #[cfg(test)]
@@ -76,6 +45,10 @@ pub use loaded::{CannotRead, Loaded, Raw};
 pub use role::{RemoveOver, Role, StoreOver};
 pub use store::{DefaultPlacement, Placement, Removal, StoreError, VersionedFile};
 
+#[cfg(test)]
+#[path = "versioned_file_tests.rs"]
+mod versioned_file_tests;
+
 /// The current schema of a file: the one that is written and, through its
 /// chain, the one every older version is read into.
 pub trait VersionedState: Schema + serde::Serialize {
@@ -86,17 +59,19 @@ pub trait VersionedState: Schema + serde::Serialize {
     const ROLE: Role;
 
     /// What a file with no `version` key reads as. `None`: such a file is
-    /// corrupt. Only for a file that existed before it was versioned.
+    /// corrupt. Only for a file that existed before it was versioned. Must be
+    /// in `1..=VERSION`: [`VersionedFile::new`] does not build otherwise.
     const UNVERSIONED_AS: Option<u32> = None;
 }
 
-/// Fails to compile when `$t`'s chain has a gap.
+/// Fails to compile when any link of `$t`'s chain, down to its floor, has a
+/// gap.
 ///
 /// A gap in generic code is reported by the build but not by `cargo check`;
 /// naming each current type once in a test makes a type-check fail too.
 #[macro_export]
 macro_rules! assert_contiguous {
     ($t:ty) => {
-        const _: () = <$t as $crate::versioned_file::Schema>::CONTIGUOUS;
+        const _: () = <$t as $crate::versioned_file::Chain>::LINKED;
     };
 }

@@ -3,8 +3,8 @@ use crate::assert_contiguous;
 use crate::versioned_file::fixtures::{DroppedFile, NoteV3};
 
 // The backstop for a gap that only the build, not `cargo check`, reports through
-// generic code: naming the constant for every current type makes the test
-// target fail to type-check.
+// generic code: naming every current type makes the test target fail to
+// type-check, for a gap anywhere in its chain.
 assert_contiguous!(NoteV3);
 assert_contiguous!(DroppedFile);
 

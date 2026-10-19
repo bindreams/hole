@@ -15,7 +15,9 @@ harness = false
 [dependencies]
 bitflags = { workspace = true }
 # `parse_error`: classifying a parse failure needs the error type it classifies.
-serde_json = { workspace = true }
+# `raw_value`: `versioned_file` reads the `version` token's text, because a
+# float cannot tell `18446744073709551616` from `1e20`.
+serde_json = { workspace = true, features = ["raw_value"] }
 # `versioned_file`: schema chain decoding, plus the atomic temp-file write and
 # the typed errors around it.
 serde = { workspace = true }

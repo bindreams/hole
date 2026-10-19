@@ -472,3 +472,49 @@ fn a_failed_prepare_tmp_leaves_no_temp_and_the_original() {
     assert_eq!(read(&dir, "decision.json"), bytes);
     assert_eq!(names(&dir), ["decision.json"]);
 }
+
+// Redaction ===========================================================================================================
+
+#[skuld::test]
+fn no_error_or_cause_text_echoes_the_file() {
+    const SECRET: &str = "hunter2";
+
+    let mut shown = Vec::new();
+    for cause in BOTH {
+        let dir = dir();
+        let bytes = put_unreadable::<OsRecordFile>(&dir, cause);
+        assert!(
+            String::from_utf8_lossy(bytes).contains(SECRET),
+            "guard: the fixture carries the secret"
+        );
+        let file = VersionedFile::<OsRecordFile>::new(dir.path());
+
+        let err = file
+            .store(&OsRecordFile { value: "v".into() }, &plain())
+            .expect_err("an os record is not replaced");
+        shown.push(format!("{err}"));
+        shown.push(format!("{err:?}"));
+        shown.push(format!("{cause}"));
+        shown.push(format!("{cause:?}"));
+        if let Loaded::Corrupt { failure, .. } = file.load() {
+            shown.push(format!("{failure}"));
+            shown.push(format!("{failure:?}"));
+        }
+    }
+    for err in [
+        VersionedFile::<OwnsVersionKey>::new(dir().path())
+            .store(&OwnsVersionKey { version: 7 }, &plain())
+            .expect_err("encode"),
+        VersionedFile::<NotAnObject>::new(dir().path())
+            .store(&NotAnObject(vec![1]), &plain())
+            .expect_err("encode"),
+    ] {
+        shown.push(format!("{err}"));
+        shown.push(format!("{err:?}"));
+    }
+
+    assert!(shown.iter().all(|text| !text.is_empty()), "guard: {shown:?}");
+    for text in &shown {
+        assert!(!text.contains(SECRET), "echoed the file: {text}");
+    }
+}

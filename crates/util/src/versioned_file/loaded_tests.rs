@@ -6,7 +6,7 @@ use garter::tracing_test::set_default_in_current_thread;
 
 use super::{CannotRead, Loaded, Raw};
 use crate::parse_error::ParseFailure;
-use crate::versioned_file::fixtures::{dir, put, DroppedFile, NoteV3, OsRecordFile, UnversionedConfig};
+use crate::versioned_file::fixtures::{dir, put, DroppedFile, MaxVersionFile, NoteV3, OsRecordFile, UnversionedConfig};
 use crate::versioned_file::store::Fs;
 use crate::versioned_file::VersionedFile;
 
@@ -72,6 +72,82 @@ fn a_newer_file_is_never_interpreted() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// Positive integers above `u32::MAX`, up to and past `u64::MAX`.
+const BEYOND_U32: [&str; 4] = [
+    "4294967296",
+    "9007199254740993",
+    "18446744073709551616",
+    "99999999999999999999999999",
+];
+
+#[skuld::test]
+fn a_positive_integer_version_above_u32_max_is_newer() {
+    for version in BEYOND_U32 {
+        let dir = dir();
+        let bytes = format!(r#"{{"version":{version},"future":true}}"#);
+        put(&dir, "note.json", bytes.as_bytes());
+        match VersionedFile::<NoteV3>::new(dir.path()).load() {
+            Loaded::Newer { found, raw } => {
+                assert_eq!(found, u32::MAX, "{version}: found saturates");
+                assert_eq!(raw.as_bytes(), bytes.as_bytes());
+            }
+            other => panic!("{version}: {other:?}"),
+        }
+    }
+}
+
+#[skuld::test]
+fn a_version_above_u32_max_is_newer_even_for_a_schema_at_u32_max() {
+    // A saturated `found` equals this schema's version; it must still not decode.
+    let dir = dir();
+    put(&dir, "max-version.json", br#"{"version":4294967296,"value":"x"}"#);
+    assert!(matches!(
+        VersionedFile::<MaxVersionFile>::new(dir.path()).load(),
+        Loaded::Newer { .. }
+    ));
+    put(&dir, "max-version.json", br#"{"version":4294967295,"value":"x"}"#);
+    assert!(matches!(
+        VersionedFile::<MaxVersionFile>::new(dir.path()).load(),
+        Loaded::Current { found: u32::MAX, .. }
+    ));
+}
+
+#[skuld::test]
+fn a_version_that_is_not_integer_syntax_stays_corrupt_however_large() {
+    for version in ["4294967296.0", "1e20", "-4294967296", r#""4294967296""#, "[4294967296]"] {
+        let dir = dir();
+        put(&dir, "note.json", format!(r#"{{"version":{version}}}"#).as_bytes());
+        assert!(
+            matches!(VersionedFile::<NoteV3>::new(dir.path()).load(), Loaded::Corrupt { .. }),
+            "{version}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_version_above_u32_max_is_refused_by_a_config_store() {
+    use crate::versioned_file::fixtures::ConfigFile;
+    use crate::versioned_file::{DefaultPlacement, StoreError};
+
+    let dir = dir();
+    let bytes = br#"{"version":18446744073709551616,"value":"future"}"#;
+    let path = put(&dir, "config.json", bytes);
+    let err = VersionedFile::<ConfigFile>::new(dir.path())
+        .store(&ConfigFile { value: "mine".into() }, &DefaultPlacement::default())
+        .expect_err("a newer config is never overwritten");
+    assert!(
+        matches!(
+            err,
+            StoreError::Unreadable {
+                cause: CannotRead::Newer,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(path).expect("read"), bytes);
 }
 
 #[skuld::test]

@@ -1,7 +1,41 @@
-use super::read_version;
+use super::{read_version, Version};
 
-fn version(json: &str, unversioned_as: Option<u32>) -> Result<u32, String> {
+fn parsed(json: &str, unversioned_as: Option<u32>) -> Result<Version, String> {
     read_version(json.as_bytes(), unversioned_as).map_err(|f| f.to_string())
+}
+
+/// The version of a document that must fit a `u32`.
+fn version(json: &str, unversioned_as: Option<u32>) -> Result<u32, String> {
+    parsed(json, unversioned_as).map(|v| match v {
+        Version::Known(n) => n,
+        Version::BeyondU32 => panic!("{json}: beyond u32"),
+    })
+}
+
+#[skuld::test]
+fn a_positive_integer_above_u32_max_is_beyond_u32_whatever_its_size() {
+    for token in [
+        "4294967296",
+        "9007199254740993",
+        "18446744073709551616",
+        "99999999999999999999999999",
+    ] {
+        let body = format!(r#"{{"x":1,"version":{token}}}"#);
+        assert_eq!(parsed(&body, None), Ok(Version::BeyondU32), "{body}");
+        assert_eq!(parsed(&body, Some(1)), Ok(Version::BeyondU32), "{body} with a default");
+    }
+    assert_eq!(parsed(r#"{"version": 4294967296 }"#, None), Ok(Version::BeyondU32));
+    assert_eq!(parsed(r#"{"version":4294967295}"#, None), Ok(Version::Known(u32::MAX)));
+}
+
+#[skuld::test]
+fn within_splits_readable_from_newer_with_the_report_saturated() {
+    assert_eq!(Version::Known(3).within(3), Ok(3));
+    assert_eq!(Version::Known(1).within(3), Ok(1));
+    assert_eq!(Version::Known(4).within(3), Err(4));
+    assert_eq!(Version::BeyondU32.within(3), Err(u32::MAX));
+    assert_eq!(Version::BeyondU32.within(u32::MAX), Err(u32::MAX));
+    assert_eq!(Version::Known(u32::MAX).within(u32::MAX), Ok(u32::MAX));
 }
 
 #[skuld::test]
@@ -24,8 +58,11 @@ fn version_zero_negative_string_fractional_is_corrupt() {
         r#"{"version":null}"#,
         r#"{"version":[1]}"#,
         r#"{"version":{"v":1}}"#,
-        r#"{"version":4294967296}"#,
-        r#"{"version":18446744073709551616}"#,
+        // Not integer syntax, however large.
+        r#"{"version":4294967296.0}"#,
+        r#"{"version":1e20}"#,
+        r#"{"version":-4294967296}"#,
+        r#"{"version":"4294967296"}"#,
     ] {
         assert!(version(body, None).is_err(), "{body} must be corrupt");
         // A declared default must not rescue a version that is present and wrong.

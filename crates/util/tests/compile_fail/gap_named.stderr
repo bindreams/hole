@@ -1,16 +1,12 @@
 error[E0080]: evaluation panicked: migration chain has a gap
  --> $RUST/core/src/panic.rs
   |
-  = note: evaluation of `<V3 as util::versioned_file::Schema>::CONTIGUOUS` failed here
+  = note: evaluation of `<V3 as util::versioned_file::Chain>::LINKED` failed here
   |
  ::: src/versioned_file/chain.rs
   |
-  |       const CONTIGUOUS: () = assert!(
-  |  ____________________________-
-  | |         Self::VERSION == <Self::Prev as Chain>::TOP + 1,
-  | |         "migration chain has a gap"
-  | |     );
-  | |_____- in this macro invocation
+  |         assert!(S::VERSION == <S::Prev as Chain>::TOP + 1, "migration chain has a gap");
+  |         ------------------------------------------------------------------------------- in this macro invocation
 
 note: erroneous constant encountered
   --> tests/compile_fail/gap_named.rs:29:1

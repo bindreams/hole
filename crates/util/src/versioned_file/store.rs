@@ -89,6 +89,8 @@ impl Placement for DefaultPlacement {
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The file on disk is newer or corrupt and its role refuses to replace it.
+    /// The text carries the full path: fine for the bridge log, but redact it
+    /// before it reaches a toast.
     #[error("{} cannot be read ({cause}); it is left as it is", path.display())]
     Unreadable { path: PathBuf, cause: CannotRead },
     /// The value cannot be framed. The reason is a fixed label, never content.
@@ -109,6 +111,17 @@ pub enum Removal {
     MovedAside(PathBuf),
 }
 
+/// An absent `version` must read as a version this schema can have: not 0,
+/// and not above its own.
+const fn assert_unversioned_as_valid<S: VersionedState>() {
+    if let Some(version) = S::UNVERSIONED_AS {
+        assert!(
+            version > 0 && version <= S::VERSION,
+            "UNVERSIONED_AS must be in 1..=VERSION"
+        );
+    }
+}
+
 /// One state file, `S::FILE_NAME` in a directory.
 pub struct VersionedFile<S: VersionedState> {
     path: PathBuf,
@@ -118,6 +131,8 @@ pub struct VersionedFile<S: VersionedState> {
 
 impl<S: VersionedState> VersionedFile<S> {
     pub fn new(dir: &Path) -> Self {
+        // Every use of a file goes through `new`, so this is evaluated for all.
+        const { assert_unversioned_as_valid::<S>() };
         Self {
             path: dir.join(S::FILE_NAME),
             fs: Arc::new(StdFs),
