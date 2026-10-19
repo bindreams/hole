@@ -444,3 +444,44 @@ fn a_failed_delete_after_the_link_leaves_a_logged_backup() {
         log.snapshot()
     );
 }
+
+/// A refusal of the rename itself, as a sticky directory or a security module
+/// answers it. Not "unavailable": a link made instead would be allowed where
+/// the rename was not, and would leave a backup beside a file that stays.
+struct RenameRefused;
+
+impl Fs for RenameRefused {
+    fn rename_noreplace(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
+#[skuld::test]
+fn a_refused_rename_fails_move_aside_and_leaves_no_backup() {
+    let dir = dir();
+    let original = unreadable_bytes(CannotRead::Newer);
+    put(&dir, "decision.json", original);
+
+    let err = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(RenameRefused))
+        .move_aside()
+        .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(read(&dir, "decision.json"), original, "the original is still there");
+    assert_eq!(names(&dir), ["decision.json"], "no backup");
+}
+
+#[skuld::test]
+fn a_refused_rename_fails_remove_and_leaves_no_backup() {
+    let dir = dir();
+    let original = unreadable_bytes(CannotRead::Newer);
+    put(&dir, "decision.json", original);
+
+    let err = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(RenameRefused))
+        .remove()
+        .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(read(&dir, "decision.json"), original, "the original is still there");
+    assert_eq!(names(&dir), ["decision.json"], "no backup");
+}
