@@ -17,10 +17,10 @@
 //! 1. Allocate an internal port for the inner plugin via probe-and-drop
 //!    on `(ip, 0)`, never a port the tap knows is taken: the public port or
 //!    `remote`'s (the next hop's, bound later). A port the OS hands back as one
-//!    of those, or refuses as a bind race (`AddrInUse`, `PermissionDenied`), is
-//!    picked again with no attempt cap, paced by a backoff and ended by
-//!    `shutdown`. Any other error, `AddrNotAvailable` included (the address is
-//!    not the host's), fails the start.
+//!    of those, or refuses as a bind race (`AddrInUse`, `PermissionDenied`,
+//!    `AddrNotAvailable`: the Windows excluded-port-range classes), is picked
+//!    again with no attempt cap, paced by a backoff and ended by `shutdown`.
+//!    Any other error fails the start.
 //! 2. Spawn the inner plugin's `run` future in a task, configured to bind
 //!    that internal port.
 //! 3. Wait for the inner plugin's own readiness report, racing the inner
@@ -387,11 +387,16 @@ pub(crate) async fn allocate_inner_port_with(
 
 /// Whether a failed `bind((ip, 0))` is a race that a later pick can win.
 ///
-/// Narrower than `util::retry::is_bind_race` (garter is published and cannot
-/// depend on the unpublished `util`): the ip is fixed here, so
-/// `AddrNotAvailable` means the host does not own it, and no pick fixes that.
+/// The same classes as `util::retry::is_bind_race`, which garter (published)
+/// cannot depend on: on Windows a `bind(:0)` fails with `PermissionDenied` or
+/// `AddrNotAvailable` when the excluded-port-range tables disagree about the
+/// port it was handed. An address the host does not own fails the same way on
+/// every pick, so such a start never readies; `shutdown` ends it.
 fn is_port_race(err: &io::Error) -> bool {
-    matches!(err.kind(), io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied)
+    matches!(
+        err.kind(),
+        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied | io::ErrorKind::AddrNotAvailable
+    )
 }
 
 /// Exponential pause between retries, 5ms doubling to a 50ms cap.

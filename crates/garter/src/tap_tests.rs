@@ -773,16 +773,16 @@ async fn the_inner_port_pick_retries_a_bind_race_without_a_cap() {
 }
 
 #[skuld::test]
-async fn the_inner_port_pick_returns_addr_not_available_at_once() {
-    // On a fixed ip the error is permanent (the address is not the host's), not a race.
+async fn the_inner_port_pick_retries_addr_not_available() {
+    // A Windows excluded-port-range refusal, like `util::retry::is_bind_race`.
     tokio::time::pause();
     let calls = Arc::new(AtomicUsize::new(0));
-    let script = vec![err(io::ErrorKind::AddrInUse), err(io::ErrorKind::AddrNotAvailable)];
-    let e = allocate_inner_port_with(&[5000], scripted(script, &calls), &CancellationToken::new())
+    let script = vec![err(io::ErrorKind::AddrNotAvailable), Ok(addr(5001))];
+    let picked = allocate_inner_port_with(&[5000], scripted(script, &calls), &CancellationToken::new())
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(e.kind(), io::ErrorKind::AddrNotAvailable);
+    assert_eq!(picked, Some(addr(5001)));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
@@ -874,17 +874,25 @@ async fn the_tap_never_hands_the_inner_the_next_hops_port() {
 }
 
 #[skuld::test]
-async fn a_tap_on_an_address_the_host_does_not_own_fails_to_start() {
-    // 192.0.2.1 (TEST-NET-1) is assigned to no interface: every probe bind fails
-    // with a permanent `AddrNotAvailable`.
+async fn a_tap_on_an_address_the_host_does_not_own_keeps_picking_until_shutdown() {
+    // 192.0.2.1 (TEST-NET-1) is assigned to no interface: every real probe bind
+    // fails with `AddrNotAvailable`, which the pick cannot tell from the Windows
+    // flake. The start must not spin unpaced or ignore `shutdown`.
+    tokio::time::pause();
     let local: SocketAddr = "192.0.2.1:0".parse().unwrap();
-    let (ready, result) = failed_start(Box::new(ParkedStub), local).await;
+    let shutdown = CancellationToken::new();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let tap = Box::new(TapPlugin::wrap(Box::new(ParkedStub)));
+    let run = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move { tap.run(local, unused_remote(), shutdown, ready_tx).await }
+    });
+    // Virtual time: the paused clock advances only through the pick's own backoff.
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    shutdown.cancel();
 
-    assert!(
-        matches!(&ready, Ok(Err(StartError::Fatal { errno: Some(_), .. }))),
-        "want Fatal with the bind errno, got {ready:?}"
-    );
-    assert!(result.is_err(), "run must fail, got {result:?}");
+    assert!(run.await.unwrap().is_ok(), "a clean shutdown is not an error");
+    assert!(ready_rx.await.is_err(), "the start never readied");
 }
 
 #[skuld::test]
