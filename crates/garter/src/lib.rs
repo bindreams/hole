@@ -1,4 +1,5 @@
 mod ansi;
+mod backoff;
 pub mod binary;
 pub mod chain;
 pub mod counting;
@@ -26,6 +27,8 @@ pub use tap::TapPlugin;
 
 #[cfg(test)]
 mod ansi_tests;
+#[cfg(test)]
+mod backoff_tests;
 #[cfg(test)]
 mod binary_tests;
 #[cfg(test)]
