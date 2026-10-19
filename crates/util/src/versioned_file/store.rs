@@ -65,7 +65,11 @@ pub trait Placement {
         Ok(())
     }
 
-    /// Makes the rename durable: the directory's buffers are flushed.
+    /// Makes the rename durable: the directory's buffers are flushed. On
+    /// Windows that is `FlushFileBuffers` on a handle to the directory, and
+    /// Microsoft does not document it as committing a rename: the durability
+    /// of the replace there rests on that reading, not on a documented
+    /// guarantee.
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         sync_dir(dir)
     }
@@ -214,6 +218,11 @@ impl<S: VersionedState> VersionedFile<S> {
     /// not let another principal create files in it: the type acts by name
     /// and does not defend against a name changed under it.
     /// [`load`](Self::load) needs none of this and reads either file whole.
+    ///
+    /// On Windows a volume that rejects POSIX rename (FAT, exFAT, some network
+    /// shares) gets `MoveFileExW` instead. There a reader that has the file
+    /// open at the instant of the replace can make the store fail with the OS
+    /// error (`PermissionDenied`); the old file is then still in place.
     ///
     /// Blocks the calling thread on file I/O: from async code call it where
     /// blocking is allowed. `serde_json` writes a non-finite float as `null`, so an

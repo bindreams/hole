@@ -8,10 +8,12 @@ use tempfile::NamedTempFile;
 
 /// Renames the temp file over `dest`, even while another handle has `dest`
 /// open: that reader keeps the old file, and the next open gets the new one.
+/// On Windows, a volume without POSIX rename (FAT, exFAT, some network shares)
+/// gets `MoveFileExW` instead, which fails while a reader has `dest` open.
 /// The caller syncs the directory to make the rename durable.
 pub(super) fn publish(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
     #[cfg(windows)]
-    return windows_impl::replace_posix(tmp, dest);
+    return windows_impl::replace(tmp, dest);
     #[cfg(not(windows))]
     return tmp.persist(dest).map(|_| ()).map_err(|e| e.error);
 }
@@ -109,17 +111,18 @@ mod windows_impl {
 
     use tempfile::NamedTempFile;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        FileRenameInfoEx, MoveFileExW, SetFileInformationByHandle, DELETE, FILE_RENAME_INFO, MOVEFILE_WRITE_THROUGH,
+        FileRenameInfoEx, MoveFileExW, SetFileInformationByHandle, DELETE, FILE_RENAME_INFO, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH,
     };
 
     /// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and `FILE_RENAME_FLAG_POSIX_SEMANTICS`
     /// of `FILE_RENAME_INFO::Flags`. With both, the target is replaced even
     /// while it has open handles: they keep the replaced file, and every later
     /// open of the name gets the renamed one. Needs Windows 10 version 1607 and
-    /// NTFS; elsewhere the call fails and so does the store, rather than
-    /// falling back to a replace that a reader's open handle can refuse.
+    /// a volume that supports it (NTFS does); elsewhere the replace falls back
+    /// to `MoveFileExW`, which an open reader can make fail.
     const REPLACE_POSIX: u32 = 0x1 | 0x2;
 
     /// A `windows` error as the `io::Error` of the Win32 code inside it.
@@ -131,12 +134,52 @@ mod windows_impl {
         }
     }
 
-    pub(super) fn replace_posix(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
+    pub(super) fn replace(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
+        publish_with(tmp, dest, rename_posix, rename_replace_legacy)
+    }
+
+    /// Renames the temp file over `dest` with `posix`, or with `legacy` when
+    /// `posix` answers that the volume does not support it. Any other error
+    /// is returned, and the temp file is removed on every failure.
+    pub(super) fn publish_with(
+        tmp: NamedTempFile,
+        dest: &Path,
+        posix: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        legacy: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
         let mut from = tmp.into_temp_path();
-        rename_posix(&from, dest)?;
+        match posix(&from, dest) {
+            Err(e) if posix_rename_unsupported(&e) => legacy(&from, dest)?,
+            result => result?,
+        }
         // Moved: the temp name is no longer ours to delete.
         from.disable_cleanup(true);
         Ok(())
+    }
+
+    /// The volume or the OS rejects `FileRenameInfoEx` with POSIX semantics:
+    /// `ERROR_INVALID_PARAMETER` (measured on a 9P volume), `ERROR_NOT_SUPPORTED`
+    /// or `ERROR_INVALID_FUNCTION`. `std` reads the same three as "unsupported"
+    /// for the POSIX-semantics delete, which FAT32 refuses the same way.
+    pub(super) fn posix_rename_unsupported(e: &io::Error) -> bool {
+        let Some(code) = e.raw_os_error() else { return false };
+        [ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION]
+            .iter()
+            .any(|unsupported| unsupported.0 as i32 == code)
+    }
+
+    pub(super) fn rename_replace_legacy(from: &Path, to: &Path) -> io::Result<()> {
+        let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+        let (from, to) = (wide(from), wide(to));
+        // SAFETY: both buffers are NUL-terminated and outlive the call.
+        unsafe {
+            MoveFileExW(
+                PCWSTR(from.as_ptr()),
+                PCWSTR(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(io_error)
     }
 
     fn rename_posix(from: &Path, to: &Path) -> io::Result<()> {

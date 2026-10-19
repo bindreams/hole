@@ -35,7 +35,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # `Win32_Foundation`, `Win32_Storage_FileSystem`: `versioned_file`'s POSIX-semantics
-# replace and no-clobber rename.
+# replace (with its `MoveFileExW` fallback) and no-clobber rename.
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]

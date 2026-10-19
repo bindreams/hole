@@ -18,7 +18,11 @@
 //!
 //! `load` needs no exclusion, on Windows too: `store` replaces the file with
 //! POSIX semantics, so a reader that has it open neither fails nor makes the
-//! store fail.
+//! store fail. A volume that lacks POSIX rename (FAT, exFAT, some network
+//! shares) gets a plain replace, where a reader can make the store fail; see
+//! [`VersionedFile::store`]. Windows durability of the replace rests on
+//! flushing the directory handle, which Microsoft does not document as
+//! committing a rename (`Placement::sync_dir`).
 //!
 //! # Compatibility
 //!
