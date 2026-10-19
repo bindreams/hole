@@ -454,7 +454,7 @@ fn a_lock_wider_than_its_files_writers_is_narrowed_by_every_operation() {
 }
 
 #[skuld::test]
-fn the_lock_can_be_taken_again_and_is_not_rewritten_when_it_is_already_right() {
+fn the_lock_has_the_same_dacl_after_every_operation() {
     let (dir, _state, lock) = paths();
     let file = VersionedFile::<DecisionFile>::new(dir.path());
     file.store(&decision("v0"), &plain()).unwrap();

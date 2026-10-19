@@ -12,6 +12,13 @@
 //! cannot stall its writers. For that the state directory must not let a
 //! principal create files in it that may not write the state file.
 //!
+//! Who may write the file is read from its mode bits (unix) or its DACL
+//! (Windows): a principal that writes it through a POSIX or macOS ACL entry is
+//! not seen. On unix the lock is owned by the file's owner, so only that owner,
+//! or root, can create it; a group writer can open a lock the owner made, not
+//! make one. A link or anything but a regular file at `<name>.lock` is an
+//! error, never followed.
+//!
 //! # Compatibility
 //!
 //! - Readers ignore unknown fields: no schema, current or frozen, nested or

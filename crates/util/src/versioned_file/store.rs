@@ -77,7 +77,9 @@ pub trait Placement {
 
     /// The new file is in place. Runs under the file's lock: it must not call
     /// `store`, `remove` or `move_aside` on this file, which would wait for the
-    /// lock it is in.
+    /// lock it is in. Not for its mode, owner or ACL: the lock's access was
+    /// derived from the temp file before this, so use
+    /// [`prepare_tmp`](Placement::prepare_tmp).
     fn after_publish(&self, _path: &Path) -> io::Result<()> {
         Ok(())
     }
