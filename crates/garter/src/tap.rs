@@ -147,7 +147,7 @@ impl ChainPlugin for TapPlugin {
         ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         let plugin_name = self.inner.name().to_string();
-        // A mapped IPv6 `local` is its IPv4 form everywhere (probe, public bind, reports): Windows refuses to bind the mapped one.
+        // Windows refuses to bind a mapped IPv6 address, so `local` is its IPv4 form throughout.
         let local = SocketAddr::new(local.ip().to_canonical(), local.port());
 
         // 1. Allocate inner port (probe-and-drop, with bind-race retry).
