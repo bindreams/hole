@@ -34,7 +34,9 @@
 //!    through), then report the tap's OWN readiness on the `ready` channel
 //!    passed to [`ChainPlugin::run`] — the chain aggregator awaits that.
 //! 5. Accept loop in a `JoinSet`; per-connection forwarder calls
-//!    `tokio::io::copy_bidirectional` with [`CountingStream`] wrappers.
+//!    `tokio::io::copy_bidirectional` with [`CountingStream`] wrappers. A forwarder
+//!    retries a refused connect to the inner until it connects, hits another
+//!    error, or is aborted (shutdown, or the inner task ending).
 //! 6. On shutdown: abort all in-flight forwarders, await the inner task,
 //!    propagate its exit status as ours.
 //!
@@ -65,13 +67,6 @@ static NEXT_TAP_CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// before the tap gives up. Mirrors [`crate::chain::ChainRunner`]'s 30s
 /// readiness budget for the outermost listener.
 const INNER_READY_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Budget for retrying the inner-plugin connect on transient
-/// `ECONNREFUSED`. Absorbs the (small) residual race between
-/// [`poll_ready`](crate::chain::poll_ready) returning and a brand-new
-/// inbound flow opening before the inner accept loop has spun up
-/// per-connection state.
-const INNER_CONNECT_RETRY_BUDGET: Duration = Duration::from_millis(250);
 
 /// Decorator that wraps any [`ChainPlugin`] in a counting loopback hop.
 ///
@@ -346,7 +341,7 @@ async fn handle_tap_connection(
     let started = Instant::now();
     tracing::info!(tap_conn_id = conn_id, %peer, %inner_local, "plugin tap: accepted");
 
-    let upstream = match retry_connect_inner(inner_local, INNER_CONNECT_RETRY_BUDGET, &shutdown).await {
+    let upstream = match retry_connect_inner(inner_local, &shutdown).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -396,21 +391,34 @@ async fn handle_tap_connection(
     );
 }
 
-async fn retry_connect_inner(
-    addr: SocketAddr,
-    budget: Duration,
+/// Connects to the inner plugin, retrying every `ECONNREFUSED`.
+///
+/// A refusal is not proof the inner will never accept (Windows reports a full
+/// listen backlog as a refusal, after the SYN retransmissions), so only a real
+/// condition ends the loop: a connection, any other error, or `shutdown`. The
+/// inner exiting ends it too, from outside: the accept loop aborts every
+/// forwarder, this one included, when the inner task finishes. The backoff
+/// paces the loop and proves nothing.
+async fn retry_connect_inner(addr: SocketAddr, shutdown: &CancellationToken) -> io::Result<TcpStream> {
+    retry_connect_with(|| TcpStream::connect(addr), shutdown).await
+}
+
+/// [`retry_connect_inner`] over a caller-supplied connect, so a test can script
+/// the refusals the OS would return.
+pub(crate) async fn retry_connect_with<T, Fut>(
+    mut connect: impl FnMut() -> Fut,
     shutdown: &CancellationToken,
-) -> io::Result<TcpStream> {
-    let deadline = Instant::now() + budget;
+) -> io::Result<T>
+where
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
     let mut delay = Duration::from_millis(5);
     let max_delay = Duration::from_millis(50);
     loop {
         tokio::select! {
-            result = TcpStream::connect(addr) => match result {
+            result = connect() => match result {
                 Ok(s) => return Ok(s),
-                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused && Instant::now() < deadline => {
-                    // fall through to backoff
-                }
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
                 Err(e) => return Err(e),
             },
             _ = shutdown.cancelled() => {

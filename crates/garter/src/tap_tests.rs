@@ -51,7 +51,7 @@ use tokio_util::sync::CancellationToken;
 use crate::counting::CountingStream;
 use crate::plugin::ChainPlugin;
 use crate::sitrep::{PluginReady, StartError};
-use crate::tap::{allocate_inner_port_with, TapPlugin};
+use crate::tap::{allocate_inner_port_with, retry_connect_with, TapPlugin};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -762,4 +762,128 @@ async fn the_inner_port_pick_returns_a_non_transient_error_at_once() {
 
     assert_eq!(err.kind(), io::ErrorKind::Other);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+// Inner connect retry =================================================================================================
+
+/// A connect that refuses `refusals` times, then succeeds with `()`, counting calls.
+fn refusing(refusals: usize, calls: &AtomicUsize) -> impl FnMut() -> std::future::Ready<io::Result<()>> + '_ {
+    move || {
+        let call = calls.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(if call < refusals {
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        } else {
+            Ok(())
+        })
+    }
+}
+
+#[skuld::test]
+async fn a_refused_inner_connect_is_retried_until_it_succeeds_however_long_that_takes() {
+    tokio::time::pause();
+    // With the delay capped at 50ms, 100 refusals span more than 4s of virtual
+    // time, far past any fixed budget.
+    let calls = AtomicUsize::new(0);
+    let started = tokio::time::Instant::now();
+    let result = retry_connect_with(refusing(100, &calls), &CancellationToken::new()).await;
+
+    assert!(result.is_ok(), "retry gave up: {result:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 101);
+    assert!(started.elapsed() > Duration::from_secs(2));
+}
+
+#[skuld::test]
+async fn a_non_refused_inner_connect_error_is_returned_at_once() {
+    tokio::time::pause();
+    let calls = AtomicUsize::new(0);
+    let connect = || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied)))
+    };
+    let err = retry_connect_with(connect, &CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[skuld::test]
+async fn shutdown_ends_the_inner_connect_retry() {
+    tokio::time::pause();
+    let shutdown = CancellationToken::new();
+    let calls = AtomicUsize::new(0);
+    // Refuses forever; the third refusal also fires shutdown.
+    let connect = || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+            shutdown.cancel();
+        }
+        std::future::ready(Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionRefused)))
+    };
+    let err = retry_connect_with(connect, &shutdown).await.unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+/// Reports ready on a listener it has already closed, so every connect to it
+/// is refused, then exits with an error once `die` fires.
+struct ClosedListenerStub {
+    die: oneshot::Receiver<()>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for ClosedListenerStub {
+    fn name(&self) -> &str {
+        "closed-listener-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        let listener = TcpListener::bind(local).await.expect("bind the inner port");
+        let listen = listener.local_addr().unwrap_or(local);
+        drop(listener);
+        let _ = ready.send(Ok(PluginReady {
+            listen,
+            transports: crate::sitrep::Transports::TCP,
+        }));
+        let _ = self.die.await;
+        Err(crate::Error::Chain("stub died".into()))
+    }
+}
+
+#[skuld::test]
+async fn the_inner_exiting_ends_a_forwarder_still_retrying_its_connect() {
+    let (subscriber, writer) = make_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+
+    let accepted_rx = writer.wait_for("plugin tap: accepted");
+    let (die_tx, die_rx) = oneshot::channel();
+    let tap = Box::new(TapPlugin::wrap(Box::new(ClosedListenerStub { die: die_rx })));
+    let (ready_tx, ready_rx) = oneshot::channel();
+    // Never cancelled: only the inner's exit may end the tap and its forwarder.
+    let shutdown = CancellationToken::new();
+    let handle = tokio::spawn(async move { tap.run(loopback(), unused_remote(), shutdown, ready_tx).await });
+
+    let public = match ready_rx.await {
+        Ok(Ok(ready)) => ready.listen,
+        other => panic!("tap did not become ready: {other:?}"),
+    };
+    let _client = TcpStream::connect(public).await.unwrap();
+    // The forwarder is spawned: its connect to the closed inner is refused until the inner exits.
+    tokio::task::spawn_blocking(move || accepted_rx.recv())
+        .await
+        .unwrap()
+        .expect("tap never accepted the client");
+
+    die_tx.send(()).unwrap();
+    let result = handle.await.expect("tap task panicked");
+
+    let err = result.expect_err("the inner's exit error is the tap's");
+    assert!(err.to_string().contains("stub died"), "got {err}");
 }
