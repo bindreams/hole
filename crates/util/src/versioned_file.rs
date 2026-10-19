@@ -5,7 +5,8 @@
 //! [`Schema::Prev`], so [`VersionedFile::load`] reads any version it knows
 //! into the current one and a missing step does not build. A file it cannot
 //! read, whether newer than this release or corrupt, meets one rule per
-//! [`Role`]. `store`, `remove` and `move_aside` hold an exclusive lock on
+//! [`Role`]; so does one whose read failed with an I/O error, under its own
+//! cell: a write or remove never destroys it unread. `store`, `remove` and `move_aside` hold an exclusive lock on
 //! `<name>.lock`, a file the type creates and never deletes; `load` takes none.
 //! The lock file can be opened by exactly the principals that may write the
 //! file it guards, and its owner, so a principal that can only read the file

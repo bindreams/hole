@@ -67,3 +67,23 @@ fn unreadable_blocks_connect_is_true_only_for_os_record() {
         }
     }
 }
+
+/// The cell for a read that failed with an I/O error: the bytes were never seen,
+/// so no backup is skipped and nothing is destroyed. One row per role.
+#[skuld::test]
+fn the_io_failure_cells_are_exactly_these() {
+    use RemoveOver::{Keep, MoveAside as MoveRemoved};
+    use StoreOver::{MoveAside, Refuse};
+
+    let table = [
+        (Role::Decision, MoveAside, MoveRemoved),
+        (Role::OsRecord, Refuse, Keep),
+        (Role::LegacyRecord, Refuse, Keep),
+        (Role::Config, MoveAside, MoveRemoved),
+    ];
+
+    for (role, store, remove) in table {
+        assert_eq!(role.on_store_io_failure(), store, "{role:?} on_store_io_failure");
+        assert_eq!(role.on_remove_io_failure(), remove, "{role:?} on_remove_io_failure");
+    }
+}

@@ -122,6 +122,11 @@ pub enum StoreError {
     /// before it reaches a toast.
     #[error("{} cannot be read ({cause}); it is left as it is", path.display())]
     Unreadable { path: PathBuf, cause: CannotRead },
+    /// The read failed with an I/O error and the role refuses to replace a file
+    /// it could not read. The text carries the full path, like
+    /// [`Unreadable`](Self::Unreadable).
+    #[error("{} could not be read ({kind}); it is left as it is", path.display())]
+    ReadFailed { path: PathBuf, kind: io::ErrorKind },
     /// The value cannot be framed, or would not read back as `S`. The reason
     /// is a fixed label, never content; the error's category is logged.
     #[error("cannot encode the state file: {0}")]
@@ -197,10 +202,12 @@ impl<S: VersionedState> VersionedFile<S> {
     /// 1. Write a same-directory temp file, sync it and have `place` set its
     ///    mode, owner and ACL. The lock is taken after that: its access is
     ///    derived from this file's.
-    /// 2. Probe the current file. Absent, older, obsolete or unreadable for an
-    ///    I/O reason goes straight to 4. A newer or corrupt file is decided by
-    ///    `S::ROLE`: refused (nothing touched, the temp file deleted),
-    ///    overwritten, or backed up in 3.
+    /// 2. Probe the current file. Absent, older or obsolete goes straight to
+    ///    4. A newer or corrupt file, and one whose read failed with an I/O
+    ///    error, is decided by `S::ROLE`: refused (nothing touched, the temp
+    ///    file deleted, [`StoreError::ReadFailed`] for the I/O error),
+    ///    overwritten, or backed up in 3. A read that failed says nothing
+    ///    about the bytes, and no role overwrites them.
     /// 3. Back the old file up as `<name>.unreadable[.N].bak`, by hard link
     ///    (the same file object, so its mode and ACL stay). Every backup made
     ///    is logged and kept, even if 4 then fails.
@@ -233,19 +240,7 @@ impl<S: VersionedState> VersionedFile<S> {
         place.prepare_tmp(tmp.path())?;
         let _lock = Lock::acquire(&*self.fs, &self.lock_path(), tmp.path())?;
 
-        let back_up = match self.load().cannot_read() {
-            None => false,
-            Some(cause) => match S::ROLE.on_store(cause) {
-                StoreOver::Refuse => {
-                    return Err(StoreError::Unreadable {
-                        path: self.path.clone(),
-                        cause,
-                    })
-                }
-                StoreOver::Overwrite => false,
-                StoreOver::MoveAside => true,
-            },
-        };
+        let back_up = store_over(&self.path, &self.load())?;
 
         if back_up {
             self.link_to_free_backup()?;
@@ -260,8 +255,8 @@ impl<S: VersionedState> VersionedFile<S> {
     }
 
     /// Removes the file, or does what `S::ROLE` says for one that cannot be
-    /// read. A file whose read failed with an I/O error is removed: the read
-    /// said nothing about its bytes. Takes the file's lock, like
+    /// read, or whose read failed with an I/O error (kept, or moved aside:
+    /// never deleted unread). Takes the file's lock, like
     /// [`store`](Self::store), and so blocks like it. When the file is not
     /// there, or its directory is not, it returns `Absent` without making
     /// anything: the answer needs no write access to the directory.
@@ -406,11 +401,47 @@ impl<S: VersionedState> VersionedFile<S> {
     }
 }
 
+/// Whether `store` backs up the file as `loaded` found it before it writes,
+/// or the error that refuses the write.
+fn store_over<S: VersionedState>(path: &Path, loaded: &Loaded<S>) -> Result<bool, StoreError> {
+    let (over, refusal) = match loaded {
+        Loaded::Unreadable(e) => (
+            S::ROLE.on_store_io_failure(),
+            StoreError::ReadFailed {
+                path: path.to_owned(),
+                kind: e.kind(),
+            },
+        ),
+        Loaded::Absent | Loaded::Obsolete { .. } | Loaded::Current { .. } => return Ok(false),
+        Loaded::Newer { .. } => (
+            S::ROLE.on_store(CannotRead::Newer),
+            StoreError::Unreadable {
+                path: path.to_owned(),
+                cause: CannotRead::Newer,
+            },
+        ),
+        Loaded::Corrupt { .. } => (
+            S::ROLE.on_store(CannotRead::Corrupt),
+            StoreError::Unreadable {
+                path: path.to_owned(),
+                cause: CannotRead::Corrupt,
+            },
+        ),
+    };
+    match over {
+        StoreOver::Refuse => Err(refusal),
+        StoreOver::MoveAside => Ok(true),
+        StoreOver::Overwrite => Ok(false),
+    }
+}
+
 /// What `remove` does with a file as `loaded` found it.
 fn remove_over<S: VersionedState>(loaded: &Loaded<S>) -> RemoveOver {
-    match loaded.cannot_read() {
-        None => RemoveOver::Remove,
-        Some(cause) => S::ROLE.on_remove(cause),
+    match loaded {
+        Loaded::Unreadable(_) => S::ROLE.on_remove_io_failure(),
+        Loaded::Absent | Loaded::Obsolete { .. } | Loaded::Current { .. } => RemoveOver::Remove,
+        Loaded::Newer { .. } => S::ROLE.on_remove(CannotRead::Newer),
+        Loaded::Corrupt { .. } => S::ROLE.on_remove(CannotRead::Corrupt),
     }
 }
 
@@ -475,6 +506,10 @@ mod store_tests;
 #[cfg(test)]
 #[path = "store_faults_tests.rs"]
 mod store_faults_tests;
+
+#[cfg(test)]
+#[path = "store_io_failure_tests.rs"]
+mod store_io_failure_tests;
 
 #[cfg(test)]
 #[path = "store_lock_tests.rs"]

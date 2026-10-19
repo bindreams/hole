@@ -32,7 +32,9 @@ pub enum Loaded<S> {
     Absent,
     /// The read failed with an I/O error. Says nothing about the bytes, so it
     /// is not [`CannotRead`]: no rule that moves or refuses a file by what it
-    /// holds may fire on it.
+    /// holds may fire on it. `store` and `remove` give it a cell of its own
+    /// per role (`Role::on_store_io_failure`, `Role::on_remove_io_failure`),
+    /// and none of them destroys the file.
     Unreadable(std::io::Error),
     /// Not JSON, a bad `version`, or the wrong shape for that version.
     Corrupt { failure: ParseFailure, raw: Raw },

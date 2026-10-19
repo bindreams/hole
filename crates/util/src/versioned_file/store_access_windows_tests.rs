@@ -504,6 +504,32 @@ fn remove_by_a_non_writer_answers_absent_for_a_file_that_is_gone_when_read() {
     assert_eq!(removal.unwrap(), Removal::Absent);
 }
 
+/// The file cannot be read, and the caller cannot open its lock either.
+struct DeniedRead;
+
+impl Fs for DeniedRead {
+    fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+#[skuld::test]
+fn remove_by_a_non_writer_over_an_io_failed_file_follows_the_io_failure_cell() {
+    let dir = dir();
+    put(&dir, "os-record.json", b"unread");
+    put(&dir, "decision.json", b"unread");
+    for name in ["os-record.json.lock", "decision.json.lock"] {
+        let lock = put(&dir, name, b"");
+        set_aces(&lock, &[Ace::deny(&EVERYONE, FILE_ALL_ACCESS)]);
+    }
+    let os_record = VersionedFile::<OsRecordFile>::with_fs(dir.path(), std::sync::Arc::new(DeniedRead));
+    let decision = VersionedFile::<DecisionFile>::with_fs(dir.path(), std::sync::Arc::new(DeniedRead));
+
+    assert_eq!(os_record.remove().unwrap(), Removal::Kept);
+    assert_eq!(decision.remove().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(std::fs::read(dir.path().join("decision.json")).unwrap(), b"unread");
+}
+
 #[skuld::test]
 fn remove_by_a_non_writer_is_the_lock_error_where_the_role_would_act() {
     for bytes in [

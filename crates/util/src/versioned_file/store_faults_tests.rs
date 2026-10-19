@@ -198,41 +198,6 @@ fn racing_stores_back_the_original_up_once() {
     ));
 }
 
-// I/O failures on read ================================================================================================
-
-struct DeniedRead;
-
-impl Fs for DeniedRead {
-    fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
-        Err(io::Error::from(io::ErrorKind::PermissionDenied))
-    }
-}
-
-#[skuld::test]
-fn store_over_an_io_failed_probe_writes_and_makes_no_backup() {
-    // The bytes would read as corrupt, but nothing proved that: the read failed.
-    let dir = dir();
-    put(&dir, "decision.json", b"not even json");
-    let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(DeniedRead));
-
-    file.store(&decision("new"), &plain()).unwrap();
-
-    assert_eq!(names(&dir), ["decision.json"], "no backup of a file nobody read");
-    let written = std::fs::read_to_string(dir.path().join("decision.json")).unwrap();
-    assert!(written.contains("\"new\""), "{written}");
-}
-
-#[skuld::test]
-fn remove_over_an_io_failed_probe_removes() {
-    let dir = dir();
-    put(&dir, "decision.json", unreadable_bytes(CannotRead::Newer));
-    let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(DeniedRead));
-
-    assert_eq!(file.remove().unwrap(), Removal::Removed);
-
-    assert!(names(&dir).is_empty(), "removed, not moved aside: {:?}", names(&dir));
-}
-
 // A backup is the same file ===========================================================================================
 
 /// `(volume, file index)` of whatever `path` names.

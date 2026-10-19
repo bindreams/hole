@@ -144,6 +144,30 @@ mod read_only_directory {
         }
     }
 
+    /// The file cannot be read, and the caller cannot lock it either.
+    struct DeniedRead;
+
+    impl Fs for DeniedRead {
+        fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+    }
+
+    #[skuld::test]
+    fn remove_by_a_non_writer_over_an_io_failed_file_follows_the_io_failure_cell() {
+        let dir = dir();
+        put(&dir, "os-record.json", b"unread");
+        put(&dir, "decision.json", b"unread");
+        let _ro = ReadOnly::new(dir.path());
+
+        let os_record = VersionedFile::<OsRecordFile>::with_fs(dir.path(), std::sync::Arc::new(DeniedRead));
+        let decision = VersionedFile::<DecisionFile>::with_fs(dir.path(), std::sync::Arc::new(DeniedRead));
+
+        assert_eq!(os_record.remove().unwrap(), Removal::Kept);
+        assert_eq!(decision.remove().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(dir.path().join("decision.json")).unwrap(), b"unread");
+    }
+
     #[skuld::test]
     fn a_file_that_is_there_but_cannot_be_locked_is_an_error_not_absent() {
         let dir = dir();
