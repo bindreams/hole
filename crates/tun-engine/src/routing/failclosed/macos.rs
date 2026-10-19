@@ -1016,10 +1016,10 @@ pub fn engage_lockdown(
 /// Gates on [`lockdown_cover_presence`] — pf's own answer folded with the
 /// state file — not on the file alone (#882): a state file that is absent or
 /// unusable is not proof pf was never engaged, since pf's label can outlive a
-/// lost or corrupted file. Only a presence [`CoverPresence::Absent`] (both
+/// lost or corrupted file. Only a presence [`CoverPresence::Absent`](crate::routing::CoverPresence::Absent) (both
 /// sources agree there is nothing) is a silent `Ok`; a presence that could not
-/// be established at all ([`CoverPresence::Unreachable`]/
-/// [`CoverPresence::Indeterminate`]) refuses rather than claim success having
+/// be established at all ([`CoverPresence::Unreachable`](crate::routing::CoverPresence::Unreachable)/
+/// [`CoverPresence::Indeterminate`](crate::routing::CoverPresence::Indeterminate)) refuses rather than claim success having
 /// done nothing. A restore that fails propagates the error and LEAVES the
 /// state file in place, so a retry (or the next start) still sees the cover
 /// rather than reading "disengaged" while the block persists.
@@ -1116,7 +1116,7 @@ fn disengage_lockdown_with(
 ///
 /// pf's own confirmation wins outright. Failing that, a state file — readable
 /// or not — is Hole's unreconciled record that a cover was engaged and never
-/// confirmed released, which is [`CoverPresence::Recorded`]. Only a pf that
+/// confirmed released, which is [`CoverPresence::Recorded`](crate::routing::CoverPresence::Recorded). Only a pf that
 /// answered "no" with nothing on disk contradicting it is `Absent`; a pf that
 /// could not answer at all, with no file either, is `Unreachable`.
 pub(crate) fn fold_presence(
