@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
-use super::{DefaultPlacement, StoreError, VersionedFile};
+use super::{DefaultPlacement, Removal, StoreError, VersionedFile};
 use crate::versioned_file::fixtures::{dir, put, DecisionFile};
 
 const STATE: &[u8] = br#"{"version":1,"value":"v"}"#;
@@ -39,6 +39,18 @@ fn run(dir: &TempDir, op: Op) -> io::Result<()> {
         Op::Remove => file.remove().map(drop),
         Op::MoveAside => file.move_aside().map(drop),
     }
+}
+
+/// Symlinks need `SeCreateSymbolicLinkPrivilege` on Windows: an elevated token,
+/// or Developer Mode.
+fn make_symlink(target: &Path, at: &Path) {
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, at);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, at);
+    made.unwrap_or_else(|e| {
+        panic!("this test needs the privilege to create symlinks (on Windows an elevated token or Developer Mode): {e}")
+    });
 }
 
 fn entries(dir: &TempDir) -> Vec<String> {
@@ -81,9 +93,59 @@ fn refused_and_nothing_changes(make: impl Fn(&Path)) {
     }
 }
 
+// A link at the state path is an entry like any other: `remove` and
+// `move_aside` act on the name, never on what it points at, and never call it
+// absent while the name is taken.
+
+#[skuld::test]
+fn remove_of_a_dangling_symlink_state_path_removes_the_link() {
+    let dir = dir();
+    let state = dir.path().join("decision.json");
+    make_symlink(&dir.path().join("nowhere"), &state);
+
+    let removal = VersionedFile::<DecisionFile>::new(dir.path()).remove().unwrap();
+
+    assert_eq!(removal, Removal::Removed);
+    assert!(std::fs::symlink_metadata(&state).is_err(), "the link is still there");
+}
+
+#[skuld::test]
+fn remove_of_a_symlink_state_path_leaves_the_file_it_points_at() {
+    let dir = dir();
+    let away = crate::versioned_file::fixtures::dir();
+    let target = put(&away, "elsewhere.json", STATE);
+    let state = dir.path().join("decision.json");
+    make_symlink(&target, &state);
+
+    let removal = VersionedFile::<DecisionFile>::new(dir.path()).remove().unwrap();
+
+    assert_eq!(removal, Removal::Removed);
+    assert!(std::fs::symlink_metadata(&state).is_err(), "the link is still there");
+    assert_eq!(std::fs::read(&target).unwrap(), STATE);
+}
+
+#[skuld::test]
+fn move_aside_of_a_dangling_symlink_state_path_moves_the_link() {
+    let dir = dir();
+    let state = dir.path().join("decision.json");
+    make_symlink(&dir.path().join("nowhere"), &state);
+
+    let backup = VersionedFile::<DecisionFile>::new(dir.path()).move_aside().unwrap();
+
+    let backup = backup.expect("the name was taken, so something was moved");
+    assert!(
+        std::fs::symlink_metadata(&state).is_err(),
+        "the link is still at its name"
+    );
+    assert!(
+        std::fs::symlink_metadata(&backup).unwrap().is_symlink(),
+        "the backup is the link itself"
+    );
+}
+
 #[cfg(unix)]
 mod unix {
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
@@ -92,7 +154,7 @@ mod unix {
         let away = dir();
         let nowhere = away.path().join("nowhere");
 
-        refused_and_nothing_changes(|lock| symlink(&nowhere, lock).unwrap());
+        refused_and_nothing_changes(|lock| make_symlink(&nowhere, lock));
 
         assert!(!nowhere.exists(), "the link's target was created through it");
     }
@@ -103,7 +165,7 @@ mod unix {
         let elsewhere = put(&away, "elsewhere", b"not a lock");
         std::fs::set_permissions(&elsewhere, PermissionsExt::from_mode(0o666)).unwrap();
 
-        refused_and_nothing_changes(|lock| symlink(&elsewhere, lock).unwrap());
+        refused_and_nothing_changes(|lock| make_symlink(&elsewhere, lock));
 
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"not a lock");
         assert_eq!(
@@ -160,25 +222,15 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    use std::os::windows::fs::symlink_file;
-
     use super::*;
     use crate::versioned_file::store::store_access_windows_tests::{aces, set_aces, Ace, EVERYONE};
-
-    /// Symlinks need `SeCreateSymbolicLinkPrivilege`: an elevated token, or
-    /// Developer Mode.
-    fn link(target: &Path, at: &Path) {
-        symlink_file(target, at).unwrap_or_else(|e| {
-            panic!("this test needs the privilege to create symlinks (an elevated token or Developer Mode): {e}")
-        });
-    }
 
     #[skuld::test]
     fn a_dangling_symlink_at_the_lock_path_is_refused() {
         let away = dir();
         let nowhere = away.path().join("nowhere");
 
-        refused_and_nothing_changes(|lock| link(&nowhere, lock));
+        refused_and_nothing_changes(|lock| make_symlink(&nowhere, lock));
 
         assert!(!nowhere.exists(), "the link's target was created through it");
     }
@@ -189,7 +241,7 @@ mod windows {
         let elsewhere = put(&away, "elsewhere", b"not a lock");
         let dacl_before = aces(&elsewhere);
 
-        refused_and_nothing_changes(|lock| link(&elsewhere, lock));
+        refused_and_nothing_changes(|lock| make_symlink(&elsewhere, lock));
 
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"not a lock");
         assert_eq!(
