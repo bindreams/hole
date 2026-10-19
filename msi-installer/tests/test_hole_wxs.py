@@ -570,9 +570,9 @@ def test_bridge_uninstall_runs_on_upgrade_and_keeps_covers(package: ET.Element) 
     )
     ca = _ca_map(package).get("BridgeUninstall")
     assert ca is not None
-    assert ca.get("ExeCommand",
-                  "").startswith("bridge uninstall --keep-covers"
-                                 ), ("without --keep-covers the upgrade path silently disarms the kill switch")
+    assert ca.get("ExeCommand", "").startswith("bridge uninstall --keep-covers"), (
+        "without --keep-covers the upgrade path silently disarms the kill switch"
+    )
 
 
 def test_bridge_release_follows_the_service_teardown(package: ET.Element) -> None:
@@ -636,11 +636,12 @@ def test_bridge_cas_pass_the_shared_log_dir(package: ET.Element) -> None:
     bridge_cas = {
         ca_id: ca
         for ca_id, ca in _ca_map(package).items()
-        if ca.get("ExeCommand", "").split()[:2] in (["bridge", "install"], ["bridge", "release-covers"],
-                                                    ["bridge", "uninstall"])
+        if ca.get("ExeCommand", "").split()[:2]
+        in (["bridge", "install"], ["bridge", "release-covers"], ["bridge", "uninstall"])
     }
-    assert set(bridge_cas) == {"BridgeInstall", "BridgeRelease", "BridgeUninstall",
-                               "BridgeUninstallRollback"}, (f"unexpected set of bridge CAs: {sorted(bridge_cas)}")
+    assert set(bridge_cas) == {"BridgeInstall", "BridgeRelease", "BridgeUninstall", "BridgeUninstallRollback"}, (
+        f"unexpected set of bridge CAs: {sorted(bridge_cas)}"
+    )
     for ca_id, ca in bridge_cas.items():
         command = ca.get("ExeCommand", "")
         assert command.endswith(wanted), f"{ca_id} must end with{wanted!r}, got {command!r}"
