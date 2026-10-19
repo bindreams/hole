@@ -179,6 +179,10 @@ pub(crate) enum BridgeAction {
         /// Hidden: hand-running it reproduces #1003 exactly.
         #[arg(long, hide = true)]
         keep_covers: bool,
+        /// Override the log directory (the MSI passes the one directory every
+        /// principal can read).
+        #[arg(long)]
+        log_dir: Option<std::path::PathBuf>,
     },
     /// Print bridge install/running status
     Status,
@@ -240,7 +244,12 @@ pub(crate) enum BridgeAction {
     /// Hidden because `unlock` is the user-facing hatch; like `unlock`, this
     /// refuses against a live bridge.
     #[command(hide = true)]
-    ReleaseCovers,
+    ReleaseCovers {
+        /// Override the log directory (the MSI passes the one directory every
+        /// principal can read).
+        #[arg(long)]
+        log_dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -354,14 +363,19 @@ pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
 /// `Bridge::Install { log_dir: Some(d), .. }` overrides the default — the
 /// GUI's elevated-install path uses this to redirect the subscriber into a
 /// per-invocation temp dir it can read back after the elevation completes
-/// (so the failure dialog can include the underlying error text).
+/// (so the failure dialog can include the underlying error text). The MSI's
+/// `bridge install`, `bridge uninstall` and `bridge release-covers` custom
+/// actions pass one too, so their log lands where every principal can find it.
 pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBuf> {
     if !should_install_cli_log_guard(command) {
         return None;
     }
     match command {
         Command::Bridge {
-            action: BridgeAction::Install { log_dir: Some(d), .. },
+            action:
+                BridgeAction::Install { log_dir: Some(d), .. }
+                | BridgeAction::Uninstall { log_dir: Some(d), .. }
+                | BridgeAction::ReleaseCovers { log_dir: Some(d) },
         } => Some(d.clone()),
         _ => Some(hole_common::logging::resolve_log_dir(None)),
     }
@@ -745,7 +759,10 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             }
             0
         }
-        BridgeAction::Uninstall { keep_covers } => {
+        BridgeAction::Uninstall {
+            keep_covers,
+            log_dir: _, // consumed by `resolve_cli_log_dir` already
+        } => {
             if let Err(e) = crate::setup::uninstall_bridge(keep_covers) {
                 cli_log!(error, "bridge uninstall failed: {e}{}", elevation_hint());
                 return 1;
@@ -804,7 +821,9 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 }
             }
         }
-        BridgeAction::ReleaseCovers => match hole_bridge::cutover::release_covers() {
+        BridgeAction::ReleaseCovers {
+            log_dir: _, // consumed by `resolve_cli_log_dir` already
+        } => match hole_bridge::cutover::release_covers() {
             Ok(clearance) => {
                 if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
                     cli_log!(warn, "{report}");

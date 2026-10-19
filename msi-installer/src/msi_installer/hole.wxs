@@ -247,11 +247,18 @@
 
     <!-- Custom actions: bridge install/uninstall + PATH add/remove.
          Uses FileRef (Type 18) to reference hole.exe by its File ID,
-         not Directory (Type 34) which fails to launch the exe. -->
+         not Directory (Type 34) which fails to launch the exe.
+
+         The three `bridge` actions pass a log directory so their gui-cli.log lands
+         in the directory every principal can find (the bridge's own), not in
+         the profile of whichever account the action runs as. The path is
+         quoted: ExeCommand is appended to the quoted hole.exe path as one
+         command line, and CommonAppDataFolder can hold a space. It carries no
+         trailing backslash, which a quoted argument would escape. -->
     <CustomAction
       Id="BridgeInstall"
       FileRef="hole.exe"
-      ExeCommand="bridge install"
+      ExeCommand="bridge install --log-dir &quot;[CommonAppDataFolder]hole\logs&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
@@ -305,7 +312,7 @@
     <CustomAction
       Id="BridgeRelease"
       FileRef="hole.exe"
-      ExeCommand="bridge release-covers"
+      ExeCommand="bridge release-covers --log-dir &quot;[CommonAppDataFolder]hole\logs&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
@@ -317,7 +324,7 @@
     <CustomAction
       Id="BridgeUninstall"
       FileRef="hole.exe"
-      ExeCommand="bridge uninstall --keep-covers"
+      ExeCommand="bridge uninstall --keep-covers --log-dir &quot;[CommonAppDataFolder]hole\logs&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />
@@ -337,7 +344,7 @@
     <CustomAction
       Id="BridgeUninstallRollback"
       FileRef="hole.exe"
-      ExeCommand="bridge install"
+      ExeCommand="bridge install --log-dir &quot;[CommonAppDataFolder]hole\logs&quot;"
       Execute="rollback"
       Impersonate="no"
       Return="ignore" />
