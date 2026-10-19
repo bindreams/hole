@@ -354,7 +354,7 @@ impl ChainPlugin for BinaryPlugin {
         // Wait for child exit or shutdown signal.
         //
         // The readiness sender (start-gate for `on_ready`) and this
-        // `child.wait()` Err return (lifecycle error driving teardown) are two
+        // exit's Err return (lifecycle error driving teardown) are two
         // intentionally separate observers of one exit; a plugin that emits
         // `fatal` then exits nonzero fires both, and neither must be suppressed.
         // If the child binds but never readies and is then shut down, the
@@ -363,9 +363,9 @@ impl ChainPlugin for BinaryPlugin {
         // full two-channel rationale.
         let drain_timeout = std::time::Duration::from_secs(5);
         tokio::select! {
-            status = child.wait() => {
-                let status = status?;
-                drain_readers_after_exit(&self.name, &mut child, stdout_task, stderr_task).await;
+            exited = child.wait_root_exit() => {
+                exited?;
+                let status = end_plugin(&self.name, &mut child, stdout_task, stderr_task).await?;
                 if status.success() {
                     Ok(())
                 } else {
@@ -382,10 +382,7 @@ impl ChainPlugin for BinaryPlugin {
             }
             _ = shutdown.cancelled() => {
                 tracing::info!(plugin = %self.name, "shutting down");
-                // The escalation force-kills the direct child; `child` dropping at
-                // the end of `run` (or on task abort) reaps the whole tree.
-                child.graceful_shutdown(drain_timeout).await?;
-                drain_readers_after_exit(&self.name, &mut child, stdout_task, stderr_task).await;
+                shut_plugin_down(&self.name, &mut child, drain_timeout, stdout_task, stderr_task).await?;
                 Ok(())
             }
         }
@@ -605,18 +602,45 @@ fn exit_edge_proves_the_tree_gone(containment: Containment) -> bool {
     }
 }
 
-/// The plugin's process tree, as the post-exit drain acts on it. `cosca`'s child implements it;
-/// a test substitutes a recorder.
+/// The plugin's process, as the teardown acts on it. `cosca`'s child implements it; a test
+/// substitutes a recorder.
 pub(crate) trait PluginTree {
     fn containment(&self) -> Containment;
+    /// Resolves once the root has exited, without reaping it: until `reap`, its pid (and with it a
+    /// process group id) stays ours and cannot be recycled onto an unrelated process.
+    async fn wait_root_exit(&self) -> Result<(), cosca::error::Error>;
+    /// [`wait_root_exit`](Self::wait_root_exit) for at most `grace`: `Ok(false)` if the root is still running.
+    async fn wait_root_exit_within(&self, grace: std::time::Duration) -> Result<bool, cosca::error::Error>;
+    /// Asks the root to exit (a cooperative signal). Does not wait.
+    fn terminate(&self) -> Result<(), cosca::error::Error>;
+    /// Hard-kills the root alone. Does not wait.
+    fn kill_root(&mut self) -> Result<(), cosca::error::Error>;
     fn kill_tree(&mut self) -> Result<(), cosca::error::Error>;
     /// Resolves once every member of the tree has exited. Not every containment can say so.
     async fn wait_tree_drained(&self) -> Result<(), cosca::error::Error>;
+    /// Collects the root's exit status.
+    async fn reap(&mut self) -> Result<std::process::ExitStatus, cosca::error::Error>;
 }
 
 impl PluginTree for cosca::tokio::Child {
     fn containment(&self) -> Containment {
         cosca::tokio::Child::containment(self)
+    }
+
+    async fn wait_root_exit(&self) -> Result<(), cosca::error::Error> {
+        cosca::tokio::Process::from_id(self.id()).wait().await
+    }
+
+    async fn wait_root_exit_within(&self, grace: std::time::Duration) -> Result<bool, cosca::error::Error> {
+        cosca::tokio::Process::from_id(self.id()).wait_timeout(grace).await
+    }
+
+    fn terminate(&self) -> Result<(), cosca::error::Error> {
+        cosca::tokio::Child::terminate(self)
+    }
+
+    fn kill_root(&mut self) -> Result<(), cosca::error::Error> {
+        cosca::tokio::Child::kill(self)
     }
 
     fn kill_tree(&mut self) -> Result<(), cosca::error::Error> {
@@ -638,6 +662,45 @@ impl PluginTree for cosca::tokio::Child {
             detail: "cosca 0.3's job-object wait_tree future is not Send".into(),
         })
     }
+
+    async fn reap(&mut self) -> Result<std::process::ExitStatus, cosca::error::Error> {
+        self.wait().await
+    }
+}
+
+/// Ends a plugin whose root has exited or been told to die: kills and drains its tree, waits for its
+/// output, and only then collects the root's status. The root stays unreaped until then, so a pgid-based
+/// kill cannot hit a recycled process group.
+pub(crate) async fn end_plugin(
+    plugin: &str,
+    tree: &mut impl PluginTree,
+    stdout: tokio::task::JoinHandle<()>,
+    stderr: tokio::task::JoinHandle<()>,
+) -> Result<std::process::ExitStatus, cosca::error::Error> {
+    drain_readers_after_exit(plugin, tree, stdout, stderr).await;
+    tree.reap().await
+}
+
+/// Shuts a running plugin down: asks the root to exit, gives it `grace`, hard-kills it if it has not
+/// (the escalation), then [`end_plugin`]s it.
+pub(crate) async fn shut_plugin_down(
+    plugin: &str,
+    tree: &mut impl PluginTree,
+    grace: std::time::Duration,
+    stdout: tokio::task::JoinHandle<()>,
+    stderr: tokio::task::JoinHandle<()>,
+) -> Result<std::process::ExitStatus, cosca::error::Error> {
+    tree.terminate()?;
+    match tree.wait_root_exit_within(grace).await {
+        Ok(true) => {}
+        // Still running after the grace, or the watch failed: either way the root must go.
+        Ok(false) => tree.kill_root()?,
+        Err(e) => {
+            tracing::debug!(plugin = %plugin, "could not watch the plugin exit during shutdown: {e}");
+            tree.kill_root()?;
+        }
+    }
+    end_plugin(plugin, tree, stdout, stderr).await
 }
 
 /// After the child has exited (or been shut down): kill its process tree, wait for the tree to

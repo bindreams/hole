@@ -148,7 +148,7 @@ use cosca::Containment;
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use crate::binary::{drain_readers_after_exit, PluginTree};
+use crate::binary::{drain_readers_after_exit, end_plugin, shut_plugin_down, PluginTree};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -241,13 +241,17 @@ fn unsupported() -> cosca::error::Error {
 /// The calls the drain made on a tree, in order.
 type Calls = Arc<Mutex<Vec<&'static str>>>;
 
-/// Answers the drain's calls as scripted: `kill` runs once, on `kill_tree`; the tree's exit edge
-/// resolves once `edge` is notified (or errors, for `edge_fails`).
+/// Answers the teardown's calls as scripted, recording them in order: `kill` runs once, on `kill_tree`;
+/// the tree's exit edge resolves once `edge` is notified (or errors, for `edge_fails`); a root watched
+/// for its grace has exited within it unless `root_outlives_grace`.
 struct FakeTree<K> {
     containment: Containment,
     kill: Option<K>,
     edge: Arc<Notify>,
     edge_fails: bool,
+    root_outlives_grace: bool,
+    root_watch_fails: bool,
+    terminate_fails: bool,
     calls: Calls,
 }
 
@@ -259,6 +263,9 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
             kill: Some(kill),
             edge: Arc::new(Notify::new()),
             edge_fails: false,
+            root_outlives_grace: false,
+            root_watch_fails: false,
+            terminate_fails: false,
             calls: Calls::default(),
         }
     }
@@ -268,6 +275,10 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
         let tree = Self::new(containment, kill);
         tree.edge.notify_one();
         tree
+    }
+
+    fn record(&self, call: &'static str) {
+        self.calls.lock().unwrap().push(call);
     }
 
     fn calls(&self) -> Vec<&'static str> {
@@ -280,18 +291,49 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
         self.containment
     }
 
+    async fn wait_root_exit(&self) -> Result<(), cosca::error::Error> {
+        self.record("wait_root_exit");
+        Ok(())
+    }
+
+    async fn wait_root_exit_within(&self, _grace: Duration) -> Result<bool, cosca::error::Error> {
+        self.record("wait_root_exit_within");
+        if self.root_watch_fails {
+            return Err(unsupported());
+        }
+        Ok(!self.root_outlives_grace)
+    }
+
+    fn terminate(&self) -> Result<(), cosca::error::Error> {
+        self.record("terminate");
+        if self.terminate_fails {
+            return Err(unsupported());
+        }
+        Ok(())
+    }
+
+    fn kill_root(&mut self) -> Result<(), cosca::error::Error> {
+        self.record("kill_root");
+        Ok(())
+    }
+
     fn kill_tree(&mut self) -> Result<(), cosca::error::Error> {
-        self.calls.lock().unwrap().push("kill_tree");
+        self.record("kill_tree");
         (self.kill.take().expect("the tree was killed twice"))()
     }
 
     async fn wait_tree_drained(&self) -> Result<(), cosca::error::Error> {
-        self.calls.lock().unwrap().push("wait_tree_drained");
+        self.record("wait_tree_drained");
         if self.edge_fails {
             return Err(unsupported());
         }
         self.edge.notified().await;
         Ok(())
+    }
+
+    async fn reap(&mut self) -> Result<std::process::ExitStatus, cosca::error::Error> {
+        self.record("reap");
+        Ok(std::process::ExitStatus::default())
     }
 }
 
@@ -666,4 +708,110 @@ async fn a_ready_before_stdout_eof_is_not_overwritten() {
 
     let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx).await.unwrap();
     assert!(matches!(&ready, Ok(Ok(r)) if r.listen == listen), "{ready:?}");
+}
+
+// Teardown order ------------------------------------------------------------------------------------------------------
+//
+// A pgid-based containment signals the root's process group id, which the OS may recycle the moment
+// the root is reaped. The tree is therefore killed while the root is still unreaped.
+
+fn killed_then_reaped(edge_awaited: bool) -> Vec<&'static str> {
+    let mut calls = vec!["kill_tree"];
+    calls.extend(edge_awaited.then_some("wait_tree_drained"));
+    calls.push("reap");
+    calls
+}
+
+#[skuld::test]
+async fn an_exited_root_is_reaped_only_after_its_tree_is_killed() {
+    tokio::time::pause();
+    for (containment, edge_awaited) in CONTAINMENTS {
+        let mut tree = drained_tree(containment);
+        let status = end_plugin("p", &mut tree, finished_reader(), finished_reader()).await;
+
+        assert!(
+            status.unwrap().success(),
+            "{containment:?}: the reaped status is returned"
+        );
+        assert_eq!(tree.calls(), killed_then_reaped(edge_awaited), "{containment:?}");
+    }
+}
+
+#[skuld::test]
+async fn a_root_that_exits_within_its_grace_is_reaped_after_the_tree_kill() {
+    tokio::time::pause();
+    for (containment, edge_awaited) in CONTAINMENTS {
+        let mut tree = drained_tree(containment);
+        let grace = Duration::from_secs(5);
+        shut_plugin_down("p", &mut tree, grace, finished_reader(), finished_reader())
+            .await
+            .unwrap();
+
+        let mut expected = vec!["terminate", "wait_root_exit_within"];
+        expected.extend(killed_then_reaped(edge_awaited));
+        assert_eq!(tree.calls(), expected, "{containment:?}");
+    }
+}
+
+#[skuld::test]
+async fn a_root_that_outlives_its_shutdown_grace_is_killed_before_the_tree_sweep_and_the_reap() {
+    tokio::time::pause();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_outlives_grace = true;
+    shut_plugin_down(
+        "p",
+        &mut tree,
+        Duration::from_secs(5),
+        finished_reader(),
+        finished_reader(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        tree.calls(),
+        ["terminate", "wait_root_exit_within", "kill_root", "kill_tree", "reap"]
+    );
+}
+
+#[skuld::test]
+async fn a_shutdown_whose_grace_watch_fails_escalates_to_a_kill() {
+    tokio::time::pause();
+    let (subscriber, writer) = subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_watch_fails = true;
+    shut_plugin_down(
+        "watched",
+        &mut tree,
+        Duration::from_secs(5),
+        finished_reader(),
+        finished_reader(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        tree.calls(),
+        ["terminate", "wait_root_exit_within", "kill_root", "kill_tree", "reap"]
+    );
+    assert!(writer.snapshot().contains("watched"), "{}", writer.snapshot());
+}
+
+#[skuld::test]
+async fn a_shutdown_whose_terminate_fails_kills_nothing_and_reaps_nothing() {
+    tokio::time::pause();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.terminate_fails = true;
+    let result = shut_plugin_down(
+        "p",
+        &mut tree,
+        Duration::from_secs(5),
+        finished_reader(),
+        finished_reader(),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(tree.calls(), ["terminate"]);
 }
