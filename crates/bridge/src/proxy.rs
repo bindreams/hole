@@ -32,12 +32,11 @@ pub mod plugin;
 pub mod plugin_log;
 pub mod shadowsocks;
 
-pub use config::{build_ss_config, validate_proxy_config, KeyMaterialFault, ProxyError, TUN_SUBNET, TUN_SUBNET6};
+pub use config::{
+    build_ss_config, resolve_plugin_path_inner, validate_proxy_config, BundledPlugin, KeyMaterialFault,
+    PluginResolveError, ProxyError, TUN_SUBNET, TUN_SUBNET6,
+};
 pub use shadowsocks::{ShadowsocksProxy, ShadowsocksRunning};
-
-// Used by `server_test.rs` + `proxy_tests.rs`. Kept crate-private so
-// external consumers can't rely on it.
-pub(crate) use config::resolve_plugin_path_inner;
 
 // Trait surface =======================================================================================================
 

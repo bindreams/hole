@@ -13,6 +13,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use super::{run_server_test, TestConfig};
+use crate::proxy::PluginResolveError;
 use crate::test_support::port_alloc::wait_for_port;
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::PORT_ALLOC;
@@ -311,12 +312,11 @@ fn run_test_returns_server_cannot_reach_internet_when_sentinels_close_empty() {
     });
 }
 
-/// Test 9: plugin start failure for a non-existent plugin binary.
+/// Test 9: a plugin Hole does not ship is refused, not looked up.
 ///
 /// The runner asks for a plugin called `plugin-that-does-not-exist`, which
-/// is not on PATH and not next to any plugin directory. `Plugin::start`
-/// returns Err immediately, surfaced as
-/// [`ServerTestOutcome::PluginStartFailed`].
+/// Hole does not bundle. Resolution refuses it before any spawn, surfaced as
+/// [`ServerTestOutcome::PluginStartFailed`] naming the bundled plugins.
 #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_returns_plugin_start_failed_for_bad_plugin_path() {
     rt().block_on(async {
@@ -336,7 +336,10 @@ fn run_test_returns_plugin_start_failed_for_bad_plugin_path() {
         let outcome = run_server_test(&entry, &cfg).await;
         match outcome {
             ServerTestOutcome::PluginStartFailed { detail } => {
-                assert!(!detail.is_empty(), "detail should describe the failure");
+                assert!(
+                    detail.contains("plugin-that-does-not-exist") && detail.contains("Bundled plugins:"),
+                    "detail should name the plugin and list the bundled ones: {detail}"
+                );
             }
             other => panic!("expected PluginStartFailed, got {other:?}"),
         }
@@ -425,7 +428,10 @@ fn run_test_with_v2ray_plugin_happy_path() {
         // Generous plugin window for cold start. fast_test_config's 800 ms
         // SS/sentinel timeouts are too short for the WS handshake.
         let cfg = TestConfig {
-            plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
+            plugin_path_override: Some(crate::proxy::BundledPlugin::for_test(
+                "v2ray-plugin",
+                plugin_path.clone(),
+            )),
             // Generous SS connect/sentinel timeouts because the WS handshake
             // adds latency on top of the raw TCP connect.
             ss_connect_timeout: Duration::from_secs(5),
@@ -482,7 +488,10 @@ fn maybe_start_plugin_preserves_eih_identity_keys() {
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let cfg = TestConfig {
-            plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
+            plugin_path_override: Some(crate::proxy::BundledPlugin::for_test(
+                "v2ray-plugin",
+                plugin_path.clone(),
+            )),
             ..fast_test_config(sentinel_a, sentinel_b)
         };
 
@@ -887,8 +896,8 @@ fn run_test_reclassify_cannot_reach_reset_is_network_blocked() {
 }
 
 /// The plugin path runs the same IPv6 preflight before spawning the plugin. A
-/// live `[::1]:port` listener makes preflight pass; a bogus plugin name then
-/// fails at spawn → `PluginStartFailed`. Reaching plugin-start proves preflight
+/// live `[::1]:port` listener makes preflight pass; an unbundled plugin name then
+/// is refused at plugin start → `PluginStartFailed`. Reaching plugin-start proves preflight
 /// connected to the raw IPv6 IP rather than failing `DnsFailed` on the bracket.
 #[skuld::test]
 fn plugin_preflight_uses_raw_ipv6_not_bracketed_host() {
@@ -905,11 +914,97 @@ fn plugin_preflight_uses_raw_ipv6_not_bracketed_host() {
         let outcome = run_server_test(&entry, &cfg).await;
         match outcome {
             ServerTestOutcome::PluginStartFailed { detail } => {
-                assert!(!detail.is_empty(), "detail should describe the failure");
+                assert_eq!(
+                    detail,
+                    PluginResolveError::NotBundled {
+                        name: "plugin-that-does-not-exist".into()
+                    }
+                    .to_string()
+                );
             }
-            other => panic!("plugin preflight must pass on raw IPv6 then fail at spawn, got {other:?}"),
+            other => panic!("plugin preflight must pass on raw IPv6 then fail at plugin start, got {other:?}"),
         }
     });
+}
+
+// A refused plugin start leaves a record in the bridge log ------------------------------------------------------------
+//
+// The privileged bridge's refusal (a damaged install, an unbundled name, bad
+// options) otherwise reaches only the GUI, so a bug report would carry no
+// bridge-side signal.
+
+/// Run `maybe_start_plugin` for `entry` under a WARN-capturing subscriber.
+/// Returns the failure detail and everything logged.
+fn plugin_start_refusal_and_log(entry: &ServerEntry, cfg: &TestConfig) -> (String, String) {
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let mut svr_cfg = super::build_server_config(entry, "127.0.0.1".parse().unwrap()).expect("a plain entry builds");
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    // Current-thread runtime: `set_default_in_current_thread` is thread-local.
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+            super::maybe_start_plugin(
+                entry,
+                &mut svr_cfg,
+                "127.0.0.1",
+                cfg,
+                crate::dns::ech::PinSource::NoQueryNeeded,
+            )
+            .await
+        });
+    match outcome {
+        Err(ServerTestOutcome::PluginStartFailed { detail }) => (detail, writer.snapshot_string()),
+        Err(other) => panic!("expected PluginStartFailed, got {other:?}"),
+        Ok(_) => panic!("the plugin start must be refused"),
+    }
+}
+
+#[skuld::test]
+fn a_refused_plugin_resolution_is_logged() {
+    let mut entry = entry("127.0.0.1", 8388, TEST_METHOD_STR, TEST_PASSWORD);
+    entry.plugin = Some("kcptun".into());
+    let cfg = preflight_only_config();
+
+    let (detail, log) = plugin_start_refusal_and_log(&entry, &cfg);
+
+    assert!(
+        log.contains(&detail),
+        "the refusal must reach the bridge log; got:\n{log}"
+    );
+}
+
+#[skuld::test]
+fn a_failed_plugin_chain_start_is_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut entry = entry("127.0.0.1", 8388, TEST_METHOD_STR, TEST_PASSWORD);
+    entry.plugin = Some("v2ray-plugin".into());
+    // Options the SIP003 parser rejects: the chain refuses before spawning.
+    entry.plugin_opts = Some(r"path=/a\".into());
+    let cfg = TestConfig {
+        plugin_path_override: Some(crate::proxy::BundledPlugin::for_test(
+            "v2ray-plugin",
+            dir.path().join("ex-ray"),
+        )),
+        ..preflight_only_config()
+    };
+
+    let (detail, log) = plugin_start_refusal_and_log(&entry, &cfg);
+
+    assert!(
+        log.contains(&detail),
+        "the refusal must reach the bridge log; got:\n{log}"
+    );
 }
 
 /// A `Reachable` outcome is not one a block can masquerade as: the probe must

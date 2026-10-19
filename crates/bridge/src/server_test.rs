@@ -7,7 +7,7 @@
 //! reports a granular per-phase outcome. Concurrent calls are safe — each
 //! gets its own plugin process and its own [`ProxyClientStream`].
 
-use crate::proxy::resolve_plugin_path_inner;
+use crate::proxy::{resolve_plugin_path_inner, BundledPlugin};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::{ServerTestOutcome, LATENCY_VALIDATED_ON_CONNECT};
 use shadowsocks::config::{ServerAddr, ServerConfig, ServerType};
@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const HEAD_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
 
@@ -45,11 +45,11 @@ pub struct TestConfig {
     pub sentinel_read_timeout: Duration,
     /// Two sentinel `host:port` strings (the second is the fallback).
     pub sentinels: [String; 2],
-    /// Optional override for the plugin path. `None` → use
+    /// Optional override for the plugin. `None` → use
     /// [`resolve_plugin_path_inner`]. Tests use this to point at a specific
     /// on-disk plugin binary (the xtask-built `ex-ray`, or a provisioned
-    /// upstream v2ray-plugin) without depending on `PATH`.
-    pub plugin_path_override: Option<String>,
+    /// upstream v2ray-plugin).
+    pub plugin_path_override: Option<BundledPlugin>,
     /// User's resolver config for the private-DoH server bootstrap.
     pub dns: hole_common::config::DnsConfig,
     /// Test-only DoH querier override. When present, `run_server_test` resolves
@@ -356,10 +356,18 @@ async fn maybe_start_plugin(
         return Ok(None);
     };
 
-    let plugin_path = cfg
-        .plugin_path_override
-        .clone()
-        .unwrap_or_else(|| resolve_plugin_path_inner(plugin_name, std::env::current_exe().ok()));
+    let plugin = match cfg.plugin_path_override.clone() {
+        Some(plugin) => plugin,
+        None => resolve_plugin_path_inner(plugin_name, std::env::current_exe().ok()).map_err(|e| {
+            warn!(error = %e, "server test: plugin refused");
+            ServerTestOutcome::PluginStartFailed { detail: e.to_string() }
+        })?,
+    };
+    debug_assert_eq!(
+        plugin.descriptor().name,
+        plugin_name,
+        "the override must be the entry's plugin"
+    );
 
     // Hand the chain the DoH-resolved bracket-safe host (not the entry's
     // unresolved hostname), so garter recombines a valid `host:port`.
@@ -387,8 +395,7 @@ async fn maybe_start_plugin(
     let ech_doh = crate::dns::ech::ech_doh_url(&cfg.dns, pin);
     debug!(ech_doh = ?ech_doh, ?pin, "ech-doh source");
     let chain = crate::proxy::plugin::start_plugin_chain(
-        plugin_name,
-        &plugin_path,
+        &plugin,
         entry.plugin_opts.as_deref(),
         server_host,
         server_port,
@@ -399,7 +406,10 @@ async fn maybe_start_plugin(
         ech_doh.as_ref(),
     )
     .await
-    .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;
+    .map_err(|e| {
+        warn!(error = %e, "server test: plugin chain failed to start");
+        ServerTestOutcome::PluginStartFailed { detail: e.to_string() }
+    })?;
 
     // Override the server address to point at the plugin's local port. Uses
     // `set_addr`, not a rebuilt `ServerConfig::new`: for an AEAD-2022 EIH

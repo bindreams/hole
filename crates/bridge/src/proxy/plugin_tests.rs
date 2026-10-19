@@ -8,14 +8,20 @@ use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 
 use super::{proxy_err_to_io_err, start_plugin_chain};
+use crate::proxy::config::BundledPlugin;
 use crate::proxy::ProxyError;
+
+/// An absolute path that exists nowhere: a fresh temp dir, never created files.
+fn absent_plugin() -> BundledPlugin {
+    let dir = tempfile::tempdir().unwrap();
+    BundledPlugin::for_test("v2ray-plugin", dir.path().join("absent-binary"))
+}
 
 #[skuld::test]
 async fn start_with_nonexistent_binary_returns_plugin_error() {
     let cancel = CancellationToken::new();
     let result = start_plugin_chain(
-        "v2ray-plugin",
-        "/nonexistent/binary",
+        &absent_plugin(),
         None,
         "127.0.0.1",
         12345,
@@ -125,6 +131,7 @@ mod identity {
             crate::proxy::plugin_log::PluginLog::new(),
             CancellationToken::new(),
             Some(dir.to_path_buf()),
+            std::path::PathBuf::from("unused"),
         )
     }
 
