@@ -65,8 +65,14 @@ def _make_wix_layout(cache_dir: Path, version: str, minor: str, wixext: str) -> 
     wix_exe.write_text("")
 
     dll = (
-        cache_root / "CFiles64" / "WixToolset" / "extensions" / "WixToolset.UI.wixext" / version / wixext /
-        "WixToolset.UI.wixext.dll"
+        cache_root
+        / "CFiles64"
+        / "WixToolset"
+        / "extensions"
+        / "WixToolset.UI.wixext"
+        / version
+        / wixext
+        / "WixToolset.UI.wixext.dll"
     )
     dll.parent.mkdir(parents=True)
     dll.write_text("")

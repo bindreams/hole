@@ -10,6 +10,7 @@ Run with admin/root privileges:
   macOS:   sudo python3 scripts/network-reset.py
   Windows: run from an elevated PowerShell
 """
+
 # /// script
 # requires-python = ">=3.9"
 # ///
@@ -339,16 +340,14 @@ def reset_windows(state: dict | None) -> None:
             run([
                 "powershell",
                 "-Command",
-                f'Remove-NetRoute -DestinationPrefix "{server_ip}/128" '
-                f'-Confirm:$false -ErrorAction SilentlyContinue',
+                f'Remove-NetRoute -DestinationPrefix "{server_ip}/128" -Confirm:$false -ErrorAction SilentlyContinue',
             ])
         elif server_ip:
             print(f"Removing IPv4 bypass route for {server_ip}...")
             run([
                 "powershell",
                 "-Command",
-                f'Remove-NetRoute -DestinationPrefix "{server_ip}/32" '
-                f'-Confirm:$false -ErrorAction SilentlyContinue',
+                f'Remove-NetRoute -DestinationPrefix "{server_ip}/32" -Confirm:$false -ErrorAction SilentlyContinue',
             ])
     else:
         print(

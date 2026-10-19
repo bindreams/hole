@@ -1,0 +1,5 @@
+line-length = 120
+
+[format]
+# Preview keeps hugged/coalesced brackets; the stable style splits them.
+preview = true

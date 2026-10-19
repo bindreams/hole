@@ -221,9 +221,8 @@ jobs:
       # dev-console, xtask, xtask-lib, payload-archive; #454), archived once and
       # run by the three steps below. These run first, before anything writes
       # outside gitignored paths, so tooling's git/prek tests see a clean tree.
-      # `--features garter/test-utils` builds garter's feature-gated test-utils
-      # targets (tap_integration) into the archive; the mock-plugin fixture bin
-      # is ungated and always archived (crates/garter/tests/common/mod.rs).
+      # The mock-plugin fixture bin is ungated and always archived
+      # (crates/garter/tests/common/mod.rs).
       # `df` records disk use per phase: one VM holds the debug workspace,
       # this archive and the release builds.
       - id: archive
@@ -233,7 +232,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p ci-artifacts
-          cargo nextest archive -p garter -p garter-bin -p galoshes -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p util --features garter/test-utils --archive-file ci-artifacts/tests.tar.zst
+          cargo nextest archive -p garter -p garter-bin -p galoshes -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p util --archive-file ci-artifacts/tests.tar.zst
           df -h .
 
       # `cargo nextest run --archive-file` refuses `-p`; the archive's package

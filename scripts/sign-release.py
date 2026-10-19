@@ -117,8 +117,7 @@ def main() -> None:
         tmpdir = Path(tmpdir)
 
         subprocess.run(
-            ["gh", "release", "download", tag, "--repo", REPO, "--pattern", "SHA256SUMS", "--dir",
-             str(tmpdir)],
+            ["gh", "release", "download", tag, "--repo", REPO, "--pattern", "SHA256SUMS", "--dir", str(tmpdir)],
             check=True,
         )
 
@@ -136,8 +135,7 @@ def main() -> None:
             sys.exit(1)
 
         subprocess.run(
-            ["gh", "release", "upload", tag, "--repo", REPO,
-             str(minisig_path)],
+            ["gh", "release", "upload", tag, "--repo", REPO, str(minisig_path)],
             check=True,
         )
 

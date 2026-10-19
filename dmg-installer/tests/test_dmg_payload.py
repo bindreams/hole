@@ -118,7 +118,7 @@ def _embeds_version(data: bytes, version: bytes) -> bool:
     """
     pattern = rb"(?<![0-9.])" + re.escape(version) + rb"(?![0-9]|\.[0-9])"
     return any(
-        not (data[m.start() - 1:m.start()] == b"-" and data[m.end():m.end() + 1] == b"/")
+        not (data[m.start() - 1 : m.start()] == b"-" and data[m.end() : m.end() + 1] == b"/")
         for m in re.finditer(pattern, data)
     )
 

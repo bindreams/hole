@@ -61,8 +61,7 @@ def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
     """
     console.print(f"[bold]Staging installer files[/] to {stage_dir} (via cargo xtask stage)")
     result = subprocess.run(
-        ["cargo", "xtask", "stage", "--profile", "release", "--out-dir",
-         str(stage_dir)],
+        ["cargo", "xtask", "stage", "--profile", "release", "--out-dir", str(stage_dir)],
         cwd=root,
     )
     if result.returncode != 0:
@@ -269,8 +268,14 @@ def ui_extension_path(wix_exe: Path) -> Path:
     version = cache_root.name.removeprefix("wix-v")
     major = version.split(".", 1)[0]
     dll = (
-        cache_root / "CFiles64" / "WixToolset" / "extensions" / "WixToolset.UI.wixext" / version / f"wixext{major}" /
-        "WixToolset.UI.wixext.dll"
+        cache_root
+        / "CFiles64"
+        / "WixToolset"
+        / "extensions"
+        / "WixToolset.UI.wixext"
+        / version
+        / f"wixext{major}"
+        / "WixToolset.UI.wixext.dll"
     )
     if not dll.exists():
         raise BuildError(f"WiX UI extension DLL not found at {dll}")
@@ -291,25 +296,27 @@ def wix_build(
     console: Console,
 ) -> None:
     console.print(f"[bold]Building MSI installer[/] (version {version})")
-    result = subprocess.run([
-        str(wix_exe),
-        "build",
-        str(wxs),
-        "-arch",
-        "x64",
-        "-ext",
-        str(ui_extension_path(wix_exe)),
-        "-bindpath",
-        f"BinDir={stage_dir}",
-        "-bindpath",
-        f"IconDir={icon_dir}",
-        "-bindpath",
-        f"LicenseDir={license_dir}",
-        "-d",
-        f"ProductVersion={version}",
-        "-o",
-        str(output),
-    ], )
+    result = subprocess.run(
+        [
+            str(wix_exe),
+            "build",
+            str(wxs),
+            "-arch",
+            "x64",
+            "-ext",
+            str(ui_extension_path(wix_exe)),
+            "-bindpath",
+            f"BinDir={stage_dir}",
+            "-bindpath",
+            f"IconDir={icon_dir}",
+            "-bindpath",
+            f"LicenseDir={license_dir}",
+            "-d",
+            f"ProductVersion={version}",
+            "-o",
+            str(output),
+        ],
+    )
     if result.returncode != 0:
         raise BuildError("wix build failed")
 

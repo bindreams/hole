@@ -102,10 +102,9 @@ def rebuild(indent: str, name: str, fill_char: str, prefix: str) -> str:
     return line + fill_char * fill_count
 
 
-def process_lines(lines: list[str],
-                  patterns: Patterns,
-                  prefix: str,
-                  is_dockerfile: bool = False) -> tuple[list[str], bool]:
+def process_lines(
+    lines: list[str], patterns: Patterns, prefix: str, is_dockerfile: bool = False
+) -> tuple[list[str], bool]:
     """Fix section comments in a list of lines. Returns (new_lines, changed)."""
     changed = False
     skip_next = False
@@ -124,7 +123,8 @@ def process_lines(lines: list[str],
             prev_line = new_lines[-1].rstrip("\r\n")
             name_m = patterns.name_half.match(prev_line)
             if (
-                name_m and not patterns.section.match(prev_line)
+                name_m
+                and not patterns.section.match(prev_line)
                 and not is_doc_comment(prev_line, prefix, is_dockerfile=is_dockerfile)
                 and name_m.group(2)  # has actual text after prefix
             ):
@@ -155,8 +155,10 @@ def process_lines(lines: list[str],
             if fill_m2:
                 name_m2 = patterns.name_half.match(line)
                 if (
-                    name_m2 and not patterns.section.match(line)
-                    and not is_doc_comment(line, prefix, is_dockerfile=is_dockerfile) and name_m2.group(2)
+                    name_m2
+                    and not patterns.section.match(line)
+                    and not is_doc_comment(line, prefix, is_dockerfile=is_dockerfile)
+                    and name_m2.group(2)
                 ):
                     indent = name_m2.group(1)
                     name = name_m2.group(2).rstrip()
@@ -624,8 +626,7 @@ def test_dockerfile_directive_whitespace_tolerant(tmp_path):
     p.write_text("#  syntax = docker/dockerfile:1\n# ==========\nFROM alpine\n")
     process_file(str(p))
     text = p.read_text()
-    assert text.startswith("#  syntax = docker/dockerfile:1\n"), \
-        f"whitespace-padded directive was modified: {text!r}"
+    assert text.startswith("#  syntax = docker/dockerfile:1\n"), f"whitespace-padded directive was modified: {text!r}"
 
 
 def test_process_file_containerfile(tmp_path):

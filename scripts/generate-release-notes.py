@@ -332,8 +332,7 @@ def render_notes(
     has_any = any(commits for commits in grouped.values())
     if not has_any:
         parts.append(
-            f"_No commits in this range touched files in this track. "
-            f"(Range: `{previous_tag}` → `{new_tag}`.)_"
+            f"_No commits in this range touched files in this track. (Range: `{previous_tag}` → `{new_tag}`.)_"
         )
     else:
         for title, commits in grouped.items():
@@ -485,6 +484,7 @@ def test_platform_label_known_pairs():
 
 def test_platform_label_unknown_pair_raises():
     import pytest
+
     with pytest.raises(KeyError):
         platform_label("freebsd", "amd64")
 
@@ -502,8 +502,8 @@ def test_parse_platforms_reads_matrix_json():
 
 def test_asset_filename_with_explicit_ext():
     assert (
-        asset_filename("hole", "0.4.0", Platform(os="windows", arch="amd64",
-                                                 ext="msi")) == "hole-0.4.0-windows-amd64.msi"
+        asset_filename("hole", "0.4.0", Platform(os="windows", arch="amd64", ext="msi"))
+        == "hole-0.4.0-windows-amd64.msi"
     )
     assert (
         asset_filename("hole", "0.4.0", Platform(os="darwin", arch="arm64", ext="dmg")) == "hole-0.4.0-darwin-arm64.dmg"
@@ -512,19 +512,19 @@ def test_asset_filename_with_explicit_ext():
 
 def test_asset_filename_raw_binary_windows_gets_exe():
     assert (
-        asset_filename("galoshes", "0.1.0", Platform(os="windows", arch="amd64",
-                                                     ext=None)) == "galoshes-0.1.0-windows-amd64.exe"
+        asset_filename("galoshes", "0.1.0", Platform(os="windows", arch="amd64", ext=None))
+        == "galoshes-0.1.0-windows-amd64.exe"
     )
 
 
 def test_asset_filename_raw_binary_unix_no_ext():
     assert (
-        asset_filename("galoshes", "0.1.0", Platform(os="darwin", arch="arm64",
-                                                     ext=None)) == "galoshes-0.1.0-darwin-arm64"
+        asset_filename("galoshes", "0.1.0", Platform(os="darwin", arch="arm64", ext=None))
+        == "galoshes-0.1.0-darwin-arm64"
     )
     assert (
-        asset_filename("galoshes", "0.1.0", Platform(os="linux", arch="amd64",
-                                                     ext=None)) == "galoshes-0.1.0-linux-amd64"
+        asset_filename("galoshes", "0.1.0", Platform(os="linux", arch="amd64", ext=None))
+        == "galoshes-0.1.0-linux-amd64"
     )
 
 
@@ -682,14 +682,14 @@ def test_integration_filtering_against_real_history():
     """
     import shutil
     import pytest
+
     if shutil.which("uv") is None:
         pytest.fail("uv not on PATH; CI must provision it (CLAUDE.md coding-style rule).")
     repo_root = Path(__file__).resolve().parent.parent
     prev_tag = find_previous_tag(repo_root, "ex-ray", "HEAD")
     if prev_tag is None:
         pytest.fail(
-            "No releases/ex-ray/v* ancestor of HEAD; CI must "
-            "fetch tags (fetch-depth: 0 or `git fetch --tags`)."
+            "No releases/ex-ray/v* ancestor of HEAD; CI must fetch tags (fetch-depth: 0 or `git fetch --tags`)."
         )
 
     script = repo_root / "scripts" / "generate-release-notes.py"
@@ -782,8 +782,7 @@ def test_integration_filtering_against_real_history():
             f"the test's bullet no longer matches how the generator renders one"
         )
         assert bullet not in out.splitlines(), (
-            f"ex-ray notes contain hole-only commit {sha[:8]}; include-path filtering may be broken. "
-            f"Subject: {subject}"
+            f"ex-ray notes contain hole-only commit {sha[:8]}; include-path filtering may be broken. Subject: {subject}"
         )
         return
     # No qualifying hole-only commit in range. Common; not a failure.
@@ -796,8 +795,9 @@ def test_shared_categories_file_loaded():
     expected_titles = [c["title"] for c in shared["categories"]]
     for track in ["hole", "galoshes", "garter", "ex-ray"]:
         config = load_config(repo_root, track)
-        assert [c.title
-                for c in config.categories] == expected_titles, (f"Track {track} categories don't match shared file")
+        assert [c.title for c in config.categories] == expected_titles, (
+            f"Track {track} categories don't match shared file"
+        )
 
 
 def test_per_track_configs_dont_duplicate_categories():
@@ -867,9 +867,7 @@ def _init_release_config(repo: Path, track: str) -> None:
     github_dir = repo / ".github"
     github_dir.mkdir(exist_ok=True)
     (github_dir / f"release-{track}.yaml").write_text(
-        "initial_release: |\n"
-        f"  Initial release of the `{track}` track.\n"
-        'include_paths:\n  - "**"\n'
+        f'initial_release: |\n  Initial release of the `{track}` track.\ninclude_paths:\n  - "**"\n'
     )
     (github_dir / "release-categories.yaml").write_text("categories:\n  - title: Other\n    types: []\n")
 

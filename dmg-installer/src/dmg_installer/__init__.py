@@ -34,7 +34,6 @@ def find_built_dmg(repo_root: Path) -> Path:
         raise DmgTestError(f"no .dmg found in {bundle_dir}; run `cargo xtask build hole-dmg` first")
     if len(matches) > 1:
         raise DmgTestError(
-            f"multiple .dmg files in {bundle_dir}: {[p.name for p in matches]}; "
-            "remove stale ones before running tests"
+            f"multiple .dmg files in {bundle_dir}: {[p.name for p in matches]}; remove stale ones before running tests"
         )
     return matches[0]
