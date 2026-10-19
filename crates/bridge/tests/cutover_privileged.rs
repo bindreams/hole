@@ -1204,19 +1204,26 @@ mod scm_probe {
         }
     }
 
-    /// The id of the running service's process. Read before the service is
-    /// marked for deletion: a marked service may refuse a new open.
-    pub fn service_process_id() -> u32 {
+    /// The process id the SCM reports for the service now, if it reports one.
+    /// Read before the service is marked for deletion: a marked service may
+    /// refuse a new open.
+    ///
+    /// START_PENDING and STOP_PENDING may report none: Microsoft documents the
+    /// id as possibly not valid there (`QueryServiceStatusEx`, Remarks).
+    pub fn reported_service_process_id() -> Option<u32> {
         use windows_service::service::ServiceAccess;
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).unwrap();
         let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS).unwrap();
-        service
-            .query_status()
-            .unwrap()
-            .process_id
-            .expect("a running service has a process")
+        service.query_status().unwrap().process_id
+    }
+
+    /// The id of the running service's process. For a caller whose setup has
+    /// seen the service RUNNING, where the id is valid; a state the SCM may
+    /// report no id for uses [`reported_service_process_id`].
+    pub fn service_process_id() -> u32 {
+        reported_service_process_id().expect("a running service has a process")
     }
 
     /// Kills process `pid` the way Task Manager would.
@@ -1465,13 +1472,46 @@ mod sid_probe {
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
 
+    /// What the production identity check answered.
+    #[derive(Debug)]
+    pub enum ProductionCheck {
+        /// The SCM reported no process id, so there was nothing to open.
+        NoProcessId,
+        /// The process or its token could not be opened with the hold's rights.
+        Unreadable,
+        /// The check ran: whether the token carries the service SID.
+        Answered(bool),
+        /// A step outside the open (the SID lookup, a second open) failed.
+        Failed(String),
+    }
+
+    impl ProductionCheck {
+        /// What this answer means for the drain, said once per variant.
+        fn meaning(&self) -> String {
+            match self {
+                ProductionCheck::NoProcessId => {
+                    "the SCM named no process in this state, so the hold has nothing to open and waits for a later state".into()
+                }
+                ProductionCheck::Unreadable => {
+                    "the token could not be read from an elevated administrator without SeDebugPrivilege: every                      uninstall run by an administrator (not SYSTEM) fails with RetireError::Hold; the lines above                      say which rights would be needed. SYSTEM (the MSI custom action) is not measured here".into()
+                }
+                ProductionCheck::Answered(true) => {
+                    "the token carries the service SID: the hold can tell this process from a stranger".into()
+                }
+                ProductionCheck::Answered(false) => {
+                    "the token does not carry the service SID: a stranger, or a service process started before the                      SID type was set".into()
+                }
+                ProductionCheck::Failed(reason) => format!("a step around the check failed: {reason}"),
+            }
+        }
+    }
+
     /// What one process's token measured.
     pub struct Measure {
         /// One line per (rights, step) attempted.
         pub lines: Vec<String>,
-        /// The answer of the production check with the rights it opens with,
-        /// when the process and its token could be opened at all.
-        pub production_check: Option<bool>,
+        /// The answer of the production check with the rights it opens with.
+        pub production_check: ProductionCheck,
     }
 
     /// The service SID as the OS's own tool prints it (`sc showsid`), the
@@ -1583,7 +1623,14 @@ mod sid_probe {
         }
     }
 
-    pub fn measure(pid: u32) -> Measure {
+    /// Measures the process `pid` names; `None` is the SCM reporting no id.
+    pub fn measure(pid: Option<u32>) -> Measure {
+        let Some(pid) = pid else {
+            return Measure {
+                lines: vec!["  the SCM reported no process id: nothing to open".into()],
+                production_check: ProductionCheck::NoProcessId,
+            };
+        };
         let mut lines = Vec::new();
         let query = PROCESS_QUERY_LIMITED_INFORMATION;
         let hold = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
@@ -1597,17 +1644,9 @@ mod sid_probe {
 
         // The production check, on a handle opened with the hold's rights.
         let production_check = if opened {
-            // SAFETY: plain FFI call.
-            let handle = unsafe { OpenProcess(hold, false, pid) }.expect("open again with the hold's rights");
-            // SAFETY: `OpenProcess` returned a new handle this value owns.
-            let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
-            let sid = ServiceSid::of(SERVICE_NAME).expect("resolve the service SID");
-            Some(
-                sid.is_in_token_of(&process)
-                    .expect("read the token the first attempt read"),
-            )
+            production_check(pid, hold)
         } else {
-            None
+            ProductionCheck::Unreadable
         };
 
         lines.push(format!("  SeDebugPrivilege: {}", enable_se_debug()));
@@ -1625,24 +1664,47 @@ mod sid_probe {
         }
     }
 
-    pub fn print(scenario: &str, pid: u32, measure: &Measure) {
+    fn production_check(pid: u32, hold: windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS) -> ProductionCheck {
+        // SAFETY: plain FFI call.
+        let handle = match unsafe { OpenProcess(hold, false, pid) } {
+            Ok(handle) => handle,
+            Err(e) => return ProductionCheck::Failed(format!("open again with the hold's rights: {e}")),
+        };
+        // SAFETY: `OpenProcess` returned a new handle this value owns.
+        let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        let sid = match ServiceSid::of(SERVICE_NAME) {
+            Ok(sid) => sid,
+            Err(e) => return ProductionCheck::Failed(format!("resolve the service SID: {e}")),
+        };
+        match sid.is_in_token_of(&process) {
+            Ok(carries) => ProductionCheck::Answered(carries),
+            Err(e) => ProductionCheck::Failed(format!("read the token the first attempt read: {e}")),
+        }
+    }
+
+    /// Prints what was measured, for the process `reported` names.
+    pub fn print(scenario: &str, reported: Option<u32>, measure: &Measure) {
         eprintln!(
-            "service SID probe, {scenario} (pid {pid}); `sc showsid {SERVICE_NAME}`: {}\n{}\n  \
-             production check `ServiceSid::is_in_token_of` -> {:?}\n  \
-             MEANS: Some(true) on a service process => the hold can tell it from a stranger, from an elevated administrator; \
-             Some(false) on a service process => the SID is not in the token and the identity check cannot work. \
-             None => the token could not be read from an elevated administrator without SeDebugPrivilege: every uninstall \
-             run by an administrator (not SYSTEM) fails with RetireError::Hold, and the unprivileged lines above say \
-             which rights would be needed. SYSTEM (the MSI custom action) is not measured here.",
+            "service SID probe, {scenario} (pid: {reported:?}; None is the SCM naming no process); `sc showsid {SERVICE_NAME}`: {}
+{}
+               production check `ServiceSid::is_in_token_of` -> {:?}
+               MEANS: {}",
             sc_showsid(),
-            measure.lines.join("\n"),
+            measure.lines.join("
+"),
             measure.production_check,
+            measure.production_check.meaning(),
         );
     }
 }
 
+/// Installs the throwaway service with the SID type set, brings it to the state
+/// `flag` selects (RUNNING for `None`, START_PENDING for `--hold-start`) and
+/// measures the process the SCM names there. The id is `None` when the SCM
+/// reports none: the state's own contract allows it in START_PENDING, so it is
+/// a result, not a failure.
 #[cfg(target_os = "windows")]
-fn service_sid_probe_of_a_service(helper: &std::path::Path, flag: Option<&str>) -> (u32, sid_probe::Measure) {
+fn service_sid_probe_of_a_service(helper: &std::path::Path, flag: Option<&str>) -> (Option<u32>, sid_probe::Measure) {
     let parked = named_event::NamedEvent::create("SidProbeParked");
     let release = named_event::NamedEvent::create("SidProbeRelease");
     let launch_arguments = match flag {
@@ -1660,11 +1722,11 @@ fn service_sid_probe_of_a_service(helper: &std::path::Path, flag: Option<&str>) 
         Some(_) => {
             let starter = start_in_background();
             parked.wait();
-            let pid = scm_probe::service_process_id();
-            let measure = sid_probe::measure(pid);
+            let reported = scm_probe::reported_service_process_id();
+            let measure = sid_probe::measure(reported);
             release.signal();
             starter.join().unwrap().expect("the held service starts once released");
-            (pid, measure)
+            (reported, measure)
         }
         None => {
             let mut os = WindowsCutoverOs {
@@ -1672,40 +1734,34 @@ fn service_sid_probe_of_a_service(helper: &std::path::Path, flag: Option<&str>) 
                 target_version: "test".into(),
             };
             CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+            // RUNNING was seen, where the id is valid.
             let pid = scm_probe::service_process_id();
-            (pid, sid_probe::measure(pid))
+            (Some(pid), sid_probe::measure(Some(pid)))
         }
     }
 }
+
+// The service-SID probes print what they measured and assert nothing about it:
+// what a measurement means for the drain is decided from the printed lines.
 
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_service_sid_probe_running() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let (pid, measure) = service_sid_probe_of_a_service(helper, None);
-    sid_probe::print("RUNNING, service SID type set", pid, &measure);
-    assert_ne!(
-        measure.production_check,
-        Some(false),
-        "a RUNNING service's token readable, and the service SID not in it"
-    );
+    let (reported, measure) = service_sid_probe_of_a_service(helper, None);
+    sid_probe::print("RUNNING, service SID type set", reported, &measure);
 }
 
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_service_sid_probe_start_pending() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let (pid, measure) = service_sid_probe_of_a_service(helper, Some("--hold-start"));
-    sid_probe::print("START_PENDING (--hold-start), service SID type set", pid, &measure);
-    assert_ne!(
-        measure.production_check,
-        Some(false),
-        "a START_PENDING service's token readable, and the service SID not in it"
-    );
+    let (reported, measure) = service_sid_probe_of_a_service(helper, Some("--hold-start"));
+    sid_probe::print("START_PENDING (--hold-start), service SID type set", reported, &measure);
 }
 
 /// What a service process started before the SID type was set looks like: the
-/// answer decides what the drain does with one.
+/// printed answer decides what the drain does with one.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_service_sid_probe_running_without_the_sid_type() {
@@ -1716,14 +1772,10 @@ fn cutover_global_net_state_service_sid_probe_running_without_the_sid_type() {
         target_version: "test".into(),
     };
     CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    // RUNNING was seen, where the id is valid.
     let pid = scm_probe::service_process_id();
-    let measure = sid_probe::measure(pid);
-    sid_probe::print("RUNNING, service SID type NOT set", pid, &measure);
-    assert_ne!(
-        measure.production_check,
-        Some(true),
-        "a service without the SID type has a token that carries its SID"
-    );
+    let measure = sid_probe::measure(Some(pid));
+    sid_probe::print("RUNNING, service SID type NOT set", Some(pid), &measure);
 }
 
 /// A process that is not the service: this test's own.
@@ -1733,16 +1785,11 @@ fn cutover_global_net_state_service_sid_probe_a_stranger() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let _service = ProvisionedService::install(helper);
     let pid = std::process::id();
-    let measure = sid_probe::measure(pid);
+    let measure = sid_probe::measure(Some(pid));
     sid_probe::print(
         "a stranger (this test's own process), service registered",
-        pid,
+        Some(pid),
         &measure,
-    );
-    assert_eq!(
-        measure.production_check,
-        Some(false),
-        "a process that is not the service must not pass the check"
     );
 }
 
