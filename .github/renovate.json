@@ -32,6 +32,14 @@
     },
     {
       "customType": "regex",
+      "managerFilePatterns": ["/^prek\\.toml$/"],
+      "matchStrings": [
+        "repo\\s*=\\s*\"https://github\\.com/(?<depName>[^/\"]+/[^/\"]+?)(?:\\.git)?\"\\s*\\n\\s*rev\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "github-tags"
+    },
+    {
+      "customType": "regex",
       "managerFilePatterns": ["/^crates/ex-ray/third_party/[^/]+/\\.gitrepo$/"],
       "matchStrings": [
         "remote\\s*=\\s*https://github\\.com/(?<packageName>[^/\\s]+/[^/\\s]+)\\n\\tbranch\\s*=\\s*(?<currentValue>\\S+)"
