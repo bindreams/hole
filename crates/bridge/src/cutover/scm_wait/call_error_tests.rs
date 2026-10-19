@@ -53,6 +53,9 @@ fn each_call_has_its_win32_name() {
         (ScmCall::DeleteService, "DeleteService"),
         (ScmCall::QueryServiceStatusEx, "QueryServiceStatusEx"),
         (ScmCall::OpenProcess, "OpenProcess"),
+        (ScmCall::OpenProcessToken, "OpenProcessToken"),
+        (ScmCall::GetTokenInformation, "GetTokenInformation"),
+        (ScmCall::LookupAccountName, "LookupAccountName"),
         (ScmCall::WaitForSingleObject, "WaitForSingleObject"),
         (ScmCall::CreateService, "CreateService"),
         (ScmCall::StartServiceCtrlDispatcher, "StartServiceCtrlDispatcher"),
@@ -133,9 +136,11 @@ fn a_failure_without_a_win32_code_still_names_its_call() {
     assert!(message.contains("no code"), "{message}");
 }
 
-/// Written from the calls themselves: only `OpenProcess` opens a process.
+/// Written from the calls themselves: opening a process, and opening and
+/// reading its token to prove whose it is, are the two reads of the process
+/// itself. Resolving the service's SID reads no process.
 #[skuld::test]
-fn only_opening_the_process_is_opening_the_service_process() {
+fn only_opening_and_identifying_the_process_is_opening_the_service_process() {
     let others = [
         ScmCall::OpenScManager,
         ScmCall::OpenService,
@@ -148,8 +153,11 @@ fn only_opening_the_process_is_opening_the_service_process() {
         ScmCall::WaitForSingleObject,
         ScmCall::CreateService,
         ScmCall::StartServiceCtrlDispatcher,
+        ScmCall::LookupAccountName,
     ];
     assert!(ScmCall::OpenProcess.is_opening_the_service_process());
+    assert!(ScmCall::OpenProcessToken.is_opening_the_service_process());
+    assert!(ScmCall::GetTokenInformation.is_opening_the_service_process());
     for call in others {
         assert!(!call.is_opening_the_service_process(), "{call:?}");
     }

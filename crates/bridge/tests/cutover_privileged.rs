@@ -209,6 +209,23 @@ impl ProvisionedService {
         launch_arguments: Vec<std::ffi::OsString>,
         restart_after: Option<std::time::Duration>,
     ) -> Self {
+        Self::create(helper, launch_arguments, restart_after, true)
+    }
+
+    /// `install`, but the service never gets a service SID: its process is what
+    /// a service started by a version that predates the SID looks like.
+    fn install_without_sid(helper: &std::path::Path) -> Self {
+        Self::create(helper, vec![], None, false)
+    }
+
+    /// The service as `install` registers it, with the service SID (what
+    /// `hole bridge install` sets) unless `with_sid` is false.
+    fn create(
+        helper: &std::path::Path,
+        launch_arguments: Vec<std::ffi::OsString>,
+        restart_after: Option<std::time::Duration>,
+        with_sid: bool,
+    ) -> Self {
         use hole_bridge::platform::os::SERVICE_NAME;
         use windows_service::service::{
             ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
@@ -247,6 +264,9 @@ impl ProvisionedService {
                     | ServiceAccess::CHANGE_CONFIG,
             )
             .expect("create the throwaway HoleBridge service");
+        if with_sid {
+            hole_bridge::platform::os::apply_service_sid(&service).expect("give the throwaway service a service SID");
+        }
         if let Some(delay) = restart_after {
             service
                 .update_failure_actions(ServiceFailureActions {
@@ -1414,6 +1434,315 @@ fn cutover_global_net_state_stop_probe_start_pending_before_attach() {
     stop_probe::print(
         "START_PENDING, process not attached",
         &stop_probe::held_start_pending(helper, "--delay-attach"),
+    );
+}
+
+/// The service-SID probe (bindreams/hole#1099): whether the token of a process
+/// carries the `NT SERVICE\HoleBridge` SID, and with which access rights the
+/// token can be read at all. These are the facts `ProcessHolds::hold_current`'s
+/// identity check rests on (`ServiceSid::is_in_token_of`), printed so a run
+/// states them instead of the code assuming them.
+///
+/// The caller is an elevated administrator, which `create_service` needs.
+/// Production uninstall runs as LocalSystem (the MSI custom action), which owns
+/// the service process's token; a test cannot be LocalSystem without a second
+/// SYSTEM process, so what a SYSTEM caller may open is NOT measured here. What
+/// is measured is the harder case: an administrator that is not the token's
+/// owner, first as it is and then with `SeDebugPrivilege` enabled.
+#[cfg(target_os = "windows")]
+mod sid_probe {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    use hole_bridge::platform::os::{ServiceSid, SERVICE_NAME};
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenGroups, LUID_AND_ATTRIBUTES,
+        SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_GROUPS, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    /// What one process's token measured.
+    pub struct Measure {
+        /// One line per (rights, step) attempted.
+        pub lines: Vec<String>,
+        /// The answer of the production check with the rights it opens with,
+        /// when the process and its token could be opened at all.
+        pub production_check: Option<bool>,
+    }
+
+    /// The service SID as the OS's own tool prints it (`sc showsid`), the
+    /// expected value derived apart from the code under test.
+    pub fn sc_showsid() -> String {
+        let out = std::process::Command::new("sc.exe")
+            .args(["showsid", SERVICE_NAME])
+            .output()
+            .expect("run sc.exe showsid");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// Enables `SeDebugPrivilege` on this process's token; says what happened.
+    fn enable_se_debug() -> String {
+        let mut token = HANDLE::default();
+        // SAFETY: plain FFI calls on this process's own token, closed below.
+        unsafe {
+            if let Err(e) = OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) {
+                return format!("could not open own token: {e}");
+            }
+            let mut luid = Default::default();
+            if let Err(e) = LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid) {
+                let _ = CloseHandle(token);
+                return format!("could not look up SeDebugPrivilege: {e}");
+            }
+            let privileges = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            let adjusted = AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None);
+            // `AdjustTokenPrivileges` succeeds even when nothing was assigned;
+            // the last error says which.
+            let assigned = windows::Win32::Foundation::GetLastError();
+            let _ = CloseHandle(token);
+            match adjusted {
+                Err(e) => format!("AdjustTokenPrivileges failed: {e}"),
+                Ok(()) if assigned == windows::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED => {
+                    "not held by this token (ERROR_NOT_ALL_ASSIGNED)".into()
+                }
+                Ok(()) => "enabled".into(),
+            }
+        }
+    }
+
+    /// The groups of `process`'s token as SID strings, or the failing step.
+    fn token_groups(process: &OwnedHandle) -> Result<Vec<String>, String> {
+        let mut token = HANDLE::default();
+        // SAFETY: `process` is a live handle; `token` is an out-parameter.
+        unsafe { OpenProcessToken(HANDLE(process.as_raw_handle()), TOKEN_QUERY, &mut token) }
+            .map_err(|e| format!("OpenProcessToken(TOKEN_QUERY) -> Err {e}"))?;
+        // SAFETY: `OpenProcessToken` returned a new handle this value now owns.
+        let token = unsafe { OwnedHandle::from_raw_handle(token.0) };
+        let token = HANDLE(token.as_raw_handle());
+        let mut len = 0u32;
+        // SAFETY: the sizing call; its expected failure is ignored.
+        let _ = unsafe { GetTokenInformation(token, TokenGroups, None, 0, &mut len) };
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        // SAFETY: `buf` holds at least `len` bytes.
+        unsafe { GetTokenInformation(token, TokenGroups, Some(buf.as_mut_ptr().cast()), len, &mut len) }
+            .map_err(|e| format!("GetTokenInformation(TokenGroups) -> Err {e}"))?;
+        // SAFETY: on success `buf` holds a `TOKEN_GROUPS` and its entries.
+        let groups = unsafe {
+            let groups = &*buf.as_ptr().cast::<TOKEN_GROUPS>();
+            std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
+        };
+        let mut names = Vec::new();
+        for group in groups {
+            let mut raw = PWSTR::null();
+            // SAFETY: the group's SID is valid inside `buf`; `raw` is freed below.
+            unsafe { ConvertSidToStringSidW(group.Sid, &mut raw) }
+                .map_err(|e| format!("ConvertSidToStringSidW: {e}"))?;
+            // SAFETY: `raw` is a NUL-terminated string owned until `LocalFree`.
+            names.push(unsafe { raw.to_string() }.unwrap_or_default());
+            // SAFETY: `raw` came from `LocalAlloc` inside the conversion.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(raw.0.cast())));
+            }
+        }
+        Ok(names)
+    }
+
+    fn attempt(
+        pid: u32,
+        label: &str,
+        rights: windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS,
+    ) -> (String, bool) {
+        // SAFETY: plain FFI call.
+        let process = match unsafe { OpenProcess(rights, false, pid) } {
+            Ok(handle) => {
+                // SAFETY: `OpenProcess` returned a new handle this value owns.
+                unsafe { OwnedHandle::from_raw_handle(handle.0) }
+            }
+            Err(e) => return (format!("  {label}: OpenProcess -> Err {e}"), false),
+        };
+        match token_groups(&process) {
+            Ok(groups) => (
+                format!("  {label}: OpenProcess -> Ok; token groups: {}", groups.join(", ")),
+                true,
+            ),
+            Err(step) => (format!("  {label}: OpenProcess -> Ok; {step}"), false),
+        }
+    }
+
+    pub fn measure(pid: u32) -> Measure {
+        let mut lines = Vec::new();
+        let query = PROCESS_QUERY_LIMITED_INFORMATION;
+        let hold = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+        lines.push(attempt(pid, "PROCESS_QUERY_LIMITED_INFORMATION", query).0);
+        let (line, opened) = attempt(
+            pid,
+            "PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION (what the hold opens)",
+            hold,
+        );
+        lines.push(line);
+
+        // The production check, on a handle opened with the hold's rights.
+        let production_check = if opened {
+            // SAFETY: plain FFI call.
+            let handle = unsafe { OpenProcess(hold, false, pid) }.expect("open again with the hold's rights");
+            // SAFETY: `OpenProcess` returned a new handle this value owns.
+            let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+            let sid = ServiceSid::of(SERVICE_NAME).expect("resolve the service SID");
+            Some(
+                sid.is_in_token_of(&process)
+                    .expect("read the token the first attempt read"),
+            )
+        } else {
+            None
+        };
+
+        lines.push(format!("  SeDebugPrivilege: {}", enable_se_debug()));
+        lines.push(
+            attempt(
+                pid,
+                "with SeDebugPrivilege, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION",
+                hold,
+            )
+            .0,
+        );
+        Measure {
+            lines,
+            production_check,
+        }
+    }
+
+    pub fn print(scenario: &str, pid: u32, measure: &Measure) {
+        eprintln!(
+            "service SID probe, {scenario} (pid {pid}); `sc showsid {SERVICE_NAME}`: {}\n{}\n  \
+             production check `ServiceSid::is_in_token_of` -> {:?}\n  \
+             MEANS: Some(true) on a service process => the hold can tell it from a stranger, from an elevated administrator; \
+             Some(false) on a service process => the SID is not in the token and the identity check cannot work. \
+             None => the token could not be read from an elevated administrator without SeDebugPrivilege: every uninstall \
+             run by an administrator (not SYSTEM) fails with RetireError::Hold, and the unprivileged lines above say \
+             which rights would be needed. SYSTEM (the MSI custom action) is not measured here.",
+            sc_showsid(),
+            measure.lines.join("\n"),
+            measure.production_check,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn service_sid_probe_of_a_service(helper: &std::path::Path, flag: Option<&str>) -> (u32, sid_probe::Measure) {
+    let parked = named_event::NamedEvent::create("SidProbeParked");
+    let release = named_event::NamedEvent::create("SidProbeRelease");
+    let launch_arguments = match flag {
+        Some(flag) => vec![
+            flag.into(),
+            release.name().into(),
+            "--parked-event".into(),
+            parked.name().into(),
+        ],
+        None => vec![],
+    };
+    let _service = ProvisionedService::install_with(helper, launch_arguments, None);
+    let _release_on_drop = release.release_on_drop();
+    match flag {
+        Some(_) => {
+            let starter = start_in_background();
+            parked.wait();
+            let pid = scm_probe::service_process_id();
+            let measure = sid_probe::measure(pid);
+            release.signal();
+            starter.join().unwrap().expect("the held service starts once released");
+            (pid, measure)
+        }
+        None => {
+            let mut os = WindowsCutoverOs {
+                images: vec![],
+                target_version: "test".into(),
+            };
+            CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+            let pid = scm_probe::service_process_id();
+            (pid, sid_probe::measure(pid))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_service_sid_probe_running() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let (pid, measure) = service_sid_probe_of_a_service(helper, None);
+    sid_probe::print("RUNNING, service SID type set", pid, &measure);
+    assert_ne!(
+        measure.production_check,
+        Some(false),
+        "a RUNNING service's token readable, and the service SID not in it"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_service_sid_probe_start_pending() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let (pid, measure) = service_sid_probe_of_a_service(helper, Some("--hold-start"));
+    sid_probe::print("START_PENDING (--hold-start), service SID type set", pid, &measure);
+    assert_ne!(
+        measure.production_check,
+        Some(false),
+        "a START_PENDING service's token readable, and the service SID not in it"
+    );
+}
+
+/// What a service process started before the SID type was set looks like: the
+/// answer decides what the drain does with one.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_service_sid_probe_running_without_the_sid_type() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install_without_sid(helper);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    let pid = scm_probe::service_process_id();
+    let measure = sid_probe::measure(pid);
+    sid_probe::print("RUNNING, service SID type NOT set", pid, &measure);
+    assert_ne!(
+        measure.production_check,
+        Some(true),
+        "a service without the SID type has a token that carries its SID"
+    );
+}
+
+/// A process that is not the service: this test's own.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_service_sid_probe_a_stranger() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
+    let pid = std::process::id();
+    let measure = sid_probe::measure(pid);
+    sid_probe::print(
+        "a stranger (this test's own process), service registered",
+        pid,
+        &measure,
+    );
+    assert_eq!(
+        measure.production_check,
+        Some(false),
+        "a process that is not the service must not pass the check"
     );
 }
 

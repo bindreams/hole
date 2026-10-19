@@ -3,29 +3,42 @@
 //! The SCM reports a service STOPPED before its process has exited, and the
 //! image the process maps cannot be removed until it has. Nothing the SCM
 //! offers names that exit once the state is STOPPED (`dwProcessId` is 0 there),
-//! so the process is opened while the service still names it, confirmed by
+//! so the process is opened while the service still names it, proven to be the
+//! service's by its token's service SID, and confirmed by
 //! [`ProcessHolds::look`].
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE};
+use windows::Win32::System::Threading::{
+    OpenProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+};
 
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{Look, ProcessHolds, ProcessSource};
+use crate::cutover::scm_wait::hold::{Look, Opened, ProcessHolds, ProcessSource};
 
-/// Open process `pid` for waiting. `None` when no process has that id: it has
-/// exited.
-pub(super) fn open_process(pid: u32) -> io::Result<Option<OwnedHandle>> {
+use super::service_sid::ServiceSid;
+
+/// Open process `pid` for waiting and for reading its token, and keep it only
+/// if the token carries the service SID. A process without it is closed and
+/// reported as not the service's.
+pub(super) fn open_process(pid: u32, service: &ServiceSid) -> io::Result<Opened<OwnedHandle>> {
     // SAFETY: plain FFI call; no pointer is passed.
-    match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
-        // SAFETY: `OpenProcess` returned a new handle this value now owns.
-        Ok(handle) => Ok(Some(unsafe { OwnedHandle::from_raw_handle(handle.0) })),
+    match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => {
+            // SAFETY: `OpenProcess` returned a new handle this value now owns.
+            let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+            if service.is_in_token_of(&process)? {
+                Ok(Opened::Service(process))
+            } else {
+                Ok(Opened::NotTheService)
+            }
+        }
         Err(e) => {
             let code = win32_code_of_hresult(e.code().0);
             if code == ERROR_INVALID_PARAMETER.0 {
-                return Ok(None);
+                return Ok(Opened::NoSuchProcess);
             }
             Err(ScmCallError {
                 call: ScmCall::OpenProcess,

@@ -14,9 +14,10 @@ use windows_service::service::{
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::service_processes::{has_exited, open_process, ServiceProcesses};
+use super::service_sid::ServiceSid;
 use super::{apply_failure_actions, scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{io_error_is_absent_service, win32_code_of_hresult, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{Look, ProcessFate, ProcessSource, Reading};
+use crate::cutover::scm_wait::hold::{Look, Opened, ProcessFate, ProcessSource, Reading};
 use crate::cutover::scm_wait::retire::ServiceSession;
 use crate::cutover::scm_wait::{observed_from_state, Observed, ScmActor, SystemScmActor, WantState};
 
@@ -28,6 +29,8 @@ pub struct RetireSession {
     service: Service,
     /// The stop wait.
     actor: SystemScmActor,
+    /// The SID a process of the service carries.
+    sid: ServiceSid,
     /// The processes the service has shown.
     processes: ServiceProcesses,
 }
@@ -46,10 +49,12 @@ impl RetireSession {
             Err(e) if super::open_error_is_absent(&e) => return Ok(None),
             Err(e) => return Err(scm_failure(ScmCall::OpenService, e).into()),
         };
+        let sid = ServiceSid::of(SERVICE_NAME).map_err(|e| format!("the service's SID could not be resolved: {e}"))?;
         match SystemScmActor::open(SERVICE_NAME) {
             Ok(actor) => Ok(Some(Self {
                 service,
                 actor,
+                sid,
                 processes: ServiceProcesses::default(),
             })),
             // Deleted between the two opens.
@@ -62,13 +67,20 @@ impl RetireSession {
     /// process is still alive; the state returned is the one the hold was
     /// confirmed against.
     fn look(&mut self) -> io::Result<Look> {
-        self.processes.look(&mut ServiceProbe(&self.service))
+        self.processes.look(&mut ServiceProbe {
+            service: &self.service,
+            sid: &self.sid,
+        })
     }
 }
 
 /// The service as [`ProcessHolds`](crate::cutover::scm_wait::hold::ProcessHolds)
-/// reads it: one query for the state and the process id, and an open by id.
-struct ServiceProbe<'a>(&'a Service);
+/// reads it: one query for the state and the process id, and an open by id
+/// that keeps a process only if its token carries the service SID.
+struct ServiceProbe<'a> {
+    service: &'a Service,
+    sid: &'a ServiceSid,
+}
 
 impl ProcessSource for ServiceProbe<'_> {
     type Process = std::os::windows::io::OwnedHandle;
@@ -83,8 +95,8 @@ impl ProcessSource for ServiceProbe<'_> {
         Ok(Reading { observed, pid })
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Option<Self::Process>> {
-        open_process(pid)
+    fn open(&mut self, pid: u32) -> io::Result<Opened<Self::Process>> {
+        open_process(pid, self.sid)
     }
 
     fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool> {
@@ -101,7 +113,7 @@ impl ServiceProbe<'_> {
         // SAFETY: the buffer is `status`'s own storage, of exactly its size.
         let queried = unsafe {
             QueryServiceStatusEx(
-                SC_HANDLE(self.0.raw_handle()),
+                SC_HANDLE(self.service.raw_handle()),
                 SC_STATUS_PROCESS_INFO,
                 Some(std::slice::from_raw_parts_mut(
                     status.as_mut_ptr().cast::<u8>(),

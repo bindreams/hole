@@ -2,10 +2,9 @@
 //!
 //! The SCM reports a service STOPPED before its process has exited, and
 //! `dwProcessId` is 0 once it has, so a process is opened while the service
-//! still names it. Opening by id is only safe if the id is still the service's
-//! process when the open lands: [`ProcessHolds::hold_current`] reads the service
-//! again after the open and keeps the handle only if the SCM still names that
-//! process.
+//! still names it. An id the SCM names is a claim, not an identity (see
+//! [`ProcessHolds::hold_current`]): a process is held only if the source
+//! proves it is the service's own.
 
 use std::io;
 
@@ -47,14 +46,70 @@ pub struct Look {
     pub fate: ProcessFate,
 }
 
+/// What opening a process id found.
+#[derive(Debug)]
+pub enum Opened<P> {
+    /// No process has that id: it has exited.
+    NoSuchProcess,
+    /// A live process that is not the service's: its token lacks the service
+    /// SID. The source closes it before returning this, so it is never held.
+    NotTheService,
+    /// A live process of the service, proven by its token.
+    Service(P),
+}
+
+/// What the process a look names came to, once [`ProcessHolds::hold_current`]
+/// has dealt with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Named {
+    /// The look names no process.
+    Nothing,
+    /// The process is held.
+    Held,
+    /// No process has the id: the named process has exited.
+    NoSuchProcess,
+    /// A live process has the id and it is not the service's. It is not held
+    /// and is never waited on; whether anything of the service is left is not
+    /// known from it.
+    NotTheService,
+}
+
+impl Named {
+    /// The fate of the named process. `held_has_exited` is a state read of the
+    /// held handle, called only for [`Named::Held`].
+    fn fate(self, held_has_exited: impl FnOnce() -> io::Result<bool>) -> io::Result<ProcessFate> {
+        Ok(match self {
+            Named::Nothing => ProcessFate::Unheld,
+            Named::Held => {
+                if held_has_exited()? {
+                    ProcessFate::Exited
+                } else {
+                    ProcessFate::Alive
+                }
+            }
+            Named::NoSuchProcess => ProcessFate::Exited,
+            Named::NotTheService => ProcessFate::Unheld,
+        })
+    }
+}
+
+/// The last look [`ProcessHolds::hold_current`] took, and what its named
+/// process came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hold {
+    pub reading: Reading,
+    pub named: Named,
+}
+
 /// The OS reads holding a process needs.
 pub trait ProcessSource {
-    /// An open process; closes when dropped.
+    /// An open process of the service; closes when dropped.
     type Process;
     /// Read the service's state and process id.
     fn read(&mut self) -> io::Result<Reading>;
-    /// Open process `pid`; `None` when no process has that id.
-    fn open(&mut self, pid: u32) -> io::Result<Option<Self::Process>>;
+    /// Open process `pid` and prove it is the service's own by its token, not
+    /// by the id (see [`ProcessHolds::hold_current`]).
+    fn open(&mut self, pid: u32) -> io::Result<Opened<Self::Process>>;
     /// Whether `process` has exited. A state read, never a wait.
     fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool>;
 }
@@ -78,34 +133,72 @@ impl<P> ProcessHolds<P> {
 
     /// Read the service and hold the process it names.
     ///
-    /// Open-then-confirm: read, open the named process, read again, and keep the
-    /// handle only if the second look names the same process. Otherwise the
-    /// handle is dropped and the second look is acted on as a first one, so a
-    /// service that keeps changing is followed, one pass per real change, with no
-    /// count. Returns the last look.
+    /// The id is a claim, not an identity. Microsoft documents it
+    /// ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks)):
     ///
-    /// The one premise: the SCM keeps the process's handle while it reports the
-    /// service non-STOPPED with that pid, so the pid cannot be reused under a
-    /// confirmed open.
-    pub fn hold_current<S: ProcessSource<Process = P>>(&mut self, source: &mut S) -> io::Result<Reading> {
+    /// > The process identifier returned in the SERVICE_STATUS_PROCESS structure
+    /// > is valid provided that the state of the service is one of SERVICE_RUNNING,
+    /// > SERVICE_PAUSE_PENDING, SERVICE_PAUSED, or SERVICE_CONTINUE_PENDING. If
+    /// > the service is in a SERVICE_START_PENDING or SERVICE_STOP_PENDING state,
+    /// > however, the process identifier may not be valid, and if the service is
+    /// > in the SERVICE_STOPPED state, it is never valid.
+    ///
+    /// START_PENDING and STOP_PENDING are states this code acts on, so a pid
+    /// read in either may name a process that is not the service's, and an id
+    /// may be reused. What makes a hold safe is not the state but the process:
+    /// [`ProcessSource::open`] keeps a process only if its token carries the
+    /// service SID (`NT SERVICE\<name>`, enabled by
+    /// `SERVICE_CONFIG_SERVICE_SID_INFO`), which the SCM puts only on a process
+    /// it started as this service. A reused id fails that in every state, and
+    /// a restarted instance of the same service passes it, which is correct: it
+    /// is still the service's.
+    ///
+    /// Open-then-confirm: read, open the named process, read again, and act on
+    /// the open only if the second look names the same id. Otherwise the handle
+    /// is dropped and the second look is acted on as a first one, so a service
+    /// that keeps changing is followed, one pass per real change, with no count.
+    /// A process that fails the SID check is dropped the same way and reported
+    /// as [`Named::NotTheService`]; it is never held. Returns the last look.
+    pub fn hold_current<S: ProcessSource<Process = P>>(&mut self, source: &mut S) -> io::Result<Hold> {
         let mut reading = source.read()?;
         loop {
             let Some(pid) = reading.process_to_hold() else {
-                return Ok(reading);
+                return Ok(Hold {
+                    reading,
+                    named: Named::Nothing,
+                });
             };
             if self.held.iter().any(|(held, _)| *held == pid) {
-                return Ok(reading);
+                return Ok(Hold {
+                    reading,
+                    named: Named::Held,
+                });
             }
-            // No process has this id: it has exited, and there is nothing to hold.
-            let Some(process) = source.open(pid)? else {
-                return Ok(reading);
+            // `None`: a live process that is not the service's, already closed.
+            let candidate = match source.open(pid)? {
+                // No process has this id: it has exited, and there is nothing to hold.
+                Opened::NoSuchProcess => {
+                    return Ok(Hold {
+                        reading,
+                        named: Named::NoSuchProcess,
+                    });
+                }
+                Opened::NotTheService => None,
+                Opened::Service(process) => Some(process),
             };
             let again = source.read()?;
-            if again.process_to_hold() == Some(pid) {
-                self.held.push((pid, process));
-                return Ok(again);
+            if again.process_to_hold() != Some(pid) {
+                reading = again;
+                continue;
             }
-            reading = again;
+            let named = match candidate {
+                Some(process) => {
+                    self.held.push((pid, process));
+                    Named::Held
+                }
+                None => Named::NotTheService,
+            };
+            return Ok(Hold { reading: again, named });
         }
     }
 
@@ -115,24 +208,19 @@ impl<P> ProcessHolds<P> {
     ///
     /// A look that names a process this holds is `Alive` or `Exited` by a
     /// state read of that handle; one that names an id no process has (the open
-    /// found none) is `Exited`; one that names no process is `Unheld`.
+    /// found none) is `Exited`; one that names no process, or a process that is
+    /// not the service's, is `Unheld`.
     pub fn look<S: ProcessSource<Process = P>>(&mut self, source: &mut S) -> io::Result<Look> {
-        let reading = self.hold_current(source)?;
-        let fate = match reading.process_to_hold() {
-            None => ProcessFate::Unheld,
-            Some(pid) => match self.held.iter().find(|(held, _)| *held == pid) {
-                Some((_, process)) => {
-                    if source.has_exited(process)? {
-                        ProcessFate::Exited
-                    } else {
-                        ProcessFate::Alive
-                    }
-                }
-                // `hold_current` returned without holding a named process only
-                // because no process has that id.
-                None => ProcessFate::Exited,
-            },
-        };
+        let Hold { reading, named } = self.hold_current(source)?;
+        let fate = named.fate(|| {
+            let pid = reading.process_to_hold().expect("a held process was named");
+            let (_, process) = self
+                .held
+                .iter()
+                .find(|(held, _)| *held == pid)
+                .expect("a process reported as held is held");
+            source.has_exited(process)
+        })?;
         Ok(Look {
             observed: reading.observed,
             fate,

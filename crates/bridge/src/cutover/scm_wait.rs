@@ -154,9 +154,16 @@ impl Observed {
         }
     }
 
-    /// Whether a service in this state has a process behind it. A process
-    /// outlives the STOPPED the SCM reports for it, so the process, not the
-    /// state, is what an uninstall waits out.
+    /// Whether a service in this state may have a process behind it, whose id
+    /// the SCM reports. A process outlives the STOPPED the SCM reports for it,
+    /// so the process, not the state, is what an uninstall waits out.
+    ///
+    /// The id is a claim: Microsoft documents that in START_PENDING and
+    /// STOP_PENDING it "may not be valid", and in STOPPED it "is never valid"
+    /// ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks)).
+    /// So a `true` here only says an id is worth opening; the hold keeps the
+    /// process only if its token carries the service SID
+    /// ([`ProcessHolds::hold_current`](hold::ProcessHolds::hold_current)).
     pub fn names_a_process(self) -> bool {
         match self {
             Observed::Stopped => false,

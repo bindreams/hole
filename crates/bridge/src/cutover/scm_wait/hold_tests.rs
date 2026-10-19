@@ -20,11 +20,13 @@ impl Drop for Handle {
 }
 
 /// A source whose `read`s are scripted. A process is open to the fake whether
-/// or not the script still names it; `gone` lists ids that no process has.
+/// or not the script still names it; `gone` lists ids that no process has and
+/// `strangers` ids whose process does not carry the service's SID.
 struct Script {
     log: Log,
     reads: VecDeque<Reading>,
     gone: Vec<u32>,
+    strangers: Vec<u32>,
     /// Ids of processes that are open but already signalled.
     exited: Vec<u32>,
 }
@@ -35,6 +37,7 @@ impl Script {
             log: log.clone(),
             reads: reads.into(),
             gone: vec![],
+            strangers: vec![],
             exited: vec![],
         }
     }
@@ -48,15 +51,20 @@ impl ProcessSource for Script {
         Ok(self.reads.pop_front().expect("read script ran dry"))
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Option<Handle>> {
+    fn open(&mut self, pid: u32) -> io::Result<Opened<Handle>> {
         self.log.borrow_mut().push(format!("open({pid})"));
         if self.gone.contains(&pid) {
-            return Ok(None);
+            return Ok(Opened::NoSuchProcess);
         }
-        Ok(Some(Handle {
+        let handle = Handle {
             pid,
             log: self.log.clone(),
-        }))
+        };
+        if self.strangers.contains(&pid) {
+            // Dropped here, as the real source drops a process it rejects.
+            return Ok(Opened::NotTheService);
+        }
+        Ok(Opened::Service(handle))
     }
 
     fn has_exited(&mut self, process: &Handle) -> io::Result<bool> {
@@ -66,6 +74,10 @@ impl ProcessSource for Script {
 
 fn reading(observed: Observed, pid: u32) -> Reading {
     Reading { observed, pid }
+}
+
+fn named_by(holds: &mut ProcessHolds<Handle>, source: &mut Script) -> Hold {
+    holds.hold_current(source).unwrap()
 }
 
 fn held_pids(holds: &ProcessHolds<Handle>) -> Vec<u32> {
@@ -80,7 +92,7 @@ fn a_process_the_service_names_on_both_sides_of_the_open_is_held() {
         vec![reading(Observed::Running, 100), reading(Observed::Running, 100)],
     );
     let mut holds = ProcessHolds::default();
-    let got = holds.hold_current(&mut source).unwrap();
+    let got = named_by(&mut holds, &mut source).reading;
     assert_eq!(got, reading(Observed::Running, 100));
     assert_eq!(held_pids(&holds), vec![100]);
     assert_eq!(*log.borrow(), vec!["read", "open(100)", "read"]);
@@ -95,7 +107,7 @@ fn the_same_process_in_another_live_state_is_still_the_same_process() {
         vec![reading(Observed::Running, 100), reading(Observed::StopPending, 100)],
     );
     let mut holds = ProcessHolds::default();
-    let got = holds.hold_current(&mut source).unwrap();
+    let got = named_by(&mut holds, &mut source).reading;
     assert_eq!(got, reading(Observed::StopPending, 100));
     assert_eq!(held_pids(&holds), vec![100]);
 }
@@ -108,7 +120,7 @@ fn a_service_that_became_stopped_between_the_look_and_the_open_holds_nothing() {
         vec![reading(Observed::Running, 100), reading(Observed::Stopped, 0)],
     );
     let mut holds = ProcessHolds::default();
-    let got = holds.hold_current(&mut source).unwrap();
+    let got = named_by(&mut holds, &mut source).reading;
     assert_eq!(got, reading(Observed::Stopped, 0));
     assert!(held_pids(&holds).is_empty());
     // The opened handle was let go, and nothing was opened for the second look.
@@ -142,7 +154,7 @@ fn a_process_the_service_no_longer_names_after_the_open_is_dropped_and_the_new_o
         ],
     );
     let mut holds = ProcessHolds::default();
-    let got = holds.hold_current(&mut source).unwrap();
+    let got = named_by(&mut holds, &mut source).reading;
     assert_eq!(got, reading(Observed::Running, 200));
     assert_eq!(held_pids(&holds), vec![200]);
     assert_eq!(
@@ -166,7 +178,7 @@ fn a_service_that_keeps_changing_process_is_followed_until_it_holds_still() {
         ],
     );
     let mut holds = ProcessHolds::default();
-    let got = holds.hold_current(&mut source).unwrap();
+    let got = named_by(&mut holds, &mut source).reading;
     assert_eq!(got, reading(Observed::Running, 5));
     assert_eq!(held_pids(&holds), vec![5]);
 }
@@ -195,7 +207,7 @@ fn a_stopped_service_holds_nothing_and_opens_nothing() {
     let log = Log::default();
     let mut source = Script::new(&log, vec![reading(Observed::Stopped, 0)]);
     let mut holds = ProcessHolds::default();
-    let got = holds.hold_current(&mut source).unwrap();
+    let got = named_by(&mut holds, &mut source).reading;
     assert_eq!(got, reading(Observed::Stopped, 0));
     assert_eq!(*log.borrow(), vec!["read"]);
 }
@@ -222,7 +234,7 @@ fn a_process_already_held_is_not_opened_again() {
     );
     let mut holds = ProcessHolds::default();
     holds.hold_current(&mut source).unwrap();
-    let got = holds.hold_current(&mut source).unwrap();
+    let got = named_by(&mut holds, &mut source).reading;
     assert_eq!(got, reading(Observed::StopPending, 100));
     assert_eq!(held_pids(&holds), vec![100]);
     assert_eq!(count(&log, "open(100)"), 1);
@@ -234,9 +246,96 @@ fn a_process_that_has_exited_before_the_open_is_not_held() {
     let mut source = Script::new(&log, vec![reading(Observed::StopPending, 100)]);
     source.gone.push(100);
     let mut holds = ProcessHolds::default();
-    let got = holds.hold_current(&mut source).unwrap();
+    let got = named_by(&mut holds, &mut source).reading;
     assert_eq!(got, reading(Observed::StopPending, 100));
     assert!(held_pids(&holds).is_empty());
+}
+
+/// A process the SCM names but whose token lacks the service's SID is not the
+/// service's: a reused id, or a service process the SID type never reached.
+#[skuld::test]
+fn a_process_without_the_service_sid_is_never_held() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![reading(Observed::Running, 100), reading(Observed::Running, 100)],
+    );
+    source.strangers.push(100);
+    let mut holds = ProcessHolds::default();
+    let got = named_by(&mut holds, &mut source);
+    assert_eq!(got.reading, reading(Observed::Running, 100));
+    assert_eq!(got.named, Named::NotTheService);
+    assert!(held_pids(&holds).is_empty());
+    // The source closes a rejected process as it returns it.
+    assert_eq!(*log.borrow(), vec!["read", "open(100)", "close(100)", "read"]);
+}
+
+#[skuld::test]
+fn a_process_without_the_service_sid_is_never_held_in_any_live_state() {
+    for live in [Observed::StartPending, Observed::Running, Observed::StopPending] {
+        let log = Log::default();
+        let mut source = Script::new(&log, steady(live, 100));
+        source.strangers.push(100);
+        let (got, holds) = look_of(&mut source);
+        assert_eq!(
+            got,
+            Look {
+                observed: live,
+                fate: ProcessFate::Unheld
+            },
+            "{live:?}"
+        );
+        assert!(held_pids(&holds).is_empty(), "{live:?}");
+    }
+}
+
+#[skuld::test]
+fn a_service_that_moves_off_a_stranger_to_its_own_process_has_that_process_held() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![
+            reading(Observed::Running, 100),
+            reading(Observed::Running, 200),
+            reading(Observed::Running, 200),
+        ],
+    );
+    source.strangers.push(100);
+    let mut holds = ProcessHolds::default();
+    let got = named_by(&mut holds, &mut source);
+    assert_eq!(got.reading, reading(Observed::Running, 200));
+    assert_eq!(got.named, Named::Held);
+    assert_eq!(held_pids(&holds), vec![200]);
+    assert_eq!(count(&log, "close(100)"), 1);
+}
+
+#[skuld::test]
+fn a_stranger_is_not_confused_with_a_process_that_has_exited() {
+    // The two answers lead to opposite drains: a gone id finishes the wait, a
+    // live stranger must not.
+    let log = Log::default();
+    let mut gone = Script::new(&log, vec![reading(Observed::Running, 100)]);
+    gone.gone.push(100);
+    assert_eq!(
+        named_by(&mut ProcessHolds::default(), &mut gone).named,
+        Named::NoSuchProcess
+    );
+    let mut stranger = Script::new(&log, steady(Observed::Running, 100));
+    stranger.strangers.push(100);
+    assert_eq!(
+        named_by(&mut ProcessHolds::default(), &mut stranger).named,
+        Named::NotTheService
+    );
+}
+
+#[skuld::test]
+fn a_look_that_names_no_process_names_nothing() {
+    let log = Log::default();
+    let mut source = Script::new(&log, vec![reading(Observed::Stopped, 100)]);
+    assert_eq!(
+        named_by(&mut ProcessHolds::default(), &mut source).named,
+        Named::Nothing
+    );
 }
 
 #[skuld::test]
@@ -251,7 +350,7 @@ fn a_failed_read_after_the_open_is_an_error_and_the_handle_is_let_go() {
             }
             self.0.read()
         }
-        fn open(&mut self, pid: u32) -> io::Result<Option<Handle>> {
+        fn open(&mut self, pid: u32) -> io::Result<Opened<Handle>> {
             self.0.open(pid)
         }
         fn has_exited(&mut self, process: &Handle) -> io::Result<bool> {
@@ -380,7 +479,7 @@ fn a_failed_exit_check_is_an_error() {
         fn read(&mut self) -> io::Result<Reading> {
             self.0.read()
         }
-        fn open(&mut self, pid: u32) -> io::Result<Option<Handle>> {
+        fn open(&mut self, pid: u32) -> io::Result<Opened<Handle>> {
             self.0.open(pid)
         }
         fn has_exited(&mut self, _: &Handle) -> io::Result<bool> {

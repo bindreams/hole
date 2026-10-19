@@ -15,6 +15,9 @@ pub enum ScmCall {
     DeleteService,
     QueryServiceStatusEx,
     OpenProcess,
+    OpenProcessToken,
+    GetTokenInformation,
+    LookupAccountName,
     WaitForSingleObject,
     CreateService,
     StartServiceCtrlDispatcher,
@@ -32,6 +35,9 @@ impl ScmCall {
             ScmCall::DeleteService => "DeleteService",
             ScmCall::QueryServiceStatusEx => "QueryServiceStatusEx",
             ScmCall::OpenProcess => "OpenProcess",
+            ScmCall::OpenProcessToken => "OpenProcessToken",
+            ScmCall::GetTokenInformation => "GetTokenInformation",
+            ScmCall::LookupAccountName => "LookupAccountName",
             ScmCall::WaitForSingleObject => "WaitForSingleObject",
             ScmCall::CreateService => "CreateService",
             ScmCall::StartServiceCtrlDispatcher => "StartServiceCtrlDispatcher",
@@ -39,11 +45,15 @@ impl ScmCall {
     }
 
     /// Whether a failure of this call is the refusal to open the service's
-    /// process, which belongs to no step of a retirement: the step that was
-    /// running only needed the process held.
+    /// process, or to read its token to prove it is the service's, which
+    /// belongs to no step of a retirement: the step that was running only
+    /// needed the process held.
     pub fn is_opening_the_service_process(self) -> bool {
         match self {
             ScmCall::OpenProcess => true,
+            ScmCall::OpenProcessToken => true,
+            ScmCall::GetTokenInformation => true,
+            ScmCall::LookupAccountName => false,
             ScmCall::OpenScManager => false,
             ScmCall::OpenService => false,
             ScmCall::NotifyServiceStatusChange => false,

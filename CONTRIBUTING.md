@@ -1916,18 +1916,40 @@ down a rollback (bindreams/hole#1099). Three rules close it:
 - **The process, not the state, is what is waited out.** The SCM reports STOPPED
   before the process has exited, and `dwProcessId` is 0 once it has, so every
   process the service shows (the first look, and every stop-wait callback that
-  names one) is opened for `SYNCHRONIZE` while it is named, and `retire` ends
+  names one) is opened for `SYNCHRONIZE` (and `PROCESS_QUERY_LIMITED_INFORMATION`,
+  to read its token) while it is named, and `retire` ends
   with a wait on all of them: `uninstall` and `ensure_stopped` return with no
   service process left. The wait has no bound: it is the exit of a process the
   SCM has been told to stop, and a bridge that never exits is the same
   documented gap as one that hangs in STOP_PENDING. The service *row* is not
-  waited for; the SCM removes it once the handles close. A process is opened
-  by id and confirmed (`ProcessHolds::hold_current`): read the service, open the
-  pid it names, read again, and keep the handle only if the second read names the
-  same pid in a non-STOPPED state; otherwise drop it and act on the second read.
-  The premise is that the SCM keeps the process's handle while it reports the
-  service non-STOPPED with that pid, so the pid cannot be reused under a
-  confirmed open.
+  waited for; the SCM removes it once the handles close.
+- **A process id the SCM names is a claim; the service SID in the token is the
+  identity.** Microsoft documents that the id
+  ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks))
+  "is valid provided that the state of the service is one of SERVICE_RUNNING,
+  SERVICE_PAUSE_PENDING, SERVICE_PAUSED, or SERVICE_CONTINUE_PENDING. If the
+  service is in a SERVICE_START_PENDING or SERVICE_STOP_PENDING state, however,
+  the process identifier may not be valid, and if the service is in the
+  SERVICE_STOPPED state, it is never valid." START_PENDING and STOP_PENDING are
+  states the stop wait and the drain act on, so no state makes the id safe to
+  trust. `hole bridge install` therefore gives the service a service SID
+  (`ChangeServiceConfig2`, `SERVICE_CONFIG_SERVICE_SID_INFO`,
+  `SERVICE_SID_TYPE_UNRESTRICTED`), which the SCM puts as `NT SERVICE\HoleBridge`
+  into the token of every process it starts as the service, and nothing else
+  carries it. A process is opened by id and its token read
+  (`ProcessSource::open`, `ServiceSid::is_in_token_of`); it is kept only if the
+  token carries the SID, and a reused id fails that in every state. A restarted
+  instance of the same service carries it too, which is right: it is still the
+  service's. `ProcessHolds::hold_current` still confirms the open: read the
+  service, open the pid it names, read again, and act on the open only if the
+  second read names the same pid; otherwise drop the handle and act on the
+  second read, so a service that keeps changing is followed. A live process
+  without the SID is `Named::NotTheService`: it is closed, never held and never
+  waited on, and its `ProcessFate` is `Unheld` (not `Exited`: a live process
+  that merely is not proven the service's is not evidence that the service's
+  process is gone). That is also what a service process started before the SID
+  type was set looks like, so on such a host the exit of the process is not
+  awaited, and the stop and the SCM's own notifications are all that is.
 
 A held process is also the ground truth for whether the status is current: the
 SCM's status can lag a process's exit by its own latency, so a process that has
@@ -1963,8 +1985,12 @@ answers and what an arm for all four states reports first; the probe
 `..._handle_of_a_service_marked_for_delete` prints a state query, an arm, a Stop and
 the stop wait on a handle opened before `DeleteService`, each with what the
 answer means for the drain; `..._open_process_synchronize_on_the_service_process`
-prints whether `OpenProcess(PROCESS_SYNCHRONIZE)` on the service process succeeds
-from an elevated administrator (a SYSTEM caller, the MSI custom action, cannot be
+prints whether `OpenProcess(PROCESS_SYNCHRONIZE)` on the service process succeeds,
+and `cutover_global_net_state_service_sid_probe_*` print, for a RUNNING and a
+START_PENDING service with the SID type set, for one without it, and for a process
+that is not the service, which rights read the token, whether the token carries
+the service SID (beside `sc showsid`'s value) and what `SeDebugPrivilege` changes,
+all from an elevated administrator (a SYSTEM caller, the MSI custom action, cannot be
 reproduced by a test; its first answer is the CI installer test's uninstall);
 `..._start_of_a_stopped_service_marked_for_delete` calls `StartService` on a
 pre-opened handle after `DeleteService` of a STOPPED service with a restart
@@ -3432,7 +3458,7 @@ User-facing commands are in [README.md](README.md#commands). The rest:
 ```
 hole bridge run [--socket-path P] [--log-dir DIR] [--state-dir DIR]   run bridge (foreground, needs elevation)
 hole bridge run --service [--log-dir DIR] [--state-dir DIR]           run as service (invoked by SCM/launchd)
-hole bridge install | uninstall | status                             register/start | stop/remove | status (elevation)
+hole bridge install | uninstall [--log-dir DIR] | status             register/start | stop/remove | status (elevation)
 hole bridge log [path | watch [--tail N]] [--log-dir DIR]            print | locate | stream the bridge log
 hole bridge grant-access [--then-send B64 | --then-send-file PATH]    create hole group, add user, write SID file
 hole bridge ipc-send (--base64 B64 | --request-file PATH)            proxy a single IPC command (elevation)

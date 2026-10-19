@@ -23,6 +23,9 @@ mod retire_session;
 pub use retire_session::RetireSession;
 #[path = "windows/service_processes.rs"]
 mod service_processes;
+#[path = "windows/service_sid.rs"]
+mod service_sid;
+pub use service_sid::{apply_service_sid, ServiceSid};
 
 // Constants ===========================================================================================================
 
@@ -517,6 +520,10 @@ pub fn install(binary_path: &Path) -> std::io::Result<()> {
     service
         .set_description(SERVICE_DESCRIPTION)
         .map_err(|e| scm_failure(ScmCall::ChangeServiceConfig2, e))?;
+    // The service SID is what lets an uninstall tell the service's process from
+    // a stranger that reuses its id (`ProcessHolds::hold_current`), so its
+    // failure fails the install like the description's does.
+    apply_service_sid(&service)?;
     // Auto-restart is hardening, applied on the just-created handle (no re-open,
     // which can race SCM propagation right after create_service). Best-effort: the
     // service is installed regardless — failing the whole install (an MSI custom
