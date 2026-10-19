@@ -61,3 +61,18 @@ fn a_lock_excludes_a_second_handle_until_it_is_released() {
     unlock(&first);
     assert!(try_lock_exclusive(&second).unwrap(), "free after the release");
 }
+
+/// `EPERM` is what a seccomp profile that predates `renameat2` answers with.
+/// A real `EPERM` falls back to a hard link, which fails the same way.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn renameat2_answers_that_mean_it_is_unavailable_fall_back_to_the_link() {
+    use super::unix_impl::renameat2_unavailable;
+
+    for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP, libc::EPERM] {
+        assert!(renameat2_unavailable(errno), "errno {errno}");
+    }
+    for errno in [libc::EEXIST, libc::ENOENT, libc::EACCES, libc::EXDEV, libc::EROFS] {
+        assert!(!renameat2_unavailable(errno), "errno {errno}");
+    }
+}

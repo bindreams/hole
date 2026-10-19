@@ -90,10 +90,17 @@ mod unix_impl {
         }
         let e = io::Error::last_os_error();
         match e.raw_os_error() {
-            // The kernel or the filesystem does not know the flag.
-            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            Some(errno) if renameat2_unavailable(errno) => Err(io::Error::from(io::ErrorKind::Unsupported)),
             _ => Err(e),
         }
+    }
+
+    /// The kernel, the filesystem or a seccomp profile does not offer
+    /// `renameat2` with the flag. `EPERM` is a profile's answer; a real one
+    /// makes the hard-link fallback fail the same way.
+    #[cfg(target_os = "linux")]
+    pub(super) fn renameat2_unavailable(errno: i32) -> bool {
+        matches!(errno, libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM)
     }
 
     #[cfg(target_os = "macos")]
