@@ -29,7 +29,7 @@ use tun_engine::exclusive::Exclusive;
 
 // Schema ==============================================================================================================
 
-/// Schema version. `load` discards a mismatched or corrupt file as
+/// Schema version. [`load`] discards a mismatched or corrupt file as
 /// [`Target::Unreadable`] rather than risk acting on a partially-understood
 /// record.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -449,7 +449,7 @@ impl TargetExclusive {
 }
 
 /// The only write surface for `bridge-target.json`. Acquires
-/// `TargetExclusive`, loads the current target *fresh* — never a value
+/// [`TargetExclusive`], loads the current target *fresh* — never a value
 /// captured before the lock, which is what makes a session-event write and
 /// the `hole bridge unlock` escape's write compose correctly instead of
 /// racing (a write that read its `current` before acquiring could overwrite

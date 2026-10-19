@@ -294,7 +294,7 @@ mod system {
 
     /// Owns the SCM + service handles and the registration of the latest `arm`.
     ///
-    /// Each `arm` builds a fresh `NotifyRecord` instead of rewriting one, so a
+    /// Each `arm` builds a fresh [`NotifyRecord`] instead of rewriting one, so a
     /// callback from an earlier arm can never see a buffer a later arm is filling.
     /// A record is freed only after its callback has run, so an APC the SCM
     /// already queued still finds live memory at the thread's next alertable

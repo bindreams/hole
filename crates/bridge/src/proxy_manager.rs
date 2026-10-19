@@ -1894,7 +1894,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// Stop the proxy in response to `event`. The standing lockdown cover's
     /// fate is no longer read off `event` directly — it comes from
     /// [`teardown_cover_disposition`], decided against the *persisted* [`Target`] `event`
-    /// moves it to (see `persist_session_event`).
+    /// moves it to (see [`persist_session_event`](Self::persist_session_event)).
     /// Routes/DNS/proxy/plugin tear down identically regardless of `event`.
     ///
     /// One exhaustive match over the posture taken from `self`, replacing it

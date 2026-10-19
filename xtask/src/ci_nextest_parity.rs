@@ -113,7 +113,7 @@ pub struct Launch {
 
 /// Resolve `job_id`'s chain: the single build.yaml target it compiles, and every
 /// nextest RUN command it then executes, over the steps `step_prefix` selects
-/// (see `scoped_steps`).
+/// (see [`scoped_steps`]).
 ///
 /// `--no-run` compiles are not runs — compiling is a separate operation, stated
 /// separately in build.yaml as `build:`.

@@ -341,13 +341,14 @@ targets:
     # rustdoc with warnings denied, so a broken intra-doc link fails CI. Links to
     # `cfg`-gated items break per target, hence one doc target per clippy target,
     # on the same legs. Same flags as `clippy-hole`. Unpublished crates are built
-    # with `--document-private-items`, so a doc may link a private item; `garter`
-    # is published and docs.rs omits private items, so it keeps the plain check.
+    # with `--document-private-items` and allow `private_intra_doc_links` (their
+    # docs are only read in source, never without private items); `garter` is
+    # published and docs.rs omits private items, so it keeps the plain check.
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     run:
       - bash:
           command: cargo doc --workspace --exclude garter --no-deps --document-private-items --no-default-features --features garter/test-utils
-          environment: { RUSTDOCFLAGS: "-D warnings" }
+          environment: { RUSTDOCFLAGS: "-D warnings -A rustdoc::private_intra_doc_links" }
       - bash:
           command: cargo doc -p garter --no-deps --no-default-features --features garter/test-utils
           environment: { RUSTDOCFLAGS: "-D warnings" }
@@ -360,7 +361,7 @@ targets:
     run:
       - bash:
           command: cargo doc --no-deps --document-private-items -p garter-bin -p galoshes -p plugin-e2e -p util -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive --features garter/test-utils
-          environment: { RUSTDOCFLAGS: "-D warnings" }
+          environment: { RUSTDOCFLAGS: "-D warnings -A rustdoc::private_intra_doc_links" }
       - bash:
           command: cargo doc --no-deps -p garter --features garter/test-utils
           environment: { RUSTDOCFLAGS: "-D warnings" }

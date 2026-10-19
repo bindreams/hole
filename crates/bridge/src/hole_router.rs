@@ -16,7 +16,7 @@
 //! Field names encode *role* (why we chose this endpoint for the flow —
 //! the [`FilterAction`] variant).
 //! Field types encode *mechanism* (how the endpoint carries bytes). The
-//! cascade in `HoleRouter::resolve_endpoint` maps role → mechanism.
+//! cascade in [`HoleRouter::resolve_endpoint`] maps role → mechanism.
 //!
 //! ## Per-flow dispatch
 //!
@@ -25,7 +25,7 @@
 //!    equivalent and always matches on IP.
 //! 2. Build a [`ConnInfo`] and run [`crate::filter::engine::decide`].
 //! 3. Cascade the `FilterAction` + flow shape to a concrete endpoint via
-//!    `HoleRouter::resolve_endpoint`, recording any drop reason on the
+//!    [`HoleRouter::resolve_endpoint`], recording any drop reason on the
 //!    [`DropSink`].
 //! 4. Call `endpoint.serve_tcp` or `endpoint.serve_udp`.
 //!

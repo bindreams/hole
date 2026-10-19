@@ -16,7 +16,7 @@
 //! - connection-level events at `info` by default
 //! - per-packet NDIS firehose events: not even at `debug`; filtered out
 //!   at the kernel subscription level so they never reach our process
-//! - anomaly events (retransmit ≥ `RETRANSMIT_WARN_THRESHOLD`,
+//! - anomaly events (retransmit ≥ [`RETRANSMIT_WARN_THRESHOLD`],
 //!   connection-request timeout, abort) escalated to `warn`
 //!
 //! # Architecture
@@ -24,13 +24,13 @@
 //! 1. [`start_consumer`] is called once at bridge startup, after the
 //!    crash-recovery snapshots. It:
 //!    a. Sweeps any stale `hole-bridge-etw-*` sessions left by a crashed
-//!    prior bridge instance (`sweep_stale_sessions` via the Win32
+//!    prior bridge instance ([`sweep_stale_sessions`] via the Win32
 //!    `QueryAllTracesW` + `ControlTraceW` APIs).
 //!    b. Builds three `ferrisetw::Provider`s with all keywords
 //!    enabled. High-volume firehose events are filtered in userspace
-//!    via `HIGH_VOLUME_TCPIP_EVENTS` rather than at the kernel
+//!    via [`HIGH_VOLUME_TCPIP_EVENTS`] rather than at the kernel
 //!    level — events 1004, 1077, and the rest of the SendPath family
-//!    must stay visible — see `TCPIP_KEYWORDS`.
+//!    must stay visible — see [`TCPIP_KEYWORDS`].
 //!    c. Starts a [`ferrisetw::UserTrace`] session named
 //!    `hole-bridge-etw-<pid>` with `buffer_size = 256` KB to absorb
 //!    the wider event volume without kernel ring-buffer overrun.
@@ -38,29 +38,29 @@
 //!    in a blocking loop. This thread runs the per-event callback.
 //!    e. Returns an [`EtwGuard`] that owns the session + the join handle.
 //!
-//! 2. The callback (`handle_event`) filters by `process_id`, extracts
-//!    a minimal shape-only `ParsedFields` struct from the live
-//!    `EventRecord`, calls the pure `dispatch` function, and
-//!    translates the returned `Emission` into a real `tracing::event!`
+//! 2. The callback ([`handle_event`]) filters by `process_id`, extracts
+//!    a minimal shape-only [`ParsedFields`] struct from the live
+//!    `EventRecord`, calls the pure [`dispatch`] function, and
+//!    translates the returned [`Emission`] into a real `tracing::event!`
 //!    invocation.
 //!
-//! 3. A dedicated timer thread (`run_periodic_stats_inner`) ticks
-//!    `query_session_stats` once immediately and then every
-//!    `LIVE_STATS_INTERVAL` for as long as the session runs — not only at
+//! 3. A dedicated timer thread ([`run_periodic_stats_inner`]) ticks
+//!    [`query_session_stats`] once immediately and then every
+//!    [`LIVE_STATS_INTERVAL`] for as long as the session runs — not only at
 //!    shutdown — so a `bridge.log` collected from a still-running bridge
 //!    (the common case: users collect logs via Help → Collect Logs while
 //!    connected) always carries at least one completeness figure for the
 //!    session, from as early as the session start. Repeated query failures
 //!    (e.g. another bridge instance sweeping this session — see
-//!    `sweep_stale_sessions`) throttle to `info!` after the first `warn!`
+//!    [`sweep_stale_sessions`]) throttle to `info!` after the first `warn!`
 //!    — loud enough to survive log rotation as standing evidence the
 //!    session is gone, quiet enough not to re-flood at `warn!` forever.
 //!
 //! 4. [`EtwGuard::drop`] first stops the timer thread (closing its shutdown
 //!    channel wakes it immediately, not after the rest of the current
 //!    interval) and joins it, THEN reads session statistics one final time
-//!    via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` (`query_session_stats`)
-//!    before stopping the session (`EtwGuard::stop_session`, which signals
+//!    via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` ([`query_session_stats`])
+//!    before stopping the session ([`EtwGuard::stop_session`], which signals
 //!    the kernel to stop delivering events). If the kernel confirmed the
 //!    session was reclaimed, `Drop` then joins the processing thread too,
 //!    guaranteeing the callback drains the pending event queue before
@@ -79,7 +79,7 @@
 //!    cross-check — nonzero loss in `EventsLost`, `LogBuffersLost`, or
 //!    `RealTimeBuffersLost` escalates to `warn!` (`BuffersWritten` is a
 //!    throughput count, not a loss counter, and never escalates);
-//!    delta-tracked on the periodic path via `should_escalate`, so an
+//!    delta-tracked on the periodic path via [`should_escalate`], so an
 //!    unchanging cumulative count doesn't re-warn every tick. See
 //!    [Drain on Drop](#drain-on-drop) below.
 //!
@@ -88,7 +88,7 @@
 //! Joining the timer thread in `Drop` adds a second, small, bounded
 //! blocking wait ahead of the pre-existing processing-thread join — bounded
 //! by however long one in-flight `ControlTraceW(QUERY)` call takes (a
-//! single synchronous Win32 call, not `LIVE_STATS_INTERVAL`), because
+//! single synchronous Win32 call, not [`LIVE_STATS_INTERVAL`]), because
 //! closing the channel wakes a blocked `recv_timeout` immediately rather
 //! than waiting out the interval. This is the same shape of synchronous
 //! wait `Drop` already performs for the processing thread, not a new
@@ -123,7 +123,7 @@
 //! `UserTrace::stop` takes `self` by value, so ferrisetw's own `Drop` repeats
 //! close+STOP once more, discarding the error, before the caller ever sees the
 //! `Err`. A one-off `CloseTrace` failure is therefore already covered by that
-//! second attempt and `EtwGuard::stop_session`'s by-name STOP is a benign
+//! second attempt and [`EtwGuard::stop_session`]'s by-name STOP is a benign
 //! no-op; a failure that *repeats* is what reaches the third attempt — the
 //! only one addressed to the session rather than to a handle.
 //!
@@ -139,23 +139,23 @@
 //!
 //! # Provider GUIDs and keywords
 //!
-//! See `TCPIP_PROVIDER`, `WFP_PROVIDER`, `AFD_PROVIDER` for the
+//! See [`TCPIP_PROVIDER`], [`WFP_PROVIDER`], [`AFD_PROVIDER`] for the
 //! GUIDs and the per-provider keyword masks. All three providers
 //! subscribe to every keyword bit (`!0`); high-volume events are
-//! dropped by event-ID in the userspace `dispatch` callback via
-//! `HIGH_VOLUME_TCPIP_EVENTS`. Kernel-level keyword filtering is
+//! dropped by event-ID in the userspace [`dispatch`] callback via
+//! [`HIGH_VOLUME_TCPIP_EVENTS`]. Kernel-level keyword filtering is
 //! avoided because it also masks events 1004 and 1077, which must stay
-//! visible — see the rationale comment on `TCPIP_KEYWORDS`.
+//! visible — see the rationale comment on [`TCPIP_KEYWORDS`].
 //!
 //! # AFD/WFP severity
 //!
 //! Only TCPIP events get rich event-id-aware severity routing.
-//! AFD and WFP events are emitted at DEBUG via `Emission::Unknown`
+//! AFD and WFP events are emitted at DEBUG via [`Emission::Unknown`]
 //! until either provider grows a rich handler. This matters because the
 //! providers recycle small event IDs (AFD `1002`/`1004` collide with
 //! TCPIP `TCB_CONNECT_REQUESTED` / `TCB_SYN_SEND`), so an event-id-only
 //! match would misclassify AFD background traffic as INFO-level TCPIP
-//! events — `dispatch` gates on the provider GUID before applying
+//! events — [`dispatch`] gates on the provider GUID before applying
 //! TCPIP severity.
 
 use dump::{dump, DeriveDump};

@@ -402,7 +402,7 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
 /// Run `bridge uninstall`.
 ///
 /// `keep_covers` leaves every fail-closed cover engaged and the target
-/// untouched — see `uninstall_bridge_with` for who needs that.
+/// untouched — see [`uninstall_bridge_with`] for who needs that.
 pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Error>> {
     uninstall_bridge_with(
         keep_covers,

@@ -26,7 +26,7 @@
 //!
 //! ## Route-command failure policy
 //!
-//! Install is fatal (`routing::setup_routes` returns `Err` on the first
+//! Install is fatal ([`routing::setup_routes`] returns `Err` on the first
 //! command that does not exit zero and is marked fatal — see
 //! [`routing::SetupCommand`]); teardown and crash recovery are best-effort
 //! (`routing::teardown_routes` returns a `routing::CleanupReport` and has

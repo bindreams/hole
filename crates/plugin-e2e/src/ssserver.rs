@@ -2,7 +2,7 @@
 //!
 //! [`start_real_ss_server`] spins up a plain `shadowsocks_service::server::Server`
 //! on a HELD loopback port (no plugin). The `_with_plugin_*` helpers front a held
-//! ss-server with a SERVER-mode plugin chain via `spawn_ss_with_plugin` — a
+//! ss-server with a SERVER-mode plugin chain via [`spawn_ss_with_plugin`] — a
 //! `garter::ChainRunner(Mode::Server)`, symmetric to the client-side
 //! [`crate::roundtrip::run_roundtrip`]. Readiness is inferred from the plugin's
 //! own sitrep `hello` ([`garter::ReadinessMode::Auto`]); the public port is

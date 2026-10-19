@@ -61,7 +61,7 @@ pub struct TrafficTotals {
 /// owns the spawned task.
 ///
 /// The trait takes `&self` (not `&mut self`) on `start` so that
-/// `crate::proxy_manager::ProxyManager::start_inner` can be a cancel-safe
+/// [`crate::proxy_manager::ProxyManager::start_inner`] can be a cancel-safe
 /// future that operates on locally-owned RAII state without ever mutating
 /// `ProxyManager`. See [`crate::proxy_manager`] for the cancellation
 /// contract.
@@ -79,7 +79,7 @@ pub trait Proxy: Send + Sync {
 /// Single-use: [`stop`](Self::stop) consumes `self`. A type implementing
 /// `RunningProxy` MUST also implement `Drop` such that every socket the
 /// proxy bound is released — this is the cancellation-safety primitive that
-/// `crate::proxy_manager::ProxyManager::start_inner` relies on. Aborting
+/// [`crate::proxy_manager::ProxyManager::start_inner`] relies on. Aborting
 /// the spawned task is necessary but not sufficient: see
 /// CONTRIBUTING.md#proxy-shutdown-contract for why the production
 /// implementation also joins a dedicated runtime.

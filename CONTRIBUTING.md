@@ -2646,14 +2646,14 @@ cargo xtask run doc-hole     # rustdoc, warnings denied (`doc-ex-galoshes` on Li
 ```
 
 CI runs the doc targets on every leg after clippy. Unpublished crates (every
-workspace crate except `garter`) are documented with `--document-private-items`,
-so a doc may link a private item. `garter` is built plain, because docs.rs omits
-private items: its docs may not link one.
+workspace crate except `garter`) are documented with `--document-private-items`
+and `-A rustdoc::private_intra_doc_links`: their docs are only read in source and
+the check always builds them with private items, so a public item may link a
+private one. No other lint is allowed. `garter` is built plain, because docs.rs
+omits private items: its docs may not link one.
 
-rustdoc still rejects a link from a `pub` item to a private one
-(`private-intra-doc-links`), flag or not. Write that reference, and a reference to
-an item that is `cfg`-gated away on some target or `#[cfg(test)]`, in backticks
-without brackets.
+A reference to an item that is `cfg`-gated away on some target or `#[cfg(test)]`
+still breaks the check; write it in backticks without brackets.
 
 ### Tauri dev/prod feature toggle
 

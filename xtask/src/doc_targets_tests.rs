@@ -1,6 +1,7 @@
 //! The rustdoc targets document private items for exactly the crates that are not published: a
 //! published crate's docs are built by docs.rs without them, so a link from its public docs to a
-//! private item is a real break there; an unpublished crate's docs are only read in source.
+//! private item is a real break there; an unpublished crate's docs are only read in source, so
+//! its steps also allow `private_intra_doc_links`, and no others.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -60,12 +61,19 @@ fn doc_targets_document_private_items_of_unpublished_crates_only() {
             let Step::Bash { command, environment } = step else {
                 panic!("{target}: expected bash steps, got {step:?}");
             };
+            let (selected, with_private) = selection(command, &members);
+            // Public docs of an unpublished crate may link its private items: nobody reads them
+            // without private items, and the check always builds with them.
+            let expected_flags = if with_private {
+                "-D warnings -A rustdoc::private_intra_doc_links"
+            } else {
+                "-D warnings"
+            };
             assert_eq!(
                 environment.get("RUSTDOCFLAGS").map(String::as_str),
-                Some("-D warnings"),
-                "{target}: `{command}` must deny rustdoc warnings"
+                Some(expected_flags),
+                "{target}: `{command}` must run with RUSTDOCFLAGS=`{expected_flags}`"
             );
-            let (selected, with_private) = selection(command, &members);
             assert!(!selected.is_empty(), "{target}: `{command}` selects no package");
             for package in &selected {
                 assert!(

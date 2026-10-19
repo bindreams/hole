@@ -137,7 +137,7 @@ impl std::fmt::Display for UpstreamCause {
     }
 }
 
-/// Why `DnsForwarder::try_forward` produced no reply.
+/// Why [`DnsForwarder::try_forward`] produced no reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardFailure {
     /// The query is shorter than the 12-byte DNS header — a caller bug.
@@ -154,13 +154,13 @@ pub enum ForwardFailure {
 /// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
 /// log path.
 ///
-/// At 136 bytes it travels as `ForwardResult`'s boxed `Err`: the
+/// At 136 bytes it travels as [`ForwardResult`]'s boxed `Err`: the
 /// transports return it through five nested `async fn` frames, so unboxed
 /// it would widen every future on the DNS path to carry a failure that is
 /// almost never taken. `?` boxes on its own via `impl<T> From<T> for
 /// Box<T>`; only the tail expressions wrap explicitly. Boxing is also why
 /// growing this struct no longer trips `clippy::result_large_err` —
-/// `ForwardResult`'s own size assertion is the guard that actually
+/// [`ForwardResult`]'s own size assertion is the guard that actually
 /// matters; the assertion below is a secondary budget so growth here stays
 /// deliberate.
 #[derive(Debug)]
@@ -234,7 +234,7 @@ impl UpstreamErr {
     /// Classify this failure for reporting. Two layers need more than the tag:
     ///
     /// - `Tls` splits on whether `first_rustls_error` found a TRUST-CHAIN
-    ///   rejection (see `is_trust_chain_rejection`).
+    ///   rejection (see [`is_trust_chain_rejection`]).
     /// - `Timeout` splits on whether a transport had been PUBLISHED when the
     ///   budget fired. `socks5_ms` is set by `AttemptProbe::connected` and
     ///   `udp_sent` by `AttemptProbe::associated`, both the instant the

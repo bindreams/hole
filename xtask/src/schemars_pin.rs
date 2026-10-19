@@ -66,7 +66,7 @@
 //! If the upstream fact stops holding — `typify` no longer requires 0.8 — the
 //! pin, the Renovate rule and this module have all become friction with no
 //! fact behind them, and should be deleted rather than defended; see
-//! `WHEN_UPSTREAM_MOVES`.
+//! [`WHEN_UPSTREAM_MOVES`].
 //!
 //! ## Two upstream signals, and why both
 //!

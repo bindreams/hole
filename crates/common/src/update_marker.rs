@@ -84,7 +84,7 @@ pub fn service_log_dir() -> PathBuf {
 /// `owner` chowns the persisted marker to the elevated-run user (a user-scoped
 /// elevated bridge writes into the user's profile); `None` for the root daemon,
 /// whose service log dir is root-owned by design. The chown lands on the temp
-/// in `staged_marker`, whose inode the rename publishes unchanged.
+/// in [`staged_marker`], whose inode the rename publishes unchanged.
 ///
 /// Overwrites an existing marker. For the single-occupancy claim use
 /// [`write_new`], which fails if the marker already exists.

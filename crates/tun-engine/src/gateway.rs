@@ -66,7 +66,7 @@ pub struct GatewayInfo {
 
 /// One upstream route, as the OS resolved it.
 ///
-/// Lives here rather than in the platform module so `classify_hop` has one
+/// Lives here rather than in the platform module so [`classify_hop`] has one
 /// body for every platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteHop {
