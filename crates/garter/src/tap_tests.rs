@@ -37,16 +37,21 @@
 // sanctioned-test-file exception.
 #![allow(clippy::disallowed_methods)]
 
+use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::counting::CountingStream;
 use crate::plugin::ChainPlugin;
-use crate::tap::TapPlugin;
+use crate::sitrep::{PluginReady, StartError};
+use crate::tap::{allocate_inner_port_with, TapPlugin};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -421,4 +426,340 @@ async fn counting_stream_smoke() {
     counted.read_exact(&mut buf).await.unwrap();
     assert_eq!(counters.read(), 3);
     server.await.unwrap();
+}
+
+// Start failures ======================================================================================================
+
+type Ready = Result<PluginReady, StartError>;
+
+/// Run `inner` under a tap on `local`, expecting the start to fail. Returns
+/// what the tap reported on `ready` (`Err(RecvError)` if it dropped the sender
+/// unsent) and what `run` returned.
+async fn failed_start(
+    inner: Box<dyn ChainPlugin>,
+    local: SocketAddr,
+) -> (Result<Ready, oneshot::error::RecvError>, crate::Result<()>) {
+    let shutdown = CancellationToken::new();
+    let plugin_shutdown = shutdown.clone();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let tap = Box::new(TapPlugin::wrap(inner));
+    let handle = tokio::spawn(async move { tap.run(local, unused_remote(), plugin_shutdown, ready_tx).await });
+
+    // Every exit path of `run` sends on `ready` or drops it.
+    let ready = ready_rx.await;
+    if matches!(ready, Ok(Ok(_))) {
+        // Release the tap so a wrongly-successful start fails instead of hanging.
+        shutdown.cancel();
+        let _ = handle.await;
+        panic!("tap became ready; the start was expected to fail");
+    }
+    (ready, handle.await.expect("tap task panicked"))
+}
+
+/// Serves like `StubPlugin` and counts how many times the tap started it.
+struct CountingStub {
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for CountingStub {
+    fn name(&self) -> &str {
+        "counting-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        let listener = TcpListener::bind(local)
+            .await
+            .map_err(|e| crate::Error::Chain(format!("stub bind {local}: {e}")))?;
+        let _ = ready.send(Ok(PluginReady {
+            listen: listener.local_addr().unwrap_or(local),
+            transports: crate::sitrep::Transports::TCP,
+        }));
+        shutdown.cancelled().await;
+        Ok(())
+    }
+}
+
+/// Finds its port taken by another listener, as a sitrep plugin that lost the
+/// race for it would: reports the real bind error as a typed `BindConflict`,
+/// then keeps running with the other listener still up.
+struct StolenPortStub {
+    /// The `(addr, errno)` it reported.
+    reported: Arc<Mutex<Option<(SocketAddr, i32)>>>,
+    /// Set when the stub's future is dropped.
+    torn_down: Arc<AtomicBool>,
+}
+
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for StolenPortStub {
+    fn name(&self) -> &str {
+        "stolen-port-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        let _torn_down = SetOnDrop(self.torn_down);
+        let _other_process = std::net::TcpListener::bind(local).expect("take the inner port");
+        let e = TcpListener::bind(local)
+            .await
+            .expect_err("the port is held, so this bind must fail");
+        let errno = e.raw_os_error().unwrap_or(0);
+        *self.reported.lock().unwrap() = Some((local, errno));
+        let _ = ready.send(Err(StartError::BindConflict { errno, addr: local }));
+        shutdown.cancelled().await;
+        Ok(())
+    }
+}
+
+/// Reports `report` (when `Some`) on `ready`, or drops `ready` unsent, then fails.
+struct FailingStub {
+    report: Option<StartError>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for FailingStub {
+    fn name(&self) -> &str {
+        "failing-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        if let Some(e) = self.report {
+            let _ = ready.send(Err(e));
+        }
+        Err(crate::Error::Chain("stub failed".into()))
+    }
+}
+
+/// Exits with an error while its `ready` sender is still alive, so the channel
+/// never resolves: the shape of a `BinaryPlugin` in `Probe` mode whose child
+/// died, whose probe task still holds the sender.
+struct ExitsHoldingReadyStub;
+
+#[async_trait::async_trait]
+impl ChainPlugin for ExitsHoldingReadyStub {
+    fn name(&self) -> &str {
+        "exits-holding-ready-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        tokio::spawn(async move {
+            shutdown.cancelled().await;
+            drop(ready);
+        });
+        Err(crate::Error::Chain("stub failed".into()))
+    }
+}
+
+/// Never readies; returns once shutdown fires.
+struct ParkedStub;
+
+#[async_trait::async_trait]
+impl ChainPlugin for ParkedStub {
+    fn name(&self) -> &str {
+        "parked-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        _ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        shutdown.cancelled().await;
+        Ok(())
+    }
+}
+
+fn loopback() -> SocketAddr {
+    "127.0.0.1:0".parse().unwrap()
+}
+
+#[skuld::test]
+async fn a_public_bind_conflict_is_reported_and_the_inner_is_not_restarted() {
+    // Another listener holds the public address.
+    let holder = std::net::TcpListener::bind(loopback()).unwrap();
+    let public = holder.local_addr().unwrap();
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let inner = Box::new(CountingStub { runs: runs.clone() });
+    let (ready, result) = failed_start(inner, public).await;
+
+    assert!(
+        matches!(&ready, Ok(Err(StartError::BindConflict { addr, errno })) if *addr == public && *errno != 0),
+        "want BindConflict on the public address, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "a public conflict never restarts the inner"
+    );
+    drop(holder);
+}
+
+#[skuld::test]
+async fn a_typed_bind_conflict_from_the_inner_is_reported_not_swallowed() {
+    let reported = Arc::new(Mutex::new(None));
+    let torn_down = Arc::new(AtomicBool::new(false));
+    let inner = Box::new(StolenPortStub {
+        reported: reported.clone(),
+        torn_down: torn_down.clone(),
+    });
+    let (ready, result) = failed_start(inner, loopback()).await;
+
+    let (inner_addr, inner_errno) = reported.lock().unwrap().expect("the stub reported its conflict");
+    assert!(inner_errno != 0, "the stub's errno comes from a real failed bind");
+    assert!(
+        matches!(&ready, Ok(Err(StartError::BindConflict { addr, errno })) if *addr == inner_addr && *errno == inner_errno),
+        "want the inner's BindConflict on {inner_addr} (errno {inner_errno}), got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+    assert!(
+        torn_down.load(Ordering::SeqCst),
+        "the inner must be gone once run returns"
+    );
+}
+
+#[skuld::test]
+async fn a_typed_fatal_from_the_inner_is_forwarded() {
+    let inner = Box::new(FailingStub {
+        report: Some(StartError::Fatal {
+            detail: "bad config".into(),
+            errno: Some(7),
+        }),
+    });
+    let (ready, result) = failed_start(inner, loopback()).await;
+
+    assert!(
+        matches!(&ready, Ok(Err(StartError::Fatal { detail, errno: Some(7) })) if detail == "bad config"),
+        "want the inner's Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn an_inner_that_exits_without_a_typed_cause_is_fatal_not_a_bind_conflict() {
+    // A non-sitrep plugin that dies before readying says nothing about why.
+    let inner = Box::new(FailingStub { report: None });
+    let (ready, result) = failed_start(inner, loopback()).await;
+
+    assert!(
+        matches!(&ready, Ok(Err(StartError::Fatal { .. }))),
+        "want Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn an_inner_that_exits_while_holding_ready_is_fatal() {
+    let (ready, result) = failed_start(Box::new(ExitsHoldingReadyStub), loopback()).await;
+
+    assert!(
+        matches!(&ready, Ok(Err(StartError::Fatal { .. }))),
+        "want Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn shutdown_before_the_inner_is_ready_drops_ready_unsent() {
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let tap = Box::new(TapPlugin::wrap(Box::new(ParkedStub)));
+    let result = tap.run(loopback(), unused_remote(), shutdown, ready_tx).await;
+
+    assert!(result.is_ok(), "a clean shutdown is not an error, got {result:?}");
+    assert!(ready_rx.await.is_err(), "shutdown before ready leaves `ready` unsent");
+}
+
+// Inner port pick =====================================================================================================
+
+fn addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// A probe that returns `script` in order, then panics, and counts its calls.
+fn scripted(script: Vec<io::Result<SocketAddr>>, calls: &AtomicUsize) -> impl FnMut() -> io::Result<SocketAddr> + '_ {
+    let mut script = script.into_iter();
+    move || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        script.next().expect("probe called past the end of its script")
+    }
+}
+
+#[skuld::test]
+async fn the_inner_port_pick_never_returns_the_public_port() {
+    // More consecutive collisions than the old attempt cap.
+    let calls = AtomicUsize::new(0);
+    let mut script: Vec<_> = (0..9).map(|_| Ok(addr(5000))).collect();
+    script.push(Ok(addr(5001)));
+    let picked = allocate_inner_port_with(5000, scripted(script, &calls)).await.unwrap();
+
+    assert_eq!(picked, addr(5001));
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
+}
+
+#[skuld::test]
+async fn the_inner_port_pick_retries_transient_errors_without_a_cap() {
+    let kinds = [
+        io::ErrorKind::AddrInUse,
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::AddrNotAvailable,
+    ];
+    let calls = AtomicUsize::new(0);
+    let mut script: Vec<_> = (0..60).map(|i| Err(io::Error::from(kinds[i % 3]))).collect();
+    script.push(Ok(addr(5001)));
+    let picked = allocate_inner_port_with(5000, scripted(script, &calls)).await.unwrap();
+
+    assert_eq!(picked, addr(5001));
+    assert_eq!(calls.load(Ordering::SeqCst), 61);
+}
+
+#[skuld::test]
+async fn the_inner_port_pick_returns_a_non_transient_error_at_once() {
+    let calls = AtomicUsize::new(0);
+    let script = vec![
+        Err(io::Error::from(io::ErrorKind::AddrInUse)),
+        Err(io::Error::from(io::ErrorKind::Other)),
+    ];
+    let err = allocate_inner_port_with(5000, scripted(script, &calls))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }

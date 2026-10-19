@@ -15,16 +15,20 @@
 //!
 //! Lifecycle:
 //! 1. Allocate an internal port for the inner plugin via probe-and-drop
-//!    on `(ip, 0)`. Wrap in a small bind-race retry loop in case Windows
-//!    excluded-port-range tables would refuse the second bind.
+//!    on `(ip, 0)`, never the public port. A port the OS refuses for a
+//!    transient reason (the Windows excluded-port-range flake) or hands back
+//!    as the public port is picked again, with no attempt cap.
 //! 2. Spawn the inner plugin's `run` future in a task, configured to bind
 //!    that internal port.
-//! 3. Wait for the inner plugin to actually accept TCP via
-//!    [`crate::chain::poll_ready`], racing the inner task's `JoinHandle`
-//!    so an early inner failure unblocks us. (The inner's own readiness
-//!    channel is discarded — the tap detects inner readiness by the probe
-//!    and inner failure by the join.) Bounded at 30s; on timeout the
-//!    inner task is aborted and `Error::Chain` propagates.
+//! 3. Wait for the inner plugin's own readiness report, racing the inner
+//!    task's `JoinHandle` so an early inner failure unblocks us. The report
+//!    is the only readiness signal: a TCP probe cannot tell the inner from
+//!    another process that took the probed port. A typed failure the inner
+//!    reports (`BindConflict` when another process took the internal port,
+//!    `Fatal`) becomes the tap's own, so the caller sees the same retryable
+//!    or terminal class. An inner that exits without reporting says nothing
+//!    about why and is `Fatal`. Bounded at 30s; on timeout the inner task is
+//!    aborted and `Error::Chain` propagates.
 //! 4. Bind the tap's public listener on `local` (only after step 3, so the
 //!    public bind happens only once the data plane is actually wired
 //!    through), then report the tap's OWN readiness on the `ready` channel
@@ -69,11 +73,6 @@ const INNER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// per-connection state.
 const INNER_CONNECT_RETRY_BUDGET: Duration = Duration::from_millis(250);
 
-/// Maximum attempts to allocate an internal port. One round of
-/// alloc-then-bind is usually enough on Linux/macOS; on Windows the
-/// excluded-port-range table can flake briefly, so up to N retries.
-const INNER_PORT_ALLOC_ATTEMPTS: u32 = 4;
-
 /// Decorator that wraps any [`ChainPlugin`] in a counting loopback hop.
 ///
 /// `wrap(inner)` produces a new plugin whose `run` performs the lifecycle
@@ -106,7 +105,7 @@ impl ChainPlugin for TapPlugin {
         let plugin_name = self.inner.name().to_string();
 
         // 1. Allocate inner port (probe-and-drop, with bind-race retry).
-        let inner_local = match allocate_inner_port(local.ip()) {
+        let inner_local = match allocate_inner_port(local.ip(), local.port()).await {
             Ok(addr) => addr,
             Err(e) => {
                 let _ = ready.send(Err(StartError::Fatal {
@@ -119,59 +118,65 @@ impl ChainPlugin for TapPlugin {
             }
         };
 
-        // 2. Spawn the inner plugin against `inner_local`. The trait
-        //    requires a readiness channel, but the tap discards the inner's
-        //    (it detects inner readiness via the TCP probe in step 3 and
-        //    inner failure via the join); the tap reports its OWN readiness
-        //    (below) once the public listener is bound.
+        // 2. Spawn the inner plugin against `inner_local`.
         let inner_shutdown = shutdown.clone();
-        let (inner_ready_tx, _inner_ready_rx) = oneshot::channel();
+        let (inner_ready_tx, mut inner_ready_rx) = oneshot::channel();
         let mut inner_handle = tokio::spawn(self.inner.run(inner_local, remote, inner_shutdown, inner_ready_tx));
 
-        // 3. Wait for the inner plugin to bind the inner port. Race
-        //    against the inner task itself so an early plugin failure
-        //    doesn't leave us blocked on a port that will never bind.
-        let ready_token = shutdown.clone();
-        // The join arm diverges (returns), so this `select!` always yields
-        // the timeout arm's `Result<Option<SocketAddr>, Elapsed>` — no
-        // `Option` wrapper / impossible `None` state to handle below.
-        let ready_outcome = tokio::select! {
-            r = tokio::time::timeout(INNER_READY_TIMEOUT, crate::chain::poll_ready(inner_local, ready_token)) => r,
+        // 3. Wait for the inner plugin's readiness report, racing the inner
+        //    task itself so an early plugin failure doesn't leave us blocked.
+        //    `biased`: a report already delivered outranks the exit that
+        //    follows it.
+        // sync-exception(external-event, CLAUDE.md class 2): INNER_READY_TIMEOUT is the
+        // failure bound for an inner plugin (often a child process) that may never ready;
+        // it is surfaced to the caller, not used to sync code we control.
+        let reported = tokio::select! {
+            biased;
+            r = tokio::time::timeout(INNER_READY_TIMEOUT, &mut inner_ready_rx) => r,
             join = &mut inner_handle => {
-                // Inner exited before binding — propagate its result. No
-                // tap listener was ever opened. Report the inner's failure
-                // through our own readiness channel so the chain aggregator
-                // sees a typed cause.
-                let _ = ready.send(Err(StartError::Fatal {
-                    detail: format!("tap[{plugin_name}]: inner exited before becoming ready"),
-                    errno: None,
-                }));
-                return match join {
-                    Ok(result) => result,
-                    Err(je) => Err(crate::Error::Chain(format!("tap[{plugin_name}]: inner task: {je}"))),
-                };
+                // The inner exited. A typed report sent just before the exit
+                // is still in the channel; nothing more can arrive after it.
+                let typed = inner_ready_rx.try_recv().ok().and_then(Result::err);
+                report_start_failure(&plugin_name, ready, typed);
+                return join_result(&plugin_name, join);
             }
-        };
-        match ready_outcome {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                // Shutdown fired before inner was ready. Drop `ready` unsent
-                // (RecvError, matching the "shutdown before ready"
-                // semantics). Wait for inner to unwind and propagate.
+            () = shutdown.cancelled() => {
+                // Drop `ready` unsent (RecvError, matching the "shutdown
+                // before ready" semantics). Wait for inner to unwind and propagate.
                 return drain_inner(plugin_name.as_str(), inner_handle).await;
             }
-            Err(_) => {
+        };
+        match reported {
+            Ok(Ok(Ok(_))) => {}
+            // A typed failure the inner reported while still running: the
+            // caller sees its class.
+            Ok(Ok(Err(e))) => {
                 inner_handle.abort();
                 let _ = inner_handle.await;
+                let detail = format!("tap[{plugin_name}]: inner failed to start: {e}");
+                report_start_failure(&plugin_name, ready, Some(e));
+                return Err(crate::Error::Chain(detail));
+            }
+            // The inner dropped `ready` unsent: it is exiting or already exited.
+            Ok(Err(_dropped)) => {
+                if shutdown.is_cancelled() {
+                    return drain_inner(plugin_name.as_str(), inner_handle).await;
+                }
+                let join = inner_handle.await;
+                report_start_failure(&plugin_name, ready, None);
+                return join_result(&plugin_name, join);
+            }
+            Err(_elapsed) => {
+                inner_handle.abort();
+                let _ = inner_handle.await;
+                let detail = format!(
+                    "tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}"
+                );
                 let _ = ready.send(Err(StartError::Fatal {
-                    detail: format!(
-                        "tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}"
-                    ),
+                    detail: detail.clone(),
                     errno: None,
                 }));
-                return Err(crate::Error::Chain(format!(
-                    "tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}"
-                )));
+                return Err(crate::Error::Chain(detail));
             }
         }
 
@@ -262,6 +267,27 @@ impl ChainPlugin for TapPlugin {
     }
 }
 
+/// Report an inner start failure on the tap's own `ready`: the inner's typed
+/// error when it sent one, else `Fatal` (an exit carries no cause).
+fn report_start_failure(
+    plugin_name: &str,
+    ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    typed: Option<StartError>,
+) {
+    let err = typed.unwrap_or_else(|| StartError::Fatal {
+        detail: format!("tap[{plugin_name}]: inner exited before becoming ready"),
+        errno: None,
+    });
+    let _ = ready.send(Err(err));
+}
+
+fn join_result(plugin_name: &str, join: Result<crate::Result<()>, tokio::task::JoinError>) -> crate::Result<()> {
+    match join {
+        Ok(result) => result,
+        Err(je) => Err(crate::Error::Chain(format!("tap[{plugin_name}]: inner task: {je}"))),
+    }
+}
+
 async fn drain_inner(plugin_name: &str, inner_handle: tokio::task::JoinHandle<crate::Result<()>>) -> crate::Result<()> {
     match inner_handle.await {
         Ok(result) => result,
@@ -270,27 +296,44 @@ async fn drain_inner(plugin_name: &str, inner_handle: tokio::task::JoinHandle<cr
     }
 }
 
-/// Probe-and-drop a free TCP port on `(ip, 0)`. Retries on
-/// `AddrInUse` / `PermissionDenied` / `AddrNotAvailable` (the Windows
-/// excluded-port-range flake) up to [`INNER_PORT_ALLOC_ATTEMPTS`] times.
-fn allocate_inner_port(ip: IpAddr) -> io::Result<SocketAddr> {
-    let mut last_err: Option<io::Error> = None;
-    for _ in 0..INNER_PORT_ALLOC_ATTEMPTS {
-        match std::net::TcpListener::bind(SocketAddr::new(ip, 0)).and_then(|l| l.local_addr()) {
-            Ok(addr) => return Ok(addr),
-            Err(e) => match e.kind() {
-                io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied | io::ErrorKind::AddrNotAvailable => {
-                    last_err = Some(e);
-                    continue;
-                }
-                _ => return Err(e),
-            },
+/// Probe-and-drop a free TCP port on `(ip, 0)` that is not `public_port`.
+async fn allocate_inner_port(ip: IpAddr, public_port: u16) -> io::Result<SocketAddr> {
+    allocate_inner_port_with(public_port, || {
+        std::net::TcpListener::bind(SocketAddr::new(ip, 0)).and_then(|l| l.local_addr())
+    })
+    .await
+}
+
+/// [`allocate_inner_port`] over a caller-supplied probe, so a test can script
+/// the sequence of ports and errors the OS would return.
+///
+/// Picks again, with no attempt cap, when the probe returns `public_port` (the
+/// OS may hand back a port the caller just freed) or an error of the
+/// ephemeral-bind race class (`AddrInUse` / `PermissionDenied` /
+/// `AddrNotAvailable`: the Windows excluded-port-range flake). Any other error
+/// is returned.
+pub(crate) async fn allocate_inner_port_with(
+    public_port: u16,
+    mut probe: impl FnMut() -> io::Result<SocketAddr>,
+) -> io::Result<SocketAddr> {
+    loop {
+        match probe() {
+            Ok(addr) if addr.port() != public_port => return Ok(addr),
+            Ok(_) => {}
+            Err(e) if is_bind_race(&e) => {}
+            Err(e) => return Err(e),
         }
+        tokio::task::yield_now().await;
     }
-    // Reaching here means the loop ran its full `INNER_PORT_ALLOC_ATTEMPTS`
-    // (>= 1) iterations and every one took the transient-error branch, each
-    // of which records `last_err` — so it is always `Some` at this point.
-    Err(last_err.expect("INNER_PORT_ALLOC_ATTEMPTS >= 1 and every transient retry records last_err"))
+}
+
+/// Mirrors `util::retry::is_bind_race` (garter is published and cannot depend
+/// on the unpublished `util`).
+fn is_bind_race(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied | io::ErrorKind::AddrNotAvailable
+    )
 }
 
 async fn handle_tap_connection(
