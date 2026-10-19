@@ -2,7 +2,7 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 
 use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
-use super::ServiceSid;
+use super::{ServiceSid, SidRepair};
 
 fn own_process() -> OwnedHandle {
     // SAFETY: plain FFI call.
@@ -36,4 +36,15 @@ fn a_sid_the_token_lacks_is_not_found_in_it() {
         sid: vec![0x0000_0201, 0x0500_0000, 80, 1],
     };
     assert!(!other.is_in_token_of(&own_process()).expect("read this process's token"));
+}
+
+/// The values are `winsvc.h`'s: `SERVICE_SID_TYPE_NONE` 0, `_UNRESTRICTED` 1,
+/// `_RESTRICTED` 3. Only the type `bridge install` sets is left alone: the
+/// uninstaller's token check needs the service's SID in the token, and a
+/// service without the type (NONE) is the one an in-app update leaves behind.
+#[skuld::test]
+fn only_the_unrestricted_sid_type_is_left_alone() {
+    assert_eq!(SidRepair::for_sid_type(0), SidRepair::Apply);
+    assert_eq!(SidRepair::for_sid_type(1), SidRepair::Leave);
+    assert_eq!(SidRepair::for_sid_type(3), SidRepair::Apply);
 }

@@ -4,6 +4,10 @@
 //! that service, once the service's SID type is set
 //! ([`apply_service_sid`]). A process id the SCM names proves nothing (see
 //! `ProcessHolds::hold_current`); the SID in the token does.
+//!
+//! `hole bridge install` sets the type, but an in-app update runs the old
+//! release's code and never does, so the running bridge makes sure of it itself
+//! ([`ensure_own_service_sid`]).
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -14,11 +18,14 @@ use windows::Win32::Security::{
     EqualSid, GetTokenInformation, LookupAccountNameW, TokenGroups, PSID, SID_NAME_USE, TOKEN_GROUPS, TOKEN_QUERY,
 };
 use windows::Win32::System::Services::{
-    ChangeServiceConfig2W, SC_HANDLE, SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_SID_INFO, SERVICE_SID_TYPE_UNRESTRICTED,
+    ChangeServiceConfig2W, QueryServiceConfig2W, SC_HANDLE, SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_SID_INFO,
+    SERVICE_SID_TYPE_UNRESTRICTED,
 };
 use windows::Win32::System::Threading::OpenProcessToken;
-use windows_service::service::Service;
+use windows_service::service::{Service, ServiceAccess};
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use super::{scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 
 fn failed(call: ScmCall, e: &windows::core::Error) -> io::Error {
@@ -32,7 +39,8 @@ fn failed(call: ScmCall, e: &windows::core::Error) -> io::Error {
 /// Give `service` a service SID (`SERVICE_SID_TYPE_UNRESTRICTED`), which every
 /// process the SCM starts as the service carries in its token from then on.
 /// Needs `CHANGE_CONFIG`. Idempotent. A process started before this ran does
-/// not carry it.
+/// not carry it. Called by `hole bridge install` and, for a service installed
+/// without it, by [`ensure_own_service_sid`].
 pub fn apply_service_sid(service: &Service) -> io::Result<()> {
     let info = SERVICE_SID_INFO {
         dwServiceSidType: SERVICE_SID_TYPE_UNRESTRICTED,
@@ -48,6 +56,79 @@ pub fn apply_service_sid(service: &Service) -> io::Result<()> {
         )
     }
     .map_err(|e| failed(ScmCall::ChangeServiceConfig2, &e))
+}
+
+/// What a service's current SID type calls for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidRepair {
+    /// It is the type [`apply_service_sid`] sets: write nothing.
+    Leave,
+    /// It is any other: set it.
+    Apply,
+}
+
+impl SidRepair {
+    /// The decision for a service whose `SERVICE_SID_INFO.dwServiceSidType` is
+    /// `current`.
+    pub fn for_sid_type(current: u32) -> Self {
+        if current == SERVICE_SID_TYPE_UNRESTRICTED {
+            SidRepair::Leave
+        } else {
+            SidRepair::Apply
+        }
+    }
+}
+
+/// What [`ensure_own_service_sid`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidRepairOutcome {
+    /// The service already had the SID type; nothing was written.
+    AlreadySet,
+    /// The service lacked it and now has it.
+    Applied,
+}
+
+/// The `SERVICE_SID_INFO.dwServiceSidType` of `service`. Needs `QUERY_CONFIG`.
+fn service_sid_type(service: &Service) -> io::Result<u32> {
+    let mut info = SERVICE_SID_INFO::default();
+    let mut needed = 0u32;
+    // SAFETY: the handle is the live one `service` owns; the buffer is the
+    // `SERVICE_SID_INFO` `info` is, which the call fills and keeps no pointer to.
+    unsafe {
+        let buffer = std::slice::from_raw_parts_mut(
+            std::ptr::from_mut(&mut info).cast::<u8>(),
+            std::mem::size_of::<SERVICE_SID_INFO>(),
+        );
+        QueryServiceConfig2W(
+            SC_HANDLE(service.raw_handle()),
+            SERVICE_CONFIG_SERVICE_SID_INFO,
+            Some(buffer),
+            &mut needed,
+        )
+    }
+    .map_err(|e| failed(ScmCall::QueryServiceConfig2, &e))?;
+    Ok(info.dwServiceSidType)
+}
+
+/// Makes sure the bridge's own service (`SERVICE_NAME`) has its service SID
+/// type, writing only when it lacks it. The SCM applies the type at the
+/// service's next start, so the running process is unchanged. Idempotent.
+///
+/// For the `--service` bridge to call at startup: an in-app update is run by
+/// the old release's code, which never set the type.
+pub fn ensure_own_service_sid() -> io::Result<SidRepairOutcome> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG)
+        .map_err(|e| scm_failure(ScmCall::OpenService, e))?;
+    match SidRepair::for_sid_type(service_sid_type(&service)?) {
+        SidRepair::Leave => Ok(SidRepairOutcome::AlreadySet),
+        SidRepair::Apply => {
+            apply_service_sid(&service)?;
+            Ok(SidRepairOutcome::Applied)
+        }
+    }
 }
 
 /// The SID a service of this name carries, resolved by the OS.

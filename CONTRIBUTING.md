@@ -1936,7 +1936,15 @@ down a rollback (bindreams/hole#1099). Three rules close it:
   (`ChangeServiceConfig2`, `SERVICE_CONFIG_SERVICE_SID_INFO`,
   `SERVICE_SID_TYPE_UNRESTRICTED`), which the SCM puts as `NT SERVICE\HoleBridge`
   into the token of every process it starts as the service, and nothing else
-  carries it. A process is opened by id and its token read
+  carries it. An in-app update (cutover) is run by the old release's code, which
+  never sets the type, so the `--service` bridge also makes sure of it at
+  startup (`ensure_own_service_sid`): it reads its own service's type and writes
+  `SERVICE_SID_TYPE_UNRESTRICTED` only when that differs, so an ordinary start
+  writes nothing. A failure is a warning and the start goes on, since the SID
+  gates only the uninstaller's wait and a bridge that would not start for it
+  locks the user out. The SCM applies the type at the service's next start (a
+  reboot or the next update); none is forced, and the uninstaller's check is
+  unchanged. A process is opened by id and its token read
   (`ProcessSource::open`, `ServiceSid::is_in_token_of`); it is kept only if the
   token carries the SID, and a reused id fails that in every state. A restarted
   instance of the same service carries it too, which is right: it is still the
@@ -1949,7 +1957,8 @@ down a rollback (bindreams/hole#1099). Three rules close it:
   that merely is not proven the service's is not evidence that the service's
   process is gone). That is also what a service process started before the SID
   type was set looks like, so on such a host the exit of the process is not
-  awaited, and the stop and the SCM's own notifications are all that is.
+  awaited, and the stop and the SCM's own notifications are all that is, until
+  the start after the one that ran the startup repair above.
 
 A held process is also the ground truth for whether the status is current: the
 SCM's status can lag a process's exit by its own latency, so a process that has

@@ -27,6 +27,11 @@
 //! - `--pid-log <path>`: append this process's id to `<path>` at start, one per
 //!   line, so a test can tell afterwards whether any process the service ran is
 //!   still alive.
+//! - `--sid-repair-log <path>`: before reporting RUNNING, run the bridge's own
+//!   startup repair of the service's SID type (`platform::os::ensure_own_service_sid`)
+//!   and append its outcome (`Applied`, `AlreadySet`, or `Failed: <cause>`) to
+//!   `<path>`, one line per start. Without the flag the helper never touches
+//!   the SID type, so the tests that need a service without one keep it.
 //! - `--parked-event <event>`: signalled once the process is parked by one of
 //!   the two flags above, so a test can tell the hold is in force without
 //!   guessing at timing.
@@ -65,6 +70,7 @@ struct Args {
     delay_attach: Option<String>,
     parked_event: Option<String>,
     pid_log: Option<PathBuf>,
+    sid_repair_log: Option<PathBuf>,
 }
 
 #[cfg(target_os = "windows")]
@@ -79,6 +85,7 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
             Some("--control-log") => args.control_log = Some(PathBuf::from(value)),
             Some("--release-event") => args.release_event = Some(value.into_string().expect("event name is UTF-8")),
             Some("--pid-log") => args.pid_log = Some(PathBuf::from(value)),
+            Some("--sid-repair-log") => args.sid_repair_log = Some(PathBuf::from(value)),
             Some("--hold-start") => args.hold_start = Some(value.into_string().expect("event name is UTF-8")),
             Some("--parked-event") => args.parked_event = Some(value.into_string().expect("event name is UTF-8")),
             Some("--delay-attach") => args.delay_attach = Some(value.into_string().expect("event name is UTF-8")),
@@ -194,6 +201,18 @@ fn service_main(_arguments: Vec<OsString>) {
     else {
         return;
     };
+    if let Some(path) = &args.sid_repair_log {
+        let line = match hole_bridge::platform::os::ensure_own_service_sid() {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(e) => format!("Failed: {e}"),
+        };
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open the sid repair log");
+        writeln!(log, "{line}").expect("write the sid repair log");
+    }
     if let Some(name) = &args.hold_start {
         if status_handle
             .set_service_status(&report(

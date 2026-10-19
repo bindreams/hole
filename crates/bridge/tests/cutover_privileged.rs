@@ -218,6 +218,11 @@ impl ProvisionedService {
         Self::create(helper, vec![], None, false)
     }
 
+    /// `install_without_sid`, with `launch_arguments` on the service's ImagePath.
+    fn install_without_sid_with_args(helper: &std::path::Path, launch_arguments: Vec<std::ffi::OsString>) -> Self {
+        Self::create(helper, launch_arguments, None, false)
+    }
+
     /// The service as `install` registers it, with the service SID (what
     /// `hole bridge install` sets) unless `with_sid` is false.
     fn create(
@@ -1776,6 +1781,61 @@ fn cutover_global_net_state_service_sid_probe_running_without_the_sid_type() {
     let pid = scm_probe::service_process_id();
     let measure = sid_probe::measure(Some(pid));
     sid_probe::print("RUNNING, service SID type NOT set", Some(pid), &measure);
+}
+
+/// The service's SID type as the OS's own tool prints it (`sc qsidtype`), read
+/// apart from the code under test.
+#[cfg(target_os = "windows")]
+fn sc_qsidtype() -> String {
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let out = std::process::Command::new("sc.exe")
+        .args(["qsidtype", SERVICE_NAME])
+        .output()
+        .expect("run sc.exe qsidtype");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("SERVICE_SID_TYPE:"))
+        .unwrap_or_else(|| panic!("sc qsidtype printed no SERVICE_SID_TYPE line: {text}"))
+        .trim()
+        .to_owned()
+}
+
+/// A bridge service that was registered without the service SID type (what an
+/// in-app update leaves behind) gets it when it starts, and a later start finds
+/// it set and writes nothing. `test_service --sid-repair-log` runs the bridge's
+/// own `ensure_own_service_sid` before reporting RUNNING and logs what it did,
+/// so the config is read once the start has returned, and the second start's
+/// outcome says whether it wrote.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_service_without_the_sid_type_gets_it_at_startup() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("sid-repair.log");
+    let _service = ProvisionedService::install_without_sid_with_args(
+        helper,
+        vec!["--sid-repair-log".into(), log.clone().into_os_string()],
+    );
+    assert_eq!(sc_qsidtype(), "NONE", "the fixture starts without the SID type");
+
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("start the service");
+    assert_eq!(sc_qsidtype(), "UNRESTRICTED", "the first start sets the SID type");
+
+    CutoverOs::stop_service_wait_stopped(&mut os).expect("stop the service");
+    CutoverOs::start_service_wait_running(&mut os).expect("start the service again");
+    assert_eq!(sc_qsidtype(), "UNRESTRICTED");
+
+    let outcomes = std::fs::read_to_string(&log).expect("the helper logs each start's outcome");
+    assert_eq!(
+        outcomes.lines().collect::<Vec<_>>(),
+        ["Applied", "AlreadySet"],
+        "the first start writes the SID type and the second finds it set"
+    );
 }
 
 /// A process that is not the service: this test's own.
