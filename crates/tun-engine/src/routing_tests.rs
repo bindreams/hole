@@ -9,6 +9,14 @@ use super::*;
 
 // Helpers =============================================================================================================
 
+/// The route record in `dir`, if it reads as a current one.
+fn load_record(dir: &Path) -> Option<RouteState> {
+    match state::read(&state::file(dir)) {
+        state::Found::Records(record) => Some(record),
+        state::Found::Nothing | state::Found::Unreadable { .. } => None,
+    }
+}
+
 fn ipv4_server() -> IpAddr {
     "1.2.3.4".parse().unwrap()
 }
@@ -1177,7 +1185,6 @@ fn recover_without_state_file_is_a_noop() {
 fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     let tmp = tempfile::tempdir().unwrap();
     let persisted_state = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
@@ -1236,7 +1243,6 @@ fn recover_with_loopback_server_skips_bypass() {
     let tmp = tempfile::tempdir().unwrap();
     let loopback: IpAddr = "127.0.0.1".parse().unwrap();
     let persisted_state = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: loopback,
         interface_name: "en0".into(),
@@ -1279,7 +1285,6 @@ fn recover_with_loopback_server_skips_bypass() {
 fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
     let tmp = tempfile::tempdir().unwrap();
     let persisted_state = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
@@ -1304,7 +1309,7 @@ fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
         |_, _| {},
     );
 
-    let remaining = state::load(tmp.path()).expect("a spawn failure on every command must keep the state file");
+    let remaining = load_record(tmp.path()).expect("a spawn failure on every command must keep the state file");
     assert_eq!(
         remaining.installed,
         planned_routes(ipv4_server()),
@@ -1316,7 +1321,6 @@ fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
 fn recover_narrows_the_state_file_to_the_command_that_failed_to_spawn() {
     let tmp = tempfile::tempdir().unwrap();
     let persisted_state = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
@@ -1345,7 +1349,7 @@ fn recover_narrows_the_state_file_to_the_command_that_failed_to_spawn() {
         |_, _| {},
     );
 
-    let remaining = state::load(tmp.path()).expect("the unconfirmed route must stay recorded");
+    let remaining = load_record(tmp.path()).expect("the unconfirmed route must stay recorded");
     assert_eq!(
         remaining.installed,
         vec![RouteId::SplitV6Low],
@@ -1365,7 +1369,6 @@ fn recover_drops_an_unplannable_id_instead_of_looping_forever() {
     let tmp = tempfile::tempdir().unwrap();
     let loopback: IpAddr = "127.0.0.1".parse().unwrap();
     let persisted_state = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: loopback,
         interface_name: "en0".into(),
@@ -1832,7 +1835,6 @@ fn recover_prefers_its_own_route_state_tun_name_over_the_fallback() {
     // precedence is actually exercised, not merely consistent with either.
     let dir = tempfile::tempdir().unwrap();
     let persisted_state = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun-from-state".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
@@ -2094,7 +2096,6 @@ fn recovery_deletes_only_the_recorded_routes() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: ipv4_server(),
             interface_name: "en0".into(),
@@ -2137,7 +2138,6 @@ fn recovery_bypass_phase_does_not_repeat_the_split_deletes() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: ipv4_server(),
             interface_name: "en0".into(),
@@ -2186,7 +2186,6 @@ fn recover_attempts_a_stale_group_and_clears_the_file_once_everything_drains() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: ipv4_server(),
             interface_name: "en0".into(),
@@ -2238,7 +2237,6 @@ fn recover_keeps_the_file_when_only_the_stale_group_fails_to_confirm_gone() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: ipv4_server(),
             interface_name: "en0".into(),
@@ -2285,7 +2283,7 @@ fn recover_keeps_the_file_when_only_the_stale_group_fails_to_confirm_gone() {
     );
 
     let remaining =
-        state::load(tmp.path()).expect("the stale group's unconfirmed route must keep the state file recorded");
+        load_record(tmp.path()).expect("the stale group's unconfirmed route must keep the state file recorded");
     assert!(
         remaining.installed.is_empty(),
         "the primary record fully drained: {:?}",
@@ -2679,7 +2677,6 @@ fn block_next_save(state_dir: &Path) {
 fn checkpoint_installed_rolls_back_in_memory_on_save_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let mut persisted = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "utun7".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
@@ -2690,14 +2687,14 @@ fn checkpoint_installed_rolls_back_in_memory_on_save_failure() {
     };
 
     // First checkpoint succeeds and lands on disk.
-    checkpoint_installed(&mut persisted, tmp.path(), None, &[RouteId::SplitV4Low]).unwrap();
+    checkpoint_installed(&mut persisted, &state::file(tmp.path()), None, &[RouteId::SplitV4Low]).unwrap();
     assert_eq!(persisted.installed, vec![RouteId::SplitV4Low]);
 
     // The next save is forced to fail deterministically.
     block_next_save(tmp.path());
     let result = checkpoint_installed(
         &mut persisted,
-        tmp.path(),
+        &state::file(tmp.path()),
         None,
         &[RouteId::SplitV4Low, RouteId::SplitV4High],
     );
@@ -2727,7 +2724,6 @@ fn install_rollback_clears_the_file_when_a_checkpoint_write_failure_leaves_nothi
     let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
 
     let mut persisted = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "utun7".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
@@ -2743,7 +2739,7 @@ fn install_rollback_clears_the_file_when_a_checkpoint_write_failure_leaves_nothi
     // file onto an existing directory.
     let state_file_path = tmp.path().join(STATE_FILE_NAME);
     std::fs::create_dir(&state_file_path).unwrap();
-    let write_result = checkpoint_installed(&mut persisted, tmp.path(), None, &[RouteId::SplitV4Low]);
+    let write_result = checkpoint_installed(&mut persisted, &state::file(tmp.path()), None, &[RouteId::SplitV4Low]);
     assert!(
         write_result.is_err(),
         "the write must fail while a directory occupies its destination"
@@ -2776,7 +2772,7 @@ fn install_rollback_clears_the_file_when_a_checkpoint_write_failure_leaves_nothi
     );
 
     assert!(
-        state::load(tmp.path()).is_none(),
+        load_record(tmp.path()).is_none(),
         "nothing was confirmed installed and nothing is uncertain, so rollback must clear the \
          state file, not leave a phantom `installed: [SplitV4Low]` record for the next start's \
          recovery to act on"
@@ -2873,7 +2869,6 @@ fn install_sweep_carries_forward_a_still_unconfirmed_leftover_instead_of_losing_
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: "9.9.9.9".parse().unwrap(),
             interface_name: "en0".into(),
@@ -2888,7 +2883,6 @@ fn install_sweep_carries_forward_a_still_unconfirmed_leftover_instead_of_losing_
 
     // The new session's own template, as `install` builds it before sweeping.
     let mut persisted = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: "1.1.1.1".parse().unwrap(),
         interface_name: "en0".into(),
@@ -2900,9 +2894,10 @@ fn install_sweep_carries_forward_a_still_unconfirmed_leftover_instead_of_losing_
 
     // The sweep's delete fails the same way it did before — never confirmed
     // gone — the exact scenario the sweep exists for.
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_, _argv, _phase| {
+    sweep_leftover_before_install(&state::file(tmp.path()), None, &mut persisted, |_, _argv, _phase| {
         Err(CommandFailure::Exit(1))
-    });
+    })
+    .unwrap();
 
     let expected_stale = vec![state::StaleRecord {
         tun_name: "hole-tun".into(),
@@ -2923,7 +2918,7 @@ fn install_sweep_carries_forward_a_still_unconfirmed_leftover_instead_of_losing_
 
     // The file on disk must ALSO carry it forward — not just the in-memory
     // value — proving the write landed, not merely the struct in memory.
-    let on_disk = state::load(tmp.path()).unwrap();
+    let on_disk = load_record(tmp.path()).unwrap();
     assert_eq!(on_disk.stale, expected_stale);
 }
 
@@ -2936,7 +2931,6 @@ fn install_sweep_drops_a_fully_confirmed_leftover() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: "9.9.9.9".parse().unwrap(),
             interface_name: "en0".into(),
@@ -2950,7 +2944,6 @@ fn install_sweep_drops_a_fully_confirmed_leftover() {
     .unwrap();
 
     let mut persisted = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: "1.1.1.1".parse().unwrap(),
         interface_name: "en0".into(),
@@ -2960,7 +2953,13 @@ fn install_sweep_drops_a_fully_confirmed_leftover() {
         stale: Vec::new(),
     };
 
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_, _argv, _phase| Ok(()));
+    sweep_leftover_before_install(
+        &state::file(tmp.path()),
+        None,
+        &mut persisted,
+        |_, _argv, _phase| Ok(()),
+    )
+    .unwrap();
 
     assert!(
         persisted.stale.is_empty(),
@@ -2980,7 +2979,6 @@ fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: "5.5.5.5".parse().unwrap(),
             interface_name: "en0".into(),
@@ -3001,7 +2999,6 @@ fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
     .unwrap();
 
     let mut persisted = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: "1.1.1.1".parse().unwrap(),
         interface_name: "en0".into(),
@@ -3012,7 +3009,7 @@ fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
     };
 
     let attempted: RefCell<Vec<String>> = RefCell::new(Vec::new());
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_, argv, _phase| {
+    sweep_leftover_before_install(&state::file(tmp.path()), None, &mut persisted, |_, argv, _phase| {
         if argv.iter().any(|a| a == "9.9.9.9") {
             attempted.borrow_mut().push("9.9.9.9".into());
         }
@@ -3020,7 +3017,8 @@ fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
             attempted.borrow_mut().push("5.5.5.5".into());
         }
         Err(CommandFailure::Exit(1)) // nothing confirms gone — both groups must still be attempted
-    });
+    })
+    .unwrap();
 
     // Both the immediately-prior session's own record AND the older debt it
     // was carrying must have driven a real teardown command — not just be
@@ -3060,7 +3058,6 @@ fn install_sweep_coalesces_a_stale_group_identical_to_the_leftover_primary() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: "9.9.9.9".parse().unwrap(),
             interface_name: "en0".into(),
@@ -3081,7 +3078,6 @@ fn install_sweep_coalesces_a_stale_group_identical_to_the_leftover_primary() {
     .unwrap();
 
     let mut persisted = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: "1.1.1.1".parse().unwrap(),
         interface_name: "en0".into(),
@@ -3092,7 +3088,7 @@ fn install_sweep_coalesces_a_stale_group_identical_to_the_leftover_primary() {
     };
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, capturing_runner(&log));
+    sweep_leftover_before_install(&state::file(tmp.path()), None, &mut persisted, capturing_runner(&log)).unwrap();
 
     let log = log.into_inner();
     let split_v4_low_deletes: Vec<_> = log
@@ -3120,7 +3116,6 @@ fn install_sweep_merges_a_new_leftover_into_an_existing_stale_group_of_the_same_
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: "9.9.9.9".parse().unwrap(),
             interface_name: "en0".into(),
@@ -3141,7 +3136,6 @@ fn install_sweep_merges_a_new_leftover_into_an_existing_stale_group_of_the_same_
     .unwrap();
 
     let mut persisted = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: "1.1.1.1".parse().unwrap(),
         interface_name: "en0".into(),
@@ -3152,9 +3146,10 @@ fn install_sweep_merges_a_new_leftover_into_an_existing_stale_group_of_the_same_
     };
 
     // Never confirms gone — both records must fold into ONE retried entry.
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_, _argv, _phase| {
+    sweep_leftover_before_install(&state::file(tmp.path()), None, &mut persisted, |_, _argv, _phase| {
         Err(CommandFailure::Exit(1))
-    });
+    })
+    .unwrap();
 
     assert_eq!(
         persisted.stale.len(),
@@ -3164,7 +3159,7 @@ fn install_sweep_merges_a_new_leftover_into_an_existing_stale_group_of_the_same_
         persisted.stale
     );
 
-    let on_disk = state::load(tmp.path()).unwrap();
+    let on_disk = load_record(tmp.path()).unwrap();
     assert_eq!(
         on_disk.stale.len(),
         1,
@@ -3184,7 +3179,6 @@ fn install_sweep_drops_an_unplannable_stale_group() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: "1.1.1.1".parse().unwrap(),
             interface_name: "en0".into(),
@@ -3205,7 +3199,6 @@ fn install_sweep_drops_an_unplannable_stale_group() {
     .unwrap();
 
     let mut persisted = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: "2.2.2.2".parse().unwrap(),
         interface_name: "en0".into(),
@@ -3216,7 +3209,7 @@ fn install_sweep_drops_an_unplannable_stale_group() {
     };
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, capturing_runner(&log));
+    sweep_leftover_before_install(&state::file(tmp.path()), None, &mut persisted, capturing_runner(&log)).unwrap();
 
     assert!(
         persisted.stale.is_empty(),
@@ -3241,7 +3234,6 @@ fn recovery_never_issues_the_same_split_delete_twice_across_groups() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "hole-tun".into(),
             server_ip: ipv4_server(),
             interface_name: "en0".into(),
@@ -3299,7 +3291,6 @@ fn recovery_never_issues_the_same_macos_split_delete_twice_across_different_tun_
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "utun7".into(),
             server_ip: ipv4_server(),
             interface_name: "en0".into(),
@@ -3362,7 +3353,6 @@ fn recover_groups_issues_one_bypass_delete_for_two_unmerged_groups() {
     state::save(
         tmp.path(),
         &RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: "utun7".into(),
             server_ip: ipv4_server(),
             interface_name: "en0".into(),
@@ -3425,7 +3415,6 @@ fn rollback_never_erases_extra_unconfirmed_mid_loop() {
     let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
 
     let persisted = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "utun7".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
@@ -3444,7 +3433,7 @@ fn rollback_never_erases_extra_unconfirmed_mid_loop() {
 
     let checked_mid_loop = std::cell::Cell::new(false);
     let runner = |_, _argv: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
-        let on_disk = state::load(tmp.path()).expect("record must exist mid-rollback");
+        let on_disk = load_record(tmp.path()).expect("record must exist mid-rollback");
         assert!(
             on_disk.installed.contains(&RouteId::ServerBypass),
             "extra_unconfirmed must never be absent from the on-disk record mid-rollback: {:?}",
@@ -3490,7 +3479,6 @@ fn rollback_never_erases_extra_unconfirmed_mid_loop() {
 fn a_stale_server_bypass_is_not_what_the_lookup_returns() {
     let tmp = tempfile::tempdir().unwrap();
     let leftover = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
@@ -3502,7 +3490,7 @@ fn a_stale_server_bypass_is_not_what_the_lookup_returns() {
     state::save(tmp.path(), &leftover, None).unwrap();
 
     let calls = std::cell::RefCell::new(Vec::new());
-    clear_stale_server_bypass(tmp.path(), None, ipv4_server(), |_, argv, _phase| {
+    clear_stale_server_bypass(&state::file(tmp.path()), None, ipv4_server(), |_, argv, _phase| {
         calls.borrow_mut().push(argv.to_vec());
         Ok(())
     });
@@ -3513,7 +3501,7 @@ fn a_stale_server_bypass_is_not_what_the_lookup_returns() {
         "the stale bypass's own delete command must run exactly once"
     );
 
-    let on_disk = state::load(tmp.path()).expect("record must still exist (only ServerBypass was cleared)");
+    let on_disk = load_record(tmp.path()).expect("record must still exist (only ServerBypass was cleared)");
     assert!(
         !on_disk.installed.contains(&RouteId::ServerBypass),
         "a confirmed-deleted stale bypass must not still be reported installed: {:?}",
@@ -3529,7 +3517,6 @@ fn a_stale_server_bypass_is_not_what_the_lookup_returns() {
 fn a_stale_bypass_to_a_different_server_is_left_alone() {
     let tmp = tempfile::tempdir().unwrap();
     let leftover = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: "9.9.9.9".parse().unwrap(),
         interface_name: "en0".into(),
@@ -3542,7 +3529,7 @@ fn a_stale_bypass_to_a_different_server_is_left_alone() {
 
     let calls = std::cell::RefCell::new(Vec::new());
     // Query for a DIFFERENT destination than the leftover's own server_ip.
-    clear_stale_server_bypass(tmp.path(), None, ipv4_server(), |_, argv, _phase| {
+    clear_stale_server_bypass(&state::file(tmp.path()), None, ipv4_server(), |_, argv, _phase| {
         calls.borrow_mut().push(argv.to_vec());
         Ok(())
     });
@@ -3551,7 +3538,7 @@ fn a_stale_bypass_to_a_different_server_is_left_alone() {
         calls.borrow().is_empty(),
         "a leftover for a different server_ip must not be touched"
     );
-    let on_disk = state::load(tmp.path()).unwrap();
+    let on_disk = load_record(tmp.path()).unwrap();
     assert!(on_disk.installed.contains(&RouteId::ServerBypass));
 }
 
@@ -3562,7 +3549,6 @@ fn a_stale_bypass_to_a_different_server_is_left_alone() {
 fn a_stale_server_bypass_inside_the_carried_forward_group_is_also_cleared() {
     let tmp = tempfile::tempdir().unwrap();
     let leftover = RouteState {
-        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: "5.5.5.5".parse().unwrap(),
         interface_name: "en1".into(),
@@ -3580,9 +3566,9 @@ fn a_stale_server_bypass_inside_the_carried_forward_group_is_also_cleared() {
     };
     state::save(tmp.path(), &leftover, None).unwrap();
 
-    clear_stale_server_bypass(tmp.path(), None, ipv4_server(), |_, _argv, _phase| Ok(()));
+    clear_stale_server_bypass(&state::file(tmp.path()), None, ipv4_server(), |_, _argv, _phase| Ok(()));
 
-    let on_disk = state::load(tmp.path()).unwrap();
+    let on_disk = load_record(tmp.path()).unwrap();
     assert!(
         on_disk.stale.is_empty(),
         "the stale group's ServerBypass must be cleared and the now-empty group dropped: {:?}",

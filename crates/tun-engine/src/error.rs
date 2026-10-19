@@ -12,6 +12,12 @@ pub enum RoutingError {
     Gateway(String),
     #[error("route setup failed: {0}")]
     RouteSetup(String),
+    /// The route record is newer than this release, corrupt, or its read fails.
+    /// It may name routes an earlier run left behind, so nothing is installed
+    /// over it and it is left as it is. `Display` names the path: it is for
+    /// the log, not a toast.
+    #[error("the route record {} cannot be read; it is left as it is, and no route is installed over it", path.display())]
+    StateUnreadable { path: PathBuf },
 }
 
 /// A route command that did not succeed: the spawn failed, or the child exited

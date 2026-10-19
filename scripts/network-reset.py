@@ -28,6 +28,9 @@ from pathlib import Path
 import _lib
 
 # Keep in sync with `crates/tun-engine/src/routing/state.rs::STATE_FILE_NAME`.
+# The file is one flat JSON object, `{"version": N, "server_ip": ..., ...}`,
+# read through `util::versioned_file`. This script reads only `server_ip` and
+# ignores the rest, as the bridge does, so a newer release's file still works.
 STATE_FILE_NAME = "bridge-routes.json"
 # Keep in sync with `crates/bridge/src/dns_state.rs::STATE_FILE_NAME` /
 # `SUPERSEDED_FILE_NAME`. The bridge's own upgrade sweep (bindreams/hole#846)

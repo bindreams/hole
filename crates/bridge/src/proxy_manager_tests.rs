@@ -351,7 +351,6 @@ impl Routing for MockRouting {
         // the fail flag is checked). This keeps the file-lifecycle tests
         // honest — they observe the same write-then-clear behavior.
         let persisted = route_state::RouteState {
-            version: route_state::SCHEMA_VERSION,
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
@@ -1964,7 +1963,9 @@ fn start_writes_state_file_then_stop_clears_it() {
         assert!(state_path.exists(), "state file must exist while proxy is running");
 
         // Verify the content contains the server IP
-        let loaded = route_state::load(dir.path()).unwrap();
+        let util::versioned_file::Loaded::Current { value: loaded, .. } = route_state::load(dir.path()) else {
+            panic!("the record written by install must read as a current one");
+        };
         assert_eq!(loaded.server_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         pm.stop().await.unwrap();

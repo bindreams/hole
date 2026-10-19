@@ -250,7 +250,6 @@ impl Routing for MockRouting {
         // any mutation, so tests that assert on `bridge-routes.json`
         // see the same write-then-clear lifecycle as production.
         let persisted = route_state::RouteState {
-            version: route_state::SCHEMA_VERSION,
             tun_name: tun.alias().to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),

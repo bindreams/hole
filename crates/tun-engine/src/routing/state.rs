@@ -4,23 +4,25 @@
 //! before mutating the routing table, clears it after normal teardown, and
 //! reads it on startup to clean up leaked routes from a previous crashed
 //! run. Best-effort; not a multi-instance lock.
+//!
+//! The file is a [`VersionedFile`] of role [`Role::OsRecord`]: it is the only
+//! evidence of what a run left in the routing table, so one this release
+//! cannot read (a newer schema, or corrupt) or whose read fails with an I/O
+//! error is never replaced, removed or acted on, and a connect is refused
+//! over it. Discarding an old or unreadable file is not an option: it strands
+//! the host on routes pointing at a dead TUN.
 
-use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use util::versioned_file::{
+    CannotRead, DefaultPlacement, Loaded, Obsolete, Removal, Role, Schema, StoreError, VersionedFile, VersionedState,
+};
 
 use super::{planned_routes, RouteId};
 
 // Types ===============================================================================================================
-
-/// Schema version for [`RouteState`]. Bump when the struct changes in a
-/// backwards-incompatible way, and give [`load`] an arm that migrates the old
-/// shape. Discarding an old file instead is not an option here: the file is
-/// the only record of what a crashed run leaked, so dropping it strands the
-/// host on routes pointing at a dead TUN.
-pub const SCHEMA_VERSION: u32 = 4;
 
 /// The IPv4 server-bypass route's form when this record's own routes went
 /// in — [`crate::gateway::NextHop`] at install time, persisted so a later
@@ -53,9 +55,7 @@ pub const STATE_FILE_NAME: &str = "bridge-routes.json";
 /// clean shutdown. On next startup, recovery reads this file to clean up
 /// any routes leaked by a previous crashed run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RouteState {
-    pub version: u32,
     pub tun_name: String,
     pub server_ip: IpAddr,
     pub interface_name: String,
@@ -88,7 +88,6 @@ pub struct RouteState {
 /// separate because a `RouteState` can carry more than one such group
 /// (a sweep can itself fail to fully drain).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StaleRecord {
     pub tun_name: String,
     pub server_ip: IpAddr,
@@ -98,34 +97,26 @@ pub struct StaleRecord {
     pub installed: Vec<RouteId>,
 }
 
+// Schema history ------------------------------------------------------------------------------------------------------
+//
+// Each version is its own frozen type, linked to the one before it. The file's
+// framing carries the version, so no type below holds it.
+
 /// Schema 1: no `installed` field. Its teardown deleted every route an install
 /// for `server_ip` would have created, whether or not that install succeeded.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RouteStateV1 {
-    version: u32,
+pub struct RouteStateV1 {
     tun_name: String,
     server_ip: IpAddr,
     interface_name: String,
 }
 
-impl From<RouteStateV1> for RouteState {
-    /// Reproduce v1's delete set exactly. A v1 file is written by a bridge
-    /// that has already crashed, so its leak is whatever that run planned;
-    /// assuming the full set cleans up at least as much as the old code did.
-    /// No gateway or stale-group provenance existed in v1 either.
-    fn from(old: RouteStateV1) -> Self {
-        debug_assert_eq!(old.version, 1, "only load's version-1 arm may build this");
-        Self {
-            version: SCHEMA_VERSION,
-            tun_name: old.tun_name,
-            installed: planned_routes(old.server_ip),
-            server_ip: old.server_ip,
-            interface_name: old.interface_name,
-            original_gateway: None,
-            route_form: RouteForm::Via,
-            stale: Vec::new(),
-        }
+impl Schema for RouteStateV1 {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
     }
 }
 
@@ -133,27 +124,26 @@ impl From<RouteStateV1> for RouteState {
 /// gateway a v2 record's own routes used was never persisted, and v2 had no
 /// concept of carried-forward leftovers.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RouteStateV2 {
-    version: u32,
+pub struct RouteStateV2 {
     tun_name: String,
     server_ip: IpAddr,
     interface_name: String,
     installed: Vec<RouteId>,
 }
 
-impl From<RouteStateV2> for RouteState {
-    fn from(old: RouteStateV2) -> Self {
-        debug_assert_eq!(old.version, 2, "only load's version-2 arm may build this");
+impl Schema for RouteStateV2 {
+    const VERSION: u32 = 2;
+    type Prev = RouteStateV1;
+
+    /// Reproduce v1's delete set exactly. A v1 file is written by a bridge
+    /// that has already crashed, so its leak is whatever that run planned;
+    /// assuming the full set cleans up at least as much as the old code did.
+    fn upgrade(prev: RouteStateV1) -> Self {
         Self {
-            version: SCHEMA_VERSION,
-            tun_name: old.tun_name,
-            server_ip: old.server_ip,
-            interface_name: old.interface_name,
-            installed: old.installed,
-            original_gateway: None,
-            route_form: RouteForm::Via,
-            stale: Vec::new(),
+            installed: planned_routes(prev.server_ip),
+            tun_name: prev.tun_name,
+            server_ip: prev.server_ip,
+            interface_name: prev.interface_name,
         }
     }
 }
@@ -162,9 +152,7 @@ impl From<RouteStateV2> for RouteState {
 /// record predates on-link support entirely, so every route it names was
 /// installed through a real gateway.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RouteStateV3 {
-    version: u32,
+pub struct RouteStateV3 {
     tun_name: String,
     server_ip: IpAddr,
     interface_name: String,
@@ -175,13 +163,30 @@ struct RouteStateV3 {
 
 /// [`StaleRecord`] without `route_form`, matching [`RouteStateV3`]'s vintage.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StaleRecordV3 {
+pub struct StaleRecordV3 {
     tun_name: String,
     server_ip: IpAddr,
     interface_name: String,
     original_gateway: Option<IpAddr>,
     installed: Vec<RouteId>,
+}
+
+impl Schema for RouteStateV3 {
+    const VERSION: u32 = 3;
+    type Prev = RouteStateV2;
+
+    /// The gateway v2 never persisted stays unknown, and there were no stale
+    /// groups.
+    fn upgrade(prev: RouteStateV2) -> Self {
+        Self {
+            tun_name: prev.tun_name,
+            server_ip: prev.server_ip,
+            interface_name: prev.interface_name,
+            original_gateway: None,
+            installed: prev.installed,
+            stale: Vec::new(),
+        }
+    }
 }
 
 impl From<StaleRecordV3> for StaleRecord {
@@ -197,31 +202,37 @@ impl From<StaleRecordV3> for StaleRecord {
     }
 }
 
-impl From<RouteStateV3> for RouteState {
-    fn from(old: RouteStateV3) -> Self {
-        debug_assert_eq!(old.version, 3, "only load's version-3 arm may build this");
+/// Schema 4, the current one.
+impl Schema for RouteState {
+    const VERSION: u32 = 4;
+    type Prev = RouteStateV3;
+
+    /// No older schema had an on-link bypass, so every group takes the
+    /// gateway form.
+    fn upgrade(prev: RouteStateV3) -> Self {
         Self {
-            version: SCHEMA_VERSION,
-            tun_name: old.tun_name,
-            server_ip: old.server_ip,
-            interface_name: old.interface_name,
-            original_gateway: old.original_gateway,
+            tun_name: prev.tun_name,
+            server_ip: prev.server_ip,
+            interface_name: prev.interface_name,
+            original_gateway: prev.original_gateway,
             route_form: RouteForm::Via,
-            installed: old.installed,
-            stale: old.stale.into_iter().map(StaleRecord::from).collect(),
+            installed: prev.installed,
+            stale: prev.stale.into_iter().map(StaleRecord::from).collect(),
         }
     }
 }
 
-/// Reads only the discriminant, tolerating fields from any schema.
-#[derive(Debug, Deserialize)]
-struct VersionProbe {
-    version: u32,
+impl VersionedState for RouteState {
+    const FILE_NAME: &'static str = STATE_FILE_NAME;
+    const ROLE: Role = Role::OsRecord;
 }
 
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join(STATE_FILE_NAME)
-}
+// Every schema, not just the current one: a gap is reported by the build, not
+// by `cargo check`, unless each type's link is named.
+util::assert_contiguous!(RouteStateV1);
+util::assert_contiguous!(RouteStateV2);
+util::assert_contiguous!(RouteStateV3);
+util::assert_contiguous!(RouteState);
 
 // Canonical form ======================================================================================================
 
@@ -280,109 +291,132 @@ pub fn coalesce(groups: Vec<StaleRecord>) -> Vec<StaleRecord> {
 
 // I/O =================================================================================================================
 
-/// Write `state` to `<state_dir>/bridge-routes.json` atomically via a
-/// same-directory temp file + rename. Contents are `sync_all`'d before
-/// persist so a process crash (panic, SIGKILL, abort) sees either the old
-/// contents or the new contents, never a truncated file. Creates
-/// `state_dir` if missing.
-///
-/// Does NOT fsync the parent directory after the rename — power-loss
-/// durability is out of scope. The design target is process-crash recovery,
-/// not disk failure recovery.
-pub fn save(state_dir: &Path, state: &RouteState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    util::ownership::chown_if_some(state_dir, owner);
+/// The route record's file. Every read and write of it goes through this type.
+pub(crate) type RouteFile = VersionedFile<RouteState>;
 
-    let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    // Same-directory NamedTempFile -> persist is a same-filesystem atomic rename.
-    let path = state_file(state_dir);
-    let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
-    tmp.write_all(&json)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
-    Ok(())
+pub(crate) fn file(state_dir: &Path) -> RouteFile {
+    VersionedFile::new(state_dir)
 }
 
-/// Load the state file, migrating a schema-1 file forward. Returns `None` for
-/// any error — missing file, corrupted JSON, unknown fields, a version with no
-/// migration — and logs at `warn` level. Crash recovery is best-effort and
-/// should never fail the caller.
-pub fn load(state_dir: &Path) -> Option<RouteState> {
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "route-state read failed");
-            return None;
-        }
-    };
-    let version = match serde_json::from_slice::<VersionProbe>(&bytes) {
-        Ok(probe) => probe.version,
-        Err(e) => {
-            // Converted immediately, never held as a `serde_json::Error`:
-            // this file records `server_ip` (and one per `StaleRecord`), a
-            // protected value, and `serde_json::Error`'s `Display` quotes the
-            // offending bytes back — a skewed file with an address where a
-            // number belongs echoes it verbatim. Nothing arms redaction on
-            // the recovery path either, so there is no sink backstop here.
-            // See `util::parse_error::ParseFailure`'s own doc for why
-            // shadowing `e` here (rather than only calling
-            // `describe_parse_error` where it's logged) is what makes that
-            // safe by construction.
-            let e = util::parse_error::ParseFailure::from(&e);
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "route-state parse failed"
-            );
-            return None;
-        }
-    };
-    let parsed = if version == SCHEMA_VERSION {
-        serde_json::from_slice::<RouteState>(&bytes)
-    } else if version == 3 {
-        tracing::info!(got = version, want = SCHEMA_VERSION, "migrating route-state forward");
-        serde_json::from_slice::<RouteStateV3>(&bytes).map(RouteState::from)
-    } else if version == 2 {
-        tracing::info!(got = version, want = SCHEMA_VERSION, "migrating route-state forward");
-        serde_json::from_slice::<RouteStateV2>(&bytes).map(RouteState::from)
-    } else if version == 1 {
-        tracing::info!(got = version, want = SCHEMA_VERSION, "migrating route-state forward");
-        serde_json::from_slice::<RouteStateV1>(&bytes).map(RouteState::from)
-    } else {
-        tracing::warn!(
-            got = version,
-            want = SCHEMA_VERSION,
-            "route-state schema mismatch, discarding"
-        );
-        return None;
-    };
-    match parsed {
-        Ok(state) => Some(state),
-        Err(e) => {
-            // Same reason as the version probe's arm above.
-            let e = util::parse_error::ParseFailure::from(&e);
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "route-state parse failed"
-            );
-            None
+/// Why a route record that exists is not one to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cause {
+    /// Newer or corrupt: the bytes were read and are not a record.
+    CannotRead(CannotRead),
+    /// The read failed with an I/O error: nothing is known about the bytes.
+    ReadFailed(std::io::ErrorKind),
+}
+
+impl Cause {
+    /// Whether a record in this state stops the bridge from connecting. A
+    /// read that failed blocks too (owner ruling 2026-10-19): the record may
+    /// name a leak, and the next start reads it again.
+    pub(crate) fn blocks_connect(self) -> bool {
+        match self {
+            Cause::CannotRead(why) => RouteState::ROLE.unreadable_blocks_connect(why),
+            Cause::ReadFailed(_) => true,
         }
     }
 }
 
-/// Delete the state file. Tolerates a missing file (returns `Ok`). Returns
-/// `Err` only on actual I/O errors (permissions, etc.).
+// The `ReadFailed` ruling above is the rule for an OS record; another role
+// would need its own.
+const _: () = assert!(matches!(RouteState::ROLE, Role::OsRecord));
+
+impl std::fmt::Display for Cause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Cause::CannotRead(why) => write!(f, "{why}"),
+            Cause::ReadFailed(kind) => write!(f, "the read failed ({kind})"),
+        }
+    }
+}
+
+/// What a caller that acts on route records finds in the file.
+#[derive(Debug)]
+pub(crate) enum Found {
+    /// A record to act on, migrated to the current schema if it was older.
+    Records(RouteState),
+    /// No record to act on.
+    Nothing,
+    /// A record this release cannot act on: newer, corrupt, or unread. It may
+    /// name a leak nobody here can interpret, so nothing runs against it and
+    /// nothing replaces it.
+    Unreadable { path: PathBuf, cause: Cause },
+}
+
+/// Reads the record and classifies it. The one place a [`Loaded`] becomes an
+/// action, shared by every load site.
+pub(crate) fn read(file: &RouteFile) -> Found {
+    match file.load() {
+        Loaded::Current { value, .. } => Found::Records(value),
+        Loaded::Absent => Found::Nothing,
+        Loaded::Unreadable(e) => Found::Unreadable {
+            path: file.path().to_path_buf(),
+            cause: Cause::ReadFailed(e.kind()),
+        },
+        Loaded::Newer { .. } => Found::Unreadable {
+            path: file.path().to_path_buf(),
+            cause: Cause::CannotRead(CannotRead::Newer),
+        },
+        Loaded::Corrupt { .. } => Found::Unreadable {
+            path: file.path().to_path_buf(),
+            cause: Cause::CannotRead(CannotRead::Corrupt),
+        },
+        // The chain's floor is 0 and the framing reads version 0 as corrupt,
+        // so no file decodes to `Obsolete`.
+        Loaded::Obsolete { .. } => unreachable!("the route-state chain has no obsolete version"),
+    }
+}
+
+/// Reads `<state_dir>/bridge-routes.json`.
+pub fn load(state_dir: &Path) -> Loaded<RouteState> {
+    file(state_dir).load()
+}
+
+/// The record's path, iff the connect gate must refuse to start over it: it
+/// is newer, corrupt, or its read fails. `None` for a readable record and no
+/// record.
+pub fn blocking(state_dir: &Path) -> Option<PathBuf> {
+    match read(&file(state_dir)) {
+        Found::Unreadable { path, cause } if cause.blocks_connect() => Some(path),
+        Found::Unreadable { .. } => None,
+        Found::Records(_) => None,
+        Found::Nothing => None,
+    }
+}
+
+/// Writes `state` atomically (same-directory temp file, `sync_all`, rename),
+/// creating `state_dir` if missing. A record this release cannot read, or
+/// whose read fails with an I/O error, is refused, never overwritten. An older
+/// record is replaced.
+pub fn save(state_dir: &Path, state: &RouteState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    write(&file(state_dir), state, owner)
+}
+
+pub(crate) fn write(file: &RouteFile, state: &RouteState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    file.store(state, &DefaultPlacement { owner })
+}
+
+/// Deletes the record. Tolerates a missing file. A record this release cannot
+/// read, or whose read fails, is kept and named in the log: it is not this
+/// process's to remove.
+/// Returns `Err` only on actual I/O errors (permissions, etc.).
 pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    let path = state_file(state_dir);
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    remove(&file(state_dir))
+}
+
+pub(crate) fn remove(file: &RouteFile) -> std::io::Result<()> {
+    match file.remove()? {
+        Removal::Removed | Removal::Absent => Ok(()),
+        Removal::Kept => {
+            tracing::error!(path = %file.path().display(), "route record cannot be read; left in place");
+            Ok(())
+        }
+        Removal::MovedAside(backup) => {
+            tracing::warn!(backup = %backup.display(), "route record moved aside");
+            Ok(())
+        }
     }
 }
 
