@@ -148,7 +148,7 @@ use cosca::Containment;
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use crate::binary::{drain_readers_after_exit, end_plugin, shut_plugin_down, PluginTree};
+use crate::binary::{drain_readers_after_exit, end_plugin, shut_plugin_down, supervise_plugin, PluginEnd, PluginTree};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -243,7 +243,9 @@ type Calls = Arc<Mutex<Vec<&'static str>>>;
 
 /// Answers the teardown's calls as scripted, recording them in order: `kill` runs once, on `kill_tree`;
 /// the tree's exit edge resolves once `edge` is notified (or errors, for `edge_fails`); a root watched
-/// for its grace has exited within it unless `root_outlives_grace`.
+/// for its grace has exited within it unless `root_outlives_grace`; a root watched without a bound has
+/// exited unless `root_never_exits`; `root_watch_fails` makes every watch of the root fail; `reap`
+/// waits for `kill_root` when `reap_waits_for_kill`.
 struct FakeTree<K> {
     containment: Containment,
     kill: Option<K>,
@@ -251,6 +253,9 @@ struct FakeTree<K> {
     edge_fails: bool,
     root_outlives_grace: bool,
     root_watch_fails: bool,
+    root_never_exits: bool,
+    reap_waits_for_kill: bool,
+    root_killed: Arc<Notify>,
     terminate_fails: bool,
     calls: Calls,
 }
@@ -265,6 +270,9 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
             edge_fails: false,
             root_outlives_grace: false,
             root_watch_fails: false,
+            root_never_exits: false,
+            reap_waits_for_kill: false,
+            root_killed: Arc::new(Notify::new()),
             terminate_fails: false,
             calls: Calls::default(),
         }
@@ -293,6 +301,12 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
 
     async fn wait_root_exit(&self) -> Result<(), cosca::error::Error> {
         self.record("wait_root_exit");
+        if self.root_watch_fails {
+            return Err(unsupported());
+        }
+        if self.root_never_exits {
+            std::future::pending::<()>().await;
+        }
         Ok(())
     }
 
@@ -314,6 +328,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
 
     fn kill_root(&mut self) -> Result<(), cosca::error::Error> {
         self.record("kill_root");
+        self.root_killed.notify_one();
         Ok(())
     }
 
@@ -332,6 +347,9 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
     }
 
     async fn reap(&mut self) -> Result<std::process::ExitStatus, cosca::error::Error> {
+        if self.reap_waits_for_kill {
+            self.root_killed.notified().await;
+        }
         self.record("reap");
         Ok(std::process::ExitStatus::default())
     }
@@ -799,19 +817,201 @@ async fn a_shutdown_whose_grace_watch_fails_escalates_to_a_kill() {
 }
 
 #[skuld::test]
-async fn a_shutdown_whose_terminate_fails_kills_nothing_and_reaps_nothing() {
+async fn a_shutdown_whose_terminate_fails_escalates_to_a_kill() {
+    tokio::time::pause();
+    for (containment, edge_awaited) in CONTAINMENTS {
+        let mut tree = drained_tree(containment);
+        tree.terminate_fails = true;
+        shut_plugin_down(
+            "p",
+            &mut tree,
+            Duration::from_secs(5),
+            finished_reader(),
+            finished_reader(),
+        )
+        .await
+        .unwrap();
+
+        let mut expected = vec!["terminate", "kill_root"];
+        expected.extend(killed_then_reaped(edge_awaited));
+        assert_eq!(tree.calls(), expected, "{containment:?}");
+    }
+}
+
+// Supervising a plugin: the wiring `BinaryPlugin::run` calls ----------------------------------------------------------
+
+const GRACE: Duration = Duration::from_secs(5);
+
+async fn supervise(tree: &mut impl PluginTree, shutdown: &CancellationToken) -> PluginEnd {
+    supervise_plugin("p", tree, shutdown, GRACE, finished_reader(), finished_reader())
+        .await
+        .unwrap()
+}
+
+fn cancelled() -> CancellationToken {
+    let token = CancellationToken::new();
+    token.cancel();
+    token
+}
+
+/// A root that exits on its own is watched without being reaped, its tree is killed, and only then is
+/// it reaped.
+#[skuld::test]
+async fn a_root_that_exits_on_its_own_has_its_tree_killed_before_it_is_reaped() {
+    tokio::time::pause();
+    for (containment, edge_awaited) in CONTAINMENTS {
+        let mut tree = drained_tree(containment);
+        let end = supervise(&mut tree, &CancellationToken::new()).await;
+
+        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        let mut expected = vec!["wait_root_exit"];
+        expected.extend(killed_then_reaped(edge_awaited));
+        assert_eq!(tree.calls(), expected, "{containment:?}");
+    }
+}
+
+/// On shutdown the root is asked to exit, given its grace, and its tree is killed before the reap.
+#[skuld::test]
+async fn a_shutdown_request_kills_the_tree_before_the_reap() {
+    tokio::time::pause();
+    for (containment, edge_awaited) in CONTAINMENTS {
+        let mut tree = drained_tree(containment);
+        tree.root_never_exits = true;
+        let end = supervise(&mut tree, &cancelled()).await;
+
+        assert!(matches!(end, PluginEnd::ShutDown), "{containment:?}");
+        let mut expected = vec!["terminate", "wait_root_exit_within"];
+        expected.extend(killed_then_reaped(edge_awaited));
+        assert_eq!(tree.calls(), expected, "{containment:?}");
+    }
+}
+
+/// A root that outlives its grace is killed first; its tree is still killed before the reap.
+#[skuld::test]
+async fn a_shutdown_request_kills_a_root_that_outlives_its_grace_before_the_tree_and_the_reap() {
     tokio::time::pause();
     let mut tree = drained_tree(Containment::ProcessGroup);
-    tree.terminate_fails = true;
-    let result = shut_plugin_down(
-        "p",
-        &mut tree,
-        Duration::from_secs(5),
-        finished_reader(),
-        finished_reader(),
-    )
-    .await;
+    tree.root_never_exits = true;
+    tree.root_outlives_grace = true;
+    let end = supervise(&mut tree, &cancelled()).await;
 
-    assert!(result.is_err());
-    assert_eq!(tree.calls(), ["terminate"]);
+    assert!(matches!(end, PluginEnd::ShutDown));
+    assert_eq!(
+        tree.calls(),
+        ["terminate", "wait_root_exit_within", "kill_root", "kill_tree", "reap"]
+    );
+}
+
+// The exit watch is unavailable ---------------------------------------------------------------------------------------
+//
+// cosca's non-reaping watch needs `pidfd_open` on Linux (absent before 5.3, or denied by a seccomp
+// profile). Without it the root is reaped first, which frees its pid, so a tree kill that signals a
+// process group id could hit an unrelated group that was handed the recycled id.
+
+/// Every containment, each paired with whether `kill_tree` signals a process group id (cosca:
+/// `ProcessGroup` and `Session` are `killpg`; a macOS `FdMarker` also fires `killpg` on its pgid).
+const KILLS_BY_PGID: [(Containment, bool); 8] = [
+    (Containment::CgroupV2, false),
+    (Containment::JobObject, false),
+    (Containment::ProcessGroup, true),
+    (Containment::Session, true),
+    (Containment::FdMarker, true),
+    (Containment::TreeWalk, false),
+    (Containment::Delegated, false),
+    (Containment::None, false),
+];
+
+fn count_matching(log: &str, needle: &str) -> usize {
+    log.lines().filter(|l| l.contains(needle)).count()
+}
+
+/// The root is reaped first. A tree whose kill names a process group id is then left alone, and only
+/// the bounded wait for the output follows; any other tree is still killed.
+#[skuld::test]
+async fn a_root_whose_exit_cannot_be_watched_is_reaped_first_and_a_pgid_tree_is_left_alone() {
+    tokio::time::pause();
+    for (containment, kills_by_pgid) in KILLS_BY_PGID {
+        let (subscriber, writer) = subscriber();
+        let _g = set_default_in_current_thread(subscriber);
+        let (out_dropped, stdout) = held_reader();
+        let mut tree = drained_tree(containment);
+        tree.root_watch_fails = true;
+        let calls = tree.calls.clone();
+        let shutdown = CancellationToken::new();
+        let end = supervise_plugin("unwatched", &mut tree, &shutdown, GRACE, stdout, finished_reader());
+        let mut end = pin!(end);
+
+        // The held stdout ends the wait for the output at its bound, on every containment.
+        assert!(poll_once(end.as_mut()).is_pending(), "{containment:?}");
+        tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
+        let end = match poll_once(end.as_mut()) {
+            Poll::Ready(end) => end.unwrap(),
+            Poll::Pending => panic!("{containment:?}: still waiting at the bound"),
+        };
+        tokio::time::timeout(VIRTUAL_HANG, out_dropped).await.unwrap().ok();
+
+        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        let edge_awaited = CONTAINMENTS.iter().any(|(c, edge)| *c == containment && *edge);
+        let expected: &[&str] = match (kills_by_pgid, edge_awaited) {
+            (true, _) => &["wait_root_exit", "reap"],
+            (false, true) => &["wait_root_exit", "reap", "kill_tree", "wait_tree_drained"],
+            (false, false) => &["wait_root_exit", "reap", "kill_tree"],
+        };
+        assert_eq!(*calls.lock().unwrap(), expected, "{containment:?}");
+
+        let log = writer.snapshot();
+        let fallback: Vec<_> = log.lines().filter(|l| l.contains("cannot be watched")).collect();
+        assert_eq!(
+            fallback.len(),
+            1,
+            "{containment:?}: the fallback is logged once:\n{log}"
+        );
+        assert!(
+            fallback[0].contains("DEBUG") && fallback[0].contains("unwatched"),
+            "{containment:?}: the fallback is a debug line naming the plugin: {}",
+            fallback[0]
+        );
+        assert_eq!(
+            count_matching(&log, "the plugin's output pipes were still open"),
+            1,
+            "{containment:?}: the bounded wait warns:\n{log}"
+        );
+    }
+}
+
+/// A shutdown that arrives while the root is being reaped (its exit could not be watched) ends the
+/// plugin as any shutdown does: the root is still unreaped, so its tree is killed before the reap.
+#[skuld::test]
+async fn a_shutdown_while_the_exit_cannot_be_watched_still_kills_the_tree_before_the_reap() {
+    tokio::time::pause();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_watch_fails = true;
+    tree.reap_waits_for_kill = true;
+    let calls = tree.calls.clone();
+    let shutdown = CancellationToken::new();
+    let end = supervise_plugin("p", &mut tree, &shutdown, GRACE, finished_reader(), finished_reader());
+    let mut end = pin!(end);
+
+    assert!(
+        poll_once(end.as_mut()).is_pending(),
+        "the reap waits for the root to exit"
+    );
+    shutdown.cancel();
+    let end = tokio::time::timeout(VIRTUAL_HANG, end)
+        .await
+        .expect("the shutdown must end the plugin")
+        .unwrap();
+
+    assert!(matches!(end, PluginEnd::ShutDown));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            "wait_root_exit",
+            "terminate",
+            "wait_root_exit_within",
+            "kill_root",
+            "kill_tree",
+            "reap"
+        ]
+    );
 }
