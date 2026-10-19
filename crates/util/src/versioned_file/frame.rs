@@ -60,8 +60,11 @@ fn version_of(token: &str) -> Result<Version, ParseFailure> {
     match token.parse::<u32>() {
         Ok(0) => Err(ParseFailure::framing(NOT_POSITIVE)),
         Ok(version) => Ok(Version::Known(version)),
-        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => Ok(Version::BeyondU32),
-        Err(_) => Err(ParseFailure::framing(NOT_POSITIVE)),
+        Err(e) => {
+            // Non-empty and all digits: overflow is the only way to fail.
+            assert_eq!(*e.kind(), std::num::IntErrorKind::PosOverflow, "{token:?}");
+            Ok(Version::BeyondU32)
+        }
     }
 }
 
