@@ -38,7 +38,9 @@
 //! 5. Accept loop in a `JoinSet`; per-connection forwarder calls
 //!    `tokio::io::copy_bidirectional` with [`CountingStream`] wrappers. A forwarder
 //!    retries a refused connect to the inner until it connects, hits another
-//!    error, or is aborted (shutdown, or the inner task ending).
+//!    error, or is aborted (shutdown, or the inner task ending). An inner that
+//!    stays alive with its listener gone breaks the sitrep contract (it must
+//!    exit); its forwarders then retry until it does.
 //! 6. On shutdown: abort all in-flight forwarders, await the inner task,
 //!    propagate its exit status as ours.
 //!
