@@ -104,7 +104,7 @@ role_file!(OsRecordFile, "os-record.json", Role::OsRecord);
 role_file!(LegacyRecordFile, "legacy-record.json", Role::LegacyRecord);
 role_file!(ConfigFile, "config.json", Role::Config);
 
-/// The current `Note`, an `OsRecord` like the layout stamp U34 adds.
+/// The current `Note`, as an `OsRecord`.
 impl VersionedState for NoteV3 {
     const FILE_NAME: &'static str = "note.json";
     const ROLE: Role = Role::OsRecord;

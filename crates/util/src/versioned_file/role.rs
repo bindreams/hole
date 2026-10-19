@@ -52,7 +52,7 @@ impl Role {
             (Role::LegacyRecord, CannotRead::Newer) => StoreOver::Refuse,
             (Role::LegacyRecord, CannotRead::Corrupt) => StoreOver::Refuse,
             (Role::Config, CannotRead::Newer) => StoreOver::Refuse,
-            // Interim, open question Q5: a corrupt `config.json` is replaced by the next save, as today.
+            // A corrupt `config.json` is replaced by the next save (owner decision 2026-10-19).
             (Role::Config, CannotRead::Corrupt) => StoreOver::Overwrite,
         }
     }

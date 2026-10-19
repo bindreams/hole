@@ -405,7 +405,36 @@ fn a_file_that_cannot_be_read_logs_once_with_the_file_name_and_versions() {
     let log = log.snapshot();
     assert_eq!(log.matches("WARN").count(), 1, "{log}");
     assert!(log.contains("note.json"), "{log}");
-    assert!(log.contains("99") && log.contains('3'), "{log}");
+    assert!(log.contains(r#"found="99""#), "{log}");
+    assert!(log.contains("supported=3"), "{log}");
+}
+
+#[skuld::test]
+fn a_migrated_load_logs_at_debug_and_a_current_one_does_not() {
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let _guard = set_default_in_current_thread(subscriber);
+    let dir = dir();
+
+    put(
+        &dir,
+        "note.json",
+        br#"{"version":3,"title":"t","tags":[],"pinned":false}"#,
+    );
+    let _ = VersionedFile::<NoteV3>::new(dir.path()).load();
+    assert_eq!(writer.snapshot(), "", "a file at the current version is not news");
+
+    put(&dir, "note.json", br#"{"version":1,"title":"t"}"#);
+    let _ = VersionedFile::<NoteV3>::new(dir.path()).load();
+    let log = writer.snapshot();
+    assert_eq!(log.matches("DEBUG").count(), 1, "{log}");
+    assert!(log.contains("note.json"), "{log}");
+    assert!(log.contains("found=1"), "{log}");
+    assert!(log.contains("supported=3"), "{log}");
 }
 
 #[skuld::test]

@@ -74,9 +74,9 @@ impl<S> Loaded<S> {
 }
 
 impl<S: VersionedState> Loaded<S> {
-    /// Classifies one read of `S`'s file. Logs one `warn!` for every outcome
-    /// but `Absent` and a plain `Current`: the file's name, the versions and
-    /// the cause, never a value.
+    /// Classifies one read of `S`'s file. Logs a `warn!` for each unusual
+    /// outcome and a `debug!` for a migrated one: name, versions and cause,
+    /// never a value.
     pub(crate) fn from_read(read: std::io::Result<Vec<u8>>) -> Self {
         let file = S::FILE_NAME;
         let bytes = match read {
@@ -113,7 +113,12 @@ impl<S: VersionedState> Loaded<S> {
             }
         };
         match <S as Chain>::decode(found, &bytes) {
-            Ok(value) => Loaded::Current { value, found },
+            Ok(value) => {
+                if found < S::VERSION {
+                    tracing::debug!(file, found, supported = S::VERSION, "state file migrated in memory");
+                }
+                Loaded::Current { value, found }
+            }
             Err(ChainError::Obsolete) => {
                 tracing::warn!(
                     file,

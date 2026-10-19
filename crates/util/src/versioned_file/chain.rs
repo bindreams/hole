@@ -32,18 +32,18 @@ pub trait Chain: Sized + sealed::Sealed {
     #[doc(hidden)]
     const LINKED: ();
 
+    /// Decodes `bytes` written at `version`, which must be at most [`TOP`](Chain::TOP):
+    /// a larger one is the caller's bug and panics, in every profile.
     #[doc(hidden)]
     fn decode(version: u32, bytes: &[u8]) -> Result<Self, ChainError>;
 }
 
 /// One version of a file's schema, linked to the one before it by [`Prev`].
 ///
-/// Each version is its own frozen type. The link makes a chain contiguous by
-/// construction: a gap, a duplicate number, or a floor that leaves a version
-/// neither dropped nor described fails to build, wherever in the chain it is.
-/// Only a build reports it: a bare `cargo check` stops before the check is
-/// evaluated, so name each current type once with
-/// [`assert_contiguous!`](crate::assert_contiguous) in a test.
+/// The link makes a chain contiguous by construction: a gap, a duplicate
+/// number, or a floor that leaves a version neither dropped nor described
+/// fails to build, wherever in the chain it is. Name each current type once in
+/// [`assert_contiguous!`](crate::assert_contiguous).
 ///
 /// A schema never declares `deny_unknown_fields` (readers ignore what they do
 /// not know) and never carries the `version` key itself: the framing owns it.
@@ -68,7 +68,7 @@ impl<const N: u32> Chain for Obsolete<N> {
     const LINKED: () = ();
 
     fn decode(version: u32, _bytes: &[u8]) -> Result<Self, ChainError> {
-        debug_assert!(version <= N, "version {version} is above this chain's floor {N}");
+        assert!(version <= N, "version {version} is above this chain's floor {N}");
         Err(ChainError::Obsolete)
     }
 }
@@ -81,12 +81,12 @@ impl<S: Schema> Chain for S {
     };
 
     fn decode(version: u32, bytes: &[u8]) -> Result<Self, ChainError> {
-        // Evaluated for every schema that is ever decoded.
+        // Forces `LINKED` to be evaluated wherever the chain is decoded.
         let () = <S as Chain>::LINKED;
         if version == S::VERSION {
             return serde_json::from_slice(bytes).map_err(|e| ChainError::Shape(ParseFailure::from(&e)));
         }
-        debug_assert!(version < S::VERSION, "version {version} is above schema {}", S::VERSION);
+        assert!(version < S::VERSION, "version {version} is above schema {}", S::VERSION);
         <S::Prev as Chain>::decode(version, bytes).map(S::upgrade)
     }
 }

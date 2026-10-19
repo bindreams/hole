@@ -15,8 +15,8 @@
 //!   a field removed, renamed, retyped or given a new meaning, or new data
 //!   that an older release's cleanup of an OS record would need. Adding an
 //!   optional field takes no step.
-//! - A release that is rolled back and stores a file drops the fields it did
-//!   not know; the rule above is what keeps that harmless for records.
+//! - A rolled-back release drops the fields it does not know when it stores, so
+//!   data an OS-record cleanup needs takes a version bump.
 //!
 //! # Adding a version
 //!
@@ -27,10 +27,9 @@
 //!
 //! # Template
 //!
-//! `versioned_file_tests.rs` is a complete `Role::OsRecord` schema (what the
-//! bridge laid on disk and needs to undo, so a copy this release cannot read
-//! stops it from connecting) with `assert_contiguous!`, a store and a load.
-//! It is a test, so CI runs it: copy it, not a snippet that can rot.
+//! `versioned_file_tests.rs` is a complete `Role::OsRecord` schema with
+//! `assert_contiguous!`, a store and a load. It is a test, so CI runs it: copy
+//! it, not a snippet that can rot.
 
 mod chain;
 #[cfg(test)]
@@ -67,8 +66,9 @@ pub trait VersionedState: Schema + serde::Serialize {
 /// Fails to compile when any link of `$t`'s chain, down to its floor, has a
 /// gap.
 ///
-/// A gap in generic code is reported by the build but not by `cargo check`;
-/// naming each current type once in a test makes a type-check fail too.
+/// A gap in generic code is reported by a build but not by a bare `cargo
+/// check`, which stops before the check is evaluated; naming each current type
+/// once with this macro makes a type-check fail too.
 #[macro_export]
 macro_rules! assert_contiguous {
     ($t:ty) => {

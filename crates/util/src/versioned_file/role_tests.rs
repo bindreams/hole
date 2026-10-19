@@ -1,8 +1,7 @@
 use super::{RemoveOver, Role, StoreOver};
 use crate::versioned_file::CannotRead::{Corrupt, Newer};
 
-/// Every cell written by hand from the Roles table in the design: one row per
-/// role, `Newer` then `Corrupt` in each column.
+/// Every cell written out by hand, one row per role, `Newer` then `Corrupt` in each column.
 #[skuld::test]
 fn the_role_table_has_exactly_these_cells() {
     use RemoveOver::{Keep, MoveAside as MoveRemoved};

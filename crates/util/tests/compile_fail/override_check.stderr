@@ -1,23 +1,5 @@
-error[E0438]: const `CONTIGUOUS` is not a member of trait `Schema`
-  --> tests/compile_fail/override_check.rs:15:5
+error[E0438]: const `LINKED` is not a member of trait `Schema`
+  --> tests/compile_fail/override_check.rs:17:5
    |
-15 |     const CONTIGUOUS: () = ();
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^ not a member of trait `Schema`
-
-error[E0080]: evaluation panicked: migration chain has a gap
- --> $RUST/core/src/panic.rs
-  |
-  = note: evaluation of `<V3 as util::versioned_file::Chain>::LINKED` failed here
-  |
- ::: src/versioned_file/chain.rs
-  |
-  |         assert!(S::VERSION == <S::Prev as Chain>::TOP + 1, "migration chain has a gap");
-  |         ------------------------------------------------------------------------------- in this macro invocation
-
-note: erroneous constant encountered
-  --> tests/compile_fail/override_check.rs:18:1
-   |
-18 | util::assert_contiguous!(V3);
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = note: this note originates in the macro `util::assert_contiguous` (in Nightly builds, run with -Z macro-backtrace for more info)
+17 |     const LINKED: () = ();
+   |     ^^^^^^^^^^^^^^^^^^^^^^ not a member of trait `Schema`

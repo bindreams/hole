@@ -26,7 +26,6 @@ impl VersionedState for Layout {
     const ROLE: Role = Role::OsRecord;
 }
 
-// A gap anywhere in the chain fails here, even under `cargo check`.
 crate::assert_contiguous!(Layout);
 
 #[skuld::test]

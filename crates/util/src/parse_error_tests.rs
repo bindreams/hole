@@ -65,8 +65,7 @@ fn a_framing_failure_names_its_reason_without_a_position() {
     assert_eq!(failure.to_string(), "version is not a positive integer");
 }
 
-/// A shape error out of `serde_json::from_value` has no position either; the
-/// description must not claim "line 0, column 0".
+/// A positionless error must not print "line 0, column 0".
 #[skuld::test]
 fn a_failure_without_a_position_does_not_print_one() {
     let e = serde_json::from_value::<u32>(serde_json::json!("x")).expect_err("must not parse");

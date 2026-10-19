@@ -2,9 +2,6 @@ use super::{Chain, ChainError, Obsolete};
 use crate::assert_contiguous;
 use crate::versioned_file::fixtures::{DroppedFile, NoteV3};
 
-// The backstop for a gap that only the build, not `cargo check`, reports through
-// generic code: naming every current type makes the test target fail to
-// type-check, for a gap anywhere in its chain.
 assert_contiguous!(NoteV3);
 assert_contiguous!(DroppedFile);
 
@@ -60,6 +57,20 @@ fn a_shape_error_in_an_older_version_is_reported_not_migrated() {
     assert!(matches!(<NoteV3 as Chain>::decode(1, body), Err(ChainError::Shape(_))));
 }
 
+/// `decode` is `pub` (the trait is sealed, the method is not), so a version
+/// above the chain is a caller's bug that must stop in a release build too,
+/// not read as `Obsolete`.
+#[skuld::test]
+fn decoding_above_the_chain_is_a_contract_violation_in_every_profile() {
+    let above_schema = std::panic::catch_unwind(|| <NoteV3 as Chain>::decode(4, b"{}"));
+    assert!(above_schema.is_err(), "a version above the top schema must panic");
+    let above_floor = std::panic::catch_unwind(|| <Obsolete<5> as Chain>::decode(6, b"{}"));
+    assert!(
+        above_floor.is_err(),
+        "a version above the floor of a bare floor must panic"
+    );
+}
+
 #[skuld::test]
 fn the_top_of_a_chain_is_the_current_version_or_the_floor() {
     assert_eq!(<NoteV3 as Chain>::TOP, 3);
@@ -67,8 +78,7 @@ fn the_top_of_a_chain_is_the_current_version_or_the_floor() {
 }
 
 /// The `.stderr` fixtures are regenerated with `TRYBUILD=overwrite cargo test
-/// -p util -- a_chain_with_a_gap_does_not_compile`; the toolchain is pinned in
-/// `rust-toolchain.toml`, so they move only when it does.
+/// -p util -- a_chain_with_a_gap_does_not_compile`.
 #[skuld::test]
 fn a_chain_with_a_gap_does_not_compile() {
     let cases = trybuild::TestCases::new();
