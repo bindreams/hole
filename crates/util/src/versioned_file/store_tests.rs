@@ -634,3 +634,31 @@ fn no_error_or_cause_text_echoes_the_file() {
         assert!(!text.contains(SECRET), "echoed the file: {text}");
     }
 }
+
+#[cfg(unix)]
+mod unix_directory_flush {
+    use std::io;
+
+    use super::super::{no_directory_flush, tolerate_missing_directory_flush};
+
+    fn os(code: i32) -> io::Error {
+        io::Error::from_raw_os_error(code)
+    }
+
+    #[skuld::test]
+    fn a_filesystem_without_directory_fsync_is_not_an_error() {
+        for code in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(no_directory_flush(&os(code)), "errno {code}");
+            tolerate_missing_directory_flush(Err(os(code))).unwrap();
+        }
+    }
+
+    #[skuld::test]
+    fn any_other_directory_fsync_error_still_fails() {
+        for code in [libc::EIO, libc::ENOSPC, libc::EACCES, libc::EBADF] {
+            assert!(!no_directory_flush(&os(code)), "errno {code}");
+            assert!(tolerate_missing_directory_flush(Err(os(code))).is_err(), "errno {code}");
+        }
+        assert!(!no_directory_flush(&io::Error::other("no os code")));
+    }
+}

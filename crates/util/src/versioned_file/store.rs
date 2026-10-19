@@ -69,17 +69,20 @@ pub trait Placement {
     /// Windows that is `FlushFileBuffers` on a handle to the directory, and
     /// Microsoft does not document it as committing a rename: the durability
     /// of the replace there rests on that reading, not on a documented
-    /// guarantee. A volume with no directory flush (an SMB share, a 9P
-    /// volume) answers `ERROR_INVALID_FUNCTION` or `ERROR_NOT_SUPPORTED`; that
-    /// is `Ok`, and the durability there is whatever the volume gives.
+    /// guarantee. A volume with no directory flush (an SMB share or a 9P
+    /// volume on Windows; a filesystem without directory fsync on unix) is
+    /// `Ok`, and the durability there is whatever the volume gives.
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         sync_dir(dir)
     }
 }
 
+/// Flushes the directory. A filesystem that offers no directory fsync (see
+/// [`no_directory_flush`]) is not an error. Failing to open the directory
+/// still is.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
+    tolerate_missing_directory_flush(std::fs::File::open(dir)?.sync_all())
 }
 
 /// Flushes the directory. A volume that offers no directory flush (see
@@ -100,7 +103,6 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     tolerate_missing_directory_flush(handle.sync_all())
 }
 
-#[cfg(windows)]
 fn tolerate_missing_directory_flush(result: io::Result<()>) -> io::Result<()> {
     match result {
         Err(e) if no_directory_flush(&e) => Ok(()),
@@ -108,16 +110,20 @@ fn tolerate_missing_directory_flush(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// The volume has no directory flush: `ERROR_INVALID_FUNCTION` (measured on an
-/// SMB share and on a 9P volume) or `ERROR_NOT_SUPPORTED`.
-#[cfg(windows)]
+/// The volume has no directory flush. Windows: `ERROR_INVALID_FUNCTION`
+/// (measured on an SMB share and on a 9P volume) or `ERROR_NOT_SUPPORTED`.
+/// Unix: `EINVAL`, which `fsync(2)` documents for a file that does not
+/// support synchronization, or `ENOTSUP`/`EOPNOTSUPP`.
 fn no_directory_flush(e: &io::Error) -> bool {
-    use windows::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED};
-
     let Some(code) = e.raw_os_error() else { return false };
-    [ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED]
-        .iter()
-        .any(|unsupported| unsupported.0 as i32 == code)
+    #[cfg(windows)]
+    let unsupported = {
+        use windows::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED};
+        [ERROR_INVALID_FUNCTION.0 as i32, ERROR_NOT_SUPPORTED.0 as i32]
+    };
+    #[cfg(unix)]
+    let unsupported = [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP];
+    unsupported.contains(&code)
 }
 
 /// [`Placement`] with only an owner.
