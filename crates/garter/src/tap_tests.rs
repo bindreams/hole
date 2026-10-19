@@ -1156,6 +1156,34 @@ fn forwarders_never_connect_to_an_address_the_inner_chose() {
     assert_eq!(connect_target(a("[::]:5000")), a("[::1]:5000"));
 }
 
+#[skuld::test]
+async fn a_tap_on_a_wildcard_address_relays_through_the_loopback() {
+    // The inner listens on the wildcard it was given; forwarders must connect to
+    // its loopback (Windows refuses a connect to 0.0.0.0, so this pins the
+    // `connect_target` call site there).
+    let shutdown = CancellationToken::new();
+    let inner = || {
+        Box::new(StubPlugin {
+            behavior: Behavior::Echo { read_bytes: 5 },
+        }) as Box<dyn ChainPlugin>
+    };
+    let wildcard: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let (public, handle) = start_tap(inner, wildcard, unused_remote(), &shutdown)
+        .await
+        .unwrap_or_else(|m| panic!("{m}"));
+
+    let mut s = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], public.port())))
+        .await
+        .unwrap();
+    s.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello");
+
+    shutdown.cancel();
+    handle.await.expect("tap task panicked").expect("tap returned error");
+}
+
 // Inner connect retry =================================================================================================
 
 /// A connect that refuses `refusals` times, then succeeds with `()`, counting calls.

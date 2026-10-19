@@ -28,8 +28,11 @@
 //!    is the only readiness signal: a TCP probe cannot tell the inner from
 //!    another process that took the probed port. The report's `listen` must be
 //!    the address the inner was given (sitrep: a host must validate `listen`
-//!    before connecting), else the start is `Fatal`; forwarders connect to the
-//!    given address (its loopback for a wildcard ip). A typed failure the inner
+//!    before connecting): the same port and ip, a mapped IPv6 form counting as
+//!    its IPv4 address, and under a wildcard ip any ip of that family, since the
+//!    inner listens on all of them. Else the start is `Fatal`. Forwarders connect
+//!    to the given address (its loopback for a wildcard), never to the reported
+//!    one. A typed failure the inner
 //!    reports (`BindConflict` when another process took the internal port,
 //!    `Fatal`) becomes the tap's own, so the caller sees the same retryable
 //!    or terminal class. Only an inner that speaks sitrep reports a typed
