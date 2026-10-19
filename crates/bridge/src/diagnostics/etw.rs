@@ -544,7 +544,7 @@ fn start_consumer_named(
 /// `start_consumer_named`'s own thread-spawn failure arm — the `drop(trace)`
 /// ordering plus [`abandon_session_on_thread_spawn_failure`] below — at the
 /// real call site, rather than calling `abandon_session_on_thread_spawn_failure`
-/// directly (see [`thread_spawn_failure_stops_the_orphaned_session`]'s doc
+/// directly (see `thread_spawn_failure_stops_the_orphaned_session`'s doc
 /// comment for why that alone doesn't pin this call site).
 fn start_consumer_named_with_spawn(
     session_name: String,
@@ -679,7 +679,7 @@ fn start_consumer_named_with_spawn(
 }
 
 /// Last-observed value of each cumulative loss counter
-/// [`EVENT_TRACE_PROPERTIES`] reports, so a caller ticking
+/// `EVENT_TRACE_PROPERTIES` reports, so a caller ticking
 /// [`query_session_stats`] repeatedly can escalate only on a genuine
 /// change instead of re-warning forever once a counter goes nonzero.
 /// `buffers_written` is deliberately excluded — it's a throughput count,

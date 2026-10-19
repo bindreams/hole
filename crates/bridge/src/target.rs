@@ -124,7 +124,7 @@ impl From<PersistedTarget> for Target {
 }
 
 /// The one read+parse of the target file, mirroring `lockdown_state`'s
-/// `read_state`/[`Intent`] split so a version mismatch and a missing file are
+/// `read_state`/[`Intent`](tun_engine::routing::failclosed::lockdown_state::Intent) split so a version mismatch and a missing file are
 /// classified rather than collapsed together in the log.
 fn read_target(state_dir: &Path) -> Target {
     let path = state_dir.join(STATE_FILE_NAME);

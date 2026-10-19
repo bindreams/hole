@@ -9,7 +9,7 @@
 //!   [`routing::SystemRouting`] impl, and a crash-recovery state file.
 //! - [`gateway`] — detect the system's default gateway + interface.
 //! - [`device`] — cross-platform TUN open (`Device::build(...)`). Windows
-//!   additionally provides `device::wintun` for wintun.dll pre-loading.
+//!   additionally provides [`device::wintun`] for wintun.dll pre-loading.
 //! - [`engine`] — the packet-loop [`engine::Engine`]; exposes caller-owned
 //!   dispatch via the [`engine::Router`] trait + optional
 //!   [`engine::DnsInterceptor`] hook.

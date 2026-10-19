@@ -343,7 +343,7 @@ fn build_server_config(entry: &ServerEntry, server_ip: IpAddr) -> Result<ServerC
 /// server address to point at the plugin chain's local port.
 ///
 /// Returns `Ok(None)` if no plugin is configured (plain shadowsocks). Returns
-/// the [`PluginChain`] guard otherwise — its [`Drop`] cancels the chain
+/// the [`PluginChain`](crate::proxy::plugin::PluginChain) guard otherwise — its [`Drop`] cancels the chain
 /// (SIP003u graceful shutdown).
 async fn maybe_start_plugin(
     entry: &ServerEntry,

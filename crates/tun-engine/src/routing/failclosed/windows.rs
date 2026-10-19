@@ -2056,13 +2056,13 @@ pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &s
 /// Classify a presence probe's outcome. Pure and total over its inputs, so the
 /// rule is table-tested without an engine.
 ///
-/// `engine_opened` false is [`CoverPresence::Unreachable`] — the firewall could
+/// `engine_opened` false is [`CoverPresence::Unreachable`](crate::routing::CoverPresence::Unreachable) — the firewall could
 /// not be asked, so nothing at all is known. Otherwise: any `ERROR_SUCCESS`
 /// means at least one lockdown filter is installed
 /// ([`CoverPresence::Live`](crate::routing::CoverPresence::Live) is "any
 /// residue", see its doc); every code being the literal
 /// [`FWP_E_FILTER_NOT_FOUND_DWORD`] means a clean host; anything else is
-/// [`CoverPresence::Indeterminate`].
+/// [`CoverPresence::Indeterminate`](crate::routing::CoverPresence::Indeterminate).
 ///
 /// **Only that one literal code produces `Absent`.** That is the structural
 /// guarantee that a DACL-denied read can never be mistaken for a clean host,

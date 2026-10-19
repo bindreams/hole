@@ -10,7 +10,7 @@
 //! `tun` 0.8.13's `platform/windows/device.rs` does `Adapter::open(name)`
 //! first and only falls back to `Adapter::create` when that fails, so
 //! [`super::Device::build`] silently adopts any pre-existing adapter named
-//! `hole-tun`. `probe_incumbent` resolves the alias to a LUID then a GUID
+//! `hole-tun`. [`probe_incumbent`] resolves the alias to a LUID then a GUID
 //! — pure reads, no handle opened, no adapter touched — and the result
 //! decides whether `Device::build` proceeds:
 //!
@@ -45,7 +45,7 @@
 //! **unverified**. A missed check, never a refusal.
 
 /// The GUID Hole requests for every adapter it mints, and the value
-/// `probe_incumbent` compares an incumbent's GUID against. A compile-time
+/// [`probe_incumbent`] compares an incumbent's GUID against. A compile-time
 /// constant compared against the live OS object — not a name pattern.
 /// Minted once; never reuse for anything else.
 pub const HOLE_ADAPTER_GUID: u128 = 0x8a3d1e6c_2f47_4b9a_9c1d_5e7f2a3b4c5d;

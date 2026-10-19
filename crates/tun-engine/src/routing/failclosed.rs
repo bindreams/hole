@@ -221,7 +221,7 @@ pub(crate) enum RecoveryDispatch {
     Disengage,
 }
 
-/// Classify a [`CoverRecovery`] into whether it disengages the standing cover.
+/// Classify a [`CoverRecovery`](crate::routing::CoverRecovery) into whether it disengages the standing cover.
 /// Pure, exhaustive, and platform-free, so "`Adopt` never disengages the
 /// cover, on either platform" is a testable statement rather than a claim
 /// about two bodies of code.

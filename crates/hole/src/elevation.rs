@@ -87,7 +87,7 @@ pub fn encode_request(request: &BridgeRequest) -> String {
 
 /// Write a BridgeRequest as JSON to a temp file with restrictive permissions.
 ///
-/// Returns a [`TempPath`] that auto-deletes the file on drop. The file handle is
+/// Returns a [`TempPath`](tempfile::TempPath) that auto-deletes the file on drop. The file handle is
 /// closed so the elevated subprocess can open it (required on Windows).
 fn write_request_file(request: &BridgeRequest) -> std::io::Result<tempfile::TempPath> {
     use std::io::Write;
