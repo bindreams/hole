@@ -339,22 +339,30 @@ targets:
 
   doc-hole:
     # rustdoc with warnings denied, so a broken intra-doc link fails CI. Links to
-    # `cfg`-gated or private items break per target, hence one doc target per
-    # clippy target, on the same legs. Public items only: a link from a public
-    # doc to a private item is itself the error. Same flags as `clippy-hole`.
+    # `cfg`-gated items break per target, hence one doc target per clippy target,
+    # on the same legs. Same flags as `clippy-hole`. Unpublished crates are built
+    # with `--document-private-items`, so a doc may link a private item; `garter`
+    # is published and docs.rs omits private items, so it keeps the plain check.
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     run:
       - bash:
-          command: cargo doc --workspace --no-deps --no-default-features --features garter/test-utils
+          command: cargo doc --workspace --exclude garter --no-deps --document-private-items --no-default-features --features garter/test-utils
+          environment: { RUSTDOCFLAGS: "-D warnings" }
+      - bash:
+          command: cargo doc -p garter --no-deps --no-default-features --features garter/test-utils
           environment: { RUSTDOCFLAGS: "-D warnings" }
 
   doc-ex-galoshes:
     # `clippy-ex-galoshes`'s legs. The crate set is the ones that compile there:
     # clippy's `-p` list plus the tooling crates the test archive builds there.
+    # Private items as in `doc-hole`, except for the published `garter`.
     platforms: [linux/amd64, linux/arm64, windows/arm64]
     run:
       - bash:
-          command: cargo doc --no-deps -p garter -p garter-bin -p galoshes -p plugin-e2e -p util -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive --features garter/test-utils
+          command: cargo doc --no-deps --document-private-items -p garter-bin -p galoshes -p plugin-e2e -p util -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive --features garter/test-utils
+          environment: { RUSTDOCFLAGS: "-D warnings" }
+      - bash:
+          command: cargo doc --no-deps -p garter --features garter/test-utils
           environment: { RUSTDOCFLAGS: "-D warnings" }
 
   prek:

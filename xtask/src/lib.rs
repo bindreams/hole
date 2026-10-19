@@ -85,6 +85,9 @@ mod tauri_context_gating_tests;
 #[path = "dmg_background_tests.rs"]
 mod dmg_background_tests;
 #[cfg(test)]
+#[path = "doc_targets_tests.rs"]
+mod doc_targets_tests;
+#[cfg(test)]
 #[path = "finish_vendor_bump_tests.rs"]
 mod finish_vendor_bump_tests;
 #[cfg(test)]
