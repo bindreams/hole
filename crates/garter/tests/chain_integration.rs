@@ -423,7 +423,7 @@ async fn bind_conflict_start_error_surfaces_typed() {
 /// (which sees EOF once the grandchild is gone) instead of giving up on it. No clock decides
 /// anything here: the gate opens when the grandchild's control connection closes.
 fn typed_failure_with_a_descendant_holding_the_pipes(fail: &str) -> Result<ChainReady, StartError> {
-    // The sink blocks a runtime worker, so the chain needs a thread besides the parked reader's.
+    // The sink blocks inside a task, which `block_in_place` allows only on a multi-thread runtime.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -453,7 +453,7 @@ fn typed_failure_with_a_descendant_holding_the_pipes(fail: &str) -> Result<Chain
                 .any(|event| line.contains(event));
             if typed_failure {
                 // `recv` also returns when the watch task ended without opening the gate.
-                let _ = gate_rx.lock().unwrap().recv();
+                let _ = tokio::task::block_in_place(|| gate_rx.lock().unwrap().recv());
             }
         });
 
