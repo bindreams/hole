@@ -211,12 +211,25 @@ async fn run_hygiene_grandchild(
 }
 
 /// Spawn the long-lived grandchild `MOCK_PLUGIN_SPAWN_GRANDCHILD` asks for: it inherits our stdio.
-fn spawn_inheriting_grandchild(callback_addr: &std::ffi::OsStr) -> Result<(), Box<dyn std::error::Error>> {
+/// With `await_up`, returns only once the grandchild has dialed `callback_addr` and holds that
+/// connection, so a caller that exits next leaves a live descendant behind.
+fn spawn_inheriting_grandchild(
+    callback_addr: &std::ffi::OsStr,
+    await_up: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.env("MOCK_PLUGIN_SLEEP", "1")
         .env("MOCK_PLUGIN_GRANDCHILD_CALLBACK", callback_addr)
         .env_remove("MOCK_PLUGIN_SPAWN_GRANDCHILD");
+    // The grandchild reports "up" on this listener after it dialed the callback.
+    let up = if await_up {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        cmd.env("MOCK_PLUGIN_GRANDCHILD_UP", listener.local_addr()?.to_string());
+        Some(listener)
+    } else {
+        None
+    };
     // Mimic how garter spawns a NESTED plugin (galoshes→ex-ray) so this
     // grandchild is reaped only by the root's process-tree kill, never by the
     // parent's graceful stop:
@@ -234,6 +247,9 @@ fn spawn_inheriting_grandchild(callback_addr: &std::ffi::OsStr) -> Result<(), Bo
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
     let _grandchild = cmd.spawn()?;
+    if let Some(listener) = up {
+        listener.accept()?;
+    }
     Ok(())
 }
 
@@ -269,6 +285,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => None,
         };
+        if let Some(addr) = std::env::var_os("MOCK_PLUGIN_GRANDCHILD_UP") {
+            let addr = addr.to_str().expect("MOCK_PLUGIN_GRANDCHILD_UP is valid utf-8");
+            TcpStream::connect(addr).await.expect("grandchild reports up");
+        }
         std::future::pending::<()>().await;
     }
 
@@ -379,7 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // that dies with a typed failure leaves a descendant holding its stdout/stderr pipes.
     if !fail.is_empty() {
         if let Some(callback_addr) = std::env::var_os("MOCK_PLUGIN_SPAWN_GRANDCHILD") {
-            spawn_inheriting_grandchild(&callback_addr)?;
+            spawn_inheriting_grandchild(&callback_addr, true)?;
         }
     }
     if fail == "fatal" {
@@ -457,7 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is not kill-on-drop, so letting it drop leaves the process running for the
     // test.
     if let Some(callback_addr) = std::env::var_os("MOCK_PLUGIN_SPAWN_GRANDCHILD") {
-        spawn_inheriting_grandchild(&callback_addr)?;
+        spawn_inheriting_grandchild(&callback_addr, false)?;
     }
 
     loop {

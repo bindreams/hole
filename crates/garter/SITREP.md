@@ -428,8 +428,7 @@ failure.
 ## Changelog
 
 - **1.0** (Draft) — initial protocol: `hello`, `ready`, `bind_conflict`,
-  `fatal` events; absence backstop; MAJOR-gated compatibility. A plugin
-  that can no longer accept connections after `ready` must exit.
+  `fatal` events; absence backstop; MAJOR-gated compatibility.
 
 ## Acknowledgements
 

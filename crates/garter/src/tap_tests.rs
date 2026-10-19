@@ -683,7 +683,6 @@ fn loopback() -> SocketAddr {
 
 #[skuld::test]
 async fn a_public_bind_conflict_is_reported_and_the_inner_is_not_restarted() {
-    // Another listener holds the public address.
     let holder = std::net::TcpListener::bind(loopback()).unwrap();
     let public = holder.local_addr().unwrap();
 
@@ -1504,8 +1503,7 @@ fn refusing(refusals: usize, calls: &AtomicUsize) -> impl FnMut() -> std::future
 #[skuld::test]
 async fn a_refused_inner_connect_is_retried_until_it_succeeds_however_long_that_takes() {
     tokio::time::pause();
-    // With the delay capped at 50ms, 100 refusals span more than 4s of virtual
-    // time, far past any fixed budget.
+    // With the delay capped at 50ms, 100 refusals span more than 4s of virtual time.
     let calls = AtomicUsize::new(0);
     let started = tokio::time::Instant::now();
     let result = retry_connect_with(7, inner_addr(), refusing(100, &calls), &CancellationToken::new()).await;

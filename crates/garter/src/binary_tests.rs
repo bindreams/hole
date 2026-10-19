@@ -1,3 +1,6 @@
+// `CancellationToken::new` roots the shutdown signal of the reader tests.
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 
 use crate::binary::BinaryPlugin;
@@ -137,6 +140,7 @@ fn fixed_env_sets_no_color() {
 
 use std::future::Future;
 use std::pin::{pin, Pin};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -144,7 +148,7 @@ use cosca::Containment;
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use crate::binary::{await_stderr_after_stdout_eof, drain_readers_after_exit, kill_guarantees_eof, READER_EOF_BOUND};
+use crate::binary::{drain_readers_after_exit, PluginTree};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -152,11 +156,16 @@ use crate::tracing_test::set_default_in_current_thread;
 /// never finishes fails here instead of hanging.
 const VIRTUAL_HANG: Duration = Duration::from_secs(24 * 3600);
 
+/// The failure bound on the wait for a plugin's output, written out so a change to it fails here.
+const EOF_BOUND: Duration = Duration::from_secs(5);
+
 /// A timer's deadline is rounded up to the next millisecond; advancing this far past a bound fires it.
 const TIMER_SLACK: Duration = Duration::from_millis(2);
 
-/// Every containment `cosca` names, each paired with whether tearing the tree down guarantees the
-/// child's pipes reach EOF. Written out from cosca's own account of which edges are kernel-owned.
+/// Every containment `cosca` names, each paired with whether the drain waits for the tree's own exit
+/// edge after a kill. That is only where the edge is kernel-owned: a live process cannot leave a
+/// cgroup or a job object without exiting. The macOS fd marker has an edge too, but a live process
+/// can close its copy of the marker and stay up, so the edge proves nothing there.
 const CONTAINMENTS: [(Containment, bool); 8] = [
     (Containment::CgroupV2, true),
     (Containment::JobObject, true),
@@ -177,6 +186,7 @@ fn subscriber() -> (impl tracing::Subscriber + Send + Sync, WaitableWriter) {
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer.clone())
         .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
         .finish();
     (subscriber, writer)
 }
@@ -220,70 +230,171 @@ fn kill_failed() -> Result<(), cosca::error::Error> {
     })
 }
 
-#[skuld::test]
-fn kill_guarantees_eof_is_decided_per_containment() {
-    for (containment, expected) in CONTAINMENTS {
-        assert_eq!(kill_guarantees_eof(containment), expected, "{containment:?}");
+fn unsupported() -> cosca::error::Error {
+    cosca::error::Error::Unsupported {
+        op: "kill_tree".into(),
+        platform: "test",
+        detail: "no tree of its own".into(),
     }
 }
 
-/// The wait must not read a timer's expiry as "the readers are done": a reader that has not reached
-/// EOF is not finished however much time has passed.
+/// The calls the drain made on a tree, in order.
+type Calls = Arc<Mutex<Vec<&'static str>>>;
+
+/// Answers the drain's calls as scripted: `kill` runs once, on `kill_tree`; the tree's exit edge
+/// resolves once `edge` is notified (or errors, for `edge_fails`).
+struct FakeTree<K> {
+    containment: Containment,
+    kill: Option<K>,
+    edge: Arc<Notify>,
+    edge_fails: bool,
+    calls: Calls,
+}
+
+impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
+    /// A tree whose exit edge has not fired.
+    fn new(containment: Containment, kill: K) -> Self {
+        Self {
+            containment,
+            kill: Some(kill),
+            edge: Arc::new(Notify::new()),
+            edge_fails: false,
+            calls: Calls::default(),
+        }
+    }
+
+    /// A tree whose exit edge has already fired.
+    fn drained(containment: Containment, kill: K) -> Self {
+        let tree = Self::new(containment, kill);
+        tree.edge.notify_one();
+        tree
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> {
+    fn containment(&self) -> Containment {
+        self.containment
+    }
+
+    fn kill_tree(&mut self) -> Result<(), cosca::error::Error> {
+        self.calls.lock().unwrap().push("kill_tree");
+        (self.kill.take().expect("the tree was killed twice"))()
+    }
+
+    async fn wait_tree_drained(&self) -> Result<(), cosca::error::Error> {
+        self.calls.lock().unwrap().push("wait_tree_drained");
+        if self.edge_fails {
+            return Err(unsupported());
+        }
+        self.edge.notified().await;
+        Ok(())
+    }
+}
+
+fn drained_tree(containment: Containment) -> FakeTree<impl FnOnce() -> Result<(), cosca::error::Error>> {
+    FakeTree::drained(containment, || Ok(()))
+}
+
+/// After a kill, a tree whose exit edge is kernel-owned is waited on with no bound: its members are
+/// gone only when the edge says so, however long that takes.
 #[skuld::test]
-async fn a_kernel_owned_join_is_not_ended_by_elapsed_time() {
+async fn a_kernel_owned_tree_is_waited_for_its_exit_edge_with_no_bound() {
     tokio::time::pause();
     for containment in [Containment::CgroupV2, Containment::JobObject] {
-        let (release, stdout) = gated_reader();
-        let drain = drain_readers_after_exit("p", containment, || Ok(()), stdout, finished_reader());
+        let mut tree = FakeTree::new(containment, || Ok(()));
+        let edge = tree.edge.clone();
+        let drain = drain_readers_after_exit("p", &mut tree, finished_reader(), finished_reader());
         let mut drain = pin!(drain);
 
         assert!(poll_once(drain.as_mut()).is_pending());
-        tokio::time::advance(READER_EOF_BOUND + VIRTUAL_HANG).await;
+        tokio::time::advance(EOF_BOUND + VIRTUAL_HANG).await;
         assert!(
             poll_once(drain.as_mut()).is_pending(),
             "{containment:?}: ended by elapsed time"
         );
 
-        release.send(()).unwrap();
+        edge.notify_one();
         tokio::time::timeout(VIRTUAL_HANG, drain)
             .await
-            .expect("the join must finish once the reader reaches EOF");
+            .expect("the drain must finish once the tree's exit edge fires");
     }
 }
 
-/// The tree is killed BEFORE the wait: here the reader reaches EOF only because the kill ran, as a
-/// reader held by a grandchild does. On a weak containment a wait-then-kill order would also end,
-/// but only by the bound's warning, so the log must be silent.
+/// A pipe holder can sit outside the tree (a process that moved to another cgroup, a handle
+/// duplicated into a process outside the job), so even a drained kernel-owned tree does not
+/// guarantee EOF: the reader wait has the bound, warns by plugin name, and aborts the readers.
 #[skuld::test]
-async fn the_tree_is_killed_before_the_readers_are_awaited() {
+async fn a_reader_held_outside_a_drained_tree_ends_at_the_bound_with_a_warning() {
+    tokio::time::pause();
+    for containment in [Containment::CgroupV2, Containment::JobObject] {
+        let (subscriber, writer) = subscriber();
+        let _g = set_default_in_current_thread(subscriber);
+        let (out_dropped, stdout) = held_reader();
+        let mut tree = drained_tree(containment);
+        let drain = drain_readers_after_exit("outside-plugin", &mut tree, stdout, finished_reader());
+        let mut drain = pin!(drain);
+
+        assert!(poll_once(drain.as_mut()).is_pending());
+        tokio::time::advance(EOF_BOUND - Duration::from_millis(1)).await;
+        assert!(
+            poll_once(drain.as_mut()).is_pending(),
+            "{containment:?}: ended before the bound"
+        );
+        tokio::time::advance(TIMER_SLACK).await;
+        assert!(
+            poll_once(drain.as_mut()).is_ready(),
+            "{containment:?}: still waiting at the bound"
+        );
+
+        tokio::time::timeout(VIRTUAL_HANG, out_dropped)
+            .await
+            .unwrap_or_else(|_| panic!("{containment:?}: the reader was detached, not aborted"))
+            .ok();
+        let log = writer.snapshot();
+        assert!(
+            log.contains("WARN") && log.contains("outside-plugin") && log.contains("cut"),
+            "{containment:?}: the warning must name the plugin and say the output was cut:\n{log}"
+        );
+    }
+}
+
+/// The order is kill, then the tree's exit edge (only where it is kernel-owned), then the readers:
+/// the readers here reach EOF only because the kill ran, as a reader held by a grandchild does.
+#[skuld::test]
+async fn the_tree_is_killed_then_its_exit_edge_awaited_then_the_readers() {
     tokio::time::pause();
     let (subscriber, writer) = subscriber();
     let _g = set_default_in_current_thread(subscriber);
 
-    for (containment, _) in CONTAINMENTS {
-        let killed = std::sync::atomic::AtomicBool::new(false);
+    for (containment, edge_awaited) in CONTAINMENTS {
         let (release, stdout) = gated_reader();
-        let kill = || {
-            killed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut tree = FakeTree::drained(containment, move || {
             release.send(()).unwrap();
             Ok(())
-        };
+        });
         tokio::time::timeout(
             VIRTUAL_HANG,
-            drain_readers_after_exit("p", containment, kill, stdout, finished_reader()),
+            drain_readers_after_exit("p", &mut tree, stdout, finished_reader()),
         )
         .await
         .unwrap_or_else(|_| panic!("{containment:?}: the readers were awaited before the kill"));
-        assert!(
-            killed.load(std::sync::atomic::Ordering::SeqCst),
-            "{containment:?}: no kill"
-        );
+
+        let expected: &[&str] = if edge_awaited {
+            &["kill_tree", "wait_tree_drained"]
+        } else {
+            &["kill_tree"]
+        };
+        assert_eq!(tree.calls(), expected, "{containment:?}");
     }
     assert!(!writer.snapshot().contains("WARN"), "{}", writer.snapshot());
 }
 
-/// Where EOF is not guaranteed, the wait ends at the bound, says so by plugin name, and ABORTS the
-/// readers (dropping them), so their holds on the readiness sender are released.
+/// Where there is no kernel-owned edge, the wait ends at the bound, says so by plugin name, and
+/// ABORTS the readers (dropping them), so their holds on the readiness sender are released.
 #[skuld::test]
 async fn a_weak_containment_join_ends_at_the_bound_with_a_warning_and_aborts_the_readers() {
     tokio::time::pause();
@@ -299,16 +410,14 @@ async fn a_weak_containment_join_ends_at_the_bound_with_a_warning_and_aborts_the
         let _g = set_default_in_current_thread(subscriber);
         let (out_dropped, stdout) = held_reader();
         let (err_dropped, stderr) = held_reader();
-        let drain = drain_readers_after_exit("held-plugin", containment, || Ok(()), stdout, stderr);
+        let mut tree = drained_tree(containment);
+        let drain = drain_readers_after_exit("held-plugin", &mut tree, stdout, stderr);
         let mut drain = pin!(drain);
 
         assert!(poll_once(drain.as_mut()).is_pending());
         tokio::time::advance(Duration::from_millis(500)).await;
-        assert!(
-            poll_once(drain.as_mut()).is_pending(),
-            "{containment:?}: ended at the old 100ms"
-        );
-        tokio::time::advance(READER_EOF_BOUND - Duration::from_millis(501)).await;
+        assert!(poll_once(drain.as_mut()).is_pending(), "{containment:?}: ended early");
+        tokio::time::advance(EOF_BOUND - Duration::from_millis(501)).await;
         assert!(
             poll_once(drain.as_mut()).is_pending(),
             "{containment:?}: ended before the bound"
@@ -344,24 +453,51 @@ async fn a_weak_containment_join_ends_at_the_bound_with_a_warning_and_aborts_the
     }
 }
 
-/// A kill that did not happen removes the guarantee, even on a kernel-owned containment.
+/// A kill that did not happen leaves the tree's exit edge unproven: it is not waited on, and the
+/// readers get the bound, even on a kernel-owned containment.
 #[skuld::test]
-async fn a_failed_kill_gives_even_a_kernel_owned_join_the_bound() {
+async fn a_failed_kill_skips_the_exit_edge_and_gives_even_a_kernel_owned_join_the_bound() {
     tokio::time::pause();
     let (subscriber, _writer) = subscriber();
     let _g = set_default_in_current_thread(subscriber);
 
     let (dropped, stdout) = held_reader();
-    let drain = drain_readers_after_exit("p", Containment::JobObject, kill_failed, stdout, finished_reader());
+    let mut tree = FakeTree::new(Containment::JobObject, kill_failed);
+    let calls = tree.calls.clone();
+    let drain = drain_readers_after_exit("p", &mut tree, stdout, finished_reader());
     let mut drain = pin!(drain);
 
     assert!(poll_once(drain.as_mut()).is_pending());
-    tokio::time::advance(READER_EOF_BOUND + TIMER_SLACK).await;
+    tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
     assert!(poll_once(drain.as_mut()).is_ready());
     tokio::time::timeout(VIRTUAL_HANG, dropped)
         .await
         .expect("the reader must be aborted at the bound")
         .ok();
+    assert_eq!(*calls.lock().unwrap(), ["kill_tree"]);
+}
+
+/// An exit edge that cannot be awaited does not strand the drain: the readers still get the bound.
+#[skuld::test]
+async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
+    tokio::time::pause();
+    let (subscriber, writer) = subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+
+    let (dropped, stdout) = held_reader();
+    let mut tree = FakeTree::new(Containment::CgroupV2, || Ok(()));
+    tree.edge_fails = true;
+    let drain = drain_readers_after_exit("p", &mut tree, stdout, finished_reader());
+    let mut drain = pin!(drain);
+
+    assert!(poll_once(drain.as_mut()).is_pending());
+    tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
+    assert!(poll_once(drain.as_mut()).is_ready());
+    tokio::time::timeout(VIRTUAL_HANG, dropped)
+        .await
+        .expect("the reader must be aborted at the bound")
+        .ok();
+    assert!(writer.snapshot().contains("DEBUG"), "{}", writer.snapshot());
 }
 
 /// A join that completes inside the bound is silent.
@@ -372,79 +508,162 @@ async fn a_weak_containment_join_that_reaches_eof_does_not_warn() {
     let _g = set_default_in_current_thread(subscriber);
 
     let (release, stdout) = gated_reader();
-    let drain = drain_readers_after_exit(
-        "quiet-plugin",
-        Containment::ProcessGroup,
-        || Ok(()),
-        stdout,
-        finished_reader(),
-    );
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    let drain = drain_readers_after_exit("quiet-plugin", &mut tree, stdout, finished_reader());
     let mut drain = pin!(drain);
     assert!(poll_once(drain.as_mut()).is_pending());
-    tokio::time::advance(READER_EOF_BOUND - Duration::from_millis(1)).await;
+    tokio::time::advance(EOF_BOUND - Duration::from_millis(1)).await;
     release.send(()).unwrap();
     tokio::time::timeout(VIRTUAL_HANG, drain).await.unwrap();
 
     assert!(!writer.snapshot().contains("quiet-plugin"), "{}", writer.snapshot());
 }
 
-// The sitrep reader's wait for the stderr reader, after stdout EOF ----------------------------------------------------
-
+/// A kill error on a tree that can tear down is a failure to bring it down: loud.
 #[skuld::test]
-async fn the_stderr_wait_on_a_kernel_owned_containment_is_not_ended_by_elapsed_time() {
-    tokio::time::pause();
-    for containment in [Containment::CgroupV2, Containment::JobObject] {
-        let stderr_done = Notify::new();
-        let wait = await_stderr_after_stdout_eof("p", containment, &stderr_done);
-        let mut wait = pin!(wait);
-
-        assert!(poll_once(wait.as_mut()).is_pending());
-        tokio::time::advance(READER_EOF_BOUND + VIRTUAL_HANG).await;
-        assert!(
-            poll_once(wait.as_mut()).is_pending(),
-            "{containment:?}: ended by elapsed time"
-        );
-
-        stderr_done.notify_one();
-        tokio::time::timeout(VIRTUAL_HANG, wait).await.unwrap();
-    }
-}
-
-#[skuld::test]
-async fn the_stderr_wait_on_a_weak_containment_ends_at_the_bound_with_a_warning() {
+async fn a_kill_error_on_a_tree_that_can_tear_down_warns() {
     tokio::time::pause();
     let (subscriber, writer) = subscriber();
     let _g = set_default_in_current_thread(subscriber);
 
-    let stderr_done = Notify::new();
-    let wait = await_stderr_after_stdout_eof("stderr-held-plugin", Containment::ProcessGroup, &stderr_done);
-    let mut wait = pin!(wait);
-
-    assert!(poll_once(wait.as_mut()).is_pending());
-    tokio::time::advance(Duration::from_millis(500)).await;
-    assert!(poll_once(wait.as_mut()).is_pending(), "ended at the old 100ms");
-    tokio::time::advance(READER_EOF_BOUND + TIMER_SLACK).await;
-    assert!(poll_once(wait.as_mut()).is_ready());
+    let mut tree = FakeTree::new(Containment::ProcessGroup, kill_failed);
+    drain_readers_after_exit("loud-plugin", &mut tree, finished_reader(), finished_reader()).await;
 
     let log = writer.snapshot();
     assert!(
-        log.contains("WARN") && log.contains("stderr-held-plugin"),
-        "the warning must name the plugin:\n{log}"
-    );
-    assert!(
-        log.contains("later; reporting it as exited before ready"),
-        "the warning text is mangled:\n{log}"
+        log.contains("WARN") && log.contains("loud-plugin") && log.contains("the kill failed"),
+        "{log}"
     );
 }
 
-/// stderr finishing first (the common crash shape) is a stored wake, not a wait.
+/// A tree with no tear-down of its own (nested, or uncontained) has nothing to kill; the refusal is
+/// not a warning, but it is not dropped either.
 #[skuld::test]
-async fn the_stderr_wait_returns_at_once_when_stderr_already_finished() {
+async fn a_kill_error_on_a_tree_that_cannot_tear_down_is_logged_at_debug() {
     tokio::time::pause();
-    for (containment, _) in CONTAINMENTS {
-        let stderr_done = Notify::new();
-        stderr_done.notify_one();
-        let wait = await_stderr_after_stdout_eof("p", containment, &stderr_done);
-        assert!(poll_once(pin!(wait)).is_ready(), "{containment:?}");
+    for containment in [Containment::Delegated, Containment::None] {
+        let (subscriber, writer) = subscriber();
+        let _g = set_default_in_current_thread(subscriber);
+
+        let mut tree = FakeTree::new(containment, || Err(unsupported()));
+        drain_readers_after_exit("nested-plugin", &mut tree, finished_reader(), finished_reader()).await;
+
+        let log = writer.snapshot();
+        assert!(!log.contains("WARN"), "{containment:?}: {log}");
+        assert!(
+            log.contains("DEBUG") && log.contains("nested-plugin") && log.contains("no tree of its own"),
+            "{containment:?}: the kill error must be logged at debug:\n{log}"
+        );
     }
+}
+
+// The sitrep stdout reader at EOF -------------------------------------------------------------------------------------
+
+use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
+
+use crate::binary::spawn_sitrep_stdout_reader;
+use crate::sitrep::{PluginReady, SitrepEvent, StartError, Transports, SITREP_PROTOCOL};
+
+type ReadyResult = Result<PluginReady, StartError>;
+
+fn sitrep_line(event: &SitrepEvent) -> String {
+    format!("{}\n", serde_json::to_string(event).unwrap())
+}
+
+fn hello(protocol: &str) -> String {
+    sitrep_line(&SitrepEvent::Hello {
+        protocol: protocol.into(),
+    })
+}
+
+/// Runs the sitrep stdout reader over `stdout_lines`, then EOF on a plugin whose stderr is still open.
+/// `local` refuses connections, so a probe never readies it.
+async fn sitrep_reader_over(
+    stdout_lines: &str,
+    auto: bool,
+) -> (oneshot::Receiver<ReadyResult>, JoinHandle<()>, CancellationToken) {
+    let freed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let (mut plugin_stdout, host_stdout) = tokio::io::duplex(4096);
+    plugin_stdout.write_all(stdout_lines.as_bytes()).await.unwrap();
+    drop(plugin_stdout);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+    let reader = spawn_sitrep_stdout_reader(
+        host_stdout,
+        "eof-plugin".into(),
+        freed,
+        shutdown.clone(),
+        ready_tx,
+        auto,
+        None,
+    );
+    (ready_rx, reader, shutdown)
+}
+
+/// A sitrep plugin's readiness travels on stdout, so once stdout is closed without `ready` it never
+/// readies: the start fails at once, however long its stderr stays open.
+#[skuld::test]
+async fn at_sitrep_stdout_eof_without_ready_the_start_fails_at_once() {
+    tokio::time::pause();
+    for (lines, auto) in [
+        (String::new(), false),
+        (hello(SITREP_PROTOCOL), false),
+        // `Auto` stands its probe down on a supported hello.
+        (hello(SITREP_PROTOCOL), true),
+    ] {
+        let (ready_rx, _reader, _shutdown) = sitrep_reader_over(&lines, auto).await;
+
+        let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx)
+            .await
+            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the start waited on a stderr that stays open"));
+        assert!(
+            matches!(&ready, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("closed its sitrep stream")),
+            "auto={auto}, {lines:?}: {ready:?}"
+        );
+    }
+}
+
+/// Where a probe owns readiness (`Auto` with no supported hello, or after an unknown-major
+/// fallback), closed stdout says nothing about the plugin's listener: the probe decides.
+#[skuld::test]
+async fn at_stdout_eof_a_probe_that_owns_readiness_decides() {
+    tokio::time::pause();
+    for (lines, auto) in [
+        (String::new(), true),
+        (hello("sitrep-9.0.0"), false),
+        (hello("sitrep-9.0.0"), true),
+    ] {
+        let (mut ready_rx, reader, shutdown) = sitrep_reader_over(&lines, auto).await;
+        tokio::time::timeout(VIRTUAL_HANG, reader)
+            .await
+            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the reader never ended"))
+            .unwrap();
+
+        assert!(
+            poll_once(pin!(&mut ready_rx)).is_pending(),
+            "auto={auto}, {lines:?}: the reader failed a start the probe still owns"
+        );
+        shutdown.cancel();
+        // The probe ends on shutdown and drops the sender unsent.
+        assert!(ready_rx.await.is_err());
+    }
+}
+
+#[skuld::test]
+async fn a_ready_before_stdout_eof_is_not_overwritten() {
+    tokio::time::pause();
+    let listen: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let lines = hello(SITREP_PROTOCOL)
+        + &sitrep_line(&SitrepEvent::Ready {
+            listen,
+            transports: Transports::TCP,
+        });
+    let (ready_rx, _reader, _shutdown) = sitrep_reader_over(&lines, false).await;
+
+    let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx).await.unwrap();
+    assert!(matches!(&ready, Ok(Ok(r)) if r.listen == listen), "{ready:?}");
 }
