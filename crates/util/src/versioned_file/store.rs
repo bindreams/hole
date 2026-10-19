@@ -263,15 +263,18 @@ impl<S: VersionedState> VersionedFile<S> {
     /// [`store`](Self::store), and so blocks like it. When the file is not
     /// there, or its directory is not, it returns `Absent` without making
     /// anything: the answer needs no write access to the directory.
+    ///
+    /// A caller that may not open or make the lock is no writer of the file.
+    /// It still gets `Kept` where the role leaves the file as it is, and the
+    /// lock's error where the role would remove or move it.
     pub fn remove(&self) -> io::Result<Removal> {
-        let Some(lock) = self.lock_existing()? else {
-            return Ok(Removal::Absent);
+        let lock = match self.lock_existing() {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return Ok(Removal::Absent),
+            Err(refused) if lacks_access(&refused) => return self.remove_without_lock(refused),
+            Err(e) => return Err(e),
         };
-        let over = match self.load().cannot_read() {
-            None => RemoveOver::Remove,
-            Some(cause) => S::ROLE.on_remove(cause),
-        };
-        match over {
+        match remove_over(&self.load()) {
             RemoveOver::Keep => Ok(Removal::Kept),
             RemoveOver::MoveAside => Ok(match self.move_aside_locked(&lock)? {
                 Some(backup) => Removal::MovedAside(backup),
@@ -282,6 +285,20 @@ impl<S: VersionedState> VersionedFile<S> {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Removal::Absent),
                 Err(e) => Err(e),
             },
+        }
+    }
+
+    /// [`remove`](Self::remove) for a caller the lock refused: it may only
+    /// learn that nothing would be done, never do it.
+    fn remove_without_lock(&self, refused: io::Error) -> io::Result<Removal> {
+        let loaded = self.load();
+        if matches!(loaded, Loaded::Absent) {
+            return Ok(Removal::Absent);
+        }
+        match remove_over(&loaded) {
+            RemoveOver::Keep => Ok(Removal::Kept),
+            RemoveOver::MoveAside => Err(refused),
+            RemoveOver::Remove => Err(refused),
         }
     }
 
@@ -385,6 +402,23 @@ impl<S: VersionedState> VersionedFile<S> {
         };
         self.dir().join(name)
     }
+}
+
+/// What `remove` does with a file as `loaded` found it.
+fn remove_over<S: VersionedState>(loaded: &Loaded<S>) -> RemoveOver {
+    match loaded.cannot_read() {
+        None => RemoveOver::Remove,
+        Some(cause) => S::ROLE.on_remove(cause),
+    }
+}
+
+/// An error that says the caller may not do this, as opposed to one that says
+/// the thing is not there or is not what it should be.
+fn lacks_access(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+    )
 }
 
 fn file_name(path: &Path) -> std::borrow::Cow<'_, str> {

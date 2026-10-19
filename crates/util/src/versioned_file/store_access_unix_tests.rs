@@ -8,7 +8,8 @@
 use std::io;
 
 use super::{DefaultPlacement, Fs, Removal, VersionedFile};
-use crate::versioned_file::fixtures::{dir, put, DecisionFile};
+use crate::versioned_file::fixtures::{dir, put, unreadable_bytes, DecisionFile, OsRecordFile};
+use crate::versioned_file::CannotRead;
 
 fn decision(value: &str) -> DecisionFile {
     DecisionFile {
@@ -85,6 +86,62 @@ mod read_only_directory {
             0,
             "nothing was removed or moved"
         );
+    }
+
+    // The caller cannot lock the file, so it is no writer of it: it may still
+    // learn that the file's role would leave it alone.
+    #[skuld::test]
+    fn remove_by_a_non_writer_answers_kept_where_the_role_keeps_the_file() {
+        let dir = dir();
+        let bytes = unreadable_bytes(CannotRead::Corrupt);
+        put(&dir, "os-record.json", bytes);
+        let _ro = ReadOnly::new(dir.path());
+
+        let removal = VersionedFile::<OsRecordFile>::new(dir.path()).remove();
+
+        assert_eq!(removal.unwrap(), Removal::Kept);
+        assert_eq!(std::fs::read(dir.path().join("os-record.json")).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no lock file was made"
+        );
+    }
+
+    /// The file is gone by the time it is read.
+    struct Vanished;
+
+    impl Fs for Vanished {
+        fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+            Err(io::ErrorKind::NotFound.into())
+        }
+    }
+
+    #[skuld::test]
+    fn remove_by_a_non_writer_answers_absent_for_a_file_that_is_gone_when_read() {
+        let dir = dir();
+        put(&dir, "decision.json", br#"{"version":1,"value":"v"}"#);
+        let _ro = ReadOnly::new(dir.path());
+
+        let removal = VersionedFile::<DecisionFile>::with_fs(dir.path(), std::sync::Arc::new(Vanished)).remove();
+
+        assert_eq!(removal.unwrap(), Removal::Absent);
+    }
+
+    #[skuld::test]
+    fn remove_by_a_non_writer_is_the_lock_error_where_the_role_would_act() {
+        for bytes in [
+            &br#"{"version":1,"value":"v"}"#[..],
+            unreadable_bytes(CannotRead::Corrupt),
+        ] {
+            let dir = dir();
+            put(&dir, "decision.json", bytes);
+            let _ro = ReadOnly::new(dir.path());
+
+            let removal = VersionedFile::<DecisionFile>::new(dir.path()).remove();
+
+            assert_eq!(removal.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        }
     }
 
     #[skuld::test]
