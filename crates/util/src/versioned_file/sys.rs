@@ -98,12 +98,13 @@ mod unix_impl {
         }
     }
 
-    /// The kernel, the filesystem or a seccomp profile does not offer
-    /// `renameat2` with the flag. `EPERM` is a profile's answer; a real one
-    /// makes the hard-link fallback fail the same way.
+    /// The kernel or the filesystem does not offer `renameat2` with the flag.
+    /// `EPERM` is not among these: it is a refusal of this rename (a sticky
+    /// directory, a security module), and the hard-link fallback is allowed
+    /// where it was not and leaves its backup when the delete is refused.
     #[cfg(target_os = "linux")]
     pub(super) fn renameat2_unavailable(errno: i32) -> bool {
-        matches!(errno, libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM)
+        matches!(errno, libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
     }
 
     #[cfg(target_os = "macos")]

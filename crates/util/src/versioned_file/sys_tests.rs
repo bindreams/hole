@@ -62,17 +62,26 @@ fn a_lock_excludes_a_second_handle_until_it_is_released() {
     assert!(try_lock_exclusive(&second).unwrap(), "free after the release");
 }
 
-/// `EPERM` is what a seccomp profile that predates `renameat2` answers with.
-/// A real `EPERM` falls back to a hard link, which fails the same way.
+/// Only an answer that says the flag is unavailable falls back to the hard link.
+/// `EPERM` is a real refusal (a sticky directory, a security module): the link
+/// is allowed where the rename was not, and the delete that follows it is
+/// refused again, so the fallback would leave a backup and fail.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn renameat2_answers_that_mean_it_is_unavailable_fall_back_to_the_link() {
+fn only_renameat2_answers_that_mean_it_is_unavailable_fall_back_to_the_link() {
     use super::unix_impl::renameat2_unavailable;
 
-    for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP, libc::EPERM] {
+    for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP] {
         assert!(renameat2_unavailable(errno), "errno {errno}");
     }
-    for errno in [libc::EEXIST, libc::ENOENT, libc::EACCES, libc::EXDEV, libc::EROFS] {
+    for errno in [
+        libc::EPERM,
+        libc::EEXIST,
+        libc::ENOENT,
+        libc::EACCES,
+        libc::EXDEV,
+        libc::EROFS,
+    ] {
         assert!(!renameat2_unavailable(errno), "errno {errno}");
     }
 }
