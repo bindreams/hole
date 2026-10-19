@@ -12,7 +12,7 @@ use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 use tempfile::{NamedTempFile, TempDir};
 
-use super::{DefaultPlacement, Fs, Placement, Removal, StoreError, VersionedFile};
+use super::{DefaultPlacement, Fs, Removal, StoreError, VersionedFile};
 use crate::versioned_file::fixtures::{dir, names, put, unreadable_bytes, DecisionFile, OsRecordFile};
 use crate::versioned_file::lock::Lock;
 use crate::versioned_file::{sys, CannotRead, Loaded};
@@ -187,7 +187,10 @@ fn run_behind_the_lock<R: Send>(
     while_held: impl FnOnce(),
     op: impl FnOnce(Arc<dyn Fs>) -> R + Send,
 ) -> R {
-    let held = Lock::acquire(&Real, &lock_path(dir, state_file)).unwrap();
+    // The lock takes its access from a file that exists: any will do here.
+    let reference_dir = crate::versioned_file::fixtures::dir();
+    let reference = put(&reference_dir, "reference", b"");
+    let held = Lock::acquire(&Real, &lock_path(dir, state_file), &reference).unwrap();
     std::thread::scope(|scope| {
         let (asked, waiting) = channel();
         let writer = scope.spawn(move || op(Arc::new(SignalsBeforeLocking(Mutex::new(asked)))));
@@ -240,6 +243,8 @@ fn store_decides_from_the_file_the_lock_holder_left() {
 fn remove_decides_from_the_file_the_lock_holder_left() {
     let dir = dir();
     let corrupt = unreadable_bytes(CannotRead::Corrupt);
+    // There is a file when `remove` starts: it is what makes it wait.
+    put(&dir, "os-record.json", br#"{"version":1,"value":"before"}"#);
 
     let result = run_behind_the_lock(
         &dir,
@@ -261,6 +266,8 @@ fn remove_decides_from_the_file_the_lock_holder_left() {
 #[skuld::test]
 fn move_aside_moves_the_file_the_lock_holder_left() {
     let dir = dir();
+    // There is a file when `move_aside` starts: it is what makes it wait.
+    put(&dir, "decision.json", b"before");
 
     let result = run_behind_the_lock(
         &dir,
@@ -324,36 +331,6 @@ fn remove_and_move_aside_in_a_missing_directory_find_nothing_and_create_nothing(
     assert_eq!(file.remove().unwrap(), Removal::Absent);
     assert_eq!(file.move_aside().unwrap(), None);
     assert!(!missing.exists(), "a removal must not create the directory");
-}
-
-#[skuld::test]
-fn the_lock_file_is_given_the_files_placement_before_the_temp_file() {
-    struct Paths(Mutex<Vec<String>>);
-    impl Placement for Paths {
-        // Only `prepare_tmp` is overridden: `prepare_lock` must default to it.
-        fn prepare_tmp(&self, path: &Path) -> io::Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(path.file_name().unwrap().to_string_lossy().into_owned());
-            Ok(())
-        }
-    }
-
-    let dir = dir();
-    let placement = Paths(Mutex::new(Vec::new()));
-
-    VersionedFile::<DecisionFile>::new(dir.path())
-        .store(&decision("v"), &placement)
-        .unwrap();
-
-    let seen = placement.0.lock().unwrap().clone();
-    assert_eq!(seen.len(), 2, "{seen:?}");
-    assert_eq!(seen[0], "decision.json.lock");
-    assert!(
-        seen[1].starts_with(".decision.json.") && seen[1].ends_with(".tmp"),
-        "{seen:?}"
-    );
 }
 
 // Backups =============================================================================================================

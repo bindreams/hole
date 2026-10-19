@@ -46,6 +46,10 @@ impl Fs for StdFs {}
 
 /// What differs per file about where and how it is written, and is not the
 /// type's business: directory creation and mode, the file's mode and owner.
+///
+/// The state directory must not let a principal create files in it that may
+/// not write the state file: such a principal could create `<name>.lock` first,
+/// with an access of its own choosing.
 pub trait Placement {
     fn owner(&self) -> Option<(u32, u32)> {
         None
@@ -58,25 +62,23 @@ pub trait Placement {
         Ok(())
     }
 
-    /// The temp file is complete, synced and not yet published: set its mode and owner here.
+    /// The temp file is complete, synced and not yet published: set its mode,
+    /// owner and ACL here. The lock file is given the access of the principals
+    /// that may write the result, so this also decides who may take the lock.
     fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
         crate::ownership::chown_if_some(tmp, self.owner());
         Ok(())
     }
 
-    /// The `<name>.lock` file next to the state file, which `store` has locked:
-    /// give it the state file's mode, owner and ACL. Defaults to
-    /// [`prepare_tmp`](Placement::prepare_tmp).
-    fn prepare_lock(&self, lock: &Path) -> io::Result<()> {
-        self.prepare_tmp(lock)
-    }
-
-    /// The new file is in place.
+    /// The new file is in place. Runs under the file's lock: it must not call
+    /// `store`, `remove` or `move_aside` on this file, which would wait for the
+    /// lock it is in.
     fn after_publish(&self, _path: &Path) -> io::Result<()> {
         Ok(())
     }
 
-    /// Makes the rename itself durable.
+    /// Makes the rename itself durable. Runs under the file's lock, like
+    /// [`after_publish`](Placement::after_publish).
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         sync_dir(dir)
     }
@@ -181,30 +183,48 @@ impl<S: VersionedState> VersionedFile<S> {
     /// Writes `value`, framed with `S::VERSION`, under the file's lock
     /// (`<name>.lock`, held from the probe to the last write, so a concurrent
     /// `store`, `remove` or `move_aside` of this file in any process waits).
-    /// In this order, so nothing is removed before its replacement is durable:
+    /// The lock can be taken by exactly the principals that may write the
+    /// file as `place` left it, and the owner. In this order, so nothing is
+    /// removed before its replacement is durable:
     ///
-    /// 1. Probe the current file. Absent, older, obsolete or unreadable for an
-    ///    I/O reason goes straight to 2. A newer or corrupt file is decided by
-    ///    `S::ROLE`: refused (nothing touched), overwritten, or backed up in 3.
-    /// 2. Write a same-directory temp file and sync it.
+    /// 1. Write a same-directory temp file, sync it and have `place` set its
+    ///    mode, owner and ACL. The lock is taken after that: its access is
+    ///    derived from this file's.
+    /// 2. Probe the current file. Absent, older, obsolete or unreadable for an
+    ///    I/O reason goes straight to 4. A newer or corrupt file is decided by
+    ///    `S::ROLE`: refused (nothing touched, the temp file deleted),
+    ///    overwritten, or backed up in 3.
     /// 3. Back the old file up as `<name>.unreadable[.N].bak`, by hard link
     ///    (the same file object, so its mode and ACL stay). Every backup made
     ///    is logged and kept, even if 4 then fails.
     /// 4. Rename the temp over the file.
     ///
-    /// A failure at 2, 3 or 4 leaves the original at its name, so a decision
-    /// file is never absent between its backup and its replacement. Once 4 has
-    /// happened the value is stored: a failure after it is
+    /// A failure at 1, 2, 3 or 4 leaves the original at its name, so a
+    /// decision file is never absent between its backup and its replacement.
+    /// Once 4 has happened the value is stored: a failure after it is
     /// [`StoreError::PublishedNotFinalized`], not `Io`.
     ///
     /// Only writers that take the lock are excluded: [`load`](Self::load)
     /// takes none, and reads either file whole.
+    ///
+    /// Blocks the calling thread for as long as another process holds the
+    /// lock, with no timeout: from async code call it where blocking is
+    /// allowed. `serde_json` writes a non-finite float as `null`, so an
+    /// `Option<f64>` holding NaN is stored, and read back, as `None`; a plain
+    /// float that would do so is refused with [`StoreError::Encode`].
     pub fn store(&self, value: &S, place: &dyn Placement) -> Result<(), StoreError> {
         let bytes = encode(value)?;
         let dir = self.dir();
         place.prepare_dir(dir)?;
-        let _lock = self.lock()?;
-        place.prepare_lock(&self.lock_path())?;
+
+        let mut tmp = tempfile::Builder::new()
+            .prefix(&format!(".{}.", S::FILE_NAME))
+            .suffix(".tmp")
+            .tempfile_in(dir)?;
+        io::Write::write_all(&mut tmp, &bytes)?;
+        tmp.as_file().sync_all()?;
+        place.prepare_tmp(tmp.path())?;
+        let _lock = Lock::acquire(&*self.fs, &self.lock_path(), tmp.path())?;
 
         let back_up = match self.load().cannot_read() {
             None => false,
@@ -219,14 +239,6 @@ impl<S: VersionedState> VersionedFile<S> {
                 StoreOver::MoveAside => true,
             },
         };
-
-        let mut tmp = tempfile::Builder::new()
-            .prefix(&format!(".{}.", S::FILE_NAME))
-            .suffix(".tmp")
-            .tempfile_in(dir)?;
-        io::Write::write_all(&mut tmp, &bytes)?;
-        tmp.as_file().sync_all()?;
-        place.prepare_tmp(tmp.path())?;
 
         if back_up {
             self.link_to_free_backup()?;
@@ -243,10 +255,11 @@ impl<S: VersionedState> VersionedFile<S> {
     /// Removes the file, or does what `S::ROLE` says for one that cannot be
     /// read. A file whose read failed with an I/O error is removed: the read
     /// said nothing about its bytes. Takes the file's lock, like
-    /// [`store`](Self::store); in a directory that does not exist there is
-    /// nothing to remove and nothing is created.
+    /// [`store`](Self::store), and so blocks like it. When the file is not
+    /// there, or its directory is not, it returns `Absent` without making
+    /// anything: the answer needs no write access to the directory.
     pub fn remove(&self) -> io::Result<Removal> {
-        let Some(lock) = self.lock_if_dir_exists()? else {
+        let Some(lock) = self.lock_existing()? else {
             return Ok(Removal::Absent);
         };
         let over = match self.load().cannot_read() {
@@ -269,15 +282,16 @@ impl<S: VersionedState> VersionedFile<S> {
 
     /// Moves the file to the first free `<name>.unreadable[.N].bak` and
     /// returns that path, whatever the file holds and whatever the role: the
-    /// caller has decided. `None` when there is no file. Never replaces a
-    /// backup that exists, and logs the one it makes. Takes the file's lock.
+    /// caller has decided. `None` when there is no file, and then nothing is
+    /// made. Never replaces a backup that exists, and logs the one it makes.
+    /// Takes the file's lock, and so blocks like [`store`](Self::store).
     ///
     /// The move is one rename that refuses to replace, so the file backed up
     /// is the file moved even if another writer renames over it meanwhile. On
     /// a platform or filesystem without such a rename it is a hard link and
     /// then a delete, which only the lock protects.
     pub fn move_aside(&self) -> io::Result<Option<PathBuf>> {
-        let Some(lock) = self.lock_if_dir_exists()? else {
+        let Some(lock) = self.lock_existing()? else {
             return Ok(None);
         };
         self.move_aside_locked(&lock)
@@ -320,14 +334,15 @@ impl<S: VersionedState> VersionedFile<S> {
         self.dir().join(format!("{}.lock", S::FILE_NAME))
     }
 
-    /// Takes the lock, creating its file when it is missing.
-    fn lock(&self) -> io::Result<Lock> {
-        Lock::acquire(&*self.fs, &self.lock_path())
-    }
-
-    /// `None` when the directory does not exist, so the file cannot either.
-    fn lock_if_dir_exists(&self) -> io::Result<Option<Lock>> {
-        match self.lock() {
+    /// The lock, for a file that is there. `None` when it is not (or its
+    /// directory is not), and then no lock file is made: where the caller
+    /// cannot write the directory, "nothing to do" must not become an error. A
+    /// file that appears right after is the same as the call having run just
+    /// before its write.
+    fn lock_existing(&self) -> io::Result<Option<Lock>> {
+        // `acquire` reads the file's access before it touches the lock file,
+        // so `NotFound` here is the file's, and nothing has been created.
+        match Lock::acquire(&*self.fs, &self.lock_path(), &self.path) {
             Ok(lock) => Ok(Some(lock)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -423,3 +438,11 @@ mod store_faults_tests;
 #[cfg(test)]
 #[path = "store_lock_tests.rs"]
 mod store_lock_tests;
+
+#[cfg(all(test, unix))]
+#[path = "store_access_unix_tests.rs"]
+mod store_access_unix_tests;
+
+#[cfg(all(test, windows))]
+#[path = "store_access_windows_tests.rs"]
+mod store_access_windows_tests;

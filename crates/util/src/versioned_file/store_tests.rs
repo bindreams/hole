@@ -438,13 +438,6 @@ impl Placement for Recorder<'_> {
         std::fs::create_dir_all(dir)
     }
 
-    fn prepare_lock(&self, _lock: &Path) -> io::Result<()> {
-        self.events
-            .borrow_mut()
-            .push(format!("prepare_lock[{}]", self.on_disk()));
-        Ok(())
-    }
-
     fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
         let tmp_bytes = std::fs::read(tmp)?;
         assert!(
@@ -492,7 +485,6 @@ fn placement_runs_around_the_publish_in_order() {
         *placement.events.borrow(),
         [
             "prepare_dir[old]",
-            "prepare_lock[old]",
             "prepare_tmp[old]",
             "after_publish[new]",
             "sync_dir[new]"

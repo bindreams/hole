@@ -7,6 +7,10 @@
 //! read, whether newer than this release or corrupt, meets one rule per
 //! [`Role`]. `store`, `remove` and `move_aside` hold an exclusive lock on
 //! `<name>.lock`, a file the type creates and never deletes; `load` takes none.
+//! The lock file can be opened by exactly the principals that may write the
+//! file it guards, and its owner, so a principal that can only read the file
+//! cannot stall its writers. For that the state directory must not let a
+//! principal create files in it that may not write the state file.
 //!
 //! # Compatibility
 //!
@@ -38,6 +42,7 @@ mod fixtures;
 mod frame;
 mod loaded;
 mod lock;
+mod lock_access;
 mod role;
 mod store;
 mod sys;
