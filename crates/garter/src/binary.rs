@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use cosca::containment::Containment;
 use cosca::tokio::Command;
 use cosca::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -264,13 +265,14 @@ impl ChainPlugin for BinaryPlugin {
             sink(child.id().pid());
         }
 
+        let containment = child.containment();
+
         // Capture stderr FIRST: the sitrep stdout reader's readiness-FAILURE
-        // path (child exited before ever readying) joins `stderr_done` —
-        // bounded, not indefinite — before reporting that failure, so a
-        // plugin whose crash lands on stderr (the common shape for a Go
-        // panic under `GOTRACEBACK=crash`) isn't reported as if it said
-        // nothing. `Notify` (not the `JoinHandle` itself) so this task's
-        // handle stays free for the unconditional drain below too.
+        // path (child exited before ever readying) joins `stderr_done` before
+        // reporting that failure, so a plugin whose crash lands on stderr (the
+        // common shape for a Go panic under `GOTRACEBACK=crash`) isn't reported
+        // as if it said nothing. `Notify` (not the `JoinHandle` itself) so this
+        // task's handle stays free for the unconditional drain below too.
         let stderr = child.stderr().expect("stderr was piped");
         let plugin_name = self.name.clone();
         let log_sink = self.log_sink.clone();
@@ -349,6 +351,7 @@ impl ChainPlugin for BinaryPlugin {
                 false,
                 self.log_sink.clone(),
                 stderr_done,
+                containment,
             ),
             ReadinessMode::Auto => spawn_sitrep_stdout_reader(
                 stdout,
@@ -359,10 +362,12 @@ impl ChainPlugin for BinaryPlugin {
                 true,
                 self.log_sink.clone(),
                 stderr_done,
+                containment,
             ),
         };
 
-        // Wait for child exit or shutdown signal.
+        // Wait for child exit or shutdown signal. Either way the output readers
+        // are then drained by `drain_readers_after_exit`, which kills the tree first.
         //
         // The readiness sender (start-gate for `on_ready`) and this
         // `child.wait()` Err return (lifecycle error driving teardown) are two
@@ -376,11 +381,7 @@ impl ChainPlugin for BinaryPlugin {
         tokio::select! {
             status = child.wait() => {
                 let status = status?;
-                // Drain remaining log lines (tasks will EOF when child's pipes close)
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    async { let _ = tokio::join!(stdout_task, stderr_task); }
-                ).await;
+                drain_readers_after_exit(&self.name, containment, || child.kill_tree(), stdout_task, stderr_task).await;
                 if status.success() {
                     Ok(())
                 } else {
@@ -400,11 +401,7 @@ impl ChainPlugin for BinaryPlugin {
                 // The escalation force-kills the direct child; `child` dropping at
                 // the end of `run` (or on task abort) reaps the whole tree.
                 child.graceful_shutdown(drain_timeout).await?;
-                // Drain remaining log lines (tasks will EOF when child's pipes close)
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    async { let _ = tokio::join!(stdout_task, stderr_task); }
-                ).await;
+                drain_readers_after_exit(&self.name, containment, || child.kill_tree(), stdout_task, stderr_task).await;
                 Ok(())
             }
         }
@@ -448,10 +445,10 @@ fn spawn_shared_probe(local: SocketAddr, standdown: CancellationToken, shared: S
 /// a non-sitrep plugin (including one silent on stdout) is still readied by the
 /// probe. Non-event lines pass through to tracing as logs. On stdout EOF without
 /// ever sending, the sender drops unsent → the chain aggregator synthesizes a
-/// process-exit failure (the intended backstop) — bounded on `stderr_done` first
-/// (see its call site), so a crash whose last words land on stderr is not
+/// process-exit failure (the intended backstop) — after `stderr_done` first
+/// ([`await_stderr_after_stdout_eof`]), so a crash whose last words land on stderr is not
 /// reported as if the plugin said nothing.
-#[allow(clippy::too_many_arguments)] // 8 args — bundling into a struct adds more noise than the warning.
+#[allow(clippy::too_many_arguments)] // 9 args — bundling into a struct adds more noise than the warning.
 fn spawn_sitrep_stdout_reader(
     stdout: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     plugin_name: String,
@@ -461,6 +458,7 @@ fn spawn_sitrep_stdout_reader(
     auto: bool,
     log_sink: Option<LogSink>,
     stderr_done: Arc<tokio::sync::Notify>,
+    containment: Containment,
 ) -> tokio::task::JoinHandle<()> {
     use crate::sitrep::{ProtocolSupport, SitrepEvent};
 
@@ -561,16 +559,12 @@ fn spawn_sitrep_stdout_reader(
                 }
             }
         }
-        // If the child closed stdout without ever sending readiness, give the
-        // stderr reader a bounded chance to catch up before dropping the
-        // shared sender below signals process-exit to the aggregator — a
-        // crash lands on stderr more often than stdout (e.g. a Go panic
-        // under `GOTRACEBACK=crash`), and the two pipes are read by
-        // independent tasks with no ordering between them otherwise. Bounded
-        // on the child's own exit (stdout just EOF'd, so stderr is expected
-        // to follow shortly), not an arbitrary wait: this mirrors the
-        // existing drain timeout in `run`'s own shutdown paths.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), stderr_done.notified()).await;
+        // If the child closed stdout without ever sending readiness, wait for the
+        // stderr reader to finish before dropping the shared sender below, which
+        // the aggregator reads as "exited before ready": a crash lands on stderr
+        // more often than stdout (e.g. a Go panic under `GOTRACEBACK=crash`), and
+        // the two pipes are read by independent tasks with no ordering otherwise.
+        await_stderr_after_stdout_eof(&plugin_name, containment, &stderr_done).await;
     })
 }
 
@@ -593,5 +587,120 @@ async fn drain_remaining_logs(
     while let Ok(Some(line)) = lines.next_line().await {
         let line = relay_to_sink(&line, log_sink);
         tracing::info!(plugin = %plugin_name, "{line}");
+    }
+}
+
+// Post-exit reader wait ===============================================================================================
+
+/// Failure bound on a post-exit wait for the plugin's output to reach EOF, used where tearing the
+/// tree down does not guarantee EOF ([`kill_guarantees_eof`]). Expiry is not taken as proof that
+/// the output is complete: it is surfaced as a warning and the readers are aborted.
+pub(crate) const READER_EOF_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether killing the plugin's tree guarantees every holder of its output pipes is gone, so the
+/// readers reach EOF. True only where the kernel owns the membership: a live process cannot leave a
+/// Windows job object or a cgroup. Every other mechanism (a process group, or macOS's advisory fd
+/// marker) lets a descendant that escaped it keep the pipe open. One arm per mechanism; `Containment`
+/// is `#[non_exhaustive]`, so a mechanism cosca adds later is unproven until named here.
+pub(crate) fn kill_guarantees_eof(containment: Containment) -> bool {
+    match containment {
+        Containment::CgroupV2 => true,
+        Containment::JobObject => true,
+        Containment::ProcessGroup => false,
+        Containment::Session => false,
+        Containment::FdMarker => false,
+        Containment::TreeWalk => false,
+        Containment::Delegated => false,
+        Containment::None => false,
+        _ => false,
+    }
+}
+
+/// What a wait for output EOF may assume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderWait {
+    /// EOF is guaranteed: wait for it with no bound.
+    UntilEof,
+    /// A holder may have escaped containment: wait at most the bound.
+    Bounded(std::time::Duration),
+}
+
+impl ReaderWait {
+    /// `tree_killed`: the tree teardown that precedes the wait succeeded (or, for the sitrep
+    /// reader's wait, is one `run` performs when the child exits or shuts down).
+    fn after(containment: Containment, tree_killed: bool) -> Self {
+        if tree_killed && kill_guarantees_eof(containment) {
+            Self::UntilEof
+        } else {
+            Self::Bounded(READER_EOF_BOUND)
+        }
+    }
+}
+
+/// After the child has exited (or been shut down): kill its process tree, then wait for both output
+/// readers to reach EOF, so the child's last lines (the typed `BindConflict`/`Fatal` among them) are
+/// delivered before `run` returns.
+///
+/// The kill comes first because a descendant that inherited the pipe holds it open after the child
+/// is gone. With a kernel-owned containment the kill makes EOF certain and the wait has no bound.
+/// Otherwise the wait is bounded by [`READER_EOF_BOUND`]; on expiry it warns that the output after
+/// this point was cut and aborts the readers (so their hold on the readiness sender drops).
+pub(crate) async fn drain_readers_after_exit(
+    plugin: &str,
+    containment: Containment,
+    kill_tree: impl FnOnce() -> Result<(), cosca::error::Error>,
+    mut stdout: tokio::task::JoinHandle<()>,
+    mut stderr: tokio::task::JoinHandle<()>,
+) {
+    let killed = match kill_tree() {
+        Ok(()) => true,
+        Err(e) => {
+            // An uncontained or nested child has no tree to kill of its own; that is not a failure.
+            if containment.can_teardown() {
+                tracing::warn!(plugin = %plugin, "failed to kill the plugin's process tree: {e}");
+            }
+            false
+        }
+    };
+    let both = async {
+        let _ = tokio::join!(&mut stdout, &mut stderr);
+    };
+    match ReaderWait::after(containment, killed) {
+        ReaderWait::UntilEof => both.await,
+        ReaderWait::Bounded(bound) => {
+            // sync-exception(external-event, CLAUDE.md class 2): a process outside containment
+            // may hold the pipe forever; the bound is surfaced to a human, not proof of state.
+            if tokio::time::timeout(bound, both).await.is_err() {
+                tracing::warn!(
+                    plugin = %plugin,
+                    "the plugin's output pipes were still open {bound:?} after it exited (a process it started                      holds them); its output after this point was cut"
+                );
+                stdout.abort();
+                stderr.abort();
+            }
+        }
+    }
+}
+
+/// The sitrep stdout reader's wait, on stdout EOF without readiness, for the stderr reader to
+/// finish, so a crash whose last words land on stderr is logged before the dropped readiness sender
+/// reads as "exited before ready". Bounded as in [`drain_readers_after_exit`]; expiry warns and
+/// returns (the stderr reader belongs to `run`, which aborts it on its own bound).
+pub(crate) async fn await_stderr_after_stdout_eof(
+    plugin: &str,
+    containment: Containment,
+    stderr_done: &tokio::sync::Notify,
+) {
+    match ReaderWait::after(containment, true) {
+        ReaderWait::UntilEof => stderr_done.notified().await,
+        ReaderWait::Bounded(bound) => {
+            // sync-exception(external-event, CLAUDE.md class 2): see `drain_readers_after_exit`.
+            if tokio::time::timeout(bound, stderr_done.notified()).await.is_err() {
+                tracing::warn!(
+                    plugin = %plugin,
+                    "the plugin closed stdout but its stderr was still open {bound:?} later; reporting it as exited                      before ready"
+                );
+            }
+        }
     }
 }

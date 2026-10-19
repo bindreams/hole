@@ -413,6 +413,65 @@ async fn bind_conflict_start_error_surfaces_typed() {
     let _ = chain_task.await;
 }
 
+/// Run a single `ExpectSitrep` mock-plugin that spawns a stdio-inheriting grandchild, emits the
+/// typed failure `fail` and exits. The grandchild still holds the plugin's stdout and stderr pipes
+/// when the plugin is gone, so the plugin's last line reaches `ready` only if the exit path
+/// delivers it before it lets go of the readers.
+async fn typed_failure_with_a_descendant_holding_the_pipes(fail: &str) -> Result<ChainReady, StartError> {
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    // The grandchild dials this address when it starts; the listener only has to stay open.
+    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = control_listener.local_addr().unwrap();
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(mock_plugin_path(), None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_FAIL", fail)
+                .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", control_addr.to_string()),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = expect_ready(ready_rx).await;
+    // The plugin has exited, so the chain ends by itself; a panic in `run`'s exit path surfaces here.
+    let run_result = chain_task.await.expect("the chain task must not panic");
+    assert!(
+        run_result.is_err(),
+        "a plugin that exited with a failure ends the chain with an error"
+    );
+    drop(control_listener);
+    outcome
+}
+
+#[skuld::test]
+async fn bind_conflict_surfaces_typed_when_a_descendant_holds_the_output_pipes() {
+    match typed_failure_with_a_descendant_holding_the_pipes("bind_conflict").await {
+        Err(StartError::BindConflict { errno, .. }) => assert_ne!(errno, 0),
+        other => panic!("expected StartError::BindConflict, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+async fn fatal_surfaces_typed_when_a_descendant_holds_the_output_pipes() {
+    match typed_failure_with_a_descendant_holding_the_pipes("fatal").await {
+        Err(StartError::Fatal { detail, .. }) => assert_eq!(detail, "injected fatal"),
+        other => panic!("expected StartError::Fatal, got {other:?}"),
+    }
+}
+
 /// A `ready` event that lists an empty transports set is a SITREP
 /// protocol violation; the consumer rejects it as `StartError::Fatal`.
 #[skuld::test]
