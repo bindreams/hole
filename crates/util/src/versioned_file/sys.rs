@@ -1,7 +1,6 @@
 //! The platform calls `versioned_file` needs and `std` does not offer: a
-//! durable replace, a rename that never replaces, and an advisory file lock.
+//! durable replace and a rename that never replaces.
 
-use std::fs::File;
 use std::io;
 use std::path::Path;
 
@@ -28,34 +27,6 @@ pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     return unix_impl::rename_noreplace(from, to);
 }
 
-/// Blocks until this handle holds the exclusive lock on its file. The lock is
-/// per handle, not per process, and released by [`unlock`] or by closing it.
-pub(super) fn lock_exclusive(file: &File) -> io::Result<()> {
-    #[cfg(windows)]
-    return windows_impl::lock(file, false).map(|_| ());
-    #[cfg(unix)]
-    return unix_impl::lock(file, false).map(|_| ());
-}
-
-/// Whether this handle took the exclusive lock without waiting.
-#[cfg(test)]
-pub(super) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
-    #[cfg(windows)]
-    return windows_impl::lock(file, true);
-    #[cfg(unix)]
-    return unix_impl::lock(file, true);
-}
-
-pub(super) fn unlock(file: &File) {
-    #[cfg(windows)]
-    windows_impl::unlock(file);
-    #[cfg(unix)]
-    unix_impl::unlock(file);
-}
-
-#[cfg(windows)]
-pub(super) use windows_impl::io_error;
-
 #[cfg(test)]
 #[path = "sys_tests.rs"]
 mod sys_tests;
@@ -63,9 +34,7 @@ mod sys_tests;
 #[cfg(unix)]
 mod unix_impl {
     use std::ffi::CString;
-    use std::fs::File;
     use std::io;
-    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
@@ -127,52 +96,22 @@ mod unix_impl {
     pub(super) fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
-
-    pub(super) fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
-        let op = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
-        loop {
-            // SAFETY: the descriptor is open for the call.
-            if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
-                return Ok(true);
-            }
-            let e = io::Error::last_os_error();
-            match e.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock if nonblocking => return Ok(false),
-                _ => return Err(e),
-            }
-        }
-    }
-
-    pub(super) fn unlock(file: &File) {
-        // SAFETY: the descriptor is open for the call. Closing the file would
-        // release the lock anyway, so a failure here has nothing to act on.
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    }
 }
 
 #[cfg(windows)]
 mod windows_impl {
-    use std::fs::File;
     use std::io;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
 
     use tempfile::NamedTempFile;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
-        LockFileEx, MoveFileExW, UnlockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LOCK_FILE_FLAGS,
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MOVE_FILE_FLAGS,
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MOVE_FILE_FLAGS,
     };
-    use windows::Win32::System::IO::OVERLAPPED;
-
-    /// `ERROR_LOCK_VIOLATION`: a `LockFileEx` that would have waited.
-    const LOCK_VIOLATION: i32 = 33;
 
     /// A `windows` error as the `io::Error` of the Win32 code inside it.
-    pub(in crate::versioned_file) fn io_error(e: windows::core::Error) -> io::Error {
+    fn io_error(e: windows::core::Error) -> io::Error {
         // An `HRESULT_FROM_WIN32` value keeps the Win32 code in its low word.
         match e.code().0 as u32 >> 16 {
             0x8007 => io::Error::from_raw_os_error((e.code().0 as u32 & 0xFFFF) as i32),
@@ -200,35 +139,5 @@ mod windows_impl {
     /// Without `MOVEFILE_REPLACE_EXISTING` the move fails when `to` exists.
     pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
         move_file(from, to, MOVEFILE_WRITE_THROUGH)
-    }
-
-    fn handle(file: &File) -> HANDLE {
-        HANDLE(file.as_raw_handle())
-    }
-
-    pub(super) fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
-        let flags = LOCKFILE_EXCLUSIVE_LOCK
-            | if nonblocking {
-                LOCKFILE_FAIL_IMMEDIATELY
-            } else {
-                LOCK_FILE_FLAGS(0)
-            };
-        let mut region = OVERLAPPED::default();
-        // SAFETY: the handle is open and `region` outlives the call; the lock
-        // covers the first byte, which no one reads or writes.
-        match unsafe { LockFileEx(handle(file), flags, None, 1, 0, &mut region) } {
-            Ok(()) => Ok(true),
-            Err(e) => match io_error(e) {
-                e if nonblocking && e.raw_os_error() == Some(LOCK_VIOLATION) => Ok(false),
-                e => Err(e),
-            },
-        }
-    }
-
-    pub(super) fn unlock(file: &File) {
-        let mut region = OVERLAPPED::default();
-        // SAFETY: as in `lock`. The system releases the lock when the handle
-        // closes, but only eventually; this is the prompt release.
-        let _ = unsafe { UnlockFileEx(handle(file), None, 1, 0, &mut region) };
     }
 }

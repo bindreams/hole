@@ -35,9 +35,8 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # `Win32_Foundation`, `Win32_Storage_FileSystem`: `versioned_file`'s write-through
-# replace, no-clobber rename and file lock. `Win32_Security`,
-# `Win32_Security_Authorization`: the lock file's DACL.
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemInformation"] }
+# replace and no-clobber rename.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
@@ -54,8 +53,3 @@ tokio = { version = "1", features = ["test-util"] }
 # `versioned_file`'s compile-fail fixtures pin that a gap in a migration chain
 # does not build.
 trybuild = { workspace = true }
-
-[target.'cfg(windows)'.dev-dependencies]
-# `versioned_file` store tests compare a backup's file identity with the
-# original's and read and set a file's DACL.
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }

@@ -6,19 +6,14 @@
 //! into the current one and a missing step does not build. A file it cannot
 //! read, whether newer than this release or corrupt, meets one rule per
 //! [`Role`]; so does one whose read failed with an I/O error, under its own
-//! cell: a write or remove never destroys it unread. `store`, `remove` and `move_aside` hold an exclusive lock on
-//! `<name>.lock`, a file the type creates and never deletes; `load` takes none.
-//! The lock file can be opened by exactly the principals that may write the
-//! file it guards, and its owner, so a principal that can only read the file
-//! cannot stall its writers. For that the state directory must not let a
-//! principal create files in it that may not write the state file.
+//! cell: a write or remove never destroys it unread.
 //!
-//! Who may write the file is read from its mode bits (unix) or its DACL
-//! (Windows): a principal that writes it through a POSIX or macOS ACL entry is
-//! not seen. On unix the lock is owned by the file's owner, so only that owner,
-//! or root, can create it; a group writer can open a lock the owner made, not
-//! make one. A link or anything but a regular file at `<name>.lock` is an
-//! error, never followed.
+//! # Exclusion
+//!
+//! The type takes no lock. `store`, `remove` and `move_aside` probe the file
+//! and then act on what they found, so the caller must ensure that no other
+//! process or task writes the same file in between (see
+//! [`VersionedFile::store`]). `load` needs no exclusion.
 //!
 //! # Compatibility
 //!
@@ -49,8 +44,6 @@ mod chain;
 mod fixtures;
 mod frame;
 mod loaded;
-mod lock;
-mod lock_access;
 mod role;
 mod store;
 mod sys;

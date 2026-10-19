@@ -1,6 +1,6 @@
 use std::io;
 
-use super::{lock_exclusive, publish, rename_noreplace, try_lock_exclusive, unlock};
+use super::{publish, rename_noreplace};
 use crate::versioned_file::fixtures::{dir, names, put};
 
 #[skuld::test]
@@ -46,20 +46,6 @@ fn publish_replaces_the_destination_and_leaves_no_temp() {
 
     assert_eq!(std::fs::read(&dest).unwrap(), b"new");
     assert_eq!(names(&dir), ["dest"]);
-}
-
-#[skuld::test]
-fn a_lock_excludes_a_second_handle_until_it_is_released() {
-    let dir = dir();
-    let path = put(&dir, "x.lock", b"");
-    let first = std::fs::File::open(&path).unwrap();
-    let second = std::fs::File::open(&path).unwrap();
-
-    lock_exclusive(&first).unwrap();
-    assert!(!try_lock_exclusive(&second).unwrap(), "held by the first handle");
-
-    unlock(&first);
-    assert!(try_lock_exclusive(&second).unwrap(), "free after the release");
 }
 
 /// Only an answer that says the flag is unavailable falls back to the hard link.

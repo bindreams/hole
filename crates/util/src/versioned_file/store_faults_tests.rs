@@ -3,13 +3,13 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 
 use tempfile::NamedTempFile;
 
 use super::{DefaultPlacement, Fs, Removal, StoreError, VersionedFile};
 use crate::versioned_file::fixtures::{dir, names, put, unreadable_bytes, DecisionFile, NoteV3};
-use crate::versioned_file::{CannotRead, Loaded};
+use crate::versioned_file::CannotRead;
 
 fn plain() -> DefaultPlacement {
     DefaultPlacement::default()
@@ -158,44 +158,6 @@ fn remove_and_move_aside_also_take_the_next_free_name() {
         std::fs::read(dir.path().join("decision.json.unreadable.bak")).unwrap(),
         b"first"
     );
-}
-
-/// Many writers at once over one unreadable decision file. Each probe and its
-/// write is one step under the file's lock, so the first writer backs the
-/// original up and every later one finds the file it wrote.
-#[skuld::test]
-fn racing_stores_back_the_original_up_once() {
-    const WRITERS: usize = 8;
-    let dir = dir();
-    let original = unreadable_bytes(CannotRead::Newer);
-    put(&dir, "decision.json", original);
-    let start = Barrier::new(WRITERS);
-
-    std::thread::scope(|scope| {
-        for i in 0..WRITERS {
-            let (path, start) = (dir.path(), &start);
-            scope.spawn(move || {
-                start.wait();
-                VersionedFile::<DecisionFile>::new(path)
-                    .store(&decision(&format!("writer {i}")), &plain())
-                    .expect("every writer stores");
-            });
-        }
-    });
-
-    assert_eq!(
-        names(&dir),
-        ["decision.json", "decision.json.unreadable.bak"],
-        "one backup, of the file that was unreadable"
-    );
-    assert_eq!(
-        std::fs::read(dir.path().join("decision.json.unreadable.bak")).unwrap(),
-        original
-    );
-    assert!(matches!(
-        VersionedFile::<DecisionFile>::new(dir.path()).load(),
-        Loaded::Current { .. }
-    ));
 }
 
 // A backup is the same file ===========================================================================================

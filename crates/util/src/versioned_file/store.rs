@@ -6,23 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::loaded::{CannotRead, Loaded};
-use super::lock::Lock;
 use super::{frame, Chain, ChainError, RemoveOver, StoreOver, VersionedState};
 use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
 /// without touching the rest. Every method defaults to the real call.
 pub(crate) trait Fs: Send + Sync {
-    /// Blocks until `file` holds the exclusive lock.
-    fn lock(&self, file: &std::fs::File) -> io::Result<()> {
-        super::sys::lock_exclusive(file)
-    }
-
-    /// Called once for a lock file this call has just made, before anything
-    /// else is done to it, so a test can read the access it has at its first
-    /// instant.
-    fn after_lock_created(&self, _file: &std::fs::File) {}
-
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
@@ -51,10 +40,6 @@ impl Fs for StdFs {}
 
 /// What differs per file about where and how it is written, and is not the
 /// type's business: directory creation and mode, the file's mode and owner.
-///
-/// The state directory must not let a principal create files in it that may
-/// not write the state file: such a principal could create `<name>.lock` first,
-/// with an access of its own choosing.
 pub trait Placement {
     fn owner(&self) -> Option<(u32, u32)> {
         None
@@ -68,24 +53,19 @@ pub trait Placement {
     }
 
     /// The temp file is complete, synced and not yet published: set its mode,
-    /// owner and ACL here. The lock file is given the access of the principals
-    /// that may write the result, so this also decides who may take the lock.
+    /// owner and ACL here.
     fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
         crate::ownership::chown_if_some(tmp, self.owner());
         Ok(())
     }
 
-    /// The new file is in place. Runs under the file's lock: it must not call
-    /// `store`, `remove` or `move_aside` on this file, which would wait for the
-    /// lock it is in. Not for its mode, owner or ACL: the lock's access was
-    /// derived from the temp file before this, so use
+    /// The new file is in place. Not for its mode, owner or ACL: use
     /// [`prepare_tmp`](Placement::prepare_tmp).
     fn after_publish(&self, _path: &Path) -> io::Result<()> {
         Ok(())
     }
 
-    /// Makes the rename itself durable. Runs under the file's lock, like
-    /// [`after_publish`](Placement::after_publish).
+    /// Makes the rename itself durable.
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         sync_dir(dir)
     }
@@ -192,16 +172,11 @@ impl<S: VersionedState> VersionedFile<S> {
         Loaded::from_read(self.fs.read(&self.path))
     }
 
-    /// Writes `value`, framed with `S::VERSION`, under the file's lock
-    /// (`<name>.lock`, held from the probe to the last write, so a concurrent
-    /// `store`, `remove` or `move_aside` of this file in any process waits).
-    /// The lock can be taken by exactly the principals that may write the
-    /// file as `place` left it, and the owner. In this order, so nothing is
+    /// Writes `value`, framed with `S::VERSION`. In this order, so nothing is
     /// removed before its replacement is durable:
     ///
     /// 1. Write a same-directory temp file, sync it and have `place` set its
-    ///    mode, owner and ACL. The lock is taken after that: its access is
-    ///    derived from this file's.
+    ///    mode, owner and ACL.
     /// 2. Probe the current file. Absent, older or obsolete goes straight to
     ///    4. A newer or corrupt file, and one whose read failed with an I/O
     ///    error, is decided by `S::ROLE`: refused (nothing touched, the temp
@@ -218,12 +193,23 @@ impl<S: VersionedState> VersionedFile<S> {
     /// Once 4 has happened the value is stored: a failure after it is
     /// [`StoreError::PublishedNotFinalized`], not `Io`.
     ///
-    /// Only writers that take the lock are excluded: [`load`](Self::load)
-    /// takes none, and reads either file whole.
+    /// # Exclusion
     ///
-    /// Blocks the calling thread for as long as another process holds the
-    /// lock, with no timeout: from async code call it where blocking is
-    /// allowed. `serde_json` writes a non-finite float as `null`, so an
+    /// The type probes the file (2) and then acts on what it found (3, 4); it
+    /// takes no lock. The caller must ensure that no other process or task
+    /// writes, removes or moves aside this file between the two: the probe is
+    /// not rechecked, so a concurrent writer's file can be overwritten or
+    /// backed up on the strength of a stale probe. For the bridge's state
+    /// files that is the bridge's liveness lock
+    /// (`crates/bridge/src/liveness.rs`: held by the running bridge and by
+    /// the CLIs that write state, one holder per state directory) plus the
+    /// caller's own ordering within the process. The state directory must
+    /// not let another principal create files in it: the type acts by name
+    /// and does not defend against a name changed under it.
+    /// [`load`](Self::load) needs none of this and reads either file whole.
+    ///
+    /// Blocks the calling thread on file I/O: from async code call it where
+    /// blocking is allowed. `serde_json` writes a non-finite float as `null`, so an
     /// `Option<f64>` holding NaN is stored, and read back, as `None`; a plain
     /// float that would do so is refused with [`StoreError::Encode`].
     pub fn store(&self, value: &S, place: &dyn Placement) -> Result<(), StoreError> {
@@ -238,7 +224,6 @@ impl<S: VersionedState> VersionedFile<S> {
         io::Write::write_all(&mut tmp, &bytes)?;
         tmp.as_file().sync_all()?;
         place.prepare_tmp(tmp.path())?;
-        let _lock = Lock::acquire(&*self.fs, &self.lock_path(), tmp.path())?;
 
         let back_up = store_over(&self.path, &self.load())?;
 
@@ -256,24 +241,17 @@ impl<S: VersionedState> VersionedFile<S> {
 
     /// Removes the file, or does what `S::ROLE` says for one that cannot be
     /// read, or whose read failed with an I/O error (kept, or moved aside:
-    /// never deleted unread). Takes the file's lock, like
-    /// [`store`](Self::store), and so blocks like it. When the file is not
-    /// there, or its directory is not, it returns `Absent` without making
-    /// anything: the answer needs no write access to the directory.
+    /// never deleted unread). When the file is not there, or its directory is
+    /// not, it returns `Absent` without making anything. A link at the name
+    /// is an entry: it is removed, never what it points at.
     ///
-    /// A caller that may not open or make the lock is no writer of the file.
-    /// It still gets `Kept` where the role leaves the file as it is, and the
-    /// lock's error where the role would remove or move it.
+    /// The type probes the file and then acts on what it found. The caller
+    /// must ensure that no other process or task writes, removes or moves
+    /// aside this file in between; see [`store`](Self::store), "Exclusion".
     pub fn remove(&self) -> io::Result<Removal> {
-        let lock = match self.lock_existing() {
-            Ok(Some(lock)) => lock,
-            Ok(None) => return Ok(Removal::Absent),
-            Err(refused) if lacks_access(&refused) => return self.remove_without_lock(refused),
-            Err(e) => return Err(e),
-        };
         match remove_over(&self.load()) {
             RemoveOver::Keep => Ok(Removal::Kept),
-            RemoveOver::MoveAside => Ok(match self.move_aside_locked(&lock)? {
+            RemoveOver::MoveAside => Ok(match self.move_aside_unchecked()? {
                 Some(backup) => Removal::MovedAside(backup),
                 None => Removal::Absent,
             }),
@@ -285,38 +263,22 @@ impl<S: VersionedState> VersionedFile<S> {
         }
     }
 
-    /// [`remove`](Self::remove) for a caller the lock refused: it may only
-    /// learn that nothing would be done, never do it.
-    fn remove_without_lock(&self, refused: io::Error) -> io::Result<Removal> {
-        let loaded = self.load();
-        if matches!(loaded, Loaded::Absent) {
-            return Ok(Removal::Absent);
-        }
-        match remove_over(&loaded) {
-            RemoveOver::Keep => Ok(Removal::Kept),
-            RemoveOver::MoveAside => Err(refused),
-            RemoveOver::Remove => Err(refused),
-        }
-    }
-
     /// Moves the file to the first free `<name>.unreadable[.N].bak` and
     /// returns that path, whatever the file holds and whatever the role: the
     /// caller has decided. `None` when there is no file, and then nothing is
     /// made. Never replaces a backup that exists, and logs the one it makes.
-    /// Takes the file's lock, and so blocks like [`store`](Self::store).
     ///
     /// The move is one rename that refuses to replace, so the file backed up
     /// is the file moved even if another writer renames over it meanwhile. On
     /// a platform or filesystem without such a rename it is a hard link and
-    /// then a delete, which only the lock protects.
+    /// then a delete, and a writer that replaces the file between the two
+    /// loses its file. The caller must ensure there is none; see
+    /// [`store`](Self::store), "Exclusion".
     pub fn move_aside(&self) -> io::Result<Option<PathBuf>> {
-        let Some(lock) = self.lock_existing()? else {
-            return Ok(None);
-        };
-        self.move_aside_locked(&lock)
+        self.move_aside_unchecked()
     }
 
-    fn move_aside_locked(&self, _lock: &Lock) -> io::Result<Option<PathBuf>> {
+    fn move_aside_unchecked(&self) -> io::Result<Option<PathBuf>> {
         let mut attempt = 1u64;
         loop {
             let backup = self.backup_path(attempt);
@@ -347,25 +309,6 @@ impl<S: VersionedState> VersionedFile<S> {
 
     fn dir(&self) -> &Path {
         self.path.parent().expect("a state file is always inside a directory")
-    }
-
-    fn lock_path(&self) -> PathBuf {
-        self.dir().join(format!("{}.lock", S::FILE_NAME))
-    }
-
-    /// The lock, for a file that is there. `None` when it is not (or its
-    /// directory is not), and then no lock file is made: where the caller
-    /// cannot write the directory, "nothing to do" must not become an error. A
-    /// file that appears right after is the same as the call having run just
-    /// before its write.
-    fn lock_existing(&self) -> io::Result<Option<Lock>> {
-        // `acquire` reads the file's access before it touches the lock file,
-        // so `NotFound` here is the file's, and nothing has been created.
-        match Lock::acquire(&*self.fs, &self.lock_path(), &self.path) {
-            Ok(lock) => Ok(Some(lock)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
     }
 
     /// Hard-links the file to the first free backup name and logs it.
@@ -445,15 +388,6 @@ fn remove_over<S: VersionedState>(loaded: &Loaded<S>) -> RemoveOver {
     }
 }
 
-/// An error that says the caller may not do this, as opposed to one that says
-/// the thing is not there or is not what it should be.
-fn lacks_access(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
-    )
-}
-
 fn file_name(path: &Path) -> std::borrow::Cow<'_, str> {
     path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
 }
@@ -512,17 +446,9 @@ mod store_faults_tests;
 mod store_io_failure_tests;
 
 #[cfg(test)]
-#[path = "store_lock_tests.rs"]
-mod store_lock_tests;
+#[path = "store_backup_tests.rs"]
+mod store_backup_tests;
 
 #[cfg(test)]
-#[path = "store_odd_lock_tests.rs"]
-mod store_odd_lock_tests;
-
-#[cfg(all(test, unix))]
-#[path = "store_access_unix_tests.rs"]
-mod store_access_unix_tests;
-
-#[cfg(all(test, windows))]
-#[path = "store_access_windows_tests.rs"]
-mod store_access_windows_tests;
+#[path = "store_link_tests.rs"]
+mod store_link_tests;
