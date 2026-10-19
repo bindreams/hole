@@ -29,12 +29,12 @@ fn a_positive_integer_above_u32_max_is_beyond_u32_whatever_its_size() {
 }
 
 #[skuld::test]
-fn within_splits_readable_from_newer_with_the_report_saturated() {
+fn within_splits_readable_from_newer() {
     assert_eq!(Version::Known(3).within(3), Ok(3));
     assert_eq!(Version::Known(1).within(3), Ok(1));
-    assert_eq!(Version::Known(4).within(3), Err(4));
-    assert_eq!(Version::BeyondU32.within(3), Err(u32::MAX));
-    assert_eq!(Version::BeyondU32.within(u32::MAX), Err(u32::MAX));
+    assert_eq!(Version::Known(4).within(3), Err(Some(4)));
+    assert_eq!(Version::BeyondU32.within(3), Err(None));
+    assert_eq!(Version::BeyondU32.within(u32::MAX), Err(None));
     assert_eq!(Version::Known(u32::MAX).within(u32::MAX), Ok(u32::MAX));
 }
 

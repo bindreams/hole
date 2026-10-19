@@ -38,9 +38,9 @@ pub enum Loaded<S> {
     Corrupt { failure: ParseFailure, raw: Raw },
     /// At or below the chain's floor: dropped on purpose.
     Obsolete { found: u32, raw: Raw },
-    /// Above this release's version: never interpreted. `found` saturates at
-    /// `u32::MAX` for a version too large for a `u32`.
-    Newer { found: u32, raw: Raw },
+    /// Above this release's version: never interpreted. `found` is `None` for
+    /// a version too large for a `u32`.
+    Newer { found: Option<u32>, raw: Raw },
     /// Read into the current schema; `found < S::VERSION` means it was
     /// migrated in memory.
     Current { value: S, found: u32 },
@@ -102,7 +102,7 @@ impl<S: VersionedState> Loaded<S> {
             Err(found) => {
                 tracing::warn!(
                     file,
-                    found,
+                    found = found.map_or_else(|| "beyond u32".to_owned(), |v| v.to_string()),
                     supported = S::VERSION,
                     "state file is from a newer release"
                 );

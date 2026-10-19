@@ -232,7 +232,7 @@ impl VersionedState for Nested {
     const ROLE: Role = Role::OsRecord;
 }
 
-/// The highest version a schema can have: a saturated `found` would equal it.
+/// The highest version a schema can have.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct MaxVersionFile {
     pub value: String,

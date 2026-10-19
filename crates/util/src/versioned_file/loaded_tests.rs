@@ -67,7 +67,7 @@ fn a_newer_file_is_never_interpreted() {
     put(&dir, "note.json", bytes);
     match VersionedFile::<NoteV3>::new(dir.path()).load() {
         Loaded::Newer { found, raw } => {
-            assert_eq!(found, 99);
+            assert_eq!(found, Some(99));
             assert_eq!(raw.as_bytes(), bytes);
         }
         other => panic!("{other:?}"),
@@ -90,7 +90,7 @@ fn a_positive_integer_version_above_u32_max_is_newer() {
         put(&dir, "note.json", bytes.as_bytes());
         match VersionedFile::<NoteV3>::new(dir.path()).load() {
             Loaded::Newer { found, raw } => {
-                assert_eq!(found, u32::MAX, "{version}: found saturates");
+                assert_eq!(found, None, "{version}");
                 assert_eq!(raw.as_bytes(), bytes.as_bytes());
             }
             other => panic!("{version}: {other:?}"),
@@ -100,7 +100,6 @@ fn a_positive_integer_version_above_u32_max_is_newer() {
 
 #[skuld::test]
 fn a_version_above_u32_max_is_newer_even_for_a_schema_at_u32_max() {
-    // A saturated `found` equals this schema's version; it must still not decode.
     let dir = dir();
     put(&dir, "max-version.json", br#"{"version":4294967296,"value":"x"}"#);
     assert!(matches!(
@@ -320,7 +319,13 @@ fn cannot_read_covers_exactly_newer_and_corrupt() {
             Some(CannotRead::Corrupt),
         ),
         (Loaded::Obsolete { found: 1, raw: raw() }, None),
-        (Loaded::Newer { found: 9, raw: raw() }, Some(CannotRead::Newer)),
+        (
+            Loaded::Newer {
+                found: Some(9),
+                raw: raw(),
+            },
+            Some(CannotRead::Newer),
+        ),
         (
             Loaded::Current {
                 value: note(&[], false),

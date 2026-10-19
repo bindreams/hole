@@ -22,13 +22,13 @@ pub(crate) enum Version {
 }
 
 impl Version {
-    /// `Ok(found)` when a schema at `current` can read it; `Err(reported)`
-    /// when it is newer, `reported` being `found` saturated at `u32::MAX`.
-    pub(crate) fn within(self, current: u32) -> Result<u32, u32> {
+    /// `Ok(found)` when a schema at `current` can read it; `Err(found)` when
+    /// it is newer, `None` for a version too large for a `u32`.
+    pub(crate) fn within(self, current: u32) -> Result<u32, Option<u32>> {
         match self {
             Version::Known(found) if found <= current => Ok(found),
-            Version::Known(found) => Err(found),
-            Version::BeyondU32 => Err(u32::MAX),
+            Version::Known(found) => Err(Some(found)),
+            Version::BeyondU32 => Err(None),
         }
     }
 }
