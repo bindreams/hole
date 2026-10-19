@@ -33,7 +33,7 @@
 //! set while a leaf token is alive, checked on every acquisition, to catch
 //! (in debug builds) an attempt to acquire a second lock while a leaf one
 //! is already held on the same thread. This module must not foreclose that
-//! guard, so [`on_acquire_entry`] and [`on_token_drop`] are called at the
+//! guard, so `on_acquire_entry` and `on_token_drop` are called at the
 //! two points the guard needs — entry to every acquisition attempt, and
 //! release of a held token — and are deliberately no-ops here. Do not
 //! remove these calls when refactoring; they are the seam, not dead code.

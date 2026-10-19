@@ -195,7 +195,7 @@ fn archived_superseded_file(state_dir: &Path, n: u64) -> PathBuf {
 /// this runs twice without the first superseded file ever being cleared
 /// (reinstall, rollback to an older build, or a second crash). When that
 /// happens, the OLDER file keeps the canonical name and the newer one is
-/// archived under [`archived_superseded_file`] instead: a superseded file
+/// archived under `archived_superseded_file` instead: a superseded file
 /// exists precisely because an earlier restore did not fully succeed, so
 /// the newer file's recorded priors may already be Hole's own (dead)
 /// resolver IPs — the older file is the one closer to the user's true

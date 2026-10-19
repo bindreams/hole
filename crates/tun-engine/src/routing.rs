@@ -1017,7 +1017,7 @@ pub(crate) fn run_capturing<P: Phase>(
 /// name is kernel-assigned and unknowable before the device is opened) —
 /// the reclaim then relies solely on the recovered file's own `tun_name`,
 /// falling back to a no-op when neither source is available. See
-/// [`recover_routes_with`]'s doc for why the file alone cannot be the only
+/// `recover_routes_with`'s doc for why the file alone cannot be the only
 /// source.
 pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>, tun_name: Option<&str>) -> Recovery {
     let intent = failclosed::lockdown_state::load_intent(state_dir);
@@ -1443,10 +1443,10 @@ pub trait CoverGuard {
 /// **All production I/O that mutates or queries the host's routing tables
 /// MUST route through this trait.** Helper types whose `Drop` impls tear
 /// down routes must do so through the associated [`Installed`](Self::Installed)
-/// type's Drop, not by calling [`teardown_routes`] directly. The only
+/// type's Drop, not by calling `teardown_routes` directly. The only
 /// legitimate call sites of the free functions are inside this module:
 /// [`SystemRouting::install`] and [`SystemRoutes::drop`] for the
-/// install/teardown path, and [`recover_routes`] / [`recover_routes_with`]
+/// install/teardown path, and [`recover_routes`] / `recover_routes_with`
 /// for crash recovery.
 ///
 /// The motivation is test isolation. Consumers (e.g. `hole_bridge::ProxyManager`)
@@ -1458,7 +1458,7 @@ pub trait Routing: Send + Sync {
     /// RAII guard returned by [`install`](Self::install). Dropping this
     /// value tears down the routes and clears the crash-recovery state
     /// file. The real implementation ([`SystemRoutes`]) calls
-    /// [`teardown_routes`]; a mock implementation increments a counter.
+    /// `teardown_routes`; a mock implementation increments a counter.
     /// No production code outside `SystemRoutes` calls the free teardown
     /// function. [`RoutesInstalled`] exposes which address families the
     /// install actually routed — see that trait's own doc.

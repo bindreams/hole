@@ -84,7 +84,7 @@ pub fn service_log_dir() -> PathBuf {
 /// `owner` chowns the persisted marker to the elevated-run user (a user-scoped
 /// elevated bridge writes into the user's profile); `None` for the root daemon,
 /// whose service log dir is root-owned by design. The chown lands on the temp
-/// in [`staged_marker`], whose inode the rename publishes unchanged.
+/// in `staged_marker`, whose inode the rename publishes unchanged.
 ///
 /// Overwrites an existing marker. For the single-occupancy claim use
 /// [`write_new`], which fails if the marker already exists.
@@ -102,7 +102,7 @@ pub fn write(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io
 /// when the destination exists), and links the fully-written temp content so a
 /// reader never sees a partial file.
 ///
-/// `owner` chowns the marker to the elevated-run user (see [`write`]); `None`
+/// `owner` chowns the marker to the elevated-run user (see [`write()`]); `None`
 /// for the root daemon. A lost claim (`AlreadyExists`) only removes its own
 /// staged temp, so the existing marker's ownership is never disturbed.
 pub fn write_new(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io::Result<()> {

@@ -135,7 +135,7 @@ impl crate::routing::CoverGuard for Cover {
     /// Delegates to the platform guard's own `detach`, which releases whatever
     /// this process still holds, rather than `std::mem::forget` — that skipped
     /// the Windows FWPM engine handle close too, leaking one handle per call
-    /// for any caller that keeps running (see [`CoverGuard::disarm`]).
+    /// for any caller that keeps running (see `CoverGuard::disarm`).
     fn disarm(self) {
         self._inner.detach();
     }
@@ -241,7 +241,7 @@ pub(crate) fn recovery_dispatch(decision: crate::routing::CoverRecovery) -> Reco
     }
 }
 
-/// Act on a [`CoverRecovery`] decision for the standing lockdown cover at
+/// Act on a `CoverRecovery` decision for the standing lockdown cover at
 /// startup. cfg-free for `routing::recover_routes`. Best-effort: a `Sweep` that
 /// cannot disengage is logged, not propagated — startup recovery has no caller
 /// to act on it.
@@ -509,7 +509,7 @@ pub enum KeyOutcome {
     /// Such a code also fails the release outright — but it reaches the
     /// clearance fold all the same, because a Windows sweep issues every
     /// delete before reading any code and hands back both halves
-    /// ([`SweepOutcome`]). So a refused delete shows up in
+    /// (`SweepOutcome`). So a refused delete shows up in
     /// [`Clearance::unproven_keys`] beside the failure, and an operator is
     /// told which key the sweep could not settle rather than only that one
     /// could not be.
@@ -640,7 +640,7 @@ impl KeyObservation {
 /// wiped state dir. See [`boottime_witness`] for the full argument.
 ///
 /// **Exactly one observation retracts the record**: a twin whose delete
-/// removed a live object, which is [`boottime_witness::WitnessUpdate::Disarm`]
+/// removed a live object, which is `boottime_witness::WitnessUpdate::Disarm`
 /// and rests on bindreams/hole#1043's purge assumption. A twin that answered
 /// EMPTY never retracts anything — that reading is #1003 itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -671,7 +671,7 @@ pub enum ArmingWitness {
     /// [`Clearance::leftover_keys`] consults.
     Unset,
     /// A record exists but could not be read, parsed, or matched the schema.
-    /// Reports, for the same reason [`SiblingEvidence::Unknown`] does.
+    /// Reports, for the same reason `SiblingEvidence::Unknown` does.
     Unreadable,
 }
 
@@ -869,7 +869,7 @@ impl Clearance {
     /// Empty is NOT "the sweep proved everything": [`Self::is_proven`] is
     /// still the proof record and still false. Empty here means BOTH evidence
     /// sources agree no twin could be outstanding on this host — the sweep
-    /// found no standing cover installed ([`SiblingEvidence::Absent`]) AND no
+    /// found no standing cover installed (`SiblingEvidence::Absent`) AND no
     /// record says one was ever armed ([`ArmingWitness::Unset`] or
     /// `Disarmed`). That is what almost every uninstall looks like, and
     /// reporting it every time is how the one host where a leftover is real
@@ -884,7 +884,7 @@ impl Clearance {
     /// record alone is lost by a wiped `state_dir`. Neither loss takes the
     /// other with it.
     ///
-    /// The other [`SiblingEvidence`] answers report for two different reasons.
+    /// The other `SiblingEvidence` answers report for two different reasons.
     /// `Installed` is the dangerous case this exists to keep visible — a kill
     /// switch armed in an earlier boot, BFE re-adding the persistent half at
     /// this one, the twins answering empty because no twin is ever live once

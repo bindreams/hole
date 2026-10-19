@@ -230,7 +230,7 @@ pub fn steps_without_literal_timeout(ci_yaml: &str, job_id: &str) -> Result<Vec<
 const BUDGET_GRID: u64 = 5;
 
 /// (label, minutes) of the steps of `job_id` whose literal `timeout-minutes`
-/// is below [`BUDGET_GRID`] or not a multiple of it, against the step-budget
+/// is below `BUDGET_GRID` or not a multiple of it, against the step-budget
 /// rule in `ci.yaml`'s header. A step with no literal budget is not named here;
 /// [`steps_without_literal_timeout`] reports it.
 pub fn steps_off_the_budget_grid(ci_yaml: &str, job_id: &str) -> Result<Vec<(String, u64)>> {

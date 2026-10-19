@@ -12,7 +12,7 @@
 //! ## The gate, per adapter AND per family
 //!
 //! For each recorded adapter, and each of its two families independently,
-//! [`system::restore_family_if_ours`] compares the family's LIVE setting
+//! `system::restore_family_if_ours` compares the family's LIVE setting
 //! against the matching subset of the file's `advertised` field:
 //!
 //! - Live equals the subset → the setting is still what Hole put there →
@@ -36,7 +36,7 @@
 //! ## Evaluated at most once
 //!
 //! After evaluating every recorded adapter, the file is DELETED if every
-//! family settled (see [`settled`]'s doc for the exact rule); otherwise it
+//! family settled (see `settled`'s doc for the exact rule); otherwise it
 //! is renamed to [`dns_state::SUPERSEDED_FILE_NAME`] with a `warn!` naming
 //! `scripts/network-reset.py`. Either way the un-suffixed name
 //! ([`dns_state::STATE_FILE_NAME`]) is gone after this call, so
@@ -85,7 +85,7 @@ fn settled(outcome: system::FamilyOutcome, advertised_totally_empty: bool) -> bo
 /// Clean up system DNS settings left behind by an older build's crashed run.
 /// Best-effort — errors logged at `warn`, returns `()`. Production entry
 /// point; uses the real platform backend. Tests drive
-/// [`recover_dns_config_with`] directly with a mock so the write side
+/// `recover_dns_config_with` directly with a mock so the write side
 /// (which requires elevation against a real adapter) is exercisable in CI.
 pub fn recover_dns_config(state_dir: &Path) {
     #[cfg(target_os = "windows")]

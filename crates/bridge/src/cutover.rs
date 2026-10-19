@@ -133,7 +133,7 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// invocation is exactly the two-writer hazard `target::apply`'s locking
 /// exists to prevent. The in-app "Unblock Network" action is the live-bridge
 /// equivalent, so refusal names it as the alternative. The exclusion is
-/// structural, not a point-in-time probe: see [`unlock_with`].
+/// structural, not a point-in-time probe: see `unlock_with`.
 /// **`Ok` is qualified, and the caller must surface it.** The returned
 /// [`Clearance`] is what the disengage could not prove — on Windows, the two
 /// boot-time twins on any boot where no bridge engaged. This is the ONE

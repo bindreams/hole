@@ -12,12 +12,12 @@
 //! binary serialization of tests that mutate global OS network state) is
 //! silently gone.
 //!
-//! [`group_config`] reads both axes from `.config/nextest.toml`.
-//! [`job_list_template`] resolves `job_id`'s own `cargo nextest run`
+//! `group_config` reads both axes from `.config/nextest.toml`.
+//! `job_list_template` resolves `job_id`'s own `cargo nextest run`
 //! command(s) into the one shared `cargo nextest list` argv template — erring
 //! loudly on any divergence (bindreams/hole#894 round-2 finding F5) rather
-//! than silently picking one. [`narrow_filter`] scopes that template to the
-//! nextest.toml name-substring filter; [`set_mismatch`] diffs the two live
+//! than silently picking one. `narrow_filter` scopes that template to the
+//! nextest.toml name-substring filter; `set_mismatch` diffs the two live
 //! listings. [`verify`] orchestrates all four and fails loudly, by exact test
 //! name in both directions, on any divergence.
 //!
@@ -38,20 +38,20 @@
 //! `[profile.default.junit]`'s path and every override, including this
 //! group's `max-threads = 1`, via nextest's own profile-inheritance model),
 //! so each lane's report survives at its own path and hands guard 3 both of
-//! them; [`merge_executed`] merges them back into the one set the job as a
+//! them; `merge_executed` merges them back into the one set the job as a
 //! whole executed.
 //!
 //! The expectation is likewise NOT re-derived here. Guard 2's step already
 //! lists the group's live membership *before* the test steps run, and records
-//! it ([`write_expectation`]); guard 3 reads it back ([`read_expectation`]).
+//! it (`write_expectation`); guard 3 reads it back (`read_expectation`).
 //! Re-listing after the run would cost a second `cargo nextest list` — 64s to
 //! 3m30s measured on the windows leg, which runs closest to its job wall —
 //! and would introduce a second, unverified derivation of the very set guard
 //! 2 exists to pin.
 //!
-//! [`junit_executed_tests`] reads nextest's own JUnit report
+//! `junit_executed_tests` reads nextest's own JUnit report
 //! (`.config/nextest.toml`'s `[profile.default.junit]`) for the tests that
-//! actually ran (present, un-skipped); [`set_missing`] diffs expectation
+//! actually ran (present, un-skipped); `set_missing` diffs expectation
 //! against union one-directionally. [`verify_executed`] orchestrates them and
 //! fails loudly, by exact test name, on any test that was selected but never
 //! shows up as executed.
@@ -266,7 +266,7 @@ pub(crate) fn conformant_membership(
 /// Run guard 2 for `job_id`: confirm the `global_net_state` test-group's
 /// `max-threads` is still `1`, then confirm its nextest.toml name-substring
 /// filter and its skuld label select the exact same live tests
-/// ([`conformant_membership`]). Fails loudly, by exact test name in both
+/// (`conformant_membership`). Fails loudly, by exact test name in both
 /// directions per binary, on any divergence.
 ///
 /// `record` additionally writes the verified membership out for guard 3

@@ -49,14 +49,14 @@ impl From<String> for TunName {
 /// Configuration for a TUN device.
 ///
 /// `tun_name` and `mtu` are required (an empty [`TunName::Requested`] name,
-/// or a zero MTU, cause [`Device::build`](super::Device::build) to fail). At
+/// or a zero MTU, cause `Device::build` to fail). At
 /// least one of `ipv4`/`ipv6` must be set.
 #[freeze]
 pub struct DeviceConfig {
     /// The name requested for the TUN interface — NOT necessarily the name
     /// the OS ended up using: see [`TunName`]'s doc. The only correct
     /// post-open source of the device's real name is
-    /// [`super::Device::identity`]`().alias()`.
+    /// `super::Device::identity``().alias()`.
     pub tun_name: TunName,
     /// The TUN device MTU. Typical value: `1400`.
     pub mtu: u16,

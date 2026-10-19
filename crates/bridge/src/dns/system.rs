@@ -610,7 +610,7 @@ pub use crate::dns_state::DnsPriorAdapter as PriorAdapter;
 // doc for why the gate is per family, not per adapter, and why it never
 // clears a file it found no evidence for.
 
-/// What [`restore_family_if_ours`] did for one adapter + family.
+/// What `restore_family_if_ours` did for one adapter + family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FamilyOutcome {
     /// The live setting matched the recorded evidence, and was written

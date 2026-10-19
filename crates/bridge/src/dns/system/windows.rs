@@ -73,7 +73,7 @@ use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 /// The bridge-side Win32 DNS backend.
 ///
 /// Production [`Win32Real`] calls the OS directly. Tests substitute
-/// `MockBackend` (in [`windows_tests`]) via
+/// `MockBackend` (in `windows_tests`) via
 /// [`crate::dns::system::SystemDns::new_with_backend`].
 ///
 /// **Send + Sync + 'static** so an `Arc<dyn WinDnsBackend>` can cross a

@@ -10,7 +10,7 @@
 //!   wintun-related filter references. Turns the known-bad case into
 //!   something greppable by severity in an incoming user log.
 //! - **debug** — full `netsh` stdout, truncated to
-//!   [`DEBUG_OUTPUT_CAP_BYTES`]. Captures the specific filter name/GUID
+//!   `DEBUG_OUTPUT_CAP_BYTES`. Captures the specific filter name/GUID
 //!   that's implicated, only when the caller has turned debug on.
 //!
 //! See the sibling `ndis` module for a parallel diagnostic covering the

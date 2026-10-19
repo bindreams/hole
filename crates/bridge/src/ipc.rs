@@ -1508,7 +1508,7 @@ pub(crate) fn is_valid_sid_string(s: &str) -> bool {
 /// Always includes SYSTEM + Administrators + the `hole` group (if it exists).
 /// Additional per-user SIDs can be appended via `extra_sids` — this is used
 /// as a temporary workaround for the Windows token snapshot limitation (see
-/// [`apply_socket_permissions`] and the doc comment on `handle_grant_access`
+/// `apply_socket_permissions` and the doc comment on `handle_grant_access`
 /// in `cli.rs`).
 #[cfg(target_os = "windows")]
 pub fn build_sddl(extra_sids: &[&str]) -> String {

@@ -254,7 +254,7 @@ fn remove_server(config: &mut AppConfig, id: &str) -> bool {
 /// this off the IPC surface is what stops a second, unguarded import path
 /// from growing back.
 ///
-/// Logging: emits `info!` at entry and through [`apply_import`]'s summary;
+/// Logging: emits `info!` at entry and through `apply_import`'s summary;
 /// emits `warn!` on validate/parse failure and on config-save failure. The
 /// save-failure path returns `ImportFailure::SaveFailed` (no detail) — the
 /// full `ConfigError` (path- and content-free) plus the config path land in
@@ -595,7 +595,7 @@ pub async fn get_public_ip() -> Result<serde_json::Value, String> {
 
 /// Build a `ProxyConfig` from the currently selected server in app config.
 ///
-/// Always requests [`TunnelMode::Full`]; `TunnelMode::SocksOnly` is reachable
+/// Always requests `TunnelMode::Full`; `TunnelMode::SocksOnly` is reachable
 /// via `hole proxy start --tunnel-mode socks-only` and direct IPC.
 ///
 /// The "Local proxy server" master toggle (`proxy_server_enabled`) gates

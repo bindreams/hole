@@ -99,7 +99,7 @@ fn write_request_file(request: &BridgeRequest) -> std::io::Result<tempfile::Temp
 
 /// Read a BridgeRequest from a JSON file and delete it.
 ///
-/// The file is deleted after reading as defense-in-depth (the writer's [`TempPath`]
+/// The file is deleted after reading as defense-in-depth (the writer's `TempPath`
 /// also deletes on drop, but the writer process may crash before cleanup).
 ///
 /// The parse arm never carries `serde_json::Error`'s own `Display`: it echoes

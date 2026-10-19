@@ -48,7 +48,7 @@ pub fn is_known(name: &str) -> bool {
 }
 
 /// Iterator over the names of every shipped plugin, in declaration
-/// order from [`KNOWN_PLUGINS`]. Covers ALL descriptors (including the
+/// order from `KNOWN_PLUGINS`. Covers ALL descriptors (including the
 /// non-user-visible `ex-ray` impl-detail entry) — this is the
 /// resolution / error-context list. For the user-facing supported list,
 /// use [`user_visible_plugin_names`].

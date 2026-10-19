@@ -46,7 +46,7 @@ pub struct TestConfig {
     /// Two sentinel `host:port` strings (the second is the fallback).
     pub sentinels: [String; 2],
     /// Optional override for the plugin path. `None` → use
-    /// [`resolve_plugin_path_inner`]. Tests use this to point at a specific
+    /// `resolve_plugin_path_inner`. Tests use this to point at a specific
     /// on-disk plugin binary (the xtask-built `ex-ray`, or a provisioned
     /// upstream v2ray-plugin) without depending on `PATH`.
     pub plugin_path_override: Option<String>,
@@ -95,7 +95,7 @@ impl TestConfig {
 /// 1. Pre-flight DNS + raw TCP probe to detect "the server endpoint is plainly
 ///    unreachable" without spending the cost of a plugin spawn.
 /// 2. Optional v2ray-plugin (or any SIP003 plugin) spawn. The
-///    [`Plugin`] guard's `Drop` impl tears down the child process on every
+///    `Plugin` guard's `Drop` impl tears down the child process on every
 ///    exit path, including panics.
 /// 3. A real shadowsocks tunnel via [`ProxyClientStream::connect`], with a
 ///    `HEAD /` request sent through to a public sentinel and the response

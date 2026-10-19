@@ -23,8 +23,8 @@
 //!
 //! `SCDynamicStore` is not `Send` (it wraps a raw CF pointer type), so the
 //! open session lives on a dedicated OS thread for its whole lifetime;
-//! [`Steering`] itself holds only a channel handle to that thread, so it
-//! *is* `Send`. [`Steering::withdraw`] is confirmable — it blocks for the
+//! `Steering` itself holds only a channel handle to that thread, so it
+//! *is* `Send`. `Steering::withdraw` is confirmable — it blocks for the
 //! thread's acknowledgement of the removal — with `Drop` as the best-effort
 //! crash/unwind fallback, mirroring the discipline
 //! `ProxyManager::stop_with` already applies to the lockdown cover: `Drop`
