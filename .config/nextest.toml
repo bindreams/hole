@@ -182,9 +182,13 @@ test-group = 'global_net_state'
 # first override that specifies it, so the `test-group` assignment above still
 # wins for this test — verified with `cargo nextest show-config test-groups`,
 # which must keep listing it under `global_net_state`.
+#
+# `immediate-final`, not `final`: `final` prints only when the whole run ends,
+# so a job killed by its time budget drops the number. `immediate-final` prints
+# it as the test finishes and again in the summary.
 [[profile.default.overrides]]
 filter = 'test(/failclosed_cover_transition_/)'
-success-output = 'final'
+success-output = 'immediate-final'
 
 # `cutover_global_net_state_service_controls_after_stop_are_measured` prints
 # which controls the SCM delivered after a Stop. nextest discards captured
