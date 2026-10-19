@@ -19,7 +19,7 @@ pub enum ReadinessMode {
     /// Parse the child's stdout for a sitrep `hello`/`ready` handshake.
     /// Use for plugins known to speak sitrep (ex-ray, galoshes-embedded).
     ExpectSitrep,
-    /// Self-probe `local` with a TCP connect (via [`crate::chain::poll_ready`]).
+    /// Self-probe `local` with a TCP connect, retried with backoff until it accepts.
     /// The conservative default for arbitrary / legacy plugins.
     #[default]
     Probe,
