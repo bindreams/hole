@@ -40,7 +40,7 @@ def main() -> None:
         print("error: these crates do not inherit workspace lints:", file=sys.stderr)
         for path in errors:
             print(f"  {path}", file=sys.stderr)
-        print('  hint: add `[lints]\nworkspace = true` to each Cargo.toml', file=sys.stderr)
+        print("  hint: add `[lints]\nworkspace = true` to each Cargo.toml", file=sys.stderr)
         sys.exit(1)
 
 

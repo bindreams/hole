@@ -118,8 +118,7 @@ def built_msi(
         text=True,
     )
     assert result.returncode == 0, (
-        f"wix build failed (exit {result.returncode}):\n"
-        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        f"wix build failed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     return msi_path
 
@@ -130,12 +129,11 @@ def decompiled_tree(wix_exe: Path, built_msi: Path, tmp_path_factory: pytest.Tem
     out_dir = tmp_path_factory.mktemp("decompiled")
     wxs_out = out_dir / "decompiled.wxs"
     result = subprocess.run(
-        [str(wix_exe), "msi", "decompile", str(built_msi), "-o",
-         str(wxs_out)],
+        [str(wix_exe), "msi", "decompile", str(built_msi), "-o", str(wxs_out)],
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0, (f"wix msi decompile failed (exit {result.returncode}):\n{result.stderr}")
+    assert result.returncode == 0, f"wix msi decompile failed (exit {result.returncode}):\n{result.stderr}"
     return ET.parse(wxs_out)
 
 
@@ -156,8 +154,7 @@ def test_ice_validation_passes(wix_exe: Path, built_msi: Path) -> None:
         text=True,
     )
     assert result.returncode == 0, (
-        f"ICE validation failed (exit {result.returncode}):\n"
-        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        f"ICE validation failed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 
@@ -193,12 +190,10 @@ def test_sequence_install_order(decompiled_tree: ET.ElementTree) -> None:
     assert "PathAdd" in entries, "PathAdd not found in InstallExecuteSequence"
 
     assert entries["BridgeInstall"]["after"] == "InstallFiles", (
-        f"BridgeInstall should be After='InstallFiles', "
-        f"got After='{entries['BridgeInstall']['after']}'"
+        f"BridgeInstall should be After='InstallFiles', got After='{entries['BridgeInstall']['after']}'"
     )
     assert entries["PathAdd"]["after"] == "BridgeInstall", (
-        f"PathAdd should be After='BridgeInstall', "
-        f"got After='{entries['PathAdd']['after']}'"
+        f"PathAdd should be After='BridgeInstall', got After='{entries['PathAdd']['after']}'"
     )
 
 
@@ -267,14 +262,12 @@ def test_arp_product_icon_in_msi(decompiled_tree: ET.ElementTree) -> None:
             arp_property = prop
             break
     assert arp_property is not None, (
-        "Decompiled MSI has no ARPPRODUCTICON property. ARP entry will "
-        "show a generic installer icon (#359)."
+        "Decompiled MSI has no ARPPRODUCTICON property. ARP entry will show a generic installer icon (#359)."
     )
 
     value = arp_property.get("Value", "")
     assert value in icon_ids, (
-        f"ARPPRODUCTICON='{value}' does not match any Icon Id in the MSI. "
-        f"Icon Ids: {sorted(icon_ids)}"
+        f"ARPPRODUCTICON='{value}' does not match any Icon Id in the MSI. Icon Ids: {sorted(icon_ids)}"
     )
 
 
@@ -354,7 +347,7 @@ def test_msi_admin_extract_works_when_separated_from_build_dir(
     # match_canonical_bindir; this is the real-artifact presence backstop.
     payload_files = canonical_windows_bindir()
     extracted = {p.name for p in extract_dir.rglob("*") if p.is_file()}
-    assert payload_files <= extracted, (f"MSI payload missing expected files: {payload_files - extracted}")
+    assert payload_files <= extracted, f"MSI payload missing expected files: {payload_files - extracted}"
 
 
 # UI property + dialog tests ===========================================================================================
@@ -378,8 +371,7 @@ def test_decompiled_has_install_start_menu_default(decompiled_tree: ET.ElementTr
     prop = _find_property(pkg, "INSTALL_START_MENU")
     assert prop is not None, "INSTALL_START_MENU property missing from built MSI"
     assert prop.get("Value") == "1", (
-        f"INSTALL_START_MENU default must be '1' (silent-upgrade safety); "
-        f"got '{prop.get('Value')}'"
+        f"INSTALL_START_MENU default must be '1' (silent-upgrade safety); got '{prop.get('Value')}'"
     )
 
 
@@ -388,8 +380,7 @@ def test_decompiled_has_install_desktop_icon_default(decompiled_tree: ET.Element
     prop = _find_property(pkg, "INSTALL_DESKTOP_ICON")
     assert prop is not None, "INSTALL_DESKTOP_ICON property missing from built MSI"
     assert prop.get("Value") == "0", (
-        f"INSTALL_DESKTOP_ICON default must be '0' (silent-upgrade safety); "
-        f"got '{prop.get('Value')}'"
+        f"INSTALL_DESKTOP_ICON default must be '0' (silent-upgrade safety); got '{prop.get('Value')}'"
     )
 
 
@@ -482,10 +473,9 @@ def test_decompiled_has_win10_launch_condition(decompiled_tree: ET.ElementTree) 
         "Decompiled MSI has no LaunchCondition referencing WIN10BUILD. The "
         "#397 Windows-version gate is missing from the built MSI."
     )
-    assert any(
-        "19041" in c for c in found_conditions
-    ), (f"LaunchCondition(s) found referencing WIN10BUILD but none gate on 19041. "
-        f"Conditions: {found_conditions}")
+    assert any("19041" in c for c in found_conditions), (
+        f"LaunchCondition(s) found referencing WIN10BUILD but none gate on 19041. Conditions: {found_conditions}"
+    )
 
 
 def test_decompiled_has_win10build_property(decompiled_tree: ET.ElementTree) -> None:
@@ -504,8 +494,7 @@ def test_decompiled_has_win10build_property(decompiled_tree: ET.ElementTree) -> 
         "the gate has no value to evaluate against."
     )
     assert search.get("Name") == "CurrentBuildNumber", (
-        f"WIN10BUILD RegistrySearch must read CurrentBuildNumber, "
-        f"got Name='{search.get('Name')}'."
+        f"WIN10BUILD RegistrySearch must read CurrentBuildNumber, got Name='{search.get('Name')}'."
     )
 
 
@@ -517,10 +506,7 @@ def test_verifyreadydlg_back_override_wins(decompiled_tree: ET.ElementTree) -> N
     """
     pkg = _decompiled_package(decompiled_tree)
     targets = _new_dialog_targets(pkg, "VerifyReadyDlg", "Back", condition="NOT Installed")
-    assert targets, (
-        "No NewDialog Publish rows with Condition='NOT Installed' for "
-        "(VerifyReadyDlg, Back) in built MSI"
-    )
+    assert targets, "No NewDialog Publish rows with Condition='NOT Installed' for (VerifyReadyDlg, Back) in built MSI"
     assert targets[-1] == "ShortcutsDlg", (
         f"Last NewDialog row (Condition='NOT Installed') for (VerifyReadyDlg, Back) is "
         f"'{targets[-1]}', not 'ShortcutsDlg'. Full sequence: {targets}."

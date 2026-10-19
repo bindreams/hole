@@ -50,9 +50,9 @@ def test_icon_size_and_background(mounted_dmg: Path) -> None:
 
 def test_icon_positions(mounted_dmg: Path) -> None:
     positions, _, _ = _read_ds_store(mounted_dmg)
-    assert positions.get(
-        layout.APP_NAME
-    ) == layout.APP_POS, (f"{layout.APP_NAME} at {positions.get(layout.APP_NAME)} != {layout.APP_POS}")
+    assert positions.get(layout.APP_NAME) == layout.APP_POS, (
+        f"{layout.APP_NAME} at {positions.get(layout.APP_NAME)} != {layout.APP_POS}"
+    )
     assert positions.get("Applications") == layout.APPFOLDER_POS, (
         f"Applications at {positions.get('Applications')} != {layout.APPFOLDER_POS}"
     )

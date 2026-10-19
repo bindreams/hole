@@ -1,4 +1,5 @@
 """https://www.sphinx-doc.org/en/master/usage/configuration.html"""
+
 import sys
 from datetime import date
 from pathlib import Path

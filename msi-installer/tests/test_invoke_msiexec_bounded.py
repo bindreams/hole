@@ -52,7 +52,7 @@ def _run_script(
     params: dict[str, str | None],
     exe_args: list[str] | None = None,
     timeout: float = 60,
-    env: dict[str, str] | None = None
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Invoke the script via `& <path> -K V ...`, built as a -Command string.
 
@@ -170,8 +170,10 @@ def test_wedge_throws_within_bound_and_emits_all_diagnostics(tmp_path: Path) -> 
     killed_pid = match.group(1)
     check = subprocess.run(
         [
-            "pwsh", "-NoProfile", "-Command",
-            f"if (Get-Process -Id {killed_pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            f"if (Get-Process -Id {killed_pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}",
         ],
         timeout=30,
     )
@@ -217,8 +219,9 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
         assert result.returncode != 0
         # Named in full: `Invoke-StackCapture` emits the same literal for a
         # capture file it cannot read, which is a different failure.
-        assert f"failed to read {log_path}" in combined, \
+        assert f"failed to read {log_path}" in combined, (
             f"expected the log-read failure to be reported, not swallowed:\n{combined}"
+        )
         for header in DIAGNOSTIC_HEADERS:
             assert header in combined, f"missing diagnostic header {header!r} after a probe failure:\n{combined}"
         assert WEDGE_THROW in combined, f"wedge throw did not surface after a probe failure:\n{combined}"
@@ -291,8 +294,9 @@ def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path:
     assert "Child-SP" in combined, f"stacks were written to file but never echoed to the job log:\n{combined}"
     # The other half of the terminate response: a capture that detached cleanly
     # froze nothing, so nothing may be killed for having been frozen.
-    assert "terminated suspended pid" not in combined, \
+    assert "terminated suspended pid" not in combined, (
         f"a target this capture did not freeze was terminated anyway:\n{combined}"
+    )
 
 
 def test_a_hung_debugger_is_killed_partial_output_survives_and_the_wedge_still_throws(tmp_path: Path) -> None:
@@ -438,8 +442,7 @@ def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_we
 
     assert result.returncode != 0
     assert "--- native thread stacks ---" in combined, f"the section vanished when skipped:\n{combined}"
-    assert "stack-capture budget of 0s is spent" in combined, \
-        f"budget exhaustion was not reported:\n{combined}"
+    assert "stack-capture budget of 0s is spent" in combined, f"budget exhaustion was not reported:\n{combined}"
     assert WEDGE_THROW in combined, f"wedge throw did not survive a skipped capture:\n{combined}"
 
 
@@ -517,8 +520,9 @@ def test_process_tree_walk_collects_every_descendant_and_terminates_on_a_cycle()
     result = subprocess.run(["pwsh", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=60)
 
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    assert result.stdout.strip() == "100,200,300", \
+    assert result.stdout.strip() == "100,200,300", (
         f"tree walk returned {result.stdout.strip()!r}, expected the root and its two descendants"
+    )
 
 
 def test_wedge_falls_back_to_thread_states_when_no_debugger_is_installed(tmp_path: Path) -> None:
@@ -552,9 +556,9 @@ def test_wedge_falls_back_to_thread_states_when_no_debugger_is_installed(tmp_pat
     combined = result.stdout + result.stderr
 
     assert result.returncode != 0
-    assert "falling back to thread states" in combined, \
-        f"a missing debugger was not reported as such:\n{combined}"
-    assert "OptionId.WindowsDesktopDebuggers" in combined, \
+    assert "falling back to thread states" in combined, f"a missing debugger was not reported as such:\n{combined}"
+    assert "OptionId.WindowsDesktopDebuggers" in combined, (
         f"the remedy for a missing debugger was not named:\n{combined}"
+    )
     assert "thread states, NOT stacks" in combined, f"no thread-state table was emitted:\n{combined}"
     assert WEDGE_THROW in combined, f"the fallback swallowed the wedge throw:\n{combined}"

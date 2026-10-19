@@ -5,6 +5,7 @@ Shared by `docs/conf.py`, which renders them as MyST substitutions, and
 which release groups exist, so a fifth one cannot be added to the docs while the
 validator keeps checking four.
 """
+
 import tomllib
 from pathlib import Path
 

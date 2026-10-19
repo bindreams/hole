@@ -211,15 +211,10 @@ hooks = [
 ]
 
 [[repos]]
-repo = "https://github.com/google/yapf"
-rev = "v0.43.0"
+repo = "https://github.com/astral-sh/ruff-pre-commit"
+rev = "v0.17.1"
 hooks = [
-  # yapf (re)writes its lib2to3 grammar pickle in the per-user cache
-  # (user_cache_dir/YAPF/<version>) by renaming the temp file into place before
-  # flushing it, so a yapf starting at that moment reads an empty file
-  # (EOFError: Ran out of input). Serial covers the processes of one hook run;
-  # concurrent prek runs on one machine are bindreams/hole#1104.
-  { id = "yapf", require_serial = true },
+  { id = "ruff-format" },
 ]
 
 # Two mdformat envs: gfm escapes MyST footnote definitions (`[^1]:` -> `\[^1\]:`),
