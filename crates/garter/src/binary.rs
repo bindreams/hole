@@ -35,12 +35,15 @@ pub enum ReadinessMode {
     ///
     /// Use for harnesses that mix sitrep and non-sitrep plugins (the plugin-e2e
     /// server fixture: ex-ray/galoshes speak sitrep, stock v2ray-plugin does not).
-    /// On a bind conflict the port never binds, so the probe can never win —
-    /// `BindConflict` always comes from sitrep (deterministic). On success either
-    /// path may win; both report the same listen address, so the sitrep-preference
-    /// (better transports) is best-effort, not guaranteed. Prefer explicit
-    /// `ExpectSitrep` when the plugin is known to speak sitrep AND authoritative
-    /// transports matter (the bridge does).
+    /// The probe connects to whatever listens on `local`, so on a bind conflict it
+    /// wins whenever another process holds the port and the plugin's `hello` has not
+    /// yet stood it down: it reports ready for the other process's listener and the
+    /// plugin's `BindConflict` is lost. Only when nothing listens on the port can
+    /// the probe not win. On success either path may win; both report the same
+    /// listen address, so the sitrep-preference (better transports) is best-effort,
+    /// not guaranteed. Prefer explicit `ExpectSitrep` when the plugin is known to
+    /// speak sitrep AND authoritative transports or a deterministic `BindConflict`
+    /// matter (the bridge does).
     ///
     /// The concurrent probe is a TCP connect (as in `Probe`), so it cannot ready
     /// a UDP-only listener; a UDP-only plugin must therefore speak sitrep. All
