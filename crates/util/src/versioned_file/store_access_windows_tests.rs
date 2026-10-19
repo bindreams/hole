@@ -10,8 +10,9 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows::Win32::Security::{
-    AclSizeInformation, AddAce, GetAce, GetAclInformation, InitializeAcl, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
-    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    AclSizeInformation, AddAce, GetAce, GetAclInformation, GetSecurityDescriptorControl, InitializeAcl, ACL,
+    ACL_REVISION, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
 };
 
 use super::{DefaultPlacement, Fs, Placement, Removal, VersionedFile};
@@ -151,6 +152,33 @@ pub(super) fn aces(path: &Path) -> Vec<Ace> {
     // SAFETY: the descriptor came from `GetNamedSecurityInfoW` and nothing points into it any more.
     unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
     found
+}
+
+/// Whether `path`'s DACL is marked protected: a later change to the directory's
+/// inheritable ACEs would otherwise be propagated into it.
+fn dacl_is_protected(path: &Path) -> bool {
+    let name = wide(path);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `name` is NUL-terminated; the out pointer is a valid local.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(name.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    };
+    assert_eq!(rc.0, 0, "GetNamedSecurityInfoW {}", path.display());
+    let (mut control, mut revision) = (0u16, 0u32);
+    // SAFETY: `descriptor` came from the call above; the out pointers are valid locals.
+    unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }.unwrap();
+    // SAFETY: nothing points into the descriptor any more.
+    unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    control & SE_DACL_PROTECTED.0 != 0
 }
 
 /// Replaces `path`'s DACL with exactly `aces`, inheriting nothing.
@@ -364,6 +392,10 @@ fn a_new_lock_has_its_final_dacl_when_it_first_exists() {
     assert_eq!(seen[0], aces(&lock), "the DACL it was made with is the one it keeps");
     assert!(everyone(&seen[0]).is_empty(), "{:?}", seen[0]);
     assert!(seen[0].iter().all(|a| a.flags() & INHERITED_ACE == 0), "{:?}", seen[0]);
+    assert!(
+        dacl_is_protected(&lock),
+        "a change to the directory would be propagated into the lock"
+    );
 }
 
 #[skuld::test]
