@@ -1309,14 +1309,15 @@ mod stop_probe {
     }
 
     /// Arms for every state on a fresh actor, sends a Stop, and takes the first
-    /// report. `before_wait` runs between the Stop and the wait.
-    fn arm_stop_wait(probe: &Probe, before_wait: impl FnOnce()) -> Reading {
+    /// report. `after_report` runs once the report is in hand, so nothing it does
+    /// (releasing a parked helper) can change what was reported.
+    fn arm_stop_wait(probe: &Probe, after_report: impl FnOnce()) -> Reading {
         let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service to arm on");
         let state_before = probe.state();
         actor.arm(WantState::Stopped, None).expect("arm for every state");
         let stop = probe.stop();
-        before_wait();
         let first_report = actor.wait_callback().expect("the armed notification fires");
+        after_report();
         Reading {
             state_before,
             stop,
@@ -1689,11 +1690,42 @@ fn cutover_global_net_state_stop_probe_start_of_a_stopped_service_marked_for_del
     let _ = scm_deletion::wait_until_deleted(SERVICE_NAME);
 }
 
-/// A `ServiceSession` over the real one that releases a parked helper the
-/// moment the first arm returns, and records what each wait reported. The arm
-/// has by then asked the SCM for the current state, so the first report is the
-/// parked state; the release then lets the helper move on, and the code under
-/// test finds out what it did from the SCM, not from this wrapper.
+/// When a [`ReleasingSession`] releases the parked helper.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum ReleaseOn {
+    /// Once the first wait has returned and been recorded: the report was made
+    /// while the helper was parked, so it is the parked state by construction.
+    /// The only choice for a test that asserts on the first report.
+    FirstReport,
+    /// As soon as the first arm returns, so a wait always has an event to fire
+    /// on even if an arm reports nothing by itself. The helper may move before
+    /// the SCM delivers the first report, so that report says nothing about
+    /// the arm: for a probe that prints and asserts nothing.
+    Arm,
+}
+
+#[cfg(target_os = "windows")]
+impl ReleaseOn {
+    fn releases_after_arm(self) -> bool {
+        match self {
+            ReleaseOn::FirstReport => false,
+            ReleaseOn::Arm => true,
+        }
+    }
+
+    fn releases_after_first_report(self) -> bool {
+        match self {
+            ReleaseOn::FirstReport => true,
+            ReleaseOn::Arm => false,
+        }
+    }
+}
+
+/// A `ServiceSession` over the real one that releases a parked helper (when
+/// `release_on` says) and records what each wait reported. The code under test
+/// finds out what the helper did after its release from the SCM, not from this
+/// wrapper.
 ///
 /// Its handles keep a deleted service registered, so a test that waits for the
 /// deletion must not hold it: [`finish`](Self::finish) is the only way to the
@@ -1702,21 +1734,30 @@ fn cutover_global_net_state_stop_probe_start_of_a_stopped_service_marked_for_del
 struct ReleasingSession<'a> {
     inner: hole_bridge::platform::os::RetireSession,
     release: &'a named_event::NamedEvent,
+    release_on: ReleaseOn,
     released: bool,
     reports: Vec<hole_bridge::cutover::scm_wait::Observed>,
 }
 
 #[cfg(target_os = "windows")]
 impl<'a> ReleasingSession<'a> {
-    fn open(release: &'a named_event::NamedEvent) -> Self {
+    fn open(release: &'a named_event::NamedEvent, release_on: ReleaseOn) -> Self {
         let inner = hole_bridge::platform::os::RetireSession::open()
             .expect("open the retire session")
             .expect("the service is registered");
         Self {
             inner,
             release,
+            release_on,
             released: false,
             reports: vec![],
+        }
+    }
+
+    fn release_once(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.release.signal();
         }
     }
 
@@ -1734,9 +1775,8 @@ impl hole_bridge::cutover::scm_wait::ScmActor for ReleasingSession<'_> {
         except: Option<hole_bridge::cutover::scm_wait::Observed>,
     ) -> std::io::Result<()> {
         self.inner.arm(want, except)?;
-        if !self.released {
-            self.released = true;
-            self.release.signal();
+        if self.release_on.releases_after_arm() {
+            self.release_once();
         }
         Ok(())
     }
@@ -1749,6 +1789,9 @@ impl hole_bridge::cutover::scm_wait::ScmActor for ReleasingSession<'_> {
     fn wait_callback(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::Observed> {
         let observed = self.inner.wait_callback()?;
         self.reports.push(observed);
+        if self.release_on.releases_after_first_report() {
+            self.release_once();
+        }
         Ok(observed)
     }
     fn process_fate(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::ProcessFate> {
@@ -1805,7 +1848,7 @@ fn retire_a_parked_service(flag: &str) {
     let starter = start_in_background();
     parked.wait();
 
-    let mut session = ReleasingSession::open(&release);
+    let mut session = ReleasingSession::open(&release, ReleaseOn::FirstReport);
     retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
     let reports = session.finish();
 
@@ -1872,7 +1915,7 @@ fn cutover_global_net_state_uninstall_lands_on_the_instance_the_scm_just_restart
     // The SCM restarts it; the new instance parks in START_PENDING.
     parked.wait();
 
-    let mut session = ReleasingSession::open(&release);
+    let mut session = ReleasingSession::open(&release, ReleaseOn::FirstReport);
     retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
     let reports = session.finish();
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
@@ -2031,6 +2074,9 @@ fn cutover_global_net_state_drain_stops_and_awaits_a_running_service_marked_for_
 /// where a Stop is refused and the process will not exit by itself: the one state
 /// that goes through an arm. Prints the outcome (it is the measurement of what
 /// an arm does on a marked service in that state); it asserts nothing about it.
+/// The helper is released at the arm, so a wait has an event to fire on even if
+/// an arm on a marked service reports nothing: the first report may be the
+/// helper's move, not the arm's.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_stop_probe_drain_of_a_start_pending_service_marked_for_delete() {
@@ -2053,7 +2099,7 @@ fn cutover_global_net_state_stop_probe_drain_of_a_start_pending_service_marked_f
     let starter = start_in_background();
     parked.wait();
 
-    let mut session = ReleasingSession::open(&release);
+    let mut session = ReleasingSession::open(&release, ReleaseOn::Arm);
     session.hold_process().expect("hold the starting service's process");
     session.delete().expect("mark the starting service for deletion");
     let drained = drain(&mut session);
