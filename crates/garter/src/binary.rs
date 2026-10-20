@@ -86,10 +86,11 @@ pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A plugin backed by an external SIP003u binary.
 ///
-/// In the sitrep readiness modes a start failure the plugin reports (or closing its sitrep stream before `ready`,
-/// unless the chain's shutdown was already requested) takes the plugin down and makes [`run`](ChainPlugin::run)
-/// return an error however the plugin then ends, even with exit status 0. The failure itself reaches the chain's
-/// readiness channel once the plugin's output has been drained. A shutdown before `ready` is not a start failure.
+/// In the sitrep readiness modes a start failure the plugin reports, or closing its sitrep stream before `ready`,
+/// takes the plugin down and makes [`run`](ChainPlugin::run) return an error however the plugin then ends, even with
+/// exit status 0. The failure itself reaches the chain's readiness channel once the plugin's output has been drained.
+/// A stdout close that a shutdown's take-down of a live, unready plugin causes is not a start failure; a close the
+/// reader saw first, or from a plugin whose root had already exited, stays one even if a shutdown was requested.
 pub struct BinaryPlugin {
     path: PathBuf,
     options: Option<String>,
@@ -466,31 +467,19 @@ struct HeldFailure {
 }
 
 /// The reader's side of a held failure: `ready` moves here, unsent, and `failed` is cancelled so the
-/// plugin is taken down. Once readiness is decided (a `ready`, or an earlier failure) it changes nothing, and
-/// logs the failure it ignored: at warn when a `ready` had decided it, at debug after an earlier failure.
+/// plugin is taken down. Returns the error back, changing nothing, once readiness is decided (a `ready`, or an
+/// earlier failure).
 ///
 /// A hold that is already gone (the supervision ended, or its future was dropped) leaves nobody to
 /// deliver the failure later, so it is sent at once: a decided failure is never dropped.
-async fn hold_failure(
-    plugin: &str,
+async fn try_hold_failure(
     shared: &SharedReady,
     held: &mut Option<oneshot::Sender<HeldFailure>>,
     failed: &CancellationToken,
     error: StartError,
-) {
+) -> Result<(), StartError> {
     let Some(ready) = shared.lock().await.take() else {
-        // `held` is gone once a failure was held; it is still there if a `ready` took the sender.
-        match held {
-            Some(_) => tracing::warn!(
-                plugin = %plugin,
-                "the plugin reported a start failure after its readiness was already decided; ignored: {error}"
-            ),
-            None => tracing::debug!(
-                plugin = %plugin,
-                "the plugin reported another start failure after its readiness was already decided; ignored: {error}"
-            ),
-        }
-        return;
+        return Err(error);
     };
     let failure = HeldFailure { ready, error };
     let undelivered = match held.take() {
@@ -501,6 +490,32 @@ async fn hold_failure(
         let _ = ready.send(Err(error));
     }
     failed.cancel();
+    Ok(())
+}
+
+/// [`try_hold_failure`] for a failure the plugin itself reported. One it cannot act on, because readiness was
+/// already decided, is logged naming the plugin: at warn when a `ready` decided it, at debug after an earlier failure.
+async fn hold_reported_failure(
+    plugin: &str,
+    shared: &SharedReady,
+    held: &mut Option<oneshot::Sender<HeldFailure>>,
+    failed: &CancellationToken,
+    error: StartError,
+) {
+    let Err(error) = try_hold_failure(shared, held, failed, error).await else {
+        return;
+    };
+    // `held` is gone once a failure was held; it is still there if a `ready` took the sender.
+    match held {
+        Some(_) => tracing::warn!(
+            plugin = %plugin,
+            "the plugin reported a start failure after its readiness was already decided; ignored: {error}"
+        ),
+        None => tracing::debug!(
+            plugin = %plugin,
+            "the plugin reported another start failure after its readiness was already decided; ignored: {error}"
+        ),
+    }
 }
 
 /// Where a sitrep reader's start failure waits for the plugin's output. The failure is sent only when the
@@ -541,7 +556,7 @@ impl FailureHold {
     }
 
     /// Closes the hold, then sends what reached it first: a reader deciding later finds the hold closed
-    /// and sends its own failure (see [`hold_failure`]), so every decided failure is sent exactly once.
+    /// and sends its own failure (see [`try_hold_failure`]), so every decided failure is sent exactly once.
     pub(crate) fn finish(&mut self) -> bool {
         self.held.close();
         let Ok(HeldFailure { ready, error }) = self.held.try_recv() else {
@@ -673,13 +688,13 @@ pub(crate) fn spawn_sitrep_stdout_reader(
                                     detail: "sitrep ready reported empty transports (protocol violation)".into(),
                                     errno: None,
                                 };
-                                hold_failure(&plugin_name, &shared, &mut held, &failed, error).await;
+                                hold_reported_failure(&plugin_name, &shared, &mut held, &failed, error).await;
                             } else if let Some(tx) = shared.lock().await.take() {
                                 let _ = tx.send(Ok(PluginReady { listen, transports }));
                             }
                         }
                         Ok(Some(SitrepEvent::BindConflict { errno, addr })) if handshake_ok => {
-                            hold_failure(
+                            hold_reported_failure(
                                 &plugin_name,
                                 &shared,
                                 &mut held,
@@ -689,7 +704,7 @@ pub(crate) fn spawn_sitrep_stdout_reader(
                             .await;
                         }
                         Ok(Some(SitrepEvent::Fatal { detail, errno })) if handshake_ok => {
-                            hold_failure(
+                            hold_reported_failure(
                                 &plugin_name,
                                 &shared,
                                 &mut held,
@@ -718,7 +733,8 @@ pub(crate) fn spawn_sitrep_stdout_reader(
                 detail: "plugin closed its sitrep stream before becoming ready".into(),
                 errno: None,
             };
-            hold_failure(&plugin_name, &shared, &mut held, &failed, error).await;
+            // Readiness already decided: the close is no event the plugin reported, so nothing is logged.
+            let _ = try_hold_failure(&shared, &mut held, &failed, error).await;
         }
     });
     (task, hold)

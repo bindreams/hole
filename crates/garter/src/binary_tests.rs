@@ -2523,3 +2523,33 @@ async fn a_failure_reported_after_readiness_was_decided_is_logged() {
         );
     }
 }
+
+/// The reader's own end-of-stream close is not an event the plugin reported: once readiness is decided it logs no
+/// "already decided" line at any level, after a `ready` or after a held failure.
+#[skuld::test]
+async fn a_stdout_close_after_readiness_was_decided_logs_no_ignored_failure() {
+    tokio::time::pause();
+    let ready = SitrepEvent::Ready {
+        listen: "127.0.0.1:9".parse().unwrap(),
+        transports: Transports::TCP,
+    };
+    let fatal = SitrepEvent::Fatal {
+        detail: "first-fatal".into(),
+        errno: None,
+    };
+    for lines in [
+        hello(SITREP_PROTOCOL) + &sitrep_line(&ready),
+        hello(SITREP_PROTOCOL) + &sitrep_line(&fatal),
+    ] {
+        let (subscriber, writer) = subscriber();
+        let _g = set_default_in_current_thread(subscriber);
+        let (_ready_rx, reader, _shutdown, _failure) = sitrep_reader_over(&lines, false).await;
+        tokio::time::timeout(VIRTUAL_HANG, reader).await.unwrap().unwrap();
+
+        let log = writer.snapshot();
+        assert!(
+            !log.contains("already decided"),
+            "{lines:?}: the end of the stream was logged as a reported failure:\n{log}"
+        );
+    }
+}
