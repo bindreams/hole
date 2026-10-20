@@ -1708,3 +1708,160 @@ async fn the_inner_exiting_ends_a_forwarder_still_retrying_its_connect() {
         writer.snapshot()
     );
 }
+
+// Start failures drain the inner ======================================================================================
+
+/// What a [`LastLineStub`] does before it waits for the tap to stop it.
+#[derive(Clone, Copy)]
+enum Prelude {
+    /// Holds `ready` and reports nothing.
+    Silent,
+    /// Reports a listener outside the address it was given.
+    ForeignListen,
+    /// Reports its own typed failure while still running.
+    TypedFatal,
+    /// Reports the address it was given, as an inner that bound it.
+    Ready,
+}
+
+/// Runs its [`Prelude`], then waits to be stopped. Once stopped it holds a last line back until `gate` opens, as a
+/// plugin whose reader is still relaying stderr, and records that the line was relayed before it returns.
+struct LastLineStub {
+    prelude: Prelude,
+    /// Fires when the inner has been told to stop.
+    stopped: oneshot::Sender<()>,
+    gate: oneshot::Receiver<()>,
+    relayed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for LastLineStub {
+    fn name(&self) -> &str {
+        "last-line-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        let _held_ready = match self.prelude {
+            Prelude::Silent => Some(ready),
+            Prelude::ForeignListen => {
+                let _ = ready.send(Ok(PluginReady {
+                    listen: "10.9.8.7:80".parse().unwrap(),
+                    transports: crate::sitrep::Transports::TCP,
+                }));
+                None
+            }
+            Prelude::TypedFatal => {
+                let _ = ready.send(Err(StartError::Fatal {
+                    detail: "inner broke".into(),
+                    errno: None,
+                }));
+                None
+            }
+            Prelude::Ready => {
+                let _ = ready.send(Ok(PluginReady {
+                    listen: local,
+                    transports: crate::sitrep::Transports::TCP,
+                }));
+                None
+            }
+        };
+        shutdown.cancelled().await;
+        let _ = self.stopped.send(());
+        let _ = self.gate.await;
+        self.relayed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Starts a tap over a [`LastLineStub`] whose start fails, with `public` as the tap's address, and asserts the
+/// failure is not reported before the inner has relayed the last line it held back after being stopped.
+async fn assert_failure_waits_for_the_inners_last_line(
+    prelude: Prelude,
+    public: SocketAddr,
+) -> (Ready, crate::Result<()>) {
+    let (stopped_tx, stopped_rx) = oneshot::channel();
+    let (gate_tx, gate_rx) = oneshot::channel();
+    let relayed = Arc::new(AtomicBool::new(false));
+    let inner = Box::new(LastLineStub {
+        prelude,
+        stopped: stopped_tx,
+        gate: gate_rx,
+        relayed: relayed.clone(),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe = scripted(vec![Ok(addr(5001))], &calls);
+    let tap = Box::new(TapPlugin::wrap_with_probe(inner, Box::new(probe)));
+    // Never cancelled: the tap ends the inner itself.
+    let shutdown = CancellationToken::new();
+    let (ready_tx, mut ready_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move { tap.run(public, unused_remote(), shutdown, ready_tx).await });
+
+    // The gate opens only after the inner was stopped, so a failure reported first was not held for it.
+    tokio::select! {
+        biased;
+        r = &mut ready_rx => panic!("the start failure was reported ({r:?}) before the inner was stopped and its last line relayed"),
+        _ = stopped_rx => {}
+    }
+    gate_tx.send(()).unwrap();
+
+    let ready = ready_rx.await.expect("the tap dropped `ready` unsent");
+    assert!(
+        relayed.load(Ordering::SeqCst),
+        "the start failure was reported before the inner relayed its last line"
+    );
+    (ready, handle.await.expect("tap task panicked"))
+}
+
+#[skuld::test]
+async fn the_readiness_bound_failure_waits_for_the_inners_last_line() {
+    tokio::time::pause();
+    let (ready, result) = assert_failure_waits_for_the_inners_last_line(Prelude::Silent, loopback()).await;
+
+    assert!(
+        matches!(&ready, Err(StartError::Fatal { detail, .. }) if detail.contains("did not bind")),
+        "want the readiness-bound Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn a_foreign_listener_failure_waits_for_the_inners_last_line() {
+    let (ready, result) = assert_failure_waits_for_the_inners_last_line(Prelude::ForeignListen, loopback()).await;
+
+    assert!(
+        matches!(&ready, Err(StartError::Fatal { detail, .. }) if detail.contains("not the address")),
+        "want the foreign-listener Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn an_inners_typed_failure_waits_for_the_inners_last_line() {
+    let (ready, result) = assert_failure_waits_for_the_inners_last_line(Prelude::TypedFatal, loopback()).await;
+
+    assert!(
+        matches!(&ready, Err(StartError::Fatal { detail, .. }) if detail == "inner broke"),
+        "want the inner's Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn a_public_bind_failure_waits_for_the_inners_last_line() {
+    let holder = std::net::TcpListener::bind(loopback()).unwrap();
+    let public = holder.local_addr().unwrap();
+    let (ready, result) = assert_failure_waits_for_the_inners_last_line(Prelude::Ready, public).await;
+
+    assert!(
+        matches!(&ready, Err(StartError::BindConflict { addr, errno }) if *addr == public && *errno != 0),
+        "want BindConflict on the public address, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+    drop(holder);
+}
