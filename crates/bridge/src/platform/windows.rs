@@ -672,9 +672,10 @@ pub fn ensure_failure_actions() -> std::io::Result<()> {
 /// uninstall retryable instead of terminal.
 ///
 /// The stop, the delete and the check after it are one SCM session
-/// ([`retire`]), because the service carries restart-on-failure: a service the
-/// SCM is about to restart reads STOPPED, and separate probes and acts each
-/// decided on a state the SCM could change under them. A service already
+/// ([`retire`](crate::cutover::scm_wait::retire::retire)), because the service
+/// carries restart-on-failure: a service the SCM is about to restart reads
+/// STOPPED, and separate probes and acts each decided on a state the SCM could
+/// change under them. A service already
 /// marked for deletion still opens, and is stopped through its handle.
 pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     if retire_service(Disposition::Deregister)? {

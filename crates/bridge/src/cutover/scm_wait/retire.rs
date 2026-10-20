@@ -219,7 +219,7 @@ fn answered_as_marked(error: &io::Error) -> bool {
 /// The change binds when the service stops. The record is written first, so a
 /// retirement cut short after the start type is disabled has its record; a
 /// failed write of it is the retirement's failure with nothing changed, and a
-/// record that cannot be read counts as present ([`RecordState::of`]).
+/// record that cannot be read counts as present (`RecordKey::state`).
 /// A failed start-type write is the retirement's failure with only the record
 /// this call wrote cleared, unless the SCM answers that the service is marked
 /// for deletion ([`Hardened::Marked`]); a failed failure-actions write only
