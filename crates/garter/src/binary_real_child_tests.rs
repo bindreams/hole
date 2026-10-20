@@ -196,6 +196,7 @@ async fn an_exited_root_is_reported_as_exited_when_a_shutdown_request_is_already
         match &end {
             PluginEnd::Exited(s) => format!("exited, {s:?}"),
             PluginEnd::ShutDown => "ShutDown".to_owned(),
+            PluginEnd::KilledAfterFailedStart => "KilledAfterFailedStart".to_owned(),
         }
     );
 }

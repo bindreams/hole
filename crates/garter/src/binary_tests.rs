@@ -280,6 +280,8 @@ struct FakeTree<K> {
     exit_watch_pends_first_poll: bool,
     root_survives_tree_kill: bool,
     reap_never_completes: bool,
+    /// `reap` waits for this to be notified: the root exits when the test says so.
+    reap_waits_for: Option<Arc<Notify>>,
     probe_fails: bool,
     tree_killed: bool,
     graces: Arc<Mutex<Vec<Duration>>>,
@@ -305,6 +307,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
             exit_watch_pends_first_poll: false,
             root_survives_tree_kill: false,
             reap_never_completes: false,
+            reap_waits_for: None,
             probe_fails: false,
             tree_killed: false,
             graces: Arc::default(),
@@ -401,6 +404,9 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
         }
         if self.reap_waits_for_kill {
             self.root_killed.notified().await;
+        }
+        if let Some(exits) = &self.reap_waits_for {
+            exits.notified().await;
         }
         self.record("reap");
         if self.reap_fails {
@@ -974,7 +980,7 @@ async fn a_root_that_outlives_its_grace_after_a_start_failure_is_killed_without_
     .expect("the plugin must end")
     .unwrap();
 
-    assert!(matches!(end, PluginEnd::ShutDown));
+    assert!(matches!(end, PluginEnd::KilledAfterFailedStart));
     assert_eq!(
         tree.calls(),
         [
@@ -1678,5 +1684,172 @@ async fn a_shutdown_while_the_exit_cannot_be_watched_still_kills_the_tree_before
             "reap",
             "disarm"
         ]
+    );
+}
+
+// A start failure while the exit cannot be watched --------------------------------------------------------------------
+//
+// The grace a failed-start plugin gets to exit by itself, and the status it exits with, do not depend on the watch:
+// the reap is what waits for the exit then.
+
+/// A reader that has decided the start failed, so the plugin is to be taken down.
+async fn decided_start_failure() -> (
+    oneshot::Receiver<Result<PluginReady, StartError>>,
+    CancellationToken,
+    FailureHold,
+) {
+    let (ready_rx, reader, shutdown, failure) = sitrep_reader_over(&hello(SITREP_PROTOCOL), false).await;
+    reader.await.unwrap();
+    (ready_rx, shutdown, failure)
+}
+
+/// An unwatchable root that exits within the grace after a start failure is not signalled before it does, and is
+/// reported with its own status.
+#[skuld::test]
+async fn an_unwatchable_root_that_exits_within_its_grace_after_a_start_failure_is_reported_as_exited() {
+    tokio::time::pause();
+    for (containment, kills_by_pgid) in KILLS_BY_PGID {
+        let (mut ready_rx, shutdown, failure) = decided_start_failure().await;
+        let exits = Arc::new(Notify::new());
+        let mut tree = drained_tree(containment);
+        tree.root_watch_fails = true;
+        tree.reap_waits_for = Some(exits.clone());
+        let calls = tree.calls.clone();
+        let sup = supervise_plugin(
+            "p",
+            &mut tree,
+            &shutdown,
+            GRACE,
+            finished_reader(),
+            finished_reader(),
+            Some(failure),
+        );
+        let mut sup = pin!(sup);
+
+        assert!(
+            poll_once(sup.as_mut()).is_pending(),
+            "{containment:?}: ended before the root exited"
+        );
+        tokio::time::advance(GRACE - Duration::from_millis(1)).await;
+        assert!(
+            poll_once(sup.as_mut()).is_pending(),
+            "{containment:?}: ended inside the grace"
+        );
+        assert!(
+            !calls.lock().unwrap().contains(&"kill_root"),
+            "{containment:?}: the root was killed inside its grace: {:?}",
+            calls.lock().unwrap()
+        );
+        assert!(
+            poll_once(pin!(&mut ready_rx)).is_pending(),
+            "{containment:?}: reported early"
+        );
+
+        exits.notify_one();
+        let end = tokio::time::timeout(VIRTUAL_HANG, sup)
+            .await
+            .unwrap_or_else(|_| panic!("{containment:?}: the plugin never ended"))
+            .unwrap();
+
+        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        let edge_awaited = CONTAINMENTS.iter().any(|(c, edge)| *c == containment && *edge);
+        let expected: &[&str] = match (kills_by_pgid, edge_awaited) {
+            (true, _) => &["wait_root_exit", "reap", "disarm"],
+            (false, true) => &["wait_root_exit", "reap", "disarm", "kill_tree", "wait_tree_drained"],
+            (false, false) => &["wait_root_exit", "reap", "disarm", "kill_tree"],
+        };
+        assert_eq!(*calls.lock().unwrap(), expected, "{containment:?}");
+        assert!(matches!(ready_rx.await, Ok(Err(_))), "{containment:?}");
+    }
+}
+
+/// An unwatchable root that outlives the grace is killed once it is over, and not before.
+#[skuld::test]
+async fn an_unwatchable_root_that_outlives_its_grace_after_a_start_failure_is_killed_when_it_is_over() {
+    tokio::time::pause();
+    let (_ready_rx, shutdown, failure) = decided_start_failure().await;
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_watch_fails = true;
+    tree.reap_waits_for_kill = true;
+    let calls = tree.calls.clone();
+    let sup = supervise_plugin(
+        "p",
+        &mut tree,
+        &shutdown,
+        GRACE,
+        finished_reader(),
+        finished_reader(),
+        Some(failure),
+    );
+    let mut sup = pin!(sup);
+
+    assert!(poll_once(sup.as_mut()).is_pending());
+    tokio::time::advance(GRACE - Duration::from_millis(1)).await;
+    assert!(poll_once(sup.as_mut()).is_pending(), "ended inside the grace");
+    assert!(
+        !calls.lock().unwrap().contains(&"kill_root"),
+        "the root was killed inside its grace: {:?}",
+        calls.lock().unwrap()
+    );
+
+    tokio::time::advance(TIMER_SLACK).await;
+    let end = tokio::time::timeout(VIRTUAL_HANG, sup)
+        .await
+        .expect("the plugin must end")
+        .unwrap();
+
+    assert!(matches!(end, PluginEnd::KilledAfterFailedStart));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["wait_root_exit", "kill_root", "kill_tree", "reap", "disarm"]
+    );
+}
+
+// What `BinaryPlugin::run` returns ------------------------------------------------------------------------------------
+
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::process::ExitStatusExt::from_raw(code as u32)
+    }
+}
+
+#[skuld::test]
+fn a_plugin_ended_by_a_shutdown_or_exiting_cleanly_is_ok() {
+    assert!(PluginEnd::ShutDown.outcome("p").is_ok());
+    assert!(PluginEnd::Exited(exit_status(0)).outcome("p").is_ok());
+}
+
+#[skuld::test]
+fn a_plugin_that_exits_with_a_code_is_an_error_naming_it() {
+    assert!(matches!(
+        PluginEnd::Exited(exit_status(3)).outcome("p"),
+        Err(crate::Error::PluginExit { name, code: 3 }) if name == "p"
+    ));
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_plugin_that_dies_to_a_signal_is_an_error_naming_it() {
+    let status = std::os::unix::process::ExitStatusExt::from_raw(9);
+    assert!(matches!(
+        PluginEnd::Exited(status).outcome("p"),
+        Err(crate::Error::PluginKilled { name }) if name == "p"
+    ));
+}
+
+/// A plugin whose start failed and that had to be killed did not run to a clean end: `run` must not return `Ok`.
+#[skuld::test]
+fn a_plugin_killed_after_a_failed_start_is_an_error_naming_it() {
+    let err = PluginEnd::KilledAfterFailedStart
+        .outcome("p")
+        .expect_err("a failed start is not a clean end");
+    assert!(
+        matches!(&err, crate::Error::Chain(msg) if msg.contains("'p'") && msg.contains("start")),
+        "{err:?}"
     );
 }
