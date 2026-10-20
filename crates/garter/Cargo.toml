@@ -34,8 +34,8 @@ semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["full"] }
-# `rt`: `task::AbortOnDropHandle`, which keeps the tap from leaving its inner running.
-tokio-util = { version = "0.7", features = ["compat", "rt"] }
+# `rt`: `task::AbortOnDropHandle`, which keeps the tap from leaving its inner running. 0.7.12 is the first release with it.
+tokio-util = { version = "0.7.12", features = ["compat", "rt"] }
 tracing = "0.1"
 regex = "1"
 # Optional: needed only by `test_utils::WaitableWriter`'s `MakeWriter`
