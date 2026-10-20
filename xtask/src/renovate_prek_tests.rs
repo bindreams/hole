@@ -12,13 +12,22 @@ use regex::Regex;
 fn extracted(renovate: &serde_json::Value, prek_text: &str) -> BTreeSet<(String, String)> {
     let mut found = BTreeSet::new();
     for manager in renovate["customManagers"].as_array().expect("customManagers") {
-        let files = manager["managerFilePatterns"].as_array().expect("managerFilePatterns");
-        if !files
+        let files: Vec<&str> = manager["managerFilePatterns"]
+            .as_array()
+            .expect("managerFilePatterns")
             .iter()
-            .any(|f| selects_prek_toml(f.as_str().expect("managerFilePatterns entry")))
-        {
+            .map(|f| f.as_str().expect("managerFilePatterns entry"))
+            .collect();
+        if !files.iter().any(|f| f.to_ascii_lowercase().contains("prek")) {
             continue;
         }
+        // Renovate's pattern lists (negations, globs, `/re/i`) are not modelled: a prek manager must
+        // use the one form this file can check.
+        assert_eq!(
+            files,
+            [PREK_FILE_PATTERN],
+            "a manager over prek.toml must select it with exactly `{PREK_FILE_PATTERN}`; update this guard to change that"
+        );
         let has_datasource_template = manager["datasourceTemplate"].as_str().is_some_and(|d| !d.is_empty());
         for pattern in manager["matchStrings"].as_array().expect("matchStrings") {
             let pattern = pattern.as_str().expect("matchStrings entry");
@@ -41,16 +50,8 @@ fn extracted(renovate: &serde_json::Value, prek_text: &str) -> BTreeSet<(String,
     found
 }
 
-/// Whether a `managerFilePatterns` entry selects the root `prek.toml`: a `/regex/` must match the
-/// path; anything else is a glob, which Renovate matches literally here.
-fn selects_prek_toml(pattern: &str) -> bool {
-    match pattern.strip_prefix('/').and_then(|p| p.strip_suffix('/')) {
-        Some(re) => Regex::new(re)
-            .unwrap_or_else(|e| panic!("`{pattern}` is not a valid regex: {e}"))
-            .is_match("prek.toml"),
-        None => pattern == "prek.toml",
-    }
-}
+/// The `managerFilePatterns` entry that selects the root `prek.toml`.
+const PREK_FILE_PATTERN: &str = r"/^prek\.toml$/";
 
 /// `(package, version)` for each `additional_dependencies` entry pinned exactly (`pkg==1` or the
 /// npm `pkg@1`); ranges (`>=`) and bare names are not pins.
