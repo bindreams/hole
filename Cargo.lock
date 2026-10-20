@@ -2421,6 +2421,7 @@ dependencies = [
  "hole-test-observability",
  "libc",
  "regex",
+ "rustix",
  "semver",
  "serde",
  "serde_json",
@@ -8182,6 +8183,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
