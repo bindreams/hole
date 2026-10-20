@@ -52,6 +52,9 @@ mod arm_probes;
 #[path = "cutover_privileged/raw_scm.rs"]
 mod raw_scm;
 #[cfg(target_os = "windows")]
+#[path = "cutover_privileged/record_proofs.rs"]
+mod record_proofs;
+#[cfg(target_os = "windows")]
 #[path = "cutover_privileged/recording.rs"]
 mod recording;
 #[cfg(target_os = "windows")]
