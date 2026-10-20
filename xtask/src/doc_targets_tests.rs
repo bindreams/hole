@@ -136,30 +136,12 @@ fn is_lib(kind: &TargetKind) -> bool {
 }
 
 /// Workspace packages `doc-ex-galoshes` does not document, each with why. Everything else is
-/// documented there, so a crate added to the workspace is either in that command or in this list.
+/// documented there, so a crate that compiles on those legs is checked per platform, and a new
+/// crate is either in that command or in this list.
 const EX_GALOSHES_EXCLUDED: &[(&str, &str)] = &[
-    (
-        "hole",
-        "Hole app: windows/macOS-only cfg-gates do not compile on these legs",
-    ),
-    (
-        "hole-bridge",
-        "Hole bridge: windows/macOS-only cfg-gates do not compile on these legs",
-    ),
-    ("hole-common", "`compile_error!` off macOS/Windows"),
-    (
-        "tun-engine",
-        "TUN engine: windows/macOS-only cfg-gates do not compile on these legs",
-    ),
-    ("tun-engine-macros", "proc-macro of `tun-engine` alone"),
-    ("handle-holders", "Windows-only support crate of the Hole tests"),
-    ("hole-test-observability", "test-only support crate of the Hole crates"),
-    ("dump", "support crate of the Hole crates; `doc-hole` documents it"),
-    ("dump-macros", "proc-macro of `dump` alone"),
-    (
-        "tombstone",
-        "crash-marker support crate of the Hole crates; `doc-hole` documents it",
-    ),
+    ("hole", "does not compile on linux or windows/arm64"),
+    ("hole-bridge", "does not compile on linux or windows/arm64"),
+    ("tun-engine", "does not compile on linux or windows/arm64"),
 ];
 
 #[skuld::test]
