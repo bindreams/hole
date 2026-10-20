@@ -406,25 +406,6 @@ fn a_checkpoint_over_a_record_whose_read_fails_is_refused() {
     );
 }
 
-/// The new record is in place but its directory entry is not known durable:
-/// the checkpoint is a failure (nothing runs on a record not known durable),
-/// and the log says the record was replaced.
-#[skuld::test]
-fn a_checkpoint_that_was_published_but_not_finalized_is_a_failure_and_names_the_path() {
-    let path = PathBuf::from("/state/bridge-routes.json");
-    let cause = std::io::Error::from(std::io::ErrorKind::TimedOut);
-
-    let mut error = None;
-    let logs = logs_of(|| {
-        error = Some(checkpoint_failure(StoreError::PublishedNotFinalized(cause), &path));
-    });
-
-    assert_eq!(error.unwrap().kind(), std::io::ErrorKind::TimedOut);
-    assert!(logs.contains(&path.display().to_string()), "{logs}");
-}
-
-/// The teardown's record of an unswept leak is the only record of it: over a
-/// file it cannot read it is not written, and the failure names the path.
 #[skuld::test]
 fn teardown_over_a_record_whose_read_fails_leaves_it_and_names_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -469,4 +450,37 @@ fn a_checkpoint_over_a_record_that_turned_unreadable_is_refused() {
         persisted.installed.is_empty(),
         "a refused write must not advance the in-memory value"
     );
+}
+
+/// A checkpoint whose record was replaced but is not known durable has landed:
+/// memory follows the disk, so no recovery reads ids memory never installed.
+#[skuld::test]
+fn a_checkpoint_published_but_not_finalized_has_landed() {
+    let path = PathBuf::from("/state/bridge-routes.json");
+    let mut persisted = persisted_with_no_routes();
+
+    let result = checkpoint_installed_with(&mut persisted, &path, &[RouteId::SplitV4Low], |_| {
+        Err(StoreError::PublishedNotFinalized(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        )))
+    });
+
+    result.unwrap();
+    assert_eq!(persisted.installed, vec![RouteId::SplitV4Low]);
+}
+
+/// Any other write failure leaves the in-memory value where it was.
+#[skuld::test]
+fn a_checkpoint_that_did_not_land_rolls_memory_back() {
+    let path = PathBuf::from("/state/bridge-routes.json");
+    let mut persisted = persisted_with_no_routes();
+
+    let result = checkpoint_installed_with(&mut persisted, &path, &[RouteId::SplitV4Low], |_| {
+        Err(StoreError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+    });
+
+    assert!(result.is_err());
+    assert!(persisted.installed.is_empty());
 }

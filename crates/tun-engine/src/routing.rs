@@ -975,16 +975,38 @@ fn checkpoint_installed(
     owner: Option<(u32, u32)>,
     ids: &[RouteId],
 ) -> std::io::Result<()> {
-    let prev = std::mem::replace(&mut persisted.installed, ids.to_vec());
-    state::write(record_file, persisted, owner)
-        .map_err(|e| checkpoint_failure(e, record_file.path()))
-        .inspect_err(|_| persisted.installed = prev)
+    checkpoint_installed_with(persisted, record_file.path(), ids, |state| {
+        state::write(record_file, state, owner)
+    })
 }
 
-/// The error `setup_routes` sees for a checkpoint that did not land. A write
-/// that replaced the record but is not known durable is a failure too: nothing
-/// may mutate the routing table on a record not known durable.
-fn checkpoint_failure(e: StoreError, record: &Path) -> std::io::Error {
+/// [`checkpoint_installed`] over an injectable write.
+fn checkpoint_installed_with(
+    persisted: &mut state::RouteState,
+    record: &Path,
+    ids: &[RouteId],
+    write: impl FnOnce(&state::RouteState) -> Result<(), StoreError>,
+) -> std::io::Result<()> {
+    let prev = std::mem::replace(&mut persisted.installed, ids.to_vec());
+    match write(persisted) {
+        Ok(()) => Ok(()),
+        // The record on disk already lists `ids`: the checkpoint landed, only its
+        // durability is unconfirmed. Treating it as a failure would leave disk
+        // listing routes memory says were never installed, and a recovery from
+        // that record would delete routes Hole never installed.
+        Err(StoreError::PublishedNotFinalized(e)) => {
+            warn!(path = %record.display(), error = %e, "route record replaced, but not known durable");
+            Ok(())
+        }
+        Err(e) => {
+            persisted.installed = prev;
+            Err(checkpoint_failure(e))
+        }
+    }
+}
+
+/// The error `setup_routes` sees for a checkpoint that did not land.
+fn checkpoint_failure(e: StoreError) -> std::io::Error {
     match e {
         StoreError::Io(e) => e,
         StoreError::Unreadable { path, cause } => {
@@ -995,9 +1017,8 @@ fn checkpoint_failure(e: StoreError, record: &Path) -> std::io::Error {
             error!(path = %path.display(), ?kind, "route record cannot be read; the checkpoint is refused");
             std::io::Error::other("the route record cannot be read")
         }
-        StoreError::PublishedNotFinalized(e) => {
-            warn!(path = %record.display(), error = %e, "route record replaced, but not known durable; the checkpoint is a failure");
-            e
+        StoreError::PublishedNotFinalized(_) => {
+            unreachable!("a published checkpoint is not a failure: see `checkpoint_installed`")
         }
         StoreError::Encode(what) => std::io::Error::other(what),
     }
