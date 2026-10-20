@@ -9,7 +9,7 @@
 //!   a log, plus the byte-level writer that enforces it.
 //! - [`retry`] — exponential-backoff retry helpers + transient-error
 //!   predicates (`is_bind_race` / `is_file_contention`).
-//! - [`system_tool`] — absolute paths for the OS tools Hole spawns, so a
+//! - `system_tool` — absolute paths for the OS tools Hole spawns, so a
 //!   bare program name is never resolved through `PATH` or the working
 //!   directory.
 //! - [`syn_budget`] — a TCP connect whose SYN-retransmission budget is

@@ -85,6 +85,9 @@ mod tauri_context_gating_tests;
 #[path = "dmg_background_tests.rs"]
 mod dmg_background_tests;
 #[cfg(test)]
+#[path = "doc_targets_tests.rs"]
+mod doc_targets_tests;
+#[cfg(test)]
 #[path = "finish_vendor_bump_tests.rs"]
 mod finish_vendor_bump_tests;
 #[cfg(test)]
@@ -111,6 +114,9 @@ mod prek_split_tests;
 #[cfg(test)]
 #[path = "pull_subrepo_tests.rs"]
 mod pull_subrepo_tests;
+#[cfg(test)]
+#[path = "renovate_prek_tests.rs"]
+mod renovate_prek_tests;
 #[cfg(test)]
 #[path = "skuld_label_coverage_tests.rs"]
 mod skuld_label_coverage_tests;

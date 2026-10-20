@@ -683,7 +683,9 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
     }
     g.insert("test-ex-ray-unit", vec!["windows/amd64", "darwin/arm64"]);
     g.insert("clippy-hole", HOLE_LEGS.to_vec());
+    g.insert("doc-hole", HOLE_LEGS.to_vec());
     g.insert("clippy-ex-galoshes", NON_HOLE_LEGS.to_vec());
+    g.insert("doc-ex-galoshes", NON_HOLE_LEGS.to_vec());
     for id in ["dmg-start", "dmg"] {
         g.insert(id, DARWIN.to_vec());
     }

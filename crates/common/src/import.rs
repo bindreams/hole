@@ -29,7 +29,7 @@ pub enum ImportError {
     ///
     /// The "bundled list" in the error message is derived from
     /// [`crate::plugin::known_plugin_names_joined`], which lists only the
-    /// user-visible plugins from [`crate::plugin::KNOWN_PLUGINS`] (so the
+    /// user-visible plugins from `crate::plugin::KNOWN_PLUGINS` (so the
     /// `ex-ray` impl-detail entry is hidden) so it can't drift.
     #[error(
         "plugin \"{name}\" is not bundled with Hole. Bundled plugins: {}",

@@ -127,7 +127,7 @@ mod tools {
         }
     }
 
-    /// The system `powershell.exe`. Not a [`SystemTool`](super::SystemTool): a
+    /// The system `powershell.exe`. Not a [`SystemTool`]: a
     /// root PowerShell autoloads cmdlets from `PSModulePath`, whose default
     /// begins with the invoking user's writable
     /// `Documents\WindowsPowerShell\Modules`, so it may only be built together

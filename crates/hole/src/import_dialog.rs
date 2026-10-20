@@ -3,7 +3,7 @@
 //!
 //! All of it runs in this process, on purpose. File > Import lives in a
 //! Rust-owned menu and the import itself is already Rust
-//! ([`commands::import_file`]), so routing the click through the webview
+//! ([`import_file`]), so routing the click through the webview
 //! would mean handing a *command* to a document that may not be listening
 //! yet — an exactly-once delivery problem, over a channel
 //! ([`Emitter::emit`]) that reports success as soon as it dispatches. Doing

@@ -182,20 +182,18 @@ test-group = 'global_net_state'
 # first override that specifies it, so the `test-group` assignment above still
 # wins for this test — verified with `cargo nextest show-config test-groups`,
 # which must keep listing it under `global_net_state`.
+#
+# `cutover_global_net_state_service_controls_after_stop_are_measured` is the same
+# kind of test: it prints which controls the SCM delivered after a Stop, and that
+# line is the measurement.
+#
+# `immediate-final` for both, not `final`: `final` prints only when the whole run
+# ends, so a job killed by its time budget drops the measurement.
+# `immediate-final` prints it as the test finishes and again in the summary.
 [[profile.default.overrides]]
 filter = 'test(/failclosed_cover_transition_/)'
-success-output = 'final'
+success-output = 'immediate-final'
 
-# `cutover_global_net_state_service_controls_after_stop_are_measured` prints
-# which controls the SCM delivered after a Stop. nextest discards captured
-# output on success, and that line is the measurement.
-#
-# `immediate-final`, not `final`: `final` prints only when the whole run ends,
-# and a lane killed by its step budget never gets there, so every measurement
-# of a run that hangs later is lost. `immediate-final` prints each test's
-# output as the test finishes and again in the final summary. Safe: these tests run one at a time
-# (`global_net_state`, `max-threads = 1`), so a block never interleaves with
-# another test's, and each prints a few lines.
 [[profile.default.overrides]]
 filter = 'test(/cutover_global_net_state_service_controls_after_stop_/)'
 success-output = 'immediate-final'

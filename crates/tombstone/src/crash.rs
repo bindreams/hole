@@ -428,8 +428,8 @@ fn extract_fault_fields(ctx: &crash_handler::CrashContext) -> (u64, u64, u32, u3
 /// 6=SIGABRT, 7=SIGBUS, 4=SIGILL, 8=SIGFPE, 5=SIGTRAP) — sweep surfaces it
 /// verbatim. pid/tid come straight off the context. Returns
 /// (code, fault_addr, pid, tid). Verified against
-/// https://docs.rs/crash-context/0.7.0/src/crash_context/linux.rs.html
-/// and https://docs.rs/libc/latest/libc/struct.signalfd_siginfo.html
+/// <https://docs.rs/crash-context/0.7.0/src/crash_context/linux.rs.html>
+/// and <https://docs.rs/libc/latest/libc/struct.signalfd_siginfo.html>
 #[cfg(target_os = "linux")]
 fn extract_fault_fields(ctx: &crash_handler::CrashContext) -> (u64, u64, u32, u32) {
     let code = ctx.siginfo.ssi_signo as u64;

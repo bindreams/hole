@@ -309,7 +309,7 @@ impl Dns for SystemDns {
 }
 
 /// Message stored in the `DebugDropBomb`. The `#[should_panic(expected =
-/// ...)]` in [`crate::dns::system::windows::windows_tests`] matches this
+/// ...)]` in `crate::dns::system::windows::windows_tests` matches this
 /// exact string.
 const BOMB_MSG: &str = "SystemDnsApplied dropped without awaiting shutdown()";
 

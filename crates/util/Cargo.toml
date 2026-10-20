@@ -9,6 +9,12 @@ description = "Small cross-platform workspace utilities (ephemeral port allocati
 [lints]
 workspace = true
 
+[features]
+# `versioned_file`'s file-system seam (`Fs`, `VersionedFile::with_fs`), so a
+# downstream crate's tests can fail a read or a link under its own state file.
+# Off by default; enable it only under `[dev-dependencies]`.
+test-support = []
+
 [lib]
 harness = false
 

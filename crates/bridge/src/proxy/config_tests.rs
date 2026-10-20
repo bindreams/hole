@@ -405,6 +405,27 @@ fn io_dispatcher_start_error_converts_to_runtime() {
     }
 }
 
+// RoutingError conversion ---------------------------------------------------------------------------------------------
+
+/// The path of a route record names the user's profile directory, and this
+/// error's `StartError` is a toast: it names the file only. The path stays in
+/// the log.
+#[skuld::test]
+fn an_unreadable_route_record_reaches_the_toast_as_its_file_name_only() {
+    let path = std::path::PathBuf::from("somebody-private").join("bridge-routes.json");
+    let err = ProxyError::from(tun_engine::RoutingError::StateUnreadable { path });
+
+    assert!(matches!(err, ProxyError::RouteSetup(_)), "{err:?}");
+    match hole_common::protocol::StartError::from(&err) {
+        hole_common::protocol::StartError::Failed { message } => assert_eq!(
+            message,
+            "route setup failed: the route record bridge-routes.json cannot be read; \
+             it is left as it is, and no route is installed over it"
+        ),
+        other => panic!("expected StartError::Failed, got {other:?}"),
+    }
+}
+
 // Key-material classification -----------------------------------------------------------------------------------------
 //
 // The 2022-blake3 ciphers take the password as base64 key material, so

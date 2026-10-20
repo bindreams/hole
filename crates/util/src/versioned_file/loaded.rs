@@ -64,7 +64,40 @@ impl std::fmt::Display for CannotRead {
     }
 }
 
+/// Why a file that exists is not one to act on: the two causes of
+/// [`CannotRead`], or a read that failed with an I/O error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhyUnreadable {
+    CannotRead(CannotRead),
+    /// Nothing is known about the bytes.
+    ReadFailed(std::io::ErrorKind),
+}
+
+impl std::fmt::Display for WhyUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WhyUnreadable::CannotRead(why) => write!(f, "{why}"),
+            WhyUnreadable::ReadFailed(kind) => write!(f, "the read failed ({kind})"),
+        }
+    }
+}
+
 impl<S> Loaded<S> {
+    /// What a caller that acts on the file's value finds: `Ok(Some)` a value
+    /// (migrated if it was older), `Ok(None)` nothing to act on (no file, or
+    /// one the chain's floor dropped on purpose), `Err` a file that exists and
+    /// is not one to act on. The one place a `Loaded` becomes an action.
+    pub fn into_actionable(self) -> Result<Option<S>, WhyUnreadable> {
+        match self {
+            Loaded::Current { value, .. } => Ok(Some(value)),
+            Loaded::Absent => Ok(None),
+            Loaded::Obsolete { .. } => Ok(None),
+            Loaded::Unreadable(e) => Err(WhyUnreadable::ReadFailed(e.kind())),
+            Loaded::Newer { .. } => Err(WhyUnreadable::CannotRead(CannotRead::Newer)),
+            Loaded::Corrupt { .. } => Err(WhyUnreadable::CannotRead(CannotRead::Corrupt)),
+        }
+    }
+
     /// `Some` for exactly `Newer` and `Corrupt`.
     pub fn cannot_read(&self) -> Option<CannotRead> {
         match self {

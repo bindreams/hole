@@ -216,6 +216,24 @@ jobs:
         shell: bash
         run: cargo xtask run clippy-ex-galoshes
 
+      # rustdoc, warnings denied: a broken intra-doc link fails the leg; per leg
+      # because a link to a `cfg`-gated item resolves on some targets and not
+      # others. Budget assumes the bins command reuses nothing from the libs one:
+      # 1.25 x (7m15s + 6m22s + 50s) rounds up to 20m.
+      - id: doc-hole
+        name: Rustdoc (Hole workspace)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole == true }}
+        timeout-minutes: 20
+        shell: bash
+        run: cargo xtask run doc-hole
+
+      - id: doc-ex-galoshes
+        name: Rustdoc (ex-Galoshes only)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole != true }}
+        timeout-minutes: 10
+        shell: bash
+        run: cargo xtask run doc-ex-galoshes
+
       # Archive lanes ===================================================================================================
       # The ex-Galoshes crates plus the workspace tooling crates (stepstool,
       # dev-console, xtask, xtask-lib, payload-archive; #454), archived once and

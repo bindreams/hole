@@ -1,20 +1,19 @@
 //! `HoleRouter` — hole's [`tun_engine::Router`] impl.
 //!
-//! Wires two [`Endpoint`](crate::endpoint::Endpoint) mechanisms plus a
-//! [`DropSink`](crate::drop_sink::DropSink) into the filter engine and
+//! Wires two [`Endpoint`] mechanisms plus a [`DropSink`] into the filter engine and
 //! TUN dispatch shape of `tun-engine`:
 //!
-//! - `proxy`: [`Socks5Endpoint`](crate::endpoint::Socks5Endpoint) —
+//! - `proxy`: [`Socks5Endpoint`] —
 //!   flows that should go through the SS tunnel.
-//! - `bypass`: [`InterfaceEndpoint`](crate::endpoint::InterfaceEndpoint) —
+//! - `bypass`: [`InterfaceEndpoint`] —
 //!   flows that should egress via the real upstream interface.
-//! - `drops`: [`LoggingDropSink`](crate::drop_sink::LoggingDropSink) —
+//! - `drops`: [`LoggingDropSink`] —
 //!   records flows the cascade refused to carry. Nothing serves them.
 //!
 //! ## Role vs. mechanism
 //!
 //! Field names encode *role* (why we chose this endpoint for the flow —
-//! the [`FilterAction`](hole_common::config::FilterAction) variant).
+//! the [`FilterAction`] variant).
 //! Field types encode *mechanism* (how the endpoint carries bytes). The
 //! cascade in [`HoleRouter::resolve_endpoint`] maps role → mechanism.
 //!
@@ -26,7 +25,7 @@
 //! 2. Build a [`ConnInfo`] and run [`crate::filter::engine::decide`].
 //! 3. Cascade the `FilterAction` + flow shape to a concrete endpoint via
 //!    [`HoleRouter::resolve_endpoint`], recording any drop reason on the
-//!    [`DropSink`](crate::drop_sink::DropSink).
+//!    [`DropSink`].
 //! 4. Call `endpoint.serve_tcp` or `endpoint.serve_udp`.
 //!
 //! ## UDP-drop privacy invariant
@@ -36,7 +35,7 @@
 //! the clear-text bypass would leak UDP outside the encrypted tunnel,
 //! violating the user's VPN expectation. Users who need tunneled UDP
 //! should configure a UDP-capable plugin (galoshes). The drop is
-//! recorded on the [`DropSink`](crate::drop_sink::DropSink).
+//! recorded on the [`DropSink`].
 
 use std::io;
 use std::net::SocketAddr;
