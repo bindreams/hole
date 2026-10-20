@@ -85,7 +85,7 @@ def live_dns_windows(alias: str, family: str) -> list[str] | None:
     never treated as evidence of a match."""
     fam_flag = "IPv4" if family == "ipv4" else "IPv6"
     result = powershell(
-        f"(Get-DnsClientServerAddress -InterfaceAlias $env:{ARG_ALIAS} -AddressFamily {fam_flag} "
+        f"(Get-DnsClientServerAddress -InterfaceAlias ([WildcardPattern]::Escape($env:{ARG_ALIAS})) -AddressFamily {fam_flag} "
         f"-ErrorAction SilentlyContinue).ServerAddresses -join ','",
         {ARG_ALIAS: alias},
     )
@@ -175,8 +175,8 @@ def restore_dns_windows(state: dict, *, force: bool) -> DnsRestore:
             elif kind == "static":
                 servers = prior.get("servers", [])
                 if not servers:
-                    # The bridge writes an empty static list as no servers, the same as `none`.
-                    outcome.attempt(_netsh_dns(family, "set", alias, "static", "none"))
+                    # The bridge restores an empty static list as a blank NameServer, which is DHCP.
+                    outcome.attempt(_netsh_dns(family, "set", alias, "dhcp"))
                     continue
                 # The `add`s extend the list the `set` starts, so they need it to have succeeded.
                 if not outcome.attempt(_netsh_dns(family, "set", alias, "static", servers[0], "primary")):
@@ -350,8 +350,8 @@ def _text(value: object, what: str) -> str:
     """A string that can be passed as a process argument."""
     if not isinstance(value, str):
         raise TypeError(f"{what} is not a string")
-    if "\0" in value:
-        raise ValueError(f"{what} contains a NUL")
+    if not value.isprintable():
+        raise ValueError(f"{what} contains a control character")
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -584,7 +584,7 @@ def main() -> None:
             print(f"  Leaving the DNS state file {dns_state_path} in place: DNS is not fully restored.")
             if dns_restore.failed:
                 print(
-                    "  A restore command failed (see above). Fix the cause and re-run, or restore "
+                    "  The DNS restore did not complete (see above). Fix the cause and re-run, or restore "
                     "your DNS settings by hand and remove the file."
                 )
             if dns_restore.skipped:
