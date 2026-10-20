@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use super::*;
 use crate::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Look, ProcessFate};
-use crate::cutover::scm_wait::settle::WaitKind;
 use crate::cutover::scm_wait::Observed;
 
 /// A look at a service whose process is held and alive.
@@ -117,10 +116,10 @@ impl StopActor for FakeSession<'_> {
     fn control_stop(&mut self) -> io::Result<()> {
         self.call("control_stop")
     }
-    fn await_callback(&mut self, _kind: WaitKind) -> io::Result<()> {
+    fn await_callback(&mut self) -> io::Result<()> {
         self.call("await_callback")
     }
-    fn await_held_exits(&mut self, _kind: WaitKind) -> io::Result<()> {
+    fn await_held_exits(&mut self) -> io::Result<()> {
         self.call("await_held_exits")
     }
     fn hold_scanned(&mut self) -> io::Result<()> {

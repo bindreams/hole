@@ -23,7 +23,7 @@ use super::{apply_failure_actions, open_error_is_absent, scm_failure, FAILURE_AC
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessSource, Reading};
 use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, StartType, StartWrite, Survivors};
-use crate::cutover::scm_wait::settle::{StopActor, WaitKind};
+use crate::cutover::scm_wait::settle::StopActor;
 use crate::cutover::scm_wait::{observed_from_state, Observed, SystemScmActor};
 
 /// One service handle, opened before anything is changed, carries the queries,
@@ -206,11 +206,11 @@ impl StopActor for RetireSession {
             .map_err(|e| scm_failure(ScmCall::ControlService, e))
     }
 
-    fn await_callback(&mut self, kind: WaitKind) -> io::Result<()> {
-        self.actor.await_callback(kind)
+    fn await_callback(&mut self) -> io::Result<()> {
+        self.actor.await_callback()
     }
 
-    fn await_held_exits(&mut self, _kind: WaitKind) -> io::Result<()> {
+    fn await_held_exits(&mut self) -> io::Result<()> {
         self.processes.await_exits()
     }
 

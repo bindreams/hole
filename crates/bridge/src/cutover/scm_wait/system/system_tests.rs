@@ -83,7 +83,7 @@ use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
 use windows::Win32::System::Services::SERVICE_QUERY_STATUS;
 
 use crate::cutover::scm_wait::hold::Look;
-use crate::cutover::scm_wait::settle::{StopActor, WaitKind};
+use crate::cutover::scm_wait::settle::StopActor;
 
 const ALWAYS_RUNNING_SERVICE: &str = "EventLog";
 
@@ -129,9 +129,9 @@ fn observing_reads_the_state_and_holds_no_process() {
 fn arming_to_leave_a_state_the_service_is_not_in_fires_at_once_on_every_arm() {
     let mut actor = actor_on_the_event_log(NoHooks);
     actor.arm_leaving(Observed::Stopped).unwrap();
-    actor.await_callback(WaitKind::Edge).unwrap();
+    actor.await_callback().unwrap();
     actor.arm_leaving(Observed::Stopped).unwrap();
-    actor.await_callback(WaitKind::Edge).unwrap();
+    actor.await_callback().unwrap();
 }
 
 #[skuld::test]
@@ -156,7 +156,7 @@ fn a_lagging_client_arms_again_on_fresh_handles() {
     let mut actor = actor_on_the_event_log(script);
     actor.arm_leaving(Observed::Stopped).unwrap();
     assert_eq!(opens.get(), 2, "the retry is an arm of its own, on handles of its own");
-    actor.await_callback(WaitKind::Edge).unwrap();
+    actor.await_callback().unwrap();
 }
 
 #[skuld::test]
@@ -168,11 +168,11 @@ fn a_failed_open_fails_that_arm_and_leaves_the_actor_usable() {
     let mut actor = actor_on_the_event_log(script);
     let error = actor.arm_leaving(Observed::Stopped).expect_err("the open fails");
     assert!(error.to_string().contains("injected open failure"), "{error}");
-    let error = actor.await_callback(WaitKind::Edge).expect_err("nothing is armed");
+    let error = actor.await_callback().expect_err("nothing is armed");
     assert!(error.to_string().contains("without a successful arm"), "{error}");
     assert_eq!(actor.observe().unwrap().observed, Observed::Running);
     actor.arm_leaving(Observed::Stopped).unwrap();
-    actor.await_callback(WaitKind::Edge).unwrap();
+    actor.await_callback().unwrap();
 }
 
 #[skuld::test]

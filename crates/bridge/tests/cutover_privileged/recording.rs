@@ -5,7 +5,7 @@
 
 use hole_bridge::cutover::scm_wait::hold::Look;
 use hole_bridge::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartType, StartWrite};
-use hole_bridge::cutover::scm_wait::settle::{StopActor, WaitKind};
+use hole_bridge::cutover::scm_wait::settle::StopActor;
 use hole_bridge::cutover::scm_wait::Observed;
 use hole_bridge::platform::os::{Opening, RetireSession};
 
@@ -101,14 +101,14 @@ impl<S: ServiceSession> StopActor for Recording<'_, S> {
         self.inner.control_stop()
     }
 
-    fn await_callback(&mut self, kind: WaitKind) -> std::io::Result<()> {
+    fn await_callback(&mut self) -> std::io::Result<()> {
         self.record(Event::AwaitCallback);
-        self.inner.await_callback(kind)
+        self.inner.await_callback()
     }
 
-    fn await_held_exits(&mut self, kind: WaitKind) -> std::io::Result<()> {
+    fn await_held_exits(&mut self) -> std::io::Result<()> {
         self.record(Event::AwaitHeldExits);
-        self.inner.await_held_exits(kind)
+        self.inner.await_held_exits()
     }
 
     fn hold_scanned(&mut self) -> std::io::Result<()> {

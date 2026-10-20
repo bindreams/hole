@@ -26,18 +26,6 @@ use super::call_error::service_gone;
 use super::hold::{Look, ProcessFate};
 use super::Observed;
 
-/// What kind of event a wait is for. How long an [`ExternalEvent`](WaitKind::ExternalEvent)
-/// may take before it is a failure is not decided here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitKind {
-    /// The kernel or the SCM is processing a fact it already has. No code of
-    /// the service has to cooperate, so the wait needs no bound.
-    Edge,
-    /// The event depends on the service's own code, or its child's, finishing,
-    /// and may never happen.
-    ExternalEvent,
-}
-
 /// What the stop wait does on a look at the service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettleStep {
@@ -84,41 +72,7 @@ impl Look {
     }
 }
 
-impl Observed {
-    /// The kind of the wait for the service to leave this state.
-    ///
-    /// RUNNING is left by a wait only when its process has already exited and
-    /// the SCM is catching up (an edge). The pending states end by the
-    /// service's own code finishing its start or stop. A wait to leave STOPPED
-    /// would be for an outside start, which no step makes.
-    pub fn leaving_wait_kind(self) -> WaitKind {
-        match self {
-            Observed::Running => WaitKind::Edge,
-            Observed::StartPending => WaitKind::ExternalEvent,
-            Observed::StopPending => WaitKind::ExternalEvent,
-            Observed::Stopped => WaitKind::ExternalEvent,
-        }
-    }
-}
-
 impl SettleStep {
-    /// The kind of the wait this step makes, or `None` for a step that waits
-    /// for nothing.
-    pub fn wait_kind(self) -> Option<WaitKind> {
-        match self {
-            SettleStep::Quiescent => None,
-            // The wait after an accepted Stop is for the service to exit.
-            SettleStep::SendStop => Some(WaitKind::ExternalEvent),
-            SettleStep::AwaitHeldExit => Some(WaitKind::ExternalEvent),
-            SettleStep::AwaitChange(from) => Some(from.leaving_wait_kind()),
-        }
-    }
-
-    /// The kind of the wait this step makes. Only a step that waits is asked.
-    fn expected_wait_kind(self) -> WaitKind {
-        self.wait_kind().expect("a step that waits has a wait kind")
-    }
-
     /// Whether the wait is over on a look that decides this step, once the
     /// scan has run.
     pub fn ends_the_wait(self) -> bool {
@@ -177,9 +131,9 @@ pub trait StopActor {
     /// Send `ControlService(STOP)`.
     fn control_stop(&mut self) -> io::Result<()>;
     /// Sleep until the armed notification fires.
-    fn await_callback(&mut self, kind: WaitKind) -> io::Result<()>;
+    fn await_callback(&mut self) -> io::Result<()>;
     /// Wait until every held process has exited.
-    fn await_held_exits(&mut self, kind: WaitKind) -> io::Result<()>;
+    fn await_held_exits(&mut self) -> io::Result<()>;
     /// Hold every live process that carries the service's token, other than
     /// the calling one. Does nothing where there is no service token.
     fn hold_scanned(&mut self) -> io::Result<()>;
@@ -256,7 +210,7 @@ pub fn settle_stopped<A: StopActor>(actor: &mut A) -> Result<(), SettleError> {
             SettleStep::SendStop => settle.stop(look)?,
             SettleStep::AwaitHeldExit => {
                 info!(?look, "stop wait: waiting for a process held past STOPPED");
-                settle.await_held_exits(step.expected_wait_kind())?;
+                settle.await_held_exits()?;
                 Next::Look(settle.observe()?)
             }
             SettleStep::AwaitChange(_) => settle.await_change(step)?,
@@ -293,12 +247,12 @@ impl<A: StopActor> Settle<'_, A> {
         self.actor.hold_scanned().map_err(SettleError::Scan)
     }
 
-    fn await_held_exits(&mut self, kind: WaitKind) -> Result<(), SettleError> {
-        self.actor.await_held_exits(kind).map_err(SettleError::AwaitExit)
+    fn await_held_exits(&mut self) -> Result<(), SettleError> {
+        self.actor.await_held_exits().map_err(SettleError::AwaitExit)
     }
 
-    fn await_callback(&mut self, kind: WaitKind) -> Result<(), SettleError> {
-        self.actor.await_callback(kind).map_err(SettleError::AwaitChange)
+    fn await_callback(&mut self) -> Result<(), SettleError> {
+        self.actor.await_callback().map_err(SettleError::AwaitChange)
     }
 
     /// Arm leaving `from`. `Ok(false)` means the SCM refused because the
@@ -337,10 +291,9 @@ impl<A: StopActor> Settle<'_, A> {
             info!(?again, error = %refused, "stop wait: the Stop was refused, but the service is no longer running");
             return Ok(Next::Look(again));
         }
-        let kind = SettleStep::SendStop.expected_wait_kind();
         match wait {
-            StopWait::HeldProcess => self.await_held_exits(kind)?,
-            StopWait::StatusChange if armed => self.await_callback(kind)?,
+            StopWait::HeldProcess => self.await_held_exits()?,
+            StopWait::StatusChange if armed => self.await_callback()?,
             StopWait::StatusChange => return self.without_arm(),
         }
         Ok(Next::Look(self.observe()?))
@@ -361,7 +314,7 @@ impl<A: StopActor> Settle<'_, A> {
             return Ok(Next::Look(again));
         }
         info!(?again, "stop wait: waiting for the service to leave its state");
-        self.await_callback(step.expected_wait_kind())?;
+        self.await_callback()?;
         Ok(Next::Look(self.observe()?))
     }
 
@@ -374,7 +327,7 @@ impl<A: StopActor> Settle<'_, A> {
         self.hold_scanned()?;
         let look = self.observe()?;
         if look.held_alive {
-            self.await_held_exits(SettleStep::AwaitHeldExit.expected_wait_kind())?;
+            self.await_held_exits()?;
             return Ok(Next::Look(self.observe()?));
         }
         if look.settle_step().ends_the_wait() {

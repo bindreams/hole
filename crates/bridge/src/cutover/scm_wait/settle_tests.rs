@@ -102,27 +102,6 @@ fn the_step_for_every_state_fate_and_hold() {
     }
 }
 
-/// A wait that depends on the service's own code may never end; one on a fact
-/// the kernel or the SCM already has needs nothing from the service.
-#[skuld::test]
-fn each_step_has_the_wait_kind_of_its_event() {
-    use SettleStep::{AwaitChange, AwaitHeldExit, Quiescent, SendStop};
-    let table = [
-        (Quiescent, None),
-        // The wait after an accepted Stop is for the service to exit.
-        (SendStop, Some(WaitKind::ExternalEvent)),
-        (AwaitHeldExit, Some(WaitKind::ExternalEvent)),
-        // RUNNING is left by a step only when the process is already gone and the SCM is catching up.
-        (AwaitChange(Observed::Running), Some(WaitKind::Edge)),
-        (AwaitChange(Observed::StartPending), Some(WaitKind::ExternalEvent)),
-        (AwaitChange(Observed::StopPending), Some(WaitKind::ExternalEvent)),
-        (AwaitChange(Observed::Stopped), Some(WaitKind::ExternalEvent)),
-    ];
-    for (step, want) in table {
-        assert_eq!(step.wait_kind(), want, "{step:?}");
-    }
-}
-
 #[skuld::test]
 fn only_a_stopped_service_with_nothing_alive_ends_the_wait_and_only_running_takes_a_stop() {
     use SettleStep::{AwaitChange, AwaitHeldExit, Quiescent, SendStop};
@@ -232,13 +211,13 @@ impl StopActor for Recording {
         self.stops.pop_front().flatten().map_or(Ok(()), Err)
     }
 
-    fn await_callback(&mut self, kind: WaitKind) -> io::Result<()> {
-        self.log.push(format!("await_callback({kind:?})"));
+    fn await_callback(&mut self) -> io::Result<()> {
+        self.log.push("await_callback".into());
         self.await_callback_error.take().map_or(Ok(()), Err)
     }
 
-    fn await_held_exits(&mut self, kind: WaitKind) -> io::Result<()> {
-        self.log.push(format!("await_held_exits({kind:?})"));
+    fn await_held_exits(&mut self) -> io::Result<()> {
+        self.log.push("await_held_exits".into());
         self.await_exit_error.take().map_or(Ok(()), Err)
     }
 
@@ -268,7 +247,7 @@ fn a_process_the_scan_finds_after_stopped_is_waited_out() {
             "observe",
             "hold_scanned",
             "observe",
-            "await_held_exits(ExternalEvent)",
+            "await_held_exits",
             "observe",
             "hold_scanned",
             "observe",
@@ -282,13 +261,7 @@ fn a_stopped_service_with_a_live_hold_is_waited_on_and_looked_at_again() {
     settle_stopped(&mut actor).unwrap();
     assert_eq!(
         actor.log(),
-        [
-            "observe",
-            "await_held_exits(ExternalEvent)",
-            "observe",
-            "hold_scanned",
-            "observe"
-        ]
+        ["observe", "await_held_exits", "observe", "hold_scanned", "observe"]
     );
 }
 
@@ -303,7 +276,7 @@ fn a_stop_to_a_held_process_waits_on_the_process_and_arms_nothing() {
         [
             "observe",
             "control_stop",
-            "await_held_exits(ExternalEvent)",
+            "await_held_exits",
             "observe",
             "hold_scanned",
             "observe",
@@ -325,7 +298,7 @@ fn a_stop_to_an_unheld_process_arms_before_it_is_sent() {
             "observe",
             "arm_leaving(Running)",
             "control_stop",
-            "await_callback(ExternalEvent)",
+            "await_callback",
             "observe",
             "hold_scanned",
             "observe",
@@ -341,7 +314,7 @@ fn a_service_restarted_after_the_stop_is_stopped_again() {
     settle_stopped(&mut actor).unwrap();
     assert_eq!(actor.count("control_stop"), 2);
     assert_eq!(actor.count("arm_leaving(Running)"), 2);
-    assert_eq!(actor.count("await_callback(ExternalEvent)"), 2);
+    assert_eq!(actor.count("await_callback"), 2);
 }
 
 /// The stop is refused and the service is still RUNNING over a process: the
@@ -356,8 +329,8 @@ fn a_stop_refused_by_a_service_that_stays_running_is_an_error() {
             "{first:?}: {error:?}"
         );
         assert_eq!(actor.count("control_stop"), 1, "{first:?}");
-        assert_eq!(actor.count("await_held_exits(ExternalEvent)"), 0, "{first:?}");
-        assert_eq!(actor.count("await_callback(ExternalEvent)"), 0, "{first:?}");
+        assert_eq!(actor.count("await_held_exits"), 0, "{first:?}");
+        assert_eq!(actor.count("await_callback"), 0, "{first:?}");
         // The look that decided it is a query, not a re-arm.
         let log = actor.log();
         assert_eq!(*log.last().unwrap(), "observe", "{first:?}");
@@ -384,7 +357,7 @@ fn a_stop_refused_by_a_service_that_has_left_running_is_not_an_error() {
     .stop_fails_with(vec![Some(io::Error::other("cannot accept"))]);
     settle_stopped(&mut actor).unwrap();
     assert_eq!(actor.count("control_stop"), 1);
-    assert_eq!(actor.count("await_callback(ExternalEvent)"), 1);
+    assert_eq!(actor.count("await_callback"), 1);
 }
 
 /// A look taken after the arm that is no longer the wait the arm was for means
@@ -420,7 +393,7 @@ fn a_restart_that_completed_between_the_look_and_the_arm_is_stopped_not_slept_on
             "arm_leaving(Running)",
             "observe",
             "control_stop",
-            "await_held_exits(ExternalEvent)",
+            "await_held_exits",
             "observe",
             "hold_scanned",
             "observe",
@@ -440,7 +413,7 @@ fn an_arm_followed_by_the_same_look_is_slept_on_once() {
                 "observe".to_string(),
                 format!("arm_leaving({state:?})"),
                 "observe".to_string(),
-                "await_callback(ExternalEvent)".to_string(),
+                "await_callback".to_string(),
                 "observe".to_string(),
                 "hold_scanned".to_string(),
                 "observe".to_string(),
@@ -450,10 +423,10 @@ fn an_arm_followed_by_the_same_look_is_slept_on_once() {
     }
 }
 
-/// The SCM catching up on an exit it can already see is an edge, not an event
-/// that waits on the service.
+/// The SCM catching up on an exit it can already see is waited on by its
+/// notification, once.
 #[skuld::test]
-fn the_scm_catching_up_on_an_exit_is_waited_on_as_an_edge() {
+fn the_scm_catching_up_on_an_exit_is_waited_on_by_its_notification() {
     let mut actor = Recording::new(vec![
         running_over_an_exited_process(),
         running_over_an_exited_process(),
@@ -461,8 +434,7 @@ fn the_scm_catching_up_on_an_exit_is_waited_on_as_an_edge() {
         stopped(),
     ]);
     settle_stopped(&mut actor).unwrap();
-    assert_eq!(actor.count("await_callback(Edge)"), 1);
-    assert_eq!(actor.count("await_callback(ExternalEvent)"), 0);
+    assert_eq!(actor.count("await_callback"), 1);
 }
 
 /// An arm on a service marked for deletion is refused and the handle must be
@@ -485,7 +457,7 @@ fn a_service_marked_for_deletion_is_waited_out_on_its_processes() {
             "arm_leaving(StopPending)",
             "hold_scanned",
             "observe",
-            "await_held_exits(ExternalEvent)",
+            "await_held_exits",
             "observe",
             "hold_scanned",
             "observe",
@@ -509,8 +481,8 @@ fn no_arm_is_made_after_the_scm_refused_one() {
     settle_stopped(&mut actor).unwrap();
     assert_eq!(actor.count("arm_leaving(StartPending)"), 1);
     assert_eq!(actor.count("arm_leaving(StopPending)"), 0);
-    assert_eq!(actor.count("await_callback(ExternalEvent)"), 0);
-    assert_eq!(actor.count("await_held_exits(ExternalEvent)"), 2);
+    assert_eq!(actor.count("await_callback"), 0);
+    assert_eq!(actor.count("await_held_exits"), 2);
 }
 
 /// Marked, the held process has exited and the scan finds nothing alive, but
@@ -566,8 +538,8 @@ fn a_marked_service_with_no_process_to_wait_on_fails_with_the_refusal() {
         panic!("the arm's refusal is the result: {error:?}")
     };
     assert_eq!(service_gone(refusal), Some(ServiceGone::MarkedForDeletion));
-    assert_eq!(actor.count("await_callback(ExternalEvent)"), 0);
-    assert_eq!(actor.count("await_held_exits(ExternalEvent)"), 0);
+    assert_eq!(actor.count("await_callback"), 0);
+    assert_eq!(actor.count("await_held_exits"), 0);
 }
 
 /// Marked, RUNNING over a process no hold could name: the Stop goes without an
@@ -588,7 +560,7 @@ fn a_stop_to_a_marked_unheld_service_is_sent_without_an_arm() {
             "observe",
         ]
     );
-    assert_eq!(actor.count("await_callback(ExternalEvent)"), 0);
+    assert_eq!(actor.count("await_callback"), 0);
 }
 
 #[skuld::test]
@@ -618,10 +590,10 @@ fn a_query_that_fails_ends_the_wait() {
         fn control_stop(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn await_callback(&mut self, _: WaitKind) -> io::Result<()> {
+        fn await_callback(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn await_held_exits(&mut self, _: WaitKind) -> io::Result<()> {
+        fn await_held_exits(&mut self) -> io::Result<()> {
             unreachable!()
         }
         fn hold_scanned(&mut self) -> io::Result<()> {
@@ -667,10 +639,10 @@ fn each_failing_act_is_its_own_error_variant() {
         fn control_stop(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn await_callback(&mut self, _: WaitKind) -> io::Result<()> {
+        fn await_callback(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn await_held_exits(&mut self, _: WaitKind) -> io::Result<()> {
+        fn await_held_exits(&mut self) -> io::Result<()> {
             unreachable!()
         }
         fn hold_scanned(&mut self) -> io::Result<()> {

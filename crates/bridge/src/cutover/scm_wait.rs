@@ -198,7 +198,7 @@ mod system {
 
     use super::call_error::{self, win32_code_of_hresult, ScmCall, ScmCallError};
     use super::hold::{Look, ProcessFate};
-    use super::settle::{StopActor, WaitKind};
+    use super::settle::StopActor;
     use super::{states_to_arm, Observed, WantState};
     use crate::cutover::registration::{Arming, Registration, Settle};
 
@@ -621,13 +621,11 @@ mod system {
             self.send_stop()
         }
 
-        /// The wait kind selects a failure bound once the owner sets one; until
-        /// then every wait is unbounded.
-        fn await_callback(&mut self, _kind: WaitKind) -> io::Result<()> {
+        fn await_callback(&mut self) -> io::Result<()> {
             self.wait_for_the_armed_notification().map(drop)
         }
 
-        fn await_held_exits(&mut self, _kind: WaitKind) -> io::Result<()> {
+        fn await_held_exits(&mut self) -> io::Result<()> {
             unreachable!("a look of this actor holds no process, so no step waits for one to exit")
         }
 
