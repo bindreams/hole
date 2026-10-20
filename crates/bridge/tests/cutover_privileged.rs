@@ -2471,6 +2471,61 @@ fn cutover_global_net_state_ensure_stopped_leaves_the_service_registered() {
     assert_eq!(scm_probe::Probe::open().state(), 1, "the service is STOPPED");
 }
 
+/// A stop-only retirement turns restart-on-failure off while it stops the
+/// service and must leave it as it found it. Writing a restart action back needs
+/// `SERVICE_START` on the handle, which a handle without it answers with
+/// "access denied" (a warning, so the service silently stops restarting).
+/// Read back through `QueryServiceConfig2`, not inferred from the call's result.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_ensure_stopped_leaves_the_failure_actions_as_it_found_them() {
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows_service::service::{ServiceAccess, ServiceActionType};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let _service = ProvisionedService::install_with_args(helper, pid_log_args(&pid_log));
+    // The failure actions `install` writes, by the production entry point.
+    hole_bridge::platform::os::ensure_failure_actions().expect("give the service its restart-on-failure");
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).unwrap();
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG)
+        .expect("open the service to read its configuration back");
+    let read = || {
+        (
+            service
+                .get_failure_actions()
+                .expect("QueryServiceConfig2: the failure actions"),
+            service
+                .get_failure_actions_on_non_crash_failures()
+                .expect("QueryServiceConfig2: the non-crash flag"),
+        )
+    };
+    let before = read();
+    let restarts = |actions: &windows_service::service::ServiceFailureActions| {
+        actions
+            .actions
+            .iter()
+            .flatten()
+            .any(|a| a.action_type == ServiceActionType::Restart)
+    };
+    assert!(restarts(&before.0), "the fixture restarts on failure: {before:?}");
+    assert!(before.1, "the fixture restarts on a non-crash failure: {before:?}");
+
+    hole_bridge::platform::os::ensure_stopped().expect("stop a running service");
+    left_behind::assert_none(&pid_log);
+
+    assert_eq!(read(), before, "the retirement put the failure actions back");
+}
+
 /// The helper's `--pid-log <path>` arguments.
 #[cfg(target_os = "windows")]
 fn pid_log_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {

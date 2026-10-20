@@ -225,3 +225,14 @@ fn a_real_scm_failure_is_not_an_absent_service() {
         None
     );
 }
+
+/// "If the service controller handles the SC_ACTION_RESTART action, hService
+/// must have the SERVICE_START access right" (`ChangeServiceConfig2W`): the
+/// failure actions `install` writes restart the service.
+#[skuld::test]
+fn the_handle_that_writes_restart_on_failure_can_start_the_service() {
+    assert_eq!(
+        FAILURE_ACTIONS_ACCESS,
+        ServiceAccess::CHANGE_CONFIG | ServiceAccess::START
+    );
+}

@@ -18,7 +18,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::service_processes::{has_exited, open_process, ServiceProcesses};
 use super::service_sid::ServiceSid;
-use super::{apply_failure_actions, open_error_gone, scm_failure, SERVICE_NAME};
+use super::{apply_failure_actions, open_error_gone, scm_failure, FAILURE_ACTIONS_ACCESS, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{service_gone, win32_code_of_hresult, ScmCall, ScmCallError, ServiceGone};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessSource, Reading};
 use crate::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartType, StartWrite};
@@ -49,19 +49,30 @@ pub struct RetireSession {
     processes: ServiceProcesses,
 }
 
+/// The rights the session's handle is opened with: exactly those its calls
+/// need.
+///
+/// - `QueryServiceStatusEx`: `SERVICE_QUERY_STATUS`.
+/// - `QueryServiceConfig`: `SERVICE_QUERY_CONFIG`.
+/// - `ChangeServiceConfigW`: `SERVICE_CHANGE_CONFIG`.
+/// - `ChangeServiceConfig2W`: `SERVICE_CHANGE_CONFIG`, and for the restart
+///   action the restore writes, `SERVICE_START` (the failure-actions right).
+/// - `ControlService` with a stop: `SERVICE_STOP`.
+/// - `DeleteService`: `DELETE`.
+fn session_access() -> ServiceAccess {
+    ServiceAccess::QUERY_STATUS
+        | ServiceAccess::QUERY_CONFIG
+        | ServiceAccess::STOP
+        | ServiceAccess::DELETE
+        | FAILURE_ACTIONS_ACCESS
+}
+
 impl RetireSession {
     /// Opens the session, or says why the SCM has no service to open.
     pub fn open() -> Result<Opening, Box<dyn std::error::Error>> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
-        let service = match manager.open_service(
-            SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS
-                | ServiceAccess::QUERY_CONFIG
-                | ServiceAccess::CHANGE_CONFIG
-                | ServiceAccess::STOP
-                | ServiceAccess::DELETE,
-        ) {
+        let service = match manager.open_service(SERVICE_NAME, session_access()) {
             Ok(service) => service,
             Err(e) => {
                 return match open_error_gone(&e) {

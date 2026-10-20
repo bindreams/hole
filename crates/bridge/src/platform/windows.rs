@@ -621,8 +621,15 @@ fn restart_failure_actions() -> ServiceFailureActions {
     }
 }
 
+/// The rights a handle needs for [`apply_failure_actions`]: `CHANGE_CONFIG` for
+/// `ChangeServiceConfig2W`, and `START` because the actions include a restart
+/// ([`ChangeServiceConfig2W`, `SERVICE_CONFIG_FAILURE_ACTIONS`](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w)):
+/// "If the service controller handles the SC_ACTION_RESTART action, hService
+/// must have the SERVICE_START access right."
+const FAILURE_ACTIONS_ACCESS: ServiceAccess = ServiceAccess::CHANGE_CONFIG.union(ServiceAccess::START);
+
 /// Write the restart-on-failure SCM config to an open `HoleBridge` handle (needs
-/// `CHANGE_CONFIG`): the `Restart` action plus the non-crash-failures flag (so a
+/// [`FAILURE_ACTIONS_ACCESS`]): the `Restart` action plus the non-crash-failures flag (so a
 /// graceful `Stopped(1)` from a failed bind is restarted too, while a clean
 /// `Stopped(0)` user/cutover stop is not).
 fn apply_failure_actions(service: &windows_service::service::Service) -> std::io::Result<()> {
@@ -640,7 +647,7 @@ pub fn ensure_failure_actions() -> std::io::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
     let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+        .open_service(SERVICE_NAME, FAILURE_ACTIONS_ACCESS)
         .map_err(|e| scm_failure(ScmCall::OpenService, e))?;
     apply_failure_actions(&service)
 }
