@@ -44,6 +44,7 @@ hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
 util = { path = "../util" }
 tun-engine = { path = "../tun-engine" }
+file-lock = { path = "../file-lock" }
 dump = { path = "../dump" }
 garter = { path = "../garter" }
 # Single source of truth for the BINDIR name set; the Windows update-cutover

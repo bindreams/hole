@@ -72,7 +72,7 @@ SOFTWARE.
 
 - Hole's own code (`crates/common`, `crates/bridge`, `crates/hole`,
   `crates/dump`, `crates/dump-macros`, `crates/handle-holders`,
-  `crates/tun-engine`, `crates/tun-engine-macros`, `xtask`, `xtask-lib`)
+  `crates/file-lock`, `crates/tun-engine`, `crates/tun-engine-macros`, `xtask`, `xtask-lib`)
   is licensed under GPL-3.0-or-later; see `LICENSE.md` at the repo root.
 - Ex-Galoshes code (`crates/garter`, `crates/garter-bin`,
   `crates/galoshes`) is licensed under Apache-2.0;
