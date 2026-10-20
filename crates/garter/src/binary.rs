@@ -894,7 +894,7 @@ impl PluginTree for cosca::tokio::Child {
 
     // cosca 0.3's job-object `wait_tree` future is `!Send` (it holds a raw `HANDLE` across its await), and
     // `BinaryPlugin::run` must be `Send`. Until cosca's wait is `Send` (bindreams/hole#1124), every take-down on
-    // Windows takes the fallback `drain_readers_after_exit` warns about.
+    // Windows takes the reader-wait fallback of `drain_readers_after_exit`.
     #[cfg(windows)]
     async fn wait_tree_drained(&self) -> Result<(), cosca::error::Error> {
         Err(cosca::error::Error::Unsupported {
@@ -1288,8 +1288,8 @@ async fn finish_plugin(
 /// kernel guarantees the members exit. The reader wait is bounded by [`READER_EOF_BOUND`] on every
 /// containment, because a pipe holder outside the tree (a process that left its cgroup, a handle
 /// duplicated into a process outside the job) outlives the drain. See `wait_for_readers` for what its
-/// expiry does. An edge that cannot be awaited is warned about, once per call, and the reader wait alone
-/// then orders the output.
+/// expiry does. An edge that cannot be awaited leaves the reader wait alone to order the output: a platform
+/// that cannot observe the edge at all is logged at debug, any other failure is a warning.
 pub(crate) async fn drain_readers_after_exit(
     plugin: &str,
     tree: &mut impl PluginTree,
@@ -1300,11 +1300,17 @@ pub(crate) async fn drain_readers_after_exit(
     match tree.kill_tree() {
         Ok(()) => {
             if exit_edge_proves_the_tree_gone(containment) {
-                if let Err(e) = tree.wait_tree_drained().await {
-                    tracing::warn!(
+                match tree.wait_tree_drained().await {
+                    Ok(()) => {}
+                    // A known platform gap (bindreams/hole#1124), so not worth a warning on every take-down.
+                    Err(e @ cosca::error::Error::Unsupported { .. }) => tracing::debug!(
+                        plugin = %plugin,
+                        "the plugin's process tree drain cannot be observed here ({e}); its output is waited for at most {READER_EOF_BOUND:?} instead"
+                    ),
+                    Err(e) => tracing::warn!(
                         plugin = %plugin,
                         "the plugin's process tree drain cannot be observed ({e}); its output is waited for at most {READER_EOF_BOUND:?} instead"
-                    );
+                    ),
                 }
             }
         }

@@ -283,6 +283,8 @@ struct FakeTree<K> {
     kill: Option<K>,
     edge: Arc<Notify>,
     edge_fails: bool,
+    /// What a failing edge answers; the platform gap by default.
+    edge_error: fn() -> cosca::error::Error,
     root_outlives_grace: bool,
     root_watch_fails: bool,
     root_never_exits: bool,
@@ -314,6 +316,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
             kill: Some(kill),
             edge: Arc::new(Notify::new()),
             edge_fails: false,
+            edge_error: unsupported,
             root_outlives_grace: false,
             root_watch_fails: false,
             root_never_exits: false,
@@ -419,7 +422,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
     async fn wait_tree_drained(&self) -> Result<(), cosca::error::Error> {
         self.record("wait_tree_drained");
         if self.edge_fails {
-            return Err(unsupported());
+            return Err((self.edge_error)());
         }
         self.edge.notified().await;
         Ok(())
@@ -624,10 +627,39 @@ async fn a_failed_kill_skips_the_exit_edge_and_gives_even_a_kernel_owned_join_th
     assert_eq!(*calls.lock().unwrap(), ["kill_tree"]);
 }
 
-/// An exit edge that cannot be awaited does not strand the drain: the readers still get the bound. The fallback is
-/// announced once per take-down, by plugin name, as a warning: the edge the ordering rests on was not observed.
+/// An exit edge that cannot be awaited does not strand the drain: the readers still get the bound. A platform that
+/// cannot observe the edge (bindreams/hole#1124) is logged at debug only, by plugin name: it is every take-down there.
 #[skuld::test]
 async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
+    let log = drain_with_an_edge_that_errors(unsupported).await;
+    assert_eq!(
+        edge_lines(&log, "WARN"),
+        0,
+        "a platform gap must not warn:
+{log}"
+    );
+    assert_eq!(
+        edge_lines(&log, "DEBUG"),
+        1,
+        "want one debug line naming the plugin:
+{log}"
+    );
+}
+
+/// Any other edge failure is a warning, once per take-down, by plugin name: the edge the ordering rests on was not
+/// observed on a platform that should observe it.
+#[skuld::test]
+async fn an_exit_edge_that_fails_otherwise_warns() {
+    let log = drain_with_an_edge_that_errors(|| std::io::Error::other("edge broke").into()).await;
+    assert_eq!(
+        edge_lines(&log, "WARN"),
+        1,
+        "want one warning naming the plugin:
+{log}"
+    );
+}
+
+async fn drain_with_an_edge_that_errors(error: fn() -> cosca::error::Error) -> String {
     tokio::time::pause();
     let (subscriber, writer) = subscriber();
     let _g = set_default_in_current_thread(subscriber);
@@ -635,6 +667,7 @@ async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
     let (dropped, stdout) = held_reader();
     let mut tree = FakeTree::new(Containment::CgroupV2, || Ok(()));
     tree.edge_fails = true;
+    tree.edge_error = error;
     let drain = drain_readers_after_exit("edge-plugin", &mut tree, stdout, finished_reader());
     let mut drain = pin!(drain);
 
@@ -645,12 +678,13 @@ async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
         .await
         .expect("the reader must be aborted at the bound")
         .ok();
-    let log = writer.snapshot();
-    let announced = log
-        .lines()
-        .filter(|l| l.contains("WARN") && l.contains("edge-plugin") && l.contains("drain cannot be observed"))
-        .count();
-    assert_eq!(announced, 1, "want one warning naming the plugin:\n{log}");
+    writer.snapshot()
+}
+
+fn edge_lines(log: &str, level: &str) -> usize {
+    log.lines()
+        .filter(|l| l.contains(level) && l.contains("edge-plugin") && l.contains("drain cannot be observed"))
+        .count()
 }
 
 /// A join that completes inside the bound is silent.
