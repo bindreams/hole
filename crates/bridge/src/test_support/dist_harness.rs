@@ -144,6 +144,13 @@ impl DistHarness {
         if !hole_exe.is_file() {
             return Err(HarnessError(format!("hole binary missing from dist dir: {hole_exe:?}")));
         }
+        // A truncated binary spawns as an empty script on macOS and exits 0, which surfaces as
+        // "bridge exited before binding socket" with no hint of the cause.
+        if std::fs::metadata(&hole_exe)?.len() == 0 {
+            return Err(HarnessError(format!(
+                "hole binary in dist dir is empty (truncated by a concurrent stager or build?): {hole_exe:?}"
+            )));
+        }
 
         let state_dir = new_tempdir()?;
         let log_dir = new_tempdir()?;

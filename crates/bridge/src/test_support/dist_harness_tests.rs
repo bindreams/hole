@@ -2,7 +2,7 @@
 //! covers the panic-hook log-dump path; the rest of the harness is
 //! exercised implicitly through the e2e tests that use it.
 
-use super::BridgeChildLogSource;
+use super::{BridgeChildLogSource, DistHarness};
 use hole_test_observability::panic_dump::PanicDumpSource;
 use std::path::PathBuf;
 
@@ -97,5 +97,25 @@ fn dump_harness_log_handles_missing_file() {
     assert!(
         out.contains("pid=42"),
         "missing-log diagnostic must still carry the pid"
+    );
+}
+
+/// An empty `hole` is a truncated binary: macOS runs it as an empty shell script that
+/// exits 0, which reads as "bridge exited before binding its socket". Spawn must name
+/// the real cause instead.
+#[skuld::test]
+fn spawn_refuses_an_empty_hole_binary() {
+    let dist = tempfile::tempdir().expect("tempdir");
+    let hole = dist.path().join(if cfg!(windows) { "hole.exe" } else { "hole" });
+    std::fs::write(&hole, b"").expect("write empty hole");
+
+    let err = crate::test_support::rt()
+        .block_on(DistHarness::spawn(dist.path()))
+        .err()
+        .expect("spawn must refuse an empty binary");
+
+    assert!(
+        err.0.contains("empty") && err.0.contains("hole"),
+        "expected an error naming the empty hole binary, got: {err}"
     );
 }
