@@ -68,7 +68,7 @@ fn unreadable_blocks_connect_is_true_only_for_os_record() {
     }
 }
 
-/// The cell for a read that failed with an I/O error: the bytes were never seen,
+/// The cells for a read that failed with an I/O error: the bytes were never seen,
 /// so no backup is skipped and nothing is destroyed. One row per role.
 #[skuld::test]
 fn the_io_failure_cells_are_exactly_these() {
@@ -76,14 +76,19 @@ fn the_io_failure_cells_are_exactly_these() {
     use StoreOver::{MoveAside, Refuse};
 
     let table = [
-        (Role::Decision, MoveAside, MoveRemoved),
-        (Role::OsRecord, Refuse, Keep),
-        (Role::LegacyRecord, Refuse, Keep),
-        (Role::Config, MoveAside, MoveRemoved),
+        (Role::Decision, MoveAside, MoveRemoved, false),
+        (Role::OsRecord, Refuse, Keep, true),
+        (Role::LegacyRecord, Refuse, Keep, false),
+        (Role::Config, MoveAside, MoveRemoved, false),
     ];
 
-    for (role, store, remove) in table {
+    for (role, store, remove, blocks_connect) in table {
         assert_eq!(role.on_store_io_failure(), store, "{role:?} on_store_io_failure");
         assert_eq!(role.on_remove_io_failure(), remove, "{role:?} on_remove_io_failure");
+        assert_eq!(
+            role.io_failure_blocks_connect(),
+            blocks_connect,
+            "{role:?} io_failure_blocks_connect"
+        );
     }
 }

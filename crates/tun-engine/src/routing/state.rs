@@ -308,20 +308,15 @@ pub(crate) enum Cause {
 }
 
 impl Cause {
-    /// Whether a record in this state stops the bridge from connecting. A
-    /// read that failed blocks too (owner ruling 2026-10-19): the record may
-    /// name a leak, and the next start reads it again.
+    /// Whether a record in this state stops the bridge from connecting; the
+    /// route record's role decides, for either cause.
     pub(crate) fn blocks_connect(self) -> bool {
         match self {
             Cause::CannotRead(why) => RouteState::ROLE.unreadable_blocks_connect(why),
-            Cause::ReadFailed(_) => true,
+            Cause::ReadFailed(_) => RouteState::ROLE.io_failure_blocks_connect(),
         }
     }
 }
-
-// The `ReadFailed` ruling above is the rule for an OS record; another role
-// would need its own.
-const _: () = assert!(matches!(RouteState::ROLE, Role::OsRecord));
 
 impl std::fmt::Display for Cause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

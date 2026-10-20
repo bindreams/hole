@@ -94,6 +94,18 @@ impl Role {
         }
     }
 
+    /// Whether a file of this role whose read failed with an I/O error stops the
+    /// bridge from connecting. The bytes were never seen, so the file may name
+    /// what an OS record exists to clean up; the next start reads it again.
+    pub fn io_failure_blocks_connect(self) -> bool {
+        match self {
+            Role::Decision => false,
+            Role::OsRecord => true,
+            Role::LegacyRecord => false,
+            Role::Config => false,
+        }
+    }
+
     /// Whether a file of this role that cannot be read stops the bridge from
     /// connecting.
     pub fn unreadable_blocks_connect(self, why: CannotRead) -> bool {
