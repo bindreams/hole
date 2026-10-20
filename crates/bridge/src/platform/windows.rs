@@ -230,59 +230,22 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             })
         })?;
         info!("Windows service started");
-        // First, so a bridge that is stopped or wedged in a later step has still
-        // made them. A failure never stops this start (see `run_startup_repairs`).
-        if let Err(e) = tokio::task::spawn_blocking(registration::run_startup_repairs).await {
-            warn!(error = %e, "startup repairs task panicked");
-        }
-        // DNS recovery runs first of the state recoveries; see crate::dns::recovery
-        // docs for ordering.
-        let state_dir_for_dns = state_dir.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir_for_dns)).await
-        {
-            tracing::warn!(error = %e, "recover_dns_config task panicked");
-        }
         // Root cancellation token for the SCM service, fed by the same
-        // `shutdown_rx` oneshot the control handler signals. Created before
-        // reconciliation so an SCM Stop arriving mid-boot abandons the
-        // auto-connect rather than racing it.
+        // `shutdown_rx` oneshot the control handler signals; the startup forwards
+        // the Stop to it before reconciling, so an SCM Stop arriving mid-boot
+        // abandons the auto-connect rather than racing it.
         #[allow(clippy::disallowed_methods)]
         // Service entry point — see clippy.toml's CancellationToken::new list.
         let shutdown = tokio_util::sync::CancellationToken::new();
-        {
-            let shutdown = shutdown.clone();
-            let stop_progress = std::sync::Arc::clone(&stop_progress);
-            tokio::spawn(async move {
-                service_stop::forward_stop(&stop_progress, shutdown_rx, || shutdown.cancel()).await;
-            });
-        }
-
-        crate::route_recovery::recover_and_record(&state_dir, &proxy_shutdown).await;
-        // Reconcile the persisted target now, before any GUI or client has had a
-        // chance to connect (narrows, does not close, #617's boot->first-connect
-        // gap: a failed connect engages nothing) — must run after recovery above, see
-        // crate::reconciler::reconcile_once's own doc.
-        crate::reconciler::reconcile_once(&state_dir, None, &proxy_shutdown, &shutdown).await;
-        let state_dir_for_plugins = state_dir.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_for_plugins))
-                .await
-        {
-            tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
-        }
-        // Native-crash observability (bindreams/hole#438): sweep crash
-        // markers left by a previously-crashed service bridge. Markers land
-        // in the service log dir (C:\ProgramData\hole\logs), NOT state_dir.
-        let log_dir_sweep = log_dir.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
-            tracing::warn!(error = %e, "crash sweep task panicked");
-        }
-        // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
-        // (it fails while an old process still maps the renamed inode).
-        if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
-            tracing::warn!(error = %e, "old-binary sweep task panicked");
-        }
+        registration::run_startup_steps(&mut ServiceStartup {
+            state_dir: state_dir.clone(),
+            log_dir: log_dir.clone(),
+            proxy: std::sync::Arc::clone(&proxy_shutdown),
+            shutdown: shutdown.clone(),
+            stop_progress: std::sync::Arc::clone(&stop_progress),
+            shutdown_rx: Some(shutdown_rx),
+        })
+        .await;
 
         // Capture WFP + NDIS state after recovery; see
         // `diagnostics::{wfp,ndis}`.
@@ -341,6 +304,92 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     run_result
+}
+
+/// The startup steps of the real service, taken in the order
+/// [`registration::run_startup_steps`] gives.
+struct ServiceStartup<F> {
+    state_dir: PathBuf,
+    log_dir: PathBuf,
+    proxy: std::sync::Arc<tokio::sync::Mutex<crate::proxy_manager::ProxyManager>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    stop_progress: std::sync::Arc<StopProgress<F>>,
+    /// Taken by [`forward_shutdown`](registration::StartupSteps::forward_shutdown),
+    /// which runs once.
+    shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl<F> registration::StartupSteps for ServiceStartup<F>
+where
+    F: Fn(StopPhase) -> std::io::Result<()> + Send + Sync + 'static,
+{
+    async fn repairs(&mut self) {
+        // A failure never stops this start (see `run_startup_repairs`).
+        if let Err(e) = tokio::task::spawn_blocking(registration::run_startup_repairs).await {
+            warn!(error = %e, "startup repairs task panicked");
+        }
+    }
+
+    async fn recover_dns(&mut self) {
+        // DNS recovery runs first of the state recoveries; see crate::dns::recovery
+        // docs for ordering.
+        let state_dir = self.state_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir)).await
+        {
+            tracing::warn!(error = %e, "recover_dns_config task panicked");
+        }
+    }
+
+    fn forward_shutdown(&mut self) {
+        let shutdown_rx = self
+            .shutdown_rx
+            .take()
+            .expect("the startup forwards the Stop once, so the receiver is still here");
+        let shutdown = self.shutdown.clone();
+        let stop_progress = std::sync::Arc::clone(&self.stop_progress);
+        tokio::spawn(async move {
+            service_stop::forward_stop(&stop_progress, shutdown_rx, || shutdown.cancel()).await;
+        });
+    }
+
+    async fn recover_routes(&mut self) {
+        crate::route_recovery::recover_and_record(&self.state_dir, &self.proxy).await;
+    }
+
+    async fn reconcile(&mut self) {
+        // Reconcile the persisted target now, before any GUI or client has had a
+        // chance to connect (narrows, does not close, #617's boot->first-connect
+        // gap: a failed connect engages nothing) — must run after recovery above, see
+        // crate::reconciler::reconcile_once's own doc.
+        crate::reconciler::reconcile_once(&self.state_dir, None, &self.proxy, &self.shutdown).await;
+    }
+
+    async fn reap_plugins(&mut self) {
+        let state_dir = self.state_dir.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir)).await
+        {
+            tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
+        }
+    }
+
+    async fn sweep_crash_markers(&mut self) {
+        // Native-crash observability (bindreams/hole#438): sweep crash
+        // markers left by a previously-crashed service bridge. Markers land
+        // in the service log dir (C:\ProgramData\hole\logs), NOT state_dir.
+        let log_dir = self.log_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir)).await {
+            tracing::warn!(error = %e, "crash sweep task panicked");
+        }
+    }
+
+    async fn sweep_old_binaries(&mut self) {
+        // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
+        // (it fails while an old process still maps the renamed inode).
+        if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
+            tracing::warn!(error = %e, "old-binary sweep task panicked");
+        }
+    }
 }
 
 /// The `StopPending` status reported while `phase` is in progress.
@@ -522,23 +571,39 @@ pub fn install(binary_path: &Path) -> std::io::Result<()> {
         account_password: None,
     };
 
-    let service = manager
-        .create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-        .map_err(|e| scm_failure(ScmCall::CreateService, e))?;
-
-    // The description and the service SID type (what lets an uninstall tell the
-    // service's process from a stranger that reuses its id) are required: their
-    // failure fails the install.
-    registration::configure_new_service(&service)?;
-    // Auto-restart is hardening, applied on the just-created handle (no re-open,
-    // which can race SCM propagation right after create_service). Best-effort: the
-    // service is installed regardless — failing the whole install (an MSI custom
-    // action) over the restart config would be worse than shipping without it.
-    if let Err(e) = apply_failure_actions(&service) {
-        warn!(error = %e, "could not configure SCM restart-on-failure; service installed without auto-restart");
-    }
+    registration::install_service(&mut NewService {
+        manager: &manager,
+        info: &service_info,
+    })?;
     info!("Windows service installed");
     Ok(())
+}
+
+/// The steps of [`install`] against the SCM.
+struct NewService<'a> {
+    manager: &'a ServiceManager,
+    info: &'a ServiceInfo,
+}
+
+impl registration::NewServiceSteps for NewService<'_> {
+    type Service = windows_service::service::Service;
+
+    fn create(&mut self) -> std::io::Result<Self::Service> {
+        self.manager
+            .create_service(self.info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+            .map_err(|e| scm_failure(ScmCall::CreateService, e))
+    }
+
+    /// The description and the service SID type (what lets an uninstall tell the
+    /// service's process from a stranger that reuses its id) are required: their
+    /// failure fails the install.
+    fn configure(&mut self, service: &Self::Service) -> std::io::Result<()> {
+        registration::configure_new_service(service)
+    }
+
+    fn failure_actions(&mut self, service: &Self::Service) -> std::io::Result<()> {
+        apply_failure_actions(service)
+    }
 }
 
 /// Restart-on-failure SCM actions. Fires on a crash / non-zero exit, not a
