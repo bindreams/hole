@@ -17,12 +17,14 @@ Run with admin/root privileges:
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import platform
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import _lib
@@ -41,24 +43,15 @@ DNS_STATE_FILE_NAME = "bridge-dns.json"
 DNS_STATE_SUPERSEDED_FILE_NAME = "bridge-dns.superseded.json"
 
 
-def load_dns_state_file() -> tuple[dict, Path] | None:
-    """Return the first valid parsed DNS state file found across candidate
-    state directories — checking the un-suffixed name before the superseded
-    one — plus the path it came from. Mirrors `load_state_file` but for
-    DNS."""
-    for name in (DNS_STATE_FILE_NAME, DNS_STATE_SUPERSEDED_FILE_NAME):
-        for d in candidate_state_dirs():
-            path = d / name
-            if not path.exists():
-                continue
-            try:
-                with path.open() as f:
-                    data = json.load(f)
-                print(f"  Found DNS state file at {path}")
-                return data, path
-            except (json.JSONDecodeError, OSError) as e:
-                print(f"  Skipping {path} (parse error: {e})")
-    return None
+def load_dns_state_file() -> tuple[tuple[dict, Path] | None, list[Path]]:
+    """Return the first readable DNS state file found across candidate state
+    directories — checking the un-suffixed name before the superseded one —
+    plus the path it came from, and the paths of those that exist but could
+    not be read. Mirrors `load_state_file` but for DNS."""
+    return load_first_record(
+        (d / name for name in (DNS_STATE_FILE_NAME, DNS_STATE_SUPERSEDED_FILE_NAME) for d in candidate_state_dirs()),
+        validate_dns_record,
+    )
 
 
 def _split_advertised(advertised: list[str]) -> tuple[list[str], list[str]]:
@@ -88,12 +81,11 @@ def live_dns_windows(alias: str, family: str) -> list[str] | None:
     `Get-DnsClientServerAddress`. `None` on any failure — a read failure is
     never treated as evidence of a match."""
     fam_flag = "IPv4" if family == "ipv4" else "IPv6"
-    result = run([
-        "powershell",
-        "-Command",
-        f'(Get-DnsClientServerAddress -InterfaceAlias "{alias}" -AddressFamily {fam_flag} '
+    result = powershell(
+        f"(Get-DnsClientServerAddress -InterfaceAlias $env:{ARG_ALIAS} -AddressFamily {fam_flag} "
         f"-ErrorAction SilentlyContinue).ServerAddresses -join ','",
-    ])
+        {ARG_ALIAS: alias},
+    )
     if result.returncode != 0:
         return None
     text = result.stdout.strip()
@@ -248,9 +240,22 @@ def clear_dns_state_file(path: Path) -> None:
         print(f"  Failed to remove {path}: {e}")
 
 
-def run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
-    print(f"  $ {' '.join(cmd)}")
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+def run(cmd: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run `cmd` (never through a shell), with `env` added to the environment."""
+    prefix = "".join(f"{k}={v} " for k, v in (env or {}).items())
+    print(f"  $ {prefix}{' '.join(cmd)}")
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, env={**os.environ, **(env or {})})
+
+
+# A record value reaches PowerShell as an environment variable the command reads
+# as `$env:NAME`, never spliced into the command text, so it cannot become code.
+ARG_ALIAS = "HOLE_RESET_ALIAS"
+ARG_IP = "HOLE_RESET_IP"
+
+
+def powershell(command: str, args: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run `command` in PowerShell. Pass record values in `args` (name -> value)."""
+    return run(["powershell", "-Command", command], env=args)
 
 
 def candidate_state_dirs() -> list[Path]:
@@ -270,31 +275,111 @@ def candidate_state_dirs() -> list[Path]:
     return dirs
 
 
-def load_state_file() -> tuple[dict | None, list[Path]]:
-    """Return the first valid parsed state file found across candidate
-    directories (None if there is none), and the paths of those that exist but
-    could not be read. An unreadable file is never touched: it may name a
-    route this script cannot identify."""
+def load_state_file() -> tuple[tuple[dict, Path] | None, list[Path]]:
+    """Return the first readable route state file found across candidate
+    directories (None if there is none) plus its path, and the paths of those
+    that exist but could not be read. An unreadable file is never touched: it
+    may name a route this script cannot identify."""
+    return load_first_record((d / STATE_FILE_NAME for d in candidate_state_dirs()), validate_route_record)
+
+
+# Records ==============================================================================================================
+#
+# Every state record this script reads goes through `load_first_record`. The
+# files live in directories a user can write, so a record is trusted for
+# nothing: it is readable only if it parses AND has, in every field a reset
+# step uses, the type and shape the Rust writer produces.
+
+
+def load_first_record(
+    paths: Iterable[Path], validate: Callable[[object], None]
+) -> tuple[tuple[dict, Path] | None, list[Path]]:
+    """Read, decode, parse and `validate` each path in turn. Returns the first
+    readable record with its path, and the paths that exist but could not be
+    read, which are reported and left in place. A missing path is skipped
+    silently. Any exception while reading makes a record unreadable."""
     unreadable: list[Path] = []
-    for d in candidate_state_dirs():
-        path = d / STATE_FILE_NAME
-        if not path.exists():
-            continue
+    for path in paths:
         try:
-            with path.open(encoding="utf-8") as f:
-                data = json.load(f)
-        except (ValueError, OSError) as e:  # ValueError: bad JSON or undecodable bytes
-            print(f"  Skipping {path} ({e})")
-            unreadable.append(path)
+            record = json.loads(path.read_bytes().decode("utf-8"))
+            validate(record)
+        except (FileNotFoundError, NotADirectoryError):
             continue
-        # The reset steps below use `server_ip` as a string.
-        if not isinstance(data, dict) or not isinstance(data.get("server_ip"), str):
-            print(f"  Skipping {path} (not a JSON object with a string server_ip)")
+        except Exception as e:  # noqa: BLE001 - whatever the record does to us, it is unreadable
+            print(f"  Skipping {path} ({type(e).__name__}: {e})")
             unreadable.append(path)
             continue
         print(f"  Found state file at {path}")
-        return data, unreadable
+        return (record, path), unreadable
     return None, unreadable
+
+
+def _text(value: object, what: str) -> str:
+    """A string that can be passed as a process argument."""
+    if not isinstance(value, str):
+        raise TypeError(f"{what} is not a string")
+    if "\0" in value:
+        raise ValueError(f"{what} contains a NUL")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{what} is not valid Unicode") from None
+    return value
+
+
+def _ip_text(value: object, what: str) -> str:
+    """An IP address in the canonical text form the Rust writer emits (so no
+    scope id, whitespace or empty string)."""
+    text = _text(value, what)
+    if "%" in text:  # a scope id: Python parses it, Rust does not
+        raise ValueError(f"{what} carries a scope id")
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        raise ValueError(f"{what} is not an IP address") from None
+    canonical = {str(ip)}
+    # Rust prints an IPv4-mapped address dotted; Python before 3.13 prints it as hex.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        canonical.add(f"::ffff:{ip.ipv4_mapped}")
+    if text not in canonical:
+        raise ValueError(f"{what} is not in canonical form")
+    return text
+
+
+def _object(value: object, what: str) -> dict:
+    if not isinstance(value, dict):
+        raise TypeError(f"{what} is not a JSON object")
+    return value
+
+
+def _list(value: object, what: str) -> list:
+    if not isinstance(value, list):
+        raise TypeError(f"{what} is not a JSON array")
+    return value
+
+
+def validate_route_record(record: object) -> None:
+    """The reset steps use `server_ip`, as an address."""
+    _ip_text(_object(record, "record").get("server_ip"), "server_ip")
+
+
+def validate_dns_record(record: object) -> None:
+    """The restore steps use `advertised` (optional) and, per adapter, `id`
+    and the `v4`/`v6` priors."""
+    record = _object(record, "record")
+    for ip in _list(record.get("advertised", []), "advertised"):
+        _ip_text(ip, "advertised entry")
+    for adapter in _list(record.get("adapters"), "adapters"):
+        adapter = _object(adapter, "adapter")
+        id_obj = _object(adapter.get("id"), "adapter id")
+        _text(id_obj.get("kind"), "adapter id kind")
+        _text(id_obj.get("value"), "adapter id value")
+        for field in ("v4", "v6"):
+            prior = _object(adapter.get(field), f"adapter {field}")
+            kind = _text(prior.get("kind"), f"adapter {field} kind")
+            if kind == "static":
+                for ip in _list(prior.get("servers"), f"adapter {field} servers"):
+                    _ip_text(ip, f"adapter {field} server")
 
 
 def reset_macos(state: dict | None) -> None:
@@ -305,11 +390,11 @@ def reset_macos(state: dict | None) -> None:
     run(["route", "-n", "delete", "-inet6", "8000::/1"])
 
     if state is not None:
-        server_ip = state.get("server_ip", "")
+        server_ip = state["server_ip"]
         if ":" in server_ip:
             print(f"Removing IPv6 bypass route for {server_ip}...")
             run(["route", "-n", "delete", "-inet6", "-host", server_ip])
-        elif server_ip:
+        else:
             print(f"Removing IPv4 bypass route for {server_ip}...")
             run(["route", "-n", "delete", "-host", server_ip])
     else:
@@ -346,21 +431,14 @@ def reset_windows(state: dict | None) -> None:
         ])
 
     if state is not None:
-        server_ip = state.get("server_ip", "")
-        if ":" in server_ip:
-            print(f"Removing IPv6 bypass route for {server_ip}...")
-            run([
-                "powershell",
-                "-Command",
-                f'Remove-NetRoute -DestinationPrefix "{server_ip}/128" -Confirm:$false -ErrorAction SilentlyContinue',
-            ])
-        elif server_ip:
-            print(f"Removing IPv4 bypass route for {server_ip}...")
-            run([
-                "powershell",
-                "-Command",
-                f'Remove-NetRoute -DestinationPrefix "{server_ip}/32" -Confirm:$false -ErrorAction SilentlyContinue',
-            ])
+        server_ip = state["server_ip"]
+        family, prefix_len = ("IPv6", 128) if ":" in server_ip else ("IPv4", 32)
+        print(f"Removing {family} bypass route for {server_ip}...")
+        powershell(
+            f"Remove-NetRoute -DestinationPrefix ($env:{ARG_IP} + '/{prefix_len}') "
+            f"-Confirm:$false -ErrorAction SilentlyContinue",
+            {ARG_IP: server_ip},
+        )
     else:
         print(
             "  No readable state file — cannot identify per-server bypass route. "
@@ -436,13 +514,16 @@ def main() -> None:
     _lib.require_elevation()
 
     print("Looking for route-state file...")
-    state, unreadable = load_state_file()
+    found, unreadable = load_state_file()
+    state = found[0] if found else None
     for path in unreadable:
         print(f"  The route record at {path} exists but could not be read; it was left in place.")
     print()
 
     print("Looking for DNS-state file...")
-    dns_state_and_path = load_dns_state_file()
+    dns_state_and_path, dns_unreadable = load_dns_state_file()
+    for path in dns_unreadable:
+        print(f"  The DNS record at {path} exists but could not be read; it was left in place.")
     print()
 
     system = platform.system()
