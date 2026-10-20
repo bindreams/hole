@@ -1438,6 +1438,85 @@ async fn sitrep_parser_sees_the_line_before_any_ansi_strip() {
     chain_task.abort();
 }
 
+// A shutdown before ready is not a start failure ======================================================================
+
+/// A chain shut down while its plugin has not said `ready` ends `Ok`, and the caller of `on_ready` hears nothing: the
+/// plugin's stdout closing is the shutdown's doing, not a start failure. Every readiness mode, with a plugin that is
+/// silent on stdout and with one that has said `hello` and then holds.
+#[skuld::test]
+async fn a_shutdown_before_ready_is_not_a_start_failure() {
+    use garter::binary::ReadinessMode;
+
+    let mut wrong = Vec::new();
+    for (mode, sitrep) in [
+        (ReadinessMode::ExpectSitrep, false),
+        (ReadinessMode::ExpectSitrep, true),
+        (ReadinessMode::Auto, false),
+        (ReadinessMode::Auto, true),
+        (ReadinessMode::Probe, false),
+        (ReadinessMode::Probe, true),
+    ] {
+        let label = format!("{mode:?}, hello={sitrep}");
+        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let chain_local = chain_listener.local_addr().unwrap();
+        drop(chain_listener);
+
+        // The shutdown comes once the plugin is in the state the row names: spawned, or (with a handshake) its
+        // `hello` read.
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let reached_tx = Arc::new(Mutex::new(Some(reached_tx)));
+        let signal = move || {
+            if let Some(tx) = reached_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        };
+        let plugin = BinaryPlugin::new(mock_plugin_path(), None)
+            .readiness(mode)
+            .env("MOCK_PLUGIN_HOLD_BEFORE_READY", "1");
+        let plugin = if sitrep {
+            plugin.log_sink(Arc::new(move |_line: &str| signal()))
+        } else {
+            plugin
+                .pid_sink(Arc::new(move |_pid| signal()))
+                .env("MOCK_PLUGIN_NO_SITREP", "1")
+        };
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let runner = ChainRunner::new()
+            .add(Box::new(plugin))
+            .on_ready(ready_tx)
+            .cancel_token(cancel.clone())
+            .drain_timeout(Duration::from_secs(30));
+        let env = PluginEnv {
+            local_host: chain_local.ip(),
+            local_port: chain_local.port(),
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 9,
+            plugin_options: None,
+        };
+        let chain = tokio::spawn(async move { runner.run(env).await });
+
+        reached_rx.await.expect("the plugin reached the state of the row");
+        cancel.cancel();
+        let run = chain.await.expect("the chain task ended");
+        let heard = ready_rx.await;
+
+        if !(run.is_ok() && heard.is_err()) {
+            wrong.push(format!("{label}: run = {run:?}, on_ready = {heard:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} rows are wrong:
+{}",
+        wrong.len(),
+        wrong.join(
+            "
+"
+        )
+    );
+}
+
 fn main() {
     skuld::run_all();
 }

@@ -85,10 +85,10 @@ pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A plugin backed by an external SIP003u binary.
 ///
-/// In the sitrep readiness modes a start failure the plugin reports (or closing its sitrep stream before `ready`)
-/// takes the plugin down and makes [`run`](ChainPlugin::run) return an error however the plugin then ends, even
-/// with exit status 0. The failure itself reaches the chain's readiness channel once the plugin's output has been
-/// drained.
+/// In the sitrep readiness modes a start failure the plugin reports (or closing its sitrep stream before `ready`,
+/// unless the chain's shutdown was already requested) takes the plugin down and makes [`run`](ChainPlugin::run)
+/// return an error however the plugin then ends, even with exit status 0. The failure itself reaches the chain's
+/// readiness channel once the plugin's output has been drained. A shutdown before `ready` is not a start failure.
 pub struct BinaryPlugin {
     path: PathBuf,
     options: Option<String>,
@@ -606,8 +606,9 @@ pub(crate) fn spawn_sitrep_stdout_reader(
             }
         }
         // Stdout is closed. Where this reader is the only readiness source, nothing can ready the
-        // plugin any more; a probe that owns readiness decides for itself.
-        if !probe_owns_readiness {
+        // plugin any more; a probe that owns readiness decides for itself. A stdout that closes under a
+        // requested shutdown is the shutdown's doing, not a start failure.
+        if !probe_owns_readiness && !shutdown.is_cancelled() {
             let error = StartError::Fatal {
                 detail: "plugin closed its sitrep stream before becoming ready".into(),
                 errno: None,

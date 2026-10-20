@@ -774,6 +774,72 @@ async fn at_sitrep_stdout_eof_without_ready_the_plugin_is_taken_down_and_the_fai
     }
 }
 
+/// A stdout that closes because the chain is shutting down is the shutdown's doing: the reader decides nothing, so
+/// the plugin is not taken down as a failed start, no failure is held, and the readiness sender drops unsent. The
+/// shutdown lands before the reader reaches the end of stdout, which a plugin only closes once it is told to go.
+#[skuld::test]
+async fn a_stdout_that_closes_under_a_requested_shutdown_is_not_a_start_failure() {
+    tokio::time::pause();
+    for (lines, auto) in [
+        (String::new(), false),
+        (hello(SITREP_PROTOCOL), false),
+        (hello(SITREP_PROTOCOL), true),
+    ] {
+        let freed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (mut plugin_stdout, host_stdout) = tokio::io::duplex(4096);
+        plugin_stdout.write_all(lines.as_bytes()).await.unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        let (reader, failure) =
+            spawn_sitrep_stdout_reader(host_stdout, "p".into(), freed, shutdown.clone(), ready_tx, auto, None);
+
+        shutdown.cancel();
+        drop(plugin_stdout);
+        tokio::time::timeout(VIRTUAL_HANG, reader)
+            .await
+            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the reader never ended"))
+            .unwrap();
+
+        assert!(
+            !failure.deliver(),
+            "auto={auto}, {lines:?}: the reader held a start failure"
+        );
+        let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx)
+            .await
+            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the readiness sender was kept"));
+        assert!(ready.is_err(), "auto={auto}, {lines:?}: the caller was told {ready:?}");
+    }
+}
+
+/// The other order: a stdout that closed before any shutdown was requested is a start failure the reader decided,
+/// and a shutdown that follows does not take it back.
+#[skuld::test]
+async fn a_stdout_that_closed_before_a_shutdown_stays_a_start_failure() {
+    tokio::time::pause();
+    for (lines, auto) in [
+        (String::new(), false),
+        (hello(SITREP_PROTOCOL), false),
+        (hello(SITREP_PROTOCOL), true),
+    ] {
+        let (ready_rx, reader, shutdown, failure) = sitrep_reader_over(&lines, auto).await;
+        tokio::time::timeout(VIRTUAL_HANG, reader)
+            .await
+            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the reader never ended"))
+            .unwrap();
+        shutdown.cancel();
+
+        assert!(failure.deliver(), "auto={auto}, {lines:?}: the failure was dropped");
+        let ready = ready_rx.await;
+        assert!(
+            matches!(&ready, Ok(Err(StartError::Fatal { .. }))),
+            "auto={auto}, {lines:?}: {ready:?}"
+        );
+    }
+}
+
 /// Where a probe owns readiness (`Auto` with no supported hello, or after an unknown-major
 /// fallback), closed stdout says nothing about the plugin's listener: the probe decides.
 #[skuld::test]
