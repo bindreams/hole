@@ -711,6 +711,49 @@ async fn a_public_bind_conflict_is_reported_and_the_inner_is_not_restarted() {
     drop(holder);
 }
 
+/// The public bind goes through the one bind classifier: a port race is the retryable `BindConflict` (errno 0 when the
+/// error has none), and any other failure is a `Fatal` that keeps the errno, because retrying it cannot succeed.
+#[skuld::test]
+async fn a_public_bind_failure_is_typed_by_the_bind_race_rule() {
+    let public: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+    for (error, conflict) in [
+        (io::Error::from(io::ErrorKind::AddrInUse), true),
+        (io::Error::from(io::ErrorKind::PermissionDenied), true),
+        (io::Error::from(io::ErrorKind::AddrNotAvailable), true),
+        (io::Error::from(io::ErrorKind::InvalidInput), false),
+        (io::Error::other("scripted bind failure"), false),
+        // 22 is no port-race errno on either family of OS: EINVAL, and an uncategorized Windows code.
+        (io::Error::from_raw_os_error(22), false),
+    ] {
+        let case = format!("{error:?}");
+        let errno = error.raw_os_error();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let tap = TapPlugin::wrap_with_bind_failure(Box::new(CountingStub { runs: runs.clone() }), error);
+
+        let (ready, result) = failed_start_of(tap, public, unused_remote()).await;
+
+        let reported = ready.expect("the start failure is reported, not dropped").unwrap_err();
+        match (conflict, &reported) {
+            (true, StartError::BindConflict { addr, errno: got }) => {
+                assert_eq!((*addr, *got), (public, errno.unwrap_or(0)), "{case}");
+            }
+            (false, StartError::Fatal { errno: got, detail }) => {
+                assert_eq!(*got, errno, "{case}");
+                assert!(
+                    detail.contains("4242"),
+                    "{case}: the detail names the address: {detail}"
+                );
+            }
+            _ => panic!(
+                "{case}: want {}, got {reported:?}",
+                if conflict { "BindConflict" } else { "Fatal" }
+            ),
+        }
+        assert!(result.is_err(), "{case}: run must fail, got {result:?}");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "{case}: the inner had started");
+    }
+}
+
 #[skuld::test]
 async fn a_typed_bind_conflict_from_the_inner_is_reported_not_swallowed() {
     let reported = Arc::new(Mutex::new(None));

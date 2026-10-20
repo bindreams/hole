@@ -61,6 +61,8 @@
 //!    public bind happens only once the data plane is actually wired
 //!    through), then report the tap's OWN readiness on the `ready` channel
 //!    passed to [`ChainPlugin::run`] — the chain awaits that before it starts the next hop.
+//!    A failed bind is typed by [`StartError::from_bind_failure`]: a port race is the retryable
+//!    `BindConflict`, any other failure is `Fatal`.
 //! 5. Accept loop in a `JoinSet`; per-connection forwarder calls
 //!    `tokio::io::copy_bidirectional` with [`CountingStream`] wrappers. A forwarder
 //!    retries a refused connect to the inner until it connects, hits another
@@ -142,6 +144,9 @@ pub struct TapPlugin {
     /// Fails the accept loop's first accept, as the OS does on fd exhaustion.
     #[cfg(test)]
     accept_failure: Mutex<Option<io::Error>>,
+    /// Replaces the public bind with this failure, as the OS refuses a bind for reasons a test cannot arrange.
+    #[cfg(test)]
+    bind_failure: Mutex<Option<io::Error>>,
 }
 
 /// Opens a forwarder's connection to the inner.
@@ -162,6 +167,8 @@ impl TapPlugin {
             connector: Mutex::new(None),
             #[cfg(test)]
             accept_failure: Mutex::new(None),
+            #[cfg(test)]
+            bind_failure: Mutex::new(None),
         }
     }
 
@@ -169,6 +176,14 @@ impl TapPlugin {
     fn take_accept_failure(&self) -> Option<io::Error> {
         #[cfg(test)]
         return self.accept_failure.lock().unwrap().take();
+        #[cfg(not(test))]
+        None
+    }
+
+    /// The public-bind failure a test scripted, if any.
+    fn take_bind_failure(&self) -> Option<io::Error> {
+        #[cfg(test)]
+        return self.bind_failure.lock().unwrap().take();
         #[cfg(not(test))]
         None
     }
@@ -207,6 +222,14 @@ impl TapPlugin {
     }
 
     #[cfg(test)]
+    pub(crate) fn wrap_with_bind_failure(inner: Box<dyn ChainPlugin>, failure: io::Error) -> Self {
+        Self {
+            bind_failure: Mutex::new(Some(failure)),
+            ..Self::wrap(inner)
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn wrap_with_accept_failure(inner: Box<dyn ChainPlugin>, failure: io::Error) -> Self {
         Self {
             accept_failure: Mutex::new(Some(failure)),
@@ -236,6 +259,7 @@ impl ChainPlugin for TapPlugin {
         let probe = self.take_probe().unwrap_or_else(|| os_probe(local.ip()));
         let connector = self.take_connector();
         let mut scripted_accept_failure = self.take_accept_failure();
+        let scripted_bind_failure = self.take_bind_failure();
         let inner_local = match pick_with(
             &plugin_name,
             local.ip(),
@@ -350,16 +374,15 @@ impl ChainPlugin for TapPlugin {
         };
 
         // 4. Bind the public-facing tap listener.
-        let listener = match TcpListener::bind(local).await {
+        let bound = match scripted_bind_failure {
+            Some(failure) => Err(failure),
+            None => TcpListener::bind(local).await,
+        };
+        let listener = match bound {
             Ok(l) => l,
             Err(e) => {
                 stop_inner(&plugin_name, &inner_stop, inner_handle).await;
-                let _ = ready.send(Err(StartError::BindConflict {
-                    // `BindConflict.errno` is a raw OS error (0 if unknown,
-                    // per sitrep); `io::Error::raw_os_error` is `Option<i32>`.
-                    errno: e.raw_os_error().unwrap_or(0),
-                    addr: local,
-                }));
+                let _ = ready.send(Err(StartError::from_bind_failure(&e, local)));
                 return Err(crate::Error::Chain(format!("tap[{plugin_name}]: bind {local}: {e}")));
             }
         };
