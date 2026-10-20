@@ -29,6 +29,14 @@ pub trait ChainPlugin: Send {
     ///   or exited early), dropping `ready` unsent signals the runner to
     ///   synthesize a process-exit failure. Send readiness BEFORE the
     ///   long-lived accept loop, not as the return value.
+    ///
+    /// A start failure (an `Err` sent on `ready`, or `ready` dropped unsent)
+    /// ends the chain. [`ChainRunner`](crate::ChainRunner) cancels `shutdown`
+    /// at once, so a plugin that reports a failure must then return rather
+    /// than keep running. It reports the failure to the caller only after
+    /// every plugin's `run` has returned, so output a plugin relays while it
+    /// stops precedes the report; a plugin that ignores `shutdown` is waited
+    /// for at most [`drain_timeout`](crate::ChainRunner::drain_timeout).
     async fn run(
         self: Box<Self>,
         local: SocketAddr,
