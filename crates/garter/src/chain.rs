@@ -6,6 +6,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::backoff::Backoff;
 use crate::plugin::ChainPlugin;
 use crate::shutdown;
 use crate::sitrep::{PluginReady, StartError, Transports};
@@ -492,17 +493,14 @@ pub(crate) fn record_exit(
     }
 }
 
-/// Poll a TCP address with exponential backoff until it accepts a connection.
-/// Returns `None` if shutdown fires before the address is ready.
+/// Poll a TCP address with exponential backoff (10ms doubling to 1s) until it
+/// accepts a connection. Returns `None` if shutdown fires before the address is
+/// ready.
 ///
 /// Each connect attempt races against the shutdown token so that a
 /// cancellation during an OS-level TCP timeout is not delayed.
-///
-/// `pub(crate)` so the [`crate::tap`] module can reuse the same backoff
-/// schedule when waiting for the inner plugin to bind.
 pub(crate) async fn poll_ready(addr: SocketAddr, shutdown: CancellationToken) -> Option<SocketAddr> {
-    let mut delay = Duration::from_millis(10);
-    let max_delay = Duration::from_secs(1);
+    let mut backoff = Backoff::new(Duration::from_millis(10), Duration::from_secs(1));
 
     loop {
         tokio::select! {
@@ -514,11 +512,8 @@ pub(crate) async fn poll_ready(addr: SocketAddr, shutdown: CancellationToken) ->
             () = shutdown.cancelled() => return None,
         }
 
-        tokio::select! {
-            () = tokio::time::sleep(delay) => {
-                delay = (delay * 2).min(max_delay);
-            }
-            () = shutdown.cancelled() => return None,
+        if !backoff.pause(&shutdown).await {
+            return None;
         }
     }
 }

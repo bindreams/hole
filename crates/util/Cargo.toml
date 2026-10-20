@@ -15,7 +15,14 @@ harness = false
 [dependencies]
 bitflags = { workspace = true }
 # `parse_error`: classifying a parse failure needs the error type it classifies.
-serde_json = { workspace = true }
+# `raw_value`: `versioned_file` reads the `version` token's text, because a
+# float cannot tell `18446744073709551616` from `1e20`.
+serde_json = { workspace = true, features = ["raw_value"] }
+# `versioned_file`: schema chain decoding, plus the atomic temp-file write and
+# the typed errors around it.
+serde = { workspace = true }
+tempfile = "3"
+thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 tracing = "0.1"
 # Redaction registry: lock-free snapshot reads so no logging call can block
@@ -27,7 +34,9 @@ aho-corasick = "1"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_SystemInformation"] }
+# `Win32_Foundation`, `Win32_Storage_FileSystem`: `versioned_file`'s POSIX-semantics
+# replace (with its `MoveFileExW` fallback) and no-clobber rename.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
@@ -41,5 +50,6 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # `retry_tests` uses `tokio::time::pause()` to auto-advance the mock clock
 # instead of burning wall-clock seconds on exponential backoff.
 tokio = { version = "1", features = ["test-util"] }
-# `parse_error_tests` derives `Deserialize` on its probe struct.
-serde = { workspace = true }
+# `versioned_file`'s compile-fail fixtures pin that a gap in a migration chain
+# does not build.
+trybuild = { workspace = true }

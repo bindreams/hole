@@ -1,0 +1,723 @@
+use std::cell::RefCell;
+use std::io;
+use std::path::Path;
+
+use super::{DefaultPlacement, Placement, Removal, StoreError, VersionedFile};
+use crate::versioned_file::fixtures::{
+    dir, names, put, unreadable_bytes, ConfigFile, DecisionFile, DroppedFile, LegacyRecordFile, NotAnObject, NoteV3,
+    OsRecordFile, OwnsVersionKey, TopEnum, Wide, WithFloat,
+};
+use crate::versioned_file::{CannotRead, Loaded, VersionedState};
+
+const BOTH: [CannotRead; 2] = [CannotRead::Newer, CannotRead::Corrupt];
+
+fn plain() -> DefaultPlacement {
+    DefaultPlacement::default()
+}
+
+fn note() -> NoteV3 {
+    NoteV3 {
+        title: "t".to_string(),
+        tags: vec!["a".to_string()],
+        pinned: true,
+    }
+}
+
+/// Puts an unreadable file for `S` in `dir` and returns its bytes.
+fn put_unreadable<S: VersionedState>(dir: &tempfile::TempDir, cause: CannotRead) -> &'static [u8] {
+    let bytes = unreadable_bytes(cause);
+    put(dir, S::FILE_NAME, bytes);
+    bytes
+}
+
+fn read(dir: &tempfile::TempDir, name: &str) -> Vec<u8> {
+    std::fs::read(dir.path().join(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+// What is written =====================================================================================================
+
+#[skuld::test]
+fn store_writes_a_flat_object_with_the_version_first() {
+    let dir = dir();
+    VersionedFile::<NoteV3>::new(dir.path())
+        .store(&note(), &plain())
+        .unwrap();
+
+    let text = String::from_utf8(read(&dir, "note.json")).unwrap();
+    assert!(text.starts_with("{\n  \"version\": 3,\n"), "{text}");
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        parsed,
+        serde_json::json!({"version": 3, "title": "t", "tags": ["a"], "pinned": true})
+    );
+    assert_eq!(names(&dir), ["note.json"], "no temp file may stay behind");
+}
+
+#[skuld::test]
+fn store_then_load_round_trips() {
+    let dir = dir();
+    let file = VersionedFile::<NoteV3>::new(dir.path());
+    file.store(&note(), &plain()).unwrap();
+    match file.load() {
+        Loaded::Current { value, found } => {
+            assert_eq!(found, 3);
+            assert_eq!(value, note());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[skuld::test]
+fn store_creates_a_missing_directory() {
+    let dir = dir();
+    let nested = dir.path().join("a").join("b");
+    VersionedFile::<NoteV3>::new(&nested).store(&note(), &plain()).unwrap();
+    assert!(nested.join("note.json").is_file());
+}
+
+#[skuld::test]
+fn payload_with_a_version_key_is_refused_by_store() {
+    let dir = dir();
+    let file = VersionedFile::<OwnsVersionKey>::new(dir.path());
+    let err = file.store(&OwnsVersionKey { version: 7 }, &plain()).unwrap_err();
+    assert!(matches!(err, StoreError::Encode(_)), "{err:?}");
+    assert!(names(&dir).is_empty(), "nothing may be written: {:?}", names(&dir));
+}
+
+#[skuld::test]
+fn a_payload_that_is_not_an_object_is_refused_by_store() {
+    let dir = dir();
+    let err = VersionedFile::<NotAnObject>::new(dir.path())
+        .store(&NotAnObject(vec![1]), &plain())
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Encode(_)), "{err:?}");
+    assert!(names(&dir).is_empty());
+}
+
+/// `store` returns `Ok` only for a file its own `load` reads back.
+#[skuld::test]
+fn a_payload_that_would_read_back_corrupt_is_refused_and_leaves_the_file_alone() {
+    let dir = dir();
+    let old = br#"{"version":1,"x":1.5}"#;
+    put(&dir, "with-float.json", old);
+    let file = VersionedFile::<WithFloat>::new(dir.path());
+    for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let err = file.store(&WithFloat { x }, &plain()).unwrap_err();
+        assert!(matches!(err, StoreError::Encode(_)), "{x}: {err:?}");
+        assert_eq!(read(&dir, "with-float.json"), old, "{x}");
+    }
+
+    let tagged = VersionedFile::<TopEnum>::new(dir.path());
+    let err = tagged
+        .store(&TopEnum::Tagged { label: "l".into() }, &plain())
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Encode(_)), "{err:?}");
+    assert!(
+        matches!(tagged.load(), Loaded::Absent),
+        "nothing may be written for a payload that cannot be read back"
+    );
+    assert_eq!(names(&dir), ["with-float.json"]);
+}
+
+#[skuld::test]
+fn an_integer_wider_than_u64_is_stored_and_read_back() {
+    let dir = dir();
+    let file = VersionedFile::<Wide>::new(dir.path());
+    file.store(&Wide { n: u128::MAX }, &plain()).unwrap();
+    match file.load() {
+        Loaded::Current { value, .. } => assert_eq!(value, Wide { n: u128::MAX }),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[skuld::test]
+fn a_refusal_to_encode_logs_the_category_and_never_the_value() {
+    use garter::test_utils::WaitableWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+
+    let writer = WaitableWriter::new();
+    let _guard = set_default_in_current_thread(
+        tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let dir = dir();
+    let _ = VersionedFile::<OwnsVersionKey>::new(dir.path()).store(&OwnsVersionKey { version: 424_242 }, &plain());
+
+    let log = writer.snapshot();
+    assert!(log.contains("data error"), "the category: {log}");
+    assert!(!log.contains("424242"), "a value: {log}");
+}
+
+#[skuld::test]
+fn a_refused_payload_leaves_an_existing_file_alone() {
+    let dir = dir();
+    let bytes = br#"{"version":1,"version_":0}"#;
+    put(&dir, "owns-version.json", bytes);
+    let _ = VersionedFile::<OwnsVersionKey>::new(dir.path()).store(&OwnsVersionKey { version: 7 }, &plain());
+    assert_eq!(read(&dir, "owns-version.json"), bytes);
+}
+
+// Older and obsolete files are ordinary ===============================================================================
+
+#[skuld::test]
+fn older_file_is_overwritten_by_store() {
+    let dir = dir();
+    put(&dir, "note.json", br#"{"version":1,"title":"old"}"#);
+    let file = VersionedFile::<NoteV3>::new(dir.path());
+    file.store(&note(), &plain()).unwrap();
+    assert!(matches!(file.load(), Loaded::Current { found: 3, .. }));
+    assert_eq!(names(&dir), ["note.json"], "an older file is not worth a backup");
+}
+
+#[skuld::test]
+fn obsolete_file_is_overwritten_by_store() {
+    let dir = dir();
+    put(&dir, "dropped.json", br#"{"version":1,"value":7}"#);
+    let file = VersionedFile::<DroppedFile>::new(dir.path());
+    file.store(&DroppedFile { value: 8 }, &plain()).unwrap();
+    assert!(matches!(
+        file.load(),
+        Loaded::Current {
+            found: 2,
+            value: DroppedFile { value: 8 }
+        }
+    ));
+    assert_eq!(names(&dir), ["dropped.json"]);
+}
+
+// A file that cannot be read, per role ================================================================================
+
+#[skuld::test]
+fn decision_store_moves_aside_then_writes() {
+    for cause in BOTH {
+        let dir = dir();
+        let original = put_unreadable::<DecisionFile>(&dir, cause);
+        let file = VersionedFile::<DecisionFile>::new(dir.path());
+
+        file.store(
+            &DecisionFile {
+                value: "new".to_string(),
+            },
+            &plain(),
+        )
+        .unwrap();
+
+        assert_eq!(read(&dir, "decision.json.unreadable.bak"), original, "{cause:?}");
+        match file.load() {
+            Loaded::Current { value, .. } => assert_eq!(value.value, "new"),
+            other => panic!("{cause:?}: {other:?}"),
+        }
+        assert_eq!(
+            names(&dir),
+            ["decision.json", "decision.json.unreadable.bak"],
+            "{cause:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn os_record_store_and_remove_leave_the_bytes_untouched() {
+    for cause in BOTH {
+        let dir = dir();
+        let original = put_unreadable::<OsRecordFile>(&dir, cause);
+        let file = VersionedFile::<OsRecordFile>::new(dir.path());
+
+        let err = file
+            .store(
+                &OsRecordFile {
+                    value: "new".to_string(),
+                },
+                &plain(),
+            )
+            .unwrap_err();
+        match &err {
+            StoreError::Unreadable { path, cause: got } => {
+                assert_eq!(path, file.path(), "{cause:?}");
+                assert_eq!(*got, cause);
+            }
+            other => panic!("{cause:?}: {other:?}"),
+        }
+        assert!(
+            err.to_string().contains(&file.path().display().to_string()),
+            "the message must name the path: {err}"
+        );
+        assert_eq!(file.remove().unwrap(), Removal::Kept, "{cause:?}");
+
+        assert_eq!(read(&dir, "os-record.json"), original, "{cause:?}");
+        assert_eq!(names(&dir), ["os-record.json"], "{cause:?}");
+    }
+}
+
+#[skuld::test]
+fn legacy_record_store_and_remove_leave_the_bytes_untouched() {
+    for cause in BOTH {
+        let dir = dir();
+        let original = put_unreadable::<LegacyRecordFile>(&dir, cause);
+        let file = VersionedFile::<LegacyRecordFile>::new(dir.path());
+
+        let err = file
+            .store(
+                &LegacyRecordFile {
+                    value: "new".to_string(),
+                },
+                &plain(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unreadable { .. }), "{cause:?}: {err:?}");
+        assert_eq!(file.remove().unwrap(), Removal::Kept, "{cause:?}");
+
+        assert_eq!(read(&dir, "legacy-record.json"), original, "{cause:?}");
+        assert_eq!(names(&dir), ["legacy-record.json"], "{cause:?}");
+    }
+}
+
+#[skuld::test]
+fn config_newer_store_is_refused() {
+    let dir = dir();
+    let original = put_unreadable::<ConfigFile>(&dir, CannotRead::Newer);
+    let file = VersionedFile::<ConfigFile>::new(dir.path());
+
+    let err = file
+        .store(
+            &ConfigFile {
+                value: "new".to_string(),
+            },
+            &plain(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Unreadable {
+                cause: CannotRead::Newer,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(read(&dir, "config.json"), original);
+    assert_eq!(names(&dir), ["config.json"]);
+}
+
+#[skuld::test]
+fn config_corrupt_store_overwrites_as_today() {
+    let dir = dir();
+    put_unreadable::<ConfigFile>(&dir, CannotRead::Corrupt);
+    let file = VersionedFile::<ConfigFile>::new(dir.path());
+
+    file.store(
+        &ConfigFile {
+            value: "new".to_string(),
+        },
+        &plain(),
+    )
+    .unwrap();
+
+    assert!(matches!(file.load(), Loaded::Current { .. }));
+    assert_eq!(
+        names(&dir),
+        ["config.json"],
+        "no backup: that is what a save does today"
+    );
+}
+
+#[skuld::test]
+fn config_remove_keeps_a_file_it_cannot_read() {
+    for cause in BOTH {
+        let dir = dir();
+        let original = put_unreadable::<ConfigFile>(&dir, cause);
+        assert_eq!(
+            VersionedFile::<ConfigFile>::new(dir.path()).remove().unwrap(),
+            Removal::Kept
+        );
+        assert_eq!(read(&dir, "config.json"), original);
+    }
+}
+
+#[skuld::test]
+fn decision_remove_moves_aside() {
+    for cause in BOTH {
+        let dir = dir();
+        let original = put_unreadable::<DecisionFile>(&dir, cause);
+        let file = VersionedFile::<DecisionFile>::new(dir.path());
+
+        let removal = file.remove().unwrap();
+
+        let backup = dir.path().join("decision.json.unreadable.bak");
+        assert_eq!(removal, Removal::MovedAside(backup), "{cause:?}");
+        assert_eq!(read(&dir, "decision.json.unreadable.bak"), original, "{cause:?}");
+        assert!(matches!(file.load(), Loaded::Absent), "{cause:?}");
+        assert_eq!(names(&dir), ["decision.json.unreadable.bak"], "{cause:?}");
+    }
+}
+
+// remove ==============================================================================================================
+
+#[skuld::test]
+fn remove_deletes_a_readable_file_and_reports_the_rest() {
+    let dir = dir();
+    let file = VersionedFile::<NoteV3>::new(dir.path());
+
+    assert_eq!(file.remove().unwrap(), Removal::Absent);
+
+    file.store(&note(), &plain()).unwrap();
+    assert_eq!(file.remove().unwrap(), Removal::Removed);
+    assert!(names(&dir).is_empty());
+
+    put(&dir, "note.json", br#"{"version":1,"title":"old"}"#);
+    assert_eq!(file.remove().unwrap(), Removal::Removed, "an older file");
+    assert!(names(&dir).is_empty());
+
+    let dropped = VersionedFile::<DroppedFile>::new(dir.path());
+    put(&dir, "dropped.json", br#"{"version":1,"value":7}"#);
+    assert_eq!(dropped.remove().unwrap(), Removal::Removed, "an obsolete file");
+    assert!(names(&dir).is_empty());
+}
+
+// move_aside ==========================================================================================================
+
+#[skuld::test]
+fn move_aside_has_nothing_to_move_when_there_is_no_file() {
+    let dir = dir();
+    assert_eq!(VersionedFile::<NoteV3>::new(dir.path()).move_aside().unwrap(), None);
+    assert!(names(&dir).is_empty());
+}
+
+#[skuld::test]
+fn move_aside_works_whatever_the_role() {
+    // `move_aside` ignores the role: the caller has decided.
+    let dir = dir();
+    let original = put_unreadable::<OsRecordFile>(&dir, CannotRead::Newer);
+    let file = VersionedFile::<OsRecordFile>::new(dir.path());
+
+    let moved = file.move_aside().unwrap();
+
+    assert_eq!(moved, Some(dir.path().join("os-record.json.unreadable.bak")));
+    assert_eq!(read(&dir, "os-record.json.unreadable.bak"), original);
+    assert_eq!(names(&dir), ["os-record.json.unreadable.bak"]);
+}
+
+#[skuld::test]
+fn move_aside_moves_a_readable_file_too() {
+    let dir = dir();
+    let file = VersionedFile::<NoteV3>::new(dir.path());
+    file.store(&note(), &plain()).unwrap();
+    let before = read(&dir, "note.json");
+
+    let moved = file.move_aside().unwrap().expect("a file to move");
+
+    assert_eq!(std::fs::read(&moved).unwrap(), before);
+    assert!(matches!(file.load(), Loaded::Absent));
+}
+
+// Placement ===========================================================================================================
+
+/// Records each call with what is on disk at that moment.
+struct Recorder<'a> {
+    path: &'a Path,
+    events: RefCell<Vec<String>>,
+}
+
+impl Recorder<'_> {
+    fn on_disk(&self) -> String {
+        match std::fs::read(self.path) {
+            Ok(bytes) if String::from_utf8_lossy(&bytes).contains("\"new\"") => "new".to_string(),
+            Ok(_) => "old".to_string(),
+            Err(_) => "absent".to_string(),
+        }
+    }
+}
+
+impl Placement for Recorder<'_> {
+    fn prepare_dir(&self, dir: &Path) -> io::Result<()> {
+        self.events
+            .borrow_mut()
+            .push(format!("prepare_dir[{}]", self.on_disk()));
+        std::fs::create_dir_all(dir)
+    }
+
+    fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
+        let tmp_bytes = std::fs::read(tmp)?;
+        assert!(
+            !tmp_bytes.is_empty(),
+            "the temp file must be complete before prepare_tmp"
+        );
+        self.events
+            .borrow_mut()
+            .push(format!("prepare_tmp[{}]", self.on_disk()));
+        Ok(())
+    }
+
+    fn after_publish(&self, _path: &Path) -> io::Result<()> {
+        self.events
+            .borrow_mut()
+            .push(format!("after_publish[{}]", self.on_disk()));
+        Ok(())
+    }
+
+    fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+        self.events.borrow_mut().push(format!("sync_dir[{}]", self.on_disk()));
+        Ok(())
+    }
+}
+
+#[skuld::test]
+fn placement_runs_around_the_publish_in_order() {
+    let dir = dir();
+    let path = put(&dir, "decision.json", br#"{"version":1,"value":"old"}"#);
+    let placement = Recorder {
+        path: &path,
+        events: RefCell::new(Vec::new()),
+    };
+
+    VersionedFile::<DecisionFile>::new(dir.path())
+        .store(
+            &DecisionFile {
+                value: "new".to_string(),
+            },
+            &placement,
+        )
+        .unwrap();
+
+    assert_eq!(
+        *placement.events.borrow(),
+        [
+            "prepare_dir[old]",
+            "prepare_tmp[old]",
+            "after_publish[new]",
+            "sync_dir[new]"
+        ]
+    );
+}
+
+/// A failure after the rename is not "nothing was written": the new value is
+/// the file's content, and the error must say so.
+#[skuld::test]
+fn a_failure_after_the_rename_says_the_file_was_replaced() {
+    struct FailsAfter {
+        in_after_publish: bool,
+    }
+    impl Placement for FailsAfter {
+        fn after_publish(&self, _path: &Path) -> io::Result<()> {
+            match self.in_after_publish {
+                true => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                false => Ok(()),
+            }
+        }
+        fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+            match self.in_after_publish {
+                true => Ok(()),
+                false => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            }
+        }
+    }
+
+    for in_after_publish in [true, false] {
+        let dir = dir();
+        put(&dir, "decision.json", br#"{"version":1,"value":"old"}"#);
+        let file = VersionedFile::<DecisionFile>::new(dir.path());
+
+        let err = file
+            .store(
+                &DecisionFile {
+                    value: "new".to_string(),
+                },
+                &FailsAfter { in_after_publish },
+            )
+            .unwrap_err();
+
+        let StoreError::PublishedNotFinalized(cause) = &err else {
+            panic!("after_publish={in_after_publish}: {err:?}");
+        };
+        assert_eq!(cause.kind(), io::ErrorKind::PermissionDenied);
+        match file.load() {
+            Loaded::Current { value, .. } => assert_eq!(value.value, "new", "the file holds the new value"),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[skuld::test]
+fn a_failed_prepare_tmp_leaves_no_temp_and_the_original() {
+    struct Fails;
+    impl Placement for Fails {
+        fn prepare_dir(&self, dir: &Path) -> io::Result<()> {
+            std::fs::create_dir_all(dir)
+        }
+        fn prepare_tmp(&self, _tmp: &Path) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+        fn after_publish(&self, _path: &Path) -> io::Result<()> {
+            Ok(())
+        }
+        fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let dir = dir();
+    let bytes = br#"{"version":1,"value":"old"}"#;
+    put(&dir, "decision.json", bytes);
+
+    let err = VersionedFile::<DecisionFile>::new(dir.path())
+        .store(
+            &DecisionFile {
+                value: "new".to_string(),
+            },
+            &Fails,
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, StoreError::Io(_)), "{err:?}");
+    assert_eq!(read(&dir, "decision.json"), bytes);
+    assert_eq!(names(&dir), ["decision.json"]);
+}
+
+/// The directory sync reaches the directory: a directory that is not there
+/// fails it, on every platform.
+#[skuld::test]
+fn sync_dir_of_a_missing_directory_fails() {
+    let dir = dir();
+    let err = plain().sync_dir(&dir.path().join("missing")).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
+}
+
+#[skuld::test]
+fn sync_dir_of_a_directory_succeeds() {
+    plain().sync_dir(dir().path()).unwrap();
+}
+
+// Redaction ===========================================================================================================
+
+#[skuld::test]
+fn no_error_or_cause_text_echoes_the_file() {
+    const SECRET: &str = "hunter2";
+
+    let mut shown = Vec::new();
+    for cause in BOTH {
+        let dir = dir();
+        let bytes = put_unreadable::<OsRecordFile>(&dir, cause);
+        assert!(
+            String::from_utf8_lossy(bytes).contains(SECRET),
+            "guard: the fixture carries the secret"
+        );
+        let file = VersionedFile::<OsRecordFile>::new(dir.path());
+
+        let err = file
+            .store(&OsRecordFile { value: "v".into() }, &plain())
+            .expect_err("an os record is not replaced");
+        shown.push(format!("{err}"));
+        shown.push(format!("{err:?}"));
+        shown.push(format!("{cause}"));
+        shown.push(format!("{cause:?}"));
+        if let Loaded::Corrupt { failure, .. } = file.load() {
+            shown.push(format!("{failure}"));
+            shown.push(format!("{failure:?}"));
+        }
+    }
+    for err in [
+        VersionedFile::<OwnsVersionKey>::new(dir().path())
+            .store(&OwnsVersionKey { version: 7 }, &plain())
+            .expect_err("encode"),
+        VersionedFile::<NotAnObject>::new(dir().path())
+            .store(&NotAnObject(vec![1]), &plain())
+            .expect_err("encode"),
+    ] {
+        shown.push(format!("{err}"));
+        shown.push(format!("{err:?}"));
+    }
+
+    assert!(shown.iter().all(|text| !text.is_empty()), "guard: {shown:?}");
+    for text in &shown {
+        assert!(!text.contains(SECRET), "echoed the file: {text}");
+    }
+}
+
+#[cfg(unix)]
+mod unix_directory_flush {
+    use std::io;
+
+    use super::super::{no_directory_flush, tolerate_missing_directory_flush};
+
+    fn os(code: i32) -> io::Error {
+        io::Error::from_raw_os_error(code)
+    }
+
+    #[skuld::test]
+    fn a_filesystem_without_directory_fsync_is_not_an_error() {
+        for code in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(no_directory_flush(&os(code)), "errno {code}");
+            tolerate_missing_directory_flush(Err(os(code))).unwrap();
+        }
+    }
+
+    #[skuld::test]
+    fn any_other_directory_fsync_error_still_fails() {
+        for code in [libc::EIO, libc::ENOSPC, libc::EACCES, libc::EBADF] {
+            assert!(!no_directory_flush(&os(code)), "errno {code}");
+            assert!(tolerate_missing_directory_flush(Err(os(code))).is_err(), "errno {code}");
+        }
+        assert!(!no_directory_flush(&io::Error::other("no os code")));
+    }
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn the_directory_flush_tolerates_a_filesystem_without_one_where_it_is_wired() {
+    let dir = crate::versioned_file::fixtures::dir();
+    let os = |code: i32| std::io::Error::from_raw_os_error(code);
+
+    super::sync_dir_with(dir.path(), |_| Err(os(libc::EINVAL))).unwrap();
+    let err = super::sync_dir_with(dir.path(), |_| Err(os(libc::EIO))).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_real_directory_without_fsync_is_not_a_failed_flush() {
+    // procfs answers a directory fsync with EINVAL.
+    super::sync_dir(std::path::Path::new("/proc")).unwrap();
+}
+
+#[skuld::test]
+fn a_failed_after_publish_still_flushes_the_directory() {
+    struct FailsAfterPublish {
+        flushed: std::cell::Cell<bool>,
+    }
+    impl Placement for FailsAfterPublish {
+        fn after_publish(&self, _path: &Path) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+        fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+            self.flushed.set(true);
+            Err(io::Error::from(io::ErrorKind::Other))
+        }
+    }
+    let dir = dir();
+    let place = FailsAfterPublish {
+        flushed: std::cell::Cell::new(false),
+    };
+
+    let err = VersionedFile::<DecisionFile>::new(dir.path())
+        .store(&DecisionFile { value: "v".to_string() }, &place)
+        .unwrap_err();
+
+    // Both failed; the first one is reported.
+    assert!(
+        matches!(&err, StoreError::PublishedNotFinalized(e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
+    assert!(
+        place.flushed.get(),
+        "the rename happened, so the directory is still flushed"
+    );
+}
+
+#[skuld::test]
+fn an_empty_directory_is_the_current_directory() {
+    // `Path::new("state.json").parent()` is `""`.
+    let file = VersionedFile::<DecisionFile>::new(Path::new(""));
+    assert_eq!(file.path(), Path::new(".").join("decision.json"));
+}

@@ -1,0 +1,5 @@
+error[E0438]: const `LINKED` is not a member of trait `Schema`
+  --> tests/compile_fail/override_check.rs:17:5
+   |
+17 |     const LINKED: () = ();
+   |     ^^^^^^^^^^^^^^^^^^^^^^ not a member of trait `Schema`

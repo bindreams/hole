@@ -1,0 +1,30 @@
+error[E0080]: evaluation panicked: UNVERSIONED_AS must be in 1..=VERSION
+ --> src/versioned_file/store.rs
+  |
+  |         const { assert_unversioned_as_valid::<S>() };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `util::versioned_file::VersionedFile::<Config>::new::{constant#0}` failed inside this call
+  |
+note: inside `versioned_file::store::assert_unversioned_as_valid::<Config>`
+ --> $RUST/core/src/panic.rs
+  |
+  = note: the failure occurred here
+  |
+ ::: src/versioned_file/store.rs
+  |
+  | /         assert!(
+  | |             version > 0 && version <= S::VERSION,
+  | |             "UNVERSIONED_AS must be in 1..=VERSION"
+  | |         );
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> src/versioned_file/store.rs
+  |
+  |         const { assert_unversioned_as_valid::<S>() };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn VersionedFile::<Config>::new`
+  --> tests/compile_fail/unversioned_zero.rs:25:13
+   |
+25 |     let _ = VersionedFile::<Config>::new(Path::new("."));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
