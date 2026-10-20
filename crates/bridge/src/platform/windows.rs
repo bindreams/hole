@@ -14,13 +14,14 @@ use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::cutover::scm_wait::call_error::{ScmCall, ServiceGone};
-use crate::cutover::scm_wait::retire::{on_service_gone, retire, Disposition};
+use crate::cutover::scm_wait::retire::{retire, Disposition};
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
 use crate::service_stop::{self, StopPhase, StopProgress};
 
 #[path = "windows/retire_session.rs"]
 mod retire_session;
-pub use retire_session::{Opening, RetireSession};
+pub use crate::cutover::scm_wait::retire::Opening;
+pub use retire_session::RetireSession;
 #[path = "windows/registration.rs"]
 pub mod registration;
 #[path = "windows/service_processes.rs"]
@@ -654,19 +655,17 @@ pub fn ensure_failure_actions() -> std::io::Result<()> {
 
 /// Stop and uninstall the bridge Windows Service.
 ///
-/// The stop is FATAL here, not the best-effort it used to be. `DeleteService`
-/// against a still-running service *succeeds* — it only marks the entry for
-/// deletion — and from that moment `OpenService` answers
-/// `ERROR_SERVICE_MARKED_FOR_DELETE`, so nothing can send the service a stop
-/// control ever again and no retry can even find it. The registration is the
-/// only handle a later attempt has; keeping it over a failed stop is what
-/// makes the uninstall retryable instead of terminal (bindreams/hole#1003).
+/// The stop is FATAL here, not best-effort. `DeleteService` against a
+/// still-running service *succeeds*: it only marks the entry for deletion, and
+/// the service keeps running until stopped. The registration is the handle a
+/// later attempt has, so keeping it over a failed stop is what makes the
+/// uninstall retryable instead of terminal.
 ///
 /// The stop, the delete and the check after it are one SCM session
 /// ([`retire`]), because the service carries restart-on-failure: a service the
 /// SCM is about to restart reads STOPPED, and separate probes and acts each
-/// decided on a state the SCM could change under them (bindreams/hole#1099).
-/// A service that is already gone is deregistered.
+/// decided on a state the SCM could change under them. A service already
+/// marked for deletion still opens, and is stopped through its handle.
 pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     if retire_service(Disposition::Deregister)? {
         info!("Windows service uninstalled");
@@ -682,54 +681,39 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
 /// has a row for it are independent facts, and the fail-closed covers are held
 /// by the live process, not by the row. See `setup::uninstall_bridge_with`.
 ///
-/// An absent row — never registered, or already marked for deletion by a prior
-/// `DeleteService` — is `Ok`: there is no handle SCM could act through, so
-/// there is nothing here to fail over. The cover release that follows carries
-/// the real guarantee; it holds the bridge's own liveness lock and refuses
-/// outright if a bridge is still alive.
-///
-/// The stop is issued FIRST and its own failure is what gets classified. A
-/// probe answers about the moment it was taken; only the act's own error is
-/// about the act, so the row going away between a probe and the act (a
-/// concurrent uninstall attempt's `DeleteService`, or the row being finalised
-/// as its last handle closed) is read off the stop's error, not off an earlier
-/// look.
+/// An absent entry (never registered) is `Ok`: there is nothing here to fail
+/// over. A service marked for deletion by a prior `DeleteService` still opens,
+/// so it is stopped like any other; if it has nothing to wait on and its state
+/// is live, that is an error. The cover release that follows carries the real
+/// guarantee; it holds the bridge's own liveness lock and refuses outright if a
+/// bridge is still alive.
 pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
     retire_service(Disposition::StopOnly).map(|_| ())
 }
 
-/// [`retire`] on a fresh session. `Ok(false)` when the SCM has no service to
-/// act on, including one that went away under the stop; `Ok(true)` when the
-/// retirement ran.
+/// [`retire`] on a fresh session. `Ok(false)` when the SCM has no entry to
+/// act on; `Ok(true)` when the retirement ran.
 fn retire_service(disposition: Disposition) -> Result<bool, Box<dyn std::error::Error>> {
     let mut session = match RetireSession::open()? {
         Opening::Opened(session) => session,
-        Opening::Gone(gone) => {
-            info!(?gone, "no Windows service to retire");
-            return Ok(on_service_gone(gone)?);
+        Opening::Absent => {
+            info!("no Windows service to retire");
+            return Ok(false);
         }
     };
-    match retire(&mut session, disposition) {
-        Ok(()) => Ok(true),
-        Err(e) => match e.service_gone() {
-            Some(gone) => {
-                info!(?gone, "the Windows service went away under the retirement");
-                Ok(on_service_gone(gone)?)
-            }
-            None => Err(e.into()),
-        },
-    }
+    retire(&mut session, disposition)?;
+    Ok(true)
 }
 
-/// Why SCM has no service to act on, if that is what an `open_service` failure
-/// means.
-fn open_error_gone(e: &windows_service::Error) -> Option<ServiceGone> {
+/// Whether an `open_service` failure means the entry does not exist.
+fn open_error_is_absent(e: &windows_service::Error) -> bool {
     let windows_service::Error::Winapi(io) = e else {
-        return None;
+        return false;
     };
     io.raw_os_error()
         .and_then(|code| u32::try_from(code).ok())
         .and_then(ServiceGone::of_code)
+        .is_some_and(ServiceGone::is_absent_at_open)
 }
 
 // Start/stop ==========================================================================================================

@@ -129,9 +129,10 @@ pub enum ServiceGone {
     /// still be running, because the SCM removes an entry once the service is
     /// not running, which is its state and not its process.
     DoesNotExist,
-    /// `ERROR_SERVICE_MARKED_FOR_DELETE`: the entry is still there and a
-    /// handle opened before the mark still queries and carries a Stop, but no
-    /// notification can be armed on it and nothing can start it.
+    /// `ERROR_SERVICE_MARKED_FOR_DELETE`: the entry is still there. It still
+    /// opens, and its handle queries and carries a Stop, but no notification
+    /// can be armed on it, its configuration cannot be changed and nothing can
+    /// start it.
     MarkedForDeletion,
 }
 
@@ -142,6 +143,27 @@ impl ServiceGone {
             ERROR_SERVICE_DOES_NOT_EXIST => Some(ServiceGone::DoesNotExist),
             ERROR_SERVICE_MARKED_FOR_DELETE => Some(ServiceGone::MarkedForDeletion),
             _ => None,
+        }
+    }
+
+    /// Whether `OpenService` failing this way means there is no entry to open.
+    /// A marked entry opens, so its mark is met later, on a call through the
+    /// handle.
+    pub fn is_absent_at_open(self) -> bool {
+        match self {
+            ServiceGone::DoesNotExist => true,
+            ServiceGone::MarkedForDeletion => false,
+        }
+    }
+
+    /// Whether the hardening's start-type read or write failing this way is
+    /// someone else's delete having come first, so that nothing was disabled
+    /// and the stop wait goes on. A missing entry cannot occur through an open
+    /// handle, so it is a plain failure.
+    pub fn harden_goes_on_marked(self) -> bool {
+        match self {
+            ServiceGone::DoesNotExist => false,
+            ServiceGone::MarkedForDeletion => true,
         }
     }
 

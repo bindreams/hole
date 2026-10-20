@@ -391,12 +391,10 @@ fn uninstall_stops_the_bridge_even_when_the_service_is_not_registered() {
     );
 }
 
-/// The dead end #1003's first fix opened: `DeleteService` against a live
-/// service succeeds by marking the row for deletion, after which `OpenService`
-/// answers `ERROR_SERVICE_MARKED_FOR_DELETE`, `is_installed` reads false, and
-/// no later run can find the service to stop it — while the bridge keeps the
-/// liveness lock the release needs. Keeping the registration over an
-/// unconfirmed stop is what leaves a retry something to work with.
+/// `DeleteService` against a live service succeeds by marking the row for
+/// deletion, and the bridge keeps the liveness lock the release needs. Keeping
+/// the registration over an unconfirmed stop is what leaves a retry something
+/// to work with.
 #[skuld::test]
 fn uninstall_never_deregisters_over_an_unconfirmed_stop() {
     let out = uninstall_probe(UninstallScript {

@@ -23,6 +23,15 @@ pub enum Disposition {
     Deregister,
 }
 
+/// What opening a retirement's session found.
+pub enum Opening<S> {
+    /// The session, with its service handle.
+    Opened(S),
+    /// The SCM has no entry for the service: never registered, or removed. A
+    /// process of it can still be running.
+    Absent,
+}
+
 /// A service's start type as the SCM reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartType {
@@ -100,10 +109,6 @@ pub enum RetireError {
     Delete(io::Error),
     #[error("the service's process could not be awaited: {0}")]
     Exit(io::Error),
-    /// The service is marked for deletion and a process of it is alive, with
-    /// no handle to send it a Stop. The ids are the processes found.
-    #[error("the service is marked for deletion and its processes are still running: {0:?}")]
-    MarkedWhileLive(Vec<u32>),
 }
 
 impl RetireError {
@@ -116,22 +121,6 @@ impl RetireError {
             RetireError::Hold(error)
         } else {
             step(error)
-        }
-    }
-
-    /// Why the SCM has no service to act on, if that is what failed the
-    /// retirement. Only the hardening, the first look and the stop can mean
-    /// that: the service went away under them. A hold, a delete or a wait is
-    /// this session's own act, and its failure is never "already done".
-    pub fn service_gone(&self) -> Option<ServiceGone> {
-        match self {
-            RetireError::Harden(error) => service_gone(error),
-            RetireError::Observe(error) => service_gone(error),
-            RetireError::Stop(error) => service_gone(error),
-            RetireError::Hold(_) => None,
-            RetireError::Delete(_) => None,
-            RetireError::Exit(_) => None,
-            RetireError::MarkedWhileLive(_) => None,
         }
     }
 }
@@ -149,6 +138,22 @@ impl From<SettleError> for RetireError {
     }
 }
 
+/// What [`harden`] found.
+enum Hardened {
+    /// The start type is disabled, which [`restore`] undoes.
+    Disabled(Hardening),
+    /// The service is already marked for deletion by someone else's delete:
+    /// nothing was changed, so there is nothing to put back and no delete to
+    /// issue.
+    Marked,
+}
+
+/// Whether `error` is the SCM answering that the service is marked for
+/// deletion, from a call through the retirement's own handle.
+fn answered_as_marked(error: &io::Error) -> bool {
+    service_gone(error).is_some_and(ServiceGone::harden_goes_on_marked)
+}
+
 /// Disable the start type, then turn restart-on-failure off.
 ///
 /// A disabled start type is what makes STOPPED final: the SCM's own restart of
@@ -156,17 +161,29 @@ impl From<SettleError> for RetireError {
 /// started ([`ChangeServiceConfig2W`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w#remarks):
 /// "The service must be explicitly disabled to prevent it from restarting").
 /// The change binds when the service stops. A failed start-type write is the
-/// retirement's failure with nothing changed; a failed failure-actions write
-/// only narrows what is queued, and is warned about.
-fn harden<S: ServiceSession>(session: &mut S) -> Result<Hardening, RetireError> {
-    let observed = session.start_type().map_err(RetireError::Harden)?;
-    session
-        .set_start_type(StartWrite::Disabled)
-        .map_err(RetireError::Harden)?;
+/// retirement's failure with nothing changed, unless the SCM answers that the
+/// service is marked for deletion ([`Hardened::Marked`]); a failed
+/// failure-actions write only narrows what is queued, and is warned about.
+fn harden<S: ServiceSession>(session: &mut S) -> Result<Hardened, RetireError> {
+    let observed = match session.start_type() {
+        Ok(observed) => observed,
+        Err(error) if answered_as_marked(&error) => return Ok(marked(&error)),
+        Err(error) => return Err(RetireError::Harden(error)),
+    };
+    match session.set_start_type(StartWrite::Disabled) {
+        Ok(()) => {}
+        Err(error) if answered_as_marked(&error) => return Ok(marked(&error)),
+        Err(error) => return Err(RetireError::Harden(error)),
+    }
     if let Err(error) = session.set_failure_actions(FailureActions::None) {
         warn!(%error, "could not turn restart-on-failure off; the disabled start type still stops a restart");
     }
-    Ok(Hardening { observed })
+    Ok(Hardened::Disabled(Hardening { observed }))
+}
+
+fn marked(error: &io::Error) -> Hardened {
+    info!(%error, "the service is marked for deletion; stopping it through the open handle");
+    Hardened::Marked
 }
 
 /// Put back what [`harden`] changed: the failure actions as `install`
@@ -184,7 +201,9 @@ fn restore<S: ServiceSession>(session: &mut S, hardening: Hardening) {
 /// Stop the service and, per `disposition`, delete it, and return once no
 /// process of it is left.
 ///
-/// 1. [`harden`]. A failure here changes nothing.
+/// 1. [`harden`]. A failure here changes nothing. A service found marked for
+///    deletion skips the rest of the steps but the stop wait: it is stopped
+///    through the open handle, and is neither restored nor deleted.
 /// 2. [`settle_stopped`]: stop on a RUNNING observation, wait on the held
 ///    process, and settle only when the SCM says STOPPED and a scan finds no
 ///    process carrying the service's token.
@@ -195,7 +214,10 @@ fn restore<S: ServiceSession>(session: &mut S, hardening: Hardening) {
 /// `DeleteService` answering that the service is already marked is a success:
 /// someone else's delete got there first.
 pub fn retire<S: ServiceSession>(session: &mut S, disposition: Disposition) -> Result<(), RetireError> {
-    let hardening = harden(session)?;
+    let hardening = match harden(session)? {
+        Hardened::Disabled(hardening) => hardening,
+        Hardened::Marked => return settle_stopped(session).map_err(RetireError::from),
+    };
     if let Err(error) = settle_stopped(session) {
         restore(session, hardening);
         return Err(error.into());
@@ -216,19 +238,6 @@ pub fn retire<S: ServiceSession>(session: &mut S, disposition: Disposition) -> R
                 Err(RetireError::Delete(error))
             }
         },
-    }
-}
-
-/// What a retirement does about a service the SCM has no handle to give: never
-/// registered, or marked for deletion before the open. `Ok(false)`: nothing was
-/// retired.
-///
-/// This does not look for a process of the service, so a process that outlives
-/// its entry is not seen.
-pub fn on_service_gone(gone: ServiceGone) -> Result<bool, RetireError> {
-    match gone {
-        ServiceGone::DoesNotExist => Ok(false),
-        ServiceGone::MarkedForDeletion => Ok(false),
     }
 }
 

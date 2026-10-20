@@ -231,3 +231,26 @@ fn a_refused_process_open_is_told_from_any_other_failure_by_its_type() {
     )));
     assert!(!io_error_is_a_refused_process_open(&io::Error::from_raw_os_error(5)));
 }
+
+/// Each question about a gone service is answered per kind by one match on the
+/// type. The answers are written from what the SCM does: an entry that does not
+/// exist is absent at the open, answers nothing and cannot be deleted; a marked
+/// entry opens, answers through its handle, and is already deleted.
+#[skuld::test]
+fn service_gone_policy_is_one_match_per_question() {
+    // (kind, absent at open, answers through an open handle, delete is done, harden continues)
+    let table = [
+        (ServiceGone::DoesNotExist, true, false, false, false),
+        (ServiceGone::MarkedForDeletion, false, true, true, true),
+    ];
+    for (kind, absent, answers, deleted, continues) in table {
+        assert_eq!(kind.is_absent_at_open(), absent, "{kind:?}: absent at open");
+        assert_eq!(kind.answers_through_an_open_handle(), answers, "{kind:?}: answers");
+        assert_eq!(kind.delete_is_done(), deleted, "{kind:?}: delete is done");
+        assert_eq!(
+            kind.harden_goes_on_marked(),
+            continues,
+            "{kind:?}: harden goes on marked"
+        );
+    }
+}

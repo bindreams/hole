@@ -18,21 +18,12 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::service_processes::{has_exited, open_process, ServiceProcesses};
 use super::service_sid::ServiceSid;
-use super::{apply_failure_actions, open_error_gone, scm_failure, FAILURE_ACTIONS_ACCESS, SERVICE_NAME};
-use crate::cutover::scm_wait::call_error::{service_gone, win32_code_of_hresult, ScmCall, ScmCallError, ServiceGone};
+use super::{apply_failure_actions, open_error_is_absent, scm_failure, FAILURE_ACTIONS_ACCESS, SERVICE_NAME};
+use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessSource, Reading};
-use crate::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartType, StartWrite};
+use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, StartType, StartWrite};
 use crate::cutover::scm_wait::settle::{StopActor, WaitKind};
 use crate::cutover::scm_wait::{observed_from_state, Observed, SystemScmActor};
-
-/// What opening the session found.
-pub enum Opening {
-    /// The session, with its service handle.
-    Opened(RetireSession),
-    /// The SCM has no service to open: never registered, or marked for
-    /// deletion before the open.
-    Gone(ServiceGone),
-}
 
 /// One service handle, opened before anything is changed, carries the queries,
 /// the hardening writes, the Stop and the delete. The delete only marks the
@@ -68,32 +59,24 @@ fn session_access() -> ServiceAccess {
 }
 
 impl RetireSession {
-    /// Opens the session, or says why the SCM has no service to open.
-    pub fn open() -> Result<Opening, Box<dyn std::error::Error>> {
+    /// Opens the session, or says the SCM has no entry to open. A service
+    /// marked for deletion opens: its mark is met on a call through the handle.
+    pub fn open() -> Result<Opening<Self>, Box<dyn std::error::Error>> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
         let service = match manager.open_service(SERVICE_NAME, session_access()) {
             Ok(service) => service,
-            Err(e) => {
-                return match open_error_gone(&e) {
-                    Some(gone) => Ok(Opening::Gone(gone)),
-                    None => Err(scm_failure(ScmCall::OpenService, e).into()),
-                }
-            }
+            Err(e) if open_error_is_absent(&e) => return Ok(Opening::Absent),
+            Err(e) => return Err(scm_failure(ScmCall::OpenService, e).into()),
         };
-        match SystemScmActor::open(SERVICE_NAME) {
-            Ok(actor) => Ok(Opening::Opened(Self {
-                service,
-                actor,
-                sid: ServiceSid::of(SERVICE_NAME),
-                processes: ServiceProcesses::default(),
-            })),
-            // Gone between the two opens.
-            Err(e) => match service_gone(&e) {
-                Some(gone) => Ok(Opening::Gone(gone)),
-                None => Err(e.into()),
-            },
-        }
+        // The first handle keeps the entry, so this open cannot find it gone.
+        let actor = SystemScmActor::open(SERVICE_NAME)?;
+        Ok(Opening::Opened(Self {
+            service,
+            actor,
+            sid: ServiceSid::of(SERVICE_NAME),
+            processes: ServiceProcesses::default(),
+        }))
     }
 
     /// Reads the service, holds the process it names, and says whether that

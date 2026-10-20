@@ -446,12 +446,10 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
 /// bridge is running and whether a registration record still names it are
 /// independent facts; the fail-closed covers are held by the live process, not
 /// by the record. Gating the stop on `is_installed` made the two look like one,
-/// and that is what turned an uninstall into a dead end: a `DeleteService`
-/// against a live service marks the entry for deletion, `OpenService` then
-/// answers `ERROR_SERVICE_MARKED_FOR_DELETE`, `is_installed` goes false, and
-/// every retry skips the teardown that would have stopped the bridge — whose
-/// liveness lock then refuses the release forever. macOS reaches the same place
-/// through a plist deleted over a still-loaded job.
+/// and a lost record then skipped the teardown that would have stopped the
+/// bridge — whose liveness lock refuses the release forever. A service marked
+/// for deletion still opens (`is_installed` stays true), and a stop reaches it
+/// through its handle. macOS has the plist deleted over a still-loaded job.
 ///
 /// **Deregistration requires a confirmed stop.** The registration is the only
 /// handle a later attempt has, so a stop that could not be confirmed leaves it

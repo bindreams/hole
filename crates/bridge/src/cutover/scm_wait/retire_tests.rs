@@ -308,7 +308,6 @@ fn a_refused_process_open_in_a_look_is_the_hold_variant() {
     let error = retire(&mut session, Disposition::Deregister).expect_err("the open was refused");
     assert!(matches!(error, RetireError::Hold(_)), "{error}");
     assert!(error.to_string().contains("OpenProcess failed"), "{error}");
-    assert!(error.service_gone().is_none());
 }
 
 #[skuld::test]
@@ -406,45 +405,158 @@ fn a_service_found_disabled_is_restored_to_auto_and_one_found_on_demand_to_on_de
     }
 }
 
-// What a failure means ================================================================================================
+// A service marked for deletion =======================================================================================
+
+/// `ERROR_SERVICE_MARKED_FOR_DELETE` from the start-type write: someone else's
+/// delete came first.
+fn marked_at_the_start_type_write() -> io::Error {
+    scm_error(ScmCall::ChangeServiceConfig, 1072)
+}
+
+/// Nothing was disabled, so there is nothing to put back, and the delete is
+/// not ours to issue: the stop wait runs and the retirement ends.
+#[skuld::test]
+fn a_start_type_write_answered_as_marked_goes_on_to_the_stop_wait() {
+    for disposition in [Disposition::StopOnly, Disposition::Deregister] {
+        let log = Log::default();
+        let mut session = FakeSession::running_then_stopped(&log)
+            .failing_with("set_start_type(Disabled)", marked_at_the_start_type_write());
+        retire(&mut session, disposition).unwrap_or_else(|e| panic!("{disposition:?}: {e}"));
+        let expected: Vec<&str> = ["start_type", "set_start_type(Disabled)"]
+            .iter()
+            .chain(&STOP_AND_SETTLE)
+            .copied()
+            .collect();
+        assert_eq!(logged(&log), expected, "{disposition:?}");
+    }
+}
 
 #[skuld::test]
-fn only_a_failure_over_a_vanished_service_before_the_delete_names_why_it_is_gone() {
-    // ERROR_SERVICE_DOES_NOT_EXIST 1060, ERROR_SERVICE_MARKED_FOR_DELETE 1072,
-    // ERROR_ACCESS_DENIED 5.
-    let gone = |code| scm_error(ScmCall::OpenService, code);
-    assert_eq!(
-        RetireError::Stop(gone(1060)).service_gone(),
-        Some(ServiceGone::DoesNotExist)
-    );
-    assert_eq!(
-        RetireError::Stop(gone(1072)).service_gone(),
-        Some(ServiceGone::MarkedForDeletion)
-    );
-    assert_eq!(
-        RetireError::Stop(io::Error::from_raw_os_error(1060)).service_gone(),
-        Some(ServiceGone::DoesNotExist)
-    );
-    assert_eq!(RetireError::Stop(gone(5)).service_gone(), None);
-    assert_eq!(RetireError::Stop(io::Error::other("plain")).service_gone(), None);
-    // The hardening's write and the first look are steps of the stop: the
-    // service going away under them is the service being gone.
-    assert_eq!(
-        RetireError::Harden(gone(1072)).service_gone(),
-        Some(ServiceGone::MarkedForDeletion)
-    );
-    assert_eq!(
-        RetireError::Observe(gone(1060)).service_gone(),
-        Some(ServiceGone::DoesNotExist)
-    );
-    assert_eq!(RetireError::Observe(gone(5)).service_gone(), None);
-    // A hold, a delete or a wait is this session's own act: its failure over a
-    // missing service is never "already done".
-    assert_eq!(RetireError::Hold(gone(1060)).service_gone(), None);
-    assert_eq!(RetireError::Delete(gone(1060)).service_gone(), None);
-    assert_eq!(RetireError::Exit(gone(1060)).service_gone(), None);
-    assert_eq!(RetireError::MarkedWhileLive(vec![1]).service_gone(), None);
+fn a_start_type_read_answered_as_marked_goes_on_to_the_stop_wait() {
+    for disposition in [Disposition::StopOnly, Disposition::Deregister] {
+        let log = Log::default();
+        let mut session = FakeSession::running_then_stopped(&log)
+            .failing_with("start_type", scm_error(ScmCall::QueryServiceConfig, 1072));
+        retire(&mut session, disposition).unwrap_or_else(|e| panic!("{disposition:?}: {e}"));
+        let expected: Vec<&str> = ["start_type"].iter().chain(&STOP_AND_SETTLE).copied().collect();
+        assert_eq!(logged(&log), expected, "{disposition:?}");
+    }
 }
+
+/// Only the documented answer of a mark continues; a missing service and a
+/// refusal are the retirement's failure, with nothing changed.
+#[skuld::test]
+fn a_start_type_write_that_fails_otherwise_is_the_retirements_failure() {
+    for code in [1060, 5] {
+        let log = Log::default();
+        let mut session = FakeSession::running_then_stopped(&log).failing_with(
+            "set_start_type(Disabled)",
+            scm_error(ScmCall::ChangeServiceConfig, code),
+        );
+        let error = retire(&mut session, Disposition::Deregister).expect_err("the write failed");
+        assert!(matches!(error, RetireError::Harden(_)), "{code}: {error}");
+        assert_eq!(logged(&log), ["start_type", "set_start_type(Disabled)"], "{code}");
+    }
+}
+
+/// The mark lands while the service is starting: the arm is refused, and the
+/// loop waits on the process it holds instead of the SCM's notification.
+#[skuld::test]
+fn a_mark_at_the_first_arm_is_waited_out_on_the_held_process() {
+    let pending = || Look {
+        observed: Observed::StartPending,
+        fate: ProcessFate::Alive,
+        held_alive: true,
+        ever_held: true,
+    };
+    for disposition in [Disposition::StopOnly, Disposition::Deregister] {
+        let log = Log::default();
+        let mut session = FakeSession::new(&log, vec![pending(), pending(), stopped(), stopped()])
+            .failing_with("set_start_type(Disabled)", marked_at_the_start_type_write())
+            .failing_with(
+                "arm_leaving(StartPending)",
+                scm_error(ScmCall::NotifyServiceStatusChange, 1072),
+            );
+        retire(&mut session, disposition).unwrap_or_else(|e| panic!("{disposition:?}: {e}"));
+        let expected = [
+            "start_type",
+            "set_start_type(Disabled)",
+            "observe",
+            "arm_leaving(StartPending)",
+            "hold_scanned",
+            "observe",
+            "await_held_exits",
+            "observe",
+            "hold_scanned",
+            "observe",
+        ];
+        assert_eq!(logged(&log), expected, "{disposition:?}");
+    }
+}
+
+/// A live state, nothing ever held and no arm possible: no event exists to
+/// wait on, so the retirement fails with the refusal and never reports done.
+#[skuld::test]
+fn a_marked_service_with_nothing_to_wait_on_fails_and_is_never_ok() {
+    let unheld_running = || Look {
+        observed: Observed::Running,
+        fate: ProcessFate::Unheld,
+        held_alive: false,
+        ever_held: false,
+    };
+    for disposition in [Disposition::StopOnly, Disposition::Deregister] {
+        let log = Log::default();
+        let mut session = FakeSession::new(&log, vec![unheld_running(), unheld_running()])
+            .failing_with("set_start_type(Disabled)", marked_at_the_start_type_write())
+            .failing_with(
+                "arm_leaving(Running)",
+                scm_error(ScmCall::NotifyServiceStatusChange, 1072),
+            );
+        let error = retire(&mut session, disposition).expect_err("nothing to wait on is never done");
+        assert!(matches!(error, RetireError::Stop(_)), "{disposition:?}: {error}");
+        assert!(error.to_string().contains("1072"), "{error}");
+        let logged = logged(&log);
+        assert!(!logged.contains(&"delete".to_owned()), "{logged:?}");
+        assert!(
+            !logged.iter().any(|call| call.starts_with("set_failure_actions")),
+            "{logged:?}"
+        );
+    }
+}
+
+/// The open handle keeps the entry, so neither 1060 nor 1072 after the open
+/// means the service is gone: each step's failure is that step's error.
+#[skuld::test]
+fn a_failure_after_the_open_is_never_read_as_gone() {
+    type Check = fn(&RetireError) -> bool;
+    for code in [1060, 1072] {
+        let log: &'static Log = Box::leak(Box::default());
+        let cases: [(&str, FakeSession<'_>, Check); 2] = [
+            (
+                "a look",
+                FakeSession::new(log, vec![]).failing_with("observe", scm_error(ScmCall::QueryServiceStatusEx, code)),
+                |e| matches!(e, RetireError::Observe(_)),
+            ),
+            (
+                "a Stop while still running",
+                FakeSession::new(log, vec![running(), running()])
+                    .failing_with("control_stop", scm_error(ScmCall::ControlService, code)),
+                |e| matches!(e, RetireError::Stop(_)),
+            ),
+        ];
+        for (what, mut session, is_expected) in cases {
+            let error = retire(&mut session, Disposition::Deregister).expect_err(what);
+            assert!(is_expected(&error), "{what}, {code}: {error}");
+        }
+    }
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log)
+        .failing_with("start_type", scm_error(ScmCall::QueryServiceConfig, 1060));
+    let error = retire(&mut session, Disposition::Deregister).expect_err("1060 on the read");
+    assert!(matches!(error, RetireError::Harden(_)), "{error}");
+}
+
+// What a failure means ================================================================================================
 
 /// A step's error maps to the retirement's variant for that step, one by one.
 #[skuld::test]
@@ -488,21 +600,4 @@ fn a_failed_step_reads_with_its_call_and_its_code() {
     assert!(message.contains('5'), "{message}");
     let message = RetireError::Harden(scm_error(ScmCall::ChangeServiceConfig, 5)).to_string();
     assert!(message.contains("ChangeServiceConfig failed"), "{message}");
-}
-
-#[skuld::test]
-fn a_service_marked_while_live_names_the_processes() {
-    let message = RetireError::MarkedWhileLive(vec![12, 34]).to_string();
-    assert!(message.contains("12") && message.contains("34"), "{message}");
-}
-
-// The service the SCM has gone from ===================================================================================
-
-/// Whatever the retirement does about a service it cannot open or that
-/// vanished under it is decided here, per kind.
-#[skuld::test]
-fn a_service_the_scm_has_gone_from_is_not_a_service_that_was_retired() {
-    for gone in [ServiceGone::DoesNotExist, ServiceGone::MarkedForDeletion] {
-        assert!(matches!(on_service_gone(gone), Ok(false)), "{gone:?}");
-    }
 }
