@@ -271,6 +271,15 @@ slow-timeout = { period = "20s", terminate-after = 2 }
 filter = 'test(/^(bind_conflict_surfaces_typed_when_a_descendant_holds_the_output_pipes|fatal_surfaces_typed_when_a_descendant_holds_the_output_pipes)$/)'
 slow-timeout = { period = "20s", terminate-after = 2 }
 
+# `crates/garter/src/binary_real_child_tests.rs` (Unix only): a real shell tree whose descendant
+# answers on a pipe; a regression that leaves the pipe open parks the read to EOF instead of
+# failing.
+#
+# COUPLED NAME, same caveat as the groups above: a bare function name.
+[[profile.default.overrides]]
+filter = 'test(/^dropping_a_reaped_roots_handle_does_not_signal_its_process_group$/)'
+slow-timeout = { period = "20s", terminate-after = 2 }
+
 # See `drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed`'s
 # own doc comment in etw_tests.rs for why this hangs on a gate regression
 # instead of failing; bounded here the same way as the tun-engine driver and

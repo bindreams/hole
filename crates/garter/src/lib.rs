@@ -29,6 +29,8 @@ pub use tap::TapPlugin;
 mod ansi_tests;
 #[cfg(test)]
 mod backoff_tests;
+#[cfg(all(test, unix))]
+mod binary_real_child_tests;
 #[cfg(test)]
 mod binary_tests;
 #[cfg(test)]
