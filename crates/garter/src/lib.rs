@@ -31,6 +31,8 @@ pub use tap::TapPlugin;
 mod ansi_tests;
 #[cfg(test)]
 mod backoff_tests;
+#[cfg(test)]
+mod binary_probe_tests;
 #[cfg(all(test, unix))]
 mod binary_real_child_tests;
 #[cfg(test)]
@@ -51,6 +53,8 @@ mod plugin_tests;
 mod sip003_tests;
 #[cfg(test)]
 mod sitrep_tests;
+#[cfg(test)]
+mod tap_failed_start_tests;
 #[cfg(test)]
 mod tap_tests;
 #[cfg(test)]

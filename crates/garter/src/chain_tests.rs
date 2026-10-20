@@ -872,6 +872,133 @@ async fn external_cancel_concurrent_with_plugin_error_preserves_plugin_error() {
     }
 }
 
+/// How long a member's take-down takes once it is told to stop: a `BinaryPlugin`'s own two waits (5 s for the root
+/// to exit, 5 s for its output), written out so a change to either fails here.
+const TAKE_DOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A member that takes `TAKE_DOWN` to stop, then ends with an error, as a plugin that ignores terminate does.
+struct SlowToStop;
+
+#[async_trait::async_trait]
+impl ChainPlugin for SlowToStop {
+    fn name(&self) -> &str {
+        "slow-to-stop"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
+        shutdown.cancelled().await;
+        tokio::time::sleep(TAKE_DOWN).await;
+        Err(crate::Error::PluginExit {
+            name: "slow-to-stop".into(),
+            code: 3,
+        })
+    }
+}
+
+/// The bounds are derived from one another, each waiting on the one below it with headroom, and the default drain
+/// budget sits on top of the stack. Both are written out here so a change to any of them fails here.
+#[skuld::test]
+fn the_drain_timeout_default_is_derived_from_the_bounds_it_waits_on() {
+    use crate::binary::{TAKEDOWN_BOUND, TAKEDOWN_TAIL};
+    use crate::chain::DEFAULT_DRAIN_TIMEOUT;
+    use crate::tap::INNER_STOP_BOUND;
+
+    assert_eq!(TAKEDOWN_BOUND, TAKE_DOWN);
+    assert_eq!(TAKEDOWN_TAIL, std::time::Duration::from_secs(1));
+    assert_eq!(INNER_STOP_BOUND, TAKE_DOWN + TAKEDOWN_TAIL);
+    assert_eq!(DEFAULT_DRAIN_TIMEOUT, INNER_STOP_BOUND + TAKEDOWN_TAIL);
+    assert_eq!(DEFAULT_DRAIN_TIMEOUT, std::time::Duration::from_secs(12));
+}
+
+/// The default drain budget outlasts a member's whole take-down, so a member that needs all of its own bounds to stop
+/// is waited for, not aborted before it has relayed its last line.
+#[skuld::test]
+async fn the_default_drain_timeout_outlasts_a_members_take_down() {
+    tokio::time::pause();
+    let cancel = CancellationToken::new();
+    let runner = ChainRunner::new()
+        .add(Box::new(SlowToStop))
+        .cancel_token(cancel.clone());
+    let mut env = test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    let handle = tokio::spawn(runner.run(env));
+
+    cancel.cancel();
+    let result = tokio::time::timeout(DRAIN, handle)
+        .await
+        .expect("the chain never ended")
+        .unwrap();
+
+    assert!(
+        matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
+        "the member must be waited for, not aborted at the default budget; got {result:?}"
+    );
+}
+
+/// A member that panics while it is dropped, as the drain bound's abort drops it.
+struct PanicsWhenAborted;
+
+struct PanicsOnDrop;
+
+impl Drop for PanicsOnDrop {
+    fn drop(&mut self) {
+        panic!("dropped");
+    }
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for PanicsWhenAborted {
+    fn name(&self) -> &str {
+        "panics-when-aborted"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
+        let _guard = PanicsOnDrop;
+        std::future::pending().await
+    }
+}
+
+/// What a member does in the abort window after the drain bound is not lost: a cancelled task is expected, anything
+/// else (here a panic while the member is dropped) is recorded and outranks the drain-timeout error.
+#[skuld::test]
+async fn a_member_that_fails_in_the_abort_window_is_recorded() {
+    tokio::time::pause();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let cancel = CancellationToken::new();
+    let runner = ChainRunner::new()
+        .add(Box::new(PanicsWhenAborted))
+        .cancel_token(cancel.clone())
+        .drain_timeout(std::time::Duration::from_millis(100));
+    let mut env = test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    let handle = tokio::spawn(runner.run(env));
+
+    cancel.cancel();
+    let result = tokio::time::timeout(DRAIN, handle)
+        .await
+        .expect("the chain never ended")
+        .unwrap();
+    std::panic::set_hook(previous);
+
+    assert!(
+        matches!(&result, Err(crate::Error::Chain(msg)) if msg.contains("panicked")),
+        "want the panic, got {result:?}"
+    );
+}
+
 // record_exit structured-field tests ==================================================================================
 
 /// `record_exit` must emit a structured `exit_code` field on a `PluginExit`
@@ -1172,11 +1299,14 @@ fn the_gate_reports_what_the_preempted_plugin_delivered_by_the_release() {
             transports: Transports::TCP,
         })
     };
-    for (delivered, reported_fatal) in [
-        (Some(Err(fatal())), true),
-        (Some(ready()), false),
-        // Nothing delivered, sender still open or dropped unsent.
-        (None, false),
+    // `member_drops_it`: the member dropped its sender before the release, instead of keeping it open.
+    for (delivered, member_drops_it, reported_fatal) in [
+        (Some(Err(fatal())), false, true),
+        (Some(ready()), false, false),
+        // Nothing delivered, sender still open.
+        (None, false, false),
+        // Nothing delivered, sender dropped unsent: the receiver reads `Closed`, which is no failure to report.
+        (None, true, false),
     ] {
         let (tx, mut rx) = oneshot::channel();
         let mut gate = ReadyGate::new(Some(tx));
@@ -1184,15 +1314,18 @@ fn the_gate_reports_what_the_preempted_plugin_delivered_by_the_release() {
         gate.absorb(Readiness::Preempted { unread: vec![unread] });
         assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 
+        let case = format!("{delivered:?}, dropped={member_drops_it}");
         if let Some(delivered) = &delivered {
             member_tx.send(delivered.clone()).unwrap();
+        } else if member_drops_it {
+            drop(member_tx);
         }
         gate.release();
 
         match rx.try_recv() {
-            Ok(Err(StartError::Fatal { .. })) => assert!(reported_fatal, "{delivered:?}"),
-            Err(oneshot::error::TryRecvError::Closed) => assert!(!reported_fatal, "{delivered:?}"),
-            other => panic!("{delivered:?}: {other:?}"),
+            Ok(Err(StartError::Fatal { .. })) => assert!(reported_fatal, "{case}"),
+            Err(oneshot::error::TryRecvError::Closed) => assert!(!reported_fatal, "{case}"),
+            other => panic!("{case}: {other:?}"),
         }
     }
 }
@@ -1512,8 +1645,8 @@ async fn a_start_failure_is_delivered_once_the_drain_bound_expires_on_a_member_t
 
 // The caller is released only after every member returned -------------------------------------------------------------
 
-/// Like a Probe-mode `BinaryPlugin`: a side task owns `ready` until the chain's shutdown while `run` itself exits with
-/// an error, so the readiness channel stays open when the chain is cancelled.
+/// Like a Probe-mode `BinaryPlugin`: a side task (the probe) owns `ready` while the plugin runs, and the plugin stops
+/// and joins it before `run` returns an error, so the readiness sender is gone by the time the chain sees the exit.
 struct ProbeLikeCrash;
 
 #[async_trait::async_trait]
@@ -1529,12 +1662,44 @@ impl ChainPlugin for ProbeLikeCrash {
         shutdown: CancellationToken,
         ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
+        let stop = shutdown.child_token();
+        let probe_stop = stop.clone();
+        let probe = tokio::spawn(async move {
+            probe_stop.cancelled().await;
+            drop(ready);
+        });
+        stop.cancel();
+        probe.await.expect("the probe ended");
+        Err(crate::Error::PluginExit {
+            name: "probe-like-crash".into(),
+            code: 3,
+        })
+    }
+}
+
+/// A plugin that breaks the contract `ProbeLikeCrash` keeps: a side task owns `ready` until the chain's shutdown while
+/// `run` itself exits with an error, so the readiness channel stays open when the chain is cancelled.
+struct ReadyHolderCrash;
+
+#[async_trait::async_trait]
+impl ChainPlugin for ReadyHolderCrash {
+    fn name(&self) -> &str {
+        "ready-holder-crash"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
         tokio::spawn(async move {
             shutdown.cancelled().await;
             drop(ready);
         });
         Err(crate::Error::PluginExit {
-            name: "probe-like-crash".into(),
+            name: "ready-holder-crash".into(),
             code: 3,
         })
     }
@@ -1564,13 +1729,39 @@ impl ChainPlugin for PanicsAtStart {
 /// that too waits for the other members: the aggregator has nothing to report, but dropping the sender is a release.
 #[skuld::test]
 async fn an_exit_that_leaves_ready_open_waits_for_the_other_members_last_line() {
-    let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(ProbeLikeCrash), 0).await;
+    let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(ReadyHolderCrash), 0).await;
 
     assert!(reported.is_err(), "nothing was reported to the caller: {reported:?}");
     assert!(
         matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
         "run must return the failing member's error, got {result:?}"
     );
+}
+
+/// A probe-owned member that stops its probe before it exits is read as exited before ready, and the caller hears the
+/// typed `Fatal`, not a dropped sender, after the other members' last line.
+async fn assert_a_probe_owned_exit_before_ready_reports_the_typed_fatal(position: usize) {
+    let (reported, result) =
+        assert_failure_waits_for_the_other_members_last_line(Box::new(ProbeLikeCrash), position).await;
+
+    assert!(
+        matches!(&reported, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
+        "want the synthesized exited-before-ready Fatal, got {reported:?}"
+    );
+    assert!(
+        matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
+        "run must return the failing member's error, got {result:?}"
+    );
+}
+
+#[skuld::test]
+async fn a_probe_owned_first_member_that_exits_before_ready_reports_the_typed_fatal() {
+    assert_a_probe_owned_exit_before_ready_reports_the_typed_fatal(0).await;
+}
+
+#[skuld::test]
+async fn a_probe_owned_member_behind_a_ready_one_that_exits_before_ready_reports_the_typed_fatal() {
+    assert_a_probe_owned_exit_before_ready_reports_the_typed_fatal(1).await;
 }
 
 #[skuld::test]
@@ -1655,7 +1846,10 @@ fn on_a_multi_thread_runtime_an_exit_before_ready_waits_for_the_other_members_la
             let mut chain = FailingChain::start(failing, 0, DRAIN);
             chain.until_the_healthy_member_is_stopped().await;
             let (reported, result) = chain.open_the_gate().await;
-            assert!(!matches!(reported, Ok(Ok(_))), "{reported:?}");
+            assert!(
+                matches!(&reported, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
+                "{reported:?}"
+            );
             assert!(
                 matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
                 "{result:?}"
@@ -1670,7 +1864,7 @@ fn on_a_multi_thread_runtime_an_exit_before_ready_waits_for_the_other_members_la
 async fn an_open_ready_is_released_once_the_drain_bound_expires_on_a_member_that_ignores_shutdown() {
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
-        .add(Box::new(ProbeLikeCrash))
+        .add(Box::new(ReadyHolderCrash))
         .add(Box::new(StubbornPlugin {
             name: "stubborn".into(),
         }))

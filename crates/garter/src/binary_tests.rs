@@ -624,7 +624,8 @@ async fn a_failed_kill_skips_the_exit_edge_and_gives_even_a_kernel_owned_join_th
     assert_eq!(*calls.lock().unwrap(), ["kill_tree"]);
 }
 
-/// An exit edge that cannot be awaited does not strand the drain: the readers still get the bound.
+/// An exit edge that cannot be awaited does not strand the drain: the readers still get the bound. The fallback is
+/// announced once per take-down, by plugin name, as a warning: the edge the ordering rests on was not observed.
 #[skuld::test]
 async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
     tokio::time::pause();
@@ -634,7 +635,7 @@ async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
     let (dropped, stdout) = held_reader();
     let mut tree = FakeTree::new(Containment::CgroupV2, || Ok(()));
     tree.edge_fails = true;
-    let drain = drain_readers_after_exit("p", &mut tree, stdout, finished_reader());
+    let drain = drain_readers_after_exit("edge-plugin", &mut tree, stdout, finished_reader());
     let mut drain = pin!(drain);
 
     assert!(poll_once(drain.as_mut()).is_pending());
@@ -644,7 +645,12 @@ async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
         .await
         .expect("the reader must be aborted at the bound")
         .ok();
-    assert!(writer.snapshot().contains("DEBUG"), "{}", writer.snapshot());
+    let log = writer.snapshot();
+    let announced = log
+        .lines()
+        .filter(|l| l.contains("WARN") && l.contains("edge-plugin") && l.contains("drain cannot be observed"))
+        .count();
+    assert_eq!(announced, 1, "want one warning naming the plugin:\n{log}");
 }
 
 /// A join that completes inside the bound is silent.
@@ -709,7 +715,7 @@ async fn a_kill_error_on_a_tree_that_cannot_tear_down_is_logged_at_debug() {
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::binary::{spawn_sitrep_stdout_reader, FailureHold};
+use crate::binary::{spawn_sitrep_stdout_reader, FailureHold, ReadinessProbes};
 use crate::sitrep::{PluginReady, SitrepEvent, StartError, Transports, SITREP_PROTOCOL};
 
 type ReadyResult = Result<PluginReady, StartError>;
@@ -746,12 +752,12 @@ async fn sitrep_reader_over(
     let shutdown = CancellationToken::new();
     let (reader, failure) = spawn_sitrep_stdout_reader(
         host_stdout,
-        "eof-plugin".into(),
         freed,
         shutdown.clone(),
         ready_tx,
         auto,
         None,
+        &ReadinessProbes::new("eof-plugin", &shutdown),
     );
     (ready_rx, reader, shutdown, failure)
 }
@@ -816,8 +822,15 @@ async fn a_stdout_that_closes_after_the_plugin_is_taken_down_is_not_a_start_fail
         plugin_stdout.write_all(lines.as_bytes()).await.unwrap();
         let (ready_tx, ready_rx) = oneshot::channel();
         let shutdown = CancellationToken::new();
-        let (reader, failure) =
-            spawn_sitrep_stdout_reader(host_stdout, "p".into(), freed, shutdown.clone(), ready_tx, auto, None);
+        let (reader, failure) = spawn_sitrep_stdout_reader(
+            host_stdout,
+            freed,
+            shutdown.clone(),
+            ready_tx,
+            auto,
+            None,
+            &ReadinessProbes::new("p", &shutdown),
+        );
 
         let taken_down = failure.taken_down_signal();
         let plugin_stdout = Mutex::new(Some(plugin_stdout));
@@ -863,8 +876,8 @@ async fn a_stdout_that_closes_after_the_plugin_is_taken_down_is_not_a_start_fail
 }
 
 /// Order {closed, reader decided, then cancelled}: a stdout that closed before any shutdown was requested is a start
-/// failure the reader decided, and a shutdown that follows does not take it back. Green before the shutdown exception
-/// existed; it guards that the exception did not swallow a decided failure.
+/// failure the reader decided, and a shutdown that follows does not take it back. Guards that the shutdown exception
+/// does not swallow a decided failure.
 #[skuld::test]
 async fn a_stdout_that_closed_before_a_shutdown_stays_a_start_failure() {
     tokio::time::pause();
@@ -938,7 +951,7 @@ async fn a_plugin_that_exited_by_itself_keeps_its_start_failure_when_a_cancel_la
 
 /// Where a probe owns readiness (`Auto` with no supported hello, or after an unknown-major
 /// fallback), closed stdout says nothing about the plugin's listener: the probe decides. The reader decides nothing
-/// there, shutdown or not, so this row was green before the shutdown exception existed.
+/// there, shutdown or not.
 #[skuld::test]
 async fn at_stdout_eof_a_probe_that_owns_readiness_decides() {
     tokio::time::pause();
@@ -1211,12 +1224,12 @@ async fn a_stdout_reader_given_up_on_at_the_bound_leaves_the_readiness_sender_to
     let shutdown = CancellationToken::new();
     let (reader, failure) = spawn_sitrep_stdout_reader(
         host_stdout,
-        "held-plugin".into(),
         freed,
         shutdown.clone(),
         ready_tx,
         false,
         None,
+        &ReadinessProbes::new("held-plugin", &shutdown),
     );
     let mut tree = drained_tree(Containment::ProcessGroup);
     let end = supervise_plugin(
@@ -1238,7 +1251,14 @@ async fn a_stdout_reader_given_up_on_at_the_bound_leaves_the_readiness_sender_to
         .ok();
 
     assert!(ready_rx.await.is_err(), "no failure was held, so none is delivered");
-    assert!(writer.snapshot().contains("held-plugin"), "{}", writer.snapshot());
+    assert!(
+        writer
+            .snapshot()
+            .lines()
+            .any(|l| l.contains("WARN") && l.contains("held-plugin") && l.contains("output pipes were still open")),
+        "{}",
+        writer.snapshot()
+    );
 }
 
 /// An unwatchable root whose reap fails ends without a tree kill, but its output wait is still bounded
@@ -1301,12 +1321,12 @@ async fn a_failure_decided_after_the_hold_ended_is_sent_by_the_reader() {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (reader, mut failure) = spawn_sitrep_stdout_reader(
             host_stdout,
-            "p".into(),
             freed,
             CancellationToken::new(),
             ready_tx,
             false,
             None,
+            &ReadinessProbes::new("p", &CancellationToken::new()),
         );
         let mut ready_rx = pin!(ready_rx);
 
@@ -1990,7 +2010,24 @@ async fn a_take_down_of_an_unwatchable_root_kills_it_at_once_then_its_tree_then_
                 "{taken_down_by:?}, {containment:?}"
             );
             let calls = tree.calls();
-            let position = |call: &str| calls.iter().position(|c| *c == call);
+            let position = |call: &str| {
+                calls
+                    .iter()
+                    .position(|c| *c == call)
+                    .unwrap_or_else(|| panic!("{taken_down_by:?}, {containment:?}: {call} was never called: {calls:?}"))
+            };
+            match taken_down_by {
+                // A failed start is not asked anything.
+                TakenDownBy::StartFailure => assert!(
+                    !calls.contains(&"terminate"),
+                    "{taken_down_by:?}, {containment:?}: a failed start was asked to exit: {calls:?}"
+                ),
+                // A shutdown asks, finds the exit unwatchable, and so has no grace to give: the kill follows at once.
+                TakenDownBy::Shutdown => assert!(
+                    position("terminate") < position("kill_root"),
+                    "{taken_down_by:?}, {containment:?}: {calls:?}"
+                ),
+            }
             assert!(
                 position("kill_root") < position("kill_tree") && position("kill_tree") < position("reap"),
                 "{taken_down_by:?}, {containment:?}: {calls:?}"
@@ -2062,9 +2099,6 @@ fn a_plugin_whose_start_failed_is_an_error_naming_it_unless_its_exit_status_alre
 }
 
 // A failed start never ends `Ok` --------------------------------------------------------------------------------------
-//
-// Whichever way a plugin whose start failed ends, `run` returns an error. Its exit code, or the signal that killed it,
-// still names the error when it has one.
 
 /// The result of `run`, as a tag: what kind of error, or `ok`.
 fn run_result(result: crate::Result<()>) -> String {
@@ -2232,12 +2266,12 @@ async fn a_failure_decided_by_a_reader_aborted_at_the_bound_never_ends_ok() {
                     entered: entered_tx,
                     release: release_rx,
                 },
-                "p".into(),
                 freed,
                 shutdown.clone(),
                 ready_tx,
                 false,
                 None,
+                &ReadinessProbes::new("p", &shutdown),
             )
         };
         entered_rx.recv().expect("the reader started its read");
@@ -2290,9 +2324,7 @@ async fn a_failure_decided_by_a_reader_aborted_at_the_bound_never_ends_ok() {
 
 // A take-down leaves no descendant ------------------------------------------------------------------------------------
 //
-// Every take-down of a running plugin, on every containment, whether or not its exit can be watched, kills the plugin's
-// tree. Where the kill signals a process group id it happens while the root is unreaped, because the OS may recycle the
-// id the moment the root is reaped.
+// Every take-down of a running plugin kills its tree (see `end_reaped_plugin` for the process-group-id constraint).
 
 #[derive(Clone, Copy, Debug)]
 enum TakenDownBy {
@@ -2400,4 +2432,60 @@ async fn every_take_down_kills_the_plugins_tree() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+// A failure reported after readiness was decided ----------------------------------------------------------------------
+
+/// A failure the plugin reports once readiness is decided (a `ready` before it, or an earlier failure) cannot change
+/// the start, but it is not lost: it is logged naming the plugin and the event, whether or not a log sink is set.
+#[skuld::test]
+async fn a_failure_reported_after_readiness_was_decided_is_logged() {
+    tokio::time::pause();
+    let listen: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let ready = SitrepEvent::Ready {
+        listen,
+        transports: Transports::TCP,
+    };
+    let fatal = |detail: &str| SitrepEvent::Fatal {
+        detail: detail.into(),
+        errno: None,
+    };
+    // (stdout lines, level, text of the event that was ignored)
+    let rows = [
+        (
+            hello(SITREP_PROTOCOL) + &sitrep_line(&ready) + &sitrep_line(&fatal("late-fatal")),
+            "WARN",
+            "late-fatal",
+        ),
+        (
+            hello(SITREP_PROTOCOL)
+                + &sitrep_line(&ready)
+                + &sitrep_line(&SitrepEvent::BindConflict {
+                    errno: 98,
+                    addr: listen,
+                }),
+            "WARN",
+            "bind conflict on",
+        ),
+        (
+            hello(SITREP_PROTOCOL) + &sitrep_line(&fatal("first-fatal")) + &sitrep_line(&fatal("second-fatal")),
+            "DEBUG",
+            "second-fatal",
+        ),
+    ];
+    for (lines, level, text) in rows {
+        let (subscriber, writer) = subscriber();
+        let _g = set_default_in_current_thread(subscriber);
+        let (_ready_rx, reader, _shutdown, _failure) = sitrep_reader_over(&lines, false).await;
+        tokio::time::timeout(VIRTUAL_HANG, reader).await.unwrap().unwrap();
+
+        let log = writer.snapshot();
+        assert!(
+            log.lines().any(|l| l.contains(level)
+                && l.contains("eof-plugin")
+                && l.contains("already decided")
+                && l.contains(text)),
+            "{level} line naming the plugin, {text:?} and that readiness was decided is missing:\n{log}"
+        );
+    }
 }

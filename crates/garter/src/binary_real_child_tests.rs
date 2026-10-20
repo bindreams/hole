@@ -70,7 +70,9 @@ impl PluginTree for UnwatchableRoot {
     }
 }
 
-/// A real child whose exit is watched with `waitid(WNOWAIT)` alone, as on a kernel without `pidfd_open`.
+/// A real child whose exit is watched the way production watches it on a kernel without `pidfd_open`: cosca's watch
+/// answers `Unsupported`, and `root_exit_watch` falls back to `waitid(WNOWAIT)`. Everything but the answer cosca
+/// would have given is production's own code.
 #[cfg(target_os = "linux")]
 struct WaitidRoot(cosca::tokio::Child);
 
@@ -80,15 +82,10 @@ impl PluginTree for WaitidRoot {
         PluginTree::containment(&self.0)
     }
     async fn wait_root_exit(&self) -> Result<(), cosca::error::Error> {
-        crate::exit_watch::wait_exit_without_reaping(self.0.id().pid())
-            .await
-            .map_err(cosca::error::Error::Io)
+        crate::binary::root_exit_watch(self.0.id().pid(), Err(unwatchable())).await
     }
     async fn wait_root_exit_within(&self, grace: Duration) -> Result<bool, cosca::error::Error> {
-        match tokio::time::timeout(grace, self.wait_root_exit()).await {
-            Ok(watched) => watched.map(|()| true),
-            Err(_grace_over) => Ok(false),
-        }
+        crate::binary::root_exit_watch_within(self.0.id().pid(), grace, Err(unwatchable())).await
     }
     fn terminate(&self) -> Result<(), cosca::error::Error> {
         PluginTree::terminate(&self.0)
@@ -320,12 +317,12 @@ async fn decided_start_failure(shutdown: &CancellationToken) -> crate::binary::F
     let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
     let (reader, failure) = crate::binary::spawn_sitrep_stdout_reader(
         host_stdout,
-        "p".into(),
         freed,
         shutdown.clone(),
         ready_tx,
         false,
         None,
+        &crate::binary::ReadinessProbes::new("p", shutdown),
     );
     reader.await.unwrap();
     failure

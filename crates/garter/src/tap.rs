@@ -41,10 +41,16 @@
 //!    readiness sender but keeps running. Every failed start from here on (that
 //!    timeout, a listener outside the given address, a failure the inner reports
 //!    while running, the step-4 bind) cancels the inner's token, a child of
-//!    `shutdown`, and awaits the inner task before reporting: the output it is
-//!    still relaying is drained first, and the wait has no bound of its own,
-//!    since an inner must return once its token fires. `Error::Chain`
-//!    propagates.
+//!    `shutdown`, and waits for the inner task before reporting: the output it is
+//!    still relaying is drained first. The chain is still starting, so no
+//!    `drain_timeout` runs: the wait has a bound of its own, a `BinaryPlugin`
+//!    inner's whole take-down plus a second, which an inner that honours its
+//!    token never reaches. On expiry the tap
+//!    warns, naming the plugin, and aborts the inner. How the inner ended is
+//!    logged (an exit status at debug, a panic at warn) and otherwise dropped:
+//!    the failure being reported is the tap's. A start failure the tap has
+//!    reported is also its `run` error, so a runner with no `on_ready` sees the
+//!    chain fail. `Error::Chain` propagates.
 //! 4. Bind the tap's public listener on `local` (only after step 3, so the
 //!    public bind happens only once the data plane is actually wired
 //!    through), then report the tap's OWN readiness on the `ready` channel
@@ -56,7 +62,10 @@
 //!    stays alive with its listener gone breaks the sitrep contract (it must
 //!    exit); its forwarders then retry until it does.
 //! 6. On shutdown: abort all in-flight forwarders, await the inner task,
-//!    propagate its exit status as ours.
+//!    propagate its exit status as ours. If the accept loop fails instead, the
+//!    tap stops the inner as in step 3 and fails with an error naming the
+//!    accept failure. The inner task is aborted if the tap is dropped (the
+//!    chain's `drain_timeout` aborts it), so it never outlives the tap.
 //!
 //! License: this module is part of `garter` (Apache-2.0). The bridge
 //! (GPL-3.0-or-later) imports it; one-way Apache → GPL compatibility
@@ -74,6 +83,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::backoff::Backoff;
 use crate::counting::CountingStream;
@@ -89,6 +99,12 @@ static NEXT_TAP_CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// before the tap gives up. Mirrors [`crate::chain::ChainRunner`]'s 30s
 /// readiness budget for the outermost listener.
 const INNER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Failure bound on the wait for the inner to return after the tap cancelled its token to report a failed start. An
+/// inner must return once its token fires, so this expires only on an inner that does not: the tap then warns and
+/// aborts it. It outlasts a [`BinaryPlugin`](crate::BinaryPlugin) inner's own take-down, so that one is never cut off.
+pub(crate) const INNER_STOP_BOUND: Duration =
+    Duration::from_secs(crate::binary::TAKEDOWN_BOUND.as_secs() + crate::binary::TAKEDOWN_TAIL.as_secs());
 
 /// Decorator that wraps any [`ChainPlugin`] in a counting loopback hop.
 ///
@@ -113,6 +129,9 @@ pub struct TapPlugin {
     /// Replaces the forwarders' TCP connect, so a test can script the refusals the OS would return.
     #[cfg(test)]
     connector: Option<Connector>,
+    /// Fails the accept loop's first accept, as the OS does on fd exhaustion.
+    #[cfg(test)]
+    accept_failure: Option<io::Error>,
 }
 
 /// One attempt to find a free port: the address a probe bound, or its error.
@@ -134,7 +153,17 @@ impl TapPlugin {
             probe: None,
             #[cfg(test)]
             connector: None,
+            #[cfg(test)]
+            accept_failure: None,
         }
+    }
+
+    /// The accept failure a test scripted, if any.
+    fn take_accept_failure(&mut self) -> Option<io::Error> {
+        #[cfg(test)]
+        return self.accept_failure.take();
+        #[cfg(not(test))]
+        None
     }
 
     /// The scripted probe a test installed, if any.
@@ -169,6 +198,14 @@ impl TapPlugin {
             ..Self::wrap(inner)
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn wrap_with_accept_failure(inner: Box<dyn ChainPlugin>, failure: io::Error) -> Self {
+        Self {
+            accept_failure: Some(failure),
+            ..Self::wrap(inner)
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -191,6 +228,7 @@ impl ChainPlugin for TapPlugin {
         // 1. Allocate inner port (probe-and-drop, with bind-race retry).
         let probe = self.take_probe().unwrap_or_else(|| os_probe(local.ip()));
         let connector = self.take_connector();
+        let mut scripted_accept_failure = self.take_accept_failure();
         let inner_local = match allocate_inner_port_with(
             &plugin_name,
             local.ip(),
@@ -219,7 +257,12 @@ impl ChainPlugin for TapPlugin {
         let inner_stop = shutdown.child_token();
         let inner_shutdown = inner_stop.clone();
         let (inner_ready_tx, mut inner_ready_rx) = oneshot::channel();
-        let mut inner_handle = tokio::spawn(self.inner.run(inner_local, remote, inner_shutdown, inner_ready_tx));
+        let mut inner_handle = AbortOnDropHandle::new(tokio::spawn(self.inner.run(
+            inner_local,
+            remote,
+            inner_shutdown,
+            inner_ready_tx,
+        )));
 
         // 3. Wait for the inner plugin's readiness report, racing the inner
         //    task itself so an early plugin failure doesn't leave us blocked.
@@ -234,7 +277,7 @@ impl ChainPlugin for TapPlugin {
                 // The inner exited. A typed report sent just before the exit is still in the channel.
                 let typed = inner_ready_rx.try_recv().ok().and_then(Result::err);
                 report_start_failure(&plugin_name, ready, typed);
-                return join_result(&plugin_name, join);
+                return failed_start_result(&plugin_name, join);
             }
             () = shutdown.cancelled() => {
                 // Drop `ready` unsent (RecvError, matching the "shutdown
@@ -276,7 +319,7 @@ impl ChainPlugin for TapPlugin {
                     () = shutdown.cancelled() => return drain_inner(plugin_name.as_str(), inner_handle).await,
                     join = &mut inner_handle => {
                         report_start_failure(&plugin_name, ready, None);
-                        return join_result(&plugin_name, join);
+                        return failed_start_result(&plugin_name, join);
                     }
                     () = tokio::time::sleep_until(ready_deadline) => {
                         return inner_not_ready(&plugin_name, inner_local, ready, &inner_stop, inner_handle).await;
@@ -325,11 +368,12 @@ impl ChainPlugin for TapPlugin {
             enum Step {
                 Continue,
                 Break,
+                AcceptFailed(io::Error),
                 InnerExited(std::result::Result<crate::Result<()>, tokio::task::JoinError>),
             }
             let step = tokio::select! {
                 _ = shutdown.cancelled() => Step::Break,
-                accept = listener.accept() => match accept {
+                accept = accept_next(&listener, &mut scripted_accept_failure) => match accept {
                     Ok((inbound, peer)) => {
                         let inbound_token = shutdown.clone();
                         let connector = connector.clone();
@@ -338,13 +382,9 @@ impl ChainPlugin for TapPlugin {
                         });
                         Step::Continue
                     }
-                    Err(e) => {
-                        // accept() failure on a previously-bound listener
-                        // is unusual (FD exhaustion / kernel error) — log
-                        // and break so the inner plugin can exit cleanly.
-                        tracing::warn!(plugin = %plugin_name, error = %e, "plugin tap: accept failed");
-                        Step::Break
-                    }
+                    // accept() failure on a previously-bound listener is unusual (FD
+                    // exhaustion / kernel error): the tap can serve nothing more.
+                    Err(e) => Step::AcceptFailed(e),
                 },
                 // Inner exiting on its own (clean or error) is a terminal
                 // condition for the chain; surface its result.
@@ -353,6 +393,16 @@ impl ChainPlugin for TapPlugin {
             match step {
                 Step::Continue => continue,
                 Step::Break => break,
+                Step::AcceptFailed(e) => {
+                    tracing::warn!(plugin = %plugin_name, error = %e, "plugin tap: accept failed");
+                    drop(listener);
+                    connections.abort_all();
+                    while connections.join_next().await.is_some() {}
+                    stop_inner(&plugin_name, &inner_stop, inner_handle).await;
+                    return Err(crate::Error::Chain(format!(
+                        "tap[{plugin_name}]: accept on {listen_addr} failed: {e}"
+                    )));
+                }
                 Step::InnerExited(join) => {
                     drop(listener);
                     connections.abort_all();
@@ -373,17 +423,52 @@ impl ChainPlugin for TapPlugin {
     }
 }
 
+/// The next connection, or the failure a test scripted in its place.
+async fn accept_next(
+    listener: &TcpListener,
+    scripted_failure: &mut Option<io::Error>,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    match scripted_failure.take() {
+        Some(failure) => Err(failure),
+        None => listener.accept().await,
+    }
+}
+
 /// Stops a still-running inner through its own token and waits for it, so the output it is still
-/// relaying reaches the log before the caller hears of the failure. Unbounded, like [`drain_inner`]:
-/// [`ChainPlugin::run`] must return once its `shutdown` fires.
+/// relaying reaches the log before the caller hears of the failure.
+///
+/// The wait is bounded by [`INNER_STOP_BOUND`], a failure bound on external code: an inner must return once
+/// its token fires, and one that does not is warned about by name and aborted. The chain is still starting, so
+/// no `drain_timeout` runs to end it. The failure being reported is the tap's; how the inner ended is only logged.
 async fn stop_inner(
     plugin_name: &str,
     inner_stop: &CancellationToken,
-    inner_handle: tokio::task::JoinHandle<crate::Result<()>>,
+    mut inner_handle: AbortOnDropHandle<crate::Result<()>>,
 ) {
     inner_stop.cancel();
-    // The failure being reported is the tap's; how the inner ended adds nothing to it.
-    let _ = drain_inner(plugin_name, inner_handle).await;
+    let joined = match tokio::time::timeout(INNER_STOP_BOUND, &mut inner_handle).await {
+        Ok(joined) => joined,
+        Err(_bound_expired) => {
+            tracing::warn!(
+                plugin = %plugin_name,
+                "plugin tap: the inner did not stop within {INNER_STOP_BOUND:?} of being asked to; aborting it"
+            );
+            inner_handle.abort();
+            inner_handle.await
+        }
+    };
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!(
+            plugin = %plugin_name,
+            "plugin tap: the inner ended with {e} while the start failure was being reported"
+        ),
+        Err(je) if je.is_cancelled() => {}
+        Err(je) => tracing::warn!(
+            plugin = %plugin_name,
+            "plugin tap: the inner task panicked while it was being stopped: {je}"
+        ),
+    }
 }
 
 /// Ends a start whose inner did not report within [`INNER_READY_TIMEOUT`]: stops the inner and reports `Fatal`.
@@ -392,7 +477,7 @@ async fn inner_not_ready(
     inner_local: SocketAddr,
     ready: oneshot::Sender<Result<PluginReady, StartError>>,
     inner_stop: &CancellationToken,
-    inner_handle: tokio::task::JoinHandle<crate::Result<()>>,
+    inner_handle: AbortOnDropHandle<crate::Result<()>>,
 ) -> crate::Result<()> {
     stop_inner(plugin_name, inner_stop, inner_handle).await;
     let detail = format!("tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}");
@@ -424,7 +509,21 @@ fn join_result(plugin_name: &str, join: Result<crate::Result<()>, tokio::task::J
     }
 }
 
-async fn drain_inner(plugin_name: &str, inner_handle: tokio::task::JoinHandle<crate::Result<()>>) -> crate::Result<()> {
+/// [`join_result`] for an inner that ended before it was ready, after the tap reported the start failure on `ready`:
+/// an inner that ended `Ok` still failed the start, so the tap's `run` is an error too.
+fn failed_start_result(
+    plugin_name: &str,
+    join: Result<crate::Result<()>, tokio::task::JoinError>,
+) -> crate::Result<()> {
+    match join_result(plugin_name, join) {
+        Ok(()) => Err(crate::Error::Chain(format!(
+            "tap[{plugin_name}]: inner exited before becoming ready"
+        ))),
+        failed => failed,
+    }
+}
+
+async fn drain_inner(plugin_name: &str, inner_handle: AbortOnDropHandle<crate::Result<()>>) -> crate::Result<()> {
     match inner_handle.await {
         Ok(result) => result,
         Err(je) if je.is_cancelled() => Ok(()),

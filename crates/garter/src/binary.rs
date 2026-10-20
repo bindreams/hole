@@ -297,6 +297,7 @@ impl ChainPlugin for BinaryPlugin {
         // mode it parses sitrep events and IS the readiness source. Build
         // the right one per `self.readiness`.
         let stdout = child.stdout().expect("stdout was piped");
+        let probes = ReadinessProbes::new(&self.name, &shutdown);
         let (stdout_task, failure) = match self.readiness {
             ReadinessMode::Probe => {
                 // Tier-2: the stdout reader is a pure log passthrough; a
@@ -322,12 +323,12 @@ impl ChainPlugin for BinaryPlugin {
                 });
 
                 // Self-probe readiness. On a successful connect, report TCP
-                // readiness; on shutdown-first, drop `ready` unsent (the
-                // receiver gets RecvError: shutdown happened before readiness).
+                // readiness; once stopped (the chain's shutdown, or the plugin's end), drop
+                // `ready` unsent.
                 let probe_local = local;
-                let probe_shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    if let Some(addr) = crate::chain::poll_ready(probe_local, probe_shutdown).await {
+                let probe_stop = probes.token();
+                probes.spawn(async move {
+                    if let Some(addr) = crate::chain::poll_ready(probe_local, probe_stop).await {
                         let _ = ready.send(Ok(PluginReady {
                             listen: addr,
                             transports: crate::sitrep::Transports::TCP,
@@ -340,24 +341,24 @@ impl ChainPlugin for BinaryPlugin {
             ReadinessMode::ExpectSitrep => {
                 let (task, failure) = spawn_sitrep_stdout_reader(
                     stdout,
-                    self.name.clone(),
                     local,
                     shutdown.clone(),
                     ready,
                     false,
                     self.log_sink.clone(),
+                    &probes,
                 );
                 (task, Some(failure))
             }
             ReadinessMode::Auto => {
                 let (task, failure) = spawn_sitrep_stdout_reader(
                     stdout,
-                    self.name.clone(),
                     local,
                     shutdown.clone(),
                     ready,
                     true,
                     self.log_sink.clone(),
+                    &probes,
                 );
                 (task, Some(failure))
             }
@@ -365,7 +366,7 @@ impl ChainPlugin for BinaryPlugin {
 
         // If the child binds but never readies and is then shut down, the readiness sender is dropped
         // unsent and the aggregator synthesizes `Fatal{exited before ready}`.
-        let end = supervise_plugin(
+        let supervised = supervise_plugin(
             &self.name,
             &mut child,
             &shutdown,
@@ -374,8 +375,11 @@ impl ChainPlugin for BinaryPlugin {
             stderr_task,
             failure,
         )
-        .await?;
-        end.outcome(&self.name)
+        .await;
+        // A probe holds the readiness sender while it polls. It ends here, before `run` returns, so a plugin that
+        // exits before ready is seen by the chain as one that dropped its sender.
+        probes.end().await;
+        supervised?.outcome(&self.name)
     }
 }
 
@@ -389,12 +393,61 @@ impl ChainPlugin for BinaryPlugin {
 /// [`ProtocolSupport::FallBackToTier2`]: crate::sitrep::ProtocolSupport::FallBackToTier2
 type SharedReady = Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<PluginReady, StartError>>>>>;
 
+/// A plugin's self-probes: the tasks that connect to its `local` until it accepts. A probe holds the plugin's
+/// readiness sender while it polls, so the plugin's `run` must [`end`](Self::end) them before it returns: the chain
+/// reads a sender that is gone as a plugin that exited before ready.
+#[derive(Clone)]
+pub(crate) struct ReadinessProbes {
+    plugin: Arc<str>,
+    /// A child of the chain's shutdown, cancelled by [`end`](Self::end).
+    stop: CancellationToken,
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl ReadinessProbes {
+    pub(crate) fn new(plugin: &str, shutdown: &CancellationToken) -> Self {
+        Self {
+            plugin: plugin.into(),
+            stop: shutdown.child_token(),
+            tasks: Arc::default(),
+        }
+    }
+
+    /// A token that ends one probe: when it is cancelled, when the probes end, or on the chain's shutdown.
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.stop.child_token()
+    }
+
+    /// Starts a probe, unless the probes have ended already.
+    pub(crate) fn spawn(&self, probe: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.stop.is_cancelled() {
+            tasks.push(tokio::spawn(probe));
+        }
+    }
+
+    /// Stops every probe and waits for them to end. Once it returns no probe holds the readiness sender, and none
+    /// starts later.
+    pub(crate) async fn end(&self) {
+        let tasks = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.stop.cancel();
+            std::mem::take(&mut *tasks)
+        };
+        for probe in tasks {
+            if let Err(e) = probe.await {
+                tracing::warn!(plugin = %self.plugin, "a readiness probe did not end normally: {e}");
+            }
+        }
+    }
+}
+
 /// Spawn a tier-2 self-probe that, on a successful TCP connect to `local`,
 /// reports `PluginReady` (TCP-only) through the shared send-once sender.
 /// Shared by `ExpectSitrep`'s unknown-major fallback and `Auto`'s concurrent
 /// probe. `standdown` ends the probe early (without sending) when cancelled.
-fn spawn_shared_probe(local: SocketAddr, standdown: CancellationToken, shared: SharedReady) {
-    tokio::spawn(async move {
+fn spawn_shared_probe(local: SocketAddr, standdown: CancellationToken, shared: SharedReady, probes: &ReadinessProbes) {
+    probes.spawn(async move {
         if let Some(addr) = crate::chain::poll_ready(local, standdown).await {
             if let Some(tx) = shared.lock().await.take() {
                 let _ = tx.send(Ok(PluginReady {
@@ -413,17 +466,30 @@ struct HeldFailure {
 }
 
 /// The reader's side of a held failure: `ready` moves here, unsent, and `failed` is cancelled so the
-/// plugin is taken down. Does nothing once readiness is decided (a `ready`, or an earlier failure).
+/// plugin is taken down. Once readiness is decided (a `ready`, or an earlier failure) it changes nothing, and
+/// logs the failure it ignored: at warn when a `ready` had decided it, at debug after an earlier failure.
 ///
 /// A hold that is already gone (the supervision ended, or its future was dropped) leaves nobody to
 /// deliver the failure later, so it is sent at once: a decided failure is never dropped.
 async fn hold_failure(
+    plugin: &str,
     shared: &SharedReady,
     held: &mut Option<oneshot::Sender<HeldFailure>>,
     failed: &CancellationToken,
     error: StartError,
 ) {
     let Some(ready) = shared.lock().await.take() else {
+        // `held` is gone once a failure was held; it is still there if a `ready` took the sender.
+        match held {
+            Some(_) => tracing::warn!(
+                plugin = %plugin,
+                "the plugin reported a start failure after its readiness was already decided; ignored: {error}"
+            ),
+            None => tracing::debug!(
+                plugin = %plugin,
+                "the plugin reported another start failure after its readiness was already decided; ignored: {error}"
+            ),
+        }
         return;
     };
     let failure = HeldFailure { ready, error };
@@ -509,15 +575,16 @@ impl Drop for FailureHold {
 /// a stdout close the reader has not yet seen is the take-down's and no failure, whoever closed it: nothing
 /// orders the close against the take-down, and the caller asked for the shutdown. A failure the reader
 /// decided first, or a plugin whose root had already exited, keeps its failure. Either way the output is
-/// relayed. The reader keeps relaying lines until stdout closes. `shutdown` ends a probe the reader started.
+/// relayed. The reader keeps relaying lines until stdout closes. The probes it starts are `probes`, which end with
+/// `shutdown` or when the plugin's `run` ends them; the reader logs under their plugin's name.
 pub(crate) fn spawn_sitrep_stdout_reader(
     stdout: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    plugin_name: String,
     local: SocketAddr,
     shutdown: CancellationToken,
     ready: oneshot::Sender<Result<PluginReady, StartError>>,
     auto: bool,
     log_sink: Option<LogSink>,
+    probes: &ReadinessProbes,
 ) -> (tokio::task::JoinHandle<()>, FailureHold) {
     use crate::sitrep::{ProtocolSupport, SitrepEvent};
 
@@ -530,6 +597,8 @@ pub(crate) fn spawn_sitrep_stdout_reader(
         failed: failed.clone(),
         taken_down: taken_down.clone(),
     };
+    let probes = probes.clone();
+    let plugin_name = probes.plugin.to_string();
     let task = tokio::spawn(async move {
         let mut held = Some(held_tx);
         // Auto: run the self-probe concurrently from the start (mirrors the
@@ -537,10 +606,10 @@ pub(crate) fn spawn_sitrep_stdout_reader(
         // `hello` cancels `probe_standdown` so the probe defers to sitrep;
         // otherwise the probe readies the plugin (handles a non-sitrep plugin
         // that is silent on stdout — there is no first line to classify on).
-        // `probe_standdown` is a child of `shutdown`, so chain shutdown stops it.
-        let probe_standdown = shutdown.child_token();
+        // `probe_standdown` is a child of the probes' token, so the chain's shutdown and the plugin's end stop it.
+        let probe_standdown = probes.token();
         if auto {
-            spawn_shared_probe(local, probe_standdown.clone(), shared.clone());
+            spawn_shared_probe(local, probe_standdown.clone(), shared.clone(), &probes);
         }
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
@@ -584,7 +653,7 @@ pub(crate) fn spawn_sitrep_stdout_reader(
                                     // start it now. The reader continues only as a log
                                     // passthrough (it never sends readiness again).
                                     if !auto {
-                                        spawn_shared_probe(local, shutdown.clone(), shared.clone());
+                                        spawn_shared_probe(local, probes.token(), shared.clone(), &probes);
                                     }
                                     probe_owns_readiness = true;
                                     // Drain the rest of stdout as logs so the
@@ -604,16 +673,30 @@ pub(crate) fn spawn_sitrep_stdout_reader(
                                     detail: "sitrep ready reported empty transports (protocol violation)".into(),
                                     errno: None,
                                 };
-                                hold_failure(&shared, &mut held, &failed, error).await;
+                                hold_failure(&plugin_name, &shared, &mut held, &failed, error).await;
                             } else if let Some(tx) = shared.lock().await.take() {
                                 let _ = tx.send(Ok(PluginReady { listen, transports }));
                             }
                         }
                         Ok(Some(SitrepEvent::BindConflict { errno, addr })) if handshake_ok => {
-                            hold_failure(&shared, &mut held, &failed, StartError::BindConflict { errno, addr }).await;
+                            hold_failure(
+                                &plugin_name,
+                                &shared,
+                                &mut held,
+                                &failed,
+                                StartError::BindConflict { errno, addr },
+                            )
+                            .await;
                         }
                         Ok(Some(SitrepEvent::Fatal { detail, errno })) if handshake_ok => {
-                            hold_failure(&shared, &mut held, &failed, StartError::Fatal { detail, errno }).await;
+                            hold_failure(
+                                &plugin_name,
+                                &shared,
+                                &mut held,
+                                &failed,
+                                StartError::Fatal { detail, errno },
+                            )
+                            .await;
                         }
                         // log line / pre-handshake / unknown event → passthrough
                         _ => tracing::info!(plugin = %plugin_name, "{clean_line}"),
@@ -635,7 +718,7 @@ pub(crate) fn spawn_sitrep_stdout_reader(
                 detail: "plugin closed its sitrep stream before becoming ready".into(),
                 errno: None,
             };
-            hold_failure(&shared, &mut held, &failed, error).await;
+            hold_failure(&plugin_name, &shared, &mut held, &failed, error).await;
         }
     });
     (task, hold)
@@ -810,7 +893,8 @@ impl PluginTree for cosca::tokio::Child {
     }
 
     // cosca 0.3's job-object `wait_tree` future is `!Send` (it holds a raw `HANDLE` across its await), and
-    // `BinaryPlugin::run` must be `Send`.
+    // `BinaryPlugin::run` must be `Send`. Until cosca's wait is `Send` (bindreams/hole#1124), every take-down on
+    // Windows takes the fallback `drain_readers_after_exit` warns about.
     #[cfg(windows)]
     async fn wait_tree_drained(&self) -> Result<(), cosca::error::Error> {
         Err(cosca::error::Error::Unsupported {
@@ -837,6 +921,16 @@ impl PluginTree for cosca::tokio::Child {
 
 /// How long a plugin gets to exit on its own after being asked to, before it is killed.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The two waits on external code a [`BinaryPlugin`]'s take-down is made of: its root's [`SHUTDOWN_GRACE`], then its
+/// output's [`READER_EOF_BOUND`]. What waits for a plugin to stop by itself must wait at least this long.
+pub(crate) const TAKEDOWN_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(SHUTDOWN_GRACE.as_secs() + READER_EOF_BOUND.as_secs());
+
+/// Headroom over a [`TAKEDOWN_BOUND`] for the steps between and after its waits, which carry no bound of their own (the
+/// kills, the tree's drain, the reap): they are the OS's to finish. Each bound that waits on another takes this on top
+/// of the bound it waits on, so the waited-on one expires, and warns, first.
+pub(crate) const TAKEDOWN_TAIL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How a plugin's root came to its end.
 pub(crate) enum PluginEnd {
@@ -885,18 +979,12 @@ impl Supervised {
 /// Runs a started plugin to its end: waits for its root to exit, for `shutdown`, or for its sitrep
 /// reader to decide the start failed, then ends it so that its tree is killed while the root is still
 /// unreaped (see [`end_plugin`]). An exit that has already happened is reported as an exit even when a
-/// take-down was requested too: when the request wins the select, the root is probed once, without
-/// waiting, because the exit watch is `Pending` on its first poll even for a root that is already a
-/// zombie. A take-down ends a plugin that is still running; an exit that lands after the probe ends as
-/// one (see [`Takedown`]).
+/// take-down was requested too; a take-down ends a plugin that is still running (see [`Takedown`]).
 ///
-/// The exit watch is non-reaping. On Linux it is cosca's pidfd watch, or `waitid(WNOWAIT)` where
-/// `pidfd_open` is missing (before 5.3) or denied; either way every take-down of a running root kills
-/// its tree before the root is reaped, with the grace a shutdown or a failed start gives it. Only when
-/// no watch works can a root's exit be seen by reaping it alone. A root that exits by itself is then
-/// reaped first, and the tree is killed only where that stays safe (see [`end_reaped_plugin`]). A
-/// take-down that finds the exit unwatchable has no grace to give: the root is killed at once, then
-/// the tree, then the reap.
+/// The exit watch is non-reaping ([`root_exit_watch`]), so every take-down of a running root kills its
+/// tree before the root is reaped. Only when no watch works is a root reaped first, and its tree killed only
+/// where that stays safe (see [`end_reaped_plugin`]); a take-down then has no grace to give and kills the
+/// root at once.
 ///
 /// The returned [`Supervised`] says whether the start failed, which makes `run` return an error
 /// however the plugin ended (see [`Supervised::outcome`]).
@@ -1199,9 +1287,9 @@ async fn finish_plugin(
 /// is gone. Where the kernel owns the tree's membership, the tree's exit edge then has no bound: the
 /// kernel guarantees the members exit. The reader wait is bounded by [`READER_EOF_BOUND`] on every
 /// containment, because a pipe holder outside the tree (a process that left its cgroup, a handle
-/// duplicated into a process outside the job) outlives the drain. On expiry it warns that the output
-/// after this point was cut, aborts the readers (so their hold on the readiness sender drops) and waits
-/// for them to end.
+/// duplicated into a process outside the job) outlives the drain. See `wait_for_readers` for what its
+/// expiry does. An edge that cannot be awaited is warned about, once per call, and the reader wait alone
+/// then orders the output.
 pub(crate) async fn drain_readers_after_exit(
     plugin: &str,
     tree: &mut impl PluginTree,
@@ -1213,7 +1301,10 @@ pub(crate) async fn drain_readers_after_exit(
         Ok(()) => {
             if exit_edge_proves_the_tree_gone(containment) {
                 if let Err(e) = tree.wait_tree_drained().await {
-                    tracing::debug!(plugin = %plugin, "could not wait for the plugin's process tree to drain: {e}");
+                    tracing::warn!(
+                        plugin = %plugin,
+                        "the plugin's process tree drain cannot be observed ({e}); its output is waited for at most {READER_EOF_BOUND:?} instead"
+                    );
                 }
             }
         }

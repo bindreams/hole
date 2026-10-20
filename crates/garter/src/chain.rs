@@ -7,11 +7,21 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::backoff::Backoff;
+use crate::binary::TAKEDOWN_TAIL;
 use crate::plugin::ChainPlugin;
 use crate::shutdown;
 use crate::sitrep::{PluginReady, StartError, Transports};
+use crate::tap::INNER_STOP_BOUND;
 
 const MAX_PORT_RETRIES: usize = 3;
+
+/// The default [`ChainRunner::drain_timeout`]: longer than the longest take-down a member waits for, a [`TapPlugin`]
+/// stopping a `BinaryPlugin` inner ([`INNER_STOP_BOUND`]), so a member that needs all of its own bounds is waited for
+/// rather than aborted mid-take-down. The headroom makes that member's own warning come first.
+///
+/// [`TapPlugin`]: crate::TapPlugin
+pub(crate) const DEFAULT_DRAIN_TIMEOUT: Duration =
+    Duration::from_secs(INNER_STOP_BOUND.as_secs() + TAKEDOWN_TAIL.as_secs());
 
 /// Whole-chain readiness reported via [`ChainRunner::on_ready`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +186,7 @@ impl ChainRunner {
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
-            drain_timeout: Duration::from_secs(5),
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             ready_tx: None,
             external_cancel: None,
             mode: Mode::default(),
@@ -204,8 +214,17 @@ impl ChainRunner {
     /// `Err(Chain("drain timeout expired"))` — unless a plugin-level error
     /// was already captured, in which case that error takes precedence.
     /// The aborted tasks are joined before the function returns, so a
-    /// plugin that reports a start failure from its `Drop` is heard; any
-    /// other terminal error produced during the abort window is lost.
+    /// plugin that reports a start failure from its `Drop` is heard, and a
+    /// plugin that ends with an error or panics in the abort window is
+    /// recorded like any other exit.
+    ///
+    /// The default is 12 seconds. It must outlast the longest take-down a
+    /// plugin may need after a shutdown: a `BinaryPlugin` gives its child 5
+    /// seconds to exit and 5 to close its output, and a `TapPlugin` waits for
+    /// that plus a second for its inner, so a plugin that needs all of those
+    /// is waited for, not aborted mid-take-down. The default is that wait plus
+    /// a second. A smaller value cuts such a plugin off mid-take-down, and its
+    /// last output is lost.
     ///
     /// It is also the bound on the wait that precedes the caller's release
     /// (see [`ChainRunner::on_ready`]): a start failure is delivered, or the
@@ -235,7 +254,7 @@ impl ChainRunner {
     /// If shutdown fires before every plugin has readied, the receiver gets the first `StartError` a plugin had
     /// delivered by the time every plugin returned (in plugin order), and `RecvError` if none had. While the chain
     /// runs the plugins are awaited in order, so a failure behind one that never readies is not seen until the
-    /// chain ends (bindreams/hole#794). Only `Ok(ChainReady)` is sent at once: every other outcome, `RecvError`
+    /// chain ends. Only `Ok(ChainReady)` is sent at once: every other outcome, `RecvError`
     /// included, reaches the caller after every plugin has returned or `drain_timeout` has expired.
     pub fn on_ready(mut self, tx: oneshot::Sender<Result<ChainReady, StartError>>) -> Self {
         self.ready_tx = Some(tx);
@@ -399,8 +418,14 @@ impl ChainRunner {
                 tracing::warn!("drain timeout expired, aborting remaining plugins");
                 set.abort_all();
                 // Aborting drops each plugin's future, and a plugin may deliver a start failure it decided from
-                // that drop: wait for the drops, so the gate below finds the failure.
-                while set.join_next().await.is_some() {}
+                // that drop: wait for the drops, so the gate below finds the failure. A task cancelled by the abort
+                // is expected; anything else (an error, a panic) is an exit like any other.
+                while let Some(result) = set.join_next().await {
+                    if matches!(&result, Err(join_err) if join_err.is_cancelled()) {
+                        continue;
+                    }
+                    record_exit(result, &mut first_error, &shutdown);
+                }
                 // A plugin-level error (if captured before drain) is more
                 // diagnostic than the drain-timeout error, so it takes
                 // precedence.
@@ -435,9 +460,8 @@ pub(crate) enum Readiness {
 /// The sole owner of the caller's `ready` sender, and the one place that decides what the caller is told. A ready
 /// chain is reported at once; every other end (a start failure, a cancel, a member that kept `ready` until it was
 /// stopped) releases the sender only through [`ReadyGate::release`], which [`ChainRunner::run`] calls once every
-/// member's `run` has returned or been given up on at `drain_timeout`. A caller that sees the sender sent or closed
-/// has therefore seen everything the members relayed first, and a failure a member decided and delivered while it
-/// stopped is found by the release, whichever way the chain ended.
+/// member's `run` has returned or been given up on at `drain_timeout`. A failure a member decided and delivered while
+/// it stopped is found by the release, whichever way the chain ended.
 pub(crate) struct ReadyGate {
     ready_tx: Option<oneshot::Sender<Result<ChainReady, StartError>>>,
     failure: Option<StartError>,

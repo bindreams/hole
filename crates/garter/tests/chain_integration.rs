@@ -1522,6 +1522,120 @@ async fn a_shutdown_before_ready_is_not_a_start_failure() {
     );
 }
 
+// A probe-owned plugin that exits before ready ========================================================================
+
+/// A plugin whose readiness a self-probe owns (`Probe`; `Auto` without a supported `hello`; `ExpectSitrep` after an
+/// unknown protocol major handed readiness to the probe) that exits before it is ready is reported to the caller as
+/// the typed `Fatal`, and `run` returns the plugin's exit. The probe task holds the readiness sender, so it must be
+/// gone by the time the plugin's `run` returns.
+#[skuld::test]
+async fn a_probe_owned_plugin_that_exits_before_ready_reports_the_typed_fatal() {
+    use garter::binary::ReadinessMode;
+
+    let mut wrong = Vec::new();
+    for (mode, env_knobs) in [
+        (ReadinessMode::Probe, &[("MOCK_PLUGIN_NO_SITREP", "1")][..]),
+        (ReadinessMode::Auto, &[("MOCK_PLUGIN_NO_SITREP", "1")][..]),
+        (ReadinessMode::ExpectSitrep, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
+        (ReadinessMode::Auto, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
+    ] {
+        let label = format!("{mode:?}, {env_knobs:?}");
+        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let chain_local = chain_listener.local_addr().unwrap();
+        drop(chain_listener);
+
+        let mut plugin = BinaryPlugin::new(mock_plugin_path(), None)
+            .readiness(mode)
+            .env("MOCK_PLUGIN_FAIL", "fatal");
+        for (k, v) in env_knobs {
+            plugin = plugin.env(*k, *v);
+        }
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = ChainRunner::new()
+            .add(Box::new(plugin))
+            .on_ready(ready_tx)
+            .drain_timeout(Duration::from_secs(30));
+        let env = PluginEnv {
+            local_host: chain_local.ip(),
+            local_port: chain_local.port(),
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 9,
+            plugin_options: None,
+        };
+        let run = runner.run(env).await;
+        let heard = ready_rx.await;
+
+        let typed = matches!(
+            &heard,
+            Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")
+        );
+        let exit = matches!(&run, Err(garter::Error::PluginExit { code: 1, .. }));
+        if !(typed && exit) {
+            wrong.push(format!("{label}: run = {run:?}, on_ready = {heard:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} rows are wrong:
+{}",
+        wrong.len(),
+        wrong.join(
+            "
+"
+        )
+    );
+}
+
+/// The same plugins, run without a chain: when `run` returns, no probe task still holds the readiness sender. This is
+/// the guarantee the chain's reading of an exit rests on; nothing here yields after `run` returns, so a probe that
+/// had only been told to stop, not joined, would still hold it.
+#[skuld::test]
+async fn a_probe_owned_plugin_that_exits_before_ready_has_dropped_its_sender_when_run_returns() {
+    use garter::binary::ReadinessMode;
+    use garter::ChainPlugin;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    let mut wrong = Vec::new();
+    for (mode, env_knobs) in [
+        (ReadinessMode::Probe, &[("MOCK_PLUGIN_NO_SITREP", "1")][..]),
+        (ReadinessMode::Auto, &[("MOCK_PLUGIN_NO_SITREP", "1")][..]),
+        (ReadinessMode::ExpectSitrep, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
+        (ReadinessMode::Auto, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
+    ] {
+        let label = format!("{mode:?}, {env_knobs:?}");
+        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = chain_listener.local_addr().unwrap();
+        drop(chain_listener);
+
+        let mut plugin = BinaryPlugin::new(mock_plugin_path(), None)
+            .readiness(mode)
+            .env("MOCK_PLUGIN_FAIL", "fatal");
+        for (k, v) in env_knobs {
+            plugin = plugin.env(*k, *v);
+        }
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        let run = Box::new(plugin)
+            .run(
+                local,
+                "127.0.0.1:9".parse().unwrap(),
+                tokio_util::sync::CancellationToken::new(),
+                ready_tx,
+            )
+            .await;
+
+        let seen = ready_rx.try_recv();
+        if !(run.is_err() && matches!(seen, Err(TryRecvError::Closed))) {
+            wrong.push(format!("{label}: run = {run:?}, ready = {seen:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} rows are wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 fn main() {
     skuld::run_all();
 }
