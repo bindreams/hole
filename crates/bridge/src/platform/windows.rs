@@ -16,7 +16,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use crate::cutover::scm_wait::call_error::{ScmCall, ServiceGone};
 use crate::cutover::scm_wait::repair::{self, InstallStart, RepairStep};
 use crate::cutover::scm_wait::retire::{retire_over, Disposition};
-use crate::disable_record::{self, DisabledBy, RecordState};
+use crate::disable_record::DisabledBy;
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
 use crate::service_stop::{self, StopPhase, StopProgress};
 
@@ -723,11 +723,11 @@ fn open_error_is_absent(e: &windows_service::Error) -> bool {
 /// says what it found ([`repair::repair`]): the Disabled start type an
 /// interrupted uninstall left is reset to automatic and the record cleared; a
 /// Disabled start type with no record is an administrator's and is left, and
-/// the caller does not start the service. With no service registered, a record
-/// left over is cleared.
+/// the caller does not start the service. With no service registered there is
+/// nothing to repair: the record lived in the service's key.
 pub fn repair_interrupted_uninstall() -> std::io::Result<RepairStep> {
     let Some(mut session) = RepairSession::open(REPAIR_ACCESS)? else {
-        return clear_record_of_absent_service();
+        return Ok(RepairStep::Nothing);
     };
     let step = repair::repair(&mut session).map_err(std::io::Error::other)?;
     match step {
@@ -741,21 +741,6 @@ pub fn repair_interrupted_uninstall() -> std::io::Result<RepairStep> {
         RepairStep::LeaveDisabled => info!("the service is disabled on this computer, and is left disabled"),
     }
     Ok(step)
-}
-
-/// A record over a service the SCM has no entry for is stale: the delete that
-/// the record covered finished.
-fn clear_record_of_absent_service() -> std::io::Result<RepairStep> {
-    let state_dir = crate::cutover::service_state_dir();
-    match disable_record::record_state(&state_dir) {
-        RecordState::Absent => Ok(RepairStep::Nothing),
-        RecordState::Present => {
-            if let Err(e) = disable_record::clear(&state_dir) {
-                warn!(error = %e, "could not clear the record that the uninstall disabled the service");
-            }
-            Ok(RepairStep::ClearRecordOnly)
-        }
-    }
 }
 
 /// Who disabled the service, if it is disabled, for an elevated caller: an

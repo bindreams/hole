@@ -3,7 +3,6 @@
 //! the delete, the state query and the wait for the service's process.
 
 use std::io;
-use std::path::PathBuf;
 
 use tracing::info;
 use windows::core::PCWSTR;
@@ -27,7 +26,7 @@ use crate::cutover::scm_wait::retire::{
 };
 use crate::cutover::scm_wait::settle::StopActor;
 use crate::cutover::scm_wait::Observed;
-use crate::disable_record::{self, RecordState};
+use crate::disable_record::{RecordKey, RecordState};
 
 /// One service handle, opened before anything is changed, carries the
 /// hardening writes and the delete; the delete only marks the service, so it
@@ -39,7 +38,7 @@ pub struct RetireSession {
     /// The stop wait.
     stop: StopSession,
     /// Where the record that an uninstall disabled the service lives.
-    state_dir: PathBuf,
+    record: RecordKey,
 }
 
 /// The rights the session's handle is opened with: exactly those its calls
@@ -70,7 +69,7 @@ impl RetireSession {
         Ok(Opening::Opened(Self {
             service,
             stop,
-            state_dir: crate::cutover::service_state_dir(),
+            record: RecordKey::service(),
         }))
     }
 }
@@ -145,11 +144,11 @@ impl StartConfig for RetireSession {
     }
 
     fn record_state(&mut self) -> RecordState {
-        disable_record::record_state(&self.state_dir)
+        self.record.state()
     }
 
     fn clear_record(&mut self) -> io::Result<()> {
-        disable_record::clear(&self.state_dir)
+        self.record.clear()
     }
 }
 
@@ -171,7 +170,7 @@ impl ServiceSession for RetireSession {
     }
 
     fn write_record(&mut self) -> io::Result<()> {
-        disable_record::write(&self.state_dir)
+        self.record.write()
     }
 }
 

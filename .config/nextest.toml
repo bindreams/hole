@@ -228,7 +228,7 @@ filter = 'test(/cutover_global_net_state_uninstall_smoke_whichever_side_of_the_s
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.overrides]]
-filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|probe|uninstall|ensure_stopped|cutover_stop|at_every_step_of|an_administrators_disable|repair|the_service_dacl|the_state_dir_record)_/)'
+filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|probe|uninstall|ensure_stopped|cutover_stop|at_every_step_of|an_administrators_disable|repair|the_service_dacl|the_service_key|the_record_dies)_/)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

@@ -2,7 +2,6 @@
 //! of whether the service is disabled.
 
 use std::io;
-use std::path::PathBuf;
 
 use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
 use windows_service::service::{Service, ServiceAccess};
@@ -12,7 +11,7 @@ use super::retire_session::{read_start_type, write_start_type};
 use super::{open_error_is_absent, scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::ScmCall;
 use crate::cutover::scm_wait::retire::{StartConfig, StartType, StartWrite};
-use crate::disable_record::{self, RecordState};
+use crate::disable_record::{RecordKey, RecordState};
 
 /// The rights a read of the start type needs, and all an unprivileged caller
 /// (the GUI) is asked for.
@@ -24,10 +23,10 @@ pub(super) const REPAIR_ACCESS: ServiceAccess = ServiceAccess::QUERY_CONFIG.unio
 /// The rights an enable needs: a repair's, and the start.
 pub(super) const ENABLE_ACCESS: ServiceAccess = REPAIR_ACCESS.union(ServiceAccess::START);
 
-/// An open `HoleBridge` service and the directory its record lives in.
+/// An open `HoleBridge` service and the key its record lives in.
 pub(super) struct RepairSession {
     service: Service,
-    state_dir: PathBuf,
+    record: RecordKey,
 }
 
 impl RepairSession {
@@ -38,7 +37,7 @@ impl RepairSession {
         match manager.open_service(SERVICE_NAME, access) {
             Ok(service) => Ok(Some(Self {
                 service,
-                state_dir: crate::cutover::service_state_dir(),
+                record: RecordKey::service(),
             })),
             Err(e) if open_error_is_absent(&e) => Ok(None),
             Err(e) => Err(scm_failure(ScmCall::OpenService, e)),
@@ -75,11 +74,11 @@ impl StartConfig for RepairSession {
     }
 
     fn record_state(&mut self) -> RecordState {
-        disable_record::record_state(&self.state_dir)
+        self.record.state()
     }
 
     fn clear_record(&mut self) -> io::Result<()> {
-        disable_record::clear(&self.state_dir)
+        self.record.clear()
     }
 }
 

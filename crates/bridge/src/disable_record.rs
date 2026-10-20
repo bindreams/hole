@@ -8,66 +8,26 @@
 //! its presence tells the two apart: present, the disable is ours and the
 //! elevated paths undo it; absent, nothing here changes a Disabled service.
 //!
-//! The file is a [`Role::Decision`]: a hint about wording and about whether to
-//! repair without asking. A record that is corrupt, newer, or fails to read
-//! with an I/O error still counts as present, because only a Hole release
-//! writes the state directory, and never blocks an uninstall, an install, a
-//! cutover or a connect. [`clear`] moves one that cannot be read aside.
+//! On Windows the record is a value in the service's own registry key
+//! ([`RecordKey`]), so it dies with the service and an unprivileged reader can
+//! see it. A record that cannot be read counts as present, and the record
+//! never blocks an uninstall, an install, a cutover or a connect.
 //!
-//! Neither [`write`] nor [`clear`] takes a lock. Two overlapping retirements
-//! can clear a record the other still needs; the service then reads as an
+//! Neither write nor clear takes a lock. Two overlapping retirements can clear
+//! a record the other still needs; the service then reads as an
 //! administrator's, which the GUI still offers to enable.
 
-use std::io;
-use std::path::Path;
-
-use serde::{Deserialize, Serialize};
-use util::versioned_file::{
-    DefaultPlacement, Loaded, Obsolete, Removal, Role, Schema, StoreError, VersionedFile, VersionedState,
-};
-
-/// The record. It has no content: its presence is the fact.
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct DisableRecord {}
-
-impl Schema for DisableRecord {
-    const VERSION: u32 = 1;
-    type Prev = Obsolete<0>;
-    fn upgrade(prev: Obsolete<0>) -> Self {
-        match prev {}
-    }
-}
-
-impl VersionedState for DisableRecord {
-    const FILE_NAME: &'static str = "bridge-service-disabled.json";
-    const ROLE: Role = Role::Decision;
-}
-
-util::assert_contiguous!(DisableRecord);
+#[cfg(windows)]
+#[path = "disable_record/record_key.rs"]
+mod record_key;
+#[cfg(windows)]
+pub use record_key::RecordKey;
 
 /// Whether the record is there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordState {
     Absent,
     Present,
-}
-
-impl RecordState {
-    /// What reading the record found. Only an absent file is absent: one that
-    /// is there but cannot be interpreted or read is present, so reading it as
-    /// absent never words a service the uninstall disabled as an
-    /// administrator's, and a record that cannot be read never fails a path
-    /// that must go on. The read has already logged why.
-    pub fn of(loaded: Loaded<DisableRecord>) -> RecordState {
-        match loaded {
-            Loaded::Absent => RecordState::Absent,
-            Loaded::Unreadable(_) => RecordState::Present,
-            Loaded::Corrupt { .. } => RecordState::Present,
-            Loaded::Obsolete { .. } => RecordState::Present,
-            Loaded::Newer { .. } => RecordState::Present,
-            Loaded::Current { .. } => RecordState::Present,
-        }
-    }
 }
 
 /// Who disabled the service, as far as the record can say.
@@ -85,36 +45,6 @@ impl DisabledBy {
             RecordState::Present => DisabledBy::InterruptedUninstall,
             RecordState::Absent => DisabledBy::Elsewhere,
         }
-    }
-}
-
-fn file(state_dir: &Path) -> VersionedFile<DisableRecord> {
-    VersionedFile::new(state_dir)
-}
-
-/// Whether the record is in `state_dir`.
-pub fn record_state(state_dir: &Path) -> RecordState {
-    RecordState::of(file(state_dir).load())
-}
-
-/// Writes the record, over one that cannot be read after backing it up.
-pub fn write(state_dir: &Path) -> io::Result<()> {
-    file(state_dir)
-        .store(&DisableRecord {}, &DefaultPlacement::default())
-        .map_err(|error| match error {
-            StoreError::Io(error) => error,
-            other => io::Error::other(other),
-        })
-}
-
-/// Removes the record, or moves one that cannot be read aside. Nothing to
-/// remove is success.
-pub fn clear(state_dir: &Path) -> io::Result<()> {
-    match file(state_dir).remove()? {
-        Removal::Removed => Ok(()),
-        Removal::Absent => Ok(()),
-        Removal::MovedAside(_) => Ok(()),
-        Removal::Kept => unreachable!("a Role::Decision file is removed or moved aside, never kept"),
     }
 }
 

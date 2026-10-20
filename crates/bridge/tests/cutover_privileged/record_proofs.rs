@@ -6,23 +6,24 @@
 //! - an administrator's Disabled start type survives `ensure_stopped`;
 //! - the repair resets only what the record says is ours;
 //! - an unprivileged reader can query the service's start type and read the
-//!   record file as installed, which is what the GUI's status does.
+//!   record, a value in the service's registry key, as installed, which is what
+//!   the GUI's status does.
 //!
-//! The recording hook and the assertions read the SCM and the state directory
-//! through handles of their own, so what they see is what the GUI would see.
+//! The recording hook and the assertions read the SCM and the registry through
+//! handles of their own, so what they see is what the GUI would see.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 use hole_bridge::cutover::os::CutoverOs;
 use hole_bridge::cutover::scm_wait::repair::RepairStep;
 use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
-use hole_bridge::disable_record::{self, DisabledBy, RecordState};
+use hole_bridge::disable_record::{DisabledBy, RecordKey, RecordState};
 use hole_bridge::platform::os::{self, SERVICE_NAME};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
+    ConvertStringSidToSidW, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SE_REGISTRY_KEY,
     TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
@@ -44,10 +45,6 @@ fn os_actor() -> WindowsCutoverOs {
         images: vec![],
         target_version: "test".into(),
     }
-}
-
-fn state_dir() -> PathBuf {
-    hole_bridge::cutover::service_state_dir()
 }
 
 // The test's own reads and writes =====================================================================================
@@ -97,16 +94,16 @@ fn set_start_type(to: ServiceStartType) {
 }
 
 fn record() -> RecordState {
-    disable_record::record_state(&state_dir())
+    RecordKey::service().state()
 }
 
 fn clear_record() {
-    disable_record::clear(&state_dir()).expect("clear the record");
+    RecordKey::service().clear().expect("clear the record");
 }
 
+/// Needs the service to exist: the record is a value in its key.
 fn write_record() {
-    std::fs::create_dir_all(state_dir()).expect("the state directory exists");
-    disable_record::write(&state_dir()).expect("write the record");
+    RecordKey::service().write().expect("write the record");
 }
 
 /// Leaves no record behind, whatever the test did.
@@ -114,7 +111,7 @@ struct RecordCleanup;
 
 impl Drop for RecordCleanup {
     fn drop(&mut self) {
-        let _ = disable_record::clear(&state_dir());
+        let _ = RecordKey::service().clear();
     }
 }
 
@@ -283,15 +280,20 @@ fn cutover_global_net_state_repair_resets_only_what_the_record_says_is_ours() {
     }
 }
 
-/// A record over a service the SCM has no entry for is swept; with no record
-/// there is nothing to do.
+/// Proves: the record is a value in the service's own key, so it goes with the
+/// service and nothing has to sweep it: after the service is deleted the record
+/// reads absent and the repair has nothing to do. Red under: the record kept
+/// anywhere the service's deletion does not reach.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_repair_sweeps_a_record_over_no_service() {
-    ProvisionedService::require_no_leftover();
+fn cutover_global_net_state_the_record_dies_with_its_service() {
     let _record = RecordCleanup;
+    let service = ProvisionedService::install(helper());
     write_record();
+    assert_eq!(record(), RecordState::Present);
 
-    assert_eq!(os::repair_interrupted_uninstall().unwrap(), RepairStep::ClearRecordOnly);
+    // Returns once the SCM has no entry for the service.
+    drop(service);
+
     assert_eq!(record(), RecordState::Absent);
     assert_eq!(os::repair_interrupted_uninstall().unwrap(), RepairStep::Nothing);
     assert_eq!(os::disabled_state(), None, "no service is not a disabled service");
@@ -316,14 +318,25 @@ fn describe_start_type_read() -> String {
     }
 }
 
+/// The service's registry key as a reader with query access finds it: whether
+/// it opens, and the `DeleteFlag` value the SCM keeps there.
+fn describe_key_read() -> String {
+    let path = format!(r"SYSTEM\CurrentControlSet\Services\{SERVICE_NAME}");
+    match windows_registry::LOCAL_MACHINE.open(path) {
+        Ok(key) => format!("the key opens, DeleteFlag {:?}", key.get_u32("DeleteFlag")),
+        Err(e) => format!("the key is refused: {e:?}"),
+    }
+}
+
 /// Measurement: what the GUI's reads say about the entry a deregistration
-/// leaves. `Deregister` leaves the start type Disabled and clears the record
-/// before the delete, and the entry stays listed while any handle is open, so
-/// the service here is Disabled, has no record and is marked for deletion
-/// while the test's handle keeps it. If `QueryServiceConfig` answers Disabled,
-/// `disabled_state()` is `Some(Elsewhere)` and the GUI's status for a service
-/// that is being removed is `Disabled(Elsewhere)`; if it refuses, the status
-/// is `Installed`.
+/// leaves, and what happens to the record in the service's key. The service
+/// here is Disabled, has a record and is marked for deletion while the test's
+/// handle keeps it. If `QueryServiceConfig` answers Disabled and the record
+/// still reads present, `disabled_state()` is `Some(InterruptedUninstall)` and
+/// the GUI's status for a service that is being removed is
+/// `Disabled(InterruptedUninstall)`; if the key is gone or the read refused,
+/// the record reads as the key says (absent for a missing key, present for a
+/// refusal).
 ///
 /// The status is `hole::setup::bridge_install_status_with` over exactly the
 /// three probes printed here: not installed, then running, then
@@ -334,14 +347,16 @@ fn describe_start_type_read() -> String {
 fn cutover_global_net_state_probe_marked_service_start_type_read() {
     let _record = RecordCleanup;
     let _service = ProvisionedService::install(helper());
-    clear_record();
     set_start_type(ServiceStartType::Disabled);
+    write_record();
     let holder = super::open_to_delete();
     super::mark_for_deletion(&holder);
 
     let read = describe_start_type_read();
     eprintln!(
-        "MARKED ANSWER: {read}. is_installed: {}. is_running: {}. disabled_state(): {:?}. disabled_by(): {:?}.",
+        "MARKED ANSWER: {read}. {}. record: {:?}. is_installed: {}. is_running: {}. disabled_state(): {:?}. disabled_by(): {:?}.",
+        describe_key_read(),
+        record(),
         os::is_installed(),
         os::is_running(),
         os::disabled_state(),
@@ -459,29 +474,20 @@ fn cutover_global_net_state_the_service_dacl_lets_an_interactive_user_query_its_
     );
 }
 
-/// Proves: the record the retirement writes into the state directory `install()`
-/// creates is readable by a standard user (`FILE_READ_DATA`), so the GUI can
-/// tell an interrupted uninstall's disable from an administrator's. Red under:
-/// a state directory whose inheritance is cut and that grants Users nothing.
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_the_state_dir_record_is_readable_by_users() {
-    ProvisionedService::require_no_leftover();
-    let _service = ProvisionedService;
-    let _record = RecordCleanup;
-    os::install(helper()).expect("install the service, which creates the state directory");
-    write_record();
-
-    let path: Vec<u16> = state_dir()
-        .join("bridge-service-disabled.json")
-        .as_os_str()
-        .encode_wide_nul();
+/// The DACL of the service's registry key, and the rights the groups of a
+/// standard user are granted on it between them.
+fn service_key_user_rights() -> u32 {
+    let path: Vec<u16> = format!(r"MACHINE\SYSTEM\CurrentControlSet\Services\{SERVICE_NAME}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut acl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `path` is NUL-terminated and outlives the call; the descriptor is freed below.
     let status = unsafe {
         GetNamedSecurityInfoW(
             PCWSTR(path.as_ptr()),
-            SE_FILE_OBJECT,
+            SE_REGISTRY_KEY,
             DACL_SECURITY_INFORMATION,
             None,
             None,
@@ -490,27 +496,57 @@ fn cutover_global_net_state_the_state_dir_record_is_readable_by_users() {
             &mut descriptor,
         )
     };
-    assert_eq!(status, ERROR_SUCCESS, "read the record file's DACL");
+    assert_eq!(status, ERROR_SUCCESS, "read the service key's DACL");
 
-    let rights = user_rights("record file", acl);
+    let rights = user_rights("service key", acl);
     // SAFETY: the descriptor was allocated by `GetNamedSecurityInfoW`, which asks for `LocalFree`.
     let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
-    const FILE_READ_DATA: u32 = 0x1;
+    rights
+}
+
+/// Proves: a standard user can read a value in the registry key of a service
+/// made by the production `install()` (`KEY_QUERY_VALUE`), so the GUI can tell
+/// an interrupted uninstall's disable from an administrator's. If this fails
+/// the GUI cannot tell the two apart unprivileged, and the design returns to
+/// the owner. Red under: a security descriptor on the key that grants Users
+/// nothing.
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_the_service_key_lets_an_interactive_user_read_the_record() {
+    ProvisionedService::require_no_leftover();
+    let _service = ProvisionedService;
+    let _record = RecordCleanup;
+    os::install(helper()).expect("install the service, which makes its key");
+    write_record();
+
+    let rights = service_key_user_rights();
+    const KEY_QUERY_VALUE: u32 = 0x1;
     assert_ne!(
-        rights & FILE_READ_DATA,
+        rights & KEY_QUERY_VALUE,
         0,
-        "a standard user cannot read the record file ({rights:#010x}): the GUI cannot tell whose disable it is"
+        "a standard user cannot read the record ({rights:#010x}): the GUI cannot tell whose disable it is"
     );
 }
 
-/// `OsStr` to the NUL-terminated UTF-16 the Win32 calls take.
-trait EncodeWideNul {
-    fn encode_wide_nul(&self) -> Vec<u16>;
-}
+/// Proves: a standard user cannot write the service's key, so the record is
+/// Hole's to make: a value (or a subkey, or the key's security) a user could
+/// set would let any user forge "an uninstall disabled this". Red under: a
+/// security descriptor on the key that grants Users write.
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_the_service_key_refuses_an_interactive_user_a_write() {
+    ProvisionedService::require_no_leftover();
+    let _service = ProvisionedService;
+    os::install(helper()).expect("install the service, which makes its key");
 
-impl EncodeWideNul for std::ffi::OsStr {
-    fn encode_wide_nul(&self) -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        self.encode_wide().chain(std::iter::once(0)).collect()
-    }
+    let rights = service_key_user_rights();
+    const KEY_SET_VALUE: u32 = 0x2;
+    const KEY_CREATE_SUB_KEY: u32 = 0x4;
+    const DELETE: u32 = 0x1_0000;
+    const WRITE_DAC: u32 = 0x4_0000;
+    const WRITE_OWNER: u32 = 0x8_0000;
+    let write = KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE | WRITE_DAC | WRITE_OWNER;
+    assert_eq!(
+        rights & write,
+        0,
+        "a standard user is granted write rights ({rights:#010x})"
+    );
 }
