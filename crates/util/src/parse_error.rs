@@ -44,8 +44,25 @@ impl From<&serde_json::Error> for ParseFailure {
     }
 }
 
+impl ParseFailure {
+    /// A failure that is not a `serde_json` error: a rule the document
+    /// breaks although it parses. `reason` is a fixed label, never input.
+    pub const fn framing(reason: &'static str) -> Self {
+        Self {
+            kind: reason,
+            line: 0,
+            column: 0,
+        }
+    }
+}
+
 impl std::fmt::Display for ParseFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Line 0 means "no position": `serde_json::from_value` and
+        // `ParseFailure::framing` have no source text to point into.
+        if self.line == 0 {
+            return f.write_str(self.kind);
+        }
         write!(f, "{} (line {}, column {})", self.kind, self.line, self.column)
     }
 }

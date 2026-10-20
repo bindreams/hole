@@ -56,3 +56,18 @@ fn each_category_gets_its_own_label() {
     // `contains("line 1")` that any wording would satisfy.
     assert_eq!(describe_parse_error(&data), "data error (line 1, column 3)");
 }
+
+/// A failure that is not a `serde_json` error (a framing rule broken by an
+/// otherwise well-formed document) has a reason and no position to report.
+#[skuld::test]
+fn a_framing_failure_names_its_reason_without_a_position() {
+    let failure = super::ParseFailure::framing("version is not a positive integer");
+    assert_eq!(failure.to_string(), "version is not a positive integer");
+}
+
+/// A positionless error must not print "line 0, column 0".
+#[skuld::test]
+fn a_failure_without_a_position_does_not_print_one() {
+    let e = serde_json::from_value::<u32>(serde_json::json!("x")).expect_err("must not parse");
+    assert_eq!(super::describe_parse_error(&e), "data error");
+}

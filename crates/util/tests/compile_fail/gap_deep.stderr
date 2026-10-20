@@ -1,0 +1,23 @@
+error[E0080]: evaluation panicked: migration chain has a gap
+ --> $RUST/core/src/panic.rs
+  |
+  = note: evaluation of `<V2 as util::versioned_file::Chain>::LINKED` failed here
+  |
+ ::: src/versioned_file/chain.rs
+  |
+  |         assert!(S::VERSION == <S::Prev as Chain>::TOP + 1, "migration chain has a gap");
+  |         ------------------------------------------------------------------------------- in this macro invocation
+
+note: erroneous constant encountered
+ --> src/versioned_file/chain.rs
+  |
+  |         <S::Prev as Chain>::LINKED
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: erroneous constant encountered
+  --> tests/compile_fail/gap_deep.rs:31:1
+   |
+31 | util::assert_contiguous!(V3);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this note originates in the macro `util::assert_contiguous` (in Nightly builds, run with -Z macro-backtrace for more info)

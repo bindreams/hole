@@ -9262,9 +9262,12 @@ dependencies = [
  "serde",
  "serde_json",
  "skuld",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "trybuild",
  "windows 0.62.2",
 ]
 

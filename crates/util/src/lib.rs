@@ -15,6 +15,8 @@
 //! - [`syn_budget`] — a TCP connect whose SYN-retransmission budget is
 //!   chosen deliberately, so a refusal-vs-timeout verdict is observable on
 //!   Windows without racing the OS's own ~2 s refusal cost.
+//! - [`versioned_file`] — one type for every state file read back across a
+//!   restart: ordered migration chain, one rule for a file it cannot read.
 //!
 //! Apache-2.0 (unlike Hole's own GPL crates) so the Apache plugin world
 //! (`garter`/`galoshes`/`plugin-e2e`) can depend on it alongside Hole's GPL
@@ -29,6 +31,7 @@ pub mod retry;
 pub mod syn_budget;
 #[cfg(any(target_os = "macos", windows))]
 pub mod system_tool;
+pub mod versioned_file;
 
 // Install the workspace test subscriber + panic hook. The dev-dep is gated on
 // cfg(test) because it isn't linked in non-test builds.
