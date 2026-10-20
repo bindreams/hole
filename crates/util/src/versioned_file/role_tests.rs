@@ -1,5 +1,6 @@
 use super::{RemoveOver, Role, StoreOver};
 use crate::versioned_file::CannotRead::{Corrupt, Newer};
+use crate::versioned_file::WhyUnreadable;
 
 /// Every cell written out by hand, one row per role, `Newer` then `Corrupt` in each column.
 #[skuld::test]
@@ -89,6 +90,27 @@ fn the_io_failure_cells_are_exactly_these() {
             role.io_failure_blocks_connect(),
             blocks_connect,
             "{role:?} io_failure_blocks_connect"
+        );
+    }
+}
+
+/// `blocks_connect` is the one question a caller asks of any unreadable file; it
+/// must give the answer of the matching cell above, whatever the cause.
+#[skuld::test]
+fn blocks_connect_takes_the_cell_of_its_cause() {
+    for role in [Role::Decision, Role::OsRecord, Role::LegacyRecord, Role::Config] {
+        let blocks = role == Role::OsRecord;
+        for why in [Newer, Corrupt] {
+            assert_eq!(
+                role.blocks_connect(WhyUnreadable::CannotRead(why)),
+                blocks,
+                "{role:?} {why:?}"
+            );
+        }
+        assert_eq!(
+            role.blocks_connect(WhyUnreadable::ReadFailed(std::io::ErrorKind::PermissionDenied)),
+            blocks,
+            "{role:?} read failed"
         );
     }
 }
