@@ -183,6 +183,17 @@ fn poll_once<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
     f.poll(&mut Context::from_waker(Waker::noop()))
 }
 
+/// Awaits `future`, which must end without the clock moving. The bound has passed, so only the aborted readers are left
+/// to end, and the scheduler does that without any time going by.
+async fn ends_without_time_passing<F: Future>(what: &str, future: Pin<&mut F>) -> F::Output {
+    let before = tokio::time::Instant::now();
+    let output = tokio::time::timeout(VIRTUAL_HANG, future)
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    assert_eq!(tokio::time::Instant::now(), before, "{what}: waited past the bound");
+    output
+}
+
 fn subscriber() -> (impl tracing::Subscriber + Send + Sync, WaitableWriter) {
     let writer = WaitableWriter::new();
     let subscriber = tracing_subscriber::fmt()
@@ -475,10 +486,7 @@ async fn a_reader_held_outside_a_drained_tree_ends_at_the_bound_with_a_warning()
             "{containment:?}: ended before the bound"
         );
         tokio::time::advance(TIMER_SLACK).await;
-        assert!(
-            poll_once(drain.as_mut()).is_ready(),
-            "{containment:?}: still waiting at the bound"
-        );
+        ends_without_time_passing(&format!("{containment:?}: still waiting at the bound"), drain.as_mut()).await;
 
         tokio::time::timeout(VIRTUAL_HANG, out_dropped)
             .await
@@ -558,10 +566,7 @@ async fn a_weak_containment_join_ends_at_the_bound_with_a_warning_and_aborts_the
         );
 
         tokio::time::advance(TIMER_SLACK).await;
-        assert!(
-            poll_once(drain.as_mut()).is_ready(),
-            "{containment:?}: still waiting at the bound"
-        );
+        ends_without_time_passing(&format!("{containment:?}: still waiting at the bound"), drain.as_mut()).await;
 
         // Aborted, not detached: both reader tasks are dropped.
         tokio::time::timeout(VIRTUAL_HANG, async {
@@ -599,7 +604,7 @@ async fn a_failed_kill_skips_the_exit_edge_and_gives_even_a_kernel_owned_join_th
 
     assert!(poll_once(drain.as_mut()).is_pending());
     tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
-    assert!(poll_once(drain.as_mut()).is_ready());
+    ends_without_time_passing("still waiting at the bound", drain.as_mut()).await;
     tokio::time::timeout(VIRTUAL_HANG, dropped)
         .await
         .expect("the reader must be aborted at the bound")
@@ -622,7 +627,7 @@ async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
 
     assert!(poll_once(drain.as_mut()).is_pending());
     tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
-    assert!(poll_once(drain.as_mut()).is_ready());
+    ends_without_time_passing("still waiting at the bound", drain.as_mut()).await;
     tokio::time::timeout(VIRTUAL_HANG, dropped)
         .await
         .expect("the reader must be aborted at the bound")
@@ -1136,7 +1141,9 @@ async fn a_stdout_reader_given_up_on_at_the_bound_leaves_the_readiness_sender_to
     assert!(poll_once(end.as_mut()).is_pending());
     assert!(poll_once(pin!(&mut ready_rx)).is_pending(), "the start failed early");
     tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
-    assert!(poll_once(end.as_mut()).is_ready(), "still waiting at the bound");
+    ends_without_time_passing("still waiting at the bound", end.as_mut())
+        .await
+        .ok();
 
     assert!(ready_rx.await.is_err(), "no failure was held, so none is delivered");
     assert!(writer.snapshot().contains("held-plugin"), "{}", writer.snapshot());
@@ -1159,7 +1166,9 @@ async fn an_unwatchable_root_whose_reap_fails_still_waits_for_its_output_at_the_
 
     assert!(poll_once(end.as_mut()).is_pending(), "ended before the output did");
     tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
-    assert!(matches!(poll_once(end.as_mut()), Poll::Ready(Err(_))));
+    assert!(ends_without_time_passing("still waiting at the bound", end.as_mut())
+        .await
+        .is_err());
     tokio::time::timeout(VIRTUAL_HANG, out_dropped).await.unwrap().ok();
     assert!(
         writer.snapshot().contains("the plugin's output pipes were still open"),
@@ -1760,10 +1769,9 @@ async fn a_root_whose_exit_cannot_be_watched_is_reaped_first_and_a_pgid_tree_is_
         // The held stdout ends the wait for the output at its bound, on every containment.
         assert!(poll_once(end.as_mut()).is_pending(), "{containment:?}");
         tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
-        let end = match poll_once(end.as_mut()) {
-            Poll::Ready(end) => end.unwrap(),
-            Poll::Pending => panic!("{containment:?}: still waiting at the bound"),
-        };
+        let end = ends_without_time_passing(&format!("{containment:?}: still waiting at the bound"), end.as_mut())
+            .await
+            .unwrap();
         tokio::time::timeout(VIRTUAL_HANG, out_dropped).await.unwrap().ok();
 
         assert!(
@@ -2082,6 +2090,109 @@ async fn a_plugin_whose_start_failed_never_ends_ok() {
         "{} rows failed:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+/// A `stdout` whose read blocks its thread until released, then reports end of file: a reader caught inside one poll,
+/// which `abort` cannot interrupt.
+struct BlockedRead {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl tokio::io::AsyncRead for BlockedRead {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let _ = self.entered.send(());
+        let _ = self.release.recv();
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A reader that is aborted at the bound while it is still deciding the start failed (its poll runs on another thread,
+/// so the abort takes effect only once the poll ends) still makes `run` an error: whatever the caller of `on_ready` is
+/// told, `run` agrees. The reader is released only after `supervise_plugin` has had its chance to return.
+#[skuld::test]
+async fn a_failure_decided_by_a_reader_aborted_at_the_bound_never_ends_ok() {
+    tokio::time::pause();
+    let mut failures = Vec::new();
+    for watched in [true, false] {
+        let freed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        // The reader runs on a runtime of its own, so a blocked poll leaves this one free.
+        let reader_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (reader, failure) = {
+            let _in_reader_runtime = reader_runtime.enter();
+            spawn_sitrep_stdout_reader(
+                BlockedRead {
+                    entered: entered_tx,
+                    release: release_rx,
+                },
+                "p".into(),
+                freed,
+                shutdown.clone(),
+                ready_tx,
+                false,
+                None,
+            )
+        };
+        entered_rx.recv().expect("the reader started its read");
+
+        let mut tree = drained_tree(Containment::ProcessGroup);
+        tree.root_watch_fails = !watched;
+        let mut sup = pin!(supervise_plugin(
+            "p",
+            &mut tree,
+            &shutdown,
+            GRACE,
+            reader,
+            finished_reader(),
+            Some(failure),
+        ));
+        let supervised = match tokio::time::timeout(VIRTUAL_HANG, sup.as_mut()).await {
+            Ok(done) => {
+                release_tx.send(()).unwrap();
+                done
+            }
+            Err(_waiting_for_the_reader) => {
+                release_tx.send(()).unwrap();
+                sup.await
+            }
+        };
+        let told = ready_rx.await;
+        reader_runtime.shutdown_background();
+
+        let run = run_result(supervised.unwrap().outcome("p"));
+        if matches!(told, Ok(Err(_))) && run == "ok" {
+            failures.push(format!(
+                "watched={watched}: the caller was told {told:?} and run was {run}"
+            ));
+        }
+        if !matches!(told, Ok(Err(_))) {
+            failures.push(format!("watched={watched}: the failure was never delivered: {told:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} rows failed:
+{}",
+        failures.len(),
+        failures.join(
+            "
+"
+        )
     );
 }
 

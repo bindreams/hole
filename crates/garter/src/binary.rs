@@ -1177,7 +1177,7 @@ pub(crate) async fn drain_readers_after_exit(
 
 /// Waits for both output readers to reach EOF, for at most [`READER_EOF_BOUND`]. On expiry it warns
 /// that the output after this point was cut and aborts the readers (so their hold on the readiness
-/// sender drops).
+/// sender drops), then waits for the aborted readers to end.
 async fn wait_for_readers(
     plugin: &str,
     mut stdout: tokio::task::JoinHandle<()>,
@@ -1193,7 +1193,13 @@ async fn wait_for_readers(
             plugin = %plugin,
             "the plugin's output pipes were still open {READER_EOF_BOUND:?} after it exited (a process it started holds them); its output after this point was cut"
         );
-        stdout.abort();
-        stderr.abort();
+        // `abort` takes effect at a task's next await, so a reader mid-poll on another thread finishes that
+        // poll first, and what it decides in it must be in before the caller reads the failure hold.
+        for reader in [&mut stdout, &mut stderr] {
+            if !reader.is_finished() {
+                reader.abort();
+                let _ = reader.await;
+            }
+        }
     }
 }
