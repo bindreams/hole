@@ -268,9 +268,17 @@ fn stage_leaves_only_the_staged_entries_in_out_dir() {
 const STAGERS: usize = 4;
 const STAGES_PER_STAGER: usize = 150;
 
+/// Whether a failed open of `dest` is the transient a Windows replace causes: the name is briefly
+/// unresolvable (`NotFound`) or deleted-pending (`PermissionDenied`). Unix `rename(2)` is atomic,
+/// so there no open may fail.
+fn is_open_error_of_a_replace_in_flight(e: &io::Error) -> bool {
+    cfg!(windows) && matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
+}
+
 /// Several stagers race on one `dest` while a reader polls it until they all
 /// finish. Every `stage` must return `Ok` with `dest` complete, `src` must stay
-/// whole, and the reader must never find `dest` missing or short.
+/// whole, and the reader must never read a short or wrong `dest`. A failed open is
+/// tolerated only where [`is_open_error_of_a_replace_in_flight`] says so.
 fn assert_concurrent_file_staging_is_safe(link: crate::stage::LinkFn<'_>) {
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
@@ -298,6 +306,7 @@ fn assert_concurrent_file_staging_is_safe(link: crate::stage::LinkFn<'_>) {
                         bytes.len(),
                         content.len()
                     )),
+                    Err(e) if is_open_error_of_a_replace_in_flight(&e) => {}
                     Err(e) => reader_violations.lock().unwrap().push(format!("dest unreadable: {e}")),
                 }
             }
@@ -342,12 +351,12 @@ fn assert_concurrent_file_staging_is_safe(link: crate::stage::LinkFn<'_>) {
 }
 
 #[skuld::test]
-fn concurrent_file_staging_by_hard_link_never_hides_or_corrupts_dest() {
+fn concurrent_file_staging_by_hard_link_never_serves_a_short_or_wrong_dest() {
     assert_concurrent_file_staging_is_safe(&|src, staged| fs::hard_link(src, staged));
 }
 
 #[skuld::test]
-fn concurrent_file_staging_by_copy_never_hides_or_corrupts_dest() {
+fn concurrent_file_staging_by_copy_never_serves_a_short_or_wrong_dest() {
     assert_concurrent_file_staging_is_safe(&link_unsupported);
 }
 

@@ -7,7 +7,11 @@
 //!
 //! Every entry is built under a unique scratch directory beside the destination
 //! and renamed into place, so concurrent stagers never write through each
-//! other's (or the source's) inode and a file destination is never absent.
+//! other's (or the source's) inode. A reader of a file destination never sees a
+//! short or wrong file, every stage returns `Ok`, and the destination ends
+//! complete. On Windows a reader can additionally find the destination
+//! `NotFound` or `PermissionDenied` while a replace is in flight; Unix `rename(2)`
+//! has no such window.
 //!
 //! This logic was previously duplicated in
 //! `msi-installer/src/msi_installer/__init__.py:link_or_copy()` and (via
@@ -77,7 +81,8 @@ fn stage_file(src: &Path, dest: &Path, link: LinkFn<'_>) -> Result<()> {
             .with_context(|| format!("failed to copy {} to {}", src.display(), staged.display()))?;
     }
 
-    // Atomic replace: `dest` is present with complete content at every instant.
+    // `dest` only ever holds complete content. On Windows a replace briefly leaves the name
+    // unopenable (`NotFound`/`PermissionDenied`) to a concurrent reader.
     std::fs::rename(&staged, dest)
         .with_context(|| format!("failed to move {} over {}", staged.display(), dest.display()))
 }
