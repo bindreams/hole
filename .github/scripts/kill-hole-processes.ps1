@@ -10,7 +10,7 @@
 # single-instance slot for tauri-driver, no held handles for msiexec); neither
 # needs the bridge dead. Killing it starts the SCM's 1s restart-on-failure
 # clock, and msiexec's uninstall then reaches the bridge about when the restart
-# lands (bindreams/hole#1099). Left alone, the bridge is stopped by the
+# lands. Left alone, the bridge is stopped by the
 # uninstall the way a user's uninstall stops it.
 #
 # Resolving BEFORE the kill is the point. `Wait-Process -Name hole` resolves its

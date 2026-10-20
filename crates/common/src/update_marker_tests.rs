@@ -287,3 +287,30 @@ fn service_log_dir_matches_log_collector_constants() {
     #[cfg(target_os = "macos")]
     assert_eq!(d, std::path::PathBuf::from("/var/log/hole"));
 }
+
+/// The MSI's bridge actions pass `--log-dir` to the CLI so its log lands where
+/// the service writes its own: the directory the wxs names must be
+/// `service_log_dir()`, or a failed install's log is somewhere nobody looks.
+/// `[CommonAppDataFolder]` is `%ProgramData%` with a trailing backslash.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_msi_bridge_actions_log_to_the_service_log_dir() {
+    const WXS: &str = include_str!("../../../msi-installer/src/msi_installer/hole.wxs");
+    const OPEN: &str = "--log-dir &quot;";
+    let program_data = std::env::var("ProgramData").expect("ProgramData is set on every Windows host");
+
+    let mut found = 0;
+    for (at, _) in WXS.match_indices(OPEN) {
+        let rest = &WXS[at + OPEN.len()..];
+        let literal = &rest[..rest.find("&quot;").expect("the quoted --log-dir closes")];
+        let dir = literal.replace("[CommonAppDataFolder]", &format!("{program_data}\\"));
+        assert_eq!(
+            std::path::Path::new(&dir),
+            service_log_dir(),
+            "the wxs names {literal:?}"
+        );
+        found += 1;
+    }
+    // install, release-covers, uninstall, and the rollback's install.
+    assert_eq!(found, 4, "the bridge actions that carry --log-dir");
+}

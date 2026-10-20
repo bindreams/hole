@@ -298,10 +298,10 @@ if ($proc.ExitCode -ne 0) {
         Write-Host "(failed to read ${LogPath}: $($_.Exception.Message))"
     }
     # The custom actions' own `hole bridge ...` log (they have no console; the
-    # MSI log above records only their exit codes), written under the SYSTEM
-    # profile. Printed here so the cause is in the job log, not only in an
-    # artifact.
-    $cliLogDir = Join-Path $env:SystemRoot 'System32\config\systemprofile\AppData\Local\hole\logs'
+    # MSI log above records only their exit codes), written to the service log
+    # directory their `--log-dir` names. Printed here so the cause is in the job
+    # log, not only in an artifact.
+    $cliLogDir = Join-Path $env:ProgramData 'hole\logs'
     try {
         if (Test-Path $cliLogDir) {
             foreach ($cliLog in Get-ChildItem $cliLogDir -File) {

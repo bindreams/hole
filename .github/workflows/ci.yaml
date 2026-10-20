@@ -660,7 +660,7 @@ jobs:
       # tauri-driver's new launch into that already-running instance, so we
       # need a clean slate. The shared script kills the GUI only, not the
       # HoleBridge service process: the bridge is not in the way, and killing
-      # it starts the SCM's 1s restart clock (bindreams/hole#1099).
+      # it starts the SCM's 1s restart clock.
       - id: installer-kill-launch
         name: Kill any running hole.exe (post-install LaunchApp)
         if: ${{ !cancelled() && steps.installer-install.outcome == 'success' }}
@@ -754,7 +754,7 @@ jobs:
 
       # What the uninstall's own processes did. The MSI's custom actions run
       # `hole bridge uninstall` / `release-covers` as SYSTEM with no console, so
-      # their only record is the CLI log under the SYSTEM profile; the SCM
+      # their only record is the CLI log in `%ProgramData%\hole\logs`; the SCM
       # events in the System log give the service's kills, restarts and state
       # changes. A failed uninstall otherwise reports only an exit code.
       - id: installer-dump-uninstall-diagnostics

@@ -1,5 +1,5 @@
 # Prints what the MSI's SYSTEM-run `hole bridge ...` actions and the SCM recorded
-# about HoleBridge, for a failed uninstall (bindreams/hole#1099). The actions have
+# about HoleBridge, for a failed uninstall. The actions have
 # no console, so the CLI log in the MSI's log directory and the System log's Service
 # Control Manager events are the only record of why `bridge uninstall` exited 1.
 param(

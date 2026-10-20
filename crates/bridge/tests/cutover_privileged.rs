@@ -1431,7 +1431,7 @@ fn start_in_background() -> std::thread::JoinHandle<windows_service::Result<()>>
     })
 }
 
-/// The stop probe (bindreams/hole#1099): what the SCM answers a Stop sent to a
+/// The stop probe: what the SCM answers a Stop sent to a
 /// service in each state a restart passes through, and what an arm for every
 /// state reports there. These are the facts the stop wait's policy rests on,
 /// printed so a run states them instead of the code assuming them.
