@@ -156,11 +156,10 @@ async fn assert_port_unbound_recorded(what: &str, addr: SocketAddr) {
 async fn roundtrip_socks5(harness: &mut DistHarness, proxy: SocketAddr, target: &HttpTarget) {
     wait_for_port(proxy, Duration::from_secs(10)).await;
     let totals_before = harness.tunnel_totals().await;
+    let accepted_before = target.mark();
     let request = http_get_request(&target.addr, "/");
-    let response = socks5_request(proxy, target.addr, &request, 8192)
-        .await
-        .expect("socks5 roundtrip");
-    target.assert_sentinel_response(&response);
+    let result = socks5_request(proxy, target.addr, &request, 8192).await;
+    target.assert_sentinel_roundtrip(accepted_before, "socks5 roundtrip", result);
     harness.assert_tunnel_traffic_since(totals_before).await;
 }
 
@@ -168,11 +167,10 @@ async fn roundtrip_socks5(harness: &mut DistHarness, proxy: SocketAddr, target: 
 async fn roundtrip_http_connect(harness: &mut DistHarness, proxy: SocketAddr, target: &HttpTarget) {
     wait_for_port(proxy, Duration::from_secs(10)).await;
     let totals_before = harness.tunnel_totals().await;
+    let accepted_before = target.mark();
     let request = http_get_request(&target.addr, "/");
-    let response = http_connect_request(proxy, &target.addr.to_string(), &request, 8192)
-        .await
-        .expect("HTTP CONNECT roundtrip");
-    target.assert_sentinel_response(&response);
+    let result = http_connect_request(proxy, &target.addr.to_string(), &request, 8192).await;
+    target.assert_sentinel_roundtrip(accepted_before, "HTTP CONNECT roundtrip", result);
     harness.assert_tunnel_traffic_since(totals_before).await;
 }
 

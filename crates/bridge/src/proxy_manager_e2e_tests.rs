@@ -103,12 +103,11 @@ async fn assert_socks5_roundtrip(harness: &mut DistHarness, proxy_port: u16, htt
     wait_for_port(proxy_addr, Duration::from_secs(10)).await;
 
     let totals_before = harness.tunnel_totals().await;
+    let accepted_before = http.mark();
     let request = http_get_request(&target_addr, "/");
-    let response = socks5_request(proxy_addr, target_addr, &request, 8192)
-        .await
-        .expect("SOCKS5 request through bridge");
+    let result = socks5_request(proxy_addr, target_addr, &request, 8192).await;
 
-    http.assert_sentinel_response(&response);
+    http.assert_sentinel_roundtrip(accepted_before, "SOCKS5 request through bridge", result);
     harness.assert_tunnel_traffic_since(totals_before).await;
 }
 
@@ -576,8 +575,9 @@ mod tun {
 
         // Direct TCP to `http.addr`, the host's own primary non-loopback
         // IPv4. Delivered locally by the host stack, not through the tunnel.
+        let accepted_before = http.mark();
         let response = direct_http_get(http.addr).await;
-        http.assert_sentinel_response(&response);
+        http.assert_sentinel_response(accepted_before, &response);
 
         let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");

@@ -119,18 +119,20 @@ pub(crate) fn test_certs() -> Result<TestCerts, String> {
     Ok(plugin_e2e::certs::generate_test_certs())
 }
 
-/// Route the in-process ss server's `log` records (shadowsocks-service logs through `log`, and the
-/// test subscriber installs no `LogTracer`) into `tracing` at `info` and above, so its relay errors
-/// land in the test's captured output next to the bridge's `bridge.log` dump. Capped at `info`: the
-/// cap bounds `log::max_level`, which is what keeps `debug!`/`trace!` records from third-party crates
-/// from being allocated into tracing events at all (the #147 trap `hole-test-observability` avoids).
-/// Idempotent; a logger installed earlier wins.
+/// Route the in-process ss server's `log` records into `tracing` at `info` and above (the test
+/// subscriber installs no `LogTracer`), so its relay errors appear next to the bridge's `bridge.log`
+/// dump. Capped at `info` so third-party `debug!`/`trace!` records are never allocated.
+/// Idempotent. If another `log` logger is already installed, the records are not routed and
+/// stderr says so (`eprintln!`, which no log filter can drop).
 pub(crate) fn route_ss_server_logs() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let _ = tracing_log::LogTracer::builder()
+        let routed = tracing_log::LogTracer::builder()
             .with_max_level(tracing_log::log::LevelFilter::Info)
             .init();
+        if let Err(e) = routed {
+            eprintln!("[ss-server-logs] not routed into tracing: {e}");
+        }
     });
 }
 

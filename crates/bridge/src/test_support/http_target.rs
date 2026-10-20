@@ -30,8 +30,7 @@ pub(crate) enum TargetBind {
     /// is up — see `net_discovery`'s module doc for why. Loopback
     /// short-circuits routing the same way.
     Ipv4Primary,
-    /// `127.0.0.1`. For SOCKS-only tests: no TUN is up, so the target needs no
-    /// route a TUN test would see, and the primary IPv4 can be briefly
+    /// `127.0.0.1`. For SOCKS-only tests: the primary IPv4 can be briefly
     /// unusable on a CI runner whose network is settling.
     Ipv4Loopback,
     /// `[::1]` IPv6 loopback. IPv6 axis test only.
@@ -50,19 +49,45 @@ pub(crate) struct HttpTarget {
     _runtime: tokio::runtime::Runtime,
 }
 
+/// The target's accepted-connection count at one instant, from [`HttpTarget::mark`].
+#[derive(Clone, Copy)]
+pub(crate) struct AcceptedMark(usize);
+
 impl HttpTarget {
-    /// Connections accepted so far. Zero after a failed roundtrip means the request never
-    /// reached the target; nonzero means it did and the failure is on the way back.
-    pub(crate) fn accepted_connections(&self) -> usize {
-        self.accepted.load(Ordering::Relaxed)
+    /// Snapshot the accepted-connection count. Take it before sending the request: the target is
+    /// shared by every test in the process, so the cumulative count says nothing about one roundtrip.
+    pub(crate) fn mark(&self) -> AcceptedMark {
+        AcceptedMark(self.accepted.load(Ordering::Relaxed))
     }
 
-    /// Assert `response` is this target's sentinel reply. On failure the message carries the
-    /// response length and bytes and how many connections the target accepted, which together
-    /// say which hop failed.
+    /// Connections accepted since `since`. Zero after a failed roundtrip means the request never
+    /// reached the target; nonzero means it did and the failure is on the way back. Another test
+    /// connecting to the same target meanwhile is counted too.
+    fn accepted_since(&self, since: AcceptedMark) -> usize {
+        self.accepted.load(Ordering::Relaxed).saturating_sub(since.0)
+    }
+
+    /// Check `result`, the outcome of a client roundtrip (`what`) to this target begun after
+    /// `since`. An `Err` panics with how many connections the target accepted since; an `Ok` goes
+    /// through [`Self::assert_sentinel_response`].
     #[track_caller]
-    pub(crate) fn assert_sentinel_response(&self, response: &[u8]) {
-        let accepted = self.accepted_connections();
+    pub(crate) fn assert_sentinel_roundtrip(&self, since: AcceptedMark, what: &str, result: std::io::Result<Vec<u8>>) {
+        match result {
+            Ok(response) => self.assert_sentinel_response(since, &response),
+            Err(e) => panic!(
+                "{what} failed: {e}; target {} accepted {} connection(s) since the request",
+                self.addr,
+                self.accepted_since(since),
+            ),
+        }
+    }
+
+    /// Assert `response` is this target's sentinel reply to a request sent after `since`. On
+    /// failure the message carries the response length and bytes and how many connections the
+    /// target accepted since, which together say which hop failed.
+    #[track_caller]
+    pub(crate) fn assert_sentinel_response(&self, since: AcceptedMark, response: &[u8]) {
+        let accepted = self.accepted_since(since);
         let Some(body) = http_response_body(response) else {
             panic!(
                 "HTTP response has no header terminator: {} byte(s) {:?}; target {} accepted {accepted} connection(s)",

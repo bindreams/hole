@@ -180,8 +180,7 @@ impl DistHarness {
             // `shadowsocks_service=debug` puts ss-local's per-connection lines
             // (CONNECT target, tunnel established, relay errors) in `bridge.log`,
             // which the panic hook dumps. Not `trace`: it renders the config,
-            // password included. The comma-separated list is honored by
-            // `hole_common::logging::init_multi`.
+            // password included.
             .env("HOLE_BRIDGE_LOG", "hole_bridge=debug,shadowsocks_service=debug")
             .env("HOLE_BRIDGE_SELF_TEST", "1");
 
@@ -265,11 +264,9 @@ impl DistHarness {
         (bytes_in, bytes_out)
     }
 
-    /// Assert the tunnel counters grew in both directions since `before` (a
-    /// [`Self::tunnel_totals`] snapshot). A host-local target is otherwise
-    /// indistinguishable from a bypass: the counters only move for bytes that
-    /// crossed the shadowsocks server, so growth proves the roundtrip between the
-    /// two snapshots went through it.
+    /// Assert both tunnel counters grew since `before` (a [`Self::tunnel_totals`]
+    /// snapshot). They move only for bytes that crossed the shadowsocks server, which
+    /// tells a host-local target apart from a bypass.
     pub(crate) async fn assert_tunnel_traffic_since(&mut self, before: (u64, u64)) {
         let after = self.tunnel_totals().await;
         assert!(

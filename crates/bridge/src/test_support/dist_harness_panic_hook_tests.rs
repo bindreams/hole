@@ -180,7 +180,7 @@ fn panic_hook_chain_dumps_bridge_log_and_libtest_message() {
 /// `dist_dir` fixture, so the parent must hold the `DIST_BIN` lock: labelled, because
 /// `serial = X` only excludes tests that carry label X.
 #[skuld::test]
-fn panic_hook_test_excludes_every_test_that_uses_the_dist_dir() {
+fn panic_hook_test_holds_the_dist_bin_lock() {
     let def = skuld::test_registry()
         .values()
         .find(|d| d.name == "panic_hook_chain_dumps_bridge_log_and_libtest_message")
@@ -192,7 +192,6 @@ fn panic_hook_test_excludes_every_test_that_uses_the_dist_dir() {
         "the panic-hook test must carry the {dist_bin} label, has {:?}",
         def.labels.iter().map(|l| l.name()).collect::<Vec<_>>()
     );
-    // The macro keeps the expression as written (`DIST_BIN`); skuld lowercases it when parsing.
     assert!(
         def.serial.eq_ignore_ascii_case(dist_bin),
         "the panic-hook test must be serial against {dist_bin}, has {:?}",
