@@ -404,7 +404,7 @@ pub(crate) enum Readiness {
     Ready(ChainReady),
     /// A hop failed to start, or exited before it could say so. The chain is no longer viable.
     Failed(HopFailure),
-    /// `shutdown` came first, or a hop ended without deciding, with nothing to report yet. `unread` is the decision
+    /// `shutdown` came first, with nothing to report yet. `unread` is the decision
     /// of the hop that was starting, if it had not been read: that hop may still deliver a start failure it had
     /// decided, until it returns.
     Preempted { unread: Option<Pending> },
@@ -498,13 +498,13 @@ pub(crate) enum Verdict {
     Ready { given: SocketAddr, report: PluginReady },
     /// The start failed, and the chain was cancelled for it.
     Failed(StartError),
-    /// The chain was already stopping, or the hop ended without deciding: nothing to report.
+    /// The chain was already stopping when the hop was judged: nothing to report.
     Preempted,
 }
 
 /// Judges `decision` against `shutdown`. A start failure the hop delivered stands whoever cancelled the chain, because
-/// `BindConflict` is the only retryable class and discarding one turns a collision into a hard failure. A `Ready` or a
-/// dropped sender after the cancel is the cancel's doing, so it is preempted rather than reported. A start failure
+/// `BindConflict` is the only retryable class and discarding one turns a collision into a hard failure. A `Ready` or an
+/// end without a decision after the cancel is the cancel's doing, so it is preempted rather than reported. A start failure
 /// cancels `shutdown`: the other plugins stop cooperatively.
 pub(crate) fn judge(decision: Result<Decision, oneshot::error::RecvError>, shutdown: &CancellationToken) -> Verdict {
     match decision {
@@ -518,21 +518,25 @@ pub(crate) fn judge(decision: Result<Decision, oneshot::error::RecvError>, shutd
             }
             Verdict::Ready { given, report }
         }
-        Ok(Decision::Dropped) => {
-            if shutdown.is_cancelled() {
-                return Verdict::Preempted;
-            }
-            // The hop dropped its sender unsent, so it exited before readying. The same exit is independently observed by
-            // the Phase-1 `record_exit`, which sets `first_error` and cancels: that is the lifecycle channel that becomes
-            // `run`'s return, and this is the typed cause for `on_ready`. The two are separate observers of one event.
-            shutdown.cancel();
-            Verdict::Failed(StartError::Fatal {
-                detail: "plugin exited before becoming ready".into(),
-                errno: None,
-            })
-        }
-        Err(_) => Verdict::Preempted,
+        Ok(Decision::Dropped) => ended_undecided(shutdown),
+        Err(_) => ended_undecided(shutdown),
     }
+}
+
+/// The verdict for a hop that ended with no start to report: its plugin dropped `ready` unsent, or the hop's task
+/// returned without deciding (a plugin that handed `ready` to a task of its own and returned). After the cancel that is
+/// the cancel's doing, so it is preempted. Otherwise the hop exited before readying, which is a failed start: it
+/// cancels `shutdown`, and it is the typed cause for `on_ready`. The same exit is independently observed by the Phase-1
+/// `record_exit`, which sets `first_error` and cancels; a start failure outranks that error in `run`'s result.
+fn ended_undecided(shutdown: &CancellationToken) -> Verdict {
+    if shutdown.is_cancelled() {
+        return Verdict::Preempted;
+    }
+    shutdown.cancel();
+    Verdict::Failed(StartError::Fatal {
+        detail: "plugin exited before becoming ready".into(),
+        errno: None,
+    })
 }
 
 /// What the start does after a decision.

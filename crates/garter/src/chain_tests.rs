@@ -1186,26 +1186,36 @@ fn a_dropped_hop_is_preempted_once_shutdown_won_the_race() {
     );
 }
 
-/// A hop supervisor that ended without deciding (it was cancelled while picking a port, or its plugin kept `ready`)
-/// has nothing to report, whether or not the chain was cancelled.
+/// A hop task that ended without deciding after the chain was cancelled (it was cancelled while picking a port or
+/// waiting to restart) has nothing to report.
 #[skuld::test]
-fn a_supervisor_that_ended_without_a_decision_is_preempted() {
-    for cancelled in [false, true] {
-        let shutdown = CancellationToken::new();
-        if cancelled {
-            shutdown.cancel();
-        }
-        let (tx, rx) = oneshot::channel::<Decision>();
-        drop(tx);
-        let closed = rx.blocking_recv();
+fn a_hop_that_ended_without_a_decision_is_preempted_once_shutdown_won_the_race() {
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let (tx, rx) = oneshot::channel::<Decision>();
+    drop(tx);
 
-        let verdict = judge(closed, &shutdown);
+    let verdict = judge(rx.blocking_recv(), &shutdown);
 
-        assert!(
-            matches!(verdict, Verdict::Preempted),
-            "cancelled={cancelled}: {verdict:?}"
-        );
-    }
+    assert!(matches!(verdict, Verdict::Preempted), "{verdict:?}");
+}
+
+/// A hop task that ended without deciding while the chain was not cancelled (its plugin handed `ready` to a task of
+/// its own and returned) never started: it is the synthesized exited-before-ready failure, and it cancels the chain,
+/// the same as a sender the plugin dropped itself.
+#[skuld::test]
+fn a_hop_that_ended_without_a_decision_fails_the_start_while_the_chain_runs() {
+    let shutdown = CancellationToken::new();
+    let (tx, rx) = oneshot::channel::<Decision>();
+    drop(tx);
+
+    let verdict = judge(rx.blocking_recv(), &shutdown);
+
+    assert!(
+        matches!(&verdict, Verdict::Failed(StartError::Fatal { detail, .. }) if detail.contains("exited before becoming ready")),
+        "{verdict:?}"
+    );
+    assert!(shutdown.is_cancelled(), "a failed start must cancel the chain");
 }
 
 // The gate on the caller's `ready` ------------------------------------------------------------------------------------
@@ -1773,6 +1783,30 @@ impl ChainPlugin for ReadyHolderCrash {
     }
 }
 
+/// [`ReadyHolderCrash`], but `run` returns `Ok(())`.
+struct ReadyHolderOk;
+
+#[async_trait::async_trait]
+impl ChainPlugin for ReadyHolderOk {
+    fn name(&self) -> &str {
+        "ready-holder-ok"
+    }
+
+    async fn run(
+        &self,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
+        tokio::spawn(async move {
+            shutdown.cancelled().await;
+            drop(ready);
+        });
+        Ok(())
+    }
+}
+
 /// A member that panics while it holds `ready`.
 struct PanicsAtStart;
 
@@ -1793,16 +1827,35 @@ impl ChainPlugin for PanicsAtStart {
     }
 }
 
-/// A member whose exit leaves `ready` open when the chain is cancelled reaches the caller as a dropped sender, and
-/// that too waits for the other members: the chain has nothing to report, but dropping the sender is a release.
+/// A member that hands `ready` to a task of its own and returns without a decision, with the chain still running,
+/// never started: the caller hears the synthesized exited-before-ready failure after the other members' last line, and
+/// `run` returns it, whatever the member returned.
 #[skuld::test]
-async fn an_exit_that_leaves_ready_open_waits_for_the_other_members_last_line() {
+async fn an_exit_that_leaves_ready_open_is_a_failed_start() {
     let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(ReadyHolderCrash)).await;
 
-    assert!(reported.is_err(), "nothing was reported to the caller: {reported:?}");
     assert!(
-        matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
-        "run must return the failing member's error, got {result:?}"
+        matches!(&reported, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
+        "want the synthesized exited-before-ready Fatal, got {reported:?}"
+    );
+    assert!(
+        is_start_failed(&result, "ready-holder-crash", exited_before_ready),
+        "run must return the failed start, got {result:?}"
+    );
+}
+
+/// The same when the member returns `Ok(())`: `run` does not return `Ok` for a start that never happened.
+#[skuld::test]
+async fn an_ok_exit_that_leaves_ready_open_is_a_failed_start() {
+    let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(ReadyHolderOk)).await;
+
+    assert!(
+        matches!(&reported, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
+        "want the synthesized exited-before-ready Fatal, got {reported:?}"
+    );
+    assert!(
+        is_start_failed(&result, "ready-holder-ok", exited_before_ready),
+        "run must return the failed start, got {result:?}"
     );
 }
 
@@ -1938,7 +1991,7 @@ fn on_a_multi_thread_runtime_an_exit_before_ready_waits_for_the_other_members_la
 /// `drain_timeout` bounds the wait for a member that ignores the cancel; the caller's channel is released then too,
 /// not left open for ever.
 #[skuld::test]
-async fn an_open_ready_is_released_once_the_drain_bound_expires_on_a_member_that_ignores_shutdown() {
+async fn the_caller_is_released_once_the_drain_bound_expires_on_a_member_that_ignores_shutdown() {
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(ReadyHolderCrash))
@@ -1952,10 +2005,17 @@ async fn an_open_ready_is_released_once_the_drain_bound_expires_on_a_member_that
     env.local_port = free_loopback_port().port();
     let handle = tokio::spawn(runner.run(env));
 
-    assert!(ready_rx.await.is_err(), "the caller must be released, not left waiting");
+    let reported = ready_rx
+        .await
+        .expect("the caller must be released with the failure, not left waiting");
     assert!(
-        matches!(handle.await.unwrap(), Err(crate::Error::PluginExit { code: 3, .. })),
-        "the member's error outranks the drain-timeout error"
+        matches!(&reported, Err(StartError::Fatal { detail, .. }) if detail.contains("exited before becoming ready")),
+        "{reported:?}"
+    );
+    let result = handle.await.unwrap();
+    assert!(
+        is_start_failed(&result, "ready-holder-crash", exited_before_ready),
+        "the start failure outranks the drain-timeout error: {result:?}"
     );
 }
 

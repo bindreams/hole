@@ -108,8 +108,8 @@ impl Drop for Relay<'_> {
         match self.ready.try_recv() {
             Ok(outcome) => self.settle(Some(outcome)),
             Err(oneshot::error::TryRecvError::Closed) => self.settle(None),
-            // The plugin kept `ready` past its own end: there is nothing to report, and the chain reads the dropped
-            // decision channel as that.
+            // The plugin kept `ready` past its own end: nothing is decided, and the chain reads the hop ending without
+            // a decision as an exit before ready.
             Err(oneshot::error::TryRecvError::Empty) => {}
         }
     }

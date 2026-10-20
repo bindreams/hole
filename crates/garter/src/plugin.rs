@@ -35,8 +35,8 @@ pub trait ChainPlugin: Send + Sync {
     ///   synthesize a process-exit failure. Send readiness BEFORE the
     ///   long-lived accept loop, not as the return value. A plugin that hands
     ///   `ready` to a task of its own (a readiness probe) must stop and join
-    ///   that task before `run` returns: a sender still held then is not read
-    ///   as an exit before ready.
+    ///   that task before `run` returns: a sender still held then is read as an
+    ///   exit before ready too.
     ///
     /// A start failure (an `Err` sent on `ready`, or `ready` dropped unsent) ends the chain. The runner cancels
     /// `shutdown` at once, so the plugin must return rather than keep running, and reports the failure to the
