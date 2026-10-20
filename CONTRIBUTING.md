@@ -2654,7 +2654,11 @@ omits private items: its docs may not link one.
 
 Libraries and binaries are separate `cargo doc` commands (`--lib`, `--bins`): a plain
 `cargo doc` skips a binary named like its crate's library, which leaves `crates/hole`'s
-binary-only modules unchecked, and one command with both writes them to one directory.
+binary-only modules unchecked. `--bins` also documents the library, so for `hole`, `xtask`,
+`dev-console` and `galoshes` two rustdoc runs write one `target/doc/<name>/` and cargo prints
+`output filename collision`; the check reads rustdoc's diagnostics, not the output. A binary
+with `required-features` (`tombstone`'s `crash_child`) is skipped unless its command enables
+them; `xtask/src/doc_targets_tests.rs` fails on a target no command documents.
 
 A reference to an item that is `cfg`-gated away on some target or `#[cfg(test)]`
 still breaks the check; write it in backticks without brackets.
