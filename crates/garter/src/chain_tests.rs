@@ -5,12 +5,13 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::chain::{allocate_ports, ChainRunner};
+use crate::chain::{allocate_ports, ChainReady, ChainRunner};
 use crate::plugin::ChainPlugin;
 use crate::sitrep::{PluginReady, StartError, Transports};
 
@@ -988,15 +989,51 @@ async fn aggregator_reports_a_start_error_delivered_before_shutdown_won_the_race
     .unwrap();
     shutdown.cancel();
 
-    run_readiness_aggregator(vec![(0, rx0)], 1, crate::chain::Mode::Client, shutdown, ready_tx).await;
+    let held = run_readiness_aggregator(vec![(0, rx0)], 1, crate::chain::Mode::Client, shutdown, ready_tx)
+        .await
+        .expect("a delivered StartError must be held for the runner, not discarded");
+    held.deliver();
 
     match ready_rx
         .await
-        .expect("a delivered StartError must be reported, not discarded")
+        .expect("a held StartError must be reported once delivered")
     {
         Err(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
         other => panic!("expected the delivered BindConflict, got {other:?}"),
     }
+}
+
+/// The aggregator never reports a start failure itself: it ends the chain and hands the failure to the runner, which
+/// reports it after the other plugins drained.
+#[skuld::test]
+async fn aggregator_holds_a_start_failure_and_cancels_the_chain() {
+    let (tx0, rx0) = oneshot::channel();
+    let (ready_tx, mut ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx0.send(Err(StartError::Fatal {
+        detail: "broke".into(),
+        errno: None,
+    }))
+    .unwrap();
+
+    let held = run_readiness_aggregator(
+        vec![(0, rx0)],
+        1,
+        crate::chain::Mode::Client,
+        shutdown.clone(),
+        ready_tx,
+    )
+    .await
+    .expect("a start failure must be returned to the runner");
+
+    assert!(shutdown.is_cancelled(), "a start failure must stop the other plugins");
+    assert!(
+        matches!(ready_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the aggregator must not report the failure itself"
+    );
+    held.deliver();
+    assert!(matches!(ready_rx.try_recv(), Ok(Err(StartError::Fatal { .. }))));
 }
 
 /// A delivered `Ok(PluginReady)` must NOT be rescued (see the shutdown
@@ -1055,6 +1092,238 @@ async fn aggregator_drops_ready_tx_when_shutdown_preempts_a_closed_receiver() {
     assert!(
         ready_rx.await.is_err(),
         "a sender dropped unsent must not become a synthesized Fatal in this arm"
+    );
+}
+
+// A start failure waits for the other members =========================================================================
+
+/// How a [`FailsAtStart`] member fails.
+#[derive(Clone, Copy)]
+enum StartFailure {
+    /// Reports a typed `Fatal` on `ready`, then exits with an error.
+    Typed,
+    /// Exits with an error without reporting, dropping `ready` unsent.
+    Dropped,
+}
+
+/// A member whose start fails at once.
+struct FailsAtStart {
+    how: StartFailure,
+    /// Keeps running after it reported, and exits cleanly once told to stop, as a plugin that reports a failure
+    /// but does not end itself.
+    lingers: bool,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for FailsAtStart {
+    fn name(&self) -> &str {
+        "fails-at-start"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
+        match self.how {
+            StartFailure::Typed => {
+                let _ = ready.send(Err(StartError::Fatal {
+                    detail: "member broke".into(),
+                    errno: None,
+                }));
+            }
+            StartFailure::Dropped => drop(ready),
+        }
+        if self.lingers {
+            shutdown.cancelled().await;
+            return Ok(());
+        }
+        Err(crate::Error::PluginExit {
+            name: "fails-at-start".into(),
+            code: 3,
+        })
+    }
+}
+
+/// A healthy member. Once the chain stops it, it holds a last line back until `gate` opens, as a plugin whose reader
+/// is still relaying stderr, and records that the line was relayed before it returns.
+struct LastLineMember {
+    /// Reports ready at once; otherwise it holds `ready` and reports nothing.
+    ready_first: bool,
+    /// Fires when the chain has told the member to stop.
+    stopped: oneshot::Sender<()>,
+    gate: oneshot::Receiver<()>,
+    relayed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for LastLineMember {
+    fn name(&self) -> &str {
+        "last-line-member"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
+        let _held_ready = if self.ready_first {
+            let _ = ready.send(Ok(PluginReady {
+                listen: local,
+                transports: Transports::TCP,
+            }));
+            None
+        } else {
+            Some(ready)
+        };
+        shutdown.cancelled().await;
+        let _ = self.stopped.send(());
+        let _ = self.gate.await;
+        self.relayed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Runs a chain of a failing member at `failing_position` and a [`LastLineMember`]. Asserts the chain does not
+/// report the failure before the healthy member was stopped and relayed the line it held back, and returns the
+/// reported outcome and the chain's result.
+async fn assert_failure_waits_for_the_other_members_last_line(
+    how: StartFailure,
+    failing_position: usize,
+) -> (Result<ChainReady, StartError>, crate::Result<()>) {
+    let (stopped_tx, stopped_rx) = oneshot::channel();
+    let (gate_tx, gate_rx) = oneshot::channel();
+    let relayed = Arc::new(AtomicBool::new(false));
+    let healthy = Box::new(LastLineMember {
+        // The aggregator awaits the members in order: a healthy member in front of the failing one must have readied.
+        ready_first: failing_position == 1,
+        stopped: stopped_tx,
+        gate: gate_rx,
+        relayed: relayed.clone(),
+    });
+    let failing = Box::new(FailsAtStart { how, lingers: false });
+    let (ready_tx, mut ready_rx) = oneshot::channel();
+    let runner = if failing_position == 0 {
+        ChainRunner::new().add(failing).add(healthy)
+    } else {
+        ChainRunner::new().add(healthy).add(failing)
+    }
+    .on_ready(ready_tx);
+
+    let mut env = test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    let handle = tokio::spawn(runner.run(env));
+
+    // The gate opens only after the healthy member was stopped, so a failure reported first was not held for it.
+    tokio::select! {
+        biased;
+        r = &mut ready_rx => panic!("the start failure was reported ({r:?}) before the other member was stopped and its last line relayed"),
+        _ = stopped_rx => {}
+    }
+    gate_tx.send(()).unwrap();
+
+    let outcome = ready_rx.await.expect("the chain dropped `ready_tx` unsent");
+    assert!(
+        relayed.load(Ordering::SeqCst),
+        "the start failure was reported before the other member relayed its last line"
+    );
+    (outcome, handle.await.expect("chain task panicked"))
+}
+
+#[skuld::test]
+async fn a_typed_start_failure_waits_for_the_other_members_last_line() {
+    let (outcome, result) = assert_failure_waits_for_the_other_members_last_line(StartFailure::Typed, 0).await;
+
+    assert!(
+        matches!(&outcome, Err(StartError::Fatal { detail, .. }) if detail == "member broke"),
+        "want the member's own Fatal, got {outcome:?}"
+    );
+    assert!(
+        matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
+        "run must return the failing member's error, got {result:?}"
+    );
+}
+
+#[skuld::test]
+async fn an_exit_before_ready_waits_for_the_other_members_last_line() {
+    let (outcome, result) = assert_failure_waits_for_the_other_members_last_line(StartFailure::Dropped, 0).await;
+
+    assert!(
+        matches!(&outcome, Err(StartError::Fatal { detail, .. }) if detail.contains("exited before becoming ready")),
+        "want the synthesized exited-before-ready Fatal, got {outcome:?}"
+    );
+    assert!(
+        matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
+        "run must return the failing member's error, got {result:?}"
+    );
+}
+
+#[skuld::test]
+async fn a_start_failure_behind_a_ready_member_waits_for_the_other_members_last_line() {
+    let (outcome, result) = assert_failure_waits_for_the_other_members_last_line(StartFailure::Typed, 1).await;
+
+    assert!(
+        matches!(&outcome, Err(StartError::Fatal { detail, .. }) if detail == "member broke"),
+        "want the member's own Fatal, got {outcome:?}"
+    );
+    assert!(
+        matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
+        "run must return the failing member's error, got {result:?}"
+    );
+}
+
+/// A member that reports a failure and keeps running does not leave the chain up: the start failure ends it.
+#[skuld::test]
+async fn a_start_failure_from_a_member_that_keeps_running_ends_the_chain() {
+    for how in [StartFailure::Typed, StartFailure::Dropped] {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = ChainRunner::new()
+            .add(Box::new(FailsAtStart { how, lingers: true }))
+            .on_ready(ready_tx);
+
+        let mut env = test_env();
+        env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+        let handle = tokio::spawn(runner.run(env));
+
+        let outcome = ready_rx.await.expect("the failure must be reported, not dropped");
+        assert!(matches!(outcome, Err(StartError::Fatal { .. })), "got {outcome:?}");
+        // Only the chain ending lets this return; it exits cleanly because the member did.
+        handle.await.unwrap().expect("a member that exits cleanly when stopped");
+    }
+}
+
+/// The held failure is still delivered when a member ignores the cancel: `drain_timeout` is the chain's documented
+/// failure bound.
+#[skuld::test]
+async fn a_start_failure_is_delivered_once_the_drain_bound_expires_on_a_member_that_ignores_shutdown() {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(FailsAtStart {
+            how: StartFailure::Typed,
+            lingers: false,
+        }))
+        .add(Box::new(StubbornPlugin {
+            name: "stubborn".into(),
+        }))
+        .drain_timeout(std::time::Duration::from_millis(100))
+        .on_ready(ready_tx);
+
+    let mut env = test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    let handle = tokio::spawn(runner.run(env));
+
+    let outcome = ready_rx.await.expect("the held failure must be delivered, not dropped");
+    assert!(
+        matches!(&outcome, Err(StartError::Fatal { detail, .. }) if detail == "member broke"),
+        "want the member's own Fatal, got {outcome:?}"
+    );
+    assert!(
+        matches!(handle.await.unwrap(), Err(crate::Error::PluginExit { code: 3, .. })),
+        "the member's error outranks the drain-timeout error"
     );
 }
 

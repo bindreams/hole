@@ -206,6 +206,10 @@ impl ChainRunner {
     /// Note that aborted tasks are not joined before the function returns;
     /// their underlying `Drop` impls run as the `JoinSet` is dropped, but
     /// any terminal error produced during the abort window is lost.
+    ///
+    /// It is also the bound on the wait that precedes a start failure's report
+    /// (see [`ChainRunner::on_ready`]): the failure is delivered once the
+    /// other plugins have returned or this budget has expired.
     pub fn drain_timeout(mut self, timeout: Duration) -> Self {
         self.drain_timeout = timeout;
         self
@@ -215,10 +219,17 @@ impl ChainRunner {
     /// with the first plugin's start error if any plugin fails to start.
     ///
     /// Fires `Ok(ChainReady)` once EVERY plugin has reported `PluginReady`;
-    /// `Err(StartError)` as soon as any plugin reports a start failure or
-    /// exits before readying. Each plugin reports its own readiness through
-    /// the `ready` channel passed to [`ChainPlugin::run`]; the aggregator
+    /// `Err(StartError)` when any plugin reports a start failure or exits
+    /// before readying. Each plugin reports its own readiness through the
+    /// `ready` channel passed to [`ChainPlugin::run`]; the aggregator
     /// collects the N per-plugin results into one chain-level outcome.
+    ///
+    /// A start failure ends the chain: the runner cancels every plugin and
+    /// reports the failure only after each one's `run` has returned, so the
+    /// output they were still relaying is out before the caller hears of it.
+    /// A plugin that ignores the cancel is waited for until `drain_timeout`
+    /// expires (see [`ChainRunner::drain_timeout`]); the failure is reported
+    /// then, with the warning that bound already logs.
     ///
     /// If shutdown fires before every plugin has readied, `tx` is dropped
     /// and the receiver gets `RecvError` — unless the plugin currently being
@@ -328,9 +339,11 @@ impl ChainRunner {
         // `async move`) because `#[debug_requires]` rewrites `return` in
         // this fn's body into `break 'run`, which is illegal across an
         // async-block boundary; a free fn keeps the rewrite out of it.
-        if let Some(ready_tx) = self.ready_tx {
-            tokio::spawn(run_readiness_aggregator(ready_rxs, n, mode, shutdown.clone(), ready_tx));
-        }
+        // It hands a start failure back instead of sending it: the failure
+        // is delivered below, once the other plugins have drained.
+        let aggregator = self
+            .ready_tx
+            .map(|ready_tx| tokio::spawn(run_readiness_aggregator(ready_rxs, n, mode, shutdown.clone(), ready_tx)));
 
         // Phase 1: run unbounded until either all plugins exit naturally or
         // shutdown is requested. Any plugin exit (clean or error) also fires
@@ -359,7 +372,7 @@ impl ChainRunner {
         })
         .await;
 
-        match drain_result {
+        let outcome = match drain_result {
             Ok(()) => first_error.map_or(Ok(()), Err),
             Err(_timeout) => {
                 tracing::warn!("drain timeout expired, aborting remaining plugins");
@@ -369,11 +382,35 @@ impl ChainRunner {
                 // precedence.
                 Err(first_error.unwrap_or_else(|| crate::Error::Chain("drain timeout expired".into())))
             }
+        };
+
+        // Every plugin has returned (or been given up on at the drain bound),
+        // so a held start failure can be reported. The aggregator ends on its
+        // own: `shutdown` is cancelled by now, and its cancel arm is biased.
+        if let Some(aggregator) = aggregator {
+            if let Ok(Some(held)) = aggregator.await {
+                held.deliver();
+            }
         }
+        outcome
     }
 }
 
 // Helpers =============================================================================================================
+
+/// A start failure the aggregator has decided on but not reported: sending it
+/// is [`ChainRunner::run`]'s to do, after the other plugins have drained.
+#[must_use = "a held start failure is reported only by `deliver`"]
+pub(crate) struct HeldFailure {
+    error: StartError,
+    ready_tx: oneshot::Sender<Result<ChainReady, StartError>>,
+}
+
+impl HeldFailure {
+    pub(crate) fn deliver(self) {
+        let _ = self.ready_tx.send(Err(self.error));
+    }
+}
 
 /// Aggregate the N per-plugin readiness results into a single chain-level
 /// outcome on `ready_tx`.
@@ -383,13 +420,18 @@ impl ChainRunner {
 /// position-0 plugin's reported `listen` is the chain's public address in
 /// Client mode; in Server mode it is position N-1. The chain's transports
 /// are the intersection across all hops.
+///
+/// A start failure is not sent. The chain is no longer viable, so this
+/// cancels `shutdown` (the other plugins stop cooperatively) and returns the
+/// failure as a [`HeldFailure`] for the runner to deliver once they have
+/// drained.
 pub(crate) async fn run_readiness_aggregator(
     ready_rxs: Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)>,
     n: usize,
     mode: Mode,
     shutdown: CancellationToken,
     ready_tx: oneshot::Sender<Result<ChainReady, StartError>>,
-) {
+) -> Option<HeldFailure> {
     let mut plugin_listens: Vec<Option<SocketAddr>> = vec![None; n];
     // Intersection identity (the full transport set); each plugin's
     // reported transports narrow this. `all()` lives on the
@@ -412,7 +454,7 @@ pub(crate) async fn run_readiness_aggregator(
                 // is NOT rescued: `shutdown` is chain-wide and may have been
                 // cancelled by another plugin's exit or an external cancel, so
                 // nothing here shows the chain is still viable.
-                _ => return,
+                _ => return None,
             },
             r = &mut rrx => r,
         };
@@ -422,8 +464,11 @@ pub(crate) async fn run_readiness_aggregator(
                 transports &= pr.transports;
             }
             Ok(Err(start_err)) => {
-                let _ = ready_tx.send(Err(start_err));
-                return;
+                shutdown.cancel();
+                return Some(HeldFailure {
+                    error: start_err,
+                    ready_tx,
+                });
             }
             Err(_recv) => {
                 // Plugin dropped its sender unsent → it exited before
@@ -435,16 +480,20 @@ pub(crate) async fn run_readiness_aggregator(
                 // observers of one event (typed cause to on_ready AND
                 // lifecycle error to teardown). Do NOT try to reconcile them
                 // into one value.
-                let _ = ready_tx.send(Err(StartError::Fatal {
-                    detail: "plugin exited before becoming ready".into(),
-                    errno: None,
-                }));
-                return;
+                shutdown.cancel();
+                return Some(HeldFailure {
+                    error: StartError::Fatal {
+                        detail: "plugin exited before becoming ready".into(),
+                        errno: None,
+                    },
+                    ready_tx,
+                });
             }
         }
     }
     let listen = plugin_listens[public_index].expect("public plugin must have reported a listen address");
     let _ = ready_tx.send(Ok(ChainReady { listen, transports }));
+    None
 }
 
 /// Shared handler for a single plugin-task exit result. Updates
