@@ -202,13 +202,17 @@ filter = 'test(/cutover_global_net_state_service_controls_after_stop_/)'
 success-output = 'immediate-final'
 
 # `cutover_global_net_state_stop_probe_*` print what the SCM answers a Stop (and
-# an arm for every state) in each state a restart passes through, and
+# an arm for every state) in each state a restart passes through,
 # `cutover_global_net_state_service_sid_probe_*` print whether a service
-# process's token carries the service SID; the code's stop policy and identity
-# check rest on those lines, and nextest discards captured output on success.
+# process's token carries the service SID, and `cutover_global_net_state_probe_*`
+# print the other SCM behaviours the service retirement rests on (recovery
+# restarts of a disabled service, arms on a fresh handle, the derived service
+# SID, the process scan, when a SID type takes effect); the code's stop policy
+# and identity check rest on those lines, and nextest discards captured output
+# on success.
 # `immediate-final` for the reason above.
 [[profile.default.overrides]]
-filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe)_/)'
+filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|probe)_/)'
 success-output = 'immediate-final'
 
 # The stop probes, the service-SID probes and the uninstall tests wait on the real SCM state with no
@@ -225,7 +229,7 @@ filter = 'test(/cutover_global_net_state_uninstall_leaves_nothing_whichever_side
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.overrides]]
-filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|uninstall|ensure_stopped|drain)_/)'
+filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|probe|uninstall|ensure_stopped|drain)_/)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

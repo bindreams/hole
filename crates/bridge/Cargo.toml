@@ -124,6 +124,14 @@ payload-archive = { path = "../payload-archive" }
 flate2 = "1"
 tar = "0.4"
 
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+# `cutover_privileged`'s service-SID probe derives the SID from the name
+# (SHA-1 of the upper-cased name) to compare it with the OS's own value.
+sha1 = "0.10"
+# `NotifyChangeEventLog`, for the restart probe's wait on the SCM's log entry;
+# tests only, so the production `windows` feature set stays as it is.
+windows = { version = "0.62", features = ["Win32_System_EventLog"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 payload-archive = { path = "../payload-archive" }
 windows-service = "0.8"

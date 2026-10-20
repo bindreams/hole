@@ -43,6 +43,24 @@ const TUN: skuld::Label;
 #[skuld::label]
 const GLOBAL_NET_STATE: skuld::Label;
 
+// Probes and their helpers live in `cutover_privileged/`; a crate root resolves
+// `mod` beside itself, where Cargo would take each file for a test target.
+#[cfg(target_os = "windows")]
+#[path = "cutover_privileged/arm_probes.rs"]
+mod arm_probes;
+#[cfg(target_os = "windows")]
+#[path = "cutover_privileged/raw_scm.rs"]
+mod raw_scm;
+#[cfg(target_os = "windows")]
+#[path = "cutover_privileged/restart_probes.rs"]
+mod restart_probes;
+#[cfg(target_os = "windows")]
+#[path = "cutover_privileged/sid_formula.rs"]
+mod sid_formula;
+#[cfg(target_os = "windows")]
+#[path = "cutover_privileged/sid_probes.rs"]
+mod sid_probes;
+
 #[cfg(target_os = "windows")]
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 #[cfg(target_os = "windows")]
@@ -1452,18 +1470,17 @@ fn cutover_global_net_state_stop_probe_start_pending_before_attach() {
     );
 }
 
-/// The service-SID probe (bindreams/hole#1099): whether the token of a process
-/// carries the `NT SERVICE\HoleBridge` SID, and with which access rights the
-/// token can be read at all. These are the facts `ProcessHolds::hold_current`'s
-/// identity check rests on (`ServiceSid::is_in_token_of`), printed so a run
-/// states them instead of the code assuming them.
+/// The service-SID probe: whether the token of a process carries the
+/// `NT SERVICE\HoleBridge` SID, and with which access rights the token can be read
+/// at all. These are the facts the identity check (`ServiceSid::is_in_token_of`)
+/// rests on, printed so a run states them instead of the code assuming them.
 ///
-/// The caller is an elevated administrator, which `create_service` needs.
-/// Production uninstall runs as LocalSystem (the MSI custom action), which owns
-/// the service process's token; a test cannot be LocalSystem without a second
-/// SYSTEM process, so what a SYSTEM caller may open is NOT measured here. What
-/// is measured is the harder case: an administrator that is not the token's
-/// owner, first as it is and then with `SeDebugPrivilege` enabled.
+/// The caller is an elevated administrator, which `create_service` needs, and
+/// that caller is what these tests assert on: it must open the service's
+/// process and read its token. A LocalSystem caller (the MSI custom action)
+/// cannot be had without a second SYSTEM process; the scan probe
+/// (`sid_probes::cutover_global_net_state_probe_scan_by_service_sid`) runs one
+/// as a scheduled task and prints what it could read.
 #[cfg(target_os = "windows")]
 mod sid_probe {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -1494,20 +1511,20 @@ mod sid_probe {
     }
 
     impl ProductionCheck {
-        /// What this answer means for the drain, said once per variant.
+        /// What this answer is, said once per variant.
         fn meaning(&self) -> String {
             match self {
                 ProductionCheck::NoProcessId => {
-                    "the SCM named no process in this state, so the hold has nothing to open and waits for a later state".into()
+                    "the SCM named no process in this state, so there was nothing to open".into()
                 }
                 ProductionCheck::Unreadable => {
-                    "the token could not be read from an elevated administrator without SeDebugPrivilege: every                      uninstall run by an administrator (not SYSTEM) fails with RetireError::Hold; the lines above                      say which rights would be needed. SYSTEM (the MSI custom action) is not measured here".into()
+                    "the process or its token could not be opened with the hold's rights from this caller (an elevated administrator without SeDebugPrivilege); the lines above say which step was refused and with what code".into()
                 }
                 ProductionCheck::Answered(true) => {
-                    "the token carries the service SID: the hold can tell this process from a stranger".into()
+                    "the token carries the service SID: the check can tell this process from a stranger".into()
                 }
                 ProductionCheck::Answered(false) => {
-                    "the token does not carry the service SID: a stranger, or a service process started before the                      SID type was set".into()
+                    "the token does not carry the service SID: a stranger, or a service process started before the SID type was set".into()
                 }
                 ProductionCheck::Failed(reason) => format!("a step around the check failed: {reason}"),
             }
@@ -1749,8 +1766,18 @@ fn service_sid_probe_of_a_service(helper: &std::path::Path, flag: Option<&str>) 
     }
 }
 
-// The service-SID probes print what they measured and assert nothing about it:
-// what a measurement means for the drain is decided from the printed lines.
+// The service-SID probes print what they measured and assert the answer of the
+// production check for the elevated administrator that runs them.
+
+/// Fails unless the production check answered `expected`.
+#[cfg(target_os = "windows")]
+fn assert_answers(measure: &sid_probe::Measure, expected: bool, scenario: &str) {
+    assert!(
+        matches!(measure.production_check, sid_probe::ProductionCheck::Answered(answer) if answer == expected),
+        "{scenario}: the production check was expected to answer Answered({expected}), got {:?}",
+        measure.production_check
+    );
+}
 
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
@@ -1758,6 +1785,7 @@ fn cutover_global_net_state_service_sid_probe_running() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let (reported, measure) = service_sid_probe_of_a_service(helper, None);
     sid_probe::print("RUNNING, service SID type set", reported, &measure);
+    assert_answers(&measure, true, "RUNNING, service SID type set");
 }
 
 #[cfg(target_os = "windows")]
@@ -1768,8 +1796,8 @@ fn cutover_global_net_state_service_sid_probe_start_pending() {
     sid_probe::print("START_PENDING (--hold-start), service SID type set", reported, &measure);
 }
 
-/// What a service process started before the SID type was set looks like: the
-/// printed answer decides what the drain does with one.
+/// What a service process started before the SID type was set looks like: its
+/// token does not carry the SID.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_service_sid_probe_running_without_the_sid_type() {
@@ -1784,6 +1812,7 @@ fn cutover_global_net_state_service_sid_probe_running_without_the_sid_type() {
     let pid = scm_probe::service_process_id();
     let measure = sid_probe::measure(Some(pid));
     sid_probe::print("RUNNING, service SID type NOT set", Some(pid), &measure);
+    assert_answers(&measure, false, "RUNNING, service SID type NOT set");
 }
 
 /// The service's SID type as the OS's own tool prints it (`sc qsidtype`), read
@@ -1870,124 +1899,7 @@ fn cutover_global_net_state_service_sid_probe_a_stranger() {
         Some(pid),
         &measure,
     );
-}
-
-/// A `RetireSession` that sends the service a Stop the moment its first arm
-/// returns, and kills the service's process if the Stop is refused, so the wait
-/// that follows always has an event to fire on: the state change the Stop (or
-/// the kill) causes, or the arm's own report of the current state. Every call is
-/// printed as it returns, so a wait that never ends (the nextest bound) still
-/// leaves what was measured before it.
-#[cfg(target_os = "windows")]
-struct StopsOnFirstArm {
-    inner: hole_bridge::platform::os::RetireSession,
-    process: u32,
-    stopped: bool,
-}
-
-#[cfg(target_os = "windows")]
-impl hole_bridge::cutover::scm_wait::ScmActor for StopsOnFirstArm {
-    fn arm(
-        &mut self,
-        want: hole_bridge::cutover::scm_wait::WantState,
-        except: Option<hole_bridge::cutover::scm_wait::Observed>,
-    ) -> std::io::Result<()> {
-        let armed = self.inner.arm(want, except);
-        eprintln!("  NotifyServiceStatusChange arm -> {armed:?}");
-        if !self.stopped {
-            // After an arm that failed too: no wait follows it, and the service
-            // still has to go.
-            self.stopped = true;
-            let stop = self.inner.control_stop();
-            eprintln!("  ControlService(STOP) -> {stop:?}");
-            if stop.is_err() {
-                scm_probe::terminate_process(self.process);
-                eprintln!("  the Stop was refused: killed the service process");
-            }
-        }
-        armed
-    }
-    fn control_stop(&mut self) -> std::io::Result<()> {
-        let stop = self.inner.control_stop();
-        eprintln!("  ControlService(STOP) by stop_via_notify -> {stop:?}");
-        stop
-    }
-    fn start(&mut self) -> std::io::Result<()> {
-        self.inner.start()
-    }
-    fn wait_callback(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::Observed> {
-        let observed = self.inner.wait_callback()?;
-        eprintln!("  wait_callback reported {observed:?}");
-        Ok(observed)
-    }
-    fn process_fate(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::ProcessFate> {
-        self.inner.process_fate()
-    }
-}
-
-/// The drain after the delete rests on a handle opened before it still
-/// working on a service marked for deletion. Measured on that handle: a state
-/// query, an arm and the first report, a Stop, and `stop_via_notify`.
-///
-/// Every call returns on an event the probe has already caused. The Stop goes
-/// out right after the arm (see [`StopsOnFirstArm`]) instead of after a wait
-/// for a report: an arm on a marked service may not report the state it finds
-/// (that is the question), and nothing else would then ever fire it.
-/// `stop_via_notify` runs only if that first report was the RUNNING the arm
-/// found: its own arms come after the Stop, and the transition they wait for
-/// can already be over, so they return only if an arm on a marked service
-/// reports the current state at once.
-#[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_stop_probe_handle_of_a_service_marked_for_delete() {
-    use hole_bridge::cutover::scm_wait::retire::ServiceSession;
-    use hole_bridge::cutover::scm_wait::{stop_via_notify, Observed, ScmActor, WantState};
-    use hole_bridge::platform::os::RetireSession;
-
-    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let _service = ProvisionedService::install(helper);
-    let mut os = WindowsCutoverOs {
-        images: vec![],
-        target_version: "test".into(),
-    };
-    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
-
-    let process = scm_probe::service_process_id();
-    let mut session = StopsOnFirstArm {
-        inner: RetireSession::open()
-            .expect("open the session")
-            .expect("the service is registered"),
-        process,
-        stopped: false,
-    };
-    session.inner.delete().expect("mark the running service for deletion");
-    eprintln!("SCM stop probe, handle opened before DeleteService on a RUNNING service:");
-    let observed = session.inner.observe();
-    eprintln!("  QueryServiceStatusEx -> {observed:?}");
-    let armed = session.arm(WantState::Stopped, None);
-    let first_report = armed.is_ok().then(|| session.wait_callback());
-    let finished = if matches!(first_report, Some(Ok(Observed::Running))) {
-        Some(stop_via_notify(&mut session))
-    } else {
-        None
-    };
-    // The Stop (or the kill) ends the process; its exit is the event.
-    let exited = session.inner.await_exits();
-    eprintln!(
-        "  first report -> {first_report:?}; stop_via_notify -> {finished:?} (None: not run, the first report was not \
-         the RUNNING the arm found); process exit awaited -> {exited:?}\n  \
-         MEANS: the drain (retire.rs `drain`) depends on the query and the Stop only. \
-         If the query is Ok the drain's looks work; if it is Err every drain look fails as \
-         RetireError::Drain and a service the SCM restarted between the stop and the delete \
-         cannot be uninstalled (the drain needs another way to read the service). \
-         If the Stop is Ok the drain's Stop for a live marked service is delivered; if it is Err \
-         the drain fails with the Stop's code (RUNNING) and needs TerminateProcess or another route. \
-         The first report says what an arm does on a marked RUNNING service: Running means it \
-         reports the current state at once, StopPending or Stopped means it reported only the \
-         change the Stop caused. The arm line says only whether the START_PENDING drain state \
-         (`DrainStep::AwaitRunning`, the one that arms) can work: an arm Err there is a loud \
-         RetireError::Drain, and the deputy's Q1 (TerminateProcess fallback) applies."
-    );
+    assert_answers(&measure, false, "a stranger");
 }
 
 /// `OpenProcess(PROCESS_SYNCHRONIZE)` on the service process from the caller's
@@ -2151,28 +2063,14 @@ fn cutover_global_net_state_stop_probe_start_of_a_stopped_service_marked_for_del
 enum ReleaseOn {
     /// Once the first wait has returned and been recorded: the report was made
     /// while the helper was parked, so it is the parked state by construction.
-    /// The only choice for a test that asserts on the first report.
     FirstReport,
-    /// As soon as the first arm returns, so a wait always has an event to fire
-    /// on even if an arm reports nothing by itself. The helper may move before
-    /// the SCM delivers the first report, so that report says nothing about
-    /// the arm: for a probe that prints and asserts nothing.
-    Arm,
 }
 
 #[cfg(target_os = "windows")]
 impl ReleaseOn {
-    fn releases_after_arm(self) -> bool {
-        match self {
-            ReleaseOn::FirstReport => false,
-            ReleaseOn::Arm => true,
-        }
-    }
-
     fn releases_after_first_report(self) -> bool {
         match self {
             ReleaseOn::FirstReport => true,
-            ReleaseOn::Arm => false,
         }
     }
 }
@@ -2229,11 +2127,7 @@ impl hole_bridge::cutover::scm_wait::ScmActor for ReleasingSession<'_> {
         want: hole_bridge::cutover::scm_wait::WantState,
         except: Option<hole_bridge::cutover::scm_wait::Observed>,
     ) -> std::io::Result<()> {
-        self.inner.arm(want, except)?;
-        if self.release_on.releases_after_arm() {
-            self.release_once();
-        }
-        Ok(())
+        self.inner.arm(want, except)
     }
     fn control_stop(&mut self) -> std::io::Result<()> {
         self.inner.control_stop()
@@ -2523,46 +2417,6 @@ fn cutover_global_net_state_drain_stops_and_awaits_a_running_service_marked_for_
     left_behind::assert_none(&pid_log);
     drop(session);
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
-}
-
-/// What the drain does with a service marked for deletion while START_PENDING,
-/// where a Stop is refused and the process will not exit by itself: the one state
-/// that goes through an arm. Prints the outcome (it is the measurement of what
-/// an arm does on a marked service in that state); it asserts nothing about it.
-/// The helper is released at the arm, so a wait has an event to fire on even if
-/// an arm on a marked service reports nothing: the first report may be the
-/// helper's move, not the arm's.
-#[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_stop_probe_drain_of_a_start_pending_service_marked_for_delete() {
-    use hole_bridge::cutover::scm_wait::retire::{drain, ServiceSession};
-
-    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let parked = named_event::NamedEvent::create("MarkedParked");
-    let release = named_event::NamedEvent::create("MarkedRelease");
-    let _service = ProvisionedService::install_with(
-        helper,
-        vec![
-            "--hold-start".into(),
-            release.name().into(),
-            "--parked-event".into(),
-            parked.name().into(),
-        ],
-        None,
-    );
-    let _release_on_drop = release.release_on_drop();
-    let starter = start_in_background();
-    parked.wait();
-
-    let mut session = ReleasingSession::open(&release, ReleaseOn::Arm);
-    session.hold_process().expect("hold the starting service's process");
-    session.delete().expect("mark the starting service for deletion");
-    let drained = drain(&mut session);
-    eprintln!(
-        "SCM stop probe, drain of a service marked for deletion while START_PENDING: {drained:?}; reports {:?}",
-        session.reports
-    );
-    let _ = starter.join();
 }
 
 /// macOS: renamex_np-swap the `.app` (a dir) + plain-rename the helper (a file)

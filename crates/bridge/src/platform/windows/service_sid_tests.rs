@@ -16,7 +16,8 @@ fn own_process() -> OwnedHandle {
 /// sub-authority, authority 1, sub-authority 0) is in every token. The
 /// negative half, a real service SID absent from a process that is not the
 /// service, needs a registered service (`NT SERVICE\<name>` resolves only for
-/// one) and is `cutover_global_net_state_service_sid_probe_a_stranger`.
+/// one) and is asserted by `cutover_global_net_state_service_sid_probe_a_stranger`
+/// (`tests/cutover_privileged.rs`).
 #[skuld::test]
 fn a_sid_the_token_carries_is_found_in_it() {
     let everyone = ServiceSid {

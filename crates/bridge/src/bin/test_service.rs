@@ -36,6 +36,16 @@
 //! - `--parked-event <event>`: signalled once the process is parked by one of
 //!   the two flags above, so a test can tell the hold is in force without
 //!   guessing at timing.
+//! - `--running-event <event>`: signalled right after the service reports
+//!   RUNNING, once per start. A test that resets it before it kills the service
+//!   learns the SCM's restarted instance is up from the signal.
+//!
+//! A first argument of `--scan-sid` makes this a one-shot scanner instead of a
+//! service: `--scan-sid <service> <out-file> [done-event]` looks for the
+//! processes whose token carries `NT SERVICE\<service>`, as the uninstaller's
+//! hold does, writes what it measured to `<out-file>` and signals `done-event`
+//! (when given) whichever way it ended. A test runs it as itself and as
+//! LocalSystem (a scheduled task) to measure what each caller can read.
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;
@@ -70,6 +80,7 @@ struct Args {
     hold_start: Option<String>,
     delay_attach: Option<String>,
     parked_event: Option<String>,
+    running_event: Option<String>,
     pid_log: Option<PathBuf>,
     sid_repair_log: Option<PathBuf>,
 }
@@ -89,6 +100,7 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
             Some("--sid-repair-log") => args.sid_repair_log = Some(PathBuf::from(value)),
             Some("--hold-start") => args.hold_start = Some(value.into_string().expect("event name is UTF-8")),
             Some("--parked-event") => args.parked_event = Some(value.into_string().expect("event name is UTF-8")),
+            Some("--running-event") => args.running_event = Some(value.into_string().expect("event name is UTF-8")),
             Some("--delay-attach") => args.delay_attach = Some(value.into_string().expect("event name is UTF-8")),
             Some("--on-stop") => {
                 args.on_stop = match value.to_str() {
@@ -104,7 +116,17 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
 }
 
 #[cfg(target_os = "windows")]
+#[path = "test_service/scan.rs"]
+mod scan;
+
+#[cfg(target_os = "windows")]
 fn main() -> Result<(), windows_service::Error> {
+    let mut raw = std::env::args_os().skip(1).peekable();
+    if raw.peek().is_some_and(|first| first == "--scan-sid") {
+        raw.next();
+        scan::run(raw);
+        return Ok(());
+    }
     ARGS.set(parse_args(std::env::args_os().skip(1))).ok();
     let args = ARGS.get().expect("set above");
     if let Some(path) = &args.pid_log {
@@ -141,6 +163,20 @@ fn park_until(parked: Option<&str>, release: &str) {
             SetEvent(parked).expect("signal the parked event");
         }
         WaitForSingleObject(release, INFINITE);
+    }
+}
+
+/// Signals the named event. A bad event name panics.
+#[cfg(target_os = "windows")]
+fn signal(event: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+
+    // SAFETY: plain FFI calls; the name is a valid HSTRING that outlives its
+    // call, and the handle is the live one just opened.
+    unsafe {
+        let event = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(event)).expect("open the event to signal");
+        SetEvent(event).expect("signal the event");
     }
 }
 
@@ -238,6 +274,9 @@ fn service_main(_arguments: Vec<OsString>) {
         .is_err()
     {
         return;
+    }
+    if let Some(name) = args.running_event.as_deref() {
+        signal(name);
     }
     let _ = stop_rx.blocking_recv(); // park until SCM sends STOP
     if let Some(release) = release {
