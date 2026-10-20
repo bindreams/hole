@@ -1,5 +1,6 @@
 pub mod cutover;
 pub mod diagnostics;
+pub mod disable_record;
 pub mod dispatcher;
 pub mod dns;
 pub mod dns_state;
