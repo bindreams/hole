@@ -2652,6 +2652,10 @@ the check always builds them with private items, so a public item may link a
 private one. No other lint is allowed. `garter` is built plain, because docs.rs
 omits private items: its docs may not link one.
 
+Libraries and binaries are separate `cargo doc` commands (`--lib`, `--bins`): a plain
+`cargo doc` skips a binary named like its crate's library, which leaves `crates/hole`'s
+binary-only modules unchecked, and one command with both writes them to one directory.
+
 A reference to an item that is `cfg`-gated away on some target or `#[cfg(test)]`
 still breaks the check; write it in backticks without brackets.
 
