@@ -49,12 +49,11 @@ impl RetireSession {
             Err(e) if super::open_error_is_absent(&e) => return Ok(None),
             Err(e) => return Err(scm_failure(ScmCall::OpenService, e).into()),
         };
-        let sid = ServiceSid::of(SERVICE_NAME).map_err(|e| format!("the service's SID could not be resolved: {e}"))?;
         match SystemScmActor::open(SERVICE_NAME) {
             Ok(actor) => Ok(Some(Self {
                 service,
                 actor,
-                sid,
+                sid: ServiceSid::of(SERVICE_NAME),
                 processes: ServiceProcesses::default(),
             })),
             // Deleted between the two opens.

@@ -9,9 +9,11 @@
 //! release's code and never does, so the running bridge makes sure of it itself
 //! ([`ensure_own_service_sid`]).
 
+use std::fmt;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
+use sha1::{Digest, Sha1};
 use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows::Win32::Security::{
@@ -131,15 +133,46 @@ pub fn ensure_own_service_sid() -> io::Result<SidRepairOutcome> {
     }
 }
 
-/// The SID a service of this name carries, resolved by the OS.
+/// The SID a service of this name carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceSid {
     /// `u32`s for the alignment of a SID's sub-authorities.
     sid: Vec<u32>,
 }
 
+/// The `SECURITY_NT_AUTHORITY` identifier authority's last byte.
+const NT_AUTHORITY: u32 = 5;
+/// `SECURITY_SERVICE_ID_BASE_RID`: the sub-authority of the `NT SERVICE` domain.
+const SERVICE_ID_BASE_RID: u32 = 80;
+
 impl ServiceSid {
-    /// Resolves `NT SERVICE\<service_name>`.
-    pub fn of(service_name: &str) -> io::Result<Self> {
+    /// The SID of the service named `service_name`, computed from the name
+    /// alone: `S-1-5-80-` and the SHA-1 of the upper-cased name's UTF-16LE
+    /// bytes, as five little-endian DWORDs. No OS call, so it answers the same
+    /// for a service registered, being deleted, or never registered.
+    ///
+    /// Panics on a non-ASCII name: the SCM's upper-casing is not specified
+    /// beyond ASCII, and `SERVICE_NAME` is ASCII.
+    pub fn of(service_name: &str) -> Self {
+        assert!(
+            service_name.is_ascii(),
+            "a service SID is derived only for an ASCII name, not {service_name:?}"
+        );
+        let mut hash = Sha1::new();
+        for unit in service_name.to_ascii_uppercase().encode_utf16() {
+            hash.update(unit.to_le_bytes());
+        }
+        let digest = hash.finalize();
+        // Revision 1, six sub-authorities, authority 5 (big-endian over six bytes).
+        let mut sid = vec![0x0000_0601, NT_AUTHORITY << 24, SERVICE_ID_BASE_RID];
+        sid.extend(digest.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word)));
+        Self { sid }
+    }
+
+    /// Resolves `NT SERVICE\<service_name>` through the OS, which answers only
+    /// while the service is registered. For checking [`Self::of`] against the
+    /// OS; the bridge does not call it.
+    pub fn os_lookup(service_name: &str) -> io::Result<Self> {
         let account = HSTRING::from(format!("NT SERVICE\\{service_name}"));
         let (mut sid_len, mut domain_len) = (0u32, 0u32);
         let mut kind = SID_NAME_USE::default();
@@ -226,6 +259,21 @@ impl ServiceSid {
         Ok(groups
             .iter()
             .any(|group| unsafe { EqualSid(group.Sid, self.psid()) }.is_ok()))
+    }
+}
+
+/// `S-1-5-80-...`, the text form `sc showsid` prints.
+impl fmt::Display for ServiceSid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every constructor writes the 8-byte header and `count` sub-authorities.
+        let bytes: Vec<u8> = self.sid.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let (revision, count) = (bytes[0], usize::from(bytes[1]));
+        let authority = bytes[2..8].iter().fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
+        write!(f, "S-{revision}-{authority}")?;
+        for sub_authority in &self.sid[2..2 + count] {
+            write!(f, "-{sub_authority}")?;
+        }
+        Ok(())
     }
 }
 

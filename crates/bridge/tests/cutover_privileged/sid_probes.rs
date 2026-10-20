@@ -19,7 +19,7 @@ use std::path::Path;
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 use hole_bridge::cutover::os::CutoverOs;
 use hole_bridge::platform::os::registration::run_startup_repairs;
-use hole_bridge::platform::os::{SidRepairOutcome, SERVICE_NAME};
+use hole_bridge::platform::os::{ServiceSid, SidRepairOutcome, SERVICE_NAME};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_SERVICE_MARKED_FOR_DELETE, HANDLE};
 use windows::Win32::System::Services::{
@@ -28,7 +28,6 @@ use windows::Win32::System::Services::{
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE};
 
 use super::named_event::NamedEvent;
-use super::sid_formula::{derived_service_sid, os_service_sid};
 use super::{scm_probe, ProvisionedService, GLOBAL_NET_STATE, TUN};
 
 fn os() -> WindowsCutoverOs {
@@ -56,17 +55,18 @@ fn sc_showsid_of(name: &str) -> String {
         .unwrap_or_else(|| text.lines().map(str::trim).collect::<Vec<_>>().join(" | "))
 }
 
-/// P4. The deputy's decision is to compute the SID from the name rather than
-/// ask the OS, which cannot answer once the service is deleted. The registered
-/// name is asserted against the OS's own lookup; the name no service has is
-/// printed (the lookup is expected to fail, the derivation is not).
+/// P4. The SID is computed from the name (`ServiceSid::of`) rather than asked
+/// of the OS, which cannot answer once the service is deleted. The registered
+/// name is asserted against the OS's own lookup and `sc showsid`; the name no
+/// service has is printed (the lookup is expected to fail, the derivation is
+/// not).
 ///
 /// Lines to read: `P4 ANSWER, registered` and `P4 ANSWER, never registered`.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_probe_computed_service_sid() {
     let _service = ProvisionedService::install(helper());
-    let computed = derived_service_sid(SERVICE_NAME);
-    let from_os = os_service_sid(SERVICE_NAME);
+    let computed = ServiceSid::of(SERVICE_NAME).to_string();
+    let from_os = ServiceSid::os_lookup(SERVICE_NAME).map(|sid| sid.to_string());
     let from_sc = sc_showsid_of(SERVICE_NAME);
     eprintln!("P4 ANSWER, registered ({SERVICE_NAME}): derived {computed}; LookupAccountNameW {from_os:?}; sc showsid {from_sc}");
     assert_eq!(
@@ -79,8 +79,8 @@ fn cutover_global_net_state_probe_computed_service_sid() {
     let unregistered = format!("HoleNeverRegistered{}", std::process::id());
     eprintln!(
         "P4 ANSWER, never registered ({unregistered}): derived {}; LookupAccountNameW {:?}; sc showsid {}",
-        derived_service_sid(&unregistered),
-        os_service_sid(&unregistered),
+        ServiceSid::of(&unregistered),
+        ServiceSid::os_lookup(&unregistered).map(|sid| sid.to_string()),
         sc_showsid_of(&unregistered)
     );
 }

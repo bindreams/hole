@@ -20,10 +20,7 @@ fn own_process() -> OwnedHandle {
 /// (`tests/cutover_privileged.rs`).
 #[skuld::test]
 fn a_sid_the_token_carries_is_found_in_it() {
-    let everyone = ServiceSid {
-        sid: vec![0x0000_0101, 0x0100_0000, 0],
-    };
-    assert!(everyone
+    assert!(ServiceSid::everyone()
         .is_in_token_of(&own_process())
         .expect("read this process's token"));
 }
@@ -33,10 +30,9 @@ fn a_sid_the_token_carries_is_found_in_it() {
 /// first virtual account, which this process does not run as.
 #[skuld::test]
 fn a_sid_the_token_lacks_is_not_found_in_it() {
-    let other = ServiceSid {
-        sid: vec![0x0000_0201, 0x0500_0000, 80, 1],
-    };
-    assert!(!other.is_in_token_of(&own_process()).expect("read this process's token"));
+    assert!(!ServiceSid::nothing_carries()
+        .is_in_token_of(&own_process())
+        .expect("read this process's token"));
 }
 
 /// The values are `winsvc.h`'s: `SERVICE_SID_TYPE_NONE` 0, `_UNRESTRICTED` 1,
@@ -48,4 +44,56 @@ fn only_the_unrestricted_sid_type_is_left_alone() {
     assert_eq!(SidRepair::for_sid_type(0), SidRepair::Apply);
     assert_eq!(SidRepair::for_sid_type(1), SidRepair::Leave);
     assert_eq!(SidRepair::for_sid_type(3), SidRepair::Apply);
+}
+
+// The name-derived SID ================================================================================================
+
+/// Microsoft's published SID for the `TrustedInstaller` service: a vector that
+/// does not come from this code.
+#[skuld::test]
+fn the_sid_of_trustedinstaller_is_the_published_one() {
+    assert_eq!(
+        ServiceSid::of("TrustedInstaller").to_string(),
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+    );
+}
+
+/// Both come from outside this code: `sc showsid <name>`, which prints a SID
+/// even for a name no service has, and Python's
+/// `hashlib.sha1(name.upper().encode("utf-16-le"))` read as five little-endian
+/// DWORDs.
+#[skuld::test]
+fn the_sid_of_a_name_is_the_one_sc_showsid_prints() {
+    assert_eq!(
+        ServiceSid::of("HoleBridge").to_string(),
+        "S-1-5-80-2360150170-1344213777-276432733-568477872-1069952987"
+    );
+    assert_eq!(
+        ServiceSid::of("EventLog").to_string(),
+        "S-1-5-80-880578595-1860270145-482643319-2788375705-1540778122"
+    );
+}
+
+#[skuld::test]
+fn the_sid_of_a_name_ignores_its_case() {
+    assert_eq!(ServiceSid::of("holebridge"), ServiceSid::of("HOLEBRIDGE"));
+    assert_eq!(ServiceSid::of("HoleBridge"), ServiceSid::of("HOLEBRIDGE"));
+}
+
+/// The SCM's upper-casing is not spelled out beyond ASCII, so the derivation
+/// refuses to guess for any other name.
+#[skuld::test]
+#[should_panic(expected = "ASCII")]
+fn the_sid_of_a_non_ascii_name_is_refused() {
+    let _ = ServiceSid::of("Hole\u{e9}Bridge");
+}
+
+/// The OS resolves services every Windows has, with no privilege, so this
+/// compares the derivation to the OS on any machine.
+#[skuld::test]
+fn the_sid_of_a_name_is_the_os_sid_of_an_installed_service() {
+    for name in ["TrustedInstaller", "EventLog", "Dnscache", "Winmgmt"] {
+        let from_os = ServiceSid::os_lookup(name).unwrap_or_else(|e| panic!("resolve NT SERVICE\\{name}: {e}"));
+        assert_eq!(ServiceSid::of(name), from_os, "{name}");
+    }
 }

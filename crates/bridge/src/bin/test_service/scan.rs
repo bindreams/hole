@@ -59,16 +59,8 @@ pub fn run(mut args: impl Iterator<Item = OsString>) {
 fn measure(service: &str) -> String {
     let mut report = String::new();
     writeln!(report, "caller: {}", caller_sid()).unwrap();
-    let sid = match ServiceSid::of(service) {
-        Ok(sid) => {
-            writeln!(report, "service SID lookup: Ok").unwrap();
-            Some(sid)
-        }
-        Err(e) => {
-            writeln!(report, "service SID lookup: Err {e}").unwrap();
-            None
-        }
-    };
+    let sid = ServiceSid::of(service);
+    writeln!(report, "service SID: {sid}").unwrap();
 
     let (mut total, mut opened, mut absent) = (0usize, 0usize, 0usize);
     // Keyed by the call, the code and the kind and rows the production table gives it.
@@ -98,7 +90,6 @@ fn measure(service: &str) -> String {
             }
         };
         opened += 1;
-        let Some(sid) = &sid else { continue };
         match sid.is_in_token_of(&process) {
             Ok(true) => matches.push(who),
             Ok(false) => absent += 1,
@@ -127,16 +118,13 @@ fn measure(service: &str) -> String {
     for (cause, who) in &token_unreadable {
         writeln!(report, "token unreadable ({cause}) x{}: {}", who.len(), who.join(", ")).unwrap();
     }
-    match &sid {
-        Some(sid) => match scan_service_processes(sid) {
-            Ok(found) => {
-                let alive: Vec<u32> = found.alive.iter().map(|(pid, _)| *pid).collect();
-                writeln!(report, "production scan, alive: {alive:?}").unwrap();
-                writeln!(report, "production scan, undetermined: {:?}", found.undetermined).unwrap();
-            }
-            Err(e) => writeln!(report, "production scan failed: {e}").unwrap(),
-        },
-        None => writeln!(report, "production scan: no service SID").unwrap(),
+    match scan_service_processes(&sid) {
+        Ok(found) => {
+            let alive: Vec<u32> = found.alive.iter().map(|(pid, _)| *pid).collect();
+            writeln!(report, "production scan, alive: {alive:?}").unwrap();
+            writeln!(report, "production scan, undetermined: {:?}", found.undetermined).unwrap();
+        }
+        Err(e) => writeln!(report, "production scan failed: {e}").unwrap(),
     }
     let ids: Vec<&str> = matches.iter().filter_map(|who| who.split(':').next()).collect();
     writeln!(

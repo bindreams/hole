@@ -55,9 +55,6 @@ mod raw_scm;
 #[path = "cutover_privileged/restart_probes.rs"]
 mod restart_probes;
 #[cfg(target_os = "windows")]
-#[path = "cutover_privileged/sid_formula.rs"]
-mod sid_formula;
-#[cfg(target_os = "windows")]
 #[path = "cutover_privileged/sid_probes.rs"]
 mod sid_probes;
 
@@ -1697,11 +1694,7 @@ mod sid_probe {
         };
         // SAFETY: `OpenProcess` returned a new handle this value owns.
         let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
-        let sid = match ServiceSid::of(SERVICE_NAME) {
-            Ok(sid) => sid,
-            Err(e) => return ProductionCheck::Failed(format!("resolve the service SID: {e}")),
-        };
-        match sid.is_in_token_of(&process) {
+        match ServiceSid::of(SERVICE_NAME).is_in_token_of(&process) {
             Ok(carries) => ProductionCheck::Answered(carries),
             Err(e) => ProductionCheck::Failed(format!("read the token the first attempt read: {e}")),
         }
