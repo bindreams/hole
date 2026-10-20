@@ -57,9 +57,12 @@
 //! (GPL-3.0-or-later) imports it; one-way Apache → GPL compatibility
 //! per the workspace `NOTICES.md`.
 
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
@@ -102,10 +105,21 @@ pub struct TapPlugin {
     /// ports and errors the OS would return.
     #[cfg(test)]
     probe: Option<Probe>,
+    /// Replaces the forwarders' TCP connect, so a test can script the refusals the OS would return.
+    #[cfg(test)]
+    connector: Option<Connector>,
 }
 
 /// One attempt to find a free port: the address a probe bound, or its error.
 pub(crate) type Probe = Box<dyn FnMut() -> io::Result<SocketAddr> + Send>;
+
+/// Opens a forwarder's connection to the inner.
+pub(crate) type Connector =
+    Arc<dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>> + Send + Sync>;
+
+fn tcp_connector() -> Connector {
+    Arc::new(|addr| Box::pin(TcpStream::connect(addr)))
+}
 
 impl TapPlugin {
     pub fn wrap(inner: Box<dyn ChainPlugin>) -> Self {
@@ -113,6 +127,8 @@ impl TapPlugin {
             inner,
             #[cfg(test)]
             probe: None,
+            #[cfg(test)]
+            connector: None,
         }
     }
 
@@ -124,11 +140,28 @@ impl TapPlugin {
         None
     }
 
+    /// The connector a test installed, else the real TCP connect.
+    fn take_connector(&mut self) -> Connector {
+        #[cfg(test)]
+        if let Some(connector) = self.connector.take() {
+            return connector;
+        }
+        tcp_connector()
+    }
+
     #[cfg(test)]
     pub(crate) fn wrap_with_probe(inner: Box<dyn ChainPlugin>, probe: Probe) -> Self {
         Self {
-            inner,
             probe: Some(probe),
+            ..Self::wrap(inner)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wrap_with_connector(inner: Box<dyn ChainPlugin>, connector: Connector) -> Self {
+        Self {
+            connector: Some(connector),
+            ..Self::wrap(inner)
         }
     }
 }
@@ -152,6 +185,7 @@ impl ChainPlugin for TapPlugin {
 
         // 1. Allocate inner port (probe-and-drop, with bind-race retry).
         let probe = self.take_probe().unwrap_or_else(|| os_probe(local.ip()));
+        let connector = self.take_connector();
         let inner_local = match allocate_inner_port_with(
             &plugin_name,
             local.ip(),
@@ -294,8 +328,9 @@ impl ChainPlugin for TapPlugin {
                 accept = listener.accept() => match accept {
                     Ok((inbound, peer)) => {
                         let inbound_token = shutdown.clone();
+                        let connector = connector.clone();
                         connections.spawn(async move {
-                            handle_tap_connection(inbound, peer, inner_target, inbound_token).await;
+                            handle_tap_connection(inbound, peer, inner_target, connector, inbound_token).await;
                         });
                         Step::Continue
                     }
@@ -477,13 +512,14 @@ async fn handle_tap_connection(
     inbound: TcpStream,
     peer: SocketAddr,
     inner_target: SocketAddr,
+    connector: Connector,
     shutdown: CancellationToken,
 ) {
     let conn_id = NEXT_TAP_CONN_ID.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
     tracing::info!(tap_conn_id = conn_id, %peer, %inner_target, "plugin tap: accepted");
 
-    let upstream = match retry_connect_inner(conn_id, inner_target, &shutdown).await {
+    let upstream = match retry_connect_inner(conn_id, inner_target, &connector, &shutdown).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -541,8 +577,13 @@ async fn handle_tap_connection(
 /// inner exiting ends it too, from outside: the accept loop aborts every
 /// forwarder, this one included, when the inner task finishes. The backoff
 /// paces the loop and proves nothing.
-async fn retry_connect_inner(conn_id: u64, addr: SocketAddr, shutdown: &CancellationToken) -> io::Result<TcpStream> {
-    retry_connect_with(conn_id, addr, || TcpStream::connect(addr), shutdown).await
+async fn retry_connect_inner(
+    conn_id: u64,
+    addr: SocketAddr,
+    connector: &Connector,
+    shutdown: &CancellationToken,
+) -> io::Result<TcpStream> {
+    retry_connect_with(conn_id, addr, || connector(addr), shutdown).await
 }
 
 /// [`retry_connect_inner`] over a caller-supplied connect, so a test can script

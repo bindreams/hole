@@ -56,7 +56,8 @@ use crate::counting::CountingStream;
 use crate::plugin::ChainPlugin;
 use crate::sitrep::{PluginReady, StartError};
 use crate::tap::{
-    allocate_inner_port_with, connect_target, is_port_race, reports_the_given_address, retry_connect_with, TapPlugin,
+    allocate_inner_port_with, connect_target, is_port_race, reports_the_given_address, retry_connect_with, Connector,
+    TapPlugin,
 };
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
@@ -1633,17 +1634,16 @@ async fn a_short_run_of_refusals_never_warns() {
     assert_eq!(count_lines(&log, "WARN"), 0, "{log}");
 }
 
-/// Reports ready on the address it was given, which it holds bound but never
-/// listens on, so every connect to it is refused and no other process can take
-/// the port; exits with an error once `die` fires.
-struct ClosedListenerStub {
+/// Reports ready on the address it was given without binding it, then exits with an
+/// error once `die` fires.
+struct ReadiedStub {
     die: oneshot::Receiver<()>,
 }
 
 #[async_trait::async_trait]
-impl ChainPlugin for ClosedListenerStub {
+impl ChainPlugin for ReadiedStub {
     fn name(&self) -> &str {
-        "closed-listener-stub"
+        "readied-stub"
     }
 
     async fn run(
@@ -1653,12 +1653,8 @@ impl ChainPlugin for ClosedListenerStub {
         _shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        let socket = tokio::net::TcpSocket::new_v4().map_err(|e| crate::Error::Chain(format!("stub socket: {e}")))?;
-        if let Err(e) = socket.bind(local) {
-            return Err(report_bind_failure(local, &e, ready));
-        }
         let _ = ready.send(Ok(PluginReady {
-            listen: socket.local_addr().unwrap_or(local),
+            listen: local,
             transports: crate::sitrep::Transports::TCP,
         }));
         let _ = self.die.await;
@@ -1666,6 +1662,8 @@ impl ChainPlugin for ClosedListenerStub {
     }
 }
 
+// The connect is scripted because no OS state refuses a connect on every platform while holding the port: a
+// bound socket that never listens refuses on Linux and Windows but drops the SYN on macOS, so the connect waits.
 #[skuld::test]
 async fn the_inner_exiting_ends_a_forwarder_still_retrying_its_connect() {
     let (subscriber, writer) = make_debug_subscriber();
@@ -1674,25 +1672,31 @@ async fn the_inner_exiting_ends_a_forwarder_still_retrying_its_connect() {
     // A refused connect is logged each time the forwarder retries: seeing one proves the
     // forwarder is in its retry loop when the inner dies.
     let refused_rx = writer.wait_for("plugin tap: inner connect refused");
-    // The sender of the start that readied; a start that lost its port is replaced.
-    let mut die_tx = None;
-    let inner = || {
-        let (tx, rx) = oneshot::channel();
-        die_tx = Some(tx);
-        Box::new(ClosedListenerStub { die: rx }) as Box<dyn ChainPlugin>
-    };
+    let (die_tx, die_rx) = oneshot::channel();
+    let always_refused: Connector = Arc::new(|_| {
+        Box::pin(std::future::ready(Err(io::Error::from(
+            io::ErrorKind::ConnectionRefused,
+        ))))
+    });
+    let tap = Box::new(TapPlugin::wrap_with_connector(
+        Box::new(ReadiedStub { die: die_rx }),
+        always_refused,
+    ));
     // Never cancelled: only the inner's exit may end the tap and its forwarder.
     let shutdown = CancellationToken::new();
-    let (public, handle) = start_tap(inner, loopback(), unused_remote(), &shutdown)
-        .await
-        .unwrap_or_else(|m| panic!("{m}"));
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move { tap.run(loopback(), unused_remote(), shutdown, ready_tx).await });
+    let public = match ready_rx.await {
+        Ok(Ok(ready)) => ready.listen,
+        other => panic!("tap did not become ready: {other:?}; run() returned {:?}", handle.await),
+    };
     let _client = TcpStream::connect(public).await.unwrap();
     tokio::task::spawn_blocking(move || refused_rx.recv())
         .await
         .unwrap()
         .expect("the forwarder never retried a refused connect");
 
-    die_tx.expect("a start readied").send(()).unwrap();
+    die_tx.send(()).unwrap();
     let result = handle.await.expect("tap task panicked");
 
     let err = result.expect_err("the inner's exit error is the tap's");
