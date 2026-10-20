@@ -1416,3 +1416,41 @@ async fn a_healthy_session_is_kept_alive_by_its_own_probe() {
         "the probe must have been answered by `echo_keepalive`, not rejected"
     );
 }
+
+/// A hop whose bind fails ends the chain with the typed exited-before-ready failure, not a closed `on_ready`: the
+/// readiness sender must be gone by the time `run` returns, or the chain reads the exit as a plugin still starting.
+/// Multi-thread, where the task holding the sender runs on another thread than the chain's reader of the exit.
+#[skuld::test]
+fn a_hop_whose_bind_fails_reports_the_typed_start_failure() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        for is_server in [false, true] {
+            // Occupies the port the hop is told to bind.
+            let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let runner = garter::ChainRunner::new()
+                .add(Box::new(crate::yamux::YamuxPlugin::new(is_server, DEFAULT_UDP_TIMEOUT)))
+                .on_ready(ready_tx);
+            let env = garter::PluginEnv {
+                local_host: "127.0.0.1".parse().unwrap(),
+                local_port: occupied.local_addr().unwrap().port(),
+                remote_host: "127.0.0.1".into(),
+                remote_port: 9,
+                plugin_options: None,
+            };
+
+            let result = runner.run(env).await;
+            let reported = ready_rx.await;
+
+            assert!(result.is_err(), "is_server={is_server}: a failed bind must fail `run`: {result:?}");
+            assert!(
+                matches!(&reported, Ok(Err(garter::StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
+                "is_server={is_server}: want the typed exited-before-ready Fatal, got {reported:?}"
+            );
+        }
+    });
+}
