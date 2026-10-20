@@ -594,6 +594,8 @@ fn exit_edge_proves_the_tree_gone(containment: Containment) -> bool {
 /// Whether `kill_tree` signals a process group id, which the OS may recycle onto an unrelated group
 /// once the root is reaped. cosca's `ProcessGroup` and `Session` are `killpg`, and a macOS `FdMarker`
 /// also fires `killpg` on its pgid. A mechanism cosca adds later is assumed to, until named here.
+/// The `FdMarker` arm holds only because cosca reports `TreeWalk`, not `FdMarker`, for a marker with
+/// no pgid.
 fn kill_tree_targets_recyclable_pgid(containment: Containment) -> bool {
     match containment {
         Containment::CgroupV2 => false,
@@ -679,6 +681,7 @@ impl PluginTree for cosca::tokio::Child {
     /// cosca's `Drop` runs the tree kill before it looks at whether the root was reaped, and for a
     /// pgid mechanism that kill is a `killpg`. `detach` is the only way to skip it; it also clears a
     /// job object's kill-on-close, so it is applied only where the drop's kill would be that `killpg`.
+    /// A tree kill that failed before the reap is therefore not retried by the drop.
     fn disarm(&mut self) {
         if kill_tree_targets_recyclable_pgid(self.containment()) {
             self.detach();
@@ -699,8 +702,10 @@ pub(crate) enum PluginEnd {
 
 /// Runs a started plugin to its end: waits for its root to exit or for `shutdown`, then ends it so
 /// that its tree is killed while the root is still unreaped (see [`end_plugin`]). An exit that has
-/// already happened is reported as an exit even when `shutdown` fired too; `shutdown` ends a plugin
-/// only while its root is still running.
+/// already happened is reported as an exit even when `shutdown` fired too: when `shutdown` wins the
+/// select, the root is probed once, without waiting, because the exit watch is `Pending` on its first
+/// poll even for a root that is already a zombie. `shutdown` ends a plugin that is still running; an
+/// exit that lands after the probe ends as a shutdown.
 ///
 /// The exit watch is non-reaping and needs `pidfd_open` on Linux, which a kernel before 5.3 lacks
 /// and a seccomp profile may deny. Without it the root is reaped first (still ending on `shutdown`)
@@ -725,7 +730,7 @@ pub(crate) async fn supervise_plugin(
         // An exit seen at the same moment as a shutdown request is still an exit.
         biased;
         watched = tree.wait_root_exit() => match watched {
-            Ok(()) => Ok(PluginEnd::Exited(end_plugin(plugin, tree, stdout, stderr).await?)),
+            Ok(()) => end_exited_plugin(plugin, tree, stdout, stderr).await,
             Err(e) => {
                 tracing::debug!(
                     plugin = %plugin,
@@ -742,8 +747,34 @@ pub(crate) async fn supervise_plugin(
                 }
             }
         },
-        () = shutdown.cancelled() => shut_down_on_request(plugin, tree, grace, stdout, stderr).await,
+        () = shutdown.cancelled() => {
+            if root_has_exited(plugin, tree).await {
+                return end_exited_plugin(plugin, tree, stdout, stderr).await;
+            }
+            shut_down_on_request(plugin, tree, grace, stdout, stderr).await
+        }
     }
+}
+
+/// Whether the root has already exited: one non-blocking read of its state (a zero-grace watch), not
+/// a wait. `false` when the state cannot be read, so the caller acts as for a running root.
+async fn root_has_exited(plugin: &str, tree: &impl PluginTree) -> bool {
+    match tree.wait_root_exit_within(std::time::Duration::ZERO).await {
+        Ok(exited) => exited,
+        Err(e) => {
+            tracing::debug!(plugin = %plugin, "could not read whether the plugin's root has exited: {e}");
+            false
+        }
+    }
+}
+
+async fn end_exited_plugin(
+    plugin: &str,
+    tree: &mut impl PluginTree,
+    stdout: tokio::task::JoinHandle<()>,
+    stderr: tokio::task::JoinHandle<()>,
+) -> Result<PluginEnd, cosca::error::Error> {
+    Ok(PluginEnd::Exited(end_plugin(plugin, tree, stdout, stderr).await?))
 }
 
 /// Collects the root's status and, with the root reaped, disarms its handle. Nothing awaits between
@@ -800,9 +831,12 @@ async fn end_reaped_plugin(
 }
 
 /// Shuts a running plugin down: asks the root to exit, gives it `grace`, hard-kills it if it has not
-/// exited (or could not be asked or watched: the escalation), then [`end_plugin`]s it. A refused root
-/// kill does not stop the tree from being killed, drained and reaped; it is reported ahead of any
-/// error from that.
+/// exited (or could not be asked or watched: the escalation), then [`end_plugin`]s it.
+///
+/// A refused root kill (an elevated or setuid wrapper) is logged at once and returned. The tree is
+/// still killed and its output drained, but the root is reaped only if a probe then finds it exited:
+/// a root that survives the tree kill too cannot be waited for, and the handle is left armed so that
+/// dropping it still kills what it can.
 pub(crate) async fn shut_plugin_down(
     plugin: &str,
     tree: &mut impl PluginTree,
@@ -824,10 +858,18 @@ pub(crate) async fn shut_plugin_down(
         }
     };
     // Still running after the grace, or never asked: either way the root must go.
-    let root_killed = if exited_within_grace { Ok(()) } else { tree.kill_root() };
-    let ended = end_plugin(plugin, tree, stdout, stderr).await;
-    root_killed?;
-    ended
+    let refusal = match if exited_within_grace { Ok(()) } else { tree.kill_root() } {
+        Ok(()) => return end_plugin(plugin, tree, stdout, stderr).await,
+        Err(refusal) => refusal,
+    };
+    tracing::warn!(plugin = %plugin, "failed to kill the plugin's root: {refusal}");
+    drain_readers_after_exit(plugin, tree, stdout, stderr).await;
+    if root_has_exited(plugin, tree).await {
+        if let Err(e) = reap_root(tree).await {
+            tracing::warn!(plugin = %plugin, "failed to reap the plugin's root: {e}");
+        }
+    }
+    Err(refusal)
 }
 
 /// After the child has exited (or been shut down): kill its process tree, wait for the tree to

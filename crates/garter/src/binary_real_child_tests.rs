@@ -136,3 +136,77 @@ async fn dropping_a_reaped_roots_handle_does_not_signal_its_process_group() {
         "{containment:?}: descendant output {rest:?}"
     );
 }
+
+// Shutdown against an exit the reactor has not delivered --------------------------------------------------------------
+
+/// A contained shell running `script`, with no output of its own.
+fn shell(script: &str) -> cosca::tokio::Child {
+    let mut cmd = Command::new();
+    cmd.executable("/bin/sh");
+    cmd.arg("/bin/sh");
+    cmd.arg("-c");
+    cmd.arg(script);
+    cmd.stdout(Stdio::null()).unwrap();
+    cmd.stderr(Stdio::null()).unwrap();
+    cmd.kill_on_drop(true);
+    cmd.contain();
+    cmd.nesting(cosca::containment::Nesting::Mark);
+    cmd.spawn().expect("spawn the shell")
+}
+
+fn cancelled() -> CancellationToken {
+    let token = CancellationToken::new();
+    token.cancel();
+    token
+}
+
+/// The real exit watch registers a pidfd (kqueue on macOS) with the reactor, so it is `Pending` on its
+/// first poll even for a root that is already a zombie; a shutdown request that is already pending
+/// would win the select. The status of a root that exited first must still be reported.
+#[skuld::test]
+async fn an_exited_root_is_reported_as_exited_when_a_shutdown_request_is_already_pending() {
+    let mut child = shell("exit 3");
+    // The root is now a known, unreaped zombie.
+    PluginTree::wait_root_exit(&child).await.expect("watch the root exit");
+
+    let reader = || tokio::spawn(async {});
+    let end = supervise_plugin(
+        "p",
+        &mut child,
+        &cancelled(),
+        Duration::from_secs(5),
+        reader(),
+        reader(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(&end, PluginEnd::Exited(s) if s.code() == Some(3)),
+        "the root exited with 3 before the shutdown request: {}",
+        match &end {
+            PluginEnd::Exited(s) => format!("exited, {s:?}"),
+            PluginEnd::ShutDown => "ShutDown".to_owned(),
+        }
+    );
+}
+
+/// The probe does not turn every shutdown into an exit: a root that is still running is shut down.
+#[skuld::test]
+async fn a_running_root_is_shut_down_when_a_shutdown_request_is_already_pending() {
+    let mut child = shell("exec sleep 1000");
+
+    let reader = || tokio::spawn(async {});
+    let end = supervise_plugin(
+        "p",
+        &mut child,
+        &cancelled(),
+        Duration::from_secs(5),
+        reader(),
+        reader(),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(end, PluginEnd::ShutDown), "a running root is shut down");
+}
