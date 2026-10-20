@@ -28,9 +28,8 @@ from pathlib import Path
 import _lib
 
 # Keep in sync with `crates/tun-engine/src/routing/state.rs::STATE_FILE_NAME`.
-# The file is one flat JSON object, `{"version": N, "server_ip": ..., ...}`,
-# read through `util::versioned_file`. This script reads only `server_ip` and
-# ignores the rest, as the bridge does, so a newer release's file still works.
+# Flat JSON object; this script reads only `server_ip` and ignores other keys,
+# so a newer release's file still works.
 STATE_FILE_NAME = "bridge-routes.json"
 # Keep in sync with `crates/bridge/src/dns_state.rs::STATE_FILE_NAME` /
 # `SUPERSEDED_FILE_NAME`. The bridge's own upgrade sweep (bindreams/hole#846)
@@ -271,9 +270,12 @@ def candidate_state_dirs() -> list[Path]:
     return dirs
 
 
-def load_state_file() -> dict | None:
+def load_state_file() -> tuple[dict | None, list[Path]]:
     """Return the first valid parsed state file found across candidate
-    directories, or None if none exists / all are corrupted."""
+    directories (None if there is none), and the paths of those that exist but
+    could not be read. An unreadable file is never touched: it may name a
+    route this script cannot identify."""
+    unreadable: list[Path] = []
     for d in candidate_state_dirs():
         path = d / STATE_FILE_NAME
         if not path.exists():
@@ -281,11 +283,17 @@ def load_state_file() -> dict | None:
         try:
             with path.open() as f:
                 data = json.load(f)
-            print(f"  Found state file at {path}")
-            return data
         except (json.JSONDecodeError, OSError) as e:
-            print(f"  Skipping {path} (parse error: {e})")
-    return None
+            print(f"  Skipping {path} ({e})")
+            unreadable.append(path)
+            continue
+        if not isinstance(data, dict):
+            print(f"  Skipping {path} (not a JSON object)")
+            unreadable.append(path)
+            continue
+        print(f"  Found state file at {path}")
+        return data, unreadable
+    return None, unreadable
 
 
 def reset_macos(state: dict | None) -> None:
@@ -305,7 +313,7 @@ def reset_macos(state: dict | None) -> None:
             run(["route", "-n", "delete", "-host", server_ip])
     else:
         print(
-            "  No state file found — cannot identify per-server bypass route. "
+            "  No readable state file — cannot identify per-server bypass route. "
             "If you still have connectivity issues, run 'netstat -rn' and "
             "remove any host routes pointing at a stale hole-tun interface."
         )
@@ -354,7 +362,7 @@ def reset_windows(state: dict | None) -> None:
             ])
     else:
         print(
-            "  No state file found — cannot identify per-server bypass route. "
+            "  No readable state file — cannot identify per-server bypass route. "
             "If you still have connectivity issues, run 'Get-NetRoute' and "
             "remove any host routes pointing at a stale hole-tun interface."
         )
@@ -427,7 +435,9 @@ def main() -> None:
     _lib.require_elevation()
 
     print("Looking for route-state file...")
-    state = load_state_file()
+    state, unreadable = load_state_file()
+    for path in unreadable:
+        print(f"  The route record at {path} exists but could not be read; it was left in place.")
     print()
 
     print("Looking for DNS-state file...")
