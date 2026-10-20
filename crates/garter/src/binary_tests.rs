@@ -1641,10 +1641,11 @@ async fn a_root_whose_exit_cannot_be_watched_is_reaped_first_and_a_pgid_tree_is_
     }
 }
 
-/// A shutdown that arrives while the root is being reaped (its exit could not be watched) ends the
-/// plugin as any shutdown does: the root is still unreaped, so its tree is killed before the reap.
+/// A shutdown that arrives while the root is being reaped (its exit could not be watched) asks the root to
+/// exit and gives it its grace, as for a watched root. One that outlives the grace is killed, its tree is
+/// killed before the reap, and not before the grace is over.
 #[skuld::test]
-async fn a_shutdown_while_the_exit_cannot_be_watched_still_kills_the_tree_before_the_reap() {
+async fn a_shutdown_while_the_exit_cannot_be_watched_gives_the_root_its_grace_then_kills_the_tree_before_the_reap() {
     tokio::time::pause();
     let mut tree = drained_tree(Containment::ProcessGroup);
     tree.root_watch_fails = true;
@@ -1667,6 +1668,16 @@ async fn a_shutdown_while_the_exit_cannot_be_watched_still_kills_the_tree_before
         "the reap waits for the root to exit"
     );
     shutdown.cancel();
+    assert!(poll_once(end.as_mut()).is_pending(), "ended before the grace");
+    tokio::time::advance(GRACE - Duration::from_millis(1)).await;
+    assert!(poll_once(end.as_mut()).is_pending(), "ended inside the grace");
+    assert!(
+        !calls.lock().unwrap().contains(&"kill_root"),
+        "the root was killed inside its grace: {:?}",
+        calls.lock().unwrap()
+    );
+
+    tokio::time::advance(TIMER_SLACK).await;
     let end = tokio::time::timeout(VIRTUAL_HANG, end)
         .await
         .expect("the shutdown must end the plugin")
@@ -1678,7 +1689,106 @@ async fn a_shutdown_while_the_exit_cannot_be_watched_still_kills_the_tree_before
         [
             "wait_root_exit",
             "terminate",
-            "wait_root_exit_within",
+            "kill_root",
+            "kill_tree",
+            "reap",
+            "disarm"
+        ]
+    );
+}
+
+/// A root that exits within the shutdown grace is not killed: it is reaped, and a pgid tree is left alone.
+#[skuld::test]
+async fn an_unwatchable_root_that_exits_within_the_shutdown_grace_is_not_killed() {
+    tokio::time::pause();
+    for (containment, kills_by_pgid) in KILLS_BY_PGID {
+        let exits = Arc::new(Notify::new());
+        let mut tree = drained_tree(containment);
+        tree.root_watch_fails = true;
+        tree.reap_waits_for = Some(exits.clone());
+        let calls = tree.calls.clone();
+        let shutdown = CancellationToken::new();
+        let end = supervise_plugin(
+            "p",
+            &mut tree,
+            &shutdown,
+            GRACE,
+            finished_reader(),
+            finished_reader(),
+            None,
+        );
+        let mut end = pin!(end);
+
+        assert!(poll_once(end.as_mut()).is_pending(), "{containment:?}");
+        shutdown.cancel();
+        assert!(
+            poll_once(end.as_mut()).is_pending(),
+            "{containment:?}: ended before the root exited"
+        );
+        tokio::time::advance(GRACE - Duration::from_millis(1)).await;
+        assert!(
+            poll_once(end.as_mut()).is_pending(),
+            "{containment:?}: ended inside the grace"
+        );
+
+        exits.notify_one();
+        let end = tokio::time::timeout(VIRTUAL_HANG, end)
+            .await
+            .unwrap_or_else(|_| panic!("{containment:?}: the plugin never ended"))
+            .unwrap();
+
+        assert!(matches!(end, PluginEnd::ShutDown), "{containment:?}");
+        let edge_awaited = CONTAINMENTS.iter().any(|(c, edge)| *c == containment && *edge);
+        let expected: &[&str] = match (kills_by_pgid, edge_awaited) {
+            (true, _) => &["wait_root_exit", "terminate", "reap", "disarm"],
+            (false, true) => &[
+                "wait_root_exit",
+                "terminate",
+                "reap",
+                "disarm",
+                "kill_tree",
+                "wait_tree_drained",
+            ],
+            (false, false) => &["wait_root_exit", "terminate", "reap", "disarm", "kill_tree"],
+        };
+        assert_eq!(*calls.lock().unwrap(), expected, "{containment:?}");
+    }
+}
+
+/// A root that cannot be asked to exit has no grace to spend: it is killed at once.
+#[skuld::test]
+async fn an_unwatchable_root_that_cannot_be_asked_to_exit_is_killed_at_once() {
+    tokio::time::pause();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_watch_fails = true;
+    tree.terminate_fails = true;
+    tree.reap_waits_for_kill = true;
+    let calls = tree.calls.clone();
+    let shutdown = CancellationToken::new();
+    let end = supervise_plugin(
+        "p",
+        &mut tree,
+        &shutdown,
+        GRACE,
+        finished_reader(),
+        finished_reader(),
+        None,
+    );
+    let mut end = pin!(end);
+
+    assert!(poll_once(end.as_mut()).is_pending());
+    shutdown.cancel();
+    let end = tokio::time::timeout(VIRTUAL_HANG, end)
+        .await
+        .expect("must end")
+        .unwrap();
+
+    assert!(matches!(end, PluginEnd::ShutDown));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            "wait_root_exit",
+            "terminate",
             "kill_root",
             "kill_tree",
             "reap",

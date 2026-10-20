@@ -781,8 +781,9 @@ impl PluginEnd {
 ///
 /// The exit watch is non-reaping and needs `pidfd_open` on Linux, which a kernel before 5.3 lacks
 /// and a seccomp profile may deny. Without it the root is reaped first (still ending on a take-down)
-/// and the tree is killed only where that stays safe (see [`end_reaped_plugin`]). A failed start's
-/// grace and the status of a root that exits within it do not depend on the watch.
+/// and the tree is killed only where that stays safe (see [`end_reaped_plugin`]). The grace a shutdown
+/// or a failed start gives the root, and the status of a failed-start root that exits within it, do
+/// not depend on the watch.
 ///
 /// A plugin whose start failed and that did not exit within its grace is killed and ends as
 /// [`PluginEnd::KilledAfterFailedStart`]: a failed start never ends `Ok`.
@@ -839,7 +840,7 @@ impl Takedown {
     }
 
     /// [`carry_out`](Self::carry_out) for a root whose exit cannot be watched: the reap is what waits for
-    /// the exit, so a start failure's grace is spent on it.
+    /// the exit, so the grace of a shutdown or of a start failure is spent on it.
     async fn carry_out_unwatched(
         self,
         plugin: &str,
@@ -849,7 +850,7 @@ impl Takedown {
         stderr: tokio::task::JoinHandle<()>,
     ) -> Result<PluginEnd, cosca::error::Error> {
         match self {
-            Takedown::Shutdown => shut_down_on_request(plugin, tree, grace, stdout, stderr).await,
+            Takedown::Shutdown => shut_down_unwatched(plugin, tree, grace, stdout, stderr).await,
             Takedown::StartFailed => end_unwatched_failed_start(plugin, tree, grace, stdout, stderr).await,
         }
     }
@@ -968,6 +969,34 @@ async fn shut_down_on_request(
 ) -> Result<PluginEnd, cosca::error::Error> {
     tracing::info!(plugin = %plugin, "shutting down");
     shut_plugin_down(plugin, tree, grace, stdout, stderr).await?;
+    Ok(PluginEnd::ShutDown)
+}
+
+/// [`shut_down_on_request`] for a root whose exit cannot be watched: asks the root to exit, then the reap
+/// waits for it for at most `grace`. A root that exits in time is not killed; one that does not, or that
+/// could not be asked, is killed and ended as [`shut_plugin_down`] does.
+async fn shut_down_unwatched(
+    plugin: &str,
+    tree: &mut impl PluginTree,
+    grace: std::time::Duration,
+    stdout: tokio::task::JoinHandle<()>,
+    stderr: tokio::task::JoinHandle<()>,
+) -> Result<PluginEnd, cosca::error::Error> {
+    tracing::info!(plugin = %plugin, "shutting down");
+    match tree.terminate() {
+        Ok(()) => match tokio::time::timeout(grace, reap_root(tree)).await {
+            Ok(reaped) => {
+                end_after_reap(plugin, tree, stdout, stderr, reaped).await?;
+            }
+            Err(_grace_over) => {
+                finish_plugin(plugin, tree, false, stdout, stderr).await?;
+            }
+        },
+        Err(e) => {
+            tracing::debug!(plugin = %plugin, "could not ask the plugin to exit: {e}");
+            finish_plugin(plugin, tree, false, stdout, stderr).await?;
+        }
+    }
     Ok(PluginEnd::ShutDown)
 }
 

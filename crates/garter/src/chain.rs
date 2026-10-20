@@ -377,8 +377,10 @@ impl ChainRunner {
                 }
             }
         }
-        // `shutdown` is cancelled and the aggregator's cancel arm is biased, so
-        // it ends on this poll without waiting for anything.
+        // Covers a cancel landing between the aggregator arm's poll and the
+        // `shutdown` arm's in one `select!` (multi-thread only). `shutdown` is
+        // cancelled and the aggregator's cancel arm is biased, so it ends on this
+        // poll without waiting for anything.
         if aggregating {
             gate.absorb(aggregate.await);
         }
