@@ -14,8 +14,8 @@
 //! the dev-only `HOLE_BRIDGE_PLUGIN_TAP=1` env var.
 //!
 //! Lifecycle:
-//! 1. Allocate an internal port for the inner plugin via probe-and-drop
-//!    on `(ip, 0)`, never a port the tap knows is taken: the public port or
+//! 1. Allocate an internal port for the inner plugin via a bind-drop-rebind-drop
+//!    probe on `(ip, 0)` (see `crate::port`), never a port the tap knows is taken: the public port or
 //!    `remote`'s (the next hop's, bound later). A port the OS hands back as one
 //!    of those, or refuses as a bind race (`AddrInUse`, `PermissionDenied`,
 //!    `AddrNotAvailable`: the Windows excluded-port-range classes), is picked
@@ -93,9 +93,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::backoff::Backoff;
 use crate::counting::CountingStream;
 use crate::plugin::ChainPlugin;
+use crate::port::{os_probe, pick_with, retry_backoff, Probe};
 use crate::sitrep::{PluginReady, StartError, Transports};
 
 /// Process-wide monotonic id assigned to each tap connection. Logged as
@@ -143,9 +143,6 @@ pub struct TapPlugin {
     #[cfg(test)]
     accept_failure: Mutex<Option<io::Error>>,
 }
-
-/// One attempt to find a free port: the address a probe bound, or its error.
-pub(crate) type Probe = Box<dyn FnMut() -> io::Result<SocketAddr> + Send>;
 
 /// Opens a forwarder's connection to the inner.
 pub(crate) type Connector =
@@ -235,11 +232,11 @@ impl ChainPlugin for TapPlugin {
         // Windows refuses to bind a mapped IPv6 address, so `local` is its IPv4 form throughout.
         let local = SocketAddr::new(local.ip().to_canonical(), local.port());
 
-        // 1. Allocate inner port (probe-and-drop, with bind-race retry).
+        // 1. Allocate inner port (probe, with bind-race retry).
         let probe = self.take_probe().unwrap_or_else(|| os_probe(local.ip()));
         let connector = self.take_connector();
         let mut scripted_accept_failure = self.take_accept_failure();
-        let inner_local = match allocate_inner_port_with(
+        let inner_local = match pick_with(
             &plugin_name,
             local.ip(),
             &[local.port(), remote.port()],
@@ -620,76 +617,6 @@ pub(crate) fn connect_target(given: SocketAddr) -> SocketAddr {
         }
         _ => given,
     }
-}
-
-/// Probe-and-drop a free TCP port on `(ip, 0)`.
-fn os_probe(ip: IpAddr) -> Probe {
-    Box::new(move || std::net::TcpListener::bind(SocketAddr::new(ip, 0)).and_then(|l| l.local_addr()))
-}
-
-/// Picks a port from `probe` that is not in `taken`.
-///
-/// Retries a taken port or a bind race ([`is_port_race`]) with no attempt cap,
-/// paced by a backoff; any other error is returned. `Ok(None)`: `shutdown`
-/// fired first.
-///
-/// Each swallowed error is logged at debug. A race that fails the same way
-/// twice in a row is warned about once, naming `plugin` and `ip`: such a cause
-/// is probably not a race (an address the host does not own never binds).
-pub(crate) async fn allocate_inner_port_with(
-    plugin: &str,
-    ip: IpAddr,
-    taken: &[u16],
-    mut probe: impl FnMut() -> io::Result<SocketAddr>,
-    shutdown: &CancellationToken,
-) -> io::Result<Option<SocketAddr>> {
-    let mut backoff = retry_backoff();
-    let mut last_race = None;
-    let mut warned = false;
-    loop {
-        match probe() {
-            Ok(addr) if !taken.contains(&addr.port()) => return Ok(Some(addr)),
-            Ok(_) => last_race = None,
-            Err(e) if is_port_race(&e) => {
-                let cause = (e.kind(), e.raw_os_error());
-                tracing::debug!(
-                    %plugin, %ip, kind = ?cause.0, errno = ?cause.1,
-                    "plugin tap: inner port probe failed, picking again"
-                );
-                if last_race == Some(cause) && !warned {
-                    warned = true;
-                    tracing::warn!(
-                        %plugin, %ip, kind = ?cause.0, errno = ?cause.1,
-                        "plugin tap: probing {ip} for the inner port keeps failing the same way; it is retried until shutdown"
-                    );
-                }
-                last_race = Some(cause);
-            }
-            Err(e) => return Err(e),
-        }
-        if !backoff.pause(shutdown).await {
-            return Ok(None);
-        }
-    }
-}
-
-/// Whether a failed `bind((ip, 0))` is a race that a later pick can win.
-///
-/// The same classes as `util::retry::is_bind_race`, which garter (published)
-/// cannot depend on: on Windows a `bind(:0)` fails with `PermissionDenied` or
-/// `AddrNotAvailable` when the excluded-port-range tables disagree about the
-/// port it was handed. An address the host does not own fails the same way on
-/// every pick, so such a start never readies; `shutdown` ends it.
-pub(crate) fn is_port_race(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied | io::ErrorKind::AddrNotAvailable
-    )
-}
-
-/// The pause between retries of the tap's own loops: 5ms doubling to a 50ms cap.
-fn retry_backoff() -> Backoff {
-    Backoff::new(Duration::from_millis(5), Duration::from_millis(50))
 }
 
 async fn handle_tap_connection(

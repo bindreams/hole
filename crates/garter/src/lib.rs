@@ -7,6 +7,7 @@ pub mod error;
 #[cfg(target_os = "linux")]
 mod exit_watch;
 pub mod plugin;
+mod port;
 pub mod shutdown;
 pub mod sip003;
 pub mod sitrep;
@@ -51,6 +52,8 @@ mod exit_watch_tests;
 mod once;
 #[cfg(test)]
 mod plugin_tests;
+#[cfg(test)]
+mod port_tests;
 #[cfg(test)]
 mod sip003_tests;
 #[cfg(test)]

@@ -55,11 +55,9 @@ use tokio_util::sync::CancellationToken;
 use crate::counting::CountingStream;
 use crate::once::Once;
 use crate::plugin::ChainPlugin;
+use crate::port::is_port_race;
 use crate::sitrep::{PluginReady, StartError};
-use crate::tap::{
-    allocate_inner_port_with, connect_target, is_port_race, reports_the_given_address, retry_connect_with, Connector,
-    TapPlugin,
-};
+use crate::tap::{connect_target, reports_the_given_address, retry_connect_with, Connector, TapPlugin};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -869,7 +867,7 @@ pub(crate) fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-fn err(kind: io::ErrorKind) -> io::Result<SocketAddr> {
+pub(crate) fn err(kind: io::ErrorKind) -> io::Result<SocketAddr> {
     Err(io::Error::from(kind))
 }
 
@@ -884,129 +882,6 @@ pub(crate) fn scripted(
         calls.fetch_add(1, Ordering::SeqCst);
         script.next().expect("probe called past the end of its script")
     }
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_never_returns_a_taken_port() {
-    tokio::time::pause();
-    // Every taken port collides repeatedly, past any fixed attempt count.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut script: Vec<_> = (0..9).map(|i| Ok(addr(if i % 2 == 0 { 5000 } else { 6000 }))).collect();
-    script.push(Ok(addr(5001)));
-    let picked = allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000, 6000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(picked, Some(addr(5001)));
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_retries_a_bind_race_without_a_cap() {
-    tokio::time::pause();
-    let kinds = [io::ErrorKind::AddrInUse, io::ErrorKind::PermissionDenied];
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut script: Vec<_> = (0..60).map(|i| err(kinds[i % 2])).collect();
-    script.push(Ok(addr(5001)));
-    let picked = allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(picked, Some(addr(5001)));
-    assert_eq!(calls.load(Ordering::SeqCst), 61);
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_retries_addr_not_available() {
-    // A Windows excluded-port-range refusal, like `util::retry::is_bind_race`.
-    tokio::time::pause();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let script = vec![err(io::ErrorKind::AddrNotAvailable), Ok(addr(5001))];
-    let picked = allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(picked, Some(addr(5001)));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_returns_any_other_error_at_once() {
-    tokio::time::pause();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let script = vec![err(io::ErrorKind::AddrInUse), err(io::ErrorKind::Other)];
-    let e = allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(e.kind(), io::ErrorKind::Other);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_paces_its_retries() {
-    tokio::time::pause();
-    // The backoff starts at 5ms and is capped at 50ms: 60 retries take well over 2s
-    // of virtual time, where a loop that never waits takes none.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut script: Vec<_> = (0..60).map(|_| err(io::ErrorKind::AddrInUse)).collect();
-    script.push(Ok(addr(5001)));
-    let started = tokio::time::Instant::now();
-    allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert!(started.elapsed() > Duration::from_secs(2), "{:?}", started.elapsed());
-}
-
-#[skuld::test]
-async fn shutdown_ends_the_inner_port_pick() {
-    tokio::time::pause();
-    let shutdown = CancellationToken::new();
-    let calls = AtomicUsize::new(0);
-    // Races forever; the third attempt also fires shutdown.
-    let probe = || {
-        if calls.fetch_add(1, Ordering::SeqCst) == 2 {
-            shutdown.cancel();
-        }
-        err(io::ErrorKind::AddrInUse)
-    };
-    let picked = allocate_inner_port_with("p", addr(5000).ip(), &[5000], probe, &shutdown)
-        .await
-        .unwrap();
-
-    assert_eq!(picked, None);
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
 /// Stands in for a runaway test: a paused runtime that goes idle jumps the clock, so a wait that
