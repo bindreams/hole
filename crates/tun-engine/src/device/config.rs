@@ -56,7 +56,7 @@ pub struct DeviceConfig {
     /// The name requested for the TUN interface — NOT necessarily the name
     /// the OS ended up using: see [`TunName`]'s doc. The only correct
     /// post-open source of the device's real name is
-    /// `super::Device::identity``().alias()`.
+    /// `super::Device::identity().alias()`.
     pub tun_name: TunName,
     /// The TUN device MTU. Typical value: `1400`.
     pub mtu: u16,
