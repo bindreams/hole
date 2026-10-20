@@ -141,7 +141,7 @@ fn is_lib(kind: &TargetKind) -> bool {
 const EX_GALOSHES_EXCLUDED: &[(&str, &str)] = &[
     ("hole", "does not compile on linux or windows/arm64"),
     ("hole-bridge", "does not compile on linux or windows/arm64"),
-    ("tun-engine", "does not compile on linux or windows/arm64"),
+    ("tun-engine", "does not compile on linux, where this command also runs"),
 ];
 
 #[skuld::test]

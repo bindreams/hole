@@ -13,9 +13,13 @@ fn extracted(renovate: &serde_json::Value, prek_text: &str) -> BTreeSet<(String,
     let mut found = BTreeSet::new();
     for manager in renovate["customManagers"].as_array().expect("customManagers") {
         let files = manager["managerFilePatterns"].as_array().expect("managerFilePatterns");
-        if !files.iter().any(|f| f.as_str().is_some_and(|f| f.contains("prek"))) {
+        if !files
+            .iter()
+            .any(|f| selects_prek_toml(f.as_str().expect("managerFilePatterns entry")))
+        {
             continue;
         }
+        let has_datasource_template = manager["datasourceTemplate"].as_str().is_some_and(|d| !d.is_empty());
         for pattern in manager["matchStrings"].as_array().expect("matchStrings") {
             let pattern = pattern.as_str().expect("matchStrings entry");
             let re = Regex::new(pattern).unwrap_or_else(|e| panic!("`{pattern}` is not a valid regex: {e}"));
@@ -26,11 +30,26 @@ fn extracted(renovate: &serde_json::Value, prek_text: &str) -> BTreeSet<(String,
                         .as_str()
                         .to_string()
                 };
+                assert!(
+                    has_datasource_template || caps.name("datasource").is_some(),
+                    "`{pattern}` names no datasource (neither `datasourceTemplate` nor a `datasource` group)"
+                );
                 found.insert((group("depName"), group("currentValue")));
             }
         }
     }
     found
+}
+
+/// Whether a `managerFilePatterns` entry selects the root `prek.toml`: a `/regex/` must match the
+/// path; anything else is a glob, which Renovate matches literally here.
+fn selects_prek_toml(pattern: &str) -> bool {
+    match pattern.strip_prefix('/').and_then(|p| p.strip_suffix('/')) {
+        Some(re) => Regex::new(re)
+            .unwrap_or_else(|e| panic!("`{pattern}` is not a valid regex: {e}"))
+            .is_match("prek.toml"),
+        None => pattern == "prek.toml",
+    }
 }
 
 /// `(package, version)` for each `additional_dependencies` entry pinned exactly (`pkg==1` or the
