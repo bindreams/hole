@@ -1794,8 +1794,8 @@ async fn a_root_whose_exit_cannot_be_watched_is_reaped_first_and_a_pgid_tree_is_
             "{containment:?}: the fallback is logged once:\n{log}"
         );
         assert!(
-            fallback[0].contains("DEBUG") && fallback[0].contains("unwatched"),
-            "{containment:?}: the fallback is a debug line naming the plugin: {}",
+            fallback[0].contains("WARN") && fallback[0].contains("unwatched"),
+            "{containment:?}: the fallback is a warning naming the plugin: {}",
             fallback[0]
         );
         assert_eq!(

@@ -7,10 +7,12 @@
 
 use std::io;
 
+use rustix::io::Errno;
 use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
 use tokio::signal::unix::{signal, SignalKind};
 
-/// Resolves once the child `pid` has exited, leaving it unreaped. An error if `pid` is not a child of this process.
+/// Resolves once the child `pid` has exited, leaving it unreaped. `pid` must be a child of this process that nothing
+/// has reaped.
 pub(crate) async fn wait_exit_without_reaping(pid: u32) -> io::Result<()> {
     let pid = i32::try_from(pid)
         .ok()
@@ -32,5 +34,21 @@ pub(crate) async fn wait_exit_without_reaping(pid: u32) -> io::Result<()> {
 /// One non-blocking look at the child's state.
 fn has_exited(pid: Pid) -> io::Result<bool> {
     let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
-    Ok(waitid(WaitId::Pid(pid), options)?.is_some())
+    match waitid(WaitId::Pid(pid), options) {
+        Ok(status) => Ok(status.is_some()),
+        Err(errno) => Err(watch_error(errno)),
+    }
+}
+
+/// The error for a failed `waitid`. Some errors can only be caused by a bug: `EINVAL` and `EFAULT` mean the call itself
+/// is malformed, and `ECHILD` on a child this process has not reaped means a third party reaped it or `SIGCHLD` is
+/// ignored. Those are contract violations and panic, in release too. The rest come from the environment (a seccomp
+/// profile denying `waitid` gives `EPERM` or `ENOSYS`) and are returned for the caller to route around.
+pub(crate) fn watch_error(errno: Errno) -> io::Error {
+    let caused_only_by_a_bug = matches!(errno, Errno::INVAL | Errno::FAULT | Errno::CHILD);
+    assert!(
+        !caused_only_by_a_bug,
+        "waitid on a child that has not been reaped failed with {errno}: the exit watch's contract is broken"
+    );
+    io::Error::from_raw_os_error(errno.raw_os_error())
 }

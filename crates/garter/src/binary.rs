@@ -724,29 +724,50 @@ async fn watch_exit_without_pidfd(_pid: u32, pidfd_error: cosca::error::Error) -
     Err(pidfd_error)
 }
 
+/// The exit watch of the root `pid`, given what cosca's own watch answered: that answer, or, where cosca could not
+/// watch, the fallback. The `Child` impl calls this, so a kernel without `pidfd_open` can be stood in for by an
+/// injected answer.
+pub(crate) async fn root_exit_watch(
+    pid: u32,
+    cosca_watch: Result<(), cosca::error::Error>,
+) -> Result<(), cosca::error::Error> {
+    match cosca_watch {
+        Err(pidfd_error) => watch_exit_without_pidfd(pid, pidfd_error).await,
+        watched => watched,
+    }
+}
+
+/// [`root_exit_watch`] for at most `grace`: `Ok(false)` if the root is still running.
+pub(crate) async fn root_exit_watch_within(
+    pid: u32,
+    grace: std::time::Duration,
+    cosca_watch: Result<bool, cosca::error::Error>,
+) -> Result<bool, cosca::error::Error> {
+    match cosca_watch {
+        Err(pidfd_error) => {
+            // A zero grace is still a probe: `timeout` polls the watch before its deadline.
+            match tokio::time::timeout(grace, watch_exit_without_pidfd(pid, pidfd_error)).await {
+                Ok(watched) => watched.map(|()| true),
+                Err(_grace_over) => Ok(false),
+            }
+        }
+        watched => watched,
+    }
+}
+
 impl PluginTree for cosca::tokio::Child {
     fn containment(&self) -> Containment {
         cosca::tokio::Child::containment(self)
     }
 
     async fn wait_root_exit(&self) -> Result<(), cosca::error::Error> {
-        match cosca::tokio::Process::from_id(self.id()).wait().await {
-            Err(pidfd_error) => watch_exit_without_pidfd(self.id().pid(), pidfd_error).await,
-            watched => watched,
-        }
+        let pidfd_watch = cosca::tokio::Process::from_id(self.id()).wait().await;
+        root_exit_watch(self.id().pid(), pidfd_watch).await
     }
 
     async fn wait_root_exit_within(&self, grace: std::time::Duration) -> Result<bool, cosca::error::Error> {
-        match cosca::tokio::Process::from_id(self.id()).wait_timeout(grace).await {
-            Err(pidfd_error) => {
-                // A zero grace is still a probe: `timeout` polls the watch before its deadline.
-                match tokio::time::timeout(grace, watch_exit_without_pidfd(self.id().pid(), pidfd_error)).await {
-                    Ok(watched) => watched.map(|()| true),
-                    Err(_grace_over) => Ok(false),
-                }
-            }
-            watched => watched,
-        }
+        let pidfd_watch = cosca::tokio::Process::from_id(self.id()).wait_timeout(grace).await;
+        root_exit_watch_within(self.id().pid(), grace, pidfd_watch).await
     }
 
     fn terminate(&self) -> Result<(), cosca::error::Error> {
@@ -943,7 +964,7 @@ async fn supervise(
         watched = tree.wait_root_exit() => match watched {
             Ok(()) => end_exited_plugin(plugin, tree, stdout, stderr).await,
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
                     plugin = %plugin,
                     "the plugin's exit cannot be watched ({e}); reaping it before killing its tree"
                 );
@@ -973,7 +994,7 @@ async fn root_has_exited(plugin: &str, tree: &impl PluginTree) -> bool {
     match tree.wait_root_exit_within(std::time::Duration::ZERO).await {
         Ok(exited) => exited,
         Err(e) => {
-            tracing::debug!(plugin = %plugin, "could not read whether the plugin's root has exited: {e}");
+            tracing::warn!(plugin = %plugin, "could not read whether the plugin's root has exited: {e}");
             false
         }
     }
@@ -1087,7 +1108,7 @@ async fn watch_root_exit_within(plugin: &str, tree: &impl PluginTree, grace: std
     match tree.wait_root_exit_within(grace).await {
         Ok(exited) => exited,
         Err(e) => {
-            tracing::debug!(plugin = %plugin, "could not watch the plugin exit during shutdown: {e}");
+            tracing::warn!(plugin = %plugin, "could not watch the plugin exit during shutdown: {e}");
             false
         }
     }
