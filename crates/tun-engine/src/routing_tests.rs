@@ -2411,16 +2411,16 @@ fn setup_routes_aborts_when_a_pre_command_checkpoint_fails() {
             // Fail the pre-command checkpoint of the 2nd command (call
             // sequence: cmd1 pre, cmd1 post, cmd2 pre, ...).
             if checkpoint_calls == 3 {
-                Err(CheckpointFailure::Io(std::io::Error::other(
-                    "simulated checkpoint failure",
-                )))
+                Err(CheckpointFailure::Io {
+                    kind: std::io::ErrorKind::Other,
+                })
             } else {
                 Ok(())
             }
         },
     );
     assert!(
-        matches!(result, Err(SetupFailure::Checkpoint(CheckpointFailure::Io(_)))),
+        matches!(result, Err(SetupFailure::Checkpoint(CheckpointFailure::Io { .. }))),
         "a pre-command checkpoint failure must abort setup as a checkpoint failure, not as a failed command: {result:?}"
     );
     assert_eq!(
@@ -2449,9 +2449,9 @@ fn setup_routes_continues_when_a_post_command_checkpoint_fails() {
             // Fail the post-command checkpoint of the 1st command (call
             // sequence: cmd1 pre = 1, cmd1 post = 2, cmd2 pre = 3, ...).
             if checkpoint_calls == 2 {
-                Err(CheckpointFailure::Io(std::io::Error::other(
-                    "simulated checkpoint failure",
-                )))
+                Err(CheckpointFailure::Io {
+                    kind: std::io::ErrorKind::Other,
+                })
             } else {
                 Ok(())
             }

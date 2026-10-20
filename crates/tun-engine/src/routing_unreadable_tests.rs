@@ -539,6 +539,42 @@ fn a_checkpoint_that_did_not_land_rolls_memory_back() {
     assert!(persisted.installed.is_empty());
 }
 
+/// `tempfile` names the temp file's path in its error text. A checkpoint that
+/// fails creating it must reach a toast without that path, and reach the log
+/// with it.
+#[skuld::test]
+fn a_checkpoint_that_could_not_be_written_reaches_the_toast_without_a_path() {
+    let missing = tempfile::tempdir().unwrap().path().join("somebody-private");
+    let io_error = tempfile::Builder::new()
+        .prefix(".bridge-routes.json.")
+        .tempfile_in(&missing)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        io_error.to_string().contains("somebody-private"),
+        "premise: tempfile's error names the path: {io_error}"
+    );
+    let kind = io_error.kind();
+    let record = missing.join(STATE_FILE_NAME);
+    let mut persisted = persisted_with_no_routes();
+
+    let mut failure = None;
+    let logs = errors_of(|| {
+        failure = checkpoint_installed_with(&mut persisted, &record, &[RouteId::SplitV4Low], |_| {
+            Err(StoreError::Io(io_error))
+        })
+        .err();
+    });
+
+    let toast = RoutingError::from(SetupFailure::Checkpoint(failure.unwrap())).redacted();
+    assert_eq!(
+        toast,
+        format!("route setup failed: the route record could not be written ({kind})")
+    );
+    assert!(!toast.contains("somebody-private"), "{toast}");
+    assert!(logs.contains("somebody-private"), "the full error is logged: {logs}");
+}
+
 // What each site makes of a removal ===================================================================================
 //
 // A site that has just emptied the record expects it gone. `Kept` means it
@@ -795,11 +831,13 @@ fn a_toast_for_any_other_routing_error_is_its_text() {
 /// that was about to run: no command is named.
 #[skuld::test]
 fn a_checkpoint_that_could_not_be_written_is_not_blamed_on_a_route_command() {
-    let failure = SetupFailure::Checkpoint(CheckpointFailure::Io(std::io::Error::other("disk full")));
+    let failure = SetupFailure::Checkpoint(CheckpointFailure::Io {
+        kind: std::io::ErrorKind::StorageFull,
+    });
 
     match RoutingError::from(failure) {
         RoutingError::RouteSetup(text) => {
-            assert_eq!(text, "the route record could not be written: disk full");
+            assert_eq!(text, "the route record could not be written (no storage space)");
         }
         other => panic!("expected RouteSetup, got: {other}"),
     }

@@ -897,7 +897,7 @@ fn persist_baseline(
         },
         owner,
     )
-    .map_err(|e| RoutingError::RouteSetup(format!("failed to persist lockdown-pf-state: {e}")))?;
+    .map_err(|e| RoutingError::state_write_failed("lockdown-pf-state", &e))?;
     Ok(nat_snapshot)
 }
 
@@ -963,9 +963,7 @@ pub fn engage_lockdown(
                     FatalPhase::CoverEngage,
                     "pfctl -X failed unwinding a failed lockdown re-enable",
                 );
-                return Err(RoutingError::RouteSetup(format!(
-                    "failed to re-persist lockdown-pf-state: {e}"
-                )));
+                return Err(RoutingError::state_write_failed("lockdown-pf-state", &e));
             }
             (token, st.nat_snapshot)
         }
@@ -1447,7 +1445,7 @@ impl EngageOps for RealEngageOps<'_> {
 
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<(), RoutingError> {
         state::save(self.state_dir, st, self.owner)
-            .map_err(|e| RoutingError::RouteSetup(format!("failed to persist failclosed-state: {e}")))
+            .map_err(|e| RoutingError::state_write_failed("failclosed-state", &e))
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {

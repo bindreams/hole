@@ -965,7 +965,7 @@ where
 ///
 /// A record that became unreadable since the sweep read it is refused, not
 /// replaced. The failure `setup_routes` sees carries no path (it reaches a
-/// toast); the path is logged here.
+/// toast); the full error, path included, is logged here.
 fn checkpoint_installed(
     persisted: &mut state::RouteState,
     record_file: &state::RouteFile,
@@ -1005,7 +1005,10 @@ fn checkpoint_installed_with(
 /// The failure `setup_routes` sees for a checkpoint that did not land.
 fn checkpoint_failure(e: StoreError) -> CheckpointFailure {
     match e {
-        StoreError::Io(e) => CheckpointFailure::Io(e),
+        StoreError::Io(e) => {
+            error!(error = %e, "route record could not be written");
+            CheckpointFailure::Io { kind: e.kind() }
+        }
         StoreError::Unreadable { path, cause } => {
             error!(path = %path.display(), %cause, "route record cannot be read; the checkpoint is refused");
             CheckpointFailure::RecordUnreadable { path }
@@ -1017,7 +1020,12 @@ fn checkpoint_failure(e: StoreError) -> CheckpointFailure {
         StoreError::PublishedNotFinalized(_) => {
             unreachable!("a published checkpoint is not a failure: see `checkpoint_installed`")
         }
-        StoreError::Encode(what) => CheckpointFailure::Io(std::io::Error::other(what)),
+        StoreError::Encode(what) => {
+            error!(what, "route record could not be encoded");
+            CheckpointFailure::Io {
+                kind: std::io::ErrorKind::Other,
+            }
+        }
     }
 }
 
