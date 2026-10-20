@@ -3,8 +3,11 @@
 //! extracts, with a datasource this file knows. A pin no manager sees never moves, and a bumped `rev`
 //! beside it changes nothing about the tool that runs. A prek manager may use only the keys, the
 //! file pattern and the capture groups checked here; anything else fails. Top-level settings that
-//! turn a manager off on purpose (`enabled`, `enabledManagers`, `ignorePaths`, `packageRules`) are
-//! not checked.
+//! turn a manager off on purpose (`enabled`, `enabledManagers`, `ignorePaths`, `ignoreDeps`,
+//! `packageRules`, ...) are not checked, nor is a second manager that extracts a pin again.
+//! `matchStrings` run here in Rust's `regex`, not Renovate's RE2: syntax only one engine reads (an
+//! inline flag, `\<`) is not caught here; the `renovate-config` CI step validates the file as
+//! Renovate reads it.
 
 use std::collections::BTreeSet;
 use std::fs;
