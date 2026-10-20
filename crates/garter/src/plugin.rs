@@ -42,7 +42,8 @@ pub trait ChainPlugin: Send + Sync {
     /// `shutdown` at once, so the plugin must return rather than keep running, and reports the failure to the
     /// caller, when [`ChainRunner::on_ready`](crate::ChainRunner::on_ready) is registered, after every plugin's `run`
     /// has returned, so output a plugin relays while it stops comes first; a plugin that ignores `shutdown` is
-    /// waited for at most [`drain_timeout`](crate::ChainRunner::drain_timeout).
+    /// waited for at most [`drain_timeout`](crate::ChainRunner::drain_timeout). [`ChainRunner::run`](crate::ChainRunner::run)
+    /// then returns [`Error::StartFailed`](crate::Error::StartFailed), whatever `run` returned here, `Ok(())` included.
     ///
     /// The one start failure that does not end the chain is `StartError::BindConflict` from a hop the chain gave
     /// an intermediate port, whatever address it names (a tap reports its inner plugin's). The runner cancels that

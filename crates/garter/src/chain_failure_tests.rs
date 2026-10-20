@@ -318,11 +318,15 @@ async fn run_row(row: Row) -> Result<(), String> {
     if holder_starts == Starts::First && !matches!(stopped_rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)) {
         return Err("a member behind the holder was started".into());
     }
-    match (holder_ends, result) {
-        (HolderEnd::Aborted, Err(crate::Error::Chain(m))) if m.contains("drain timeout") => Ok(()),
-        (HolderEnd::Aborted, other) => Err(format!("run must end at the drain bound: {other:?}")),
-        (_, Err(_)) => Ok(()),
-        (_, Ok(())) => Err("run returned Ok for a chain whose holder failed".into()),
+    // The decided failure is `run`'s result however the chain ended, the drain bound's abort and a sibling's own
+    // error included.
+    match result {
+        Err(crate::Error::StartFailed { plugin, cause })
+            if plugin == "holds-failure" && is_decided_failure(holder_starts, &cause) =>
+        {
+            Ok(())
+        }
+        other => Err(format!("run must return the holder's start failure: {other:?}")),
     }
 }
 

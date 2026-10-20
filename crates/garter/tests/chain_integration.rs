@@ -1586,7 +1586,7 @@ async fn a_shutdown_before_ready_is_not_a_start_failure() {
 
 /// A plugin whose readiness a self-probe owns (`Probe`; `Auto` without a supported `hello`; `ExpectSitrep` after an
 /// unknown protocol major handed readiness to the probe) that exits before it is ready is reported to the caller as
-/// the typed `Fatal`, and `run` returns the plugin's exit. The probe task holds the readiness sender, so it must be
+/// the typed `Fatal`, and `run` returns that failed start. The probe task holds the readiness sender, so it must be
 /// gone by the time the plugin's `run` returns.
 #[skuld::test]
 async fn a_probe_owned_plugin_that_exits_before_ready_reports_the_typed_fatal() {
@@ -1629,7 +1629,11 @@ async fn a_probe_owned_plugin_that_exits_before_ready_reports_the_typed_fatal() 
             &heard,
             Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")
         );
-        let exit = matches!(&run, Err(garter::Error::PluginExit { code: 1, .. }));
+        let exit = matches!(
+            &run,
+            Err(garter::Error::StartFailed { cause: StartError::Fatal { detail, .. }, .. })
+                if detail.contains("exited before becoming ready")
+        );
         if !(typed && exit) {
             wrong.push(format!("{label}: run = {run:?}, on_ready = {heard:?}"));
         }

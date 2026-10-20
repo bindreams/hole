@@ -191,7 +191,8 @@ impl ChainRunner {
     /// If the drain budget expires while plugins are still running,
     /// [`ChainRunner::run`] calls `JoinSet::abort_all` and returns
     /// `Err(Chain("drain timeout expired"))` — unless a plugin-level error
-    /// was already captured, in which case that error takes precedence.
+    /// was already captured, in which case that error takes precedence, and a start
+    /// failure ([`Error::StartFailed`](crate::Error::StartFailed)) outranks both.
     /// The aborted tasks are joined before the function returns, so a
     /// plugin that reports a start failure from its `Drop` is heard, and a
     /// plugin that ends with an error or panics in the abort window is
@@ -265,6 +266,13 @@ impl ChainRunner {
     /// A hop that reports a bind conflict on its intermediate port is stopped and run again on a fresh port, without
     /// a cap and without disturbing the hops already running; only a shutdown ends that. A conflict on the public port
     /// is the caller's and is reported.
+    ///
+    /// Any other start failure (a hop's reported failure, or a hop that ends before it is ready) ends the chain: every
+    /// plugin is cancelled, with or without an [`on_ready`](ChainRunner::on_ready) callback, and `run` returns
+    /// [`Error::StartFailed`](crate::Error::StartFailed) with the hop and its typed cause once every plugin has returned.
+    /// It does so whatever the failed hop's own `run` returned, and ahead of another member's exit error and of the
+    /// drain-timeout error. A hop's own exit error is logged when it exits. A shutdown before every hop is ready is not a
+    /// start failure: `run` then returns what its members returned.
     #[debug_requires(!self.plugins.is_empty(), "chain must have at least one plugin")]
     pub async fn run(self, env: crate::sip003::PluginEnv) -> crate::Result<()> {
         let n = self.plugins.len();
@@ -326,8 +334,8 @@ impl ChainRunner {
             tokio::select! {
                 biased;
                 decision = await_decision(&mut start.pending), if start.pending.is_some() => {
-                    start.pending = None;
-                    match start.advance(decision, &mut set, &shutdown) {
+                    let pending = start.pending.take().expect("the branch is guarded on a pending hop");
+                    match start.advance(pending.plugin, decision, &mut set, &shutdown) {
                         Step::Launched => {}
                         Step::Settled(readiness) => gate.absorb(readiness),
                     }
@@ -355,7 +363,7 @@ impl ChainRunner {
         })
         .await;
 
-        let outcome = match drain_result {
+        let drained = match drain_result {
             Ok(()) => first_error.map_or(Ok(()), Err),
             Err(_timeout) => {
                 tracing::warn!("drain timeout expired, aborting remaining plugins");
@@ -378,9 +386,12 @@ impl ChainRunner {
 
         // Every plugin has returned (or been given up on at the drain bound):
         // only now does the caller hear of a start failure, or find the
-        // channel closed.
-        gate.release();
-        outcome
+        // channel closed. A start failure is `run`'s result whatever else ended the chain, a member's own exit
+        // (already logged by `record_exit`) and the drain bound included.
+        match gate.release() {
+            Some(failure) => Err(failure.into()),
+            None => drained,
+        }
     }
 }
 
@@ -392,25 +403,47 @@ pub(crate) enum Readiness {
     /// Every hop reported ready.
     Ready(ChainReady),
     /// A hop failed to start, or exited before it could say so. The chain is no longer viable.
-    Failed(StartError),
+    Failed(HopFailure),
     /// `shutdown` came first, or a hop ended without deciding, with nothing to report yet. `unread` is the decision
     /// of the hop that was starting, if it had not been read: that hop may still deliver a start failure it had
     /// decided, until it returns.
-    Preempted {
-        unread: Option<oneshot::Receiver<Decision>>,
-    },
+    Preempted { unread: Option<Pending> },
+}
+
+/// A hop's failed start: which hop, and the typed failure it reported or the chain synthesized.
+#[derive(Debug)]
+pub(crate) struct HopFailure {
+    pub(crate) plugin: String,
+    pub(crate) cause: StartError,
+}
+
+impl From<HopFailure> for crate::Error {
+    fn from(failure: HopFailure) -> Self {
+        crate::Error::StartFailed {
+            plugin: failure.plugin,
+            cause: failure.cause,
+        }
+    }
+}
+
+/// The hop that is starting, and the receiver its decision arrives on.
+#[derive(Debug)]
+pub(crate) struct Pending {
+    pub(crate) plugin: String,
+    pub(crate) decision: oneshot::Receiver<Decision>,
 }
 
 /// The sole owner of the caller's `ready` sender, and the one place that decides what the caller is told. A ready
 /// chain is reported at once; every other end (a start failure, a cancel, a member that kept `ready` until it was
 /// stopped) releases the sender only through [`ReadyGate::release`], which [`ChainRunner::run`] calls once every
 /// member's `run` has returned or been given up on at `drain_timeout`. A failure a member decided and delivered while
-/// it stopped is found by the release, whichever way the chain ended.
+/// it stopped is found by the release, whichever way the chain ended. The release also hands the failure back, so
+/// [`ChainRunner::run`] returns the one the caller was told.
 pub(crate) struct ReadyGate {
     ready_tx: Option<oneshot::Sender<Result<ChainReady, StartError>>>,
-    failure: Option<StartError>,
+    failure: Option<HopFailure>,
     /// The decision a preempted start had not read.
-    unread: Option<oneshot::Receiver<Decision>>,
+    unread: Option<Pending>,
 }
 
 impl ReadyGate {
@@ -437,19 +470,24 @@ impl ReadyGate {
     /// Sends the failure to report, if there is one; otherwise drops the sender unsent, which the receiver sees as
     /// `RecvError`. The failure is the one the start found, or else the one a preempted hop has delivered since. A
     /// delivered `Ready` is not rescued: `shutdown` is chain-wide and nothing shows the chain is still viable.
-    pub(crate) fn release(self) {
-        let Some(ready_tx) = self.ready_tx else { return };
+    ///
+    /// Returns that failure whether or not a sender was registered.
+    pub(crate) fn release(self) -> Option<HopFailure> {
         let delivered_since = || {
-            self.unread.and_then(|mut unread| match unread.try_recv() {
-                Ok(Decision::Failed(error)) => Some(error),
+            let Pending { plugin, decision } = self.unread?;
+            let mut decision = decision;
+            match decision.try_recv() {
+                Ok(Decision::Failed(cause)) => Some(HopFailure { plugin, cause }),
                 Ok(Decision::Ready { .. }) => None,
                 Ok(Decision::Dropped) => None,
                 Err(_) => None,
-            })
+            }
         };
-        if let Some(error) = self.failure.or_else(delivered_since) {
-            let _ = ready_tx.send(Err(error));
+        let failure = self.failure.or_else(delivered_since);
+        if let (Some(failure), Some(ready_tx)) = (&failure, self.ready_tx) {
+            let _ = ready_tx.send(Err(failure.cause.clone()));
         }
+        failure
     }
 }
 
@@ -518,8 +556,8 @@ struct StartSequence {
     /// Ports an intermediate pick must not return: the ends of the chain and the ports already given.
     taken: Vec<u16>,
     transports: Transports,
-    /// The decision of the hop that was launched last, until it is read.
-    pending: Option<oneshot::Receiver<Decision>>,
+    /// The hop that was launched last, until its decision is read.
+    pending: Option<Pending>,
     #[cfg(test)]
     probe: Option<Arc<std::sync::Mutex<Probe>>>,
 }
@@ -579,9 +617,12 @@ impl StartSequence {
             }
         };
         let (decided_tx, decided_rx) = oneshot::channel();
-        self.pending = Some(decided_rx);
-
         let name = plugin.name().to_string();
+        self.pending = Some(Pending {
+            plugin: name.clone(),
+            decision: decided_rx,
+        });
+
         let span = tracing::info_span!("plugin", name = %name, position, chain_mode = ?self.mode);
         let token = shutdown.child_token();
         let remote = self.forward_to;
@@ -596,12 +637,14 @@ impl StartSequence {
     /// Takes one hop's `decision` and launches the next hop if the chain is still starting.
     fn advance(
         &mut self,
+        plugin: String,
         decision: Result<Decision, oneshot::error::RecvError>,
         set: &mut tokio::task::JoinSet<(String, crate::Result<()>)>,
         shutdown: &CancellationToken,
     ) -> Step {
+        // The hop that decided is the one `pending` named; the caller took it out before asking.
         match judge(decision, shutdown) {
-            Verdict::Failed(error) => Step::Settled(Readiness::Failed(error)),
+            Verdict::Failed(cause) => Step::Settled(Readiness::Failed(HopFailure { plugin, cause })),
             Verdict::Preempted => Step::Settled(Readiness::Preempted { unread: None }),
             Verdict::Ready { given, report } => {
                 self.transports &= report.transports;
@@ -625,11 +668,9 @@ impl StartSequence {
 }
 
 /// Waits for the decision of the hop that is starting; never ends when there is none.
-async fn await_decision(
-    pending: &mut Option<oneshot::Receiver<Decision>>,
-) -> Result<Decision, oneshot::error::RecvError> {
+async fn await_decision(pending: &mut Option<Pending>) -> Result<Decision, oneshot::error::RecvError> {
     match pending {
-        Some(decision) => decision.await,
+        Some(pending) => (&mut pending.decision).await,
         None => std::future::pending().await,
     }
 }
