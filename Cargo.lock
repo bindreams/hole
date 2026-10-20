@@ -10534,6 +10534,7 @@ dependencies = [
  "png 0.18.1",
  "proc-macro2",
  "quote",
+ "regex",
  "roxmltree 0.21.1",
  "serde",
  "serde_json",

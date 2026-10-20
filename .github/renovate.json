@@ -27,7 +27,14 @@
       "customType": "regex",
       "managerFilePatterns": ["/^prek\\.toml$/"],
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+additional_dependencies\\s*=\\s*\\[\"[^\"=]+==(?<currentValue>[^\"]+)\"\\]"
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+additional_dependencies\\s*=\\s*\\[\"[^\"=]+==(?<currentValue>[^\"]+)\""
+      ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^prek\\.toml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\{[^}\\n]*additional_dependencies\\s*=\\s*\\[\"@?[^\"@]+@(?<currentValue>[^\"]+)\""
       ]
     },
     {

@@ -115,6 +115,9 @@ mod prek_split_tests;
 #[path = "pull_subrepo_tests.rs"]
 mod pull_subrepo_tests;
 #[cfg(test)]
+#[path = "renovate_prek_tests.rs"]
+mod renovate_prek_tests;
+#[cfg(test)]
 #[path = "skuld_label_coverage_tests.rs"]
 mod skuld_label_coverage_tests;
 #[cfg(test)]
