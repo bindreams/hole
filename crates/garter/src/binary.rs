@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use cosca::containment::Containment;
@@ -443,12 +444,27 @@ pub(crate) struct FailureHold {
     held: oneshot::Receiver<HeldFailure>,
     /// Cancelled once the reader has decided the start failed. A child of the chain's shutdown token.
     failed: CancellationToken,
+    /// Set when the supervision takes the plugin down on a chain shutdown, before it sends the plugin anything.
+    /// The reader reads it to tell a stdout closed by that take-down from one the plugin closed itself.
+    taken_down: Arc<AtomicBool>,
 }
 
 impl FailureHold {
     /// Resolves once the reader has decided the start failed.
     pub(crate) async fn failed(&self) {
         self.failed.cancelled().await;
+    }
+
+    /// Records that this plugin is being taken down on a shutdown. Call it before anything is sent to the plugin: a
+    /// stdout closed after that is the take-down's doing, one closed before it is not.
+    fn mark_taken_down(&self) {
+        self.taken_down.store(true, Ordering::SeqCst);
+    }
+
+    /// The signal [`mark_taken_down`](Self::mark_taken_down) raises, for a test to watch from a fake tree.
+    #[cfg(test)]
+    pub(crate) fn taken_down_signal(&self) -> Arc<AtomicBool> {
+        self.taken_down.clone()
     }
 
     /// Sends the failure the reader held, if it held one, on the plugin's readiness channel, and
@@ -489,8 +505,10 @@ impl Drop for FailureHold {
 /// A `ready` is sent at once. A failure (`fatal`, `bind_conflict`, an empty `ready`, or stdout closing
 /// where no probe owns readiness: a sitrep plugin's readiness travels on stdout, so it can never become
 /// ready) is not: it is held in the returned [`FailureHold`], which [`supervise_plugin`] takes the plugin
-/// down for, drains its output, and only then delivers. The reader keeps relaying lines until stdout
-/// closes. `shutdown` ends a probe the reader started.
+/// down for, drains its output, and only then delivers. A stdout that closes because the supervision took
+/// the plugin down on a shutdown is no failure; one the plugin closed itself is, even if a shutdown has been
+/// requested by the time the reader sees it. The reader keeps relaying lines until stdout closes. `shutdown`
+/// ends a probe the reader started.
 pub(crate) fn spawn_sitrep_stdout_reader(
     stdout: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     plugin_name: String,
@@ -505,9 +523,11 @@ pub(crate) fn spawn_sitrep_stdout_reader(
     let shared: SharedReady = Arc::new(tokio::sync::Mutex::new(Some(ready)));
     let (held_tx, held_rx) = oneshot::channel();
     let failed = shutdown.child_token();
+    let taken_down = Arc::new(AtomicBool::new(false));
     let hold = FailureHold {
         held: held_rx,
         failed: failed.clone(),
+        taken_down: taken_down.clone(),
     };
     let task = tokio::spawn(async move {
         let mut held = Some(held_tx);
@@ -606,9 +626,10 @@ pub(crate) fn spawn_sitrep_stdout_reader(
             }
         }
         // Stdout is closed. Where this reader is the only readiness source, nothing can ready the
-        // plugin any more; a probe that owns readiness decides for itself. A stdout that closes under a
-        // requested shutdown is the shutdown's doing, not a start failure.
-        if !probe_owns_readiness && !shutdown.is_cancelled() {
+        // plugin any more; a probe that owns readiness decides for itself. A stdout that closes because
+        // the plugin was taken down is the take-down's doing, not a start failure; one the plugin closed
+        // by itself is, whatever the chain's token says by now.
+        if !probe_owns_readiness && !taken_down.load(Ordering::SeqCst) {
             let error = StartError::Fatal {
                 detail: "plugin closed its sitrep stream before becoming ready".into(),
                 errno: None,
@@ -922,12 +943,19 @@ impl Takedown {
         self,
         plugin: &str,
         tree: &mut impl PluginTree,
+        failure: Option<&FailureHold>,
         grace: std::time::Duration,
         stdout: tokio::task::JoinHandle<()>,
         stderr: tokio::task::JoinHandle<()>,
     ) -> Result<PluginEnd, cosca::error::Error> {
         match self {
-            Takedown::Shutdown => shut_down_on_request(plugin, tree, grace, stdout, stderr).await,
+            Takedown::Shutdown => {
+                // Before anything reaches the plugin, so a stdout it closes in answer is seen as taken down.
+                if let Some(failure) = failure {
+                    failure.mark_taken_down();
+                }
+                shut_down_on_request(plugin, tree, grace, stdout, stderr).await
+            }
             Takedown::StartFailed => end_failed_start(plugin, tree, grace, stdout, stderr).await,
         }
     }
@@ -974,7 +1002,7 @@ async fn supervise(
                     // Nothing can say the root exited short of reaping it, which would leave the tree to a
                     // recycled process group id: the take-down kills the root and then the tree first.
                     takedown = takedown_requested(shutdown, failure) => {
-                        takedown.carry_out(plugin, tree, grace, stdout, stderr).await
+                        takedown.carry_out(plugin, tree, failure, grace, stdout, stderr).await
                     }
                 }
             }
@@ -983,7 +1011,7 @@ async fn supervise(
             if root_has_exited(plugin, tree).await {
                 return end_exited_plugin(plugin, tree, stdout, stderr).await;
             }
-            takedown.carry_out(plugin, tree, grace, stdout, stderr).await
+            takedown.carry_out(plugin, tree, failure, grace, stdout, stderr).await
         }
     }
 }
@@ -1171,7 +1199,8 @@ async fn finish_plugin(
 /// kernel guarantees the members exit. The reader wait is bounded by [`READER_EOF_BOUND`] on every
 /// containment, because a pipe holder outside the tree (a process that left its cgroup, a handle
 /// duplicated into a process outside the job) outlives the drain. On expiry it warns that the output
-/// after this point was cut and aborts the readers (so their hold on the readiness sender drops).
+/// after this point was cut, aborts the readers (so their hold on the readiness sender drops) and waits
+/// for them to end.
 pub(crate) async fn drain_readers_after_exit(
     plugin: &str,
     tree: &mut impl PluginTree,

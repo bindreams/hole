@@ -140,6 +140,7 @@ fn fixed_env_sets_no_color() {
 
 use std::future::Future;
 use std::pin::{pin, Pin};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -296,6 +297,8 @@ struct FakeTree<K> {
     /// `reap` waits for this to be notified: the root exits when the test says so.
     reap_waits_for: Option<Arc<Notify>>,
     probe_fails: bool,
+    /// Runs at the top of `terminate` and `kill_root`, before the plugin is sent anything.
+    before_signal: Option<Box<dyn Fn() + Send + Sync>>,
     /// What `reap` reports.
     exit_status: std::process::ExitStatus,
     tree_killed: bool,
@@ -324,6 +327,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
             reap_never_completes: false,
             reap_waits_for: None,
             probe_fails: false,
+            before_signal: None,
             exit_status: std::process::ExitStatus::default(),
             tree_killed: false,
             graces: Arc::default(),
@@ -340,6 +344,12 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
 
     fn record(&self, call: &'static str) {
         self.calls.lock().unwrap().push(call);
+    }
+
+    fn signal_is_about_to_be_sent(&self) {
+        if let Some(hook) = &self.before_signal {
+            hook();
+        }
     }
 
     fn calls(&self) -> Vec<&'static str> {
@@ -382,6 +392,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
     }
 
     fn terminate(&self) -> Result<(), cosca::error::Error> {
+        self.signal_is_about_to_be_sent();
         self.record("terminate");
         if self.terminate_fails {
             return Err(unsupported());
@@ -390,6 +401,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
     }
 
     fn kill_root(&mut self) -> Result<(), cosca::error::Error> {
+        self.signal_is_about_to_be_sent();
         self.record("kill_root");
         self.root_killed.notify_one();
         if self.kill_root_fails {
@@ -779,17 +791,23 @@ async fn at_sitrep_stdout_eof_without_ready_the_plugin_is_taken_down_and_the_fai
     }
 }
 
-/// A stdout that closes because the chain is shutting down is the shutdown's doing: the reader decides nothing, so
-/// the plugin is not taken down as a failed start, no failure is held, and the readiness sender drops unsent. The
-/// shutdown lands before the reader reaches the end of stdout, which a plugin only closes once it is told to go.
+/// Order {taken down, then closed}: a stdout that closes because the supervision took the plugin down on a chain
+/// shutdown is the take-down's doing, not a start failure. The reader decides nothing, so no failure is held, the
+/// readiness sender drops unsent, and the run does not end in a start failure. The plugin closes its stdout from
+/// inside the signal sent to it (`terminate`, or `kill_root` when the ask fails), where the take-down must already be
+/// recorded.
 #[skuld::test]
-async fn a_stdout_that_closes_under_a_requested_shutdown_is_not_a_start_failure() {
+async fn a_stdout_that_closes_after_the_plugin_is_taken_down_is_not_a_start_failure() {
     tokio::time::pause();
-    for (lines, auto) in [
-        (String::new(), false),
-        (hello(SITREP_PROTOCOL), false),
-        (hello(SITREP_PROTOCOL), true),
+    for (lines, auto, terminate_fails) in [
+        (String::new(), false, false),
+        (hello(SITREP_PROTOCOL), false, false),
+        (hello(SITREP_PROTOCOL), true, false),
+        (String::new(), false, true),
+        (hello(SITREP_PROTOCOL), false, true),
+        (hello(SITREP_PROTOCOL), true, true),
     ] {
+        let case = format!("auto={auto}, terminate_fails={terminate_fails}, {lines:?}");
         let freed = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -801,26 +819,52 @@ async fn a_stdout_that_closes_under_a_requested_shutdown_is_not_a_start_failure(
         let (reader, failure) =
             spawn_sitrep_stdout_reader(host_stdout, "p".into(), freed, shutdown.clone(), ready_tx, auto, None);
 
+        let taken_down = failure.taken_down_signal();
+        let plugin_stdout = Mutex::new(Some(plugin_stdout));
+        let mut tree = drained_tree(Containment::ProcessGroup);
+        tree.root_never_exits = true;
+        tree.terminate_fails = terminate_fails;
+        tree.before_signal = Some(Box::new({
+            let case = case.clone();
+            move || {
+                assert!(
+                    taken_down.load(Ordering::SeqCst),
+                    "{case}: the plugin was sent a signal before its take-down was recorded"
+                );
+                drop(plugin_stdout.lock().unwrap().take());
+            }
+        }));
         shutdown.cancel();
-        drop(plugin_stdout);
-        tokio::time::timeout(VIRTUAL_HANG, reader)
-            .await
-            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the reader never ended"))
-            .unwrap();
+        let end = tokio::time::timeout(
+            VIRTUAL_HANG,
+            supervise_plugin(
+                "p",
+                &mut tree,
+                &shutdown,
+                GRACE,
+                reader,
+                finished_reader(),
+                Some(failure),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: the plugin never ended"))
+        .unwrap();
 
         assert!(
-            !failure.deliver(),
-            "auto={auto}, {lines:?}: the reader held a start failure"
+            matches!(end.end, PluginEnd::ShutDown) && !end.start_failed,
+            "{case}: the reader held a start failure"
         );
         let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx)
             .await
-            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the readiness sender was kept"));
-        assert!(ready.is_err(), "auto={auto}, {lines:?}: the caller was told {ready:?}");
+            .unwrap_or_else(|_| panic!("{case}: the readiness sender was kept"));
+        assert!(ready.is_err(), "{case}: the caller was told {ready:?}");
     }
 }
 
-/// The other order: a stdout that closed before any shutdown was requested is a start failure the reader decided,
-/// and a shutdown that follows does not take it back.
+/// Order {closed, reader decided, then cancelled}: a stdout that closed before any shutdown was requested is a start
+/// failure the reader decided, and a shutdown that follows does not take it back. Green before the shutdown exception
+/// existed; it guards that the exception did not swallow a decided failure.
 #[skuld::test]
 async fn a_stdout_that_closed_before_a_shutdown_stays_a_start_failure() {
     tokio::time::pause();
@@ -845,8 +889,56 @@ async fn a_stdout_that_closed_before_a_shutdown_stays_a_start_failure() {
     }
 }
 
+/// The third order: a plugin that exits by itself before `ready` (exit 0, stdout closed) and a chain cancel that
+/// lands before the plugin's reader is first scheduled. Nothing was sent to the plugin, so its closed stdout is
+/// not the shutdown's doing and the start failure stands.
+#[skuld::test]
+async fn a_plugin_that_exited_by_itself_keeps_its_start_failure_when_a_cancel_lands_before_its_reader_runs() {
+    tokio::time::pause();
+    for (lines, auto) in [
+        (String::new(), false),
+        (hello(SITREP_PROTOCOL), false),
+        (hello(SITREP_PROTOCOL), true),
+    ] {
+        let (ready_rx, reader, shutdown, failure) = sitrep_reader_over(&lines, auto).await;
+        shutdown.cancel();
+        let mut tree = drained_tree(Containment::CgroupV2);
+        let end = tokio::time::timeout(
+            VIRTUAL_HANG,
+            supervise_plugin(
+                "p",
+                &mut tree,
+                &shutdown,
+                GRACE,
+                reader,
+                finished_reader(),
+                Some(failure),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the plugin never ended"))
+        .unwrap();
+
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()) && end.start_failed,
+            "auto={auto}, {lines:?}: exit 0 before ready ended without its start failure"
+        );
+        assert!(
+            !tree.calls().contains(&"terminate") && !tree.calls().contains(&"kill_root"),
+            "auto={auto}, {lines:?}: the plugin was told to go: {:?}",
+            tree.calls()
+        );
+        let ready = ready_rx.await;
+        assert!(
+            matches!(&ready, Ok(Err(StartError::Fatal { .. }))),
+            "auto={auto}, {lines:?}: {ready:?}"
+        );
+    }
+}
+
 /// Where a probe owns readiness (`Auto` with no supported hello, or after an unknown-major
-/// fallback), closed stdout says nothing about the plugin's listener: the probe decides.
+/// fallback), closed stdout says nothing about the plugin's listener: the probe decides. The reader decides nothing
+/// there, shutdown or not, so this row was green before the shutdown exception existed.
 #[skuld::test]
 async fn at_stdout_eof_a_probe_that_owns_readiness_decides() {
     tokio::time::pause();

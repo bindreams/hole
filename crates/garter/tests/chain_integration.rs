@@ -1443,6 +1443,10 @@ async fn sitrep_parser_sees_the_line_before_any_ansi_strip() {
 /// A chain shut down while its plugin has not said `ready` ends `Ok`, and the caller of `on_ready` hears nothing: the
 /// plugin's stdout closing is the shutdown's doing, not a start failure. Every readiness mode, with a plugin that is
 /// silent on stdout and with one that has said `hello` and then holds.
+///
+/// The `Probe` rows and the `Auto` rows without a handshake never had the reader decide a failure at the end of
+/// stdout (a probe owns readiness), so they were green before the shutdown exception and guard that it stayed so. The
+/// `ExpectSitrep` rows and `Auto` with a handshake pin the order {cancel, then the take-down closes stdout}.
 #[skuld::test]
 async fn a_shutdown_before_ready_is_not_a_start_failure() {
     use garter::binary::ReadinessMode;
@@ -1462,7 +1466,8 @@ async fn a_shutdown_before_ready_is_not_a_start_failure() {
         drop(chain_listener);
 
         // The shutdown comes once the plugin is in the state the row names: spawned, or (with a handshake) its
-        // `hello` read.
+        // `hello` read. The sink runs inside the reader's poll, before `hello` is processed, so the row is reached with
+        // the reader still reading and the plugin's stdout open.
         let (reached_tx, reached_rx) = oneshot::channel();
         let reached_tx = Arc::new(Mutex::new(Some(reached_tx)));
         let signal = move || {
