@@ -10525,7 +10525,6 @@ dependencies = [
  "ctrlc",
  "dunce",
  "flate2",
- "glob",
  "hole-common",
  "indexmap 2.14.0",
  "libc",

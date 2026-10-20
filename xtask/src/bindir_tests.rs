@@ -40,17 +40,10 @@ fn fake_repo() -> tempfile::TempDir {
         }
     }
 
-    // .cache/ex-ray/ex-ray-<triple>{.exe} — exactly one match
+    // .cache/ex-ray/ex-ray-<host triple>{.exe}, the name `xtask ex-ray` writes.
     let ex_ray = root.join(".cache").join("ex-ray");
     fs::create_dir_all(&ex_ray).unwrap();
-    let ex_ray_name = if cfg!(windows) {
-        "ex-ray-x86_64-pc-windows-msvc.exe"
-    } else if cfg!(target_arch = "aarch64") {
-        "ex-ray-aarch64-apple-darwin"
-    } else {
-        "ex-ray-x86_64-apple-darwin"
-    };
-    fs::write(ex_ray.join(ex_ray_name), b"fake ex-ray").unwrap();
+    fs::write(ex_ray.join(crate::ex_ray::output_name()), b"fake ex-ray").unwrap();
 
     // target/release/galoshes{.exe} (unified workspace target dir)
     let galoshes = root.join("target").join("release");
@@ -134,10 +127,10 @@ fn bindir_uses_correct_profile_dir() {
 }
 
 #[skuld::test]
-fn bindir_errors_when_ex_ray_glob_has_zero_matches() {
+fn bindir_errors_when_ex_ray_host_binary_is_missing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    // Set up only the hole binary, no ex-ray glob match.
+    // Only the hole binary: no ex-ray in the cache.
     let target = root.join("target").join("debug");
     fs::create_dir_all(&target).unwrap();
     let name = if cfg!(windows) { "hole.exe" } else { "hole" };
@@ -146,31 +139,23 @@ fn bindir_errors_when_ex_ray_glob_has_zero_matches() {
     let err = bindir_files(Profile::Debug, root).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("no files matched") && msg.contains("ex-ray"),
-        "expected ex-ray glob error, got: {msg}"
+        msg.contains("ex-ray") && msg.contains(&crate::ex_ray::output_name()) && msg.contains("cargo xtask deps"),
+        "expected a missing host ex-ray error naming the file, got: {msg}"
     );
 }
 
+/// A cross-target build leaves another target's empty stub in the cache
+/// (`crates/hole/build.rs` stubs each sidecar for the build's `TARGET`). Only
+/// the host's binary is the staging source.
 #[skuld::test]
-fn bindir_errors_when_ex_ray_glob_has_multiple_matches() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let target = root.join("target").join("debug");
-    fs::create_dir_all(&target).unwrap();
-    let name = if cfg!(windows) { "hole.exe" } else { "hole" };
-    fs::write(target.join(name), b"x").unwrap();
+fn bindir_picks_the_host_ex_ray_among_other_targets_stubs() {
+    let repo = fake_repo();
+    let ex_ray = repo.path().join(".cache").join("ex-ray");
+    // One stub with the host's extension convention, one with the opposite.
+    fs::write(ex_ray.join("ex-ray-sparc64-unknown-linux-gnu"), b"").unwrap();
+    fs::write(ex_ray.join("ex-ray-sparc64-pc-windows-msvc.exe"), b"").unwrap();
 
-    let ex_ray = root.join(".cache").join("ex-ray");
-    fs::create_dir_all(&ex_ray).unwrap();
-    // Two matches — should error.
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
-    fs::write(ex_ray.join(format!("ex-ray-a{suffix}")), b"x").unwrap();
-    fs::write(ex_ray.join(format!("ex-ray-b{suffix}")), b"x").unwrap();
-
-    let err = bindir_files(Profile::Debug, root).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("expected exactly 1 file") && msg.contains("ex-ray"),
-        "expected multiple-match error, got: {msg}"
-    );
+    let files = bindir_files(Profile::Debug, repo.path()).unwrap();
+    let sidecar = files.iter().find(|f| f.dest_name.starts_with("ex-ray")).unwrap();
+    assert_eq!(sidecar.source.path(), ex_ray.join(crate::ex_ray::output_name()));
 }
