@@ -759,7 +759,7 @@ pub fn repair_interrupted_uninstall() -> std::io::Result<RepairStep> {
 /// the record covered finished.
 fn clear_record_of_absent_service() -> std::io::Result<RepairStep> {
     let state_dir = service_state_dir();
-    match disable_record::record_state(&state_dir)? {
+    match disable_record::record_state(&state_dir) {
         RecordState::Absent => Ok(RepairStep::Nothing),
         RecordState::Present => {
             if let Err(e) = disable_record::clear(&state_dir) {
@@ -771,7 +771,8 @@ fn clear_record_of_absent_service() -> std::io::Result<RepairStep> {
 }
 
 /// Who disabled the service, if it is disabled, for an elevated caller: an
-/// unreadable start type or record is its error, because the caller acts on it.
+/// unreadable start type is its error, because the caller acts on it.
+/// A record that cannot be read counts as present.
 pub fn disabled_by() -> std::io::Result<Option<DisabledBy>> {
     let Some(mut session) = RepairSession::open(READ_ACCESS)? else {
         return Ok(None);

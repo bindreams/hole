@@ -144,9 +144,9 @@ impl StartConfig for FakeSession<'_> {
     fn set_start_type(&mut self, to: StartWrite) -> io::Result<()> {
         self.call(format!("set_start_type({to:?})"))
     }
-    fn record_state(&mut self) -> io::Result<RecordState> {
-        self.call("record_state")?;
-        Ok(self.record)
+    fn record_state(&mut self) -> RecordState {
+        self.log.borrow_mut().push("record_state".into());
+        self.record
     }
     fn clear_record(&mut self) -> io::Result<()> {
         self.call("clear_record")?;
@@ -461,15 +461,6 @@ fn a_failed_record_write_changes_nothing_and_is_a_record_error() {
     let error = retire(&mut session, Disposition::Deregister).expect_err("the record write failed");
     assert!(matches!(error, RetireError::Record(_)), "{error}");
     assert_eq!(logged(&log), ["start_type", "record_state", "write_record"]);
-}
-
-#[skuld::test]
-fn a_record_that_cannot_be_read_is_a_record_error_before_anything_is_written() {
-    let log = Log::default();
-    let mut session = FakeSession::running_then_stopped(&log).failing("record_state");
-    let error = retire(&mut session, Disposition::Deregister).expect_err("the record read failed");
-    assert!(matches!(error, RetireError::Record(_)), "{error}");
-    assert_eq!(logged(&log), ["start_type", "record_state"]);
 }
 
 /// The start type put back: the one observed, except that `Other` (a boot or
@@ -1139,13 +1130,12 @@ impl StartConfig for Model {
             }
         })
     }
-    fn record_state(&mut self) -> io::Result<RecordState> {
-        self.step(None, |_| {})?;
-        Ok(if self.record {
+    fn record_state(&mut self) -> RecordState {
+        if self.record {
             RecordState::Present
         } else {
             RecordState::Absent
-        })
+        }
     }
     fn clear_record(&mut self) -> io::Result<()> {
         self.step(None, |model| model.record = false)

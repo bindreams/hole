@@ -24,16 +24,16 @@ fn backups(dir: &Path) -> Vec<std::path::PathBuf> {
 #[skuld::test]
 fn a_written_record_reads_present_and_a_cleared_one_absent() {
     let dir = tempfile::tempdir().expect("tempdir");
-    assert_eq!(record_state(dir.path()).expect("read"), RecordState::Absent);
+    assert_eq!(record_state(dir.path()), RecordState::Absent);
 
     write(dir.path()).expect("write");
-    assert_eq!(record_state(dir.path()).expect("read"), RecordState::Present);
+    assert_eq!(record_state(dir.path()), RecordState::Present);
     let on_disk: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).expect("the file")).expect("JSON");
     assert_eq!(on_disk, serde_json::json!({"version": 1}));
 
     clear(dir.path()).expect("clear");
-    assert_eq!(record_state(dir.path()).expect("read"), RecordState::Absent);
+    assert_eq!(record_state(dir.path()), RecordState::Absent);
     assert!(!dir.path().join(FILE).exists());
 }
 
@@ -41,7 +41,7 @@ fn a_written_record_reads_present_and_a_cleared_one_absent() {
 fn clearing_an_absent_record_is_ok() {
     let dir = tempfile::tempdir().expect("tempdir");
     clear(dir.path()).expect("nothing to clear is not a failure");
-    assert_eq!(record_state(dir.path()).expect("read"), RecordState::Absent);
+    assert_eq!(record_state(dir.path()), RecordState::Absent);
 }
 
 /// Only a Hole release writes the state dir, so a file that is there but not
@@ -60,7 +60,7 @@ fn a_corrupt_or_newer_record_reads_present() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_bytes(dir.path(), bytes);
         assert_eq!(
-            record_state(dir.path()).expect("an unreadable record is still a record"),
+            record_state(dir.path()),
             RecordState::Present,
             "{}",
             String::from_utf8_lossy(bytes)
@@ -68,14 +68,14 @@ fn a_corrupt_or_newer_record_reads_present() {
     }
 }
 
-/// A directory at the file's path fails the read with an OS error that says
-/// nothing about the file's content: that is not "no record".
+/// A directory at the file's path fails the read with an OS error. Like a file
+/// that cannot be interpreted, it is the record's place and counts as present,
+/// so no elevated path fails on it: the write that follows replaces it.
 #[skuld::test]
-fn a_read_that_fails_with_an_io_error_is_an_error_not_absent() {
+fn a_read_that_fails_with_an_io_error_reads_present() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir(dir.path().join(FILE)).expect("a directory where the file goes");
-    let read = record_state(dir.path());
-    assert!(read.is_err(), "{read:?}");
+    assert_eq!(record_state(dir.path()), RecordState::Present);
 }
 
 #[skuld::test]
@@ -100,7 +100,7 @@ fn clearing_a_corrupt_record_moves_it_aside_and_reads_absent() {
 
     clear(dir.path()).expect("a newer record never blocks a clear");
 
-    assert_eq!(record_state(dir.path()).expect("read"), RecordState::Absent);
+    assert_eq!(record_state(dir.path()), RecordState::Absent);
     let saved = backups(dir.path());
     assert_eq!(saved.len(), 1, "{saved:?}");
     assert_eq!(std::fs::read(&saved[0]).expect("the backup"), br#"{"version": 2}"#);

@@ -9,10 +9,10 @@
 //! elevated paths undo it; absent, nothing here changes a Disabled service.
 //!
 //! The file is a [`Role::Decision`]: a hint about wording and about whether to
-//! repair without asking, with a safe default (absent). A record that is
-//! corrupt or newer still counts as present, because only a Hole release
-//! writes the state directory, and never blocks a write, a clear or a
-//! connect: it is backed up and replaced or removed.
+//! repair without asking. A record that is corrupt, newer, or fails to read
+//! with an I/O error still counts as present, because only a Hole release
+//! writes the state directory, and never blocks a write, a clear, an
+//! uninstall or a connect: it is backed up and replaced or removed.
 //!
 //! Neither [`write`] nor [`clear`] takes a lock. Two overlapping retirements
 //! can clear a record the other still needs; the service then reads as an
@@ -22,6 +22,7 @@ use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use util::versioned_file::{
     DefaultPlacement, Loaded, Obsolete, Removal, Role, Schema, StoreError, VersionedFile, VersionedState,
 };
@@ -53,17 +54,22 @@ pub enum RecordState {
 }
 
 impl RecordState {
-    /// What reading the record found. A file that is there but cannot be
-    /// interpreted is present; a read that failed with an I/O error says
-    /// nothing about the file, so it is the error.
-    pub fn of(loaded: Loaded<DisableRecord>) -> io::Result<RecordState> {
+    /// What reading the record found. Only an absent file is absent: one that
+    /// is there but cannot be interpreted or read is present, so reading it as
+    /// absent never words a service the uninstall disabled as an
+    /// administrator's, and a record that cannot be read never fails a path
+    /// that must go on (the write that follows replaces it).
+    pub fn of(loaded: Loaded<DisableRecord>) -> RecordState {
         match loaded {
-            Loaded::Absent => Ok(RecordState::Absent),
-            Loaded::Unreadable(error) => Err(error),
-            Loaded::Corrupt { .. } => Ok(RecordState::Present),
-            Loaded::Obsolete { .. } => Ok(RecordState::Present),
-            Loaded::Newer { .. } => Ok(RecordState::Present),
-            Loaded::Current { .. } => Ok(RecordState::Present),
+            Loaded::Absent => RecordState::Absent,
+            Loaded::Unreadable(error) => {
+                warn!(%error, "the record that an uninstall disabled the service could not be read; counting it as present");
+                RecordState::Present
+            }
+            Loaded::Corrupt { .. } => RecordState::Present,
+            Loaded::Obsolete { .. } => RecordState::Present,
+            Loaded::Newer { .. } => RecordState::Present,
+            Loaded::Current { .. } => RecordState::Present,
         }
     }
 }
@@ -91,7 +97,7 @@ fn file(state_dir: &Path) -> VersionedFile<DisableRecord> {
 }
 
 /// Whether the record is in `state_dir`.
-pub fn record_state(state_dir: &Path) -> io::Result<RecordState> {
+pub fn record_state(state_dir: &Path) -> RecordState {
     RecordState::of(file(state_dir).load())
 }
 

@@ -92,12 +92,6 @@ impl InstallStart {
 pub enum RepairError {
     #[error("the service's start type could not be read: {0}")]
     StartType(io::Error),
-    #[error("the record that an uninstall disabled the service could not be read: {source}")]
-    Record {
-        /// The start type, which was read first.
-        start: StartType,
-        source: io::Error,
-    },
     #[error("the service's start type could not be set to automatic: {0}")]
     Reset(io::Error),
 }
@@ -105,21 +99,15 @@ pub enum RepairError {
 /// The step a repair would take, reading both facts and writing neither.
 pub fn observe<S: StartConfig>(session: &mut S) -> Result<RepairStep, RepairError> {
     let start = session.start_type().map_err(RepairError::StartType)?;
-    let record = session
-        .record_state()
-        .map_err(|source| RepairError::Record { start, source })?;
-    Ok(RepairStep::of(record, start))
+    Ok(RepairStep::of(session.record_state(), start))
 }
 
 /// Who disabled the service, for a reader that must never fail (the GUI's
-/// status). A start type that could not be read says nothing is disabled; a
-/// record that could not be read leaves the service an administrator's, because
-/// only a record that is there says the disable is ours.
+/// status). A start type that could not be read says nothing is disabled.
 pub fn for_display(observed: Result<RepairStep, RepairError>) -> Option<DisabledBy> {
     match observed {
         Ok(step) => step.disabled_by(),
         Err(RepairError::StartType(_)) => None,
-        Err(RepairError::Record { start, .. }) => RepairStep::of(RecordState::Absent, start).disabled_by(),
         Err(RepairError::Reset(_)) => None,
     }
 }

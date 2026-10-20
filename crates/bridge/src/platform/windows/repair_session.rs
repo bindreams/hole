@@ -74,7 +74,7 @@ impl StartConfig for RepairSession {
         write_start_type(&self.service, to)
     }
 
-    fn record_state(&mut self) -> io::Result<RecordState> {
+    fn record_state(&mut self) -> RecordState {
         disable_record::record_state(&self.state_dir)
     }
 

@@ -131,7 +131,7 @@ pub trait StartConfig {
     /// Write the start type.
     fn set_start_type(&mut self, to: StartWrite) -> io::Result<()>;
     /// Whether the record that an uninstall disabled the service is there.
-    fn record_state(&mut self) -> io::Result<RecordState>;
+    fn record_state(&mut self) -> RecordState;
     /// Remove the record.
     fn clear_record(&mut self) -> io::Result<()>;
 }
@@ -151,7 +151,7 @@ pub trait ServiceSession: StopActor + StartConfig {
 /// Why a retirement failed, by the step that failed.
 #[derive(Debug, thiserror::Error)]
 pub enum RetireError {
-    #[error("the record that the uninstall disables the service could not be read or written: {0}")]
+    #[error("the record that the uninstall disables the service could not be written: {0}")]
     Record(io::Error),
     #[error("the service could not be hardened against a restart: {0}")]
     Harden(io::Error),
@@ -218,7 +218,8 @@ fn answered_as_marked(error: &io::Error) -> bool {
 /// "The service must be explicitly disabled to prevent it from restarting").
 /// The change binds when the service stops. The record is written first, so a
 /// retirement cut short after the start type is disabled has its record; a
-/// failed read or write of it is the retirement's failure with nothing changed.
+/// failed write of it is the retirement's failure with nothing changed, and a
+/// record that cannot be read counts as present ([`RecordState::of`]).
 /// A failed start-type write is the retirement's failure with only the record
 /// this call wrote cleared, unless the SCM answers that the service is marked
 /// for deletion ([`Hardened::Marked`]); a failed failure-actions write only
@@ -229,7 +230,7 @@ fn harden<S: ServiceSession>(session: &mut S) -> Result<Hardened, RetireError> {
         Err(error) if answered_as_marked(&error) => return Ok(marked(&error)),
         Err(error) => return Err(RetireError::Harden(error)),
     };
-    let record = session.record_state().map_err(RetireError::Record)?;
+    let record = session.record_state();
     let Plan {
         hardening,
         writes_record,

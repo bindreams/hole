@@ -166,7 +166,7 @@ impl<S: ServiceSession> StartConfig for Recording<'_, S> {
         self.note(Call::SetStartType, result)
     }
 
-    fn record_state(&mut self) -> std::io::Result<RecordState> {
+    fn record_state(&mut self) -> RecordState {
         self.inner.record_state()
     }
 

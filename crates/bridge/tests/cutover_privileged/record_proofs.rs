@@ -97,7 +97,7 @@ fn set_start_type(to: ServiceStartType) {
 }
 
 fn record() -> RecordState {
-    disable_record::record_state(&state_dir()).expect("the record is readable")
+    disable_record::record_state(&state_dir())
 }
 
 fn clear_record() {

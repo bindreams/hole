@@ -2116,11 +2116,13 @@ match each** (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
   `..._at_every_step_of_a_stop_only_retirement_a_disabled_service_has_its_record`
   and its `deregistration` twin.
 - **Role.** The record is `Role::Decision`: a hint about wording and about
-  whether to self-repair, with a safe default (absent: the administrator's
-  wording, an offered enable, nothing silent). A corrupt or newer file counts as
-  present, an unreadable one is an error to an elevated path and "an
-  administrator's" to the GUI, and none ever blocks an uninstall or a connect: a
-  record that could block them is the lockout this design removes.
+  whether to self-repair. Only an absent file is absent: a corrupt or newer
+  one, and one whose read fails with an I/O error, counts as present on every
+  path (`RecordState::of`, which cannot fail), because only a Hole release
+  writes the state dir. None ever blocks an uninstall, an install, a cutover or
+  a connect: a record that could block them is the lockout this design removes,
+  and the MSI goes on to remove files under a running service when the uninstall
+  fails. The write that follows replaces one that cannot be read.
 - **Disclosed residual.** There is no lock between retirements. Two uninstalls
   that overlap (a CLI run during an MSI action) can have one clear the record
   while the other still has the service disabled, and a kill then leaves a

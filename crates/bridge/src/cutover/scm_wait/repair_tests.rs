@@ -63,9 +63,9 @@ impl StartConfig for FakeConfig {
         Ok(())
     }
 
-    fn record_state(&mut self) -> io::Result<RecordState> {
-        self.call("record_state".into())?;
-        Ok(self.record)
+    fn record_state(&mut self) -> RecordState {
+        self.calls.push("record_state".into());
+        self.record
     }
 
     fn clear_record(&mut self) -> io::Result<()> {
@@ -145,10 +145,6 @@ fn a_failed_read_is_the_error_and_nothing_is_written() {
     let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled).failing("start_type");
     assert!(matches!(repair(&mut config), Err(RepairError::StartType(_))));
     assert_eq!(config.calls(), ["start_type"]);
-
-    let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled).failing("record_state");
-    assert!(matches!(repair(&mut config), Err(RepairError::Record { .. })));
-    assert_eq!(config.calls(), ["start_type", "record_state"]);
 }
 
 // Repairing -----------------------------------------------------------------------------------------------------------
@@ -278,15 +274,6 @@ fn a_gui_reading_names_who_disabled_the_service_from_what_it_found() {
 fn a_gui_reading_that_cannot_read_the_start_type_says_nothing() {
     let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled).failing("start_type");
     assert_eq!(for_display(observe(&mut config)), None);
-}
-
-#[skuld::test]
-fn a_gui_reading_that_cannot_read_the_record_of_a_disabled_service_calls_it_an_administrators() {
-    // Only a record that is there says the disable is ours. One that cannot be
-    // read says nothing, and the safe wording is the one that offers the
-    // administrator's enable, which a Disabled service needs either way.
-    let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled).failing("record_state");
-    assert_eq!(for_display(observe(&mut config)), Some(DisabledBy::Elsewhere));
 }
 
 // Installing ----------------------------------------------------------------------------------------------------------
