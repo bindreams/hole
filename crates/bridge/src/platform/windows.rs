@@ -24,6 +24,9 @@ use crate::service_stop::{self, StopPhase, StopProgress};
 mod retire_session;
 pub use crate::cutover::scm_wait::retire::Opening;
 pub use retire_session::{GoneSession, RetireSession};
+#[path = "windows/stop_session.rs"]
+mod stop_session;
+pub use stop_session::StopSession;
 #[path = "windows/repair_session.rs"]
 mod repair_session;
 use repair_session::{RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};

@@ -189,17 +189,14 @@ mod system {
         ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING,
     };
     use windows::Win32::System::Services::{
-        ControlService, NotifyServiceStatusChangeW, QueryServiceStatusEx, StartServiceW, SC_STATUS_PROCESS_INFO,
-        SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING,
-        SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOPPED, SERVICE_NOTIFY_STOP_PENDING, SERVICE_QUERY_STATUS,
-        SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP,
+        NotifyServiceStatusChangeW, StartServiceW, SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING,
+        SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOPPED,
+        SERVICE_NOTIFY_STOP_PENDING, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
         SERVICE_STOPPED, SERVICE_STOP_PENDING,
     };
     use windows::Win32::System::Threading::SleepEx;
 
     use super::call_error::{self, win32_code_of_hresult, ScmCall, ScmCallError};
-    use super::hold::{Look, ProcessFate};
-    use super::settle::StopActor;
     use super::{states_to_arm, Observed, WantState};
     use crate::cutover::registration::{Arming, Registration, Settle};
 
@@ -426,7 +423,7 @@ mod system {
     }
 
     impl SystemScmActor {
-        /// Open the SCM + service handles with query/stop/start access.
+        /// Open the SCM + service handles with start access.
         pub fn open(service_name: &str) -> io::Result<Self> {
             Self::open_with(service_name, NoHooks)
         }
@@ -437,11 +434,11 @@ mod system {
         /// outcomes they intercept.
         #[doc(hidden)]
         pub fn open_with(service_name: &str, hooks: H) -> io::Result<Self> {
-            Self::open_with_access(service_name, SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START, hooks)
+            Self::open_with_access(service_name, SERVICE_START, hooks)
         }
 
-        /// [`open_with`](Self::open_with) with the query and control handle
-        /// opened for `access` only.
+        /// [`open_with`](Self::open_with) with the start handle opened for
+        /// `access` only.
         fn open_with_access(service_name: &str, access: u32, hooks: H) -> io::Result<Self> {
             let name = HSTRING::from(service_name);
             let handles = Handles::open(&name, access)?;
@@ -525,19 +522,6 @@ mod system {
             tracing::debug!(scm_current_state = state, awaiting = ?self.awaiting, "SCM status callback fired");
             Ok(state)
         }
-
-        /// `ControlService(STOP)` on the control handle.
-        fn send_stop(&mut self) -> io::Result<()> {
-            let mut status = SERVICE_STATUS::default();
-            match unsafe { ControlService(self.handles.service(), SERVICE_CONTROL_STOP, &mut status) } {
-                Ok(()) => Ok(()),
-                Err(e) => Err(ScmCallError {
-                    call: ScmCall::ControlService,
-                    code: win32_code_of_hresult(e.code().0),
-                }
-                .into_io()),
-            }
-        }
     }
 
     // No `Drop` impl: field order is the drop order.
@@ -572,68 +556,22 @@ mod system {
         }
     }
 
-    /// This actor holds no process: it queries the SCM's state and arms on it,
-    /// and its looks name no process ([`ProcessFate::Unheld`]), so the loop
-    /// never waits on one.
-    impl<H: Hooks> StopActor for SystemScmActor<H> {
-        fn observe(&mut self) -> io::Result<Look> {
-            let mut status = SERVICE_STATUS_PROCESS::default();
-            let mut needed = 0u32;
-            // SAFETY: the buffer is `status`'s own storage, of exactly its size,
-            // and the handle is live for `self`.
-            unsafe {
-                QueryServiceStatusEx(
-                    self.handles.service(),
-                    SC_STATUS_PROCESS_INFO,
-                    Some(std::slice::from_raw_parts_mut(
-                        std::ptr::from_mut(&mut status).cast::<u8>(),
-                        std::mem::size_of::<SERVICE_STATUS_PROCESS>(),
-                    )),
-                    &mut needed,
-                )
-            }
-            .map_err(|e| {
-                ScmCallError {
-                    call: ScmCall::QueryServiceStatusEx,
-                    code: win32_code_of_hresult(e.code().0),
-                }
-                .into_io()
-            })?;
-            let state = status.dwCurrentState.0;
-            let observed = observed_from_state(state).ok_or_else(|| {
-                io::Error::other(format!(
-                    "the service reported state {state}, which is not one it can be stopped from"
-                ))
-            })?;
-            Ok(Look {
-                observed,
-                fate: ProcessFate::Unheld,
-                held_alive: false,
-                ever_held: false,
-            })
-        }
-
-        fn arm_leaving(&mut self, from: Observed) -> io::Result<()> {
+    /// The arms of the stop wait. The actor holds no process and reads no
+    /// state, so it is no [`StopActor`](super::settle::StopActor): the stop
+    /// wait runs over a session that also finds the service's processes
+    /// ([`StopSession`](crate::platform::os::StopSession)).
+    impl<H: Hooks> SystemScmActor<H> {
+        /// Arms a notification for every state but `from`, on handles opened
+        /// for this arm. Fails with the SCM's refusal if the service is marked
+        /// for deletion.
+        pub fn arm_leaving(&mut self, from: Observed) -> io::Result<()> {
             self.awaiting = WantState::Stopped;
             self.arm_states(&states_to_arm(WantState::Stopped, false, Some(from)))
         }
 
-        fn control_stop(&mut self) -> io::Result<()> {
-            self.send_stop()
-        }
-
-        fn await_callback(&mut self) -> io::Result<()> {
+        /// Sleeps until the armed notification fires.
+        pub fn await_callback(&mut self) -> io::Result<()> {
             self.wait_for_the_armed_notification().map(drop)
-        }
-
-        fn await_held_exits(&mut self) -> io::Result<()> {
-            unreachable!("a look of this actor holds no process, so no step waits for one to exit")
-        }
-
-        /// Holds nothing: the cutover's stop does not look for a process the SCM
-        /// no longer names.
-        fn hold_scanned(&mut self) -> io::Result<()> {
-            Ok(())
         }
     }
 }

@@ -9,7 +9,7 @@ use crate::cutover::os::CutoverOs;
 use crate::cutover::scm_wait::repair::RepairStep;
 use crate::cutover::scm_wait::settle::{settle_stopped, SettleError};
 use crate::cutover::scm_wait::{start_via_notify, SystemScmActor};
-use crate::platform::os::SERVICE_NAME;
+use crate::platform::os::{StopSession, SERVICE_NAME};
 
 /// One image to rename-away-then-move-in: the live binary at `installed` is
 /// renamed aside, then the staged new bytes are moved onto `installed`.
@@ -159,8 +159,8 @@ impl CutoverOs for WindowsCutoverOs {
     }
 
     fn stop_service_wait_stopped(&mut self) -> std::io::Result<()> {
-        let mut actor = SystemScmActor::open(SERVICE_NAME)?;
-        settle_stopped(&mut actor).map_err(SettleError::into_io)
+        let mut session = StopSession::open()?;
+        settle_stopped(&mut session).map_err(SettleError::into_io)
     }
 
     fn repair_start_type(&mut self) -> std::io::Result<RepairStep> {

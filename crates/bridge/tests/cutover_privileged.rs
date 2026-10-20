@@ -773,14 +773,12 @@ fn cutover_global_net_state_a_lagging_client_arms_again_on_fresh_handles() {
     );
 }
 
-/// A retry whose handles fail to open fails that arm only: the actor's own
-/// handle still answers, a later arm works, and the lagging call's record,
-/// whose callback never ran, is not freed.
+/// A retry whose handles fail to open fails that arm only: a later arm works,
+/// and the lagging call's record, whose callback never ran, is not freed.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_a_failed_open_for_a_retry_fails_that_arm_only() {
-    use hole_bridge::cutover::scm_wait::settle::StopActor;
-    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
+    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
     use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
 
@@ -806,10 +804,6 @@ fn cutover_global_net_state_a_failed_open_for_a_retry_fails_that_arm_only() {
     );
     assert_eq!(records.borrow().len(), 1, "no record is made for an open that failed");
     actor.wait_callback().expect_err("the last arm failed");
-    assert_eq!(
-        actor.observe().expect("the actor's own handle still answers").observed,
-        Observed::Stopped
-    );
     actor
         .arm(WantState::Running, None)
         .expect("a later arm opens handles of its own");
@@ -2298,10 +2292,10 @@ fn cutover_global_net_state_uninstall_stops_the_instance_the_scm_restarted_while
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy)]
 enum StoppedBy {
-    /// The retirement's own Stop, sent into a RUNNING service whose process it
-    /// holds, so it waits on that process.
+    /// The stop wait's own Stop (the retirement's or the cutover's), sent into
+    /// a RUNNING service whose process it holds, so it waits on that process.
     TheRetirement,
-    /// The test, before the retirement begins: the first look is already
+    /// The test, before the stop wait begins: the first look is already
     /// STOPPED, which names no process, so only the scan for the service's
     /// token can find the one that is left.
     TheTest,
@@ -2419,6 +2413,143 @@ fn cutover_global_net_state_uninstall_waits_out_a_service_process_that_outlives_
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_finds_a_service_process_that_outlived_stopped_before_it_began() {
     uninstall_waits_out_a_process_that_outlives_stopped(StoppedBy::TheTest);
+}
+
+/// The cutover's stop wait over the session it runs on
+/// ([`StopSession`](hole_bridge::platform::os::StopSession)), announcing the
+/// wait on a held process before it blocks.
+#[cfg(target_os = "windows")]
+struct WatchedStop<'a> {
+    inner: hole_bridge::platform::os::StopSession,
+    on_await_held_exits: Box<dyn FnMut() + 'a>,
+}
+
+#[cfg(target_os = "windows")]
+impl hole_bridge::cutover::scm_wait::settle::StopActor for WatchedStop<'_> {
+    fn observe(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::Look> {
+        self.inner.observe()
+    }
+
+    fn arm_leaving(&mut self, from: hole_bridge::cutover::scm_wait::Observed) -> std::io::Result<()> {
+        self.inner.arm_leaving(from)
+    }
+
+    fn control_stop(&mut self) -> std::io::Result<()> {
+        self.inner.control_stop()
+    }
+
+    fn await_callback(&mut self) -> std::io::Result<()> {
+        self.inner.await_callback()
+    }
+
+    fn await_held_exits(&mut self) -> std::io::Result<()> {
+        (self.on_await_held_exits)();
+        self.inner.await_held_exits()
+    }
+
+    fn hold_scanned(&mut self) -> std::io::Result<()> {
+        self.inner.hold_scanned()
+    }
+}
+
+/// The update cutover's stop wait returns only once a service process that
+/// outlives STOPPED has exited: it runs the same stop loop and scan for the
+/// service's token as the uninstall, and a cutover that swapped the images
+/// out from under that process would start a new bridge beside it. The shape
+/// is [`uninstall_waits_out_a_process_that_outlives_stopped`]'s: the stop wait
+/// runs on a thread, the first message must be `Reached` with the helper
+/// alive, and only then does the test let the helper exit.
+#[cfg(target_os = "windows")]
+fn cutover_stop_waits_out_a_process_that_outlives_stopped(stopped_by: StoppedBy) {
+    use hole_bridge::cutover::scm_wait::settle::settle_stopped;
+    use hole_bridge::platform::os::StopSession;
+
+    #[derive(Debug)]
+    enum Message {
+        Reached(Vec<u32>),
+        Returned(std::io::Result<()>),
+    }
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let parked = named_event::NamedEvent::create("CutoverOutlivesParked");
+    let exit = named_event::NamedEvent::create("CutoverOutlivesExit");
+    let mut args = pid_log_args(&pid_log);
+    args.extend([
+        "--outlive-stopped".into(),
+        exit.name().into(),
+        "--parked-event".into(),
+        parked.name().into(),
+    ]);
+    let _service = ProvisionedService::install_with_args(helper, args);
+    let _exit_on_drop = exit.release_on_drop();
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    let service_pids = left_behind::logged(&pid_log);
+    assert_eq!(service_pids.len(), 1, "one service process so far: {service_pids:?}");
+
+    if let StoppedBy::TheTest = stopped_by {
+        scm_probe::Probe::open().stop().expect("the test stops the service");
+        // The helper parks only after reporting STOPPED, so the first look
+        // finds a stopped service whose process is still alive.
+        parked.wait();
+    }
+
+    let (messages, inbox) = std::sync::mpsc::channel();
+    let thread_pid_log = pid_log.clone();
+    let stop = std::thread::spawn(move || {
+        let reached = messages.clone();
+        let mut session = WatchedStop {
+            inner: StopSession::open().expect("open the stop session"),
+            on_await_held_exits: Box::new(move || {
+                let _ = reached.send(Message::Reached(left_behind::still_running(&thread_pid_log)));
+            }),
+        };
+        let result = settle_stopped(&mut session).map_err(hole_bridge::cutover::scm_wait::settle::SettleError::into_io);
+        let _ = messages.send(Message::Returned(result));
+    });
+
+    parked.wait();
+    match inbox.recv().expect("the stop wait ended without a message") {
+        Message::Reached(alive) => {
+            assert_eq!(
+                alive, service_pids,
+                "the process waited on is the helper's, and it is alive"
+            )
+        }
+        returned @ Message::Returned(_) => panic!(
+            "the cutover's stop returned while the service process was still alive, \
+             without waiting on it: {returned:?}"
+        ),
+    }
+    exit.signal();
+    let mut waits = 1;
+    let result = loop {
+        match inbox.recv().expect("the stop wait ended without returning") {
+            Message::Reached(_) => waits += 1,
+            Message::Returned(result) => break result,
+        }
+    };
+    result.expect("the stop wait succeeds once the process exits");
+    assert_eq!(waits, 1, "one wait on the held process, not a loop that spins");
+    stop.join().expect("the stop thread");
+    left_behind::assert_none(&pid_log);
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_cutover_stop_waits_out_a_service_process_that_outlives_its_own_stop() {
+    cutover_stop_waits_out_a_process_that_outlives_stopped(StoppedBy::TheRetirement);
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_cutover_stop_finds_a_service_process_that_outlived_stopped_before_it_began() {
+    cutover_stop_waits_out_a_process_that_outlives_stopped(StoppedBy::TheTest);
 }
 
 /// A service whose process the retirement cannot hold (one started before the

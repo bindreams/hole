@@ -1935,7 +1935,11 @@ state read before its act loses that race, so four rules close it:
   names one) is opened for `SYNCHRONIZE` (and `PROCESS_QUERY_LIMITED_INFORMATION`,
   to read its token) while it is named, and the settle ends with a wait on all of
   them: `uninstall` and `ensure_stopped` return with no service process left. The
-  service *row* is not waited for; the SCM removes it once the handles close.
+  update cutover's stop runs the same loop over the same `windows::StopSession`
+  (`RetireSession` delegates its stop to it), so it too returns with none left,
+  bar its own process: the cutover child carries the bridge's token, and the
+  scan skips the calling process. The service *row* is not waited for; the SCM
+  removes it once the handles close.
 - **No wait here has a bound.** Each is the exit of a process the SCM has been
   told to stop, or an SCM notification, and every iteration of the loop ends in
   one of those or in a state change a query read; nothing retries on a count or

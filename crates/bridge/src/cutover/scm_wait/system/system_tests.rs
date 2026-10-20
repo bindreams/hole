@@ -82,9 +82,6 @@ use std::rc::Rc;
 use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
 use windows::Win32::System::Services::SERVICE_QUERY_STATUS;
 
-use crate::cutover::scm_wait::hold::Look;
-use crate::cutover::scm_wait::settle::StopActor;
-
 const ALWAYS_RUNNING_SERVICE: &str = "EventLog";
 
 /// Counts the opens of notification handles and plays back scripted outcomes.
@@ -109,20 +106,6 @@ impl Hooks for Script {
 fn actor_on_the_event_log<H: Hooks>(hooks: H) -> SystemScmActor<H> {
     SystemScmActor::open_with_access(ALWAYS_RUNNING_SERVICE, SERVICE_QUERY_STATUS, hooks)
         .unwrap_or_else(|e| panic!("open {ALWAYS_RUNNING_SERVICE}, which every Windows host runs: {e}"))
-}
-
-#[skuld::test]
-fn observing_reads_the_state_and_holds_no_process() {
-    let mut actor = actor_on_the_event_log(NoHooks);
-    assert_eq!(
-        actor.observe().unwrap(),
-        Look {
-            observed: Observed::Running,
-            fate: ProcessFate::Unheld,
-            held_alive: false,
-            ever_held: false,
-        }
-    );
 }
 
 #[skuld::test]
@@ -170,15 +153,6 @@ fn a_failed_open_fails_that_arm_and_leaves_the_actor_usable() {
     assert!(error.to_string().contains("injected open failure"), "{error}");
     let error = actor.await_callback().expect_err("nothing is armed");
     assert!(error.to_string().contains("without a successful arm"), "{error}");
-    assert_eq!(actor.observe().unwrap().observed, Observed::Running);
     actor.arm_leaving(Observed::Stopped).unwrap();
     actor.await_callback().unwrap();
-}
-
-#[skuld::test]
-fn scanning_for_the_service_token_holds_nothing() {
-    let mut actor = actor_on_the_event_log(NoHooks);
-    actor.hold_scanned().unwrap();
-    let look = actor.observe().unwrap();
-    assert!(!look.held_alive && !look.ever_held, "{look:?}");
 }
