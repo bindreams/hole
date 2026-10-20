@@ -48,7 +48,13 @@
 //!    token never reaches. On expiry the tap
 //!    warns, naming the plugin, and aborts the inner. How the inner ended is
 //!    logged (an exit status at debug, a panic at warn) and otherwise dropped:
-//!    the failure being reported is the tap's. A start failure the tap has
+//!    the failure being reported is the tap's, unless the inner delivered a typed
+//!    start failure by the time it stopped (a `BinaryPlugin` delivers one it
+//!    decided at the end of its take-down): that is reported instead. The
+//!    readiness bound and a shutdown before readiness read it so; the latter then
+//!    also fails `run` instead of only dropping `ready`. The other failed starts
+//!    here follow a report the inner has already made, its one readiness message.
+//!    A start failure the tap has
 //!    reported is also its `run` error, so a runner with no `on_ready` sees the
 //!    chain fail. `Error::Chain` propagates.
 //! 4. Bind the tap's public listener on `local` (only after step 3, so the
@@ -275,8 +281,7 @@ impl ChainPlugin for TapPlugin {
             r = tokio::time::timeout_at(ready_deadline, &mut inner_ready_rx) => r,
             join = &mut inner_handle => {
                 // The inner exited. A typed report sent just before the exit is still in the channel.
-                let typed = inner_ready_rx.try_recv().ok().and_then(Result::err);
-                report_start_failure(&plugin_name, ready, typed);
+                report_start_failure(&plugin_name, ready, delivered_start_failure(&mut inner_ready_rx));
                 return failed_start_result(&plugin_name, join);
             }
             () = shutdown.cancelled() => {
@@ -306,9 +311,7 @@ impl ChainPlugin for TapPlugin {
             // caller sees its class.
             Ok(Ok(Err(e))) => {
                 stop_inner(&plugin_name, &inner_stop, inner_handle).await;
-                let detail = format!("tap[{plugin_name}]: inner failed to start: {e}");
-                report_start_failure(&plugin_name, ready, Some(e));
-                return Err(crate::Error::Chain(detail));
+                return Err(report_inner_failure(&plugin_name, ready, e));
             }
             // The inner dropped `ready` unsent: it is exiting, or it will never report. The
             // readiness budget keeps running while it winds down.
@@ -322,11 +325,29 @@ impl ChainPlugin for TapPlugin {
                         return failed_start_result(&plugin_name, join);
                     }
                     () = tokio::time::sleep_until(ready_deadline) => {
-                        return inner_not_ready(&plugin_name, inner_local, ready, &inner_stop, inner_handle).await;
+                        return inner_not_ready(
+                            &plugin_name,
+                            inner_local,
+                            ready,
+                            &inner_stop,
+                            &mut inner_ready_rx,
+                            inner_handle,
+                        )
+                        .await;
                     }
                 }
             }
-            Err(_elapsed) => return inner_not_ready(&plugin_name, inner_local, ready, &inner_stop, inner_handle).await,
+            Err(_elapsed) => {
+                return inner_not_ready(
+                    &plugin_name,
+                    inner_local,
+                    ready,
+                    &inner_stop,
+                    &mut inner_ready_rx,
+                    inner_handle,
+                )
+                .await
+            }
         };
 
         // 4. Bind the public-facing tap listener.
@@ -471,15 +492,40 @@ async fn stop_inner(
     }
 }
 
-/// Ends a start whose inner did not report within [`INNER_READY_TIMEOUT`]: stops the inner and reports `Fatal`.
+/// The typed start failure the inner has delivered into `inner_ready_rx`, if any. Read it once the inner has ended or
+/// been stopped, never earlier: an inner such as a `BinaryPlugin` delivers a failure it decided only at the end of its
+/// take-down, and the tap's own failure must not replace it. An already-consumed receiver holds nothing.
+fn delivered_start_failure(
+    inner_ready_rx: &mut oneshot::Receiver<Result<PluginReady, StartError>>,
+) -> Option<StartError> {
+    inner_ready_rx.try_recv().ok().and_then(Result::err)
+}
+
+/// Reports the typed failure the inner delivered as the tap's own, and returns the tap's `run` error for it.
+fn report_inner_failure(
+    plugin_name: &str,
+    ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    typed: StartError,
+) -> crate::Error {
+    let detail = format!("tap[{plugin_name}]: inner failed to start: {typed}");
+    report_start_failure(plugin_name, ready, Some(typed));
+    crate::Error::Chain(detail)
+}
+
+/// Ends a start whose inner did not report within [`INNER_READY_TIMEOUT`]: stops the inner and reports `Fatal`, unless
+/// the inner delivered a typed failure while it stopped, which is reported instead.
 async fn inner_not_ready(
     plugin_name: &str,
     inner_local: SocketAddr,
     ready: oneshot::Sender<Result<PluginReady, StartError>>,
     inner_stop: &CancellationToken,
+    inner_ready_rx: &mut oneshot::Receiver<Result<PluginReady, StartError>>,
     inner_handle: AbortOnDropHandle<crate::Result<()>>,
 ) -> crate::Result<()> {
     stop_inner(plugin_name, inner_stop, inner_handle).await;
+    if let Some(typed) = delivered_start_failure(inner_ready_rx) {
+        return Err(report_inner_failure(plugin_name, ready, typed));
+    }
     let detail = format!("tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}");
     let _ = ready.send(Err(StartError::Fatal {
         detail: detail.clone(),
@@ -533,7 +579,7 @@ async fn drain_after_shutdown(
     inner_handle: AbortOnDropHandle<crate::Result<()>>,
 ) -> crate::Result<()> {
     let join = inner_handle.await;
-    if let Ok(Err(typed)) = inner_ready_rx.try_recv() {
+    if let Some(typed) = delivered_start_failure(inner_ready_rx) {
         report_start_failure(plugin_name, ready, Some(typed));
         return failed_start_result(plugin_name, join);
     }

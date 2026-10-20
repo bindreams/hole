@@ -509,3 +509,134 @@ async fn a_start_failure_the_inner_delivers_while_the_tap_drains_it_is_still_rep
         }
     }
 }
+
+// A typed start failure is reported on every path that ends the start -------------------------------------------------
+
+/// When a [`Delivers`] stub hands its typed failure to `ready`.
+#[derive(Clone, Copy, Debug)]
+enum DeliversWhen {
+    /// After its token fires, as a `BinaryPlugin` does at the end of its take-down.
+    AfterStop,
+    /// At once, then it ends.
+    ThenExits,
+    /// At once, then it runs on until its token fires.
+    ThenWaits,
+}
+
+/// Announces it is running, then delivers `error` on `ready` as `when` says, and ends with an error.
+struct Delivers {
+    error: StartError,
+    when: DeliversWhen,
+    running: oneshot::Sender<()>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for Delivers {
+    fn name(&self) -> &str {
+        "delivers-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        let _ = self.running.send(());
+        match self.when {
+            DeliversWhen::AfterStop => {
+                shutdown.cancelled().await;
+                tokio::task::yield_now().await;
+                let _ = ready.send(Err(self.error));
+            }
+            DeliversWhen::ThenExits => {
+                let _ = ready.send(Err(self.error));
+            }
+            DeliversWhen::ThenWaits => {
+                let _ = ready.send(Err(self.error));
+                shutdown.cancelled().await;
+            }
+        }
+        Err(crate::Error::Chain("the stub decided its start failed".into()))
+    }
+}
+
+/// Whatever ends a start decides the error the caller gets, so the typed failure an inner delivers is the one reported
+/// on every path, whichever of them stops or drains the inner: the readiness bound, a shutdown before ready, the inner
+/// exiting on its own, and a failure it reports while running.
+///
+/// Paths that start from an inner that already reported (a listener outside the given address, the public bind, an
+/// accept failure) have consumed its one readiness message: the inner cannot deliver a second, and the tap's own
+/// failure is the only one, which `a_failed_start_aborts_an_inner_that_ignores_its_token_at_the_bound` covers.
+#[skuld::test]
+async fn a_typed_start_failure_the_inner_delivers_is_reported_on_every_path_that_ends_the_start() {
+    tokio::time::pause();
+    let errors = [
+        StartError::Fatal {
+            detail: "decided earlier".into(),
+            errno: None,
+        },
+        StartError::BindConflict {
+            errno: 98,
+            addr: loopback(),
+        },
+    ];
+    // (path, when the inner delivers, whether the caller shuts down once the inner runs)
+    let paths = [
+        ("readiness bound", DeliversWhen::AfterStop, false),
+        ("shutdown before ready", DeliversWhen::AfterStop, true),
+        ("inner exits on its own", DeliversWhen::ThenExits, false),
+        ("failure reported while running", DeliversWhen::ThenWaits, false),
+    ];
+    let mut wrong = Vec::new();
+    for error in errors {
+        for (path, when, shuts_down) in paths {
+            let label = format!("{path}, {error:?}");
+            let (running_tx, running_rx) = oneshot::channel();
+            let inner = Box::new(Delivers {
+                error: error.clone(),
+                when,
+                running: running_tx,
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tap = Box::new(TapPlugin::wrap_with_probe(
+                inner,
+                Box::new(scripted(vec![Ok(addr(5001))], &calls)),
+            ));
+            let shutdown = CancellationToken::new();
+            let plugin_shutdown = shutdown.clone();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let handle =
+                tokio::spawn(async move { tap.run(loopback(), unused_remote(), plugin_shutdown, ready_tx).await });
+            if shuts_down {
+                running_rx.await.expect("the stub never ran");
+                shutdown.cancel();
+            }
+
+            let heard = tokio::time::timeout(VIRTUAL_HANG, ready_rx)
+                .await
+                .unwrap_or_else(|_| panic!("{label}: the start never ended"));
+            let result = handle.await.expect("tap task panicked");
+            let want = format!(
+                "{:?}",
+                Ok::<_, oneshot::error::RecvError>(Err::<crate::sitrep::PluginReady, _>(error.clone()))
+            );
+            if format!("{heard:?}") != want {
+                wrong.push(format!("{label}: want the inner's own failure, got {heard:?}"));
+            }
+            if result.is_ok() {
+                wrong.push(format!("{label}: a failed start fails the tap, got {result:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "paths that lose the inner's failure:
+{}",
+        wrong.join(
+            "
+"
+        )
+    );
+}
