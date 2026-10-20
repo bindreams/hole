@@ -26,9 +26,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 import _lib
 
@@ -85,8 +87,8 @@ def live_dns_windows(alias: str, family: str) -> list[str] | None:
     never treated as evidence of a match."""
     fam_flag = "IPv4" if family == "ipv4" else "IPv6"
     result = powershell(
-        f"(Get-DnsClientServerAddress -InterfaceAlias ([WildcardPattern]::Escape($env:{ARG_ALIAS})) -AddressFamily {fam_flag} "
-        f"-ErrorAction SilentlyContinue).ServerAddresses -join ','",
+        f"(Get-DnsClientServerAddress -InterfaceAlias ([WildcardPattern]::Escape($env:{ARG_ALIAS})) "
+        f"-AddressFamily {fam_flag} -ErrorAction SilentlyContinue).ServerAddresses -join ','",
         {ARG_ALIAS: alias},
     )
     if result.returncode != 0:
@@ -350,8 +352,8 @@ def _text(value: object, what: str) -> str:
     """A string that can be passed as a process argument."""
     if not isinstance(value, str):
         raise TypeError(f"{what} is not a string")
-    if not value.isprintable():
-        raise ValueError(f"{what} contains a control character")
+    if "\0" in value:
+        raise ValueError(f"{what} contains a NUL")
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -526,11 +528,34 @@ def reset_windows(state: dict | None) -> None:
     print("  netsh int ip reset")
 
 
+class _ControlEscaping(io.TextIOBase):
+    """Writes text with control characters other than newline and tab escaped, so
+    a value read from a record cannot drive the terminal."""
+
+    def __init__(self, inner: TextIO) -> None:
+        self._inner = inner
+
+    def write(self, s: str) -> int:
+        self._inner.write("".join(_escape_control(c) for c in s))
+        return len(s)
+
+    def flush(self) -> None:
+        self._inner.flush()
+
+
+def _escape_control(c: str) -> str:
+    if c in "\n\t" or unicodedata.category(c) != "Cc":
+        return c
+    return f"\\x{ord(c):02x}"
+
+
 def main() -> None:
     # An adapter name the console code page cannot encode must not crash the reset.
-    for stream in (sys.stdout, sys.stderr):
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
         if isinstance(stream, io.TextIOWrapper):
             stream.reconfigure(errors="backslashreplace")
+        setattr(sys, name, _ControlEscaping(stream))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--force-dns-restore",
