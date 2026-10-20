@@ -633,6 +633,27 @@ fn only_a_stopped_service_has_no_process() {
     }
 }
 
+/// Microsoft's `QueryServiceStatusEx` remarks: the id "is valid provided that
+/// the state of the service is one of SERVICE_RUNNING, SERVICE_PAUSE_PENDING,
+/// SERVICE_PAUSED, or SERVICE_CONTINUE_PENDING", "may not be valid" in
+/// START_PENDING and STOP_PENDING, and "is never valid" in STOPPED. Written from
+/// that text, not from the code.
+#[skuld::test]
+fn each_state_has_the_pid_validity_microsoft_documents() {
+    assert_eq!(Observed::Running.reported_pid(), ReportedPid::Valid);
+    assert_eq!(Observed::StartPending.reported_pid(), ReportedPid::MayBeInvalid);
+    assert_eq!(Observed::StopPending.reported_pid(), ReportedPid::MayBeInvalid);
+    assert_eq!(Observed::Stopped.reported_pid(), ReportedPid::Never);
+}
+
+/// An id no process has is the service's exit only where the id is valid.
+#[skuld::test]
+fn a_gone_id_is_an_exit_only_where_the_id_is_valid() {
+    assert!(ReportedPid::Valid.gone_id_is_an_exit());
+    assert!(!ReportedPid::MayBeInvalid.gone_id_is_an_exit());
+    assert!(!ReportedPid::Never.gone_id_is_an_exit());
+}
+
 #[skuld::test]
 fn each_state_has_the_start_policy_its_cause_gives_it() {
     let table = [

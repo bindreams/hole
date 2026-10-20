@@ -34,8 +34,9 @@ pub enum ProcessFate {
     Unheld,
     /// A held process that has not exited.
     Alive,
-    /// The named process has exited: a held one that is signalled, or an id no
-    /// process has. Whatever state the SCM still reports.
+    /// The named process has exited: a held one that is signalled, whatever
+    /// state the SCM still reports, or an id no process has in a state whose id
+    /// is valid ([`Observed::reported_pid`]).
     Exited,
 }
 
@@ -49,7 +50,7 @@ pub struct Look {
 /// What opening a process id found.
 #[derive(Debug)]
 pub enum Opened<P> {
-    /// No process has that id: it has exited.
+    /// No process has that id.
     NoSuchProcess,
     /// A live process that is not the service's: its token lacks the service
     /// SID. The source closes it before returning this, so it is never held.
@@ -66,7 +67,8 @@ pub enum Named {
     Nothing,
     /// The process is held.
     Held,
-    /// No process has the id: the named process has exited.
+    /// No process has the id. Whether that is the service's exit depends on the
+    /// state the id was read in ([`Named::fate`]).
     NoSuchProcess,
     /// A live process has the id and it is not the service's. It is not held
     /// and is never waited on; whether anything of the service is left is not
@@ -75,9 +77,9 @@ pub enum Named {
 }
 
 impl Named {
-    /// The fate of the named process. `held_has_exited` is a state read of the
-    /// held handle, called only for [`Named::Held`].
-    fn fate(self, held_has_exited: impl FnOnce() -> io::Result<bool>) -> io::Result<ProcessFate> {
+    /// The fate of the process named in `observed`. `held_has_exited` is a
+    /// state read of the held handle, called only for [`Named::Held`].
+    fn fate(self, observed: Observed, held_has_exited: impl FnOnce() -> io::Result<bool>) -> io::Result<ProcessFate> {
         Ok(match self {
             Named::Nothing => ProcessFate::Unheld,
             Named::Held => {
@@ -87,7 +89,13 @@ impl Named {
                     ProcessFate::Alive
                 }
             }
-            Named::NoSuchProcess => ProcessFate::Exited,
+            Named::NoSuchProcess => {
+                if observed.reported_pid().gone_id_is_an_exit() {
+                    ProcessFate::Exited
+                } else {
+                    ProcessFate::Unheld
+                }
+            }
             Named::NotTheService => ProcessFate::Unheld,
         })
     }
@@ -176,7 +184,7 @@ impl<P> ProcessHolds<P> {
             }
             // `None`: a live process that is not the service's, already closed.
             let candidate = match source.open(pid)? {
-                // No process has this id: it has exited, and there is nothing to hold.
+                // No process has this id, so there is nothing to hold.
                 Opened::NoSuchProcess => {
                     return Ok(Hold {
                         reading,
@@ -207,12 +215,14 @@ impl<P> ProcessHolds<P> {
     /// a process's exit, a process handle cannot.
     ///
     /// A look that names a process this holds is `Alive` or `Exited` by a
-    /// state read of that handle; one that names an id no process has (the open
-    /// found none) is `Exited`; one that names no process, or a process that is
-    /// not the service's, is `Unheld`.
+    /// state read of that handle. One that names an id no process has (the open
+    /// found none) is `Exited` where the id is valid and `Unheld` where it may
+    /// not be (START_PENDING, STOP_PENDING): the service's process may be alive
+    /// under another id, so the wait rests on the SCM's own transition. One that
+    /// names no process, or a process that is not the service's, is `Unheld`.
     pub fn look<S: ProcessSource<Process = P>>(&mut self, source: &mut S) -> io::Result<Look> {
         let Hold { reading, named } = self.hold_current(source)?;
-        let fate = named.fate(|| {
+        let fate = named.fate(reading.observed, || {
             let pid = reading.process_to_hold().expect("a held process was named");
             let (_, process) = self
                 .held

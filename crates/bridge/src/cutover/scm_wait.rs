@@ -58,6 +58,31 @@ pub enum Observed {
     StopPending,
 }
 
+/// How far the process id the SCM reports for a state can be trusted
+/// ([`Observed::reported_pid`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportedPid {
+    /// The id names the service's process.
+    Valid,
+    /// The id "may not be valid": it can name no process, or another one.
+    MayBeInvalid,
+    /// The state has no process to name.
+    Never,
+}
+
+impl ReportedPid {
+    /// Whether an id that no process has means the service's process has
+    /// exited. Only where the id is valid is that a fact about the service;
+    /// where it may be invalid it is a fact about the id.
+    pub fn gone_id_is_an_exit(self) -> bool {
+        match self {
+            ReportedPid::Valid => true,
+            ReportedPid::MayBeInvalid => false,
+            ReportedPid::Never => false,
+        }
+    }
+}
+
 /// What a stop wait does on seeing a state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopStep {
@@ -165,11 +190,21 @@ impl Observed {
     /// process only if its token carries the service SID
     /// ([`ProcessHolds::hold_current`](hold::ProcessHolds::hold_current)).
     pub fn names_a_process(self) -> bool {
+        match self.reported_pid() {
+            ReportedPid::Valid => true,
+            ReportedPid::MayBeInvalid => true,
+            ReportedPid::Never => false,
+        }
+    }
+
+    /// How far the id the SCM reports in this state can be trusted, from the
+    /// same Microsoft remarks as [`names_a_process`](Self::names_a_process).
+    pub fn reported_pid(self) -> ReportedPid {
         match self {
-            Observed::Stopped => false,
-            Observed::StartPending => true,
-            Observed::Running => true,
-            Observed::StopPending => true,
+            Observed::Running => ReportedPid::Valid,
+            Observed::StartPending => ReportedPid::MayBeInvalid,
+            Observed::StopPending => ReportedPid::MayBeInvalid,
+            Observed::Stopped => ReportedPid::Never,
         }
     }
 

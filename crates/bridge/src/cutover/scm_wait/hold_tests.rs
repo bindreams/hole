@@ -430,14 +430,38 @@ fn a_held_process_that_has_exited_is_exited_whatever_the_state_still_says() {
     }
 }
 
+/// RUNNING is a state whose id Microsoft documents as valid, so an id no
+/// process has there is the service's process having exited.
 #[skuld::test]
-fn a_named_id_no_process_has_is_exited() {
+fn a_running_service_whose_named_id_no_process_has_is_exited() {
     let log = Log::default();
-    let mut source = Script::new(&log, vec![reading(Observed::StopPending, 100)]);
+    let mut source = Script::new(&log, vec![reading(Observed::Running, 100)]);
     source.gone.push(100);
     let (got, holds) = look_of(&mut source);
     assert_eq!(got.fate, ProcessFate::Exited);
     assert!(held_pids(&holds).is_empty());
+}
+
+/// In START_PENDING and STOP_PENDING Microsoft documents that the id "may not be
+/// valid", so an id no process has says nothing about the service's process,
+/// which may be alive: the look rests on the SCM's own transition.
+#[skuld::test]
+fn a_pending_service_whose_named_id_no_process_has_is_unheld_not_exited() {
+    for pending in [Observed::StartPending, Observed::StopPending] {
+        let log = Log::default();
+        let mut source = Script::new(&log, vec![reading(pending, 100)]);
+        source.gone.push(100);
+        let (got, holds) = look_of(&mut source);
+        assert_eq!(
+            got,
+            Look {
+                observed: pending,
+                fate: ProcessFate::Unheld
+            },
+            "{pending:?}"
+        );
+        assert!(held_pids(&holds).is_empty(), "{pending:?}");
+    }
 }
 
 #[skuld::test]

@@ -1962,8 +1962,12 @@ down a rollback (bindreams/hole#1099). Three rules close it:
 
 A held process is also the ground truth for whether the status is current: the
 SCM's status can lag a process's exit by its own latency, so a process that has
-exited (a zero-timeout wait on the held handle, or an id no process has) counts
-as gone **whatever state the SCM still reports**. The stop wait treats it as
+exited (a zero-timeout wait on the held handle) counts as gone **whatever state
+the SCM still reports**. An id no process has counts the same only where
+Microsoft documents the id as valid (`Observed::reported_pid`: RUNNING). In
+START_PENDING and STOP_PENDING the id "may not be valid", so an id no process
+has is a fact about the id, not about the service: the look is `Unheld` and the
+wait rests on the SCM's own transition. The stop wait treats an exit as
 stopped (`Observed::for_stop_wait(ProcessFate)`): a Stop that failed because the
 process died under it is explained, not an error, and a RUNNING or STOP_PENDING
 status over a dead process is not waited on. The failure that remains is a Stop
