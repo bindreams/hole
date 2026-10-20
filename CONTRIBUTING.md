@@ -871,10 +871,11 @@ leaves working DNS + broken routes, not the inverse):
   [Route ownership](#route-ownership). The same call also sweeps a stale
   [fail-closed cover](#fail-closed-cover) (Windows by fixed WFP GUID, macOS via
   `bridge-failclosed.json`).
-- **`bridge-service-disabled.json`** (Windows) — present while an uninstall's
-  Disabled start type is in force; `repair_interrupted_uninstall` (the cutover
-  child, `bridge install`) and the next retirement reset what it names and sweep
-  a stale one. See
+- **`HoleDisabledByUninstall`** (Windows; a registry value under the service's
+  own key, not a file in `<state_dir>`) — present while an uninstall's Disabled
+  start type is in force; `repair_interrupted_uninstall` (the cutover child,
+  `bridge install`) and the next retirement reset what it names and sweep a
+  stale one. It goes with the service's key. See
   [A Disabled service](#a-disabled-service-whose-disable-it-is).
 - **`bridge-failclosed.json`** (macOS only) — the `pfctl -E` enable token of an
   engaged fail-closed cover; `routing::failclosed::recover_cover` restores
@@ -2088,13 +2089,14 @@ A retirement disables the start type so that STOPPED is final, then puts it
 back. A process killed in between leaves a Disabled service that looks exactly
 like one an administrator disabled, and the two want opposite treatment: the
 first is broken, the second is a choice. Two writes cannot be one, so a record,
-`bridge-service-disabled.json` in `<state_dir>` (installed:
-`C:\ProgramData\hole\state\`; see
-[`disable_record.rs`](crates/bridge/src/disable_record.rs)), is written **before**
-the Disabled write and cleared only **after** the start type is written back
-(`StopOnly`) or the service is deleted (`Deregister`). Its presence is the fact
-(v1, empty payload). **Record and start type together decide, one exhaustive
-match each** (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
+the DWORD value `HoleDisabledByUninstall` under the service's own key
+(`HKLM\SYSTEM\CurrentControlSet\Services\HoleBridge`; see
+[`RecordKey`](crates/bridge/src/disable_record/record_key.rs)), is written
+**before** the Disabled write and cleared only **after** the start type is
+written back (`StopOnly`) or the service is deleted (`Deregister`). Its
+presence is the fact: any value of that name, of any type, is the record.
+**Record and start type together decide, one exhaustive match each**
+(`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
 
 | Record  | Start type   | Cutover child, before its start        | `bridge install`                               | Retirement's restore                  | GUI                                                             |
 | ------- | ------------ | -------------------------------------- | ---------------------------------------------- | ------------------------------------- | --------------------------------------------------------------- |
@@ -2117,14 +2119,25 @@ match each** (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
   and every failing, killed or marked call) and, against a real service in CI, by
   `..._at_every_step_of_a_stop_only_retirement_a_disabled_service_has_its_record`
   and its `deregistration` twin.
-- **Role.** The record is `Role::Decision`: a hint about wording and about
-  whether to self-repair. Only an absent file is absent: a corrupt or newer
-  one, and one whose read fails with an I/O error, counts as present on every
-  path (`RecordState::of`, which cannot fail), because only a Hole release
-  writes the state dir. None ever blocks an uninstall, an install, a cutover or
-  a connect: a record that could block them is the lockout this design removes,
-  and the MSI goes on to remove files under a running service when the uninstall
-  fails. The clear moves one that cannot be read aside.
+- **Place, and why not a file.** The record is a registry value rather than a
+  file in `<state_dir>` because the GUI must read it unprivileged and the state
+  directory cannot grant that: it holds the password, so its DACL is protected
+  and names SYSTEM and Administrators only (`target.rs` `state_sddl`), so Users
+  read nothing in it. A service key grants Users read and nothing else, so the
+  GUI reads the value and no user can forge it.
+  The record also dies with the service, so nothing sweeps a record over a
+  service the SCM no longer has, and `repair_interrupted_uninstall` finds nothing
+  to do then. Windows only: the macOS service has no start type and no record.
+- **Role.** The record is a hint about wording and about whether to
+  self-repair. A missing key or value is absent; every other failure to read it
+  (the key refuses the open, the query fails) leaves its existence unknown and
+  counts as present on every path (`RecordKey::state`, which cannot fail),
+  because only a Hole release writes the value. None ever blocks an uninstall,
+  an install, a cutover or a connect: a record that could block them is the
+  lockout this design removes, and the MSI goes on to remove files under a
+  running service when the uninstall fails. A write needs the key and fails
+  without it (nothing else has changed yet, and a key made there would outlive
+  the service); a clear with no key or no value is success.
 - **Disclosed residual.** There is no lock between retirements. Two uninstalls
   that overlap (a CLI run during an MSI action) can have one clear the record
   while the other still has the service disabled, and a kill then leaves a
@@ -2169,12 +2182,20 @@ match each** (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
   (running 0, stopped 1, not installed 2). The GUI's read is unprivileged and
   never fails (`disabled_state`: a start type it cannot read is none, a record it
   cannot read counts as present, as on every path). That read works as
-  installed because nothing sets a service security descriptor or a state
-  directory ACL, so both inherit the Windows defaults; the proof is the
+  installed because nothing sets a security descriptor on the service or on its
+  key, so both keep the Windows defaults; the proof is the
   `..._the_service_dacl_lets_an_interactive_user_query_its_config` and
-  `..._the_state_dir_record_is_readable_by_users` tests (CI), which ask
-  `GetEffectiveRightsFromAclW` for the groups an interactive user's token holds
-  on a service made by the production `install()`.
+  `..._the_service_key_lets_an_interactive_user_read_the_record` tests (CI),
+  which ask `GetEffectiveRightsFromAclW` for the groups an interactive user's
+  token holds on a service made by the production `install()`;
+  `..._the_service_key_refuses_an_interactive_user_a_write` proves the other
+  half, that no user can write the record.
+- **A service marked for deletion.** The mark
+  leaves the key (and so the record) in place until the last handle closes;
+  that the key still opens and reads, and what `disabled_state()` and the status
+  then say, is unmeasured here and is read from the CI line `MARKED ANSWER` of
+  `..._probe_marked_service_start_type_read`. A key that refuses the read counts
+  the record as present, like any unreadable record.
 
 ##### What the MSI must guarantee for the keep-covers path to be safe
 
