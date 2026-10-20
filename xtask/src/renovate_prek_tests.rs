@@ -1,7 +1,7 @@
 //! Every version `prek.toml` pins, the `rev` of each hook repository and each exact
 //! `additional_dependencies` entry, is one a `regex` custom manager in `.github/renovate.json`
 //! extracts, with a datasource this file knows. A pin no manager sees never moves, and a bumped `rev`
-//! beside it changes nothing about the tool that runs. Settings that turn a manager off on purpose
+//! beside it changes nothing about the tool that runs. Top-level settings that turn a manager off on purpose
 //! (`enabled`, `ignorePaths`, `packageRules`) are not checked here.
 
 use std::collections::BTreeSet;
@@ -34,6 +34,14 @@ fn extracted(renovate: &serde_json::Value, prek_text: &str) -> BTreeSet<(String,
             Some("regex"),
             "a manager over prek.toml must be a `regex` manager"
         );
+        // Any other key (templates, `matchStringsStrategy`, `enabled`, ...) changes what Renovate
+        // extracts in ways this file does not model.
+        let keys = manager.as_object().expect("manager is an object").keys();
+        let unmodelled: Vec<&String> = keys.filter(|k| !PREK_MANAGER_KEYS.contains(&k.as_str())).collect();
+        assert!(
+            unmodelled.is_empty(),
+            "a manager over prek.toml may use only {PREK_MANAGER_KEYS:?}, not {unmodelled:?}; update this guard to change that"
+        );
         let datasource_template = manager["datasourceTemplate"].as_str();
         for pattern in manager["matchStrings"].as_array().expect("matchStrings") {
             let pattern = pattern.as_str().expect("matchStrings entry");
@@ -45,10 +53,9 @@ fn extracted(renovate: &serde_json::Value, prek_text: &str) -> BTreeSet<(String,
                         .as_str()
                         .to_string()
                 };
-                let datasource = caps
-                    .name("datasource")
-                    .map(|d| d.as_str())
-                    .or(datasource_template)
+                // As in Renovate, a template wins over the group.
+                let datasource = datasource_template
+                    .or(caps.name("datasource").map(|d| d.as_str()))
                     .unwrap_or_else(|| panic!("`{pattern}` names no datasource"));
                 assert!(
                     PREK_DATASOURCES.contains(&datasource),
@@ -60,6 +67,15 @@ fn extracted(renovate: &serde_json::Value, prek_text: &str) -> BTreeSet<(String,
     }
     found
 }
+
+/// The keys a manager over prek.toml may carry: the ones this file checks.
+const PREK_MANAGER_KEYS: &[&str] = &[
+    "customType",
+    "description",
+    "managerFilePatterns",
+    "matchStrings",
+    "datasourceTemplate",
+];
 
 /// The Renovate datasources prek.toml pins come from.
 const PREK_DATASOURCES: &[&str] = &["github-tags", "npm", "pypi"];
