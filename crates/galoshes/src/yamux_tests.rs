@@ -1417,9 +1417,40 @@ async fn a_healthy_session_is_kept_alive_by_its_own_probe() {
     );
 }
 
-/// A hop whose bind fails ends the chain with the typed exited-before-ready failure, not a closed `on_ready`: the
-/// readiness sender must be gone by the time `run` returns, or the chain reads the exit as a plugin still starting.
-/// Multi-thread, where the task holding the sender runs on another thread than the chain's reader of the exit.
+/// `run` returns with the readiness sender already gone when its bind fails, or the chain reads the exit as a plugin
+/// still starting. On the current-thread runtime nothing yields between the failed bind and the return, so a holder
+/// task `run` did not join has never run and the sender is still held: `Empty`, not `Closed`.
+#[skuld::test]
+async fn a_hop_whose_bind_fails_has_dropped_its_readiness_sender_when_run_returns() {
+    for is_server in [false, true] {
+        // Occupies the port the hop is told to bind.
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        let plugin: Box<dyn garter::ChainPlugin> =
+            Box::new(crate::yamux::YamuxPlugin::new(is_server, DEFAULT_UDP_TIMEOUT));
+
+        let result = plugin
+            .run(
+                occupied.local_addr().unwrap(),
+                "127.0.0.1:9".parse().unwrap(),
+                CancellationToken::new(),
+                ready_tx,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "is_server={is_server}: a failed bind must fail `run`: {result:?}"
+        );
+        assert!(
+            matches!(ready_rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+            "is_server={is_server}: `run` returned with the readiness sender still held"
+        );
+    }
+}
+
+/// End to end: a hop whose bind fails ends the chain with the typed exited-before-ready failure, not a closed
+/// `on_ready`. Multi-thread, as the bridge runs it.
 #[skuld::test]
 fn a_hop_whose_bind_fails_reports_the_typed_start_failure() {
     let rt = tokio::runtime::Builder::new_multi_thread()
