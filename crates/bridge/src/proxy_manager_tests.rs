@@ -351,7 +351,6 @@ impl Routing for MockRouting {
         // the fail flag is checked). This keeps the file-lifecycle tests
         // honest — they observe the same write-then-clear behavior.
         let persisted = route_state::RouteState {
-            version: route_state::SCHEMA_VERSION,
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
@@ -363,13 +362,13 @@ impl Routing for MockRouting {
             installed: installed.clone(),
             stale: Vec::new(),
         };
-        route_state::save(&self.state_dir, &persisted, None)
+        route_state::write(&route_state::file(&self.state_dir), &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
 
         if self.state.fail_install.load(Ordering::SeqCst) {
             // Defensive: match `SystemRouting::install`'s error path —
             // clear the stale file we just wrote.
-            let _ = route_state::clear(&self.state_dir);
+            let _ = route_state::remove(&route_state::file(&self.state_dir));
             return Err(RoutingError::RouteSetup("mock install failure".into()));
         }
 
@@ -391,7 +390,7 @@ impl Routing for MockRouting {
             // rather than consulting `persisted.stale` — stale-group
             // interaction with fail-closed rollback is untested at this
             // layer and is covered only by routing_tests.rs.
-            let _ = route_state::clear(&self.state_dir);
+            let _ = route_state::remove(&route_state::file(&self.state_dir));
             return Err(RoutingError::RouteSetup(format!(
                 "route install incomplete: {}/{} routes confirmed",
                 installed.len(),
@@ -507,7 +506,7 @@ impl Drop for MockRoutes {
         self.state.teardown_calls.fetch_add(1, Ordering::SeqCst);
         self.state.teardown_order.lock().unwrap().push("routes");
         *self.state.last_teardown_installed.lock().unwrap() = Some(self.installed.clone());
-        let _ = route_state::clear(&self.state_dir);
+        let _ = route_state::remove(&route_state::file(&self.state_dir));
     }
 }
 
@@ -1964,7 +1963,9 @@ fn start_writes_state_file_then_stop_clears_it() {
         assert!(state_path.exists(), "state file must exist while proxy is running");
 
         // Verify the content contains the server IP
-        let loaded = route_state::load(dir.path()).unwrap();
+        let util::versioned_file::Loaded::Current { value: loaded, .. } = route_state::load(dir.path()) else {
+            panic!("the record written by install must read as a current one");
+        };
         assert_eq!(loaded.server_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         pm.stop().await.unwrap();
