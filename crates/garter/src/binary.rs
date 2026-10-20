@@ -505,10 +505,11 @@ impl Drop for FailureHold {
 /// A `ready` is sent at once. A failure (`fatal`, `bind_conflict`, an empty `ready`, or stdout closing
 /// where no probe owns readiness: a sitrep plugin's readiness travels on stdout, so it can never become
 /// ready) is not: it is held in the returned [`FailureHold`], which [`supervise_plugin`] takes the plugin
-/// down for, drains its output, and only then delivers. A stdout that closes because the supervision took
-/// the plugin down on a shutdown is no failure; one the plugin closed itself is, even if a shutdown has been
-/// requested by the time the reader sees it. The reader keeps relaying lines until stdout closes. `shutdown`
-/// ends a probe the reader started.
+/// down for, drains its output, and only then delivers. Once a shutdown starts taking a live plugin down,
+/// a stdout close the reader has not yet seen is the take-down's and no failure, whoever closed it: nothing
+/// orders the close against the take-down, and the caller asked for the shutdown. A failure the reader
+/// decided first, or a plugin whose root had already exited, keeps its failure. Either way the output is
+/// relayed. The reader keeps relaying lines until stdout closes. `shutdown` ends a probe the reader started.
 pub(crate) fn spawn_sitrep_stdout_reader(
     stdout: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     plugin_name: String,
