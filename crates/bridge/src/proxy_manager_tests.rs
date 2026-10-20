@@ -1240,6 +1240,106 @@ fn check_health_does_not_mark_healthy_task_as_crashed() {
     });
 }
 
+// A plugin chain's exit is a session death (a plugin dying mid-session) ===============================================
+
+/// A chain task the test ends on demand. Ending it is the plugin dying; a
+/// chain task finishes when any plugin in it exits. Returns the chain, the
+/// release trigger, and a receiver that fires from inside the task just
+/// before it returns: the task runs to completion on this current-thread
+/// runtime before the awaiting test is polled again, so `is_finished()` is
+/// already true on resume (no clock involved).
+fn controllable_chain() -> (
+    crate::proxy::plugin::PluginChain,
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+) {
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _ = release_rx.await;
+        let _ = done_tx.send(());
+        Ok(())
+    });
+    let chain = crate::proxy::plugin::PluginChain::over_task_for_test(handle, CancellationToken::new());
+    (chain, release_tx, done_rx)
+}
+
+#[skuld::test]
+fn check_health_reports_a_session_whose_plugin_chain_task_ended() {
+    current_thread_rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::new());
+        pm.start(&test_config()).await.unwrap();
+        let (chain, release, done) = controllable_chain();
+        pm.set_plugin_chain_for_test(chain);
+
+        assert_eq!(pm.check_health(), None, "a live chain is a healthy session");
+
+        release.send(()).unwrap();
+        done.await.unwrap();
+
+        let event = pm.check_health().expect("a chain that exited must report GaveUp");
+        assert_eq!(event, SessionEvent::GaveUp);
+        pm.stop_with(event).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Stopped);
+    });
+}
+
+#[skuld::test]
+fn a_plugin_chain_death_surfaces_the_path_free_death_reason() {
+    current_thread_rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::new());
+        pm.start(&test_config()).await.unwrap();
+        let (chain, release, done) = controllable_chain();
+        pm.set_plugin_chain_for_test(chain);
+
+        release.send(()).unwrap();
+        done.await.unwrap();
+        let event = pm.check_health().expect("a chain that exited must report GaveUp");
+        pm.stop_with(event).await.unwrap();
+
+        assert_eq!(
+            pm.death_reason(),
+            Some(DEATH_REASON),
+            "the GUI must be told the session died"
+        );
+        assert!(
+            pm.last_error().unwrap().contains("unexpectedly"),
+            "last_error must record the death"
+        );
+    });
+}
+
+#[skuld::test]
+fn a_plugin_chain_death_moves_the_target_off() {
+    current_thread_rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.start(&test_config()).await.unwrap();
+        target::save(
+            dir.path(),
+            &Target::Connected {
+                config: Box::new(test_config()),
+            },
+            None,
+        )
+        .unwrap();
+        let (chain, release, done) = controllable_chain();
+        pm.set_plugin_chain_for_test(chain);
+
+        release.send(()).unwrap();
+        done.await.unwrap();
+        let event = pm.check_health().expect("a chain that exited must report GaveUp");
+        pm.stop_with(event).await.unwrap();
+
+        assert_eq!(
+            target::load(dir.path()),
+            Target::Off,
+            "a plugin death takes the same teardown as a proxy death"
+        );
+    });
+}
+
 #[skuld::test]
 fn uptime_increases_while_running() {
     rt().block_on(async {

@@ -501,6 +501,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
+    /// Test seam: install `chain` as the live session's plugin chain, so a
+    /// test can drive `check_health` against a chain whose task it controls.
+    /// Panics when no session is running.
+    #[cfg(test)]
+    pub fn set_plugin_chain_for_test(&mut self, chain: crate::proxy::plugin::PluginChain) {
+        self.posture
+            .session_mut()
+            .expect("set_plugin_chain_for_test: no running session")
+            .plugin_chain = Some(chain);
+    }
+
     /// Sample cumulative tunnel-traffic totals and compute speeds over
     /// the window since the previous sample. Each call advances the
     /// window — the IPC metrics poll is the sampling event. `None` when
@@ -2192,8 +2203,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
-    /// Sync health check: detects a proxy task that exited on its own
-    /// (e.g. shadowsocks panic or upstream connection failure). Performs no
+    /// Sync health check: detects a proxy task or plugin chain that exited on
+    /// its own (e.g. shadowsocks panic, upstream connection failure, or a
+    /// plugin process dying mid-session). Both report the same
+    /// [`DEATH_REASON`]; the log line says which one died. Performs no
     /// teardown itself — it only records the failure and reports it as a
     /// [`SessionEvent::GaveUp`] for the caller to feed into
     /// [`Self::stop_with`], so the give-up path and the cover decision it
@@ -2206,10 +2219,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// be made async too.
     pub fn check_health(&mut self) -> Option<SessionEvent> {
         let state = self.posture.session()?;
-        if state.proxy.is_alive() {
+        if !state.proxy.is_alive() {
+            error!("proxy task exited unexpectedly");
+        } else if state.plugin_chain.as_ref().is_some_and(|c| !c.is_alive()) {
+            error!("plugin chain exited unexpectedly");
+        } else {
             return None;
         }
-        error!("proxy task exited unexpectedly");
         self.last_error = Some(DEATH_REASON.into());
         // Path-free death reason for the GUI status/toast (#470).
         self.death_reason = Some(DEATH_REASON);

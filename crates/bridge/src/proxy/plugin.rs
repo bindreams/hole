@@ -55,6 +55,13 @@ impl PluginChain {
         self.local_addr
     }
 
+    /// Cheap, synchronous check: is the chain's task still running? The task
+    /// ends as soon as any plugin in the chain exits, so `false` outside a
+    /// teardown means a plugin died.
+    pub fn is_alive(&self) -> bool {
+        !self.handle.is_finished()
+    }
+
     /// Transports the live chain reported via its sitrep `ready` message.
     /// The UDP-drop policy reads this to decide whether `Proxy`-routed UDP
     /// flows can be carried through the tunnel or must be dropped.
@@ -88,6 +95,24 @@ impl PluginChain {
             transports: garter::Transports::TCP,
             state_dir,
             log,
+        }
+    }
+
+    /// Build a `PluginChain` over a caller-controlled task, so a test can end
+    /// the chain's task at a moment it chooses. `cancel` is caller-supplied for
+    /// the same lint reason as [`Self::for_test`].
+    #[cfg(test)]
+    pub(crate) fn over_task_for_test(
+        handle: tokio::task::JoinHandle<garter::Result<()>>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            handle,
+            cancel,
+            local_addr: SocketAddr::from(([127, 0, 0, 1], 1)),
+            transports: garter::Transports::TCP,
+            state_dir: None,
+            log: crate::proxy::plugin_log::PluginLog::new(),
         }
     }
 
