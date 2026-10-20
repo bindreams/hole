@@ -297,6 +297,59 @@ fn cutover_global_net_state_repair_sweeps_a_record_over_no_service() {
     assert_eq!(os::disabled_state(), None, "no service is not a disabled service");
 }
 
+// What a service marked for deletion answers ==========================================================================
+
+/// The start type read with `SERVICE_QUERY_CONFIG` alone on a handle of its
+/// own, as the GUI reads it, or the call that was refused with its Win32 code.
+fn describe_start_type_read() -> String {
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) {
+        Ok(manager) => manager,
+        Err(e) => return format!("OpenSCManager refused: {e:?}"),
+    };
+    let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => service,
+        Err(e) => return format!("OpenService(SERVICE_QUERY_CONFIG) refused: {e:?}"),
+    };
+    match service.query_config() {
+        Ok(config) => format!("QueryServiceConfig answered start type {:?}", config.start_type),
+        Err(e) => format!("QueryServiceConfig refused: {e:?}"),
+    }
+}
+
+/// Measurement: what the GUI's reads say about the entry a deregistration
+/// leaves. `Deregister` leaves the start type Disabled and clears the record
+/// before the delete, and the entry stays listed while any handle is open, so
+/// the service here is Disabled, has no record and is marked for deletion
+/// while the test's handle keeps it. If `QueryServiceConfig` answers Disabled,
+/// `disabled_state()` is `Some(Elsewhere)` and the GUI's status for a service
+/// that is being removed is `Disabled(Elsewhere)`; if it refuses, the status
+/// is `Installed`.
+///
+/// The status is `hole::setup::bridge_install_status_with` over exactly the
+/// three probes printed here: not installed, then running, then
+/// `disabled_state()`. It is in the `hole` crate, which this test binary
+/// cannot depend on. Asserts nothing about the answer; the line to read is
+/// `MARKED ANSWER`.
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_probe_marked_service_start_type_read() {
+    let _record = RecordCleanup;
+    let _service = ProvisionedService::install(helper());
+    clear_record();
+    set_start_type(ServiceStartType::Disabled);
+    let holder = super::open_to_delete();
+    super::mark_for_deletion(&holder);
+
+    let read = describe_start_type_read();
+    eprintln!(
+        "MARKED ANSWER: {read}. is_installed: {}. is_running: {}. disabled_state(): {:?}. disabled_by(): {:?}.",
+        os::is_installed(),
+        os::is_running(),
+        os::disabled_state(),
+        os::disabled_by().map_err(|e| e.to_string()),
+    );
+    drop(holder);
+}
+
 // What an unprivileged reader can read ================================================================================
 
 /// The well-known groups a standard interactive user's token holds, as SDDL
