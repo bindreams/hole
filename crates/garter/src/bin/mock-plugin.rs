@@ -210,6 +210,49 @@ async fn run_hygiene_grandchild(
     Ok(())
 }
 
+/// Spawn the long-lived grandchild `MOCK_PLUGIN_SPAWN_GRANDCHILD` asks for: it inherits our stdio.
+/// With `await_up`, returns only once the grandchild has dialed `callback_addr` and holds that
+/// connection, so a caller that exits next leaves a live descendant behind.
+fn spawn_inheriting_grandchild(
+    callback_addr: &std::ffi::OsStr,
+    await_up: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env("MOCK_PLUGIN_SLEEP", "1")
+        .env("MOCK_PLUGIN_GRANDCHILD_CALLBACK", callback_addr)
+        .env_remove("MOCK_PLUGIN_SPAWN_GRANDCHILD");
+    // The grandchild reports "up" on this listener after it dialed the callback.
+    let up = if await_up {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        cmd.env("MOCK_PLUGIN_GRANDCHILD_UP", listener.local_addr()?.to_string());
+        Some(listener)
+    } else {
+        None
+    };
+    // Mimic how garter spawns a NESTED plugin (galoshes→ex-ray) so this
+    // grandchild is reaped only by the root's process-tree kill, never by the
+    // parent's graceful stop:
+    //  - Windows: give it its OWN console group (CREATE_NEW_PROCESS_GROUP,
+    //    exactly as garter spawns every plugin) so graceful_stop's CTRL_BREAK
+    //    to the parent's group can't reach it; it still joins the root's job
+    //    object by handle inheritance and is reaped that way.
+    //  - Unix: do NOT setpgid — inherit the parent's process group like a
+    //    nested ex-ray, so the root's kill(-pgid) reaps it. graceful_stop's
+    //    SIGTERM is PID-targeted, so it can't reach the grandchild anyway.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    let _grandchild = cmd.spawn()?;
+    if let Some(listener) = up {
+        listener.accept()?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Knob: MOCK_PLUGIN_SLEEP — "grandchild" mode (a garter process-tree-reaping
@@ -242,6 +285,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => None,
         };
+        if let Some(addr) = std::env::var_os("MOCK_PLUGIN_GRANDCHILD_UP") {
+            let addr = addr.to_str().expect("MOCK_PLUGIN_GRANDCHILD_UP is valid utf-8");
+            TcpStream::connect(addr).await.expect("grandchild reports up");
+        }
         std::future::pending::<()>().await;
     }
 
@@ -348,6 +395,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fault-injection knob: MOCK_PLUGIN_FAIL=fatal | bind_conflict | bind_conflict_once
     let fail = std::env::var("MOCK_PLUGIN_FAIL").unwrap_or_default();
+    // Combined with a fault knob, the grandchild is spawned BEFORE the fault is emitted, so a plugin
+    // that dies with a typed failure leaves a descendant holding its stdout/stderr pipes.
+    if !fail.is_empty() {
+        if let Some(callback_addr) = std::env::var_os("MOCK_PLUGIN_SPAWN_GRANDCHILD") {
+            spawn_inheriting_grandchild(&callback_addr, true)?;
+        }
+    }
     if fail == "fatal" {
         emit(
             &SitrepEvent::Fatal {
@@ -423,28 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is not kill-on-drop, so letting it drop leaves the process running for the
     // test.
     if let Some(callback_addr) = std::env::var_os("MOCK_PLUGIN_SPAWN_GRANDCHILD") {
-        let exe = std::env::current_exe()?;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.env("MOCK_PLUGIN_SLEEP", "1")
-            .env("MOCK_PLUGIN_GRANDCHILD_CALLBACK", &callback_addr)
-            .env_remove("MOCK_PLUGIN_SPAWN_GRANDCHILD");
-        // Mimic how garter spawns a NESTED plugin (galoshes→ex-ray) so this
-        // grandchild is reaped only by the root's process-tree kill, never by the
-        // parent's graceful stop:
-        //  - Windows: give it its OWN console group (CREATE_NEW_PROCESS_GROUP,
-        //    exactly as garter spawns every plugin) so graceful_stop's CTRL_BREAK
-        //    to the parent's group can't reach it; it still joins the root's job
-        //    object by handle inheritance and is reaped that way.
-        //  - Unix: do NOT setpgid — inherit the parent's process group like a
-        //    nested ex-ray, so the root's kill(-pgid) reaps it. graceful_stop's
-        //    SIGTERM is PID-targeted, so it can't reach the grandchild anyway.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-        }
-        let _grandchild = cmd.spawn()?;
+        spawn_inheriting_grandchild(&callback_addr, false)?;
     }
 
     loop {

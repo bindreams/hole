@@ -1057,3 +1057,28 @@ async fn aggregator_drops_ready_tx_when_shutdown_preempts_a_closed_receiver() {
         "a sender dropped unsent must not become a synthesized Fatal in this arm"
     );
 }
+
+// poll_ready ==========================================================================================================
+
+#[skuld::test]
+async fn poll_ready_returns_the_address_once_it_accepts() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let ready = crate::chain::poll_ready(addr, CancellationToken::new()).await;
+
+    assert_eq!(ready, Some(addr));
+}
+
+#[skuld::test]
+async fn poll_ready_gives_up_on_shutdown_while_the_address_refuses() {
+    // A freed port refuses until something else takes it; shutdown must end the poll either way.
+    let freed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    assert_eq!(crate::chain::poll_ready(freed, shutdown).await, None);
+}
