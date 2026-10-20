@@ -21,11 +21,13 @@ use crate::service_stop::{self, StopPhase, StopProgress};
 #[path = "windows/retire_session.rs"]
 mod retire_session;
 pub use retire_session::RetireSession;
+#[path = "windows/registration.rs"]
+pub mod registration;
 #[path = "windows/service_processes.rs"]
 mod service_processes;
 #[path = "windows/service_sid.rs"]
 mod service_sid;
-pub use service_sid::{apply_service_sid, ensure_own_service_sid, ServiceSid, SidRepair, SidRepairOutcome};
+pub use service_sid::{ServiceSid, SidRepair, SidRepairOutcome};
 
 // Constants ===========================================================================================================
 
@@ -227,7 +229,13 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             })
         })?;
         info!("Windows service started");
-        // DNS recovery runs first; see crate::dns::recovery docs for ordering.
+        // First, so a bridge that is stopped or wedged in a later step has still
+        // made them. A failure never stops this start (see `run_startup_repairs`).
+        if let Err(e) = tokio::task::spawn_blocking(registration::run_startup_repairs).await {
+            warn!(error = %e, "startup repairs task panicked");
+        }
+        // DNS recovery runs first of the state recoveries; see crate::dns::recovery
+        // docs for ordering.
         let state_dir_for_dns = state_dir.clone();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir_for_dns)).await
@@ -273,18 +281,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // (it fails while an old process still maps the renamed inode).
         if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
             tracing::warn!(error = %e, "old-binary sweep task panicked");
-        }
-
-        // The service SID type, which only `bridge install` sets: a host updated
-        // in-app never got it. Applied at the service's next start, and the
-        // SID only gates the uninstaller's wait, so a failure never stops this start.
-        match tokio::task::spawn_blocking(ensure_own_service_sid).await {
-            Ok(Ok(SidRepairOutcome::Applied)) => {
-                info!("set the service SID type; the next start of the service carries it")
-            }
-            Ok(Ok(SidRepairOutcome::AlreadySet)) => {}
-            Ok(Err(e)) => warn!(error = %e, "could not set the service SID type"),
-            Err(e) => warn!(error = %e, "service SID type task panicked"),
         }
 
         // Capture WFP + NDIS state after recovery; see
@@ -529,13 +525,10 @@ pub fn install(binary_path: &Path) -> std::io::Result<()> {
         .create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
         .map_err(|e| scm_failure(ScmCall::CreateService, e))?;
 
-    service
-        .set_description(SERVICE_DESCRIPTION)
-        .map_err(|e| scm_failure(ScmCall::ChangeServiceConfig2, e))?;
-    // The service SID is what lets an uninstall tell the service's process from
-    // a stranger that reuses its id (`ProcessHolds::hold_current`), so its
-    // failure fails the install like the description's does.
-    apply_service_sid(&service)?;
+    // The description and the service SID type (what lets an uninstall tell the
+    // service's process from a stranger that reuses its id) are required: their
+    // failure fails the install.
+    registration::configure_new_service(&service)?;
     // Auto-restart is hardening, applied on the just-created handle (no re-open,
     // which can race SCM propagation right after create_service). Best-effort: the
     // service is installed regardless — failing the whole install (an MSI custom

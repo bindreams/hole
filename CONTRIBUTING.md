@@ -1933,13 +1933,17 @@ down a rollback (bindreams/hole#1099). Three rules close it:
   SERVICE_STOPPED state, it is never valid." START_PENDING and STOP_PENDING are
   states the stop wait and the drain act on, so no state makes the id safe to
   trust. `hole bridge install` therefore gives the service a service SID
-  (`ChangeServiceConfig2`, `SERVICE_CONFIG_SERVICE_SID_INFO`,
+  (`registration::configure_new_service`, which the privileged tests' service
+  fixture also calls; `ChangeServiceConfig2`, `SERVICE_CONFIG_SERVICE_SID_INFO`,
   `SERVICE_SID_TYPE_UNRESTRICTED`), which the SCM puts as `NT SERVICE\HoleBridge`
   into the token of every process it starts as the service; the children such a
   process spawns (ex-ray, galoshes, `SystemTool` children) inherit the token and
   carry it too. An in-app update (cutover) is run by the old release's code, which
   never sets the type, so the `--service` bridge also makes sure of it at
-  startup (`ensure_own_service_sid`): it reads its own service's type and writes
+  startup (`registration::run_startup_repairs`, called first in `run_service` once
+  it reports Running, before any recovery, reconcile or sweep that could wedge or
+  be stopped; `ensure_own_service_sid` is its one repair): it reads its own
+  service's type and writes
   `SERVICE_SID_TYPE_UNRESTRICTED` only when that differs, so an ordinary start
   writes nothing. A failure is a warning and the start goes on, since the SID
   gates only the uninstaller's wait and a bridge that would not start for it

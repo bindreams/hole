@@ -28,10 +28,11 @@
 //!   line, so a test can tell afterwards whether any process the service ran is
 //!   still alive.
 //! - `--sid-repair-log <path>`: before reporting RUNNING, run the bridge's own
-//!   startup repair of the service's SID type (`platform::os::ensure_own_service_sid`)
-//!   and append its outcome (`Applied`, `AlreadySet`, or `Failed: <cause>`) to
-//!   `<path>`, one line per start. Without the flag the helper never touches
-//!   the SID type, so the tests that need a service without one keep it.
+//!   startup repairs (`platform::os::registration::run_startup_repairs`, the
+//!   function `run_service` calls) and append the SID type repair's outcome
+//!   (`Applied`, `AlreadySet`, or `Failed: <cause>`) to `<path>`, one line per
+//!   start. Without the flag the helper never touches the SID type, so the
+//!   tests that need a service without one keep it.
 //! - `--parked-event <event>`: signalled once the process is parked by one of
 //!   the two flags above, so a test can tell the hold is in force without
 //!   guessing at timing.
@@ -202,7 +203,7 @@ fn service_main(_arguments: Vec<OsString>) {
         return;
     };
     if let Some(path) = &args.sid_repair_log {
-        let line = match hole_bridge::platform::os::ensure_own_service_sid() {
+        let line = match hole_bridge::platform::os::registration::run_startup_repairs().service_sid {
             Ok(outcome) => format!("{outcome:?}"),
             Err(e) => format!("Failed: {e}"),
         };

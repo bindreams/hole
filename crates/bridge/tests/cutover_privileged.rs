@@ -223,8 +223,9 @@ impl ProvisionedService {
         Self::create(helper, launch_arguments, None, false)
     }
 
-    /// The service as `install` registers it, with the service SID (what
-    /// `hole bridge install` sets) unless `with_sid` is false.
+    /// The service as `install` registers it, with the configuration `install`
+    /// requires (`registration::configure_new_service`: the description and the
+    /// service SID type) unless `with_sid` is false.
     fn create(
         helper: &std::path::Path,
         launch_arguments: Vec<std::ffi::OsString>,
@@ -270,7 +271,9 @@ impl ProvisionedService {
             )
             .expect("create the throwaway HoleBridge service");
         if with_sid {
-            hole_bridge::platform::os::apply_service_sid(&service).expect("give the throwaway service a service SID");
+            // The steps `install` takes, so the fixture cannot drift from them.
+            hole_bridge::platform::os::registration::configure_new_service(&service)
+                .expect("configure the throwaway service as install does");
         }
         if let Some(delay) = restart_after {
             service
@@ -1804,9 +1807,10 @@ fn sc_qsidtype() -> String {
 /// A bridge service that was registered without the service SID type (what an
 /// in-app update leaves behind) gets it when it starts, and a later start finds
 /// it set and writes nothing. `test_service --sid-repair-log` runs the bridge's
-/// own `ensure_own_service_sid` before reporting RUNNING and logs what it did,
-/// so the config is read once the start has returned, and the second start's
-/// outcome says whether it wrote.
+/// own `registration::run_startup_repairs`, the function `run_service` calls
+/// (a unit test pins that call and its place), before reporting RUNNING and
+/// logs what it did, so the config is read once the start has returned, and the
+/// second start's outcome says whether it wrote.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_service_without_the_sid_type_gets_it_at_startup() {
@@ -1836,6 +1840,21 @@ fn cutover_global_net_state_service_without_the_sid_type_gets_it_at_startup() {
         ["Applied", "AlreadySet"],
         "the first start writes the SID type and the second finds it set"
     );
+}
+
+/// `hole bridge install` gives the service the SID type, through the real
+/// `install` on a throwaway binary path (the service is never started). A
+/// service without it makes the uninstaller skip the wait for the service's
+/// process, and nothing else in the suite fails for that.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_install_gives_the_service_its_sid_type() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    ProvisionedService::require_no_leftover();
+    // Deleted on drop, whatever `install` got done before it failed.
+    let _service = ProvisionedService;
+    hole_bridge::platform::os::install(helper).expect("install the service");
+    assert_eq!(sc_qsidtype(), "UNRESTRICTED");
 }
 
 /// A process that is not the service: this test's own.
