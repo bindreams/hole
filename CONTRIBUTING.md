@@ -2124,7 +2124,7 @@ match each** (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
   writes the state dir. None ever blocks an uninstall, an install, a cutover or
   a connect: a record that could block them is the lockout this design removes,
   and the MSI goes on to remove files under a running service when the uninstall
-  fails. The write that follows replaces one that cannot be read.
+  fails. The clear moves one that cannot be read aside.
 - **Disclosed residual.** There is no lock between retirements. Two uninstalls
   that overlap (a CLI run during an MSI action) can have one clear the record
   while the other still has the service disabled, and a kill then leaves a

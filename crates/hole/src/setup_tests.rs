@@ -752,7 +752,7 @@ fn a_service_an_interrupted_uninstall_disabled_is_registered_automatic_and_start
 }
 
 #[skuld::test]
-fn a_start_type_that_cannot_be_read_fails_the_install_before_anything_changes() {
+fn a_start_type_that_cannot_be_read_fails_the_install_before_the_service_changes() {
     let (result, steps) = install_probe(InstallScript {
         disabled_by: Err(std::io::Error::other("injected")),
         installed: true,

@@ -11,8 +11,8 @@
 //! The file is a [`Role::Decision`]: a hint about wording and about whether to
 //! repair without asking. A record that is corrupt, newer, or fails to read
 //! with an I/O error still counts as present, because only a Hole release
-//! writes the state directory, and never blocks a write, a clear, an
-//! uninstall or a connect: it is backed up and replaced or removed.
+//! writes the state directory, and never blocks an uninstall, an install, a
+//! cutover or a connect. [`clear`] moves one that cannot be read aside.
 //!
 //! Neither [`write`] nor [`clear`] takes a lock. Two overlapping retirements
 //! can clear a record the other still needs; the service then reads as an
@@ -22,7 +22,6 @@ use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 use util::versioned_file::{
     DefaultPlacement, Loaded, Obsolete, Removal, Role, Schema, StoreError, VersionedFile, VersionedState,
 };
@@ -58,14 +57,11 @@ impl RecordState {
     /// is there but cannot be interpreted or read is present, so reading it as
     /// absent never words a service the uninstall disabled as an
     /// administrator's, and a record that cannot be read never fails a path
-    /// that must go on (the write that follows replaces it).
+    /// that must go on. The read has already logged why.
     pub fn of(loaded: Loaded<DisableRecord>) -> RecordState {
         match loaded {
             Loaded::Absent => RecordState::Absent,
-            Loaded::Unreadable(error) => {
-                warn!(%error, "the record that an uninstall disabled the service could not be read; counting it as present");
-                RecordState::Present
-            }
+            Loaded::Unreadable(_) => RecordState::Present,
             Loaded::Corrupt { .. } => RecordState::Present,
             Loaded::Obsolete { .. } => RecordState::Present,
             Loaded::Newer { .. } => RecordState::Present,

@@ -70,7 +70,7 @@ fn a_corrupt_or_newer_record_reads_present() {
 
 /// A directory at the file's path fails the read with an OS error. Like a file
 /// that cannot be interpreted, it is the record's place and counts as present,
-/// so no elevated path fails on it: the write that follows replaces it.
+/// so no elevated path fails on it.
 #[skuld::test]
 fn a_read_that_fails_with_an_io_error_reads_present() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -404,8 +404,8 @@ impl Drop for ProvisionedService {
 /// The Windows cutover's SCM stop/start must gate strictly on real STOPPED then
 /// RUNNING callbacks from `NotifyServiceStatusChange` — never a loopback probe.
 /// This drives the actual production seam (`WindowsCutoverOs::stop_service_wait_stopped`
-/// then `start_service_wait_running`, each opening its own `SystemScmActor` exactly
-/// as the cutover child does) against a SELF-PROVISIONED throwaway service (the
+/// over a `StopSession`, then `start_service_wait_running` over a `SystemScmActor`,
+/// exactly as the cutover child does) against a SELF-PROVISIONED throwaway service (the
 /// `test_service` helper). The arm-before-start ORDERING is unit-proven
 /// separately against a fake `ScmActor`; this is the real-service integration
 /// half, NOT a full-bridge cutover e2e (no `images`, so the swap never runs).
