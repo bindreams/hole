@@ -277,7 +277,7 @@ slow-timeout = { period = "20s", terminate-after = 2 }
 #
 # COUPLED NAME, same caveat as the groups above: a bare function name.
 [[profile.default.overrides]]
-filter = 'test(/^dropping_a_reaped_roots_handle_does_not_signal_its_process_group$/)'
+filter = 'test(/^(dropping_a_reaped_roots_handle_does_not_signal_its_process_group|an_exited_root_is_reported_as_exited_when_a_shutdown_request_is_already_pending|a_running_root_is_shut_down_when_a_shutdown_request_is_already_pending)$/)'
 slow-timeout = { period = "20s", terminate-after = 2 }
 
 # See `drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed`'s

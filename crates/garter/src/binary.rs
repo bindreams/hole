@@ -591,19 +591,19 @@ fn exit_edge_proves_the_tree_gone(containment: Containment) -> bool {
     }
 }
 
-/// Whether `kill_tree` signals a process group id, which the OS may recycle onto an unrelated group
-/// once the root is reaped. cosca's `ProcessGroup` and `Session` are `killpg`, and a macOS `FdMarker`
-/// also fires `killpg` on its pgid. A mechanism cosca adds later is assumed to, until named here.
-/// The `FdMarker` arm holds only because cosca reports `TreeWalk`, not `FdMarker`, for a marker with
-/// no pgid.
-fn kill_tree_targets_recyclable_pgid(containment: Containment) -> bool {
+/// Whether `kill_tree` finds the tree through an id the root's reap releases, so that after the
+/// reap the OS may have recycled it onto an unrelated process. cosca's `ProcessGroup` and `Session`
+/// are `killpg` of the root's pgid, a macOS `FdMarker` fires `killpg` on its pgid, and `TreeWalk`
+/// enumerates descendants from the root's pid. A mechanism cosca adds later is assumed to, until
+/// named here. A kernel container (`CgroupV2`, `JobObject`) is its own object and outlives the reap.
+fn kill_tree_addresses_a_releasable_id(containment: Containment) -> bool {
     match containment {
         Containment::CgroupV2 => false,
         Containment::JobObject => false,
         Containment::ProcessGroup => true,
         Containment::Session => true,
         Containment::FdMarker => true,
-        Containment::TreeWalk => false,
+        Containment::TreeWalk => true,
         Containment::Delegated => false,
         Containment::None => false,
         _ => true,
@@ -683,7 +683,7 @@ impl PluginTree for cosca::tokio::Child {
     /// job object's kill-on-close, so it is applied only where the drop's kill would be that `killpg`.
     /// A tree kill that failed before the reap is therefore not retried by the drop.
     fn disarm(&mut self) {
-        if kill_tree_targets_recyclable_pgid(self.containment()) {
+        if kill_tree_addresses_a_releasable_id(self.containment()) {
             self.detach();
         }
     }
@@ -819,7 +819,7 @@ async fn end_reaped_plugin(
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
 ) {
-    if kill_tree_targets_recyclable_pgid(tree.containment()) {
+    if kill_tree_addresses_a_releasable_id(tree.containment()) {
         tracing::debug!(
             plugin = %plugin,
             "not killing the plugin's process tree: its root is reaped and the process group id the kill names may be recycled"

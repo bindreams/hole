@@ -1245,15 +1245,16 @@ async fn a_refused_root_kill_that_leaves_the_root_alive_is_returned_without_reap
 // profile). Without it the root is reaped first, which frees its pid, so a tree kill that signals a
 // process group id could hit an unrelated group that was handed the recycled id.
 
-/// Every containment, each paired with whether `kill_tree` signals a process group id (cosca:
-/// `ProcessGroup` and `Session` are `killpg`; a macOS `FdMarker` also fires `killpg` on its pgid).
+/// Every containment, each paired with whether `kill_tree` finds the tree through an id the root's
+/// reap releases (cosca: `ProcessGroup` and `Session` are `killpg`; a macOS `FdMarker` also fires
+/// `killpg` on its pgid; `TreeWalk` enumerates descendants from the root's pid).
 const KILLS_BY_PGID: [(Containment, bool); 8] = [
     (Containment::CgroupV2, false),
     (Containment::JobObject, false),
     (Containment::ProcessGroup, true),
     (Containment::Session, true),
     (Containment::FdMarker, true),
-    (Containment::TreeWalk, false),
+    (Containment::TreeWalk, true),
     (Containment::Delegated, false),
     (Containment::None, false),
 ];
