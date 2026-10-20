@@ -1,8 +1,10 @@
 //! Every version `prek.toml` pins, the `rev` of each hook repository and each exact
 //! `additional_dependencies` entry, is one a `regex` custom manager in `.github/renovate.json`
 //! extracts, with a datasource this file knows. A pin no manager sees never moves, and a bumped `rev`
-//! beside it changes nothing about the tool that runs. Top-level settings that turn a manager off on purpose
-//! (`enabled`, `ignorePaths`, `packageRules`) are not checked here.
+//! beside it changes nothing about the tool that runs. A prek manager may use only the keys, the
+//! file pattern and the capture groups checked here; anything else fails. Top-level settings that
+//! turn a manager off on purpose (`enabled`, `enabledManagers`, `ignorePaths`, `packageRules`) are
+//! not checked.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -42,10 +44,28 @@ fn extracted(renovate: &serde_json::Value, prek_text: &str) -> BTreeSet<(String,
             unmodelled.is_empty(),
             "a manager over prek.toml may use only {PREK_MANAGER_KEYS:?}, not {unmodelled:?}; update this guard to change that"
         );
-        let datasource_template = manager["datasourceTemplate"].as_str();
+        let datasource_template = match &manager["datasourceTemplate"] {
+            serde_json::Value::Null => None,
+            template => Some(
+                template
+                    .as_str()
+                    .expect("a prek manager's `datasourceTemplate` must be a string"),
+            ),
+        };
         for pattern in manager["matchStrings"].as_array().expect("matchStrings") {
             let pattern = pattern.as_str().expect("matchStrings entry");
             let re = Regex::new(pattern).unwrap_or_else(|e| panic!("`{pattern}` is not a valid regex: {e}"));
+            // Renovate reads other named groups (`packageName`, `registryUrl`, `versioning`, ...) and
+            // they override what is looked up.
+            let unmodelled: Vec<&str> = re
+                .capture_names()
+                .flatten()
+                .filter(|g| !PREK_CAPTURE_GROUPS.contains(g))
+                .collect();
+            assert!(
+                unmodelled.is_empty(),
+                "`{pattern}` may name only the groups {PREK_CAPTURE_GROUPS:?}, not {unmodelled:?}; update this guard to change that"
+            );
             for caps in re.captures_iter(prek_text) {
                 let group = |name| {
                     caps.name(name)
@@ -76,6 +96,9 @@ const PREK_MANAGER_KEYS: &[&str] = &[
     "matchStrings",
     "datasourceTemplate",
 ];
+
+/// The capture groups a prek manager's `matchStrings` may name.
+const PREK_CAPTURE_GROUPS: &[&str] = &["depName", "currentValue", "datasource"];
 
 /// The Renovate datasources prek.toml pins come from.
 const PREK_DATASOURCES: &[&str] = &["github-tags", "npm", "pypi"];
