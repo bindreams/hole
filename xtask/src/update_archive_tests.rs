@@ -20,7 +20,7 @@ fn fake_repo() -> tempfile::TempDir {
     fs::write(wintun.join("wintun.dll"), b"wt").unwrap();
     let exray = root.join(".cache/ex-ray");
     fs::create_dir_all(&exray).unwrap();
-    fs::write(exray.join("ex-ray-x86_64-pc-windows-msvc.exe"), b"exray").unwrap();
+    fs::write(exray.join(crate::ex_ray::output_name()), b"exray").unwrap();
     fs::write(root.join("NOTICES.md"), b"notices").unwrap();
     dir
 }
