@@ -2028,7 +2028,7 @@ assert the latter). The drain assumes only that a handle opened before
 `DeleteService` still answers a state query and carries a Stop; the privileged
 test `..._drain_stops_and_awaits_a_running_service_marked_for_delete` passes
 whatever an arm does there, and
-`..._uninstall_leaves_nothing_whichever_side_of_the_scm_restart_wins` runs the
+`..._uninstall_smoke_whichever_side_of_the_scm_restart_wins` runs the
 timer race itself (restart delay 0, process killed, uninstall at once) five times
 and asserts no row and no process remains.
 

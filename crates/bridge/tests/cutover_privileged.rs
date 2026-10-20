@@ -52,6 +52,9 @@ mod arm_probes;
 #[path = "cutover_privileged/raw_scm.rs"]
 mod raw_scm;
 #[cfg(target_os = "windows")]
+#[path = "cutover_privileged/recording.rs"]
+mod recording;
+#[cfg(target_os = "windows")]
 #[path = "cutover_privileged/restart_probes.rs"]
 mod restart_probes;
 #[cfg(target_os = "windows")]
@@ -1145,7 +1148,7 @@ mod left_behind {
     };
 
     /// The ids the helper logged.
-    fn logged(pid_log: &Path) -> Vec<u32> {
+    pub fn logged(pid_log: &Path) -> Vec<u32> {
         std::fs::read_to_string(pid_log)
             .unwrap_or_default()
             .lines()
@@ -1159,6 +1162,16 @@ mod left_behind {
             .into_iter()
             .filter(|pid| is_running_helper(*pid))
             .collect()
+    }
+
+    /// Fails unless the helper logged at least `count` processes, so a test
+    /// that expects a restarted instance knows one ran.
+    pub fn assert_started(pid_log: &Path, count: usize) {
+        let logged = logged(pid_log);
+        assert!(
+            logged.len() >= count,
+            "the helper logged {logged:?}, fewer than the {count} processes the test expects"
+        );
     }
 
     /// Fails unless every process the helper logged has exited. A log that
@@ -2041,107 +2054,45 @@ fn cutover_global_net_state_stop_probe_open_process_synchronize_on_the_service_p
     );
 }
 
-/// A `ServiceSession` over the real one that releases a parked helper on the
-/// first wait and records what each look reported. The code under test finds
-/// out what the helper did after its release from the SCM, not from this
-/// wrapper.
-///
-/// The release comes as the retirement goes to sleep: the service is parked in
-/// START_PENDING by construction, the look that said so is recorded, and the
-/// wait it is about to make is for a state change only the release produces.
-///
-/// Its handles keep a deleted service registered, so a test that waits for the
-/// deletion must not hold it: [`finish`](Self::finish) is the only way to the
-/// recorded reports, and it consumes the session.
+/// The hook that releases a parked helper as the retirement goes to sleep. The
+/// service is parked in START_PENDING by construction, the look that said so is
+/// recorded, and the wait the retirement is about to make is for a state change
+/// only the release produces. What the helper does after its release is found
+/// out by the code under test from the SCM, not from this hook.
 #[cfg(target_os = "windows")]
-struct ReleasingSession<'a> {
-    inner: hole_bridge::platform::os::RetireSession,
-    release: &'a named_event::NamedEvent,
-    released: bool,
-    reports: Vec<hole_bridge::cutover::scm_wait::Observed>,
-}
-
-#[cfg(target_os = "windows")]
-impl<'a> ReleasingSession<'a> {
-    fn open(release: &'a named_event::NamedEvent) -> Self {
-        use hole_bridge::platform::os::{Opening, RetireSession};
-        let inner = match RetireSession::open().expect("open the retire session") {
-            Opening::Opened(session) => session,
-            Opening::Gone(gone) => panic!("the service is registered: {gone:?}"),
-        };
-        Self {
-            inner,
-            release,
-            released: false,
-            reports: vec![],
+fn releasing(release: &named_event::NamedEvent) -> recording::Hook<'_> {
+    let mut released = false;
+    Box::new(move |event| {
+        let is_a_sleep = matches!(
+            event,
+            recording::Event::AwaitCallback | recording::Event::AwaitHeldExits
+        );
+        if is_a_sleep && !released {
+            released = true;
+            release.signal();
         }
-    }
-
-    fn release_once(&mut self) {
-        if !self.released {
-            self.released = true;
-            self.release.signal();
-        }
-    }
-
-    /// Closes the session's SCM handles and returns the state each look reported.
-    fn finish(self) -> Vec<hole_bridge::cutover::scm_wait::Observed> {
-        self.reports
-    }
+    })
 }
 
+/// Retires the registered service through the production `retire`, over a
+/// session that records each act, and returns the record. The session's
+/// handles are closed first: they keep a deleted service registered, and a
+/// test that waits for the deletion must not hold it.
 #[cfg(target_os = "windows")]
-impl hole_bridge::cutover::scm_wait::settle::StopActor for ReleasingSession<'_> {
-    fn observe(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::Look> {
-        let look = self.inner.observe()?;
-        self.reports.push(look.observed);
-        Ok(look)
-    }
-    fn arm_leaving(&mut self, from: hole_bridge::cutover::scm_wait::Observed) -> std::io::Result<()> {
-        self.inner.arm_leaving(from)
-    }
-    fn control_stop(&mut self) -> std::io::Result<()> {
-        self.inner.control_stop()
-    }
-    fn await_callback(&mut self, kind: hole_bridge::cutover::scm_wait::settle::WaitKind) -> std::io::Result<()> {
-        self.release_once();
-        self.inner.await_callback(kind)
-    }
-    fn await_held_exits(&mut self, kind: hole_bridge::cutover::scm_wait::settle::WaitKind) -> std::io::Result<()> {
-        self.release_once();
-        self.inner.await_held_exits(kind)
-    }
-    fn hold_scanned(&mut self) -> std::io::Result<()> {
-        self.inner.hold_scanned()
-    }
+fn deregister_recorded(hook: recording::Hook<'_>) -> recording::Trace {
+    use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
+
+    let mut session = recording::open_retire_session(hook);
+    retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
+    session.finish()
 }
 
-#[cfg(target_os = "windows")]
-impl hole_bridge::cutover::scm_wait::retire::ServiceSession for ReleasingSession<'_> {
-    fn start_type(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::retire::StartType> {
-        self.inner.start_type()
-    }
-    fn set_start_type(&mut self, to: hole_bridge::cutover::scm_wait::retire::StartWrite) -> std::io::Result<()> {
-        self.inner.set_start_type(to)
-    }
-    fn set_failure_actions(
-        &mut self,
-        actions: hole_bridge::cutover::scm_wait::retire::FailureActions,
-    ) -> std::io::Result<()> {
-        self.inner.set_failure_actions(actions)
-    }
-    fn delete(&mut self) -> std::io::Result<()> {
-        self.inner.delete()
-    }
-}
-
-/// Retires a service parked in START_PENDING by `flag`, through the production
-/// `retire`, and checks it ends up deregistered. The first look must be the
-/// parked START_PENDING (the case a blind Stop used to be sent into), and the
-/// Stop must have come only after a later RUNNING.
+/// Retires a service parked in START_PENDING by `flag`, and checks it ends up
+/// deregistered. The first look must be the parked START_PENDING (the case a
+/// blind Stop used to be sent into), and the Stop must have come only after a
+/// later RUNNING, with the start type already disabled.
 #[cfg(target_os = "windows")]
 fn retire_a_parked_service(flag: &str) {
-    use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
     use hole_bridge::cutover::scm_wait::Observed;
     use hole_bridge::platform::os::SERVICE_NAME;
 
@@ -2162,21 +2113,22 @@ fn retire_a_parked_service(flag: &str) {
     let starter = start_in_background();
     parked.wait();
 
-    let mut session = ReleasingSession::open(&release);
-    retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
-    let reports = session.finish();
+    let trace = deregister_recorded(releasing(&release));
 
     starter.join().unwrap().expect("the held service starts once released");
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    let observed = trace.observed();
     assert_eq!(
-        reports.first(),
+        observed.first(),
         Some(&Observed::StartPending),
-        "the first look is the parked state: {reports:?}"
+        "the first look is the parked state: {observed:?}"
     );
     assert!(
-        reports.contains(&Observed::Running),
-        "the held service ran before it was stopped: {reports:?}"
+        observed.contains(&Observed::Running),
+        "the held service ran before it was stopped: {observed:?}"
     );
+    assert!(trace.stops() > 0, "the service that ran needed a Stop: {trace:#?}");
+    trace.assert_the_order_of_a_deregistration();
 }
 
 #[cfg(target_os = "windows")]
@@ -2191,29 +2143,28 @@ fn cutover_global_net_state_uninstall_waits_out_a_service_not_yet_attached() {
     retire_a_parked_service("--delay-attach");
 }
 
-/// The #1099 shape: the SCM restarts a killed service (the restart delay is
-/// configuration; the test blocks on the helper's parked event) and the
-/// retirement lands on the restarted, START_PENDING instance.
+/// The SCM restarts a killed service (the restart delay is configuration; the
+/// test blocks on the helper's parked event) and the retirement lands on the
+/// restarted, START_PENDING instance. Neither instance's process may be left.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_lands_on_the_instance_the_scm_just_restarted() {
-    use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
     use hole_bridge::cutover::scm_wait::Observed;
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
     let parked = named_event::NamedEvent::create("RestartParked");
     let release = named_event::NamedEvent::create("RestartRelease");
-    let _service = ProvisionedService::install_with(
-        helper,
-        vec![
-            "--hold-start".into(),
-            release.name().into(),
-            "--parked-event".into(),
-            parked.name().into(),
-        ],
-        Some(std::time::Duration::from_secs(1)),
-    );
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--hold-start".into(),
+        release.name().into(),
+        "--parked-event".into(),
+        parked.name().into(),
+    ];
+    args.extend(pid_log_args(&pid_log));
+    let _service = ProvisionedService::install_with(helper, args, Some(std::time::Duration::from_secs(1)));
     let _release_on_drop = release.release_on_drop();
 
     // First instance: let it start, then kill it.
@@ -2229,22 +2180,30 @@ fn cutover_global_net_state_uninstall_lands_on_the_instance_the_scm_just_restart
     // The SCM restarts it; the new instance parks in START_PENDING.
     parked.wait();
 
-    let mut session = ReleasingSession::open(&release);
-    retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
-    let reports = session.finish();
+    let trace = deregister_recorded(releasing(&release));
+    left_behind::assert_started(&pid_log, 2);
+    left_behind::assert_none(&pid_log);
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    let observed = trace.observed();
     assert_eq!(
-        reports.first(),
+        observed.first(),
         Some(&Observed::StartPending),
-        "the first look is the restarted instance's START_PENDING: {reports:?}"
+        "the first look is the restarted instance's START_PENDING: {observed:?}"
     );
+    assert!(trace.stops() > 0, "the restarted instance needed a Stop: {trace:#?}");
+    trace.assert_the_order_of_a_deregistration();
 }
 
-/// A killed service reads STOPPED while its restart is pending. The production
-/// `uninstall` returns once it is deregistered.
+/// A killed service reads STOPPED while its restart is pending (an hour away,
+/// so the state holds for the whole test). The retirement finds that state,
+/// sends no Stop, and leaves no row and no process. This observes the state;
+/// that the restart is suppressed is asserted through the start type every
+/// retirement's record carries, not by waiting for an instance that must not
+/// appear.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_deregisters_a_killed_service_with_a_restart_pending() {
+    use hole_bridge::cutover::scm_wait::Observed;
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
@@ -2263,9 +2222,210 @@ fn cutover_global_net_state_uninstall_deregisters_a_killed_service_with_a_restar
     scm_probe::kill_service_process();
     wait_until_stopped();
 
-    hole_bridge::platform::os::uninstall().expect("uninstall a stopped service with a restart pending");
+    let trace = deregister_recorded(Box::new(|_| {}));
     left_behind::assert_none(&pid_log);
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    assert_eq!(
+        trace.observed().first(),
+        Some(&Observed::Stopped),
+        "the first look is the killed service's STOPPED: {trace:#?}"
+    );
+    assert_eq!(trace.stops(), 0, "a stopped service takes no Stop: {trace:#?}");
+    trace.assert_the_order_of_a_deregistration();
+}
+
+/// The other side of the race the five-round smoke test below draws at random,
+/// taken deterministically: the SCM has already restarted the killed service
+/// (no delay) and the replacement is RUNNING when the retirement begins. The
+/// retirement stops the second instance, and neither process is left.
+///
+/// The replacement's RUNNING is read from the helper's event, which it signals
+/// once per start. The first instance's own signal is consumed before the
+/// reset, so it cannot be mistaken for the replacement's.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_stops_the_instance_the_scm_restarted_while_running() {
+    use hole_bridge::cutover::scm_wait::Observed;
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let running = named_event::NamedEvent::create("ReplacementRunning");
+    let mut args = pid_log_args(&pid_log);
+    args.extend(["--running-event".into(), running.name().into()]);
+    let _service = ProvisionedService::install_with(helper, args, Some(std::time::Duration::ZERO));
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    running.wait();
+    running.reset();
+    scm_probe::kill_service_process();
+    running.wait();
+
+    let trace = deregister_recorded(Box::new(|_| {}));
+    left_behind::assert_started(&pid_log, 2);
+    left_behind::assert_none(&pid_log);
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    assert_eq!(
+        trace.observed().first(),
+        Some(&Observed::Running),
+        "the first look is the replacement's RUNNING: {trace:#?}"
+    );
+    assert!(trace.stops() > 0, "the replacement needed a Stop: {trace:#?}");
+    trace.assert_the_order_of_a_deregistration();
+}
+
+/// Who stops the service whose process then outlives STOPPED.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum StoppedBy {
+    /// The retirement's own Stop, sent into a RUNNING service whose process it
+    /// holds, so it waits on that process.
+    TheRetirement,
+    /// The test, before the retirement begins: the first look is already
+    /// STOPPED, which names no process, so only the scan for the service's
+    /// token can find the one that is left.
+    TheTest,
+}
+
+/// A service process that outlives the STOPPED the SCM reports for it. The
+/// helper reports STOPPED on the Stop, then parks until the test signals; the
+/// uninstall must still be waiting on that process when the test looks.
+///
+/// The retirement runs on a thread over a recording session that sends
+/// `Reached` as it begins to wait on the held process and `Returned` when the
+/// retirement ends, both on one channel. The first message must be `Reached`,
+/// with the helper alive; only then does the test let the process exit, so a
+/// retirement that returns first never waited. There is no timing: the thread's
+/// next message is whatever the retirement does next.
+#[cfg(target_os = "windows")]
+fn uninstall_waits_out_a_process_that_outlives_stopped(stopped_by: StoppedBy) {
+    use hole_bridge::cutover::scm_wait::retire::{retire, Disposition, RetireError};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    #[derive(Debug)]
+    enum Message {
+        /// The retirement began to wait on a held process; the helper
+        /// processes alive at that moment.
+        Reached(Vec<u32>),
+        Returned(Result<(), RetireError>),
+    }
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let parked = named_event::NamedEvent::create("OutlivesParked");
+    let exit = named_event::NamedEvent::create("OutlivesExit");
+    let mut args = pid_log_args(&pid_log);
+    args.extend([
+        "--outlive-stopped".into(),
+        exit.name().into(),
+        "--parked-event".into(),
+        parked.name().into(),
+    ]);
+    let _service = ProvisionedService::install_with_args(helper, args);
+    let _exit_on_drop = exit.release_on_drop();
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    let service_pids = left_behind::logged(&pid_log);
+    assert_eq!(service_pids.len(), 1, "one service process so far: {service_pids:?}");
+
+    if let StoppedBy::TheTest = stopped_by {
+        scm_probe::Probe::open().stop().expect("the test stops the service");
+        // The helper parks only after reporting STOPPED, so the retirement's
+        // first look finds a stopped service whose process is still alive.
+        parked.wait();
+    }
+
+    let (messages, inbox) = std::sync::mpsc::channel();
+    let thread_pid_log = pid_log.clone();
+    let retirement = std::thread::spawn(move || {
+        let reached = messages.clone();
+        let hook: recording::Hook<'_> = Box::new(move |event| {
+            if matches!(event, recording::Event::AwaitHeldExits) {
+                let _ = reached.send(Message::Reached(left_behind::still_running(&thread_pid_log)));
+            }
+        });
+        let mut session = recording::open_retire_session(hook);
+        let result = retire(&mut session, Disposition::Deregister);
+        let trace = session.finish();
+        let _ = messages.send(Message::Returned(result));
+        trace
+    });
+
+    parked.wait();
+    match inbox.recv().expect("the retirement ended without a message") {
+        Message::Reached(alive) => {
+            assert_eq!(
+                alive, service_pids,
+                "the process waited on is the helper's, and it is alive"
+            )
+        }
+        returned @ Message::Returned(_) => panic!(
+            "the uninstall returned while the service process was still alive, \
+             without waiting on it: {returned:?}"
+        ),
+    }
+    exit.signal();
+    let mut waits = 1;
+    let result = loop {
+        match inbox.recv().expect("the retirement ended without returning") {
+            Message::Reached(_) => waits += 1,
+            Message::Returned(result) => break result,
+        }
+    };
+    result.expect("the uninstall succeeds once the process exits");
+    assert_eq!(waits, 1, "one wait on the held process, not a loop that spins");
+
+    let trace = retirement.join().expect("the retirement thread");
+    left_behind::assert_none(&pid_log);
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    trace.assert_the_order_of_a_deregistration();
+    match stopped_by {
+        StoppedBy::TheRetirement => assert!(trace.stops() > 0, "the retirement stopped the service: {trace:#?}"),
+        StoppedBy::TheTest => assert_eq!(trace.stops(), 0, "the service was already stopped: {trace:#?}"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_waits_out_a_service_process_that_outlives_its_own_stop() {
+    uninstall_waits_out_a_process_that_outlives_stopped(StoppedBy::TheRetirement);
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_finds_a_service_process_that_outlived_stopped_before_it_began() {
+    uninstall_waits_out_a_process_that_outlives_stopped(StoppedBy::TheTest);
+}
+
+/// A service whose process the retirement cannot hold (one started before the
+/// SID type, so its token has no service SID) has no exit to wait on: the SCM's
+/// report of the Stop is the only event, so the arm for it must come before the
+/// Stop. The record shows the order.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_arms_before_the_stop_of_a_service_it_cannot_hold() {
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install_without_sid(helper);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+
+    let trace = deregister_recorded(Box::new(|_| {}));
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    trace.assert_the_order_of_a_deregistration();
+    trace.assert_every_stop_follows_an_arm();
 }
 
 /// Unchanged behaviour: a RUNNING service is stopped and deregistered.
@@ -2317,20 +2477,20 @@ fn pid_log_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     vec!["--pid-log".into(), path.as_os_str().to_owned()]
 }
 
-/// How many times the race below is run. The race is the SCM's restart timer
-/// against the uninstall; each round is a fresh draw, none is a retry of
-/// another, and every round must pass.
+/// How many times the smoke test below draws the race. Each round is a fresh
+/// draw, none is a retry of another, and every round must pass.
 #[cfg(target_os = "windows")]
 const RACE_ROUNDS: usize = 5;
 
-/// The #1099 race itself: restart-on-failure with no delay, the service
-/// process killed, the uninstall started at once. Whichever side wins each
-/// round (the uninstall lands before the restart, between the stop and the
-/// delete, or after the delete), it must succeed and leave neither a service
-/// row nor a service process.
+/// Smoke test for the race between the SCM's restart timer and the uninstall:
+/// restart-on-failure with no delay, the service process killed, the uninstall
+/// started at once. Which side wins each round is the SCM's to decide and is
+/// not asserted; the two sides the uninstall can land on are each pinned by
+/// their own test above. Whichever way it falls, the uninstall must succeed and
+/// leave neither a service row nor a service process.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_uninstall_leaves_nothing_whichever_side_of_the_scm_restart_wins() {
+fn cutover_global_net_state_uninstall_smoke_whichever_side_of_the_scm_restart_wins() {
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));

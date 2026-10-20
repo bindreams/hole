@@ -222,14 +222,14 @@ success-output = 'immediate-final'
 # budget: the sanctioned "failure bound surfaced to a human" use. A test here
 # takes seconds.
 #
-# The race test runs five rounds, each a fresh service install, kill and uninstall,
+# The race smoke test runs five rounds, each a fresh service install, kill and uninstall,
 # so it gets five times the budget (first match wins, so it is listed first).
 [[profile.default.overrides]]
-filter = 'test(/cutover_global_net_state_uninstall_leaves_nothing_whichever_side_of_the_scm_restart_wins/)'
+filter = 'test(/cutover_global_net_state_uninstall_smoke_whichever_side_of_the_scm_restart_wins/)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.overrides]]
-filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|probe|uninstall|ensure_stopped|drain)_/)'
+filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|probe|uninstall|ensure_stopped)_/)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

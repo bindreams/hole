@@ -33,9 +33,12 @@
 //!   (`Applied`, `AlreadySet`, or `Failed: <cause>`) to `<path>`, one line per
 //!   start. Without the flag the helper never touches the SID type, so the
 //!   tests that need a service without one keep it.
+//! - `--outlive-stopped <event>`: after reporting STOPPED, keep the process
+//!   alive until the named event is signalled, as a service whose process
+//!   outlives the state the SCM reports for it.
 //! - `--parked-event <event>`: signalled once the process is parked by one of
-//!   the two flags above, so a test can tell the hold is in force without
-//!   guessing at timing.
+//!   `--hold-start`, `--delay-attach` or `--outlive-stopped`, so a test can tell
+//!   the hold is in force without guessing at timing.
 //! - `--crash-on-first-stop <marker>`: on the first Stop any instance of the
 //!   service takes, create `<marker>` and exit without reporting STOPPED, so
 //!   the SCM sees the service fail and applies its failure actions. Later
@@ -83,6 +86,7 @@ struct Args {
     on_stop: OnStop,
     hold_start: Option<String>,
     delay_attach: Option<String>,
+    outlive_stopped: Option<String>,
     parked_event: Option<String>,
     running_event: Option<String>,
     crash_on_first_stop: Option<PathBuf>,
@@ -108,6 +112,7 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
             Some("--parked-event") => args.parked_event = Some(value.into_string().expect("event name is UTF-8")),
             Some("--running-event") => args.running_event = Some(value.into_string().expect("event name is UTF-8")),
             Some("--delay-attach") => args.delay_attach = Some(value.into_string().expect("event name is UTF-8")),
+            Some("--outlive-stopped") => args.outlive_stopped = Some(value.into_string().expect("event name is UTF-8")),
             Some("--on-stop") => {
                 args.on_stop = match value.to_str() {
                     Some("stop-pending") => OnStop::ReportStopPending,
@@ -147,7 +152,13 @@ fn main() -> Result<(), windows_service::Error> {
     if let Some(name) = args.delay_attach.as_deref() {
         park_until(args.parked_event.as_deref(), name);
     }
-    windows_service::service_dispatcher::start(hole_bridge::platform::os::SERVICE_NAME, ffi_service_main)
+    // The dispatcher returns once every service of the process has reported
+    // STOPPED, so this is where a process that outlives that state waits.
+    let served = windows_service::service_dispatcher::start(hole_bridge::platform::os::SERVICE_NAME, ffi_service_main);
+    if let Some(name) = args.outlive_stopped.as_deref() {
+        park_until(args.parked_event.as_deref(), name);
+    }
+    served
 }
 
 /// Signals `parked` (when given), then blocks until `release` is signalled.
