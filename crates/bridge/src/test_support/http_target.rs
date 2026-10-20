@@ -1,11 +1,11 @@
 //! Long-lived HTTP/1.0 sentinel for the e2e proxy tests.
 //!
 //! [`HttpTarget`] owns its own tokio runtime and acts as "the public internet"
-//! for the `DistHarness`-backed bridge tests. It binds either the host's
-//! primary IPv4 or `[::1]` (for the IPv6 axis).
+//! for the `DistHarness`-backed bridge tests. It binds the host's primary IPv4,
+//! `127.0.0.1`, or `[::1]` (for the IPv6 axis).
 //!
-//! Neither address reaches `hole-tun`. A target here is what proves host-local
-//! networking survives while Full mode is up; for tunnel transit the
+//! None of these addresses reaches `hole-tun`. A target here is what proves
+//! host-local networking survives while Full mode is up; for tunnel transit the
 //! destination has to be one the host does not hold — see
 //! [`crate::test_support::net_discovery::UNOWNED_DSTS`].
 //!
@@ -14,7 +14,10 @@
 //! plugin suites); it lives in the shared `plugin-e2e` harness.
 
 use crate::test_support::net_discovery::detect_primary_ipv4;
+use crate::test_support::socks5_client::http_response_body;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,6 +30,10 @@ pub(crate) enum TargetBind {
     /// is up — see `net_discovery`'s module doc for why. Loopback
     /// short-circuits routing the same way.
     Ipv4Primary,
+    /// `127.0.0.1`. For SOCKS-only tests: no TUN is up, so the target needs no
+    /// route a TUN test would see, and the primary IPv4 can be briefly
+    /// unusable on a CI runner whose network is settling.
+    Ipv4Loopback,
     /// `[::1]` IPv6 loopback. IPv6 axis test only.
     Ipv6Loopback,
 }
@@ -38,8 +45,41 @@ pub(crate) enum TargetBind {
 /// the canonical const directly rather than reading a struct field.
 pub(crate) struct HttpTarget {
     pub addr: SocketAddr,
+    accepted: Arc<AtomicUsize>,
     shutdown: Option<oneshot::Sender<()>>,
     _runtime: tokio::runtime::Runtime,
+}
+
+impl HttpTarget {
+    /// Connections accepted so far. Zero after a failed roundtrip means the request never
+    /// reached the target; nonzero means it did and the failure is on the way back.
+    pub(crate) fn accepted_connections(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Assert `response` is this target's sentinel reply. On failure the message carries the
+    /// response length and bytes and how many connections the target accepted, which together
+    /// say which hop failed.
+    #[track_caller]
+    pub(crate) fn assert_sentinel_response(&self, response: &[u8]) {
+        let accepted = self.accepted_connections();
+        let Some(body) = http_response_body(response) else {
+            panic!(
+                "HTTP response has no header terminator: {} byte(s) {:?}; target {} accepted {accepted} connection(s)",
+                response.len(),
+                String::from_utf8_lossy(response),
+                self.addr,
+            );
+        };
+        assert_eq!(
+            body,
+            SENTINEL_BODY,
+            "expected sentinel body; response is {} byte(s) {:?}; target {} accepted {accepted} connection(s)",
+            response.len(),
+            String::from_utf8_lossy(response),
+            self.addr,
+        );
+    }
 }
 
 impl Drop for HttpTarget {
@@ -80,6 +120,11 @@ pub(crate) fn start_http_target(bind: TargetBind) -> HttpTarget {
                 let addr = SocketAddr::from((primary, port));
                 (listener, addr)
             }
+            TargetBind::Ipv4Loopback => {
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 127.0.0.1:0");
+                let addr = listener.local_addr().unwrap();
+                (listener, addr)
+            }
             TargetBind::Ipv6Loopback => {
                 let listener = TcpListener::bind("[::1]:0").await.expect("bind [::1]:0");
                 let addr = listener.local_addr().unwrap();
@@ -88,6 +133,8 @@ pub(crate) fn start_http_target(bind: TargetBind) -> HttpTarget {
         }
     });
 
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_by_task = Arc::clone(&accepted);
     let (tx, mut rx) = oneshot::channel();
     runtime.spawn(async move {
         loop {
@@ -95,6 +142,7 @@ pub(crate) fn start_http_target(bind: TargetBind) -> HttpTarget {
                 _ = &mut rx => return,
                 accept = listener.accept() => {
                     if let Ok((sock, _)) = accept {
+                        accepted_by_task.fetch_add(1, Ordering::Relaxed);
                         tokio::spawn(handle_connection(sock));
                     }
                 }
@@ -104,6 +152,7 @@ pub(crate) fn start_http_target(bind: TargetBind) -> HttpTarget {
 
     HttpTarget {
         addr,
+        accepted,
         shutdown: Some(tx),
         _runtime: runtime,
     }

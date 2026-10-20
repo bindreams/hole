@@ -119,10 +119,26 @@ pub(crate) fn test_certs() -> Result<TestCerts, String> {
     Ok(plugin_e2e::certs::generate_test_certs())
 }
 
+/// Route the in-process ss server's `log` records (shadowsocks-service logs through `log`, and the
+/// test subscriber installs no `LogTracer`) into `tracing` at `info` and above, so its relay errors
+/// land in the test's captured output next to the bridge's `bridge.log` dump. Capped at `info`: the
+/// cap bounds `log::max_level`, which is what keeps `debug!`/`trace!` records from third-party crates
+/// from being allocated into tracing events at all (the #147 trap `hole-test-observability` avoids).
+/// Idempotent; a logger installed earlier wins.
+pub(crate) fn route_ss_server_logs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_log::LogTracer::builder()
+            .with_max_level(tracing_log::log::LevelFilter::Info)
+            .init();
+    });
+}
+
 /// Plain shadowsocks server, no plugin. `serial = PORT_ALLOC` per the
 /// label's docstring above.
 #[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_none() -> Result<SsServerHandle, String> {
+    route_ss_server_logs();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let addr = runtime.block_on(async {
         let (addr, _handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
@@ -142,6 +158,7 @@ pub(crate) fn ssserver_none() -> Result<SsServerHandle, String> {
 /// Shadowsocks server fronted by galoshes (websocket, no TLS).
 #[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_ws() -> Result<SsServerHandle, String> {
+    route_ss_server_logs();
     let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let (addr, server) =
@@ -160,6 +177,7 @@ pub(crate) fn ssserver_ws() -> Result<SsServerHandle, String> {
 /// Shadowsocks server fronted by galoshes (websocket + TLS).
 #[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
+    route_ss_server_logs();
     let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let plugin_opts = format!(
@@ -185,6 +203,7 @@ pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Resul
 /// auto-enables TLS inside the wrapped ex-ray so the cert+key pair is required.
 #[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
+    route_ss_server_logs();
     let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let plugin_opts = format!(
@@ -211,6 +230,12 @@ pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<
 #[skuld::fixture(scope = process)]
 pub(crate) fn http_target_ipv4() -> Result<HttpTarget, String> {
     Ok(start_http_target(TargetBind::Ipv4Primary))
+}
+
+/// HTTP target bound to `127.0.0.1`, for SOCKS-only tests that need no TUN-visible address.
+#[skuld::fixture(scope = process)]
+pub(crate) fn http_target_loopback() -> Result<HttpTarget, String> {
+    Ok(start_http_target(TargetBind::Ipv4Loopback))
 }
 
 /// HTTP target bound to `[::1]` for the IPv6 axis test.
