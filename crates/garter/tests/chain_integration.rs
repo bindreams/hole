@@ -16,6 +16,10 @@ use skuld::env;
 mod common;
 use common::mock_plugin_path;
 
+/// The public port these tests ask for. A hop binds a port of its own choosing and the chain reports it in
+/// `ChainReady::listen`, so no test picks a port and frees it for the plugin to take.
+const ANY_PORT: u16 = 0;
+
 /// Spin up an echo server and a chain of 2 mock plugins, send data through,
 /// verify it arrives.
 ///
@@ -46,11 +50,6 @@ async fn two_plugin_chain_relays_data() {
         }
     });
 
-    // Allocate a port for the chain's local side
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
 
     // Build chain: mock-plugin-1 -> mock-plugin-2, both in ExpectSitrep
@@ -68,8 +67,8 @@ async fn two_plugin_chain_relays_data() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         plugin_options: None,
@@ -102,6 +101,65 @@ async fn two_plugin_chain_relays_data() {
     let _ = chain_task.await;
 }
 
+/// A public `local_port` of 0 reaches the public hop unchanged; the chain reports the port the hop bound (its sitrep
+/// `ready.listen`), and a client connecting there is relayed through both hops.
+#[skuld::test]
+async fn public_port_zero_is_reported_through_the_chain() {
+    let mock_path = mock_plugin_path();
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = echo_listener.accept().await {
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = tokio::io::split(stream);
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None).readiness(garter::binary::ReadinessMode::ExpectSitrep),
+        ))
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None).readiness(garter::binary::ReadinessMode::ExpectSitrep),
+        ))
+        .on_ready(ready_tx)
+        .cancel_token(cancel.clone())
+        .drain_timeout(Duration::from_secs(3));
+    let env = PluginEnv {
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: 0,
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+    let handle = tokio::spawn(async move { runner.run(env).await });
+
+    let chain_ready = expect_ready(ready_rx).await.expect("the chain should be ready");
+    assert_ne!(
+        chain_ready.listen.port(),
+        0,
+        "the chain reports the bound port, not the requested 0"
+    );
+
+    let mut client = TcpStream::connect(chain_ready.listen)
+        .await
+        .expect("connect to the chain");
+    client.write_all(b"through port zero").await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = client.read(&mut buf).await.expect("read from the chain");
+    assert_eq!(&buf[..n], b"through port zero");
+
+    drop(client);
+    echo_task.abort();
+    cancel.cancel();
+    let _ = handle.await;
+}
+
 /// Verify that pid_sink fires once per binary plugin with a valid PID.
 #[skuld::test]
 async fn pid_sink_fires_once_per_binary_plugin() {
@@ -113,12 +171,9 @@ async fn pid_sink_fires_once_per_binary_plugin() {
         sink_pids.lock().unwrap().push(pid);
     });
 
-    // Single-accept echo: this test only awaits `on_ready` and checks
-    // pid counts — it does not send any client traffic. The plugins run
-    // in the default `Probe` readiness mode, whose self-probe TCP-connects
-    // to each plugin's OWN listener (not through the chain to the echo).
-    // The sister test (`two_plugin_chain_relays_data`) does send real
-    // client traffic.
+    // Single-accept echo: this test only awaits `on_ready` and checks pid counts; it does not send any client
+    // traffic. Readiness comes from each plugin's sitrep `ready`, so the public port can be 0. The sister test
+    // (`two_plugin_chain_relays_data`) does send real client traffic.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -128,23 +183,27 @@ async fn pid_sink_fires_once_per_binary_plugin() {
         }
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let runner = ChainRunner::new()
-        .add(Box::new(BinaryPlugin::new(&mock_path, None).pid_sink(sink.clone())))
-        .add(Box::new(BinaryPlugin::new(&mock_path, None).pid_sink(sink.clone())))
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .pid_sink(sink.clone()),
+        ))
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .pid_sink(sink.clone()),
+        ))
         .on_ready(ready_tx)
         .cancel_token(cancel.clone())
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         plugin_options: None,
@@ -176,10 +235,6 @@ async fn an_intermediate_binary_plugin_that_loses_its_port_is_restarted() {
     let sentinel = std::env::temp_dir().join(format!("garter-restart-sentinel-{}", std::process::id()));
     let _ = std::fs::remove_file(&sentinel);
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_pids = pids.clone();
     let sink: garter::PidSink = Arc::new(move |pid| sink_pids.lock().unwrap().push(pid));
@@ -204,8 +259,8 @@ async fn an_intermediate_binary_plugin_that_loses_its_port_is_restarted() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9, // discard; ExpectSitrep dials nothing
         plugin_options: None,
@@ -256,25 +311,36 @@ async fn two_plugin_chain_server_mode_relays_data() {
         }
     });
 
-    // Public-facing port (SS_REMOTE): in server mode the chain LISTENS here.
-    let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let public_addr = public_listener.local_addr().unwrap();
-    drop(public_listener);
+    // Public-facing port (SS_REMOTE): in server mode the chain LISTENS here. Port 0: the outer plugin binds a port of
+    // its own and says which in its sitrep `ready`.
+    let public_host = "127.0.0.1";
 
     let (ready_tx, ready_rx) = oneshot::channel();
 
+    // The outer plugin's sink records its own `ready` line: an independent record of the address it bound.
+    let outer_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let outer_sink: garter::LogSink = {
+        let lines = outer_lines.clone();
+        Arc::new(move |line: &str| lines.lock().unwrap().push(line.to_string()))
+    };
     let runner = ChainRunner::new()
         .mode(garter::Mode::Server)
-        .add(Box::new(BinaryPlugin::new(&mock_path, None)))
-        .add(Box::new(BinaryPlugin::new(&mock_path, None)))
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None).readiness(garter::binary::ReadinessMode::ExpectSitrep),
+        ))
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .log_sink(outer_sink),
+        ))
         .on_ready(ready_tx)
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
         local_host: echo_addr.ip(), // SS_LOCAL = ssserver-stand-in
         local_port: echo_addr.port(),
-        remote_host: public_addr.ip().to_string(), // SS_REMOTE = public port
-        remote_port: public_addr.port(),
+        remote_host: public_host.to_string(), // SS_REMOTE = public port
+        remote_port: ANY_PORT,
         plugin_options: None,
     };
 
@@ -284,15 +350,25 @@ async fn two_plugin_chain_server_mode_relays_data() {
     let chain_ready = expect_ready(ready_rx)
         .await
         .expect("chain should be ready, not a start error");
+    // The reader sinks a line before it parses it, so a ready chain has sunk the outer plugin's `ready` line.
+    let outer_ready = outer_lines
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).ok()?;
+            (event["event"] == "ready").then(|| event["listen"].as_str()?.parse::<std::net::SocketAddr>().ok())?
+        })
+        .expect("the outer plugin's sunk `ready` line names the address it bound");
+    assert_ne!(outer_ready.port(), 0, "the outer plugin reports the port it bound");
     assert_eq!(
-        chain_ready.listen.port(),
-        public_addr.port(),
-        "on_ready in Server mode must report SS_REMOTE (the public port)"
+        chain_ready.listen, outer_ready,
+        "on_ready in Server mode must report SS_REMOTE (the outer plugin's bind), not the intermediate hop's"
     );
 
     // External client connects to the public port; data round-trips
     // through the chain to the echo and back.
-    let mut client = TcpStream::connect(public_addr).await.expect("connect to public");
+    let mut client = TcpStream::connect(chain_ready.listen).await.expect("connect to public");
     client.write_all(b"hello server-mode chain").await.unwrap();
 
     let mut buf = [0u8; 1024];
@@ -386,10 +462,6 @@ async fn fatal_start_error_surfaces_typed() {
     let mock_path = mock_plugin_path();
 
     // No echo / client needed: the plugin exits before binding.
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let runner = ChainRunner::new()
@@ -402,8 +474,8 @@ async fn fatal_start_error_surfaces_typed() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9, // discard; never dialed (plugin exits first)
         plugin_options: None,
@@ -424,14 +496,10 @@ async fn fatal_start_error_surfaces_typed() {
 
 /// A plugin that emits `bind_conflict` then exits surfaces a typed
 /// `StartError::BindConflict` with the host-native errno and the
-/// allocated listen address.
+/// address the public hop was given.
 #[skuld::test]
 async fn bind_conflict_start_error_surfaces_typed() {
     let mock_path = mock_plugin_path();
-
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
 
     let (ready_tx, ready_rx) = oneshot::channel();
 
@@ -445,8 +513,8 @@ async fn bind_conflict_start_error_surfaces_typed() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -460,12 +528,12 @@ async fn bind_conflict_start_error_surfaces_typed() {
             // Host-native errno (10048 / 98 / 48) — assert nonzero rather
             // than a specific foreign constant.
             assert_ne!(errno, 0, "bind_conflict errno should be the host-native value");
-            // mock-plugin emits `addr: local_addr`, which in a single-plugin
-            // Client chain is the chain's local (public) port.
+            // mock-plugin emits `addr: local_addr`, which in a single-plugin Client chain is the address the chain
+            // gave its public hop.
             assert_eq!(
-                addr.port(),
-                chain_local.port(),
-                "bind_conflict addr should be the allocated chain local port"
+                addr,
+                "127.0.0.1:0".parse().unwrap(),
+                "bind_conflict addr should be the address the public hop was given"
             );
         }
         other => panic!("expected StartError::BindConflict, got {other:?}"),
@@ -492,10 +560,6 @@ fn typed_failure_with_a_descendant_holding_the_pipes(fail: &str) -> Result<Chain
         .build()
         .unwrap();
     runtime.block_on(async {
-        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let chain_local = chain_listener.local_addr().unwrap();
-        drop(chain_listener);
-
         // The grandchild dials this address once it is up and holds the connection; the connection
         // closing means it is dead.
         let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -531,8 +595,8 @@ fn typed_failure_with_a_descendant_holding_the_pipes(fail: &str) -> Result<Chain
             .on_ready(ready_tx)
             .drain_timeout(Duration::from_secs(3));
         let env = PluginEnv {
-            local_host: chain_local.ip(),
-            local_port: chain_local.port(),
+            local_host: "127.0.0.1".parse().unwrap(),
+            local_port: ANY_PORT,
             remote_host: "127.0.0.1".to_string(),
             remote_port: 9,
             plugin_options: None,
@@ -574,10 +638,6 @@ fn fatal_surfaces_typed_when_a_descendant_holds_the_output_pipes() {
 async fn empty_transports_ready_surfaces_fatal() {
     let mock_path = mock_plugin_path();
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let runner = ChainRunner::new()
@@ -590,8 +650,8 @@ async fn empty_transports_ready_surfaces_fatal() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -786,10 +846,6 @@ async fn auto_readies_sitrep_plugin() {
         }
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
@@ -798,8 +854,8 @@ async fn auto_readies_sitrep_plugin() {
         .on_ready(ready_tx)
         .drain_timeout(Duration::from_secs(3));
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         plugin_options: None,
@@ -826,10 +882,6 @@ async fn auto_readies_sitrep_plugin() {
 async fn auto_surfaces_bind_conflict() {
     let mock_path = mock_plugin_path();
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
@@ -840,8 +892,8 @@ async fn auto_surfaces_bind_conflict() {
         .on_ready(ready_tx)
         .drain_timeout(Duration::from_secs(3));
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -864,10 +916,6 @@ async fn auto_surfaces_bind_conflict() {
 async fn auto_surfaces_fatal() {
     let mock_path = mock_plugin_path();
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
@@ -878,8 +926,8 @@ async fn auto_surfaces_fatal() {
         .on_ready(ready_tx)
         .drain_timeout(Duration::from_secs(3));
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -911,10 +959,6 @@ async fn force_kill_reaps_descendant_tree() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     // Control channel: the grandchild dials back here on startup and holds the
     // connection open. `accept()` => the grandchild is alive (deterministic
     // readiness — no PID, no poll); a later read => EOF/reset the instant the
@@ -937,8 +981,8 @@ async fn force_kill_reaps_descendant_tree() {
         .cancel_token(cancel.clone())
         .drain_timeout(Duration::from_secs(3));
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         plugin_options: None,
@@ -1003,10 +1047,6 @@ async fn log_sink_receives_every_line_including_sitrep_frames() {
         let _ = tx.send(line.to_string());
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
     // `ExpectSitrep` is REQUIRED, not incidental: `BinaryPlugin::new` defaults
     // to `Probe`, whose stdout task is a plain passthrough that never parses —
@@ -1022,8 +1062,8 @@ async fn log_sink_receives_every_line_including_sitrep_frames() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -1058,10 +1098,6 @@ async fn log_sink_receives_a_frame_the_sitrep_parser_consumes() {
         let _ = tx.send(line.to_string());
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
@@ -1074,8 +1110,8 @@ async fn log_sink_receives_a_frame_the_sitrep_parser_consumes() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -1234,10 +1270,6 @@ async fn log_sink_receives_stderr_lines() {
         let _ = tx.send(line.to_string());
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
@@ -1249,8 +1281,8 @@ async fn log_sink_receives_stderr_lines() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -1347,10 +1379,6 @@ async fn stderr_relay_strips_ansi_even_from_an_uncooperative_child() {
         let _ = tx.send(line.to_string());
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
@@ -1363,8 +1391,8 @@ async fn stderr_relay_strips_ansi_even_from_an_uncooperative_child() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -1408,10 +1436,6 @@ async fn no_color_and_clicolor_reach_the_real_child(#[fixture] env: &skuld::EnvG
         let _ = tx.send(line.to_string());
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
@@ -1424,8 +1448,8 @@ async fn no_color_and_clicolor_reach_the_real_child(#[fixture] env: &skuld::EnvG
         .drain_timeout(Duration::from_secs(3));
 
     let plugin_env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -1462,10 +1486,6 @@ async fn no_color_and_clicolor_reach_the_real_child(#[fixture] env: &skuld::EnvG
 async fn sitrep_parser_sees_the_line_before_any_ansi_strip() {
     let mock_path = mock_plugin_path();
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let malformed = "{\"event\":\"fatal\",\"detail\":\"conn \x1b[31m failed: timeout\"}";
 
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -1479,8 +1499,8 @@ async fn sitrep_parser_sees_the_line_before_any_ansi_strip() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -1521,10 +1541,6 @@ async fn a_shutdown_before_ready_is_not_a_start_failure() {
         (ReadinessMode::Probe, true),
     ] {
         let label = format!("{mode:?}, hello={sitrep}");
-        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let chain_local = chain_listener.local_addr().unwrap();
-        drop(chain_listener);
-
         // The shutdown comes once the plugin is in the state the row names: spawned, or (with a handshake) its
         // `hello` read. The sink runs inside the reader's poll, before `hello` is processed, so the row is reached with
         // the reader still reading and the plugin's stdout open.
@@ -1553,8 +1569,8 @@ async fn a_shutdown_before_ready_is_not_a_start_failure() {
             .cancel_token(cancel.clone())
             .drain_timeout(Duration::from_secs(30));
         let env = PluginEnv {
-            local_host: chain_local.ip(),
-            local_port: chain_local.port(),
+            local_host: "127.0.0.1".parse().unwrap(),
+            local_port: ANY_PORT,
             remote_host: "127.0.0.1".to_string(),
             remote_port: 9,
             plugin_options: None,
@@ -1600,10 +1616,6 @@ async fn a_probe_owned_plugin_that_exits_before_ready_reports_the_typed_fatal() 
         (ReadinessMode::Auto, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
     ] {
         let label = format!("{mode:?}, {env_knobs:?}");
-        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let chain_local = chain_listener.local_addr().unwrap();
-        drop(chain_listener);
-
         let mut plugin = BinaryPlugin::new(mock_plugin_path(), None)
             .readiness(mode)
             .env("MOCK_PLUGIN_FAIL", "fatal");
@@ -1616,8 +1628,8 @@ async fn a_probe_owned_plugin_that_exits_before_ready_reports_the_typed_fatal() 
             .on_ready(ready_tx)
             .drain_timeout(Duration::from_secs(30));
         let env = PluginEnv {
-            local_host: chain_local.ip(),
-            local_port: chain_local.port(),
+            local_host: "127.0.0.1".parse().unwrap(),
+            local_port: ANY_PORT,
             remote_host: "127.0.0.1".to_string(),
             remote_port: 9,
             plugin_options: None,
@@ -1667,10 +1679,6 @@ async fn a_probe_owned_plugin_that_exits_before_ready_has_dropped_its_sender_whe
         (ReadinessMode::Auto, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
     ] {
         let label = format!("{mode:?}, {env_knobs:?}");
-        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local = chain_listener.local_addr().unwrap();
-        drop(chain_listener);
-
         let mut plugin = BinaryPlugin::new(mock_plugin_path(), None)
             .readiness(mode)
             .env("MOCK_PLUGIN_FAIL", "fatal");
@@ -1680,7 +1688,7 @@ async fn a_probe_owned_plugin_that_exits_before_ready_has_dropped_its_sender_whe
         let (ready_tx, mut ready_rx) = oneshot::channel();
         let run = plugin
             .run(
-                local,
+                "127.0.0.1:0".parse().unwrap(),
                 "127.0.0.1:9".parse().unwrap(),
                 tokio_util::sync::CancellationToken::new(),
                 ready_tx,
@@ -1717,15 +1725,15 @@ async fn a_binary_plugin_runs_again_after_it_was_stopped() {
     let remote = remote_listener.local_addr().unwrap();
 
     for run in 1..=2 {
-        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local_addr = local.local_addr().unwrap();
-        drop(local);
-
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = oneshot::channel();
         let handle = tokio::spawn({
             let (plugin, shutdown) = (plugin.clone(), shutdown.clone());
-            async move { plugin.run(local_addr, remote, shutdown, ready_tx).await }
+            async move {
+                plugin
+                    .run("127.0.0.1:0".parse().unwrap(), remote, shutdown, ready_tx)
+                    .await
+            }
         });
 
         // A bound on a child that may never ready: the failure surfaced to a human, as in `expect_ready`.

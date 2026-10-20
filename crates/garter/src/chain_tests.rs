@@ -58,6 +58,19 @@ impl ChainPlugin for InstantPlugin {
 /// Plugin that binds a TCP listener and waits for shutdown.
 struct ListeningPlugin {
     name: String,
+    /// The address it bound and reported, for a test to compare against what the chain reports.
+    bound: Arc<Mutex<Option<SocketAddr>>>,
+}
+
+impl ListeningPlugin {
+    fn new(name: &str) -> (Self, Arc<Mutex<Option<SocketAddr>>>) {
+        let bound = Arc::new(Mutex::new(None));
+        let plugin = Self {
+            name: name.into(),
+            bound: bound.clone(),
+        };
+        (plugin, bound)
+    }
 }
 
 #[async_trait::async_trait]
@@ -75,6 +88,7 @@ impl ChainPlugin for ListeningPlugin {
     ) -> crate::Result<()> {
         let listener = tokio::net::TcpListener::bind(local).await?;
         let actual = listener.local_addr().unwrap_or(local);
+        *self.bound.lock().unwrap() = Some(actual);
         let _ = ready.send(Ok(PluginReady {
             listen: actual,
             transports: Transports::TCP,
@@ -92,6 +106,8 @@ impl ChainPlugin for ListeningPlugin {
 struct TransportsPlugin {
     name: String,
     transports: Transports,
+    /// The address it bound and reported, for a test to compare against what the chain reports.
+    bound: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 #[async_trait::async_trait]
@@ -109,6 +125,7 @@ impl ChainPlugin for TransportsPlugin {
     ) -> crate::Result<()> {
         let listener = tokio::net::TcpListener::bind(local).await?;
         let actual = listener.local_addr().unwrap_or(local);
+        *self.bound.lock().unwrap() = Some(actual);
         let _ = ready.send(Ok(PluginReady {
             listen: actual,
             transports: self.transports,
@@ -251,19 +268,14 @@ async fn chain_runner_multiple_plugins() {
 // Readiness tests =====================================================================================================
 
 #[skuld::test]
-async fn on_ready_fires_with_local_addr() {
+async fn on_ready_fires_with_the_bound_address() {
     let (tx, rx) = oneshot::channel();
+    let (listener, bound) = ListeningPlugin::new("listener");
 
-    let runner = ChainRunner::new()
-        .add(Box::new(ListeningPlugin {
-            name: "listener".into(),
-        }))
-        .on_ready(tx);
+    let runner = ChainRunner::new().add(Box::new(listener)).on_ready(tx);
 
-    let mut env = test_env();
-    // Use an ephemeral port so the plugin can actually bind.
-    let addr = free_loopback_port();
-    env.local_port = addr.port();
+    // Port 0: the plugin binds a port of its own and reports it.
+    let env = test_env();
 
     let handle = tokio::spawn(runner.run(env));
 
@@ -273,7 +285,19 @@ async fn on_ready_fires_with_local_addr() {
         .expect("ready_tx was dropped without sending")
         .expect("chain should be ready, not a start error");
 
-    assert_eq!(chain_ready.listen.port(), addr.port());
+    assert_ne!(
+        chain_ready.listen.port(),
+        0,
+        "the chain reports the bound port, not the requested 0"
+    );
+    assert_eq!(
+        Some(chain_ready.listen),
+        *bound.lock().unwrap(),
+        "the chain reports the address the plugin bound"
+    );
+    tokio::net::TcpStream::connect(chain_ready.listen)
+        .await
+        .expect("the reported address is really listening");
 
     // Clean up: abort the chain (it's waiting for shutdown).
     handle.abort();
@@ -319,21 +343,24 @@ async fn on_ready_transports_are_intersection_across_hops() {
 
     // Position 0 is the chain-public hop; it serves TCP+UDP. Position 1
     // (downstream) is TCP-only, so the end-to-end set narrows to TCP.
-    let public_addr = free_loopback_port();
+    let public_bound = Arc::new(Mutex::new(None));
+    let downstream_bound = Arc::new(Mutex::new(None));
 
     let runner = ChainRunner::new()
         .add(Box::new(TransportsPlugin {
             name: "public".into(),
             transports: Transports::TCP | Transports::UDP,
+            bound: public_bound.clone(),
         }))
         .add(Box::new(TransportsPlugin {
             name: "downstream".into(),
             transports: Transports::TCP,
+            bound: downstream_bound.clone(),
         }))
         .on_ready(tx);
 
-    let mut env = test_env();
-    env.local_port = public_addr.port();
+    // Port 0: the public hop binds a port of its own and reports it.
+    let env = test_env();
 
     let handle = tokio::spawn(runner.run(env));
 
@@ -347,9 +374,11 @@ async fn on_ready_transports_are_intersection_across_hops() {
         Transports::TCP,
         "end-to-end transports must be the intersection (TCP+UDP ∩ TCP = TCP)"
     );
+    let public = public_bound.lock().unwrap().expect("the public hop bound");
+    let downstream = downstream_bound.lock().unwrap().expect("the downstream hop bound");
+    assert_ne!(public, downstream, "the hops bound different ports");
     assert_eq!(
-        chain_ready.listen.port(),
-        public_addr.port(),
+        chain_ready.listen, public,
         "Client-mode listen must be the position-0 (public) plugin's bind, not whichever readied first"
     );
 
@@ -364,15 +393,12 @@ async fn cancel_token_triggers_graceful_shutdown() {
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let runner = ChainRunner::new()
-        .add(Box::new(ListeningPlugin {
-            name: "listener".into(),
-        }))
+        .add(Box::new(ListeningPlugin::new("listener").0))
         .cancel_token(cancel.clone())
         .on_ready(ready_tx);
 
-    let mut env = test_env();
-    let addr = free_loopback_port();
-    env.local_port = addr.port();
+    // Port 0: the plugin binds a port of its own.
+    let env = test_env();
 
     let handle = tokio::spawn(runner.run(env));
 
@@ -484,37 +510,35 @@ async fn chain_runner_server_mode_inverts_address_wiring() {
 #[skuld::test]
 async fn chain_runner_server_mode_inverts_on_ready_probe_target() {
     let (tx, rx) = oneshot::channel();
-    let listen_addr = free_loopback_port();
+    let (inner, inner_bound) = ListeningPlugin::new("inner-listener");
+    let (outer, outer_bound) = ListeningPlugin::new("outer-listener");
 
-    // `ListeningPlugin` binds whatever `local` it is given. In Server mode
-    // the OUTER (position 1) plugin gets `local = SS_REMOTE`, so on_ready
-    // must probe THAT address. The probe's TCP-connect either succeeds
-    // (correct probe target) or never fires (wrong probe target — the
-    // test then hangs and skuld's runtime drop bounds it).
+    // `ListeningPlugin` binds whatever `local` it is given. In Server mode the OUTER (position 1) plugin gets
+    // `local = SS_REMOTE`, so `on_ready` must report what THAT plugin bound, not what the inner did. Port 0 for
+    // SS_REMOTE: each plugin binds a port of its own and records it.
     let runner = ChainRunner::new()
         .mode(crate::chain::Mode::Server)
-        .add(Box::new(ListeningPlugin {
-            name: "inner-listener".into(),
-        }))
-        .add(Box::new(ListeningPlugin {
-            name: "outer-listener".into(),
-        }))
+        .add(Box::new(inner))
+        .add(Box::new(outer))
         .on_ready(tx);
 
-    let ss_local_port = free_loopback_port().port();
+    let ss_local_port = free_loopback_port().port(); // the inner forwards here; nothing binds it
     let env = crate::sip003::PluginEnv {
         local_host: "127.0.0.1".parse().unwrap(),
         local_port: ss_local_port,
         remote_host: "127.0.0.1".into(),
-        remote_port: listen_addr.port(),
+        remote_port: 0,
         plugin_options: None,
     };
 
     let handle = tokio::spawn(runner.run(env));
     let chain_ready = rx.await.expect("ready_tx dropped").expect("chain should be ready");
+    let outer = outer_bound.lock().unwrap().expect("the outer plugin bound");
+    let inner = inner_bound.lock().unwrap().expect("the inner plugin bound");
+    assert_ne!(outer.port(), 0);
+    assert_ne!(outer, inner, "the plugins bound different ports");
     assert_eq!(
-        chain_ready.listen.port(),
-        listen_addr.port(),
+        chain_ready.listen, outer,
         "on_ready in Server mode must report SS_REMOTE (outer's local), not SS_LOCAL (inner's remote)"
     );
     handle.abort();

@@ -466,7 +466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     emit(
         &SitrepEvent::Ready {
-            listen: local_addr,
+            listen: listener.local_addr()?,
             transports: ready_transports,
         },
         sitrep_enabled,
