@@ -21,19 +21,16 @@ use crate::cutover::scm_wait::hold::{Look, Opened, ProcessHolds, ProcessSource};
 use super::service_sid::ServiceSid;
 
 /// Open process `pid` for waiting and for reading its token, and keep it only
-/// if the token carries the service SID. A process without it is closed and
-/// reported as not the service's.
+/// if the token carries the service SID. A process without it, or whose token
+/// cannot be read, is closed and reported as not the service's.
 pub(super) fn open_process(pid: u32, service: &ServiceSid) -> io::Result<Opened<OwnedHandle>> {
     // SAFETY: plain FFI call; no pointer is passed.
     match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(handle) => {
             // SAFETY: `OpenProcess` returned a new handle this value now owns.
             let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
-            if service.is_in_token_of(&process)? {
-                Ok(Opened::Service(process))
-            } else {
-                Ok(Opened::NotTheService)
-            }
+            let read = service.is_in_token_of(&process);
+            Ok(opened_from_token_read(process, pid, read))
         }
         Err(e) => {
             let code = win32_code_of_hresult(e.code().0);
@@ -45,6 +42,23 @@ pub(super) fn open_process(pid: u32, service: &ServiceSid) -> io::Result<Opened<
                 code,
             }
             .into_io())
+        }
+    }
+}
+
+/// `process` (the process `pid`), classified by what reading its token for the
+/// service SID gave. A token that cannot be read is not the service's: the
+/// service's own is readable by SYSTEM and by an elevated administrator
+/// (measured by the service-SID probes), so an unreadable one is some protected
+/// process that reused the id. It is not an error either, which would fail an
+/// uninstall for a process that has nothing to do with the service.
+fn opened_from_token_read<P>(process: P, pid: u32, read: io::Result<bool>) -> Opened<P> {
+    match read {
+        Ok(true) => Opened::Service(process),
+        Ok(false) => Opened::NotTheService,
+        Err(e) => {
+            tracing::warn!(pid, error = %e, "the token of the process the SCM names cannot be read: not the service's");
+            Opened::NotTheService
         }
     }
 }
@@ -92,3 +106,7 @@ impl ServiceProcesses {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "service_processes_tests.rs"]
+mod service_processes_tests;

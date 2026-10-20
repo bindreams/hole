@@ -1935,8 +1935,9 @@ down a rollback (bindreams/hole#1099). Three rules close it:
   trust. `hole bridge install` therefore gives the service a service SID
   (`ChangeServiceConfig2`, `SERVICE_CONFIG_SERVICE_SID_INFO`,
   `SERVICE_SID_TYPE_UNRESTRICTED`), which the SCM puts as `NT SERVICE\HoleBridge`
-  into the token of every process it starts as the service, and nothing else
-  carries it. An in-app update (cutover) is run by the old release's code, which
+  into the token of every process it starts as the service; the children such a
+  process spawns (ex-ray, galoshes, `SystemTool` children) inherit the token and
+  carry it too. An in-app update (cutover) is run by the old release's code, which
   never sets the type, so the `--service` bridge also makes sure of it at
   startup (`ensure_own_service_sid`): it reads its own service's type and writes
   `SERVICE_SID_TYPE_UNRESTRICTED` only when that differs, so an ordinary start
@@ -1946,9 +1947,13 @@ down a rollback (bindreams/hole#1099). Three rules close it:
   reboot or the next update); none is forced, and the uninstaller's check is
   unchanged. A process is opened by id and its token read
   (`ProcessSource::open`, `ServiceSid::is_in_token_of`); it is kept only if the
-  token carries the SID, and a reused id fails that in every state. A restarted
-  instance of the same service carries it too, which is right: it is still the
-  service's. `ProcessHolds::hold_current` still confirms the open: read the
+  token carries the SID. A reused id fails that in every state unless its new
+  owner is a child of the service. A token that cannot be read is not the
+  service's either: the service's own is readable by SYSTEM and by an elevated
+  administrator (measured), so a protected process that reused the id is
+  `Named::NotTheService` with a warning, not an error that would fail the
+  uninstall. A restarted instance of the same service carries the SID too, which
+  is right: it is still the service's. `ProcessHolds::hold_current` still confirms the open: read the
   service, open the pid it names, read again, and act on the open only if the
   second read names the same pid; otherwise drop the handle and act on the
   second read, so a service that keeps changing is followed. A live process

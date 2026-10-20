@@ -171,12 +171,22 @@ impl ServiceSid {
         Ok(Self { sid })
     }
 
+    /// `Everyone` (S-1-1-0: revision 1, one sub-authority, authority 1,
+    /// sub-authority 0), which every readable token carries.
+    #[cfg(test)]
+    pub(super) fn everyone() -> Self {
+        Self {
+            sid: vec![0x0000_0101, 0x0100_0000, 0],
+        }
+    }
+
     fn psid(&self) -> PSID {
         PSID(self.sid.as_ptr().cast_mut().cast())
     }
 
-    /// Whether the token of `process` carries this SID. `process` must have
-    /// been opened with `PROCESS_QUERY_LIMITED_INFORMATION`.
+    /// Whether the token of `process` carries this SID, or the error that kept
+    /// it from being read. `process` must have been opened with
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`.
     pub fn is_in_token_of(&self, process: &OwnedHandle) -> io::Result<bool> {
         let mut token = HANDLE::default();
         // SAFETY: `process` is a live handle, and `token` is an out-parameter.
