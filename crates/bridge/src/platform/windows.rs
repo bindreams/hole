@@ -521,18 +521,6 @@ fn service_log_dir() -> PathBuf {
     hole_common::update_marker::service_log_dir()
 }
 
-/// System state directory for the Windows service (`C:\ProgramData\hole\state`).
-///
-/// Holds the bridge crash-recovery state files (`bridge-dns.json`,
-/// `bridge-routes.json`, `bridge-plugins.json`). Writable by LocalSystem;
-/// pre-created by `install()` so the service has somewhere to write on its
-/// first run.
-fn service_state_dir() -> PathBuf {
-    PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
-        .join("hole")
-        .join("state")
-}
-
 /// Install the bridge as a Windows Service.
 ///
 /// The service is registered to run
@@ -558,7 +546,7 @@ pub fn install_as(binary_path: &Path, start: InstallStart) -> std::io::Result<()
     .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
 
     let log_dir = service_log_dir();
-    let state_dir = service_state_dir();
+    let state_dir = crate::cutover::service_state_dir();
     // Create log + state dirs during install (running elevated) so the service
     // itself (running as LocalSystem) can write to them on its first run.
     let _ = std::fs::create_dir_all(&log_dir);
@@ -758,7 +746,7 @@ pub fn repair_interrupted_uninstall() -> std::io::Result<RepairStep> {
 /// A record over a service the SCM has no entry for is stale: the delete that
 /// the record covered finished.
 fn clear_record_of_absent_service() -> std::io::Result<RepairStep> {
-    let state_dir = service_state_dir();
+    let state_dir = crate::cutover::service_state_dir();
     match disable_record::record_state(&state_dir) {
         RecordState::Absent => Ok(RepairStep::Nothing),
         RecordState::Present => {

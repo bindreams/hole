@@ -214,10 +214,10 @@ success-output = 'immediate-final'
 filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|probe)_/)'
 success-output = 'immediate-final'
 
-# The stop probes, the service-SID probes and the uninstall tests wait on the real SCM state with no
-# bound of their own (a bound would be a guess at how long the SCM takes). If a
-# premise they measure is false, the wait never ends, so `terminate-after` turns
-# the hang into a failure carrying the test's name instead of consuming the job
+# The stop probes, the service-SID probes, the uninstall and cutover-stop tests and the record
+# proofs wait on the real SCM state with no bound of their own (a bound would be a
+# guess at how long the SCM takes). If a premise they measure is false, the wait
+# never ends, so `terminate-after` turns the hang into a failure carrying the test's name instead of consuming the job
 # budget: the sanctioned "failure bound surfaced to a human" use. A test here
 # takes seconds.
 #
@@ -228,7 +228,7 @@ filter = 'test(/cutover_global_net_state_uninstall_smoke_whichever_side_of_the_s
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.overrides]]
-filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|probe|uninstall|ensure_stopped)_/)'
+filter = 'test(/cutover_global_net_state_(stop_probe|service_sid_probe|probe|uninstall|ensure_stopped|cutover_stop|at_every_step_of|an_administrators_disable|repair|the_service_dacl|the_state_dir_record)_/)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

@@ -545,7 +545,7 @@ fn install_bridge_with(
         Ok(disabled_by) => InstallStart::for_disabled_by(disabled_by),
         Err(e) => {
             return Err(
-                format!("could not tell whether the service is disabled, so the install changed nothing: {e}").into(),
+                format!("could not tell whether the service is disabled, so the service was not changed: {e}").into(),
             )
         }
     };

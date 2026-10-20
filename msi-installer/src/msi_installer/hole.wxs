@@ -333,8 +333,10 @@
          Return="check", so the action immediately after BridgeUninstall can
          abort the whole transaction; without this, the product is still
          installed but its service is stopped and deregistered, and nothing
-         puts it back. Re-runs exactly what BridgeInstall runs, so the restored
-         state is the state the uninstall found.
+         puts it back. Re-runs exactly what BridgeInstall runs, so the product
+         comes back as a fresh install would, Automatic and started: the
+         deleted service has no start type to read, so one an administrator
+         set is not carried.
 
          Sequenced Before="BridgeUninstall" because a rollback action must be
          written into the script ahead of the deferred action it undoes; MSI

@@ -762,6 +762,9 @@ fn a_start_type_that_cannot_be_read_fails_the_install_before_anything_changes() 
         .expect_err("guessing not-disabled would re-enable an administrator's choice")
         .to_string();
     assert!(message.contains("injected"), "{message}");
+    // The service is what the install leaves alone; `prepare_ipc_access` has
+    // already run, so the message must not claim the install changed nothing.
+    assert!(message.contains("the service was not changed"), "{message}");
     assert_eq!(steps, ["disabled_by"]);
 }
 

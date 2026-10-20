@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 
 use tun_engine::routing::failclosed::Clearance;
 
-/// The privileged service's state dir, where the lockdown intent + cover state
-/// files live. `unlock` needs it without a running bridge, so it resolves the
-/// same per-platform location `install()` provisions.
+/// The privileged service's state dir (Windows: `C:\ProgramData\hole\state`),
+/// where the crash-recovery state, the lockdown intent + cover state and the
+/// disable record live. `unlock` needs it without a running bridge, so it
+/// resolves the same per-platform location `install()` provisions.
 pub fn service_state_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {

@@ -2108,7 +2108,9 @@ match each** (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
   failed record write changes nothing, a failed start-type write clears only the
   record this call wrote, a restore whose start-type write failed leaves the
   record, and a stale record (present over a service that is not Disabled) is
-  swept by the restore, the delete, the cutover child and `bridge install`. The
+  swept by the restore, the delete, the cutover child and `bridge install`; a
+  retirement that finds the service marked for deletion sweeps none, and
+  keeps a stale record. The
   class is pinned by `at_no_point_is_a_service_we_disabled_left_without_a_record`
   and `a_service_an_administrator_disabled_is_never_touched_at_any_step` (a model
   of the service and the record, checked after every call, for every start state
@@ -2153,6 +2155,10 @@ match each** (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
   the new product's `BridgeInstall` runs, so there is no start type left to read,
   and the new install registers the service Automatic and starts it; no state is
   carried across the upgrade, by design.
+- **A rolled-back MSI uninstall re-enables a service an administrator disabled.**
+  `BridgeUninstallRollback` re-runs `bridge install` after `BridgeUninstall` has
+  deleted the service, so the same holds: the install finds no service to read,
+  registers it Automatic and starts it. Deletion carries no state, by design.
 - **The GUI tells the two cases apart at the connect gate**, where the install
   prompt already lives. `BridgeInstallStatus` is, in precedence order, not
   installed, running (a running service that is Disabled works), disabled
@@ -2162,7 +2168,7 @@ match each** (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
   prompt's text. `hole bridge status` prints `installed (disabled)` and exits 3
   (running 0, stopped 1, not installed 2). The GUI's read is unprivileged and
   never fails (`disabled_state`: a start type it cannot read is none, a record it
-  cannot read over a Disabled service is an administrator's). That read works as
+  cannot read counts as present, as on every path). That read works as
   installed because nothing sets a service security descriptor or a state
   directory ACL, so both inherit the Windows defaults; the proof is the
   `..._the_service_dacl_lets_an_interactive_user_query_its_config` and
