@@ -71,8 +71,10 @@ impl PluginTree for UnwatchableRoot {
 }
 
 /// A real child whose exit is watched with `waitid(WNOWAIT)` alone, as on a kernel without `pidfd_open`.
+#[cfg(target_os = "linux")]
 struct WaitidRoot(cosca::tokio::Child);
 
+#[cfg(target_os = "linux")]
 impl PluginTree for WaitidRoot {
     fn containment(&self) -> Containment {
         PluginTree::containment(&self.0)
@@ -273,9 +275,18 @@ const LIVE_ROOT: &str =
 #[derive(Clone, Copy, Debug)]
 enum Watch {
     Cosca,
+    #[cfg(target_os = "linux")]
     Waitid,
     Unwatchable,
 }
+
+/// Every way a take-down can watch the root where this platform has it.
+const WATCHES: &[Watch] = &[
+    Watch::Cosca,
+    #[cfg(target_os = "linux")]
+    Watch::Waitid,
+    Watch::Unwatchable,
+];
 
 #[derive(Clone, Copy, Debug)]
 enum TakenDownBy {
@@ -360,6 +371,7 @@ async fn taken_down_root_leaves_no_descendant(watch: Watch, by: TakenDownBy) {
     let supervised = async move {
         match watch {
             Watch::Cosca => supervise_plugin("p", &mut child, shutdown_ref, grace, reader(), reader(), failure).await,
+            #[cfg(target_os = "linux")]
             Watch::Waitid => {
                 let mut tree = WaitidRoot(child);
                 supervise_plugin("p", &mut tree, shutdown_ref, grace, reader(), reader(), failure).await
@@ -402,14 +414,14 @@ async fn taken_down_root_leaves_no_descendant(watch: Watch, by: TakenDownBy) {
 
 #[skuld::test]
 async fn a_shutdown_leaves_no_descendant_whether_or_not_the_exit_can_be_watched() {
-    for watch in [Watch::Cosca, Watch::Waitid, Watch::Unwatchable] {
+    for &watch in WATCHES {
         taken_down_root_leaves_no_descendant(watch, TakenDownBy::Shutdown).await;
     }
 }
 
 #[skuld::test]
 async fn a_failed_start_leaves_no_descendant_whether_or_not_the_exit_can_be_watched() {
-    for watch in [Watch::Cosca, Watch::Waitid, Watch::Unwatchable] {
+    for &watch in WATCHES {
         taken_down_root_leaves_no_descendant(watch, TakenDownBy::StartFailure).await;
     }
 }
