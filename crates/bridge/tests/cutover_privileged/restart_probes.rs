@@ -151,15 +151,7 @@ impl Drop for ProbeService {
     fn drop(&mut self) {
         let Some(service) = self.service.take() else { return };
         // Nothing may restart it while it is stopped and deleted.
-        let _ = service.update_failure_actions(ServiceFailureActions {
-            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
-            reboot_msg: None,
-            command: None,
-            actions: Some(vec![ServiceAction {
-                action_type: ServiceActionType::None,
-                delay: Duration::ZERO,
-            }]),
-        });
+        scm_probe::forbid_restart(&service);
         // Refused when it is not running, which is fine.
         let _ = service.stop();
         if let Err(e) = service.delete() {
@@ -168,6 +160,8 @@ impl Drop for ProbeService {
                 self.name
             );
         }
+        // A panicking probe leaves the process running; deletion waits on its exit.
+        scm_probe::kill_process_of(&service);
         // An open handle keeps the deletion pending.
         drop(service);
         if let Err(e) = scm_deletion::wait_until_deleted(&self.name) {

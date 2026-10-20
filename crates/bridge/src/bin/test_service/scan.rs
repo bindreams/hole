@@ -61,6 +61,17 @@ fn measure(service: &str) -> String {
     writeln!(report, "caller: {}", caller_sid()).unwrap();
     let sid = ServiceSid::of(service);
     writeln!(report, "service SID: {sid}").unwrap();
+    // The OS answers only while the service is registered and not marked for
+    // deletion; printed to cross-check the derivation (P4), never used.
+    match ServiceSid::os_lookup(service) {
+        Ok(from_os) => writeln!(
+            report,
+            "OS lookup (P4 cross-check): {from_os}; equals the derived: {}",
+            from_os == sid
+        ),
+        Err(e) => writeln!(report, "OS lookup (P4 cross-check): Err {e}"),
+    }
+    .unwrap();
 
     let (mut total, mut opened, mut absent) = (0usize, 0usize, 0usize);
     // Keyed by the call, the code and the kind and rows the production table gives it.

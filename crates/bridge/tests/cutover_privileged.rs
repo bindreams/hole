@@ -355,12 +355,13 @@ impl ProvisionedService {
         }
     }
 
-    /// Stops and deletes the throwaway service, returning only once it no longer
-    /// exists. Best-effort: failures are reported on stderr, never panicked on,
-    /// because this also runs from `Drop`.
+    /// Kills the throwaway service's process and deletes the service, returning
+    /// only once it no longer exists. It acts on the service as it finds it: a
+    /// probe that panicked can leave it running, or marked for deletion with
+    /// its process alive, and no cooperative Stop is waited on in either state.
+    /// Best-effort: failures are reported on stderr, never panicked on, because
+    /// this also runs from `Drop`.
     fn teardown() {
-        use hole_bridge::cutover::os::windows::WindowsCutoverOs;
-        use hole_bridge::cutover::os::CutoverOs;
         use hole_bridge::platform::os::SERVICE_NAME;
         use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE};
         use windows_service::service::ServiceAccess;
@@ -369,21 +370,16 @@ impl ProvisionedService {
         let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) else {
             return;
         };
-        match manager.open_service(SERVICE_NAME, ServiceAccess::DELETE) {
+        let access = ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG;
+        match manager.open_service(SERVICE_NAME, access) {
             Ok(service) => {
-                // A STOPPED notification, not a Stop request alone: deletion
-                // cannot complete while the service process is alive.
-                let mut os = WindowsCutoverOs {
-                    images: vec![],
-                    target_version: "test".into(),
-                };
-                if let Err(e) = os.stop_service_wait_stopped() {
-                    eprintln!("teardown: stopping the throwaway service failed: {e}");
-                }
+                scm_probe::forbid_restart(&service);
                 // Any refusal leaves the wait below hanging, so say which it was.
                 if let Err(e) = service.delete() {
                     eprintln!("teardown: deleting the throwaway service failed (awaiting deletion anyway): {e}");
                 }
+                // Deletion cannot complete while the service process is alive.
+                scm_probe::kill_process_of(&service);
                 // An open handle keeps the deletion pending.
                 drop(service);
             }
@@ -1247,6 +1243,50 @@ mod scm_probe {
     /// report no id for uses [`reported_service_process_id`].
     pub fn service_process_id() -> u32 {
         reported_service_process_id().expect("a running service has a process")
+    }
+
+    /// Sets the service's failure actions to none, so killing its process
+    /// cannot bring it back. Best-effort, for teardown.
+    pub fn forbid_restart(service: &windows_service::service::Service) {
+        use std::time::Duration;
+        use windows_service::service::{
+            ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
+        };
+
+        let _ = service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![ServiceAction {
+                action_type: ServiceActionType::None,
+                delay: Duration::ZERO,
+            }]),
+        });
+    }
+
+    /// Kills the process the SCM reports for `service` and returns once it has
+    /// exited; nothing if it reports none or the process is already gone.
+    /// Best-effort, for teardown, which also runs while a probe is panicking.
+    /// Needs a handle with `QUERY_STATUS`.
+    pub fn kill_process_of(service: &windows_service::service::Service) {
+        use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE};
+
+        let Ok(status) = service.query_status() else { return };
+        let Some(pid) = status.process_id else { return };
+        // SAFETY: plain FFI calls on a handle this function opens and closes.
+        unsafe {
+            let Ok(process) = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) else {
+                return;
+            };
+            // The exit follows a successful terminate, so the wait is on an event
+            // that will happen.
+            if TerminateProcess(process, 1).is_ok() {
+                WaitForSingleObject(process, INFINITE);
+            } else {
+                eprintln!("teardown: killing the throwaway service's process {pid} was refused");
+            }
+            let _ = CloseHandle(process);
+        }
     }
 
     /// Kills process `pid` the way Task Manager would.
