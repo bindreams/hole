@@ -1234,6 +1234,15 @@ impl YamuxPlugin {
     }
 }
 
+/// Waits for the task that holds `ready`: `run` returning with that sender still held reads, to the chain, as a hop
+/// that is still starting rather than one that exited before ready. The task ends once `run_server`/`run_client`
+/// has sent its address or dropped its sender, and both have by now.
+async fn join_ready_holder(holder: tokio::task::JoinHandle<()>) {
+    holder
+        .await
+        .expect("the readiness holder only awaits a channel and sends");
+}
+
 #[async_trait::async_trait]
 impl garter::ChainPlugin for YamuxPlugin {
     fn name(&self) -> &str {
@@ -1254,7 +1263,8 @@ impl garter::ChainPlugin for YamuxPlugin {
         // Readiness comes from the bind point itself, over the same channel the
         // tests use: `run_server`/`run_client` send their bound address once
         // their listeners are up, and a YAMUX plugin serves both TCP and UDP
-        // there. A failed bind drops `ready` unsent (RecvError). Startup is not
+        // there. A failed bind drops `ready` unsent, which the chain reports as an
+        // exit before ready once `run` has joined the task holding it. Startup is not
         // gated on `shutdown` here — garter's readiness aggregator is `biased` on
         // it and owns the "shutdown before ready" outcome for the whole chain.
         //
@@ -1268,21 +1278,23 @@ impl garter::ChainPlugin for YamuxPlugin {
         let transports = garter::Transports::TCP | garter::Transports::UDP;
         let result = if self.is_server {
             let (bound_tx, bound_rx) = oneshot::channel();
-            tokio::spawn(async move {
+            let holder = tokio::spawn(async move {
                 let Ok(listen) = bound_rx.await else { return };
                 let _ = ready.send(Ok(garter::PluginReady { listen, transports }));
             });
-            run_server(self.config, local, remote, shutdown, Some(bound_tx)).await
+            let result = run_server(self.config, local, remote, shutdown, Some(bound_tx)).await;
+            join_ready_holder(holder).await;
+            result
         } else {
             let (bound_tx, bound_rx) = oneshot::channel::<ClientBoundAddrs>();
-            tokio::spawn(async move {
+            let holder = tokio::spawn(async move {
                 let Ok(addrs) = bound_rx.await else { return };
                 let _ = ready.send(Ok(garter::PluginReady {
                     listen: addrs.tcp,
                     transports,
                 }));
             });
-            run_client(
+            let result = run_client(
                 self.config,
                 local,
                 remote,
@@ -1291,7 +1303,9 @@ impl garter::ChainPlugin for YamuxPlugin {
                 Some(bound_tx),
                 None,
             )
-            .await
+            .await;
+            join_ready_holder(holder).await;
+            result
         };
 
         result.map_err(|e| garter::Error::Chain(e.to_string()))

@@ -22,7 +22,7 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Owns the tokio task running the chain and a cancellation token for
 /// graceful shutdown. Drop cancels the token (SIP003u: SIGTERM on Unix,
-/// CTRL_BREAK on Windows, 5s drain timeout) and aborts the task as a
+/// CTRL_BREAK on Windows, garter's 12s default drain timeout) and aborts the task as a
 /// safety net.
 ///
 /// `Drop` does not touch the plugin state file. It aborts the chain's task

@@ -65,7 +65,7 @@ use crate::tracing_test::set_default_in_current_thread;
 // Subscriber capture ==================================================================================================
 
 /// [`make_subscriber`] that also captures `debug!` events.
-fn make_debug_subscriber() -> (impl tracing::Subscriber + Send + Sync, WaitableWriter) {
+pub(crate) fn make_debug_subscriber() -> (impl tracing::Subscriber + Send + Sync, WaitableWriter) {
     let writer = WaitableWriter::new();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer.clone())
@@ -168,7 +168,7 @@ async fn handle_stub_conn(mut stream: TcpStream, behavior: Behavior) {
     }
 }
 
-fn unused_remote() -> SocketAddr {
+pub(crate) fn unused_remote() -> SocketAddr {
     // The stubs ignore `remote`; any valid address works.
     "127.0.0.1:1".parse().unwrap()
 }
@@ -495,7 +495,7 @@ async fn counting_stream_smoke() {
 
 // Start failures ======================================================================================================
 
-type Ready = Result<PluginReady, StartError>;
+pub(crate) type Ready = Result<PluginReady, StartError>;
 
 /// Run `inner` under a tap on `local`, expecting the start to fail. Returns
 /// what the tap reported on `ready` (`Err(RecvError)` if it dropped the sender
@@ -508,7 +508,7 @@ async fn failed_start(
 }
 
 /// [`failed_start`] over a prepared tap and an explicit `remote`.
-async fn failed_start_of(
+pub(crate) async fn failed_start_of(
     tap: TapPlugin,
     local: SocketAddr,
     remote: SocketAddr,
@@ -631,9 +631,9 @@ impl ChainPlugin for FailingStub {
     }
 }
 
-/// Exits with an error while its `ready` sender is still alive, so the channel
-/// never resolves: the shape of a `BinaryPlugin` in `Probe` mode whose child
-/// died, whose probe task still holds the sender.
+/// Exits with an error while its `ready` sender is still alive in a detached
+/// task, so the channel never resolves: a plugin that breaks the `ready`
+/// contract. The tap still reads its exit as a start failure.
 struct ExitsHoldingReadyStub;
 
 #[async_trait::async_trait]
@@ -678,7 +678,7 @@ impl ChainPlugin for ParkedStub {
     }
 }
 
-fn loopback() -> SocketAddr {
+pub(crate) fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
 
@@ -864,7 +864,7 @@ async fn shutdown_before_the_inner_is_ready_drops_ready_unsent() {
 
 // Inner port pick =====================================================================================================
 
-fn addr(port: u16) -> SocketAddr {
+pub(crate) fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
@@ -873,7 +873,7 @@ fn err(kind: io::ErrorKind) -> io::Result<SocketAddr> {
 }
 
 /// A probe that returns `script` in order, then panics, and counts its calls.
-fn scripted(
+pub(crate) fn scripted(
     script: Vec<io::Result<SocketAddr>>,
     calls: &Arc<AtomicUsize>,
 ) -> impl FnMut() -> io::Result<SocketAddr> + Send + 'static {
@@ -1707,4 +1707,170 @@ async fn the_inner_exiting_ends_a_forwarder_still_retrying_its_connect() {
         "{}",
         writer.snapshot()
     );
+}
+
+// Start failures drain the inner ======================================================================================
+
+/// What a stub does before it waits for the tap to stop it.
+#[derive(Clone, Copy)]
+pub(crate) enum Prelude {
+    /// Holds `ready` and reports nothing.
+    Silent,
+    /// Reports a listener outside the address it was given.
+    ForeignListen,
+    /// Reports its own typed failure while still running.
+    TypedFatal,
+    /// Reports the address it was given, as an inner that bound it.
+    Ready,
+}
+
+/// Does what `prelude` says on `ready`, and returns the sender if the prelude keeps it.
+pub(crate) fn announce(
+    prelude: Prelude,
+    local: SocketAddr,
+    ready: oneshot::Sender<Ready>,
+) -> Option<oneshot::Sender<Ready>> {
+    match prelude {
+        Prelude::Silent => Some(ready),
+        Prelude::ForeignListen => {
+            let _ = ready.send(Ok(PluginReady {
+                listen: "10.9.8.7:80".parse().unwrap(),
+                transports: crate::sitrep::Transports::TCP,
+            }));
+            None
+        }
+        Prelude::TypedFatal => {
+            let _ = ready.send(Err(StartError::Fatal {
+                detail: "inner broke".into(),
+                errno: None,
+            }));
+            None
+        }
+        Prelude::Ready => {
+            let _ = ready.send(Ok(PluginReady {
+                listen: local,
+                transports: crate::sitrep::Transports::TCP,
+            }));
+            None
+        }
+    }
+}
+
+/// Runs its [`Prelude`], then waits to be stopped. Once stopped it holds a last line back until `gate` opens, as a
+/// plugin whose reader is still relaying stderr, and records that the line was relayed before it returns.
+struct LastLineStub {
+    prelude: Prelude,
+    /// Fires when the inner has been told to stop.
+    stopped: oneshot::Sender<()>,
+    gate: oneshot::Receiver<()>,
+    relayed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for LastLineStub {
+    fn name(&self) -> &str {
+        "last-line-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        let _held_ready = announce(self.prelude, local, ready);
+        shutdown.cancelled().await;
+        let _ = self.stopped.send(());
+        let _ = self.gate.await;
+        self.relayed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Starts a tap over a [`LastLineStub`] whose start fails, with `public` as the tap's address, and asserts the
+/// failure is not reported before the inner has relayed the last line it held back after being stopped.
+async fn assert_failure_waits_for_the_inners_last_line(
+    prelude: Prelude,
+    public: SocketAddr,
+) -> (Ready, crate::Result<()>) {
+    let (stopped_tx, stopped_rx) = oneshot::channel();
+    let (gate_tx, gate_rx) = oneshot::channel();
+    let relayed = Arc::new(AtomicBool::new(false));
+    let inner = Box::new(LastLineStub {
+        prelude,
+        stopped: stopped_tx,
+        gate: gate_rx,
+        relayed: relayed.clone(),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe = scripted(vec![Ok(addr(5001))], &calls);
+    let tap = Box::new(TapPlugin::wrap_with_probe(inner, Box::new(probe)));
+    // Never cancelled: the tap ends the inner itself.
+    let shutdown = CancellationToken::new();
+    let (ready_tx, mut ready_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move { tap.run(public, unused_remote(), shutdown, ready_tx).await });
+
+    // The gate opens only after the inner was stopped, so a failure reported first was not held for it.
+    tokio::select! {
+        biased;
+        r = &mut ready_rx => panic!("the start failure was reported ({r:?}) before the inner was stopped and its last line relayed"),
+        _ = stopped_rx => {}
+    }
+    gate_tx.send(()).unwrap();
+
+    let ready = ready_rx.await.expect("the tap dropped `ready` unsent");
+    assert!(
+        relayed.load(Ordering::SeqCst),
+        "the start failure was reported before the inner relayed its last line"
+    );
+    (ready, handle.await.expect("tap task panicked"))
+}
+
+#[skuld::test]
+async fn the_readiness_bound_failure_waits_for_the_inners_last_line() {
+    tokio::time::pause();
+    let (ready, result) = assert_failure_waits_for_the_inners_last_line(Prelude::Silent, loopback()).await;
+
+    assert!(
+        matches!(&ready, Err(StartError::Fatal { detail, .. }) if detail.contains("did not bind")),
+        "want the readiness-bound Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn a_foreign_listener_failure_waits_for_the_inners_last_line() {
+    let (ready, result) = assert_failure_waits_for_the_inners_last_line(Prelude::ForeignListen, loopback()).await;
+
+    assert!(
+        matches!(&ready, Err(StartError::Fatal { detail, .. }) if detail.contains("not the address")),
+        "want the foreign-listener Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn an_inners_typed_failure_waits_for_the_inners_last_line() {
+    let (ready, result) = assert_failure_waits_for_the_inners_last_line(Prelude::TypedFatal, loopback()).await;
+
+    assert!(
+        matches!(&ready, Err(StartError::Fatal { detail, .. }) if detail == "inner broke"),
+        "want the inner's Fatal, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+}
+
+#[skuld::test]
+async fn a_public_bind_failure_waits_for_the_inners_last_line() {
+    let holder = std::net::TcpListener::bind(loopback()).unwrap();
+    let public = holder.local_addr().unwrap();
+    let (ready, result) = assert_failure_waits_for_the_inners_last_line(Prelude::Ready, public).await;
+
+    assert!(
+        matches!(&ready, Err(StartError::BindConflict { addr, errno }) if *addr == public && *errno != 0),
+        "want BindConflict on the public address, got {ready:?}"
+    );
+    assert!(result.is_err(), "run must fail, got {result:?}");
+    drop(holder);
 }
