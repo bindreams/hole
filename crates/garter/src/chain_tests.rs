@@ -108,7 +108,7 @@ fn allocate_one_port_absorbs_transient_wsaeacces() {
 
 // Test helpers ========================================================================================================
 
-fn test_env() -> crate::sip003::PluginEnv {
+pub(crate) fn test_env() -> crate::sip003::PluginEnv {
     crate::sip003::PluginEnv {
         local_host: "127.0.0.1".parse().unwrap(),
         local_port: 0, // will be overridden by allocate_ports
@@ -1070,7 +1070,7 @@ async fn aggregator_never_reports_ready_once_shutdown_won_the_race() {
     let readiness = run_readiness_aggregator(vec![(0, rx0)], 1, Mode::Client, shutdown).await;
 
     assert!(
-        matches!(readiness, Readiness::Preempted),
+        matches!(readiness, Readiness::Preempted { .. }),
         "a chain whose plugin already exited must never be reported ready: {readiness:?}"
     );
 }
@@ -1085,7 +1085,7 @@ async fn aggregator_is_preempted_by_shutdown_on_an_empty_receiver() {
 
     let readiness = run_readiness_aggregator(vec![(0, rx0)], 1, Mode::Client, shutdown).await;
 
-    assert!(matches!(readiness, Readiness::Preempted), "{readiness:?}");
+    assert!(matches!(readiness, Readiness::Preempted { .. }), "{readiness:?}");
     drop(tx0);
 }
 
@@ -1103,7 +1103,7 @@ async fn aggregator_is_preempted_by_shutdown_on_a_closed_receiver() {
     let readiness = run_readiness_aggregator(vec![(0, rx0)], 1, Mode::Client, shutdown).await;
 
     assert!(
-        matches!(readiness, Readiness::Preempted),
+        matches!(readiness, Readiness::Preempted { .. }),
         "a sender dropped unsent must not become a synthesized Fatal in this arm: {readiness:?}"
     );
 }
@@ -1153,12 +1153,48 @@ fn the_gate_holds_a_start_failure_until_released() {
 fn the_gate_keeps_the_sender_open_when_there_is_nothing_to_report_until_released() {
     let (tx, mut rx) = oneshot::channel();
     let mut gate = ReadyGate::new(Some(tx));
+    let (_member_tx, unread) = oneshot::channel();
 
-    gate.absorb(Readiness::Preempted);
+    gate.absorb(Readiness::Preempted { unread: vec![unread] });
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 
     gate.release();
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
+}
+
+/// What the preempted plugin delivers before the release is read at the release, and only a typed failure counts: a
+/// `PluginReady` does not rescue a chain whose `shutdown` already fired.
+#[skuld::test]
+fn the_gate_reports_what_the_preempted_plugin_delivered_by_the_release() {
+    let ready = || {
+        Ok(PluginReady {
+            listen: "127.0.0.1:1080".parse().unwrap(),
+            transports: Transports::TCP,
+        })
+    };
+    for (delivered, reported_fatal) in [
+        (Some(Err(fatal())), true),
+        (Some(ready()), false),
+        // Nothing delivered, sender still open or dropped unsent.
+        (None, false),
+    ] {
+        let (tx, mut rx) = oneshot::channel();
+        let mut gate = ReadyGate::new(Some(tx));
+        let (member_tx, unread) = oneshot::channel();
+        gate.absorb(Readiness::Preempted { unread: vec![unread] });
+        assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+
+        if let Some(delivered) = &delivered {
+            member_tx.send(delivered.clone()).unwrap();
+        }
+        gate.release();
+
+        match rx.try_recv() {
+            Ok(Err(StartError::Fatal { .. })) => assert!(reported_fatal, "{delivered:?}"),
+            Err(oneshot::error::TryRecvError::Closed) => assert!(!reported_fatal, "{delivered:?}"),
+            other => panic!("{delivered:?}: {other:?}"),
+        }
+    }
 }
 
 /// A chain that never started aggregating is released the same way.
@@ -1334,8 +1370,8 @@ impl FailingChain {
 }
 
 /// How long the chain may sit idle before it counts as quiescent. Shorter than the chain's `drain_timeout` below.
-const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
-const DRAIN: std::time::Duration = std::time::Duration::from_secs(3600);
+pub(crate) const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const DRAIN: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Runs a chain of `failing` at `failing_position` and a [`LastLineMember`] on a paused clock, and asserts the
 /// caller is not told of the failure until the healthy member was stopped and relayed the line it held back.

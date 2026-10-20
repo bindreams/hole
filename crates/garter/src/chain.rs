@@ -203,9 +203,9 @@ impl ChainRunner {
     /// [`ChainRunner::run`] calls `JoinSet::abort_all` and returns
     /// `Err(Chain("drain timeout expired"))` — unless a plugin-level error
     /// was already captured, in which case that error takes precedence.
-    /// Note that aborted tasks are not joined before the function returns;
-    /// their underlying `Drop` impls run as the `JoinSet` is dropped, but
-    /// any terminal error produced during the abort window is lost.
+    /// The aborted tasks are joined before the function returns, so a
+    /// plugin that reports a start failure from its `Drop` is heard; any
+    /// other terminal error produced during the abort window is lost.
     ///
     /// It is also the bound on the wait that precedes the caller's release
     /// (see [`ChainRunner::on_ready`]): a start failure is delivered, or the
@@ -232,13 +232,11 @@ impl ChainRunner {
     /// expires (see [`ChainRunner::drain_timeout`]); the failure is reported
     /// then, with the warning that bound already logs.
     ///
-    /// If shutdown fires before every plugin has readied, `tx` is dropped
-    /// and the receiver gets `RecvError` — unless the plugin currently being
-    /// awaited had already delivered a `StartError`, which is reported rather
-    /// than discarded. A `StartError` sitting in a LATER plugin's channel is
-    /// still discarded (bindreams/hole#794). That drop waits like a failure's
-    /// report does: `RecvError` too reaches the caller only after every plugin
-    /// has returned. Only `Ok(ChainReady)` is sent at once.
+    /// If shutdown fires before every plugin has readied, the receiver gets the first `StartError` a plugin had
+    /// delivered by the time every plugin returned (in plugin order), and `RecvError` if none had. While the chain
+    /// runs the plugins are awaited in order, so a failure behind one that never readies is not seen until the
+    /// chain ends (bindreams/hole#794). Only `Ok(ChainReady)` is sent at once: every other outcome, `RecvError`
+    /// included, reaches the caller after every plugin has returned or `drain_timeout` has expired.
     pub fn on_ready(mut self, tx: oneshot::Sender<Result<ChainReady, StartError>>) -> Self {
         self.ready_tx = Some(tx);
         self
@@ -400,6 +398,9 @@ impl ChainRunner {
             Err(_timeout) => {
                 tracing::warn!("drain timeout expired, aborting remaining plugins");
                 set.abort_all();
+                // Aborting drops each plugin's future, and a plugin may deliver a start failure it decided from
+                // that drop: wait for the drops, so the gate below finds the failure.
+                while set.join_next().await.is_some() {}
                 // A plugin-level error (if captured before drain) is more
                 // diagnostic than the drain-timeout error, so it takes
                 // precedence.
@@ -424,18 +425,24 @@ pub(crate) enum Readiness {
     Ready(ChainReady),
     /// A plugin failed to start, or exited before it could say so. The chain is no longer viable.
     Failed(StartError),
-    /// `shutdown` came first: nothing to report.
-    Preempted,
+    /// `shutdown` came first, with nothing to report yet. `unread` holds the receivers it had not read, in plugin
+    /// order: a plugin may still deliver a start failure it had decided, until it returns.
+    Preempted {
+        unread: Vec<oneshot::Receiver<Result<PluginReady, StartError>>>,
+    },
 }
 
-/// The sole owner of the caller's `ready` sender. A ready chain is reported at once; every other end (a start
-/// failure, a cancel, a member that kept `ready` until it was stopped) releases the sender only through
-/// [`ReadyGate::release`], which [`ChainRunner::run`] calls once every member's `run` has returned or been given up
-/// on at `drain_timeout`. A caller that sees the sender sent or closed has therefore seen everything the members
-/// relayed first.
+/// The sole owner of the caller's `ready` sender, and the one place that decides what the caller is told. A ready
+/// chain is reported at once; every other end (a start failure, a cancel, a member that kept `ready` until it was
+/// stopped) releases the sender only through [`ReadyGate::release`], which [`ChainRunner::run`] calls once every
+/// member's `run` has returned or been given up on at `drain_timeout`. A caller that sees the sender sent or closed
+/// has therefore seen everything the members relayed first, and a failure a member decided and delivered while it
+/// stopped is found by the release, whichever way the chain ended.
 pub(crate) struct ReadyGate {
     ready_tx: Option<oneshot::Sender<Result<ChainReady, StartError>>>,
     failure: Option<StartError>,
+    /// The receivers a preempted aggregation had not read.
+    unread: Vec<oneshot::Receiver<Result<PluginReady, StartError>>>,
 }
 
 impl ReadyGate {
@@ -443,6 +450,7 @@ impl ReadyGate {
         Self {
             ready_tx,
             failure: None,
+            unread: Vec::new(),
         }
     }
 
@@ -459,14 +467,23 @@ impl ReadyGate {
                 }
             }
             Readiness::Failed(error) => self.failure = Some(error),
-            Readiness::Preempted => {}
+            Readiness::Preempted { unread } => self.unread = unread,
         }
     }
 
-    /// Sends a held failure; otherwise drops the sender unsent, which the receiver sees as `RecvError`.
+    /// Sends the failure to report, if there is one; otherwise drops the sender unsent, which the receiver sees as
+    /// `RecvError`. The failure is the one the aggregator found, or else the first typed one a preempted plugin has
+    /// delivered since, in plugin order. A delivered `Ok(PluginReady)` is not rescued, as in the aggregator:
+    /// `shutdown` is chain-wide and nothing shows the chain is still viable.
     pub(crate) fn release(self) {
         let Some(ready_tx) = self.ready_tx else { return };
-        if let Some(error) = self.failure {
+        let delivered_since = || {
+            self.unread.into_iter().find_map(|mut unread| match unread.try_recv() {
+                Ok(Err(error)) => Some(error),
+                _ => None,
+            })
+        };
+        if let Some(error) = self.failure.or_else(delivered_since) {
             let _ = ready_tx.send(Err(error));
         }
     }
@@ -499,7 +516,8 @@ pub(crate) async fn run_readiness_aggregator(
         Mode::Client => 0,
         Mode::Server => n - 1,
     };
-    for (i, mut rrx) in ready_rxs {
+    let mut unread = ready_rxs.into_iter();
+    while let Some((i, mut rrx)) = unread.next() {
         let outcome = tokio::select! {
             biased;
             () = shutdown.cancelled() => match rrx.try_recv() {
@@ -511,8 +529,13 @@ pub(crate) async fn run_readiness_aggregator(
                 // Anything else returns as before. A delivered `Ok(PluginReady)`
                 // is NOT rescued: `shutdown` is chain-wide and may have been
                 // cancelled by another plugin's exit or an external cancel, so
-                // nothing here shows the chain is still viable.
-                _ => return Readiness::Preempted,
+                // nothing here shows the chain is still viable. A failure the
+                // plugin delivers later is found by `ReadyGate::release`.
+                _ => {
+                    return Readiness::Preempted {
+                        unread: std::iter::once(rrx).chain(unread.map(|(_, rx)| rx)).collect(),
+                    }
+                }
             },
             r = &mut rrx => r,
         };

@@ -34,6 +34,8 @@ mod binary_real_child_tests;
 #[cfg(test)]
 mod binary_tests;
 #[cfg(test)]
+mod chain_failure_tests;
+#[cfg(test)]
 mod chain_tests;
 #[cfg(test)]
 mod counting_tests;
