@@ -281,14 +281,15 @@ def load_state_file() -> tuple[dict | None, list[Path]]:
         if not path.exists():
             continue
         try:
-            with path.open() as f:
+            with path.open(encoding="utf-8") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:  # ValueError: bad JSON or undecodable bytes
             print(f"  Skipping {path} ({e})")
             unreadable.append(path)
             continue
-        if not isinstance(data, dict):
-            print(f"  Skipping {path} (not a JSON object)")
+        # The reset steps below use `server_ip` as a string.
+        if not isinstance(data, dict) or not isinstance(data.get("server_ip"), str):
+            print(f"  Skipping {path} (not a JSON object with a string server_ip)")
             unreadable.append(path)
             continue
         print(f"  Found state file at {path}")
