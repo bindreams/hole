@@ -1,7 +1,12 @@
 use crate::bindir::{BindirFile, BindirSource};
-use crate::stage::stage;
+use crate::stage::{stage, stage_with};
 use std::fs;
+use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The second line of a missing-source error, as the user sees it.
+const HINT: &str = "Run `cargo build` (and `cargo xtask deps`) first.";
 
 #[skuld::test]
 fn stage_creates_out_dir_and_links_or_copies_files() {
@@ -59,6 +64,7 @@ fn stage_errors_when_source_missing() {
         msg.contains("does not exist") && msg.contains("hole.exe"),
         "expected missing-source error, got: {msg}"
     );
+    assert_eq!(msg.lines().nth(1), Some(HINT), "hint line in: {msg:?}");
 }
 
 #[skuld::test]
@@ -129,6 +135,26 @@ fn stage_errors_when_directory_source_missing() {
         msg.contains("does not exist") && msg.contains("bundle.dSYM"),
         "expected missing-directory error, got: {msg}"
     );
+    assert_eq!(msg.lines().nth(1), Some(HINT), "hint line in: {msg:?}");
+}
+
+/// A bundle named `replaced` must stage over an existing one like any other.
+#[skuld::test]
+fn stage_directory_replaces_an_existing_bundle_named_replaced() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+
+    let bundle = src_dir.path().join("replaced");
+    fs::create_dir(&bundle).unwrap();
+    fs::write(bundle.join("new.txt"), b"new").unwrap();
+    let existing = dst_dir.path().join("replaced");
+    fs::create_dir(&existing).unwrap();
+    fs::write(existing.join("stale.txt"), b"stale").unwrap();
+
+    stage(dst_dir.path(), &[BindirFile::directory(bundle, "replaced")]).unwrap();
+
+    assert!(!existing.join("stale.txt").exists());
+    assert_eq!(fs::read(existing.join("new.txt")).unwrap(), b"new");
 }
 
 #[skuld::test]
@@ -147,7 +173,7 @@ fn stage_rejects_dest_name_with_path_separator() {
     );
 }
 
-// Concurrency and atomicity (#1082) ===================================================================================
+// Concurrency and atomicity ===========================================================================================
 
 /// `dest` must never be written through: when it is already a hard link of
 /// `src` (what a concurrent stager leaves behind), copying onto it would
@@ -166,6 +192,53 @@ fn stage_leaves_src_intact_when_dest_is_a_hard_link_of_src() {
 
     assert_eq!(fs::read(&src).unwrap(), b"hole content");
     assert_eq!(fs::read(&dest).unwrap(), b"hole content");
+}
+
+/// A link step that fails, so every file takes the copy fallback.
+fn link_unsupported(_src: &Path, _staged: &Path) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// The copy fallback must not write through a `dest` that is already a hard link of `src`. A
+/// concurrent stager's link can land at `dest` at any time during our staging; here the link step
+/// plants it and then fails, so the fallback copy runs with that link in place.
+#[skuld::test]
+fn copy_fallback_leaves_src_intact_when_a_link_of_src_lands_at_dest() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+
+    let src = src_dir.path().join("hole");
+    fs::write(&src, b"hole content").unwrap();
+    let dest = dst_dir.path().join("hole");
+
+    let plant_link_at_dest_then_fail = |src: &Path, _staged: &Path| {
+        fs::hard_link(src, &dest)?;
+        Err(io::ErrorKind::Unsupported.into())
+    };
+    stage_with(
+        dst_dir.path(),
+        &[BindirFile::new(src.clone(), "hole")],
+        &plant_link_at_dest_then_fail,
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(&src).unwrap(), b"hole content");
+    assert_eq!(fs::read(&dest).unwrap(), b"hole content");
+}
+
+#[skuld::test]
+fn copy_fallback_replaces_existing_dest_file() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+
+    let src = src_dir.path().join("hole");
+    fs::write(&src, b"new content").unwrap();
+    let dest = dst_dir.path().join("hole");
+    fs::write(&dest, b"old content").unwrap();
+
+    stage_with(dst_dir.path(), &[BindirFile::new(src, "hole")], &link_unsupported).unwrap();
+
+    assert_eq!(fs::read(&dest).unwrap(), b"new content");
 }
 
 #[skuld::test]
@@ -197,11 +270,8 @@ const STAGES_PER_STAGER: usize = 150;
 
 /// Several stagers race on one `dest` while a reader polls it until they all
 /// finish. Every `stage` must return `Ok` with `dest` complete, `src` must stay
-/// whole, and the reader must never find `dest` missing or short: the old
-/// remove-then-link left a window with no file (ENOENT) and a copy-onto-a-link
-/// fallback that truncated `src`.
-#[skuld::test]
-fn concurrent_file_staging_never_hides_or_corrupts_dest() {
+/// whole, and the reader must never find `dest` missing or short.
+fn assert_concurrent_file_staging_is_safe(link: crate::stage::LinkFn<'_>) {
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
 
@@ -211,7 +281,7 @@ fn concurrent_file_staging_never_hides_or_corrupts_dest() {
     let dest = dst_dir.path().join("hole");
     let files = vec![BindirFile::new(src.clone(), "hole")];
     // The reader starts from a present dest, as in a test run that staged first.
-    stage(dst_dir.path(), &files).unwrap();
+    stage_with(dst_dir.path(), &files, link).unwrap();
 
     let done = AtomicBool::new(false);
     let reader_violations = std::sync::Mutex::new(Vec::<String>::new());
@@ -237,7 +307,7 @@ fn concurrent_file_staging_never_hides_or_corrupts_dest() {
             .map(|_| {
                 scope.spawn(|| {
                     for i in 0..STAGES_PER_STAGER {
-                        if let Err(e) = stage(dst_dir.path(), &files) {
+                        if let Err(e) = stage_with(dst_dir.path(), &files, link) {
                             stage_failures.lock().unwrap().push(format!("stage #{i}: {e:#}"));
                         }
                         let src_len = fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
@@ -271,9 +341,18 @@ fn concurrent_file_staging_never_hides_or_corrupts_dest() {
     assert_eq!(fs::read(&dest).unwrap(), content);
 }
 
+#[skuld::test]
+fn concurrent_file_staging_by_hard_link_never_hides_or_corrupts_dest() {
+    assert_concurrent_file_staging_is_safe(&|src, staged| fs::hard_link(src, staged));
+}
+
+#[skuld::test]
+fn concurrent_file_staging_by_copy_never_hides_or_corrupts_dest() {
+    assert_concurrent_file_staging_is_safe(&link_unsupported);
+}
+
 /// Directory bundles take the same path: concurrent stagers all succeed and the
-/// bundle ends complete. Unix only: bundles are macOS `.dSYM`s, never staged on Windows, whose
-/// directory renames answer a concurrent move of the same directory with `ACCESS_DENIED`.
+/// bundle ends complete. Unix only; see `stage_directory` for why Windows is excluded.
 #[cfg(unix)]
 #[skuld::test]
 fn concurrent_directory_staging_leaves_a_complete_bundle() {
