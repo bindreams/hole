@@ -16,7 +16,7 @@
 //!   Hole-side crate pinned to `debug`; override with
 //!   `HOLE_TEST_LOG=...`.
 //! * Hole's tracing-emitting panic hook
-//!   ([`hole_common::logging::install_panic_hook`]) chained before the
+//!   (`hole_common::logging::install_panic_hook`) chained before the
 //!   stdlib default — adds `target=hole::panic` events with
 //!   `force_capture` backtraces.
 //!
