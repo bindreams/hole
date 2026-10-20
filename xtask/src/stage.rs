@@ -84,7 +84,8 @@ fn stage_file(src: &Path, dest: &Path) -> Result<()> {
 /// The tree is built under a unique scratch directory beside `dest`, then the
 /// old `dest` is renamed aside and the new tree renamed into place. A directory
 /// cannot be renamed over a non-empty one, so there is a gap with no `dest`;
-/// bundles are debug symbols, never executed.
+/// bundles are debug symbols, never executed. On Windows, concurrent stagers of
+/// one directory can fail with access denied; only macOS stages a bundle.
 fn stage_directory(src: &Path, dest: &Path) -> Result<()> {
     if !src.is_dir() {
         return Err(anyhow!(
