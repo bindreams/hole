@@ -17,16 +17,26 @@
 //! acquisition cannot observe contention, only succeed or fail with an I/O
 //! error.
 //!
-//! **Open discipline (security-relevant, applies to both platforms
-//! wherever the mechanism exists):** the lock file is opened with the
-//! symlink-attack defense native to the platform (`O_NOFOLLOW` on unix,
-//! reparse-point rejection on Windows — see `open_locked` in each
-//! platform module below), its permissions are set explicitly at open
-//! rather than trusted to umask/ACL defaults, and ownership is transferred
-//! on the open file descriptor/handle, never by path — a path-based chown
-//! after the fact is a TOCTOU window on a user-writable directory (the
-//! elevation-mode state dir this exists to protect). None of the three is
-//! simplified away for either platform.
+//! **Open discipline (security-relevant).** The lock sits in a directory
+//! another principal may write (the elevation-mode state dir belongs to the
+//! interactive user), so whatever is at the lock name when it is opened is
+//! attacker-chosen. Every check and every change goes through the open
+//! descriptor/handle, never the path:
+//!
+//! - the open refuses a symlink (`O_NOFOLLOW` on unix, reparse-point rejection
+//!   on Windows);
+//! - the opened file must be a regular file with exactly one link, and (unix,
+//!   when an `owner` is given) owned by that owner or by the process itself.
+//!   A hard link planted at the lock name to some other file passes
+//!   `O_NOFOLLOW`; without this check the `fchmod`/`fchown` below would
+//!   re-permission that file. A file that fails is refused with an error
+//!   naming the path, never repaired;
+//! - only a file that passed is `fchmod`ed to `0600` and `fchown`ed to
+//!   `owner`. Windows applies no security descriptor at all, by path or by
+//!   handle: the owner-only DACL comes from the install path.
+//!
+//! The link-count window is closed: a hard link made to the lock file *after*
+//! the check can only name our own lock file, which is ours to permission.
 //!
 //! **Extensibility hook for #878's depth guard.** `#878` adds a
 //! complementary, debug-only thread-local depth guard on top of this core:
@@ -38,9 +48,20 @@
 //! release of a held token — and are deliberately no-ops here. Do not
 //! remove these calls when refactoring; they are the seam, not dead code.
 
+use std::fmt;
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as platform;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as platform;
 
 // Extensibility hooks =================================================================================================
 
@@ -54,6 +75,59 @@ fn on_acquire_entry() {}
 /// See the module doc's "Extensibility hook for #878's depth guard".
 #[inline]
 fn on_token_drop() {}
+
+// Refusal =============================================================================================================
+
+/// Why an existing lock file was refused. The one place that decides how each
+/// reason reads; platform modules only choose which reason applies.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// Not a regular file: a FIFO, device, socket or directory.
+    NotRegular,
+    /// More than one name: a hard link planted next to some other file.
+    ExtraLinks { links: u64 },
+    /// A reparse point (symlink, junction) where the lock file should be.
+    #[cfg(windows)]
+    ReparsePoint,
+    /// Owned by neither the expected owner nor this process.
+    #[cfg(unix)]
+    ForeignOwner { uid: u32 },
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::NotRegular => f.write_str("it is not a regular file"),
+            Refusal::ExtraLinks { links } => write!(f, "it has {links} links, not 1"),
+            #[cfg(windows)]
+            Refusal::ReparsePoint => f.write_str("it is a symbolic link or other reparse point"),
+            #[cfg(unix)]
+            Refusal::ForeignOwner { uid } => write!(f, "it is owned by uid {uid}"),
+        }
+    }
+}
+
+/// A [`Refusal`] together with the path it was made for; the payload of the
+/// `io::Error` the acquire functions return.
+#[derive(Debug)]
+struct Refused {
+    path: PathBuf,
+    why: Refusal,
+}
+
+impl Refused {
+    fn into_io_error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, self)
+    }
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "refusing to lock {}: {}", self.path.display(), self.why)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 // Exclusive ===========================================================================================================
 
@@ -74,11 +148,17 @@ impl Exclusive {
     /// `Ok(None)` means the lock is currently held by someone else (this
     /// process or another) — contention, not an error. `owner`, when
     /// `Some((uid, gid))`, is applied via `fchown` on the opened file
-    /// descriptor/handle once the lock is held; `None` leaves ownership
-    /// alone (the root-owned `--service` daemon case).
+    /// descriptor once the lock is held (unix; Windows ignores it), and an
+    /// existing lock file must already be owned by `uid` or by this process;
+    /// `None` leaves ownership alone and does not check it (the root-owned
+    /// `--service` daemon case).
+    ///
+    /// An existing lock file that is not a regular file with exactly one link
+    /// (or has another owner, above) is refused with an `InvalidData` error
+    /// naming the path; it is never re-permissioned.
     pub fn try_acquire(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Option<Self>> {
         on_acquire_entry();
-        match platform::open_locked(path, false)? {
+        match platform::open_locked(path, false, owner)? {
             Some(file) => {
                 platform::chown_fd(&file, owner)?;
                 Ok(Some(Exclusive { file }))
@@ -98,7 +178,7 @@ impl Exclusive {
     /// enforce that; it is a per-newtype contract, not a core one.
     pub fn acquire(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Self> {
         on_acquire_entry();
-        let file = platform::open_locked(path, true)?.expect("blocking open_locked always returns Some");
+        let file = platform::open_locked(path, true, owner)?.expect("blocking open_locked always returns Some");
         platform::chown_fd(&file, owner)?;
         Ok(Exclusive { file })
     }
@@ -110,144 +190,6 @@ impl Drop for Exclusive {
         // this open file description/handle closes, which happens when
         // `self.file` drops right after this. No explicit unlock call.
         on_token_drop();
-    }
-}
-
-// Platform: unix ======================================================================================================
-
-#[cfg(unix)]
-mod platform {
-    use super::*;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use std::os::unix::io::AsRawFd;
-
-    /// Open (creating if absent) with `O_NOFOLLOW` — refuses to follow a
-    /// symlink planted at `path`, the defense against a user-writable state
-    /// directory being used to redirect this open elsewhere — then take an
-    /// exclusive `flock` on the resulting file description, blocking or not
-    /// per `block`. `Ok(None)` only when `block` is false and the lock is
-    /// held elsewhere; a blocking open always resolves to `Ok(Some(_))` or
-    /// `Err`.
-    pub(super) fn open_locked(path: &Path, block: bool) -> io::Result<Option<File>> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-
-        // Set the mode explicitly and unconditionally rather than trust the
-        // create-time mode above to survive umask — same discipline
-        // `target.rs::save` uses for the state file itself.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-
-        let op = if block {
-            libc::LOCK_EX
-        } else {
-            libc::LOCK_EX | libc::LOCK_NB
-        };
-        // SAFETY: `file.as_raw_fd()` is a valid, open fd for the lifetime of
-        // this call (`file` is not dropped until after it returns).
-        let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
-        if rc == 0 {
-            return Ok(Some(file));
-        }
-        let err = io::Error::last_os_error();
-        if !block && err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Ok(None);
-        }
-        Err(err)
-    }
-
-    /// `fchown` on the file descriptor, never on the path — a path-based
-    /// chown after `open_locked` returns would re-open the TOCTOU window
-    /// `O_NOFOLLOW` just closed on the initial open. No-op when `owner` is
-    /// `None`.
-    pub(super) fn chown_fd(file: &File, owner: Option<(u32, u32)>) -> io::Result<()> {
-        let Some((uid, gid)) = owner else {
-            return Ok(());
-        };
-        // SAFETY: `file.as_raw_fd()` is a valid, open fd for the duration of
-        // this call.
-        let rc = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-}
-
-// Platform: windows ===================================================================================================
-
-#[cfg(windows)]
-mod platform {
-    use super::*;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
-
-    /// Windows has no direct `O_NOFOLLOW`; the equivalent defense is to open
-    /// with `FILE_FLAG_OPEN_REPARSE_POINT` (so `CreateFileW` does not
-    /// transparently follow a symlink/junction planted at `path`) and then
-    /// reject the open outright if the resulting handle turns out to be a
-    /// reparse point — refusing to follow it, same intent as `O_NOFOLLOW`.
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-
-    pub(super) fn open_locked(path: &Path, block: bool) -> io::Result<Option<File>> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-
-        // Reject a reparse point the same open_locked call would otherwise
-        // have silently traversed — see the const doc above.
-        {
-            use std::os::windows::fs::MetadataExt;
-            let attrs = file.metadata()?.file_attributes();
-            if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(io::Error::other("refusing to lock through a reparse point"));
-            }
-        }
-
-        // No POSIX mode to set here — the owner-only DACL for this file is
-        // applied by the caller's existing service/task-scheduler install
-        // path, same as `target.rs::save`'s Windows arm.
-
-        let handle = HANDLE(file.as_raw_handle());
-        let flags = if block {
-            LOCKFILE_EXCLUSIVE_LOCK
-        } else {
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
-        };
-        let mut overlapped = windows::Win32::System::IO::OVERLAPPED::default();
-        // SAFETY: `handle` is a valid, open file handle for the duration of
-        // this call; `overlapped` is a local, live for the same duration; the
-        // lock region (0..=u32::MAX twice) covers the whole file, which is
-        // never more than a few hundred bytes of JSON.
-        let result = unsafe { LockFileEx(handle, flags, None, u32::MAX, u32::MAX, &mut overlapped) };
-        match result {
-            Ok(()) => Ok(Some(file)),
-            Err(e) => {
-                if !block && e.code() == windows::Win32::Foundation::ERROR_LOCK_VIOLATION.to_hresult() {
-                    return Ok(None);
-                }
-                Err(io::Error::from(e))
-            }
-        }
-    }
-
-    /// Windows has no `fchown` equivalent; ownership here is a POSIX-only
-    /// concept (NTFS ownership is a DACL/SID, set by the caller's install
-    /// path — see `target.rs::save`'s Windows arm for the same split).
-    /// Always a no-op.
-    pub(super) fn chown_fd(_file: &File, _owner: Option<(u32, u32)>) -> io::Result<()> {
-        Ok(())
     }
 }
 
