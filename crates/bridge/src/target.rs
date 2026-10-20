@@ -22,10 +22,10 @@ use std::io::Write;
 use std::marker::PhantomData;
 use std::path::Path;
 
+use file_lock::Exclusive;
 use hole_common::config::StartupBehavior;
 use hole_common::protocol::ProxyConfig;
 use serde::{Deserialize, Serialize};
-use tun_engine::exclusive::Exclusive;
 
 // Schema ==============================================================================================================
 
@@ -400,7 +400,7 @@ const LOCK_FILE_NAME: &str = "bridge-target.json.lock";
 
 /// The bridge's one leaf lock. Held only across [`apply`]'s
 /// load-apply-save critical section — microseconds of pure file I/O, never
-/// for a session's lifetime — over the shared [`tun_engine::exclusive::Exclusive`]
+/// for a session's lifetime — over the shared [`file_lock::Exclusive`]
 /// core (see its module doc for the open discipline: `O_NOFOLLOW` +
 /// `mode(0o600)` at open + `fchown` on the fd, all security-relevant on the
 /// user-writable elevation-mode state directory).

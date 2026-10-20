@@ -2562,6 +2562,7 @@ Each publishable member declares a release group in
 | `crates/tun-engine[-macros]/`      | GPL · hole                             | TUN + routing + packet-loop engine (+ `#[freeze]` macro)                         |
 | `crates/dump[-macros]/`            | GPL · hole                             | YAML-shaped logging representation (+ derive)                                    |
 | `crates/handle-holders/`           | GPL · hole                             | File-handle introspection (Win NtQuery / mac lsof)                               |
+| `crates/file-lock/`                | GPL · —                                | `Exclusive`: cross-process file lock safe in a directory another user can write  |
 | `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                          |
 | `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                                |
 | `crates/stepstool/`                | Apache · —                             | Elevation primitives: sudo priming + wrapping (POSIX), elevation detection (Win) |

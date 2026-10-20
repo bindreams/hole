@@ -2135,6 +2135,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "file-lock"
+version = "0.1.0"
+dependencies = [
+ "hole-test-observability",
+ "libc",
+ "skuld",
+ "tempfile",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "file-rotate"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3306,6 +3317,7 @@ dependencies = [
  "drop_bomb",
  "dump",
  "ferrisetw",
+ "file-lock",
  "flate2",
  "garter",
  "handle-holders",

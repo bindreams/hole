@@ -20,7 +20,7 @@
 use std::io;
 use std::path::Path;
 
-use tun_engine::exclusive::Exclusive;
+use file_lock::Exclusive;
 
 /// Lock filename, alongside `bridge-target.json` in the same root-owned
 /// state directory. Never itself holds any state.
