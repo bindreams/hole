@@ -6,8 +6,8 @@
 //! turn a manager off on purpose (`enabled`, `enabledManagers`, `ignorePaths`, `ignoreDeps`,
 //! `packageRules`, ...) are not checked, nor is a second manager that extracts a pin again.
 //! `matchStrings` run here in Rust's `regex`, not Renovate's RE2: syntax only one engine reads (an
-//! inline flag, `\<`) is not caught here; the `renovate-config` CI step validates the file as
-//! Renovate reads it.
+//! inline flag, `\<`) is not caught here; the `renovate-config` CI step rejects only a pattern RE2
+//! cannot compile.
 
 use std::collections::BTreeSet;
 use std::fs;
