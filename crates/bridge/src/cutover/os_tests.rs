@@ -4,6 +4,19 @@ use std::cell::RefCell;
 #[derive(Default)]
 struct Recorder {
     calls: RefCell<Vec<&'static str>>,
+    /// What the repair step finds; `None` is a repair that fails.
+    #[cfg(target_os = "windows")]
+    repair: Option<RepairStep>,
+}
+
+#[cfg(target_os = "windows")]
+impl Recorder {
+    fn repairing(step: Option<RepairStep>) -> Self {
+        Self {
+            repair: step,
+            ..Self::default()
+        }
+    }
 }
 
 impl CutoverOs for Recorder {
@@ -21,6 +34,11 @@ impl CutoverOs for Recorder {
         Ok(())
     }
     #[cfg(target_os = "windows")]
+    fn repair_start_type(&mut self) -> std::io::Result<RepairStep> {
+        self.calls.borrow_mut().push("repair_start_type");
+        self.repair.ok_or_else(|| std::io::Error::other("injected"))
+    }
+    #[cfg(target_os = "windows")]
     fn start_service_wait_running(&mut self) -> std::io::Result<()> {
         self.calls.borrow_mut().push("start_wait_running");
         Ok(())
@@ -33,12 +51,48 @@ impl CutoverOs for Recorder {
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn windows_sequence_is_stop_swap_start() {
-    let mut os = Recorder::default();
-    run_cutover(&mut os).unwrap();
+fn windows_sequence_is_stop_swap_repair_start() {
+    for step in [
+        RepairStep::Nothing,
+        RepairStep::ClearRecordOnly,
+        RepairStep::ResetThenClear,
+    ] {
+        let mut os = Recorder::repairing(Some(step));
+        run_cutover(&mut os).unwrap();
+        assert_eq!(
+            *os.calls.borrow(),
+            vec!["stop_wait_stopped", "swap", "repair_start_type", "start_wait_running"],
+            "{step:?}"
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_service_an_administrator_disabled_is_not_started_and_the_cutover_says_why() {
+    let mut os = Recorder::repairing(Some(RepairStep::LeaveDisabled));
+    let error = run_cutover(&mut os).expect_err("the update cannot restart a disabled service");
+    // The images are swapped; only the start is skipped, because it would fail.
     assert_eq!(
         *os.calls.borrow(),
-        vec!["stop_wait_stopped", "swap", "start_wait_running"]
+        vec!["stop_wait_stopped", "swap", "repair_start_type"]
+    );
+    let message = error.to_string();
+    assert!(message.contains("disabled"), "{message}");
+    assert!(
+        message.contains("swapped") || message.contains("installed"),
+        "{message}"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_failed_repair_fails_the_cutover_before_the_start() {
+    let mut os = Recorder::repairing(None);
+    run_cutover(&mut os).expect_err("a failed repair is the cutover's failure");
+    assert_eq!(
+        *os.calls.borrow(),
+        vec!["stop_wait_stopped", "swap", "repair_start_type"]
     );
 }
 

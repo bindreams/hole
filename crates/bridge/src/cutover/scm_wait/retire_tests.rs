@@ -136,7 +136,7 @@ impl StopActor for FakeSession<'_> {
     }
 }
 
-impl ServiceSession for FakeSession<'_> {
+impl StartConfig for FakeSession<'_> {
     fn start_type(&mut self) -> io::Result<StartType> {
         self.call("start_type")?;
         Ok(self.start_type)
@@ -144,24 +144,27 @@ impl ServiceSession for FakeSession<'_> {
     fn set_start_type(&mut self, to: StartWrite) -> io::Result<()> {
         self.call(format!("set_start_type({to:?})"))
     }
+    fn record_state(&mut self) -> io::Result<RecordState> {
+        self.call("record_state")?;
+        Ok(self.record)
+    }
+    fn clear_record(&mut self) -> io::Result<()> {
+        self.call("clear_record")?;
+        self.record = RecordState::Absent;
+        Ok(())
+    }
+}
+
+impl ServiceSession for FakeSession<'_> {
     fn set_failure_actions(&mut self, actions: FailureActions) -> io::Result<()> {
         self.call(format!("set_failure_actions({actions:?})"))
     }
     fn delete(&mut self) -> io::Result<()> {
         self.call("delete")
     }
-    fn record_state(&mut self) -> io::Result<RecordState> {
-        self.call("record_state")?;
-        Ok(self.record)
-    }
     fn write_record(&mut self) -> io::Result<()> {
         self.call("write_record")?;
         self.record = RecordState::Present;
-        Ok(())
-    }
-    fn clear_record(&mut self) -> io::Result<()> {
-        self.call("clear_record")?;
-        self.record = RecordState::Absent;
         Ok(())
     }
 }
@@ -1122,7 +1125,7 @@ impl StopActor for Model {
     }
 }
 
-impl ServiceSession for Model {
+impl StartConfig for Model {
     fn start_type(&mut self) -> io::Result<StartType> {
         self.step(None, |_| {})?;
         Ok(self.start)
@@ -1136,12 +1139,6 @@ impl ServiceSession for Model {
             }
         })
     }
-    fn set_failure_actions(&mut self, _: FailureActions) -> io::Result<()> {
-        self.step(Some(ScmCall::ChangeServiceConfig2), |_| {})
-    }
-    fn delete(&mut self) -> io::Result<()> {
-        self.step(Some(ScmCall::DeleteService), |model| model.marked = true)
-    }
     fn record_state(&mut self) -> io::Result<RecordState> {
         self.step(None, |_| {})?;
         Ok(if self.record {
@@ -1150,11 +1147,20 @@ impl ServiceSession for Model {
             RecordState::Absent
         })
     }
-    fn write_record(&mut self) -> io::Result<()> {
-        self.step(None, |model| model.record = true)
-    }
     fn clear_record(&mut self) -> io::Result<()> {
         self.step(None, |model| model.record = false)
+    }
+}
+
+impl ServiceSession for Model {
+    fn set_failure_actions(&mut self, _: FailureActions) -> io::Result<()> {
+        self.step(Some(ScmCall::ChangeServiceConfig2), |_| {})
+    }
+    fn delete(&mut self) -> io::Result<()> {
+        self.step(Some(ScmCall::DeleteService), |model| model.marked = true)
+    }
+    fn write_record(&mut self) -> io::Result<()> {
+        self.step(None, |model| model.record = true)
     }
 }
 

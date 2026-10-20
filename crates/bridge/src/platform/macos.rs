@@ -325,6 +325,30 @@ pub fn is_installed() -> bool {
     Path::new(PLIST_PATH).exists()
 }
 
+/// launchd has no start type to disable: there is nothing to repair.
+pub fn repair_interrupted_uninstall() -> std::io::Result<crate::cutover::scm_wait::repair::RepairStep> {
+    Ok(crate::cutover::scm_wait::repair::RepairStep::Nothing)
+}
+
+/// launchd has no start type to disable, so the bridge is never disabled.
+pub fn disabled_by() -> std::io::Result<Option<crate::disable_record::DisabledBy>> {
+    Ok(None)
+}
+
+/// [`disabled_by`] for the GUI's status.
+pub fn disabled_state() -> Option<crate::disable_record::DisabledBy> {
+    None
+}
+
+/// launchd has no disabled start type to undo, so `hole bridge enable` has no
+/// macOS meaning.
+pub fn enable() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the macOS bridge has no start type to enable",
+    ))
+}
+
 /// Check whether the bridge is currently running.
 ///
 /// Its one caller is `setup::bridge_install_status`, a cosmetic status

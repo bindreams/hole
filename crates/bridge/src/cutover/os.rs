@@ -4,6 +4,9 @@
 //! `os::{windows, macos}` impls behind the bindreams/hole#165 isolation
 //! contract.
 
+#[cfg(target_os = "windows")]
+use crate::cutover::scm_wait::repair::RepairStep;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "windows")]
@@ -32,6 +35,11 @@ pub trait CutoverOs {
     /// marker-conditional disarm fires; it does not wait (a self-wait is
     /// unreachable) and `KeepAlive` respawns the new binary.
     fn stop_service_wait_stopped(&mut self) -> std::io::Result<()>;
+    /// Put the service's start type right for the start that follows, and say
+    /// what was found: an interrupted uninstall's Disabled start type is reset,
+    /// an administrator's is not. WINDOWS ONLY, like the start.
+    #[cfg(target_os = "windows")]
+    fn repair_start_type(&mut self) -> std::io::Result<RepairStep>;
     /// Start the bridge service and wait until it is really running
     /// (`StartService` + `NotifyServiceStatusChange(RUNNING)`). WINDOWS ONLY —
     /// macOS restart is `KeepAlive`-driven and never calls this.
@@ -40,9 +48,12 @@ pub trait CutoverOs {
 }
 
 /// Drive the cutover sequence. Ordering is OS-asymmetric:
-/// - Windows: stop -> swap (while no bridge runs) -> start. Stopping first
-///   bounds the gap and lets the new bridge boot from the new image
-///   deterministically. The detached child outlives the stopped service.
+/// - Windows: stop -> swap (while no bridge runs) -> repair the start type ->
+///   start. Stopping first bounds the gap and lets the new bridge boot from the
+///   new image deterministically. The detached child outlives the stopped
+///   service. A service an administrator disabled is not started (the start
+///   would fail), and that is reported as the cutover's error: the images are
+///   swapped, and the marker is cleared with the failure.
 /// - macOS: swap both images FIRST, then trigger the bridge's own graceful
 ///   shutdown (SIGTERM rides `pm.stop()`, so the marker-conditional disarm
 ///   fires). It returns there: the inline actor SIGTERMs its own process, so a
@@ -54,6 +65,12 @@ pub fn run_cutover<O: CutoverOs>(os: &mut O) -> std::io::Result<()> {
     {
         os.stop_service_wait_stopped()?;
         os.swap_images()?;
+        let repaired = os.repair_start_type()?;
+        if !repaired.starts_service() {
+            return Err(std::io::Error::other(
+                "the Hole service is disabled on this computer, so the update did not start it;                  the new files are installed (swapped in) and the service stays stopped until it is enabled",
+            ));
+        }
         os.start_service_wait_running()?;
     }
     #[cfg(target_os = "macos")]

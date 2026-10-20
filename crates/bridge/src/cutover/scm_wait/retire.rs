@@ -123,24 +123,29 @@ struct Plan {
     writes_record: bool,
 }
 
-/// The SCM operations a retirement needs on top of the stop wait, all through
-/// one service handle opened before anything is changed, so the delete, which
-/// only marks the service, cannot take it away.
-pub trait ServiceSession: StopActor {
+/// A service's start type and the record that an uninstall disabled it: what a
+/// retirement hardens and restores, and what a repair reads and resets.
+pub trait StartConfig {
     /// The start type now.
     fn start_type(&mut self) -> io::Result<StartType>;
     /// Write the start type.
     fn set_start_type(&mut self, to: StartWrite) -> io::Result<()>;
+    /// Whether the record that an uninstall disabled the service is there.
+    fn record_state(&mut self) -> io::Result<RecordState>;
+    /// Remove the record.
+    fn clear_record(&mut self) -> io::Result<()>;
+}
+
+/// The SCM operations a retirement needs on top of the stop wait, all through
+/// one service handle opened before anything is changed, so the delete, which
+/// only marks the service, cannot take it away.
+pub trait ServiceSession: StopActor + StartConfig {
     /// Write the failure actions.
     fn set_failure_actions(&mut self, actions: FailureActions) -> io::Result<()>;
     /// `DeleteService`: mark the service for deletion.
     fn delete(&mut self) -> io::Result<()>;
-    /// Whether the record that an uninstall disabled the service is there.
-    fn record_state(&mut self) -> io::Result<RecordState>;
     /// Write the record.
     fn write_record(&mut self) -> io::Result<()>;
-    /// Remove the record.
-    fn clear_record(&mut self) -> io::Result<()>;
 }
 
 /// Why a retirement failed, by the step that failed.
@@ -249,7 +254,7 @@ fn harden<S: ServiceSession>(session: &mut S) -> Result<Hardened, RetireError> {
 
 /// Remove the record. A failure is a warning: the next retirement, cutover or
 /// install sweeps a record over a service that is not Disabled.
-fn clear_record<S: ServiceSession>(session: &mut S) {
+pub(super) fn clear_record<S: StartConfig>(session: &mut S) {
     if let Err(error) = session.clear_record() {
         warn!(%error, "could not clear the record that the uninstall disabled the service");
     }

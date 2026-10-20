@@ -6,6 +6,7 @@
 
 pub mod call_error;
 pub mod hold;
+pub mod repair;
 pub mod retire;
 pub mod scan;
 pub mod settle;

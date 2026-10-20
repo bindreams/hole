@@ -14,7 +14,9 @@ use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::cutover::scm_wait::call_error::{ScmCall, ServiceGone};
+use crate::cutover::scm_wait::repair::{self, InstallStart, RepairStep};
 use crate::cutover::scm_wait::retire::{retire_over, Disposition};
+use crate::disable_record::{self, DisabledBy, RecordState};
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
 use crate::service_stop::{self, StopPhase, StopProgress};
 
@@ -22,6 +24,9 @@ use crate::service_stop::{self, StopPhase, StopProgress};
 mod retire_session;
 pub use crate::cutover::scm_wait::retire::Opening;
 pub use retire_session::{GoneSession, RetireSession};
+#[path = "windows/repair_session.rs"]
+mod repair_session;
+use repair_session::{RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
 #[path = "windows/registration.rs"]
 pub mod registration;
 #[path = "windows/service_processes.rs"]
@@ -538,6 +543,11 @@ fn service_state_dir() -> PathBuf {
 /// predates this config up to date — so a bare `install()` is not the only path
 /// that provisions it.
 pub fn install(binary_path: &Path) -> std::io::Result<()> {
+    install_as(binary_path, InstallStart::Automatic)
+}
+
+/// [`install`] with the start type the service is registered with.
+pub fn install_as(binary_path: &Path, start: InstallStart) -> std::io::Result<()> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -551,11 +561,27 @@ pub fn install(binary_path: &Path) -> std::io::Result<()> {
     let _ = std::fs::create_dir_all(&log_dir);
     let _ = std::fs::create_dir_all(&state_dir);
 
-    let service_info = ServiceInfo {
+    let service_info = service_info(binary_path, start, log_dir, state_dir);
+
+    registration::install_service(&mut NewService {
+        manager: &manager,
+        info: &service_info,
+    })?;
+    info!("Windows service installed");
+    Ok(())
+}
+
+/// What `install` registers: the bridge as `LocalSystem`, running
+/// `<binary_path> bridge run --service --log-dir <log> --state-dir <state>`.
+fn service_info(binary_path: &Path, start: InstallStart, log_dir: PathBuf, state_dir: PathBuf) -> ServiceInfo {
+    ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(SERVICE_DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
+        start_type: match start {
+            InstallStart::Automatic => ServiceStartType::AutoStart,
+            InstallStart::LeaveDisabled => ServiceStartType::Disabled,
+        },
         error_control: ServiceErrorControl::Normal,
         executable_path: binary_path.to_path_buf(),
         launch_arguments: vec![
@@ -570,14 +596,7 @@ pub fn install(binary_path: &Path) -> std::io::Result<()> {
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
-    };
-
-    registration::install_service(&mut NewService {
-        manager: &manager,
-        info: &service_info,
-    })?;
-    info!("Windows service installed");
-    Ok(())
+    }
 }
 
 /// The steps of [`install`] against the SCM.
@@ -707,6 +726,90 @@ fn open_error_is_absent(e: &windows_service::Error) -> bool {
         .and_then(|code| u32::try_from(code).ok())
         .and_then(ServiceGone::of_code)
         .is_some_and(ServiceGone::is_absent_at_open)
+}
+
+/// Puts the service's start type right before an elevated path starts it, and
+/// says what it found ([`repair::repair`]): the Disabled start type an
+/// interrupted uninstall left is reset to automatic and the record cleared; a
+/// Disabled start type with no record is an administrator's and is left, and
+/// the caller does not start the service. With no service registered, a record
+/// left over is cleared.
+pub fn repair_interrupted_uninstall() -> std::io::Result<RepairStep> {
+    let Some(mut session) = RepairSession::open(REPAIR_ACCESS)? else {
+        return clear_record_of_absent_service();
+    };
+    let step = repair::repair(&mut session).map_err(std::io::Error::other)?;
+    match step {
+        RepairStep::Nothing => {}
+        RepairStep::ClearRecordOnly => {
+            info!("swept a record that an uninstall disabled a service that is not disabled")
+        }
+        RepairStep::ResetThenClear => {
+            info!("an interrupted uninstall had left the service disabled; set it to automatic")
+        }
+        RepairStep::LeaveDisabled => info!("the service is disabled on this computer, and is left disabled"),
+    }
+    Ok(step)
+}
+
+/// A record over a service the SCM has no entry for is stale: the delete that
+/// the record covered finished.
+fn clear_record_of_absent_service() -> std::io::Result<RepairStep> {
+    let state_dir = service_state_dir();
+    match disable_record::record_state(&state_dir)? {
+        RecordState::Absent => Ok(RepairStep::Nothing),
+        RecordState::Present => {
+            if let Err(e) = disable_record::clear(&state_dir) {
+                warn!(error = %e, "could not clear the record that the uninstall disabled the service");
+            }
+            Ok(RepairStep::ClearRecordOnly)
+        }
+    }
+}
+
+/// Who disabled the service, if it is disabled, for an elevated caller: an
+/// unreadable start type or record is its error, because the caller acts on it.
+pub fn disabled_by() -> std::io::Result<Option<DisabledBy>> {
+    let Some(mut session) = RepairSession::open(READ_ACCESS)? else {
+        return Ok(None);
+    };
+    let step = repair::observe(&mut session).map_err(std::io::Error::other)?;
+    Ok(step.disabled_by())
+}
+
+/// [`disabled_by`] for a reader that must never fail (the GUI's status, which
+/// runs unprivileged). A service it cannot open or read is "not disabled", and
+/// the reason is logged, the convention of [`is_installed`].
+pub fn disabled_state() -> Option<DisabledBy> {
+    let mut session = match RepairSession::open(READ_ACCESS) {
+        Ok(Some(session)) => session,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(error = %e, "could not open the service to read whether it is disabled");
+            return None;
+        }
+    };
+    let observed = repair::observe(&mut session);
+    if let Err(e) = &observed {
+        warn!(error = %e, "could not read whether the service is disabled");
+    }
+    repair::for_display(observed)
+}
+
+/// Sets the service's start type to automatic, clears the record, and starts
+/// it: the administrator's explicit request to undo a disable, whoever made
+/// it. A service already running is success.
+pub fn enable() -> std::io::Result<()> {
+    let Some(mut session) = RepairSession::open(ENABLE_ACCESS)? else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the Hole service is not installed",
+        ));
+    };
+    repair::enable(&mut session).map_err(std::io::Error::other)?;
+    session.start()?;
+    info!("Windows service enabled and started");
+    Ok(())
 }
 
 // Start/stop ==========================================================================================================

@@ -23,7 +23,9 @@ use super::service_sid::ServiceSid;
 use super::{apply_failure_actions, open_error_is_absent, scm_failure, FAILURE_ACTIONS_ACCESS, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessSource, Reading};
-use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, StartType, StartWrite, Survivors};
+use crate::cutover::scm_wait::retire::{
+    FailureActions, Opening, ServiceSession, StartConfig, StartType, StartWrite, Survivors,
+};
 use crate::cutover::scm_wait::settle::StopActor;
 use crate::cutover::scm_wait::{observed_from_state, Observed, SystemScmActor};
 use crate::disable_record::{self, RecordState};
@@ -93,10 +95,6 @@ impl RetireSession {
             service: &self.service,
             sid: &self.sid,
         })
-    }
-
-    fn raw(&self) -> SC_HANDLE {
-        SC_HANDLE(self.service.raw_handle())
     }
 }
 
@@ -224,42 +222,25 @@ impl StopActor for RetireSession {
     }
 }
 
-impl ServiceSession for RetireSession {
+impl StartConfig for RetireSession {
     fn start_type(&mut self) -> io::Result<StartType> {
-        self.service
-            .query_config()
-            .map(|config| start_type_from(config.start_type))
-            .map_err(|e| scm_failure(ScmCall::QueryServiceConfig, e))
+        read_start_type(&self.service)
     }
 
     fn set_start_type(&mut self, to: StartWrite) -> io::Result<()> {
-        // SAFETY: the handle is the live one `self.service` owns; every pointer
-        // argument is null, which `SERVICE_NO_CHANGE` and the documented null
-        // defaults leave alone.
-        unsafe {
-            ChangeServiceConfigW(
-                self.raw(),
-                ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
-                SERVICE_START_TYPE(scm_start_type(to).to_raw()),
-                SERVICE_ERROR(SERVICE_NO_CHANGE),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                None,
-                PCWSTR::null(),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                PCWSTR::null(),
-            )
-        }
-        .map_err(|e| {
-            ScmCallError {
-                call: ScmCall::ChangeServiceConfig,
-                code: win32_code_of_hresult(e.code().0),
-            }
-            .into_io()
-        })
+        write_start_type(&self.service, to)
     }
 
+    fn record_state(&mut self) -> io::Result<RecordState> {
+        disable_record::record_state(&self.state_dir)
+    }
+
+    fn clear_record(&mut self) -> io::Result<()> {
+        disable_record::clear(&self.state_dir)
+    }
+}
+
+impl ServiceSession for RetireSession {
     fn set_failure_actions(&mut self, actions: FailureActions) -> io::Result<()> {
         match actions {
             FailureActions::None => self
@@ -276,17 +257,46 @@ impl ServiceSession for RetireSession {
             .map_err(|e| scm_failure(ScmCall::DeleteService, e))
     }
 
-    fn record_state(&mut self) -> io::Result<RecordState> {
-        disable_record::record_state(&self.state_dir)
-    }
-
     fn write_record(&mut self) -> io::Result<()> {
         disable_record::write(&self.state_dir)
     }
+}
 
-    fn clear_record(&mut self) -> io::Result<()> {
-        disable_record::clear(&self.state_dir)
+/// The start type of an open service (needs `SERVICE_QUERY_CONFIG`).
+pub(super) fn read_start_type(service: &Service) -> io::Result<StartType> {
+    service
+        .query_config()
+        .map(|config| start_type_from(config.start_type))
+        .map_err(|e| scm_failure(ScmCall::QueryServiceConfig, e))
+}
+
+/// Writes the start type of an open service (needs `SERVICE_CHANGE_CONFIG`).
+pub(super) fn write_start_type(service: &Service, to: StartWrite) -> io::Result<()> {
+    // SAFETY: the handle is the live one `service` owns; every pointer
+    // argument is null, which `SERVICE_NO_CHANGE` and the documented null
+    // defaults leave alone.
+    unsafe {
+        ChangeServiceConfigW(
+            SC_HANDLE(service.raw_handle()),
+            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+            SERVICE_START_TYPE(scm_start_type(to).to_raw()),
+            SERVICE_ERROR(SERVICE_NO_CHANGE),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            None,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+        )
     }
+    .map_err(|e| {
+        ScmCallError {
+            call: ScmCall::ChangeServiceConfig,
+            code: win32_code_of_hresult(e.code().0),
+        }
+        .into_io()
+    })
 }
 
 /// The retirement's start type for what the SCM reports.

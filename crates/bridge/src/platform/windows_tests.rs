@@ -222,3 +222,51 @@ fn the_handle_that_writes_restart_on_failure_can_start_the_service() {
         ServiceAccess::CHANGE_CONFIG | ServiceAccess::START
     );
 }
+
+// What `install` registers ============================================================================================
+
+#[skuld::test]
+fn the_registered_start_type_is_the_one_the_install_is_given() {
+    let info = |start| {
+        service_info(
+            Path::new("hole.exe"),
+            start,
+            PathBuf::from("logs"),
+            PathBuf::from("state"),
+        )
+    };
+    assert_eq!(info(InstallStart::Automatic).start_type, ServiceStartType::AutoStart);
+    assert_eq!(info(InstallStart::LeaveDisabled).start_type, ServiceStartType::Disabled);
+}
+
+#[skuld::test]
+fn the_registered_service_runs_the_bridge_as_local_system_whatever_its_start_type() {
+    for start in [InstallStart::Automatic, InstallStart::LeaveDisabled] {
+        let info = service_info(
+            Path::new("hole.exe"),
+            start,
+            PathBuf::from("logs"),
+            PathBuf::from("state"),
+        );
+        assert_eq!(info.account_name, None, "{start:?}");
+        assert_eq!(info.executable_path, PathBuf::from("hole.exe"), "{start:?}");
+        let arguments: Vec<_> = info
+            .launch_arguments
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            arguments,
+            [
+                "bridge",
+                "run",
+                "--service",
+                "--log-dir",
+                "logs",
+                "--state-dir",
+                "state"
+            ],
+            "{start:?}"
+        );
+    }
+}

@@ -470,6 +470,194 @@ fn uninstall_keep_covers_tears_down_without_releasing() {
     );
 }
 
+// `bridge install` orchestration ======================================================================================
+
+// An administrator's Disabled start type survives a reinstall (the service is
+// deleted and recreated, so it is read first), an interrupted uninstall's does
+// not, and an install over the first still succeeds so the MSI's custom action
+// does not fail on it.
+
+type StepLog = std::cell::RefCell<Vec<String>>;
+
+/// The scripted outcome of each injected effect of `install_bridge_with`.
+struct InstallScript {
+    disabled_by: std::io::Result<Option<DisabledBy>>,
+    installed: bool,
+    repair: std::io::Result<RepairStep>,
+    register: Result<(), &'static str>,
+    start: Result<(), &'static str>,
+}
+
+impl Default for InstallScript {
+    /// A first install: nothing registered, nothing to repair.
+    fn default() -> Self {
+        Self {
+            disabled_by: Ok(None),
+            installed: false,
+            repair: Ok(RepairStep::Nothing),
+            register: Ok(()),
+            start: Ok(()),
+        }
+    }
+}
+
+fn install_probe(script: InstallScript) -> (Result<(), Box<dyn std::error::Error>>, Vec<String>) {
+    let steps: StepLog = std::cell::RefCell::new(Vec::new());
+    let note = |step: &str| steps.borrow_mut().push(step.to_string());
+    let result = install_bridge_with(
+        || {
+            note("disabled_by");
+            script.disabled_by
+        },
+        || {
+            note("is_installed");
+            script.installed
+        },
+        || {
+            note("stop");
+            Ok(())
+        },
+        || {
+            note("deregister");
+            Ok(())
+        },
+        |start| {
+            note(&format!("register({start:?})"));
+            script.register.map_err(Into::into)
+        },
+        || {
+            note("repair");
+            script.repair
+        },
+        || {
+            note("start");
+            script.start.map_err(Into::into)
+        },
+    );
+    (result, steps.into_inner())
+}
+
+#[skuld::test]
+fn a_first_install_registers_automatic_repairs_and_starts() {
+    let (result, steps) = install_probe(InstallScript::default());
+    assert!(result.is_ok());
+    assert_eq!(
+        steps,
+        ["disabled_by", "is_installed", "register(Automatic)", "repair", "start"]
+    );
+}
+
+#[skuld::test]
+fn a_reinstall_stops_and_deregisters_first_and_repairs_between_the_registration_and_the_start() {
+    let (result, steps) = install_probe(InstallScript {
+        installed: true,
+        ..InstallScript::default()
+    });
+    assert!(result.is_ok());
+    assert_eq!(
+        steps,
+        [
+            "disabled_by",
+            "is_installed",
+            "stop",
+            "deregister",
+            "register(Automatic)",
+            "repair",
+            "start"
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_service_an_administrator_disabled_is_registered_disabled_not_started_and_the_install_succeeds() {
+    let (result, steps) = install_probe(InstallScript {
+        disabled_by: Ok(Some(DisabledBy::Elsewhere)),
+        installed: true,
+        repair: Ok(RepairStep::LeaveDisabled),
+        ..InstallScript::default()
+    });
+    // Ok: the MSI's custom action fails the install on a nonzero exit.
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        steps,
+        [
+            "disabled_by",
+            "is_installed",
+            "stop",
+            "deregister",
+            "register(LeaveDisabled)",
+            "repair",
+        ],
+        "the Disabled start type is read before the delete, and the service is never started"
+    );
+}
+
+#[skuld::test]
+fn a_service_an_interrupted_uninstall_disabled_is_registered_automatic_and_started() {
+    let (result, steps) = install_probe(InstallScript {
+        disabled_by: Ok(Some(DisabledBy::InterruptedUninstall)),
+        installed: true,
+        ..InstallScript::default()
+    });
+    assert!(result.is_ok());
+    assert!(steps.contains(&"register(Automatic)".to_string()), "{steps:?}");
+    assert_eq!(steps.last().map(String::as_str), Some("start"));
+}
+
+#[skuld::test]
+fn a_start_type_that_cannot_be_read_fails_the_install_before_anything_changes() {
+    let (result, steps) = install_probe(InstallScript {
+        disabled_by: Err(std::io::Error::other("injected")),
+        installed: true,
+        ..InstallScript::default()
+    });
+    let message = result
+        .expect_err("guessing not-disabled would re-enable an administrator's choice")
+        .to_string();
+    assert!(message.contains("injected"), "{message}");
+    assert_eq!(steps, ["disabled_by"]);
+}
+
+#[skuld::test]
+fn a_failed_registration_or_repair_or_start_is_the_installs_failure() {
+    let (result, steps) = install_probe(InstallScript {
+        register: Err("registration failed"),
+        ..InstallScript::default()
+    });
+    assert!(result.is_err());
+    assert_eq!(steps.last().map(String::as_str), Some("register(Automatic)"));
+
+    let (result, steps) = install_probe(InstallScript {
+        repair: Err(std::io::Error::other("repair failed")),
+        ..InstallScript::default()
+    });
+    assert!(result.is_err());
+    assert_eq!(steps.last().map(String::as_str), Some("repair"));
+
+    let (result, _) = install_probe(InstallScript {
+        start: Err("start failed"),
+        ..InstallScript::default()
+    });
+    assert!(result.is_err());
+}
+
+#[skuld::test]
+fn the_service_is_started_exactly_when_the_repair_says_it_may_be() {
+    for step in [
+        RepairStep::Nothing,
+        RepairStep::ClearRecordOnly,
+        RepairStep::ResetThenClear,
+        RepairStep::LeaveDisabled,
+    ] {
+        let (result, steps) = install_probe(InstallScript {
+            repair: Ok(step),
+            ..InstallScript::default()
+        });
+        assert!(result.is_ok(), "{step:?}");
+        assert_eq!(steps.contains(&"start".to_string()), step.starts_service(), "{step:?}");
+    }
+}
+
 // Uninstall wiring ====================================================================================================
 //
 // Everything above drives `uninstall_bridge_with` through injected closures, so
@@ -565,8 +753,9 @@ fn the_bridge_stop_is_wired_ahead_of_every_deregistration() {
     assert_eq!(
         production_call_sites(&pattern),
         expected_sites(&[
-            ("setup.rs", "install_bridge"),   // reinstall: stop before replacing the image.
-            ("setup.rs", "uninstall_bridge"), // uninstall: stop before deregistering.
+            ("setup.rs", "install_bridge"),      // reinstall: stop before replacing the image.
+            ("setup.rs", "install_bridge_with"), // the injected effect's own invocation, as below.
+            ("setup.rs", "uninstall_bridge"),    // uninstall: stop before deregistering.
             // The injected effect's own invocation, which shares the name. Worth
             // pinning rather than pattern-matching away: a body that stopped
             // calling it would leave `uninstall_bridge`'s wiring intact and dead.

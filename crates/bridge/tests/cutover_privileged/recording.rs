@@ -5,7 +5,9 @@
 
 use hole_bridge::cutover::scm_wait::call_error::{service_gone, ServiceGone};
 use hole_bridge::cutover::scm_wait::hold::Look;
-use hole_bridge::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartType, StartWrite, Survivors};
+use hole_bridge::cutover::scm_wait::retire::{
+    FailureActions, ServiceSession, StartConfig, StartType, StartWrite, Survivors,
+};
 use hole_bridge::cutover::scm_wait::settle::StopActor;
 use hole_bridge::cutover::scm_wait::Observed;
 use hole_bridge::disable_record::RecordState;
@@ -152,7 +154,7 @@ impl<S: ServiceSession> StopActor for Recording<'_, S> {
     }
 }
 
-impl<S: ServiceSession> ServiceSession for Recording<'_, S> {
+impl<S: ServiceSession> StartConfig for Recording<'_, S> {
     fn start_type(&mut self) -> std::io::Result<StartType> {
         let result = self.inner.start_type();
         self.note(Call::ReadStartType, result)
@@ -164,24 +166,26 @@ impl<S: ServiceSession> ServiceSession for Recording<'_, S> {
         self.note(Call::SetStartType, result)
     }
 
+    fn record_state(&mut self) -> std::io::Result<RecordState> {
+        self.inner.record_state()
+    }
+
+    fn clear_record(&mut self) -> std::io::Result<()> {
+        self.record(Event::ClearRecord);
+        self.inner.clear_record()
+    }
+}
+
+impl<S: ServiceSession> ServiceSession for Recording<'_, S> {
     fn set_failure_actions(&mut self, actions: FailureActions) -> std::io::Result<()> {
         self.record(Event::SetFailureActions(actions));
         let result = self.inner.set_failure_actions(actions);
         self.note(Call::SetFailureActions, result)
     }
 
-    fn record_state(&mut self) -> std::io::Result<RecordState> {
-        self.inner.record_state()
-    }
-
     fn write_record(&mut self) -> std::io::Result<()> {
         self.record(Event::WriteRecord);
         self.inner.write_record()
-    }
-
-    fn clear_record(&mut self) -> std::io::Result<()> {
-        self.record(Event::ClearRecord);
-        self.inner.clear_record()
     }
 
     fn delete(&mut self) -> std::io::Result<()> {

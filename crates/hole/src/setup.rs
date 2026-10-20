@@ -3,6 +3,9 @@
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+use hole_bridge::cutover::scm_wait::repair::{InstallStart, RepairStep};
+use hole_bridge::disable_record::DisabledBy;
+
 // Status detection ====================================================================================================
 
 /// Installation state of the bridge service.
@@ -381,19 +384,87 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
     // after install, so the installer must not silently continue.
     hole_bridge::ipc::prepare_ipc_access()?;
 
+    install_bridge_with(
+        hole_bridge::platform::os::disabled_by,
+        hole_bridge::platform::os::is_installed,
+        || {
+            hole_bridge::platform::os::ensure_stopped()?;
+            Ok(())
+        },
+        || {
+            hole_bridge::platform::os::uninstall()?;
+            Ok(())
+        },
+        |start| {
+            #[cfg(target_os = "windows")]
+            hole_bridge::platform::os::install_as(&binary_path, start)?;
+            #[cfg(not(target_os = "windows"))]
+            match start {
+                InstallStart::Automatic => hole_bridge::platform::os::install(&binary_path)?,
+                InstallStart::LeaveDisabled => unreachable!("only the Windows bridge reports a disabled service"),
+            }
+            Ok(())
+        },
+        hole_bridge::platform::os::repair_interrupted_uninstall,
+        // On macOS, install() already bootstraps with RunAtLoad=true, so the bridge starts automatically.
+        // On Windows, we need to explicitly start the service.
+        || {
+            #[cfg(target_os = "windows")]
+            hole_bridge::platform::os::start()?;
+            Ok(())
+        },
+    )
+}
+
+/// `install_bridge`'s ordering, with the effects injected so tests can drive it
+/// without touching SCM/launchd.
+///
+/// **A Disabled start type an administrator chose survives a reinstall.** The
+/// reinstall deletes and recreates the service, so the start type is read
+/// first; a service found Disabled with no record of ours is registered
+/// Disabled again and is not started, and the install still succeeds (the MSI's
+/// custom action reads the exit code). `hole bridge enable` is what undoes it.
+/// A start type the read cannot answer fails the install before anything
+/// changes: guessing "not disabled" would re-enable it.
+///
+/// **The repair follows the registration.** A record an interrupted uninstall
+/// left is cleared there (the new registration is automatic), and the repair
+/// says whether the service may be started.
+fn install_bridge_with(
+    disabled_by: impl FnOnce() -> std::io::Result<Option<DisabledBy>>,
+    is_installed: impl FnOnce() -> bool,
+    ensure_stopped: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    deregister: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    register: impl FnOnce(InstallStart) -> Result<(), Box<dyn std::error::Error>>,
+    repair: impl FnOnce() -> std::io::Result<RepairStep>,
+    start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start_type = match disabled_by() {
+        Ok(disabled_by) => InstallStart::for_disabled_by(disabled_by),
+        Err(e) => {
+            return Err(
+                format!("could not tell whether the service is disabled, so the install changed nothing: {e}").into(),
+            )
+        }
+    };
+
     // Idempotent: if already installed, stop and uninstall first
-    if hole_bridge::platform::os::is_installed() {
+    if is_installed() {
         cli_log!(info, "bridge already installed, reinstalling...");
-        let _ = hole_bridge::platform::os::ensure_stopped();
-        let _ = hole_bridge::platform::os::uninstall();
+        let _ = ensure_stopped();
+        let _ = deregister();
     }
 
-    // Install and start
-    hole_bridge::platform::os::install(&binary_path)?;
-    // On macOS, install() already bootstraps with RunAtLoad=true, so the bridge starts automatically.
-    // On Windows, we need to explicitly start the service.
-    #[cfg(target_os = "windows")]
-    hole_bridge::platform::os::start()?;
+    register(start_type)?;
+    let repaired = repair().map_err(|e| format!("could not repair the service's start type: {e}"))?;
+    if !repaired.starts_service() {
+        cli_log!(
+            warn,
+            "bridge installed; the service is disabled on this computer and was left disabled, so it is not running.              Run `hole bridge enable` to enable and start it"
+        );
+        return Ok(());
+    }
+    start()?;
 
     cli_log!(info, "bridge installed and started");
     Ok(())

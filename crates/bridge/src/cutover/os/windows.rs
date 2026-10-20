@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cutover::os::CutoverOs;
+use crate::cutover::scm_wait::repair::RepairStep;
 use crate::cutover::scm_wait::settle::{settle_stopped, SettleError};
 use crate::cutover::scm_wait::{start_via_notify, SystemScmActor};
 use crate::platform::os::SERVICE_NAME;
@@ -160,6 +161,10 @@ impl CutoverOs for WindowsCutoverOs {
     fn stop_service_wait_stopped(&mut self) -> std::io::Result<()> {
         let mut actor = SystemScmActor::open(SERVICE_NAME)?;
         settle_stopped(&mut actor).map_err(SettleError::into_io)
+    }
+
+    fn repair_start_type(&mut self) -> std::io::Result<RepairStep> {
+        crate::platform::os::repair_interrupted_uninstall()
     }
 
     fn start_service_wait_running(&mut self) -> std::io::Result<()> {
