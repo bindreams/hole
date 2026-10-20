@@ -280,9 +280,9 @@ impl ChainPlugin for TapPlugin {
                 return failed_start_result(&plugin_name, join);
             }
             () = shutdown.cancelled() => {
-                // Drop `ready` unsent (RecvError, matching the "shutdown
-                // before ready" semantics). Wait for inner to unwind and propagate.
-                return drain_inner(plugin_name.as_str(), inner_handle).await;
+                // Wait for inner to unwind and propagate. `ready` goes unsent (RecvError, matching the "shutdown
+                // before ready" semantics) unless the inner delivers a typed start failure while it unwinds.
+                return drain_after_shutdown(plugin_name.as_str(), ready, &mut inner_ready_rx, inner_handle).await;
             }
         };
         let inner_target = match reported {
@@ -520,6 +520,26 @@ fn failed_start_result(
             "tap[{plugin_name}]: inner exited before becoming ready"
         ))),
         failed => failed,
+    }
+}
+
+/// [`drain_inner`] for a shutdown before the inner readied. A typed start failure the inner delivers while it unwinds
+/// (a `BinaryPlugin` delivers a failure it decided at the end of its take-down) is forwarded on `ready` and fails the
+/// tap, as for an inner that exited on its own.
+async fn drain_after_shutdown(
+    plugin_name: &str,
+    ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    inner_ready_rx: &mut oneshot::Receiver<Result<PluginReady, StartError>>,
+    inner_handle: AbortOnDropHandle<crate::Result<()>>,
+) -> crate::Result<()> {
+    let join = inner_handle.await;
+    if let Ok(Err(typed)) = inner_ready_rx.try_recv() {
+        report_start_failure(plugin_name, ready, Some(typed));
+        return failed_start_result(plugin_name, join);
+    }
+    match join {
+        Err(je) if je.is_cancelled() => Ok(()),
+        join => join_result(plugin_name, join),
     }
 }
 

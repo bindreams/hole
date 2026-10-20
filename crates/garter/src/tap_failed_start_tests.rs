@@ -411,3 +411,101 @@ async fn an_inner_that_returns_ok_before_ready_fails_the_start_and_the_tap() {
         );
     }
 }
+
+// A start failure decided before a shutdown ---------------------------------------------------------------------------
+
+/// Announces it is running, waits for its token, then delivers a typed start failure and ends: the order a
+/// `BinaryPlugin` has, which delivers a failure it decided only at the end of its take-down.
+struct DeliversAfterStop {
+    error: StartError,
+    running: oneshot::Sender<()>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for DeliversAfterStop {
+    fn name(&self) -> &str {
+        "delivers-after-stop-stub"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Ready>,
+    ) -> crate::Result<()> {
+        let _ = self.running.send(());
+        shutdown.cancelled().await;
+        // On a current-thread runtime this puts the delivery behind the tap, already woken by the same cancel.
+        tokio::task::yield_now().await;
+        let _ = ready.send(Err(self.error));
+        Err(crate::Error::Chain("the stub decided its start failed".into()))
+    }
+}
+
+/// What a chain over `plugin` tells `on_ready` when its token is cancelled once `plugin` is running, and what `run`
+/// returns.
+async fn cancelled_chain_of(
+    plugin: Box<dyn ChainPlugin>,
+    running: oneshot::Receiver<()>,
+) -> (
+    Result<Result<crate::chain::ChainReady, StartError>, oneshot::error::RecvError>,
+    crate::Result<()>,
+) {
+    let cancel = CancellationToken::new();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(plugin)
+        .on_ready(ready_tx)
+        .cancel_token(cancel.clone());
+    let mut env = crate::chain_tests::test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    let handle = tokio::spawn(runner.run(env));
+    running.await.expect("the stub never ran");
+    cancel.cancel();
+    let heard = ready_rx.await;
+    (heard, handle.await.unwrap())
+}
+
+/// A start failure the inner decided before the chain's shutdown reaches `on_ready` typed, tapped or not.
+#[skuld::test]
+async fn a_start_failure_the_inner_delivers_while_the_tap_drains_it_is_still_reported() {
+    let errors = [
+        StartError::Fatal {
+            detail: "decided earlier".into(),
+            errno: None,
+        },
+        StartError::BindConflict {
+            errno: 98,
+            addr: loopback(),
+        },
+    ];
+    for error in errors {
+        for tapped in [false, true] {
+            let (running_tx, running_rx) = oneshot::channel();
+            let inner = Box::new(DeliversAfterStop {
+                error: error.clone(),
+                running: running_tx,
+            });
+            let plugin: Box<dyn ChainPlugin> = if tapped {
+                Box::new(TapPlugin::wrap(inner))
+            } else {
+                inner
+            };
+            let (heard, result) = cancelled_chain_of(plugin, running_rx).await;
+            let label = format!("{error:?}, tapped={tapped}");
+            let typed = match (&heard, &error) {
+                (Ok(Err(StartError::Fatal { detail, .. })), StartError::Fatal { detail: want, .. }) => detail == want,
+                (Ok(Err(StartError::BindConflict { errno, addr })), StartError::BindConflict { errno: e, addr: a }) => {
+                    errno == e && addr == a
+                }
+                _ => false,
+            };
+            assert!(typed, "{label}: want the inner's own failure, got {heard:?}");
+            assert!(
+                result.is_err(),
+                "{label}: a failed start fails the chain, got {result:?}"
+            );
+        }
+    }
+}
