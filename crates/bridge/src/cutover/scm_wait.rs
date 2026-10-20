@@ -263,7 +263,8 @@ pub trait ScmActor {
 /// the wait's own: the actor's [`ScmActor::process_fate`] is the ground truth
 /// when the SCM's status lags the process.
 ///
-/// The cutover's `stop_service_wait_stopped` and the `retire` session use this.
+/// The `retire` session uses this. The cutover's `stop_service_wait_stopped`
+/// runs [`settle::settle_stopped`].
 pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
     a.arm(WantState::Stopped, None)?;
     let mut observed = a.wait_callback()?;
@@ -342,14 +343,17 @@ mod system {
         ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING,
     };
     use windows::Win32::System::Services::{
-        ControlService, NotifyServiceStatusChangeW, StartServiceW, SC_HANDLE, SERVICE_CONTROL_STOP, SERVICE_NOTIFY,
-        SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE,
-        SERVICE_NOTIFY_STOPPED, SERVICE_NOTIFY_STOP_PENDING, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
+        ControlService, NotifyServiceStatusChangeW, QueryServiceStatusEx, StartServiceW, SC_STATUS_PROCESS_INFO,
+        SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING,
+        SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOPPED, SERVICE_NOTIFY_STOP_PENDING, SERVICE_QUERY_STATUS,
+        SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP,
         SERVICE_STOPPED, SERVICE_STOP_PENDING,
     };
     use windows::Win32::System::Threading::SleepEx;
 
     use super::call_error::{self, win32_code_of_hresult, ScmCall, ScmCallError};
+    use super::hold::Look;
+    use super::settle::{StopActor, WaitKind};
     use super::{states_to_arm, Observed, ProcessFate, WantState};
     use crate::cutover::registration::{Arming, Registration, Settle};
 
@@ -529,7 +533,8 @@ mod system {
             None
         }
 
-        /// `Some(error)` makes `reopen` fail to open the handles with it.
+        /// Called before each arm opens its handles. `Some(error)` makes that
+        /// open fail with it.
         fn fail_open(&mut self) -> Option<io::Error> {
             None
         }
@@ -541,9 +546,13 @@ mod system {
 
     impl Hooks for NoHooks {}
 
-    /// Owns the SCM + service handles and the registration of the latest `arm`.
+    /// Owns the SCM + service handles the queries and controls use, the handles
+    /// of the latest arm, and the registration of that arm.
     ///
-    /// Each `arm` builds a fresh [`NotifyRecord`] instead of rewriting one, so a
+    /// Each arm opens handles of its own, so no arm repeats the same service and
+    /// state on one handle, which the SCM does not queue at once
+    /// ([`NotifyServiceStatusChangeW`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-notifyservicestatuschangew#remarks)).
+    /// It also builds a fresh [`NotifyRecord`] instead of rewriting one, so a
     /// callback from an earlier arm can never see a buffer a later arm is filling.
     /// A record is freed only after its callback has run, so an APC the SCM
     /// already queued still finds live memory at the thread's next alertable
@@ -553,9 +562,12 @@ mod system {
     /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`. Nothing caps how many such calls
     /// are made (the LAGGING retry has no cap), so nothing caps the leak.
     pub struct SystemScmActor<H: Hooks = NoHooks> {
-        /// `None` only after a `reopen` that failed part-way; every use then errs.
-        /// Declared before `arming` so the handles close first on drop.
-        handles: Option<Handles>,
+        /// The handles of the latest arm. The next arm closes them, which cancels
+        /// what is outstanding on them. Declared before `arming` so they close
+        /// first on drop.
+        armed: Option<Handles>,
+        /// The handles for queries and controls.
+        handles: Handles,
         service_name: HSTRING,
         /// What the latest `arm` left behind; only a confirmed one is waited on.
         arming: Arming<NotifyRecord>,
@@ -579,10 +591,17 @@ mod system {
         /// outcomes they intercept.
         #[doc(hidden)]
         pub fn open_with(service_name: &str, hooks: H) -> io::Result<Self> {
+            Self::open_with_access(service_name, SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START, hooks)
+        }
+
+        /// [`open_with`](Self::open_with) with the query and control handle
+        /// opened for `access` only.
+        fn open_with_access(service_name: &str, access: u32, hooks: H) -> io::Result<Self> {
             let name = HSTRING::from(service_name);
-            let handles = Handles::open(&name)?;
+            let handles = Handles::open(&name, access)?;
             Ok(Self {
-                handles: Some(handles),
+                armed: None,
+                handles,
                 service_name: name,
                 arming: Arming::Idle,
                 awaiting: WantState::Stopped,
@@ -591,43 +610,27 @@ mod system {
             })
         }
 
-        /// Close + reopen both handles. Used on
-        /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`, which the SCM raises when the
-        /// client missed a notification: the handle's notify queue must be
-        /// dropped and re-established.
-        fn reopen(&mut self) -> io::Result<()> {
-            // Close first (the documented remedy), by taking the handles out so a
-            // failed open below leaves nothing for `Drop` to close again.
-            self.handles = None;
-            let opened = match self.hooks.fail_open() {
-                Some(error) => Err(error),
-                None => Handles::open(&self.service_name),
-            };
-            self.handles = Some(opened?);
-            Ok(())
-        }
-
-        /// The open service handle, or an error after a failed `reopen`.
-        fn service(&self) -> io::Result<SC_HANDLE> {
-            self.handles
-                .as_ref()
-                .map(Handles::service)
-                .ok_or_else(|| io::Error::other("SCM handles closed by a failed reopen"))
-        }
-    }
-
-    // No `Drop` impl: field order is the drop order.
-
-    impl<H: Hooks> super::ScmActor for SystemScmActor<H> {
-        fn arm(&mut self, want: WantState, except: Option<Observed>) -> io::Result<()> {
-            self.awaiting = want;
-            let mask = states_to_mask(&states_to_arm(want, self.started, except));
+        /// Arms a notification for `states` on handles opened for it, closing
+        /// the previous arm's first.
+        ///
+        /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` means the client missed a
+        /// notification and "should close the handle to the SCM, open a new
+        /// handle, and call this function again": the next pass of the loop,
+        /// which opens fresh handles for every arm.
+        fn arm_states(&mut self, states: &[Observed]) -> io::Result<()> {
+            let mask = states_to_mask(states);
             // Whatever this arm does, the previous one is no longer what a wait
             // may rely on.
             self.arming.unconfirm();
             loop {
+                // Closing the previous handles cancels what is outstanding on them.
+                self.armed = None;
+                let opened = match self.hooks.fail_open() {
+                    Some(error) => Err(error),
+                    None => Handles::open(&self.service_name, SERVICE_QUERY_STATUS),
+                };
+                let service = self.armed.insert(opened?).service();
                 // Before the record exists: a failure here registers nothing.
-                let service = self.service()?;
                 let registration = NotifyRecord::registered();
                 let buffer = registration.get().buffer();
                 let address = registration.get() as *const NotifyRecord as usize;
@@ -635,7 +638,8 @@ mod system {
                 self.arming.begin(registration);
                 let rc = match self.hooks.intercept_notify(address) {
                     Some(rc) => rc.get(),
-                    // SAFETY: `service` is a live handle and `buffer` points at the
+                    // SAFETY: `service` is a live handle (`armed` closes it only
+                    // on the next arm or on drop) and `buffer` points at the
                     // record `arming` now owns, which is freed only once settled.
                     None => unsafe { NotifyServiceStatusChangeW(service, mask, buffer) },
                 };
@@ -644,9 +648,8 @@ mod system {
                     return Ok(());
                 }
                 if rc == ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.0 {
-                    tracing::warn!("SCM notify client lagging: reopening the SCM handles and arming again");
-                    self.reopen()?;
-                    continue; // re-arm against the fresh handle
+                    tracing::warn!("SCM notify client lagging: arming again on fresh handles");
+                    continue;
                 }
                 return Err(ScmCallError {
                     call: ScmCall::NotifyServiceStatusChange,
@@ -656,42 +659,12 @@ mod system {
             }
         }
 
-        fn control_stop(&mut self) -> io::Result<()> {
-            let mut status = SERVICE_STATUS::default();
-            let service = self.service()?;
-            match unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut status) } {
-                Ok(()) => Ok(()),
-                Err(e) => Err(ScmCallError {
-                    call: ScmCall::ControlService,
-                    code: win32_code_of_hresult(e.code().0),
-                }
-                .into_io()),
-            }
-        }
-
-        fn start(&mut self) -> io::Result<()> {
-            let r = self.service().and_then(|service| {
-                unsafe { StartServiceW(service, None) }.map_err(|e| {
-                    ScmCallError {
-                        call: ScmCall::StartService,
-                        code: win32_code_of_hresult(e.code().0),
-                    }
-                    .into_io()
-                })
-            });
-            // Mark started even if StartServiceW errored: the two-phase arm keys on
-            // "start was attempted", and the caller propagates the error anyway.
-            self.started = true;
-            r
-        }
-
-        fn wait_callback(&mut self) -> io::Result<Observed> {
-            // A failed reopen closed the handles, and nothing can fire without
-            // them.
-            self.service()?;
+        /// Sleeps until the latest arm's notification fires and returns the
+        /// state it reports, as the SCM's number.
+        fn wait_for_the_armed_notification(&mut self) -> io::Result<u32> {
             // Alertable wait: blocks until the SCM delivers the notify APC, which
             // runs `notify_callback` and sets `status.fired`. A spurious early
-            // wake (an unrelated APC) re-enters the wait. Only the last `arm`'s
+            // wake (an unrelated APC) re-enters the wait. Only the last arm's
             // record, and only if its call succeeded, is one the SCM will fire.
             let Some(record) = self.arming.confirmed() else {
                 return Err(io::Error::other("wait_callback without a successful arm"));
@@ -704,6 +677,51 @@ mod system {
             // Trace here, NOT in `notify_callback`: that runs in an APC where any
             // allocation/lock (which `tracing` may take) is a hazard.
             tracing::debug!(scm_current_state = state, awaiting = ?self.awaiting, "SCM status callback fired");
+            Ok(state)
+        }
+
+        /// `ControlService(STOP)` on the control handle.
+        fn send_stop(&mut self) -> io::Result<()> {
+            let mut status = SERVICE_STATUS::default();
+            match unsafe { ControlService(self.handles.service(), SERVICE_CONTROL_STOP, &mut status) } {
+                Ok(()) => Ok(()),
+                Err(e) => Err(ScmCallError {
+                    call: ScmCall::ControlService,
+                    code: win32_code_of_hresult(e.code().0),
+                }
+                .into_io()),
+            }
+        }
+    }
+
+    // No `Drop` impl: field order is the drop order.
+
+    impl<H: Hooks> super::ScmActor for SystemScmActor<H> {
+        fn arm(&mut self, want: WantState, except: Option<Observed>) -> io::Result<()> {
+            self.awaiting = want;
+            self.arm_states(&states_to_arm(want, self.started, except))
+        }
+
+        fn control_stop(&mut self) -> io::Result<()> {
+            self.send_stop()
+        }
+
+        fn start(&mut self) -> io::Result<()> {
+            let r = unsafe { StartServiceW(self.handles.service(), None) }.map_err(|e| {
+                ScmCallError {
+                    call: ScmCall::StartService,
+                    code: win32_code_of_hresult(e.code().0),
+                }
+                .into_io()
+            });
+            // Mark started even if StartServiceW errored: the two-phase arm keys on
+            // "start was attempted", and the caller propagates the error anyway.
+            self.started = true;
+            r
+        }
+
+        fn wait_callback(&mut self) -> io::Result<Observed> {
+            let state = self.wait_for_the_armed_notification()?;
             observed_from_state(state).ok_or_else(|| {
                 io::Error::other(format!(
                     "the SCM reported service state {state}, which no wait here arms for"
@@ -713,6 +731,73 @@ mod system {
 
         fn process_fate(&mut self) -> io::Result<ProcessFate> {
             Ok(ProcessFate::Unheld)
+        }
+    }
+
+    /// This actor holds no process: it queries the SCM's state and arms on it,
+    /// and its looks name no process ([`ProcessFate::Unheld`]), so the loop
+    /// never waits on one.
+    impl<H: Hooks> StopActor for SystemScmActor<H> {
+        fn observe(&mut self) -> io::Result<Look> {
+            let mut status = SERVICE_STATUS_PROCESS::default();
+            let mut needed = 0u32;
+            // SAFETY: the buffer is `status`'s own storage, of exactly its size,
+            // and the handle is live for `self`.
+            unsafe {
+                QueryServiceStatusEx(
+                    self.handles.service(),
+                    SC_STATUS_PROCESS_INFO,
+                    Some(std::slice::from_raw_parts_mut(
+                        std::ptr::from_mut(&mut status).cast::<u8>(),
+                        std::mem::size_of::<SERVICE_STATUS_PROCESS>(),
+                    )),
+                    &mut needed,
+                )
+            }
+            .map_err(|e| {
+                ScmCallError {
+                    call: ScmCall::QueryServiceStatusEx,
+                    code: win32_code_of_hresult(e.code().0),
+                }
+                .into_io()
+            })?;
+            let state = status.dwCurrentState.0;
+            let observed = observed_from_state(state).ok_or_else(|| {
+                io::Error::other(format!(
+                    "the service reported state {state}, which is not one it can be stopped from"
+                ))
+            })?;
+            Ok(Look {
+                observed,
+                fate: ProcessFate::Unheld,
+                held_alive: false,
+                ever_held: false,
+            })
+        }
+
+        fn arm_leaving(&mut self, from: Observed) -> io::Result<()> {
+            self.awaiting = WantState::Stopped;
+            self.arm_states(&states_to_arm(WantState::Stopped, false, Some(from)))
+        }
+
+        fn control_stop(&mut self) -> io::Result<()> {
+            self.send_stop()
+        }
+
+        /// The wait kind selects a failure bound once the owner sets one; until
+        /// then every wait is unbounded.
+        fn await_callback(&mut self, _kind: WaitKind) -> io::Result<()> {
+            self.wait_for_the_armed_notification().map(drop)
+        }
+
+        fn await_held_exits(&mut self, _kind: WaitKind) -> io::Result<()> {
+            unreachable!("a look of this actor holds no process, so no step waits for one to exit")
+        }
+
+        /// Holds nothing: the cutover's stop does not look for a process the SCM
+        /// no longer names.
+        fn hold_scanned(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 }

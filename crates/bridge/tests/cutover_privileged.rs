@@ -438,6 +438,43 @@ fn cutover_global_net_state_real_scm_restart_gates_on_running_callback() {
         .expect("SCM restart must reach RUNNING via NotifyServiceStatusChange");
 }
 
+/// The cutover's stop wait on a service whose first instance fails on its Stop
+/// and which the SCM restarts at once (restart-on-failure with no delay, and no
+/// hardening, as the cutover leaves it). The wait arms before the Stop, so the
+/// Stop's effect queues the callback whether it finds the service stopped or
+/// already restarted, and it returns on a real event.
+///
+/// What the test proves is that the wait returns: a wait that armed after the
+/// Stop, or that left out the state the restarted instance is in, can sleep
+/// for good, and the job's wall clock is then the failure. It does not assert
+/// the state afterwards, since a wait that reads the crashed instance's STOPPED
+/// before the SCM's restart has run is right to return.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_stop_wait_returns_when_the_scm_restarts_the_service_at_once() {
+    use hole_bridge::cutover::os::windows::WindowsCutoverOs;
+    use hole_bridge::cutover::os::CutoverOs;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("crashed");
+    let _service = ProvisionedService::install_with(
+        helper,
+        vec!["--crash-on-first-stop".into(), marker.clone().into_os_string()],
+        Some(std::time::Duration::ZERO),
+    );
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    os.start_service_wait_running()
+        .expect("bring the throwaway service up via the production start seam");
+
+    os.stop_service_wait_stopped()
+        .expect("the stop wait returns although the SCM restarts the service at once");
+    assert!(marker.exists(), "the first instance must have failed on its Stop");
+}
+
 /// Reports whether this thread freed one watched block. The SCM's queueing is
 /// not observable from outside the process, so the release of the notify record
 /// itself is the observable.
@@ -497,7 +534,8 @@ struct Script {
     records: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
     /// Per `NotifyServiceStatusChangeW` call: `Some(rc)` replaces the call with a failure.
     notify: std::collections::VecDeque<Option<std::num::NonZeroU32>>,
-    /// Per `reopen`: `Some(error)` makes the handles fail to open.
+    /// Per arm attempt, before it opens its handles: `Some(error)` makes the
+    /// open fail.
     open: std::collections::VecDeque<Option<std::io::Error>>,
     /// The call whose record to hand to `freed_watch` as it is created.
     watch_call: Option<usize>,
@@ -697,11 +735,11 @@ fn cutover_global_net_state_waiting_after_an_arm_that_failed_over_a_good_one_err
     );
 }
 
-/// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` reopens the handles and arms again on
-/// the fresh ones. The lagging call's record is leaked, not freed.
+/// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` arms again on handles opened for the
+/// retry. The lagging call's record is leaked, not freed.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_a_lagging_client_reopens_and_arms_again() {
+fn cutover_global_net_state_a_lagging_client_arms_again_on_fresh_handles() {
     use hole_bridge::cutover::os::windows::WindowsCutoverOs;
     use hole_bridge::cutover::os::CutoverOs;
     use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
@@ -725,7 +763,7 @@ fn cutover_global_net_state_a_lagging_client_reopens_and_arms_again() {
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
     actor
         .arm(WantState::Stopped, None)
-        .expect("the retry arms on the reopened handles");
+        .expect("the retry arms on fresh handles");
     assert_eq!(records.borrow().len(), 2, "the lagging call is retried once");
     assert_eq!(
         actor.wait_callback().expect("the retried notification fires at once"),
@@ -738,37 +776,46 @@ fn cutover_global_net_state_a_lagging_client_reopens_and_arms_again() {
     );
 }
 
-/// A failed reopen leaves the actor without handles: every later use errs, and
-/// the lagging call's record, whose callback never ran, is not freed on drop.
+/// A retry whose handles fail to open fails that arm only: the actor's own
+/// handle still answers, a later arm works, and the lagging call's record,
+/// whose callback never ran, is not freed.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_a_failed_reopen_leaves_every_use_erring() {
-    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
+fn cutover_global_net_state_a_failed_open_for_a_retry_fails_that_arm_only() {
+    use hole_bridge::cutover::scm_wait::settle::StopActor;
+    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
     use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let _service = ProvisionedService::install(helper);
 
-    let (mut script, _records) = Script::new();
+    let (mut script, records) = Script::new();
     script
         .notify
         .push_back(std::num::NonZeroU32::new(ERROR_SERVICE_NOTIFY_CLIENT_LAGGING.0));
+    // The first attempt opens as usual; its retry's open fails.
+    script.open.push_back(None);
     script
         .open
         .push_back(Some(std::io::Error::other("injected open failure")));
     script.watch_call = Some(0);
     let mut actor = SystemScmActor::open_with(SERVICE_NAME, script).expect("open the throwaway service");
 
-    let err = actor.arm(WantState::Running, None).expect_err("the reopen fails");
+    let err = actor.arm(WantState::Running, None).expect_err("the retry's open fails");
     assert!(
         err.to_string().contains("injected open failure"),
         "unexpected error: {err}"
     );
-    actor.arm(WantState::Running, None).expect_err("no handles to arm on");
-    actor.control_stop().expect_err("no handles to stop through");
-    actor.start().expect_err("no handles to start through");
+    assert_eq!(records.borrow().len(), 1, "no record is made for an open that failed");
     actor.wait_callback().expect_err("the last arm failed");
+    assert_eq!(
+        actor.observe().expect("the actor's own handle still answers").observed,
+        Observed::Stopped
+    );
+    actor
+        .arm(WantState::Running, None)
+        .expect("a later arm opens handles of its own");
     drop(actor);
     assert!(
         !freed_watch::was_freed(),

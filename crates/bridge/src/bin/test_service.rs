@@ -36,6 +36,10 @@
 //! - `--parked-event <event>`: signalled once the process is parked by one of
 //!   the two flags above, so a test can tell the hold is in force without
 //!   guessing at timing.
+//! - `--crash-on-first-stop <marker>`: on the first Stop any instance of the
+//!   service takes, create `<marker>` and exit without reporting STOPPED, so
+//!   the SCM sees the service fail and applies its failure actions. Later
+//!   instances (the marker exists) stop as usual.
 //! - `--running-event <event>`: signalled right after the service reports
 //!   RUNNING, once per start. A test that resets it before it kills the service
 //!   learns the SCM's restarted instance is up from the signal.
@@ -81,6 +85,7 @@ struct Args {
     delay_attach: Option<String>,
     parked_event: Option<String>,
     running_event: Option<String>,
+    crash_on_first_stop: Option<PathBuf>,
     pid_log: Option<PathBuf>,
     sid_repair_log: Option<PathBuf>,
 }
@@ -98,6 +103,7 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
             Some("--release-event") => args.release_event = Some(value.into_string().expect("event name is UTF-8")),
             Some("--pid-log") => args.pid_log = Some(PathBuf::from(value)),
             Some("--sid-repair-log") => args.sid_repair_log = Some(PathBuf::from(value)),
+            Some("--crash-on-first-stop") => args.crash_on_first_stop = Some(PathBuf::from(value)),
             Some("--hold-start") => args.hold_start = Some(value.into_string().expect("event name is UTF-8")),
             Some("--parked-event") => args.parked_event = Some(value.into_string().expect("event name is UTF-8")),
             Some("--running-event") => args.running_event = Some(value.into_string().expect("event name is UTF-8")),
@@ -279,6 +285,17 @@ fn service_main(_arguments: Vec<OsString>) {
         signal(name);
     }
     let _ = stop_rx.blocking_recv(); // park until SCM sends STOP
+    if let Some(marker) = &args.crash_on_first_stop {
+        // `create_new` fails once the marker exists, so only one instance crashes.
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker)
+            .is_ok()
+        {
+            std::process::exit(1);
+        }
+    }
     if let Some(release) = release {
         // SAFETY: `release` is the live event handle opened above.
         unsafe { WaitForSingleObject(release, INFINITE) };
