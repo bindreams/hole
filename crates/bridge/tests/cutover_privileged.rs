@@ -2666,6 +2666,12 @@ fn cutover_global_net_state_uninstall_stops_a_service_marked_between_the_hardeni
         [(recording::Call::Delete, true)],
         "the only refusal is the delete, answered as marked: {trace:#?}"
     );
+    assert_eq!(
+        events.last(),
+        Some(&recording::Event::ClearRecord),
+        "a delete answered as marked is a delete done, and the record goes after it: {trace:#?}"
+    );
+    trace.assert_the_record_written_was_cleared();
 }
 
 /// A service marked for deletion that has already stopped, its process gone,

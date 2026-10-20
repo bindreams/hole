@@ -5,6 +5,7 @@ use super::*;
 use crate::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Look, ProcessFate};
 use crate::cutover::scm_wait::Observed;
+use crate::disable_record::RecordState;
 
 /// A look at a service whose process is held and alive.
 fn running() -> Look {
@@ -35,6 +36,8 @@ struct FakeSession<'a> {
     log: &'a Log,
     looks: VecDeque<Look>,
     start_type: StartType,
+    /// Whether the record is there: `write_record` sets it, `clear_record` unsets it.
+    record: RecordState,
     /// `(call, n)`: the n-th (1-based) occurrence of `call` fails with a plain error.
     fail: Vec<(&'static str, usize)>,
     /// `(call, error)`: the first occurrence of `call` fails with `error`.
@@ -50,6 +53,7 @@ impl<'a> FakeSession<'a> {
             log,
             looks: looks.into(),
             start_type: StartType::Auto,
+            record: RecordState::Absent,
             fail: vec![],
             fail_with: vec![],
             open_refused_at_look: None,
@@ -64,6 +68,11 @@ impl<'a> FakeSession<'a> {
 
     fn with_start_type(mut self, start_type: StartType) -> Self {
         self.start_type = start_type;
+        self
+    }
+
+    fn with_record(mut self, record: RecordState) -> Self {
+        self.record = record;
         self
     }
 
@@ -141,14 +150,35 @@ impl ServiceSession for FakeSession<'_> {
     fn delete(&mut self) -> io::Result<()> {
         self.call("delete")
     }
+    fn record_state(&mut self) -> io::Result<RecordState> {
+        self.call("record_state")?;
+        Ok(self.record)
+    }
+    fn write_record(&mut self) -> io::Result<()> {
+        self.call("write_record")?;
+        self.record = RecordState::Present;
+        Ok(())
+    }
+    fn clear_record(&mut self) -> io::Result<()> {
+        self.call("clear_record")?;
+        self.record = RecordState::Absent;
+        Ok(())
+    }
 }
 
 fn logged(log: &Log) -> Vec<String> {
     log.borrow().clone()
 }
 
-/// What the hardening writes, in order.
-const HARDEN: [&str; 3] = ["start_type", "set_start_type(Disabled)", "set_failure_actions(None)"];
+/// What the hardening of an `Auto` service with no record does, in order: the
+/// record is written before the start type is disabled.
+const HARDEN: [&str; 5] = [
+    "start_type",
+    "record_state",
+    "write_record",
+    "set_start_type(Disabled)",
+    "set_failure_actions(None)",
+];
 /// The settle loop over a service that is running and then stopped.
 const STOP_AND_SETTLE: [&str; 6] = [
     "observe",
@@ -158,8 +188,9 @@ const STOP_AND_SETTLE: [&str; 6] = [
     "hold_scanned",
     "observe",
 ];
-/// What a restore of an `Auto` service writes: the failure actions, then the start type last.
-const RESTORE_AUTO: [&str; 2] = ["set_failure_actions(Restart)", "set_start_type(Auto)"];
+/// What a restore of an `Auto` service we disabled does: the failure actions,
+/// then the start type, then the record last.
+const RESTORE_AUTO: [&str; 3] = ["set_failure_actions(Restart)", "set_start_type(Auto)", "clear_record"];
 
 fn scm_error(call: ScmCall, code: u32) -> io::Error {
     ScmCallError { call, code }.into_io()
@@ -168,7 +199,7 @@ fn scm_error(call: ScmCall, code: u32) -> io::Error {
 // The order of a retirement ===========================================================================================
 
 #[skuld::test]
-fn deregistering_hardens_settles_then_deletes_and_nothing_follows_the_delete() {
+fn deregistering_hardens_settles_then_deletes_and_only_the_record_follows_the_delete() {
     let log = Log::default();
     let mut session = FakeSession::running_then_stopped(&log);
     retire(&mut session, Disposition::Deregister).unwrap();
@@ -176,7 +207,7 @@ fn deregistering_hardens_settles_then_deletes_and_nothing_follows_the_delete() {
         .iter()
         .chain(&STOP_AND_SETTLE)
         .copied()
-        .chain(["delete"])
+        .chain(["delete", "clear_record"])
         .collect();
     assert_eq!(logged(&log), expected);
 }
@@ -251,7 +282,11 @@ fn each_failure_before_the_delete_restores_and_returns_its_own_variant() {
         assert!(is_expected(&error), "{what}: {error}");
         let logged = logged(log);
         assert!(!logged.contains(&"delete".to_owned()), "{what}: {logged:?}");
-        assert_eq!(logged[logged.len() - 2..], RESTORE_AUTO, "{what}: {logged:?}");
+        assert_eq!(
+            logged[logged.len() - RESTORE_AUTO.len()..],
+            RESTORE_AUTO,
+            "{what}: {logged:?}"
+        );
     }
 }
 
@@ -262,8 +297,8 @@ fn a_failed_delete_restores_and_is_the_delete_variant() {
     let error = retire(&mut session, Disposition::Deregister).expect_err("the delete failed");
     assert!(matches!(error, RetireError::Delete(_)), "{error}");
     let logged = logged(&log);
-    assert_eq!(logged[logged.len() - 2..], RESTORE_AUTO, "{logged:?}");
-    assert_eq!(logged[logged.len() - 3], "delete", "{logged:?}");
+    assert_eq!(logged[logged.len() - RESTORE_AUTO.len()..], RESTORE_AUTO, "{logged:?}");
+    assert_eq!(logged[logged.len() - RESTORE_AUTO.len() - 1], "delete", "{logged:?}");
 }
 
 /// `DeleteService` says the service is already marked for deletion: someone
@@ -275,7 +310,7 @@ fn a_delete_that_finds_the_service_already_marked_is_a_success_and_restores_noth
         .failing_with("delete", scm_error(ScmCall::DeleteService, 1072));
     retire(&mut session, Disposition::Deregister).unwrap();
     let logged = logged(&log);
-    assert_eq!(logged.last().map(String::as_str), Some("delete"), "{logged:?}");
+    assert_eq!(logged[logged.len() - 2..], ["delete", "clear_record"], "{logged:?}");
 }
 
 /// The SCM has no entry left at the delete: that is not "already done"; the
@@ -295,7 +330,8 @@ fn a_failed_stop_only_wait_restores_before_returning_the_error() {
     let mut session = FakeSession::new(&log, vec![running()]).failing("await_held_exits");
     let error = retire(&mut session, Disposition::StopOnly).expect_err("the wait failed");
     assert!(matches!(error, RetireError::Exit(_)), "{error}");
-    assert_eq!(logged(&log).last().map(String::as_str), Some("set_start_type(Auto)"));
+    let logged = logged(&log);
+    assert_eq!(logged[logged.len() - RESTORE_AUTO.len()..], RESTORE_AUTO, "{logged:?}");
 }
 
 /// A refused open of the service's process (or of its token) is not the step
@@ -330,15 +366,25 @@ fn a_refused_token_read_is_the_hold_variant_whichever_step_needed_the_process() 
 
 // The hardening =======================================================================================================
 
-/// The start type is the first thing written: a failure there leaves nothing
-/// changed, so there is nothing to put back.
+/// The start type is the first service setting written: a failure there leaves
+/// nothing changed but the record written before it, which is cleared.
 #[skuld::test]
-fn a_start_type_that_cannot_be_disabled_fails_the_retirement_and_restores_nothing() {
+fn a_start_type_that_cannot_be_disabled_fails_the_retirement_and_clears_only_the_record_it_wrote() {
     let log = Log::default();
     let mut session = FakeSession::running_then_stopped(&log).failing("set_start_type(Disabled)");
     let error = retire(&mut session, Disposition::Deregister).expect_err("the start type write failed");
     assert!(matches!(error, RetireError::Harden(_)), "{error}");
-    assert_eq!(logged(&log), ["start_type", "set_start_type(Disabled)"]);
+    assert_eq!(
+        logged(&log),
+        [
+            "start_type",
+            "record_state",
+            "write_record",
+            "set_start_type(Disabled)",
+            "clear_record"
+        ]
+    );
+    assert_eq!(session.record, RecordState::Absent);
 }
 
 #[skuld::test]
@@ -348,6 +394,7 @@ fn a_start_type_that_cannot_be_read_fails_the_retirement_before_anything_is_writ
     let error = retire(&mut session, Disposition::Deregister).expect_err("the start type read failed");
     assert!(matches!(error, RetireError::Harden(_)), "{error}");
     assert_eq!(logged(&log), ["start_type"]);
+    assert_eq!(session.record, RecordState::Absent);
 }
 
 #[skuld::test]
@@ -365,7 +412,12 @@ fn a_restore_that_cannot_write_the_failure_actions_still_writes_the_start_type()
     let log = Log::default();
     let mut session = FakeSession::running_then_stopped(&log).failing("set_failure_actions(Restart)");
     retire(&mut session, Disposition::StopOnly).unwrap();
-    assert_eq!(logged(&log).last().map(String::as_str), Some("set_start_type(Auto)"));
+    let logged = logged(&log);
+    assert_eq!(
+        logged[logged.len() - 2..],
+        ["set_start_type(Auto)", "clear_record"],
+        "{logged:?}"
+    );
 }
 
 #[skuld::test]
@@ -376,32 +428,204 @@ fn a_restore_that_cannot_write_the_start_type_is_not_a_failed_stop() {
     retire(&mut session, Disposition::StopOnly).unwrap();
 }
 
-/// What the retirement leaves for a service that was left Disabled is what the
-/// product treats as working, not what an interrupted retirement leaves.
-#[skuld::test]
-fn the_start_type_put_back_is_the_one_observed_unless_it_was_disabled() {
-    let table = [
-        (StartType::Auto, StartWrite::Auto),
-        (StartType::Demand, StartWrite::Demand),
-        (StartType::Disabled, StartWrite::Auto),
-        (StartType::Other, StartWrite::Auto),
-    ];
-    for (observed, restored) in table {
-        assert_eq!(Hardening { observed }.restored(), restored, "{observed:?}");
-    }
+// The record ==========================================================================================================
+
+fn position(logged: &[String], call: &str) -> usize {
+    logged
+        .iter()
+        .position(|logged| logged == call)
+        .unwrap_or_else(|| panic!("{call} was never called: {logged:?}"))
 }
 
 #[skuld::test]
-fn a_service_found_disabled_is_restored_to_auto_and_one_found_on_demand_to_on_demand() {
-    for (observed, written) in [
-        (StartType::Disabled, "set_start_type(Auto)"),
-        (StartType::Demand, "set_start_type(Demand)"),
-    ] {
-        let log = Log::default();
-        let mut session = FakeSession::running_then_stopped(&log).with_start_type(observed);
-        retire(&mut session, Disposition::StopOnly).unwrap();
-        assert_eq!(logged(&log).last().map(String::as_str), Some(written), "{observed:?}");
+fn the_record_is_written_before_the_start_type_is_disabled() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log);
+    retire(&mut session, Disposition::StopOnly).unwrap();
+    let logged = logged(&log);
+    assert!(
+        position(&logged, "write_record") < position(&logged, "set_start_type(Disabled)"),
+        "{logged:?}"
+    );
+}
+
+/// A failed write changes nothing: the start type is not touched, and the
+/// failure is the record's own.
+#[skuld::test]
+fn a_failed_record_write_changes_nothing_and_is_a_record_error() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log).failing("write_record");
+    let error = retire(&mut session, Disposition::Deregister).expect_err("the record write failed");
+    assert!(matches!(error, RetireError::Record(_)), "{error}");
+    assert_eq!(logged(&log), ["start_type", "record_state", "write_record"]);
+}
+
+#[skuld::test]
+fn a_record_that_cannot_be_read_is_a_record_error_before_anything_is_written() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log).failing("record_state");
+    let error = retire(&mut session, Disposition::Deregister).expect_err("the record read failed");
+    assert!(matches!(error, RetireError::Record(_)), "{error}");
+    assert_eq!(logged(&log), ["start_type", "record_state"]);
+}
+
+/// The start type put back: the one observed, except that `Other` (a boot or
+/// system start, which a service of its own process never has) becomes `Auto`,
+/// and `Disabled` becomes `Auto` only when the disable is ours.
+#[skuld::test]
+fn restored_is_one_table_over_observed_and_ours() {
+    let table = [
+        (StartType::Auto, true, StartWrite::Auto),
+        (StartType::Auto, false, StartWrite::Auto),
+        (StartType::Demand, true, StartWrite::Demand),
+        (StartType::Demand, false, StartWrite::Demand),
+        (StartType::Disabled, true, StartWrite::Auto),
+        (StartType::Disabled, false, StartWrite::Disabled),
+        (StartType::Other, true, StartWrite::Auto),
+        (StartType::Other, false, StartWrite::Auto),
+    ];
+    for (observed, ours, restored) in table {
+        assert_eq!(
+            Hardening { observed, ours }.restored(),
+            restored,
+            "{observed:?}, ours {ours}"
+        );
     }
+}
+
+/// An administrator's Disable is not ours to undo: no record is written for it
+/// or cleared, and what is put back is Disabled.
+#[skuld::test]
+fn a_disabled_service_without_a_record_is_not_ours_and_is_restored_disabled() {
+    for disposition in [Disposition::StopOnly, Disposition::Deregister] {
+        let log = Log::default();
+        let mut session = FakeSession::running_then_stopped(&log).with_start_type(StartType::Disabled);
+        retire(&mut session, disposition).unwrap_or_else(|e| panic!("{disposition:?}: {e}"));
+        let logged = logged(&log);
+        assert!(
+            !logged.contains(&"write_record".to_owned()),
+            "{disposition:?}: {logged:?}"
+        );
+        assert!(
+            !logged.contains(&"clear_record".to_owned()),
+            "{disposition:?}: {logged:?}"
+        );
+        if disposition == Disposition::StopOnly {
+            assert_eq!(
+                logged.last().map(String::as_str),
+                Some("set_start_type(Disabled)"),
+                "{logged:?}"
+            );
+        }
+        assert_eq!(session.record, RecordState::Absent, "{disposition:?}");
+    }
+}
+
+/// A Disabled service with a record is ours: put back as Automatic, and the
+/// record, which already exists, is neither rewritten nor kept.
+#[skuld::test]
+fn a_disabled_service_with_a_record_is_restored_automatic_and_the_record_cleared() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log)
+        .with_start_type(StartType::Disabled)
+        .with_record(RecordState::Present);
+    retire(&mut session, Disposition::StopOnly).unwrap();
+    let logged = logged(&log);
+    assert!(!logged.contains(&"write_record".to_owned()), "{logged:?}");
+    assert_eq!(logged[logged.len() - RESTORE_AUTO.len()..], RESTORE_AUTO, "{logged:?}");
+    assert_eq!(session.record, RecordState::Absent);
+}
+
+#[skuld::test]
+fn a_service_found_on_demand_is_restored_to_on_demand_and_its_record_cleared() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log).with_start_type(StartType::Demand);
+    retire(&mut session, Disposition::StopOnly).unwrap();
+    let logged = logged(&log);
+    assert_eq!(
+        logged[logged.len() - 3..],
+        ["set_failure_actions(Restart)", "set_start_type(Demand)", "clear_record"],
+        "{logged:?}"
+    );
+}
+
+/// A record over a service that is not Disabled is stale: the retirement
+/// restores the start type as observed and sweeps it, without writing it again.
+#[skuld::test]
+fn a_stale_record_over_a_service_that_is_not_disabled_is_swept() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log).with_record(RecordState::Present);
+    retire(&mut session, Disposition::StopOnly).unwrap();
+    let logged = logged(&log);
+    assert!(!logged.contains(&"write_record".to_owned()), "{logged:?}");
+    assert_eq!(logged[logged.len() - RESTORE_AUTO.len()..], RESTORE_AUTO, "{logged:?}");
+    assert_eq!(session.record, RecordState::Absent);
+}
+
+/// The record goes only after the start type is written back: a record cleared
+/// first, then a failure, would leave a Disabled service that looks like an
+/// administrator's.
+#[skuld::test]
+fn the_record_is_cleared_after_the_start_type_is_written_back_and_not_before() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log);
+    retire(&mut session, Disposition::StopOnly).unwrap();
+    let logged = logged(&log);
+    assert!(
+        position(&logged, "set_start_type(Auto)") < position(&logged, "clear_record"),
+        "{logged:?}"
+    );
+}
+
+#[skuld::test]
+fn a_failed_start_type_restore_leaves_the_record() {
+    let log = Log::default();
+    let mut session =
+        FakeSession::running_then_stopped(&log).failing_with("set_start_type(Auto)", io::Error::other("no"));
+    retire(&mut session, Disposition::StopOnly).unwrap();
+    assert!(
+        !logged(&log).contains(&"clear_record".to_owned()),
+        "the service is still Disabled"
+    );
+    assert_eq!(session.record, RecordState::Present);
+}
+
+/// Clearing the record is the last step of an uninstall that has already
+/// deleted the service: it warns when it fails.
+#[skuld::test]
+fn a_record_that_cannot_be_cleared_is_not_a_failed_retirement() {
+    for disposition in [Disposition::StopOnly, Disposition::Deregister] {
+        let log = Log::default();
+        let mut session = FakeSession::running_then_stopped(&log).failing("clear_record");
+        retire(&mut session, disposition).unwrap_or_else(|e| panic!("{disposition:?}: {e}"));
+    }
+}
+
+/// The record is cleared after the delete, and also after a delete answering
+/// that the service is already marked, which is a delete done.
+#[skuld::test]
+fn a_deregister_clears_the_record_after_the_delete_and_after_a_delete_answering_1072() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log);
+    retire(&mut session, Disposition::Deregister).unwrap();
+    let logged_ok = logged(&log);
+    assert_eq!(
+        logged_ok[logged_ok.len() - 2..],
+        ["delete", "clear_record"],
+        "{logged_ok:?}"
+    );
+
+    let log = Log::default();
+    let mut session =
+        FakeSession::running_then_stopped(&log).failing_with("delete", scm_error(ScmCall::DeleteService, 1072));
+    retire(&mut session, Disposition::Deregister).unwrap();
+    let logged_marked = logged(&log);
+    assert_eq!(
+        logged_marked[logged_marked.len() - 2..],
+        ["delete", "clear_record"],
+        "{logged_marked:?}"
+    );
+    assert_eq!(session.record, RecordState::Absent);
 }
 
 // A service marked for deletion =======================================================================================
@@ -421,13 +645,46 @@ fn a_start_type_write_answered_as_marked_goes_on_to_the_stop_wait() {
         let mut session = FakeSession::running_then_stopped(&log)
             .failing_with("set_start_type(Disabled)", marked_at_the_start_type_write());
         retire(&mut session, disposition).unwrap_or_else(|e| panic!("{disposition:?}: {e}"));
-        let expected: Vec<&str> = ["start_type", "set_start_type(Disabled)"]
-            .iter()
-            .chain(&STOP_AND_SETTLE)
-            .copied()
-            .collect();
+        // The record this call wrote is cleared at once: nothing was disabled.
+        let expected: Vec<&str> = [
+            "start_type",
+            "record_state",
+            "write_record",
+            "set_start_type(Disabled)",
+            "clear_record",
+        ]
+        .iter()
+        .chain(&STOP_AND_SETTLE)
+        .copied()
+        .collect();
         assert_eq!(logged(&log), expected, "{disposition:?}");
+        assert_eq!(session.record, RecordState::Absent, "{disposition:?}");
     }
+}
+
+/// A record written by an earlier, interrupted uninstall is not this call's to
+/// clear: nothing was written, so nothing is cleared.
+#[skuld::test]
+fn a_marked_answer_clears_the_record_this_call_wrote_and_keeps_a_stale_one() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log)
+        .with_record(RecordState::Present)
+        .failing_with("set_start_type(Disabled)", marked_at_the_start_type_write());
+    retire(&mut session, Disposition::Deregister).unwrap();
+    let logged = logged(&log);
+    assert!(!logged.contains(&"write_record".to_owned()), "{logged:?}");
+    assert!(!logged.contains(&"clear_record".to_owned()), "{logged:?}");
+    assert_eq!(session.record, RecordState::Present);
+
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log)
+        .failing_with("set_start_type(Disabled)", marked_at_the_start_type_write());
+    retire(&mut session, Disposition::Deregister).unwrap();
+    assert_eq!(
+        session.record,
+        RecordState::Absent,
+        "the record this call wrote is gone"
+    );
 }
 
 #[skuld::test]
@@ -454,7 +711,17 @@ fn a_start_type_write_that_fails_otherwise_is_the_retirements_failure() {
         );
         let error = retire(&mut session, Disposition::Deregister).expect_err("the write failed");
         assert!(matches!(error, RetireError::Harden(_)), "{code}: {error}");
-        assert_eq!(logged(&log), ["start_type", "set_start_type(Disabled)"], "{code}");
+        assert_eq!(
+            logged(&log),
+            [
+                "start_type",
+                "record_state",
+                "write_record",
+                "set_start_type(Disabled)",
+                "clear_record"
+            ],
+            "{code}"
+        );
     }
 }
 
@@ -479,7 +746,10 @@ fn a_mark_at_the_first_arm_is_waited_out_on_the_held_process() {
         retire(&mut session, disposition).unwrap_or_else(|e| panic!("{disposition:?}: {e}"));
         let expected = [
             "start_type",
+            "record_state",
+            "write_record",
             "set_start_type(Disabled)",
+            "clear_record",
             "observe",
             "arm_leaving(StartPending)",
             "hold_scanned",
@@ -736,7 +1006,226 @@ fn an_opened_session_never_scans_for_survivors() {
         .iter()
         .chain(&STOP_AND_SETTLE)
         .copied()
-        .chain(["delete"])
+        .chain(["delete", "clear_record"])
         .collect();
     assert_eq!(logged(&log), expected);
+}
+
+// Where a retirement can be cut short =================================================================================
+
+/// What goes wrong at the n-th call (1-based) of a retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// The call fails and changes nothing.
+    Fails(usize),
+    /// The call succeeds and the process dies right after it.
+    Killed(usize),
+    /// Someone else's delete marks the service just before the call: from then
+    /// on the SCM answers a configuration write, an arm and a delete with
+    /// `ERROR_SERVICE_MARKED_FOR_DELETE`.
+    MarkedBefore(usize),
+}
+
+/// The process dying: unwinds without a panic message, and is caught by the
+/// harness, so nothing after the call that carried it runs.
+struct Killed;
+
+/// A service and its record, as the SCM and the state directory hold them,
+/// checked after every call.
+struct Model {
+    start: StartType,
+    record: bool,
+    marked: bool,
+    stopped: bool,
+    /// Disabled with no record when the retirement began: an administrator's.
+    administrators: bool,
+    calls: usize,
+    fault: Option<Fault>,
+}
+
+impl Model {
+    fn new(start: StartType, record: bool, fault: Option<Fault>) -> Self {
+        Self {
+            start,
+            record,
+            marked: false,
+            stopped: false,
+            administrators: start == StartType::Disabled && !record,
+            calls: 0,
+            fault,
+        }
+    }
+
+    /// The invariants of the record, true after every call. A service marked
+    /// for deletion is going away, so only a live one is held to them.
+    fn check(&self) {
+        if self.marked {
+            return;
+        }
+        if self.administrators {
+            assert!(
+                self.start == StartType::Disabled && !self.record,
+                "an administrator's disable was changed: start {:?}, record {}",
+                self.start,
+                self.record
+            );
+        } else {
+            assert!(
+                !(self.start == StartType::Disabled && !self.record),
+                "a service this retirement disabled is Disabled with no record"
+            );
+        }
+    }
+
+    /// One call: counts it, applies the fault, runs `apply` and checks the
+    /// invariants. `refused_when_marked` names the SCM call a mark makes the
+    /// SCM answer 1072.
+    fn step(&mut self, refused_when_marked: Option<ScmCall>, apply: impl FnOnce(&mut Self)) -> io::Result<()> {
+        self.calls += 1;
+        if self.fault == Some(Fault::MarkedBefore(self.calls)) {
+            self.marked = true;
+        }
+        if self.fault == Some(Fault::Fails(self.calls)) {
+            return Err(io::Error::other("injected"));
+        }
+        if let (true, Some(call)) = (self.marked, refused_when_marked) {
+            return Err(scm_error(call, 1072));
+        }
+        apply(self);
+        self.check();
+        if self.fault == Some(Fault::Killed(self.calls)) {
+            std::panic::resume_unwind(Box::new(Killed));
+        }
+        Ok(())
+    }
+}
+
+impl StopActor for Model {
+    fn observe(&mut self) -> io::Result<Look> {
+        self.step(None, |_| {})?;
+        Ok(if self.stopped { stopped() } else { running() })
+    }
+    fn arm_leaving(&mut self, _: Observed) -> io::Result<()> {
+        self.step(Some(ScmCall::NotifyServiceStatusChange), |_| {})
+    }
+    fn control_stop(&mut self) -> io::Result<()> {
+        self.step(None, |model| model.stopped = true)
+    }
+    fn await_callback(&mut self) -> io::Result<()> {
+        self.step(None, |_| {})
+    }
+    fn await_held_exits(&mut self) -> io::Result<()> {
+        self.step(None, |_| {})
+    }
+    fn hold_scanned(&mut self) -> io::Result<()> {
+        self.step(None, |_| {})
+    }
+}
+
+impl ServiceSession for Model {
+    fn start_type(&mut self) -> io::Result<StartType> {
+        self.step(None, |_| {})?;
+        Ok(self.start)
+    }
+    fn set_start_type(&mut self, to: StartWrite) -> io::Result<()> {
+        self.step(Some(ScmCall::ChangeServiceConfig), |model| {
+            model.start = match to {
+                StartWrite::Auto => StartType::Auto,
+                StartWrite::Demand => StartType::Demand,
+                StartWrite::Disabled => StartType::Disabled,
+            }
+        })
+    }
+    fn set_failure_actions(&mut self, _: FailureActions) -> io::Result<()> {
+        self.step(Some(ScmCall::ChangeServiceConfig2), |_| {})
+    }
+    fn delete(&mut self) -> io::Result<()> {
+        self.step(Some(ScmCall::DeleteService), |model| model.marked = true)
+    }
+    fn record_state(&mut self) -> io::Result<RecordState> {
+        self.step(None, |_| {})?;
+        Ok(if self.record {
+            RecordState::Present
+        } else {
+            RecordState::Absent
+        })
+    }
+    fn write_record(&mut self) -> io::Result<()> {
+        self.step(None, |model| model.record = true)
+    }
+    fn clear_record(&mut self) -> io::Result<()> {
+        self.step(None, |model| model.record = false)
+    }
+}
+
+const STARTS: [StartType; 4] = [
+    StartType::Auto,
+    StartType::Demand,
+    StartType::Disabled,
+    StartType::Other,
+];
+
+/// Runs a retirement over every starting point, every disposition and every
+/// fault at every call the clean run makes, and fails with the scenario that
+/// broke an invariant. The number of faults is the number of calls of the
+/// clean run: nothing is sampled.
+fn under_every_fault(only: impl Fn(StartType, bool) -> bool) {
+    for start in STARTS {
+        for record in [false, true] {
+            if !only(start, record) {
+                continue;
+            }
+            for disposition in [Disposition::StopOnly, Disposition::Deregister] {
+                let mut clean = Model::new(start, record, None);
+                retire(&mut clean, disposition).unwrap_or_else(|e| panic!("{start:?}/{record}/{disposition:?}: {e}"));
+                for n in 1..=clean.calls {
+                    for fault in [Fault::Fails(n), Fault::Killed(n), Fault::MarkedBefore(n)] {
+                        let mut model = Model::new(start, record, Some(fault));
+                        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _ = retire(&mut model, disposition);
+                        }));
+                        let Err(payload) = ran else { continue };
+                        if payload.is::<Killed>() {
+                            continue;
+                        }
+                        let message = payload
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                            .unwrap_or_else(|| "a panic with no message".into());
+                        panic!("{start:?} with record {record}, {disposition:?}, {fault:?}: {message}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The kill point: whatever call a retirement fails or dies at, and whether or
+/// not someone else marks the service meanwhile, a live service this
+/// retirement disabled has its record.
+#[skuld::test]
+fn at_no_point_is_a_service_we_disabled_left_without_a_record() {
+    under_every_fault(|start, record| !(start == StartType::Disabled && !record));
+}
+
+/// An administrator's Disable stays exactly as it was, with no record made,
+/// whatever call a retirement fails or dies at.
+#[skuld::test]
+fn a_service_an_administrator_disabled_is_never_touched_at_any_step() {
+    under_every_fault(|start, record| start == StartType::Disabled && !record);
+}
+
+/// A retirement that completes leaves no record behind, whatever it began with.
+#[skuld::test]
+fn a_completed_retirement_leaves_no_record() {
+    for start in STARTS {
+        for record in [false, true] {
+            for disposition in [Disposition::StopOnly, Disposition::Deregister] {
+                let mut model = Model::new(start, record, None);
+                retire(&mut model, disposition).unwrap();
+                assert!(!model.record, "{start:?} with record {record}, {disposition:?}");
+            }
+        }
+    }
 }

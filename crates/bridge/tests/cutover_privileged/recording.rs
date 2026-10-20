@@ -8,6 +8,7 @@ use hole_bridge::cutover::scm_wait::hold::Look;
 use hole_bridge::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartType, StartWrite, Survivors};
 use hole_bridge::cutover::scm_wait::settle::StopActor;
 use hole_bridge::cutover::scm_wait::Observed;
+use hole_bridge::disable_record::RecordState;
 use hole_bridge::platform::os::{Opening, RetireSession};
 
 /// A call on the session the SCM can refuse.
@@ -39,6 +40,9 @@ pub enum Event {
     HoldScanned,
     SetStartType(StartWrite),
     SetFailureActions(FailureActions),
+    /// The record that an uninstall disabled the service, written or removed.
+    WriteRecord,
+    ClearRecord,
     /// The delete, with the start type the SCM held at that moment, if a read
     /// of it was answered.
     Delete {
@@ -166,6 +170,20 @@ impl<S: ServiceSession> ServiceSession for Recording<'_, S> {
         self.note(Call::SetFailureActions, result)
     }
 
+    fn record_state(&mut self) -> std::io::Result<RecordState> {
+        self.inner.record_state()
+    }
+
+    fn write_record(&mut self) -> std::io::Result<()> {
+        self.record(Event::WriteRecord);
+        self.inner.write_record()
+    }
+
+    fn clear_record(&mut self) -> std::io::Result<()> {
+        self.record(Event::ClearRecord);
+        self.inner.clear_record()
+    }
+
     fn delete(&mut self) -> std::io::Result<()> {
         // The read is the test's own, as in `control_stop`.
         let start_type = self.inner.start_type().ok();
@@ -221,7 +239,7 @@ impl Trace {
     /// - a Stop goes out only after a look that read RUNNING;
     /// - every Stop and the delete found the start type disabled, which is
     ///   what keeps the SCM from starting the service once it stops;
-    /// - nothing follows the delete.
+    /// - nothing follows the delete but the clearing of the record.
     pub fn assert_the_order_of_a_deregistration(&self) {
         for event in &self.0 {
             match event {
@@ -245,8 +263,15 @@ impl Trace {
                 _ => {}
             }
         }
+        let after_the_delete = self
+            .0
+            .iter()
+            .rev()
+            .take_while(|event| matches!(event, Event::ClearRecord))
+            .count();
         assert!(
-            matches!(self.0.last(), Some(Event::Delete { .. })),
+            self.0.len() > after_the_delete
+                && matches!(self.0[self.0.len() - after_the_delete - 1], Event::Delete { .. }),
             "the session was used after the delete, or never deleted the service: {self:#?}"
         );
     }
@@ -294,6 +319,17 @@ impl Trace {
                 _ => {}
             }
         }
+        self.assert_the_record_written_was_cleared();
+    }
+
+    /// Fails unless every record the retirement wrote was cleared.
+    pub fn assert_the_record_written_was_cleared(&self) {
+        let count = |wanted: fn(&Event) -> bool| self.0.iter().filter(|event| wanted(event)).count();
+        assert_eq!(
+            count(|event| matches!(event, Event::WriteRecord)),
+            count(|event| matches!(event, Event::ClearRecord)),
+            "a record was written and not cleared, or cleared and not written: {self:#?}"
+        );
     }
 
     /// Fails unless every Stop came straight after an arm for the states
