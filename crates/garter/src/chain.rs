@@ -223,7 +223,8 @@ impl ChainRunner {
     /// `ready` channel passed to [`ChainPlugin::run`]; the chain reads them one
     /// at a time as it starts the hops, and folds them into one chain-level outcome.
     ///
-    /// A start failure ends the chain: the runner cancels every plugin and
+    /// A start failure ends the chain, except a bind conflict on a port the chain picked: that hop alone is stopped and
+    /// run again on a fresh port (see [`ChainRunner::run`]). The runner cancels every plugin and
     /// reports the failure only after each one's `run` has returned, so the
     /// output they were still relaying is out before the caller hears of it.
     /// A plugin that ignores the cancel is waited for until `drain_timeout`
@@ -260,6 +261,10 @@ impl ChainRunner {
     /// The hops start one at a time, in the order [`Mode`] gives (the hop that forwards to the destination first), each
     /// only once the hop it forwards to has reported ready. Every hop but the last-started listens on a port the chain
     /// picks for it just before it starts.
+    ///
+    /// A hop that reports a bind conflict on its intermediate port is stopped and run again on a fresh port, without
+    /// a cap and without disturbing the hops already running; only a shutdown ends that. A conflict on the public port
+    /// is the caller's and is reported.
     #[debug_requires(!self.plugins.is_empty(), "chain must have at least one plugin")]
     pub async fn run(self, env: crate::sip003::PluginEnv) -> crate::Result<()> {
         let n = self.plugins.len();

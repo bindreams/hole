@@ -166,6 +166,68 @@ async fn pid_sink_fires_once_per_binary_plugin() {
     let _ = handle.await;
 }
 
+/// A real child that loses its intermediate port is run again: the chain readies, and the hop's `pid_sink` fires once per
+/// spawn.
+#[skuld::test]
+async fn an_intermediate_binary_plugin_that_loses_its_port_is_restarted() {
+    let mock_path = mock_plugin_path();
+
+    // The mock fails with a bind conflict on whichever run creates this file first, and starts normally after.
+    let sentinel = std::env::temp_dir().join(format!("garter-restart-sentinel-{}", std::process::id()));
+    let _ = std::fs::remove_file(&sentinel);
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_pids = pids.clone();
+    let sink: garter::PidSink = Arc::new(move |pid| sink_pids.lock().unwrap().push(pid));
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    // Client mode starts the second plugin first: it is the one given the intermediate port.
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None).readiness(garter::binary::ReadinessMode::ExpectSitrep),
+        ))
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_FAIL", "bind_conflict_once")
+                .env("MOCK_PLUGIN_FAIL_SENTINEL", sentinel.to_str().unwrap())
+                .pid_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .cancel_token(cancel.clone())
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9, // discard; ExpectSitrep dials nothing
+        plugin_options: None,
+    };
+
+    let handle = tokio::spawn(async move { runner.run(env).await });
+
+    expect_ready(ready_rx)
+        .await
+        .expect("the chain should ready once the hop is restarted");
+
+    {
+        let recorded = pids.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "the hop was spawned twice, got {recorded:?}");
+        assert_ne!(recorded[0], recorded[1], "each spawn is its own process");
+    }
+
+    cancel.cancel();
+    let _ = handle.await;
+    let _ = std::fs::remove_file(&sentinel);
+}
+
 /// Server-mode counterpart to `two_plugin_chain_relays_data`. In server
 /// mode, the chain runs in reverse: an external client connects to the
 /// "public" port (SS_REMOTE), data flows through the chain in the

@@ -44,6 +44,8 @@ mod chain_failure_tests;
 #[cfg(test)]
 mod chain_order_tests;
 #[cfg(test)]
+mod chain_restart_tests;
+#[cfg(test)]
 mod chain_tests;
 #[cfg(test)]
 mod counting_tests;

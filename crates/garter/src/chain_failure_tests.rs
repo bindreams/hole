@@ -23,11 +23,28 @@ use crate::sitrep::{PluginReady, StartError, Transports};
 
 type Ready = oneshot::Sender<Result<PluginReady, StartError>>;
 
-fn bind_conflict() -> StartError {
-    StartError::BindConflict {
-        errno: 98,
-        addr: "127.0.0.1:1080".parse().unwrap(),
+/// The failure a holder decides. A hop given an intermediate port is run again on a bind conflict instead of
+/// failing the chain, so the first-started holder decides a fatal failure; the public one decides the conflict.
+fn decided_failure(holder_starts: Starts) -> StartError {
+    match holder_starts {
+        Starts::First => StartError::Fatal {
+            detail: "injected".into(),
+            errno: Some(98),
+        },
+        Starts::Second => StartError::BindConflict {
+            errno: 98,
+            addr: "127.0.0.1:1080".parse().unwrap(),
+        },
     }
+}
+
+/// Whether `reported` is [`decided_failure`] for `holder_starts`.
+fn is_decided_failure(holder_starts: Starts, reported: &StartError) -> bool {
+    matches!(
+        (holder_starts, reported),
+        (Starts::First, StartError::Fatal { errno: Some(98), .. })
+            | (Starts::Second, StartError::BindConflict { errno: 98, .. })
+    )
 }
 
 /// Sends `error` on `ready` when dropped, which is what a `BinaryPlugin`'s held failure does whenever the plugin's end
@@ -58,6 +75,7 @@ enum Finish {
 
 /// A member whose start failed. It has decided the failure and holds the report until it ends.
 struct HoldsFailure {
+    error: StartError,
     finish: Finish,
     /// Fires once the member is running and holds its failure.
     running: Once<oneshot::Sender<()>>,
@@ -78,7 +96,7 @@ impl ChainPlugin for HoldsFailure {
     ) -> crate::Result<()> {
         let _held = Held {
             ready: Some(ready),
-            error: Some(bind_conflict()),
+            error: Some(self.error.clone()),
         };
         let _ = self.running.take().send(());
         match self.finish.clone() {
@@ -249,6 +267,7 @@ async fn run_row(row: Row) -> Result<(), String> {
         HolderEnd::Aborted => Finish::Never,
     };
     let holder: Box<dyn ChainPlugin> = Box::new(HoldsFailure {
+        error: decided_failure(holder_starts),
         finish,
         running: Once::new(running_tx),
     });
@@ -289,7 +308,7 @@ async fn run_row(row: Row) -> Result<(), String> {
         gate.cancel();
     }
     let reported = ready_rx.await;
-    if !matches!(&reported, Ok(Err(StartError::BindConflict { errno: 98, .. }))) {
+    if !matches!(&reported, Ok(Err(error)) if is_decided_failure(holder_starts, error)) {
         return Err(format!("the decided failure was lost: {reported:?}"));
     }
     if drains && !relayed.load(Ordering::SeqCst) {

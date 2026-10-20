@@ -43,6 +43,12 @@ pub trait ChainPlugin: Send + Sync {
     /// caller, when [`ChainRunner::on_ready`](crate::ChainRunner::on_ready) is registered, after every plugin's `run`
     /// has returned, so output a plugin relays while it stops comes first; a plugin that ignores `shutdown` is
     /// waited for at most [`drain_timeout`](crate::ChainRunner::drain_timeout).
+    ///
+    /// The one start failure that does not end the chain is `StartError::BindConflict` from a hop the chain gave
+    /// an intermediate port, whatever address it names (a tap reports its inner plugin's). The runner cancels that
+    /// attempt's `shutdown`, waits for `run` to return, and calls `run` again on a fresh port, as often as it takes
+    /// until the chain shuts down. A conflict on the public port is the caller's to retry, so it is reported like any
+    /// other failure.
     async fn run(
         &self,
         local: SocketAddr,
