@@ -394,19 +394,24 @@ impl<P> ProcessHolds<P> {
                 .expect("a process reported as held is held");
             source.has_exited(process)
         })?;
-        let mut held_alive = false;
-        for (_, process) in &self.held {
-            if !source.has_exited(process)? {
-                held_alive = true;
-                break;
-            }
-        }
+        let held_alive = self.any_alive(|process| source.has_exited(process))?;
         Ok(Look {
             observed: reading.observed,
             fate,
             held_alive,
             ever_held: !self.held.is_empty(),
         })
+    }
+
+    /// Whether any held process has not exited, by `has_exited` on each: a
+    /// state read of the handle, never a wait.
+    pub fn any_alive(&self, mut has_exited: impl FnMut(&P) -> io::Result<bool>) -> io::Result<bool> {
+        for (_, process) in &self.held {
+            if !has_exited(process)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Hold `process`, the process `pid`, unless it is held already; the

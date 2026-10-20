@@ -164,6 +164,16 @@ impl ServiceProcesses {
             .map(|_undetermined| ())
     }
 
+    /// How many processes are held, exited or not.
+    pub(super) fn held(&self) -> usize {
+        self.holds.processes().count()
+    }
+
+    /// Whether any held process has not exited: a state read of each handle.
+    pub(super) fn any_alive(&self) -> io::Result<bool> {
+        self.holds.any_alive(has_exited)
+    }
+
     /// Blocks until every held process has exited. An external event with no
     /// bound of its own to choose: the exit of a process the SCM has been told
     /// to stop.

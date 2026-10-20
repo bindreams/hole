@@ -5,6 +5,7 @@
 use std::io;
 use std::mem::MaybeUninit;
 
+use tracing::info;
 use windows::core::PCWSTR;
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, QueryServiceStatusEx, ENUM_SERVICE_TYPE, SC_HANDLE, SC_STATUS_PROCESS_INFO, SERVICE_ERROR,
@@ -21,7 +22,7 @@ use super::service_sid::ServiceSid;
 use super::{apply_failure_actions, open_error_is_absent, scm_failure, FAILURE_ACTIONS_ACCESS, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessSource, Reading};
-use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, StartType, StartWrite};
+use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, StartType, StartWrite, Survivors};
 use crate::cutover::scm_wait::settle::{StopActor, WaitKind};
 use crate::cutover::scm_wait::{observed_from_state, Observed, SystemScmActor};
 
@@ -91,6 +92,40 @@ impl RetireSession {
 
     fn raw(&self) -> SC_HANDLE {
         SC_HANDLE(self.service.raw_handle())
+    }
+}
+
+/// The processes of a service the SCM has no entry for, found by its token
+/// alone.
+pub struct GoneSession {
+    sid: ServiceSid,
+    processes: ServiceProcesses,
+}
+
+impl GoneSession {
+    pub fn new() -> Self {
+        Self {
+            sid: ServiceSid::of(SERVICE_NAME),
+            processes: ServiceProcesses::default(),
+        }
+    }
+}
+
+impl Survivors for GoneSession {
+    fn hold_scanned(&mut self) -> io::Result<()> {
+        self.processes.hold_scanned(&self.sid)
+    }
+
+    fn any_alive(&mut self) -> io::Result<bool> {
+        self.processes.any_alive()
+    }
+
+    fn await_exits(&mut self) -> io::Result<()> {
+        info!(
+            held = self.processes.held(),
+            "waiting for the processes of a removed service entry to exit"
+        );
+        self.processes.await_exits()
     }
 }
 

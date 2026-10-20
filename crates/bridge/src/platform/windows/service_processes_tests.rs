@@ -3,7 +3,7 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 
 use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE};
 
-use super::{has_exited, open_process, opened_from_token_read, scan_service_processes, ServiceSid};
+use super::{has_exited, open_process, opened_from_token_read, scan_service_processes, ServiceProcesses, ServiceSid};
 use crate::cutover::scm_wait::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Opened};
 use crate::cutover::scm_wait::ReportedPid;
@@ -131,4 +131,18 @@ fn the_scan_skips_the_calling_process_and_finds_others() {
 fn the_scan_for_a_sid_nothing_carries_finds_nothing() {
     let found = scan_service_processes(&ServiceSid::nothing_carries()).expect("scan");
     assert!(found.alive.is_empty());
+}
+
+/// A live process held is alive; nothing held is not.
+#[skuld::test]
+fn service_processes_are_alive_while_a_held_process_has_not_exited() {
+    let mut processes = ServiceProcesses::default();
+    assert!(!processes.any_alive().expect("nothing held"));
+    // SAFETY: plain FFI call.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, GetCurrentProcessId()) }
+        .expect("open this process for synchronization only");
+    // SAFETY: `OpenProcess` returned a new handle this value now owns.
+    let this = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    processes.holds.adopt(std::process::id(), this);
+    assert!(processes.any_alive().expect("this process is running"));
 }

@@ -601,3 +601,143 @@ fn a_failed_step_reads_with_its_call_and_its_code() {
     let message = RetireError::Harden(scm_error(ScmCall::ChangeServiceConfig, 5)).to_string();
     assert!(message.contains("ChangeServiceConfig failed"), "{message}");
 }
+
+// A process that outlives its removed entry ===========================================================================
+
+/// What the survivors wait does, in order, with scripted answers. A script that
+/// runs dry panics, so a loop that would spin fails instead of hanging.
+struct FakeSurvivors<'a> {
+    log: &'a Log,
+    /// The answer of each `any_alive`, in order.
+    alive: VecDeque<bool>,
+    scan_fails: bool,
+    await_fails: bool,
+    alive_fails: bool,
+}
+
+impl<'a> FakeSurvivors<'a> {
+    fn new(log: &'a Log, alive: Vec<bool>) -> Self {
+        Self {
+            log,
+            alive: alive.into(),
+            scan_fails: false,
+            await_fails: false,
+            alive_fails: false,
+        }
+    }
+}
+
+impl Survivors for FakeSurvivors<'_> {
+    fn hold_scanned(&mut self) -> io::Result<()> {
+        self.log.borrow_mut().push("hold_scanned".into());
+        if self.scan_fails {
+            return Err(io::Error::other("scan"));
+        }
+        Ok(())
+    }
+    fn any_alive(&mut self) -> io::Result<bool> {
+        self.log.borrow_mut().push("any_alive".into());
+        if self.alive_fails {
+            return Err(io::Error::other("alive"));
+        }
+        Ok(self.alive.pop_front().expect("the alive script ran dry"))
+    }
+    fn await_exits(&mut self) -> io::Result<()> {
+        self.log.borrow_mut().push("await_exits".into());
+        if self.await_fails {
+            return Err(io::Error::other("await"));
+        }
+        Ok(())
+    }
+}
+
+#[skuld::test]
+fn an_absent_service_with_no_process_is_not_retired() {
+    let log = Log::default();
+    let mut survivors = FakeSurvivors::new(&log, vec![false]);
+    wait_out_survivors(&mut survivors).unwrap();
+    assert_eq!(logged(&log), ["hold_scanned", "any_alive"]);
+}
+
+/// The wait ends only on a scan that leaves nothing alive: a process that
+/// exits can have started another, which the next scan finds.
+#[skuld::test]
+fn a_process_that_outlives_its_entry_is_waited_on_until_a_scan_finds_none() {
+    let log = Log::default();
+    // The first scan holds the process, the second a descendant it started, the third nothing.
+    let mut survivors = FakeSurvivors::new(&log, vec![true, true, false]);
+    wait_out_survivors(&mut survivors).unwrap();
+    assert_eq!(
+        logged(&log),
+        [
+            "hold_scanned",
+            "any_alive",
+            "await_exits",
+            "hold_scanned",
+            "any_alive",
+            "await_exits",
+            "hold_scanned",
+            "any_alive",
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_scan_failure_is_a_hold_error_and_a_wait_failure_an_exit_error() {
+    let log = Log::default();
+    let mut survivors = FakeSurvivors::new(&log, vec![]);
+    survivors.scan_fails = true;
+    let error = wait_out_survivors(&mut survivors).expect_err("the scan failed");
+    assert!(matches!(error, RetireError::Hold(_)), "{error}");
+
+    let mut survivors = FakeSurvivors::new(&log, vec![true]);
+    survivors.await_fails = true;
+    let error = wait_out_survivors(&mut survivors).expect_err("the wait failed");
+    assert!(matches!(error, RetireError::Exit(_)), "{error}");
+
+    let mut survivors = FakeSurvivors::new(&log, vec![]);
+    survivors.alive_fails = true;
+    let error = wait_out_survivors(&mut survivors).expect_err("the state read failed");
+    assert!(matches!(error, RetireError::Exit(_)), "{error}");
+}
+
+#[skuld::test]
+fn an_absent_opening_goes_to_the_survivors_and_never_to_retire() {
+    let log = Log::default();
+    let built = RefCell::new(0);
+    let opened = retire_over(
+        Opening::<FakeSession<'_>>::Absent,
+        || {
+            *built.borrow_mut() += 1;
+            FakeSurvivors::new(&log, vec![true, false])
+        },
+        Disposition::Deregister,
+    )
+    .unwrap();
+    assert!(!opened, "nothing was retired");
+    assert_eq!(*built.borrow(), 1);
+    assert_eq!(
+        logged(&log),
+        ["hold_scanned", "any_alive", "await_exits", "hold_scanned", "any_alive"]
+    );
+}
+
+#[skuld::test]
+fn an_opened_session_never_scans_for_survivors() {
+    let log = Log::default();
+    let session = FakeSession::running_then_stopped(&log);
+    let opened = retire_over(
+        Opening::Opened(session),
+        || -> FakeSurvivors<'_> { panic!("an opened session has no entry to be gone from") },
+        Disposition::Deregister,
+    )
+    .unwrap();
+    assert!(opened, "the retirement ran");
+    let expected: Vec<&str> = HARDEN
+        .iter()
+        .chain(&STOP_AND_SETTLE)
+        .copied()
+        .chain(["delete"])
+        .collect();
+    assert_eq!(logged(&log), expected);
+}

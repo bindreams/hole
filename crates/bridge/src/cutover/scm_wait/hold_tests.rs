@@ -913,3 +913,38 @@ fn ever_held_outlasts_the_exit_of_everything_held() {
     assert!(got.ever_held);
     assert!(!got.held_alive);
 }
+
+// Whether anything held is still alive ================================================================================
+
+#[skuld::test]
+fn any_alive_is_true_while_a_held_process_has_not_exited() {
+    let log = Log::default();
+    let mut source = Script::new(&log, vec![]);
+    let mut holds = ProcessHolds::default();
+    assert!(
+        !holds.any_alive(|p| source.has_exited(p)).unwrap(),
+        "nothing held is nothing alive"
+    );
+
+    holds.adopt(100, process(&log, 100));
+    holds.adopt(300, process(&log, 300));
+    assert!(holds.any_alive(|p| source.has_exited(p)).unwrap());
+    source.exited.push(100);
+    assert!(
+        holds.any_alive(|p| source.has_exited(p)).unwrap(),
+        "one process exiting leaves the other alive"
+    );
+    source.exited.push(300);
+    assert!(!holds.any_alive(|p| source.has_exited(p)).unwrap());
+}
+
+#[skuld::test]
+fn a_failed_exit_check_ends_any_alive_with_that_error() {
+    let log = Log::default();
+    let mut holds = ProcessHolds::default();
+    holds.adopt(100, process(&log, 100));
+    let error = holds
+        .any_alive(|_| Err(io::Error::other("no state")))
+        .expect_err("the check failed");
+    assert_eq!(error.to_string(), "no state");
+}

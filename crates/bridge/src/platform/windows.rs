@@ -14,13 +14,14 @@ use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::cutover::scm_wait::call_error::{ScmCall, ServiceGone};
-use crate::cutover::scm_wait::retire::{retire, Disposition};
+use crate::cutover::scm_wait::retire::{retire_over, Disposition};
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
 use crate::service_stop::{self, StopPhase, StopProgress};
 
 #[path = "windows/retire_session.rs"]
 mod retire_session;
 pub use crate::cutover::scm_wait::retire::Opening;
+use retire_session::GoneSession;
 pub use retire_session::RetireSession;
 #[path = "windows/registration.rs"]
 pub mod registration;
@@ -691,18 +692,11 @@ pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
     retire_service(Disposition::StopOnly).map(|_| ())
 }
 
-/// [`retire`] on a fresh session. `Ok(false)` when the SCM has no entry to
-/// act on; `Ok(true)` when the retirement ran.
+/// [`retire_over`] on a fresh session. `Ok(false)` when the SCM has no entry to
+/// act on, after waiting out any process of it that outlived the entry;
+/// `Ok(true)` when the retirement ran.
 fn retire_service(disposition: Disposition) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut session = match RetireSession::open()? {
-        Opening::Opened(session) => session,
-        Opening::Absent => {
-            info!("no Windows service to retire");
-            return Ok(false);
-        }
-    };
-    retire(&mut session, disposition)?;
-    Ok(true)
+    Ok(retire_over(RetireSession::open()?, GoneSession::new, disposition)?)
 }
 
 /// Whether an `open_service` failure means the entry does not exist.

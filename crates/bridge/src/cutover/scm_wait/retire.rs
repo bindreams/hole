@@ -241,6 +241,56 @@ pub fn retire<S: ServiceSession>(session: &mut S, disposition: Disposition) -> R
     }
 }
 
+/// What waiting out the processes of a service the SCM has no entry for needs.
+pub trait Survivors {
+    /// Hold every live process that carries the service's token, other than
+    /// the calling one.
+    fn hold_scanned(&mut self) -> io::Result<()>;
+    /// Whether any held process has not exited: a state read of each handle,
+    /// never a wait.
+    fn any_alive(&mut self) -> io::Result<bool>;
+    /// Wait until every held process has exited.
+    fn await_exits(&mut self) -> io::Result<()>;
+}
+
+/// Wait out every process that carries a removed service's token.
+///
+/// The SCM drops an entry once the service is not running, which is its state
+/// and not its process, so a process can outlive its entry, and only a scan by
+/// token sees it. Scan, hold, and while a held process is alive wait for it;
+/// scan again, because a process that exited can have started another. Every
+/// iteration ends in a process exit or in a scan that leaves nothing alive.
+pub fn wait_out_survivors<W: Survivors>(survivors: &mut W) -> Result<(), RetireError> {
+    loop {
+        survivors.hold_scanned().map_err(RetireError::Hold)?;
+        if !survivors.any_alive().map_err(RetireError::Exit)? {
+            return Ok(());
+        }
+        survivors.await_exits().map_err(RetireError::Exit)?;
+    }
+}
+
+/// [`retire`] on what opening the service found. `Ok(false)`: the SCM has no
+/// entry, and the processes of it that outlived the entry (if any) were waited
+/// out. `Ok(true)`: the retirement ran. `survivors` is built only for an absent
+/// entry.
+pub fn retire_over<S: ServiceSession, G: Survivors>(
+    opening: Opening<S>,
+    survivors: impl FnOnce() -> G,
+    disposition: Disposition,
+) -> Result<bool, RetireError> {
+    match opening {
+        Opening::Absent => {
+            wait_out_survivors(&mut survivors())?;
+            Ok(false)
+        }
+        Opening::Opened(mut session) => {
+            retire(&mut session, disposition)?;
+            Ok(true)
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "retire_tests.rs"]
 mod retire_tests;
