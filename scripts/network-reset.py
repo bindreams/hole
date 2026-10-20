@@ -17,6 +17,7 @@ Run with admin/root privileges:
 from __future__ import annotations
 
 import argparse
+import io
 import ipaddress
 import json
 import os
@@ -495,6 +496,10 @@ def reset_windows(state: dict | None) -> None:
 
 
 def main() -> None:
+    # An adapter name the console code page cannot encode must not crash the reset.
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--force-dns-restore",
