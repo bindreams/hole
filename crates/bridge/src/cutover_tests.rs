@@ -153,19 +153,30 @@ fn unlock_holds_the_liveness_lock_across_the_whole_sequence() {
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn clear_marker_on_failure_clears_only_on_err() {
-    let dir = tempfile::tempdir().unwrap();
-    let m = hole_common::update_marker::MarkerInfo {
-        version: hole_common::update_marker::MARKER_VERSION,
-        driver: cosca::identity::ProcessId::current()
-            .to_record()
-            .expect("persist this process's identity"),
+fn the_marker_stays_only_for_a_cutover_a_new_bridge_will_sweep() {
+    use crate::cutover::os::CutoverOutcome;
+
+    let marker_after = |result: std::io::Result<CutoverOutcome>| {
+        let dir = tempfile::tempdir().unwrap();
+        let m = hole_common::update_marker::MarkerInfo {
+            version: hole_common::update_marker::MARKER_VERSION,
+            driver: cosca::identity::ProcessId::current()
+                .to_record()
+                .expect("persist this process's identity"),
+        };
+        hole_common::update_marker::write(dir.path(), &m, None).unwrap();
+        settle_marker(&result, dir.path());
+        hole_common::update_marker::is_present(dir.path())
     };
-    hole_common::update_marker::write(dir.path(), &m, None).unwrap();
-    clear_marker_on_cutover_failure(&Ok(()), dir.path());
-    assert!(hole_common::update_marker::is_present(dir.path()));
-    clear_marker_on_cutover_failure(&Err(std::io::Error::other("boom")), dir.path());
-    assert!(!hole_common::update_marker::is_present(dir.path()));
+    assert!(
+        marker_after(Ok(CutoverOutcome::Started)),
+        "Started: the new bridge sweeps it"
+    );
+    assert!(
+        !marker_after(Ok(CutoverOutcome::LeftDisabled)),
+        "LeftDisabled: no bridge will bind, so the cutover clears it"
+    );
+    assert!(!marker_after(Err(std::io::Error::other("boom"))), "an error clears it");
 }
 
 #[cfg(target_os = "windows")]

@@ -45,14 +45,16 @@ pub fn service_state_dir() -> PathBuf {
 /// bridge cannot SCM-restart itself, so it spawns this LocalSystem child). Swaps
 /// the staged binaries into the install dir and SCM-restarts the service. The
 /// marker is left for the new bridge's post-bind sweep to clear (it is the
-/// authoritative, always-runs clear once any new bridge binds).
+/// authoritative, always-runs clear once any new bridge binds), except where no
+/// bridge will bind: a failure, or a service an administrator disabled, which
+/// is left stopped and reported as success.
 ///
 /// `payload` is the staging dir holding the extracted binaries; `target_version`
 /// names the `.old-<ver>` rename-away path.
 #[cfg(target_os = "windows")]
 pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()> {
-    use crate::cutover::os::run_cutover;
     use crate::cutover::os::windows::WindowsCutoverOs;
+    use crate::cutover::os::{run_cutover, CutoverOutcome};
 
     // Bring an install base predating the restart-on-failure SCM config up to date
     // as part of the update itself. Best-effort: a failure here must not abort the
@@ -72,21 +74,32 @@ pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()>
         target_version: target_version.to_string(),
     };
     let result = run_cutover(&mut os);
-    clear_marker_on_cutover_failure(&result, &hole_common::update_marker::service_log_dir());
-    result
+    settle_marker(&result, &hole_common::update_marker::service_log_dir());
+    if let Ok(CutoverOutcome::LeftDisabled) = result {
+        tracing::info!(
+            "cutover: the new files are installed, but the Hole service is disabled on this computer, so it was not started; enable it to run the new version"
+        );
+    }
+    result.map(|_| ())
 }
 
-/// On a graceful cutover failure clear the marker so a retry is not blocked by
-/// the single-occupancy claim. Load-bearing for the stop/swap sub-case (no new
-/// bridge binds to sweep it); an idempotent second clear for the start-failure
-/// sub-case (the SCM's restart-on-failure also sweeps post-bind). A crash is
-/// covered by the GUI liveness net.
+/// Clear the marker unless a new bridge will bind and sweep it. A graceful
+/// failure clears it so a retry is not blocked by the single-occupancy claim
+/// (load-bearing for the stop/swap sub-case; an idempotent second clear for the
+/// start-failure sub-case, which the SCM's restart-on-failure also sweeps
+/// post-bind). A service left disabled starts no bridge, so its outcome clears
+/// it too. A crash is covered by the GUI liveness net.
 #[cfg(target_os = "windows")]
-fn clear_marker_on_cutover_failure(result: &std::io::Result<()>, log_dir: &Path) {
-    if result.is_err() {
-        if let Err(e) = hole_common::update_marker::clear(log_dir) {
-            tracing::warn!(error = %e, "cutover child: failed to clear marker on graceful failure");
-        }
+fn settle_marker(result: &std::io::Result<crate::cutover::os::CutoverOutcome>, log_dir: &Path) {
+    let leaves_marker = match result {
+        Ok(outcome) => outcome.leaves_marker_for_new_bridge(),
+        Err(_) => false,
+    };
+    if leaves_marker {
+        return;
+    }
+    if let Err(e) = hole_common::update_marker::clear(log_dir) {
+        tracing::warn!(error = %e, "cutover child: failed to clear the marker no new bridge will sweep");
     }
 }
 

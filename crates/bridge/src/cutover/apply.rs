@@ -365,7 +365,7 @@ mod macos {
         // BEFORE the SIGTERM; clear the marker so the GUI stops masking
         // Disconnected (no new bridge will start to clear it).
         tokio::spawn(async move {
-            let outcome = tokio::task::spawn_blocking(move || run_cutover(&mut os)).await;
+            let outcome = tokio::task::spawn_blocking(move || run_cutover(&mut os).map(|_| ())).await;
             let result = match outcome {
                 Ok(r) => r,
                 Err(e) => Err(std::io::Error::other(format!("cutover actor panicked: {e}"))),

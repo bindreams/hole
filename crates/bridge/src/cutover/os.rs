@@ -47,29 +47,51 @@ pub trait CutoverOs {
     fn start_service_wait_running(&mut self) -> std::io::Result<()>;
 }
 
+/// How a cutover that ran without error ended. The caller's marker policy is a
+/// match on this type, so a new outcome cannot inherit an answer chosen for
+/// another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoverOutcome {
+    /// The new images are in place and the restart is under way: a new bridge
+    /// will bind and sweep the update marker.
+    Started,
+    /// The new images are in place, and the service was left stopped because an
+    /// administrator disabled it. No bridge will bind, so nothing else clears
+    /// the update marker.
+    LeftDisabled,
+}
+
+impl CutoverOutcome {
+    /// Whether the update marker stays for the new bridge's post-bind sweep.
+    pub fn leaves_marker_for_new_bridge(self) -> bool {
+        match self {
+            CutoverOutcome::Started => true,
+            CutoverOutcome::LeftDisabled => false,
+        }
+    }
+}
+
 /// Drive the cutover sequence. Ordering is OS-asymmetric:
 /// - Windows: stop -> swap (while no bridge runs) -> repair the start type ->
 ///   start. Stopping first bounds the gap and lets the new bridge boot from the
 ///   new image deterministically. The detached child outlives the stopped
 ///   service. A service an administrator disabled is not started (the start
-///   would fail), and that is reported as the cutover's error: the images are
-///   swapped, and the marker is cleared with the failure.
+///   would fail): the update did install, so that is `LeftDisabled`, not an
+///   error.
 /// - macOS: swap both images FIRST, then trigger the bridge's own graceful
 ///   shutdown (SIGTERM rides `pm.stop()`, so the marker-conditional disarm
 ///   fires). It returns there: the inline actor SIGTERMs its own process, so a
 ///   self-wait + explicit start would be unreachable. launchd's `KeepAlive=true`
 ///   respawns the now-swapped binary (swap precedes shutdown), and the standing
 ///   pf cover + Adopt hold the gap.
-pub fn run_cutover<O: CutoverOs>(os: &mut O) -> std::io::Result<()> {
+pub fn run_cutover<O: CutoverOs>(os: &mut O) -> std::io::Result<CutoverOutcome> {
     #[cfg(target_os = "windows")]
     {
         os.stop_service_wait_stopped()?;
         os.swap_images()?;
         let repaired = os.repair_start_type()?;
         if !repaired.starts_service() {
-            return Err(std::io::Error::other(
-                "the Hole service is disabled on this computer, so the update did not start it;                  the new files are installed (swapped in) and the service stays stopped until it is enabled",
-            ));
+            return Ok(CutoverOutcome::LeftDisabled);
         }
         os.start_service_wait_running()?;
     }
@@ -78,7 +100,7 @@ pub fn run_cutover<O: CutoverOs>(os: &mut O) -> std::io::Result<()> {
         os.swap_images()?;
         os.stop_service_wait_stopped()?;
     }
-    Ok(())
+    Ok(CutoverOutcome::Started)
 }
 
 #[cfg(test)]

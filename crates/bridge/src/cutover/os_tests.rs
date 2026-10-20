@@ -58,7 +58,7 @@ fn windows_sequence_is_stop_swap_repair_start() {
         RepairStep::ResetThenClear,
     ] {
         let mut os = Recorder::repairing(Some(step));
-        run_cutover(&mut os).unwrap();
+        assert_eq!(run_cutover(&mut os).unwrap(), CutoverOutcome::Started, "{step:?}");
         assert_eq!(
             *os.calls.borrow(),
             vec!["stop_wait_stopped", "swap", "repair_start_type", "start_wait_running"],
@@ -69,19 +69,14 @@ fn windows_sequence_is_stop_swap_repair_start() {
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn a_service_an_administrator_disabled_is_not_started_and_the_cutover_says_why() {
+fn a_service_an_administrator_disabled_is_not_started_and_the_cutover_succeeds() {
     let mut os = Recorder::repairing(Some(RepairStep::LeaveDisabled));
-    let error = run_cutover(&mut os).expect_err("the update cannot restart a disabled service");
-    // The images are swapped; only the start is skipped, because it would fail.
+    let outcome = run_cutover(&mut os).expect("the update installed; only the start is skipped");
+    assert_eq!(outcome, CutoverOutcome::LeftDisabled);
+    // The images are swapped; the start is skipped because it would fail.
     assert_eq!(
         *os.calls.borrow(),
         vec!["stop_wait_stopped", "swap", "repair_start_type"]
-    );
-    let message = error.to_string();
-    assert!(message.contains("disabled"), "{message}");
-    assert!(
-        message.contains("swapped") || message.contains("installed"),
-        "{message}"
     );
 }
 
@@ -100,7 +95,7 @@ fn a_failed_repair_fails_the_cutover_before_the_start() {
 #[skuld::test]
 fn macos_sequence_is_swap_then_graceful_shutdown() {
     let mut os = Recorder::default();
-    run_cutover(&mut os).unwrap();
+    assert_eq!(run_cutover(&mut os).unwrap(), CutoverOutcome::Started);
     // macOS swaps both images FIRST (the running daemon keeps its old inode),
     // then triggers its OWN graceful shutdown (SIGTERM rides pm.stop(), so the
     // marker-conditional disarm fires). It does NOT wait-for-exit or start: the
