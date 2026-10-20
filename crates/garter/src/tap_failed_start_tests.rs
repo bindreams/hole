@@ -3,7 +3,7 @@
 //! The paused clock makes the bounds exact; every wait on the inner is raced against a virtual hang, so a tap that
 //! waits for an inner that ignores its token fails these tests instead of hanging them.
 
-// `CancellationToken::new` is the cancel-test harness root; `allocate_ports` is the chain's TCP-only allocator.
+// `CancellationToken::new` is the cancel-test harness root.
 #![allow(clippy::disallowed_methods)]
 
 use std::io;
@@ -15,9 +15,10 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::chain::{allocate_ports, ChainRunner};
+use crate::chain::ChainRunner;
 use crate::once::Once;
 use crate::plugin::ChainPlugin;
+use crate::port::free_loopback_port;
 use crate::sitrep::StartError;
 use crate::tap::TapPlugin;
 use crate::tap_tests::{
@@ -206,7 +207,7 @@ async fn a_chain_over_an_inner_that_ignores_its_token_ends_at_the_bounds() {
         }))))
         .on_ready(ready_tx);
     let mut env = crate::chain_tests::test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
     let started = tokio::time::Instant::now();
     let handle = tokio::spawn(runner.run(env));
 
@@ -460,7 +461,7 @@ async fn cancelled_chain_of(
         .on_ready(ready_tx)
         .cancel_token(cancel.clone());
     let mut env = crate::chain_tests::test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
     let handle = tokio::spawn(runner.run(env));
     running.await.expect("the stub never ran");
     cancel.cancel();

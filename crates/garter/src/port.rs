@@ -90,3 +90,9 @@ pub(crate) fn is_port_race(err: &io::Error) -> bool {
 pub(crate) fn retry_backoff() -> Backoff {
     Backoff::new(Duration::from_millis(5), Duration::from_millis(50))
 }
+
+/// A free loopback TCP port, for a test that needs a public port to hand a chain.
+#[cfg(test)]
+pub(crate) fn free_loopback_port() -> SocketAddr {
+    os_probe(std::net::Ipv4Addr::LOCALHOST.into())().expect("the OS has a free loopback port")
+}

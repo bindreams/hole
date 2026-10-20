@@ -20,7 +20,7 @@ use common::mock_plugin_path;
 /// verify it arrives.
 ///
 /// Readiness is signaled by both plugins' sitrep `ready` events (both run in
-/// `ExpectSitrep` mode); the client connects only after the aggregator collects
+/// `ExpectSitrep` mode); the client connects only after the chain has read
 /// every `ready`, so the connect can never race ahead of a bound listener.
 #[skuld::test]
 async fn two_plugin_chain_relays_data() {
@@ -1054,15 +1054,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 async fn expect_ready(ready_rx: oneshot::Receiver<Result<ChainReady, StartError>>) -> Result<ChainReady, StartError> {
     match tokio::time::timeout(READY_TIMEOUT, ready_rx).await {
         Ok(Ok(outcome)) => outcome,
-        // `run_readiness_aggregator`'s `shutdown.cancelled()` arm (chain.rs)
-        // returns without sending whenever chain-wide shutdown fires before
-        // THIS plugin's own readiness does — e.g. another plugin in the
-        // chain exiting (`record_exit` cancels `shutdown` on every exit) or
-        // an external cancel — not only when the aggregator task itself dies.
+        // The chain's start (chain.rs) ends without sending whenever chain-wide
+        // shutdown fires before THIS plugin's own readiness does — e.g. another
+        // plugin in the chain exiting (`record_exit` cancels `shutdown` on every
+        // exit) or an external cancel — not only when the chain task itself dies.
         Ok(Err(_)) => panic!(
             "chain's ready_tx was dropped without sending — chain-wide shutdown fired \
-             before this plugin readied (see garter::chain::run_readiness_aggregator's \
-             shutdown.cancelled() arm), or the aggregator task panicked"
+             before this plugin readied (see garter::chain::judge), or the chain task panicked"
         ),
         Err(_) => panic!(
             "chain did not report readiness within {READY_TIMEOUT:?} — the mock-plugin child \

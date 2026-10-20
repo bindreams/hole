@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,12 +9,12 @@ use tracing::Instrument;
 
 use crate::backoff::Backoff;
 use crate::binary::TAKEDOWN_TAIL;
+use crate::hop::{run_hop, Decision, Placement};
 use crate::plugin::ChainPlugin;
+use crate::port::{self, Probe};
 use crate::shutdown;
 use crate::sitrep::{PluginReady, StartError, Transports};
 use crate::tap::INNER_STOP_BOUND;
-
-const MAX_PORT_RETRIES: usize = 3;
 
 /// The default [`ChainRunner::drain_timeout`]: longer than the longest take-down a member waits for, a [`TapPlugin`]
 /// stopping a `BinaryPlugin` inner ([`INNER_STOP_BOUND`]), so a member that needs all of its own bounds is waited for
@@ -101,71 +101,37 @@ impl Mode {
             },
         )
     }
-}
 
-/// Allocate `count` unique ephemeral ports on localhost.
-pub fn allocate_ports(count: usize) -> crate::Result<Vec<SocketAddr>> {
-    let mut ports = Vec::with_capacity(count);
-    let mut seen = std::collections::HashSet::with_capacity(count);
-    for _ in 0..count {
-        loop {
-            let addr = allocate_one_port()?;
-            if seen.insert(addr.port()) {
-                ports.push(addr);
-                break;
-            }
-            tracing::debug!(port = addr.port(), "duplicate port, retrying");
+    /// The order a chain of `hops` plugins starts in and the two ends it is wired between, for `local` (`SS_LOCAL`) and
+    /// `remote` (`SS_REMOTE`). This is the one place the mode decides them.
+    ///
+    /// Start position `p` forwards to the destination when `p == 0` and to the address the hop at `p - 1` was given
+    /// otherwise; the last-started hop listens on the public end, and every other one on a port picked for it.
+    pub(crate) fn flow(self, hops: usize, local: SocketAddr, remote: SocketAddr) -> Flow {
+        match self {
+            Mode::Client => Flow {
+                order: (0..hops).rev().collect(),
+                public: local,
+                destination: remote,
+            },
+            Mode::Server => Flow {
+                order: (0..hops).collect(),
+                public: remote,
+                destination: local,
+            },
         }
     }
-    Ok(ports)
 }
 
-fn allocate_one_port() -> crate::Result<SocketAddr> {
-    for attempt in 0..MAX_PORT_RETRIES {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        drop(listener);
-
-        #[cfg(all(test, windows))]
-        test_hook::fire(addr.port());
-
-        match std::net::TcpListener::bind(addr) {
-            Ok(l) => {
-                drop(l);
-                return Ok(addr);
-            }
-            // `AddrInUse` — another socket grabbed the port between drop and rebind.
-            // `PermissionDenied` — Windows `WSAEACCES`: typically a shift in the
-            // TCP dynamic excluded-port range (Hyper-V / WSL2 / Docker Desktop
-            // reservations, visible via `netsh int ipv4 show excludedportrange`),
-            // or another socket claiming the port with `SO_EXCLUSIVEADDRUSE` on a
-            // wildcard interface.
-            // `AddrNotAvailable` — same excluded-port-range class; distinct from
-            // `WSAEACCES` only in whether the kernel rejects the bind at the
-            // address-reservation layer or the permission layer.
-            // All three are transient probe-races; retry on a fresh ephemeral port.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::AddrInUse
-                        | std::io::ErrorKind::PermissionDenied
-                        | std::io::ErrorKind::AddrNotAvailable
-                ) =>
-            {
-                tracing::debug!(
-                    attempt,
-                    port = addr.port(),
-                    kind = ?e.kind(),
-                    "port unavailable, retrying"
-                );
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(crate::Error::Chain(
-        "failed to allocate a free port after retries".into(),
-    ))
+/// How a [`Mode`] wires a chain.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Flow {
+    /// Plugin indexes in the order they start.
+    pub(crate) order: Vec<usize>,
+    /// What the last-started hop listens on, and what the chain reports.
+    pub(crate) public: SocketAddr,
+    /// What the first-started hop forwards to.
+    pub(crate) destination: SocketAddr,
 }
 
 /// Orchestrates a chain of SIP003u plugins.
@@ -175,6 +141,9 @@ pub struct ChainRunner {
     ready_tx: Option<oneshot::Sender<Result<ChainReady, StartError>>>,
     external_cancel: Option<CancellationToken>,
     mode: Mode,
+    /// Replaces the OS probe for every intermediate-port pick.
+    #[cfg(test)]
+    probe: Option<Arc<std::sync::Mutex<crate::port::Probe>>>,
 }
 
 impl Default for ChainRunner {
@@ -191,7 +160,16 @@ impl ChainRunner {
             ready_tx: None,
             external_cancel: None,
             mode: Mode::default(),
+            #[cfg(test)]
+            probe: None,
         }
+    }
+
+    /// Test seam: every intermediate-port pick asks `probe` instead of the OS.
+    #[cfg(test)]
+    pub(crate) fn with_probe(mut self, probe: crate::port::Probe) -> Self {
+        self.probe = Some(Arc::new(std::sync::Mutex::new(probe)));
+        self
     }
 
     /// Add a plugin to the end of the chain.
@@ -242,8 +220,8 @@ impl ChainRunner {
     /// Fires `Ok(ChainReady)` once EVERY plugin has reported `PluginReady`;
     /// `Err(StartError)` when any plugin reports a start failure or exits
     /// before readying. Each plugin reports its own readiness through the
-    /// `ready` channel passed to [`ChainPlugin::run`]; the aggregator
-    /// collects the N per-plugin results into one chain-level outcome.
+    /// `ready` channel passed to [`ChainPlugin::run`]; the chain reads them one
+    /// at a time as it starts the hops, and folds them into one chain-level outcome.
     ///
     /// A start failure ends the chain: the runner cancels every plugin and
     /// reports the failure only after each one's `run` has returned, so the
@@ -252,10 +230,10 @@ impl ChainRunner {
     /// expires (see [`ChainRunner::drain_timeout`]); the failure is reported
     /// then, with the warning that bound already logs.
     ///
-    /// If shutdown fires before every plugin has readied, the receiver gets the first `StartError` a plugin had
-    /// delivered by the time every plugin returned (in plugin order), and `RecvError` if none had. While the chain
-    /// runs the plugins are awaited in order, so a failure behind one that never readies is not seen until the
-    /// chain ends. Only `Ok(ChainReady)` is sent at once: every other outcome, `RecvError`
+    /// If shutdown fires before every plugin has readied, the receiver gets the `StartError` the hop that was
+    /// starting had delivered by the time every plugin returned, and `RecvError` if it had delivered none. A hop is
+    /// started only once the hop it forwards to is ready, so a hop that never readies keeps every later one from
+    /// starting. Only `Ok(ChainReady)` is sent at once: every other outcome, `RecvError`
     /// included, reaches the caller after every plugin has returned or `drain_timeout` has expired.
     pub fn on_ready(mut self, tx: oneshot::Sender<Result<ChainReady, StartError>>) -> Self {
         self.ready_tx = Some(tx);
@@ -278,6 +256,10 @@ impl ChainRunner {
     }
 
     /// Run the full chain. Blocks until all plugins exit or shutdown is requested.
+    ///
+    /// The hops start one at a time, in the order [`Mode`] gives (the hop that forwards to the destination first), each
+    /// only once the hop it forwards to has reported ready. Every hop but the last-started listens on a port the chain
+    /// picks for it just before it starts.
     #[debug_requires(!self.plugins.is_empty(), "chain must have at least one plugin")]
     pub async fn run(self, env: crate::sip003::PluginEnv) -> crate::Result<()> {
         let n = self.plugins.len();
@@ -287,19 +269,7 @@ impl ChainRunner {
             .await?
             .next()
             .ok_or_else(|| crate::Error::Chain(format!("failed to resolve {}:{}", env.remote_host, env.remote_port)))?;
-
-        // Build address chain: [local, intermediate..., remote]
-        #[allow(clippy::disallowed_methods)]
-        // Sanctioned: every in-repo plugin at a non-zero chain position binds
-        // TCP only (ex-ray's dokodemo inbounds, yamux's server-mode TCP
-        // listener), so garter's own intermediate-port allocation is the
-        // sanctioned use of its TCP-only allocator. See hole's clippy.toml
-        // `garter::chain::allocate_ports` rule.
-        let intermediate = allocate_ports(n.saturating_sub(1))?;
-        let mut addrs = Vec::with_capacity(n + 1);
-        addrs.push(env.local_addr());
-        addrs.extend(intermediate);
-        addrs.push(remote_addr);
+        let flow = self.mode.flow(n, env.local_addr(), remote_addr);
 
         // Shared shutdown token. ChainRunner owns its own shutdown scope —
         // the external `cancel_token` builder option is wired into this
@@ -322,51 +292,16 @@ impl ChainRunner {
             });
         }
 
-        // Capture `Copy` field before the partial move below.
-        let mode = self.mode;
-
-        // Spawn all plugins, each with its own readiness channel. In Client
-        // mode, plugin i listens on addrs[i] and forwards to addrs[i+1]. In
-        // Server mode, the direction is inverted: plugin i listens on
-        // addrs[i+1] and forwards to addrs[i]. See `Mode`. The aggregator
-        // below collects the N per-plugin readiness results.
         let mut set = tokio::task::JoinSet::new();
-        let mut ready_rxs: Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)> = Vec::with_capacity(n);
-        for (i, plugin) in self.plugins.into_iter().enumerate() {
-            let (local, remote) = match mode {
-                Mode::Client => (addrs[i], addrs[i + 1]),
-                Mode::Server => (addrs[i + 1], addrs[i]),
-            };
-            let token = shutdown.child_token();
-            let plugin_name = plugin.name().to_string();
-            let (rtx, rrx) = oneshot::channel();
-            ready_rxs.push((i, rrx));
-
-            let span = tracing::info_span!(
-                "plugin",
-                name = %plugin_name,
-                position = i,
-                chain_mode = ?mode,
-            );
-            set.spawn(async move {
-                let result = plugin.run(local, remote, token, rtx).instrument(span).await;
-                (plugin_name, result)
-            });
-        }
-
-        // Readiness aggregator: await all N plugin results, racing the
-        // shared shutdown token so a cancel during startup doesn't hang.
-        // The aggregator body lives in a free async fn (not an inline
-        // `async move`) because `#[debug_requires]` rewrites `return` in
-        // this fn's body into `break 'run`, which is illegal across an
-        // async-block boundary; a free fn keeps the rewrite out of it.
-        // It is polled here, in Phase 1, rather than spawned: the caller's
-        // `ready` sender is owned by `gate` alone, so no path releases it
-        // before the other plugins have drained.
+        // Polled here, in Phase 1, rather than spawned: the caller's `ready` sender is owned by `gate` alone, so no
+        // path releases it before the other plugins have drained.
         let mut gate = ReadyGate::new(self.ready_tx);
-        let aggregate = run_readiness_aggregator(ready_rxs, n, mode, shutdown.clone());
-        tokio::pin!(aggregate);
-        let mut aggregating = gate.wants_readiness();
+        let mut start = StartSequence::new(self.plugins, self.mode, flow);
+        #[cfg(test)]
+        {
+            start.probe = self.probe;
+        }
+        start.launch(&mut set, &shutdown);
 
         // Phase 1: run unbounded until either all plugins exit naturally or
         // shutdown is requested. Any plugin exit (clean or error) also fires
@@ -375,18 +310,22 @@ impl ChainRunner {
         // deliberately does NOT bound this phase — a long-running plugin is
         // expected to run until something tells it to stop.
         //
-        // The aggregator goes first (`biased`): a plugin that exits without
-        // readying has dropped its sender by the time `join_next` yields it,
-        // and that exit must be read as "exited before ready" before
-        // `record_exit` cancels `shutdown` and turns it into a preempted
-        // aggregation.
+        // The start sequence goes first (`biased`): a hop that exits without
+        // readying has decided so by the time `join_next` yields it, and that
+        // exit must be read as "exited before ready" before `record_exit`
+        // cancels `shutdown` and turns it into a preempted start. It is also
+        // what launches the next hop, so an exit of a hop that is already
+        // running is seen while a later one is still starting.
         let mut first_error: Option<crate::Error> = None;
         loop {
             tokio::select! {
                 biased;
-                readiness = &mut aggregate, if aggregating => {
-                    aggregating = false;
-                    gate.absorb(readiness);
+                decision = await_decision(&mut start.pending), if start.pending.is_some() => {
+                    start.pending = None;
+                    match start.advance(decision, &mut set, &shutdown) {
+                        Step::Launched => {}
+                        Step::Settled(readiness) => gate.absorb(readiness),
+                    }
                 }
                 () = shutdown.cancelled() => break,
                 maybe_result = set.join_next() => {
@@ -395,12 +334,10 @@ impl ChainRunner {
                 }
             }
         }
-        // Covers a cancel landing between the aggregator arm's poll and the
-        // `shutdown` arm's in one `select!` (multi-thread only). `shutdown` is
-        // cancelled and the aggregator's cancel arm is biased, so it ends on this
-        // poll without waiting for anything.
-        if aggregating {
-            gate.absorb(aggregate.await);
+        // A start still waiting for its hop when the loop ended: the hop may yet deliver a failure it had decided,
+        // until it returns, and the gate reads it at the release.
+        if let Some(unread) = start.pending.take() {
+            gate.absorb(Readiness::Preempted { unread: Some(unread) });
         }
 
         // Phase 2: drain remaining plugins, bounded by `drain_timeout`. An
@@ -444,17 +381,18 @@ impl ChainRunner {
 
 // Helpers =============================================================================================================
 
-/// What the readiness aggregator found.
+/// What the chain's start found.
 #[derive(Debug)]
 pub(crate) enum Readiness {
-    /// Every plugin reported ready.
+    /// Every hop reported ready.
     Ready(ChainReady),
-    /// A plugin failed to start, or exited before it could say so. The chain is no longer viable.
+    /// A hop failed to start, or exited before it could say so. The chain is no longer viable.
     Failed(StartError),
-    /// `shutdown` came first, with nothing to report yet. `unread` holds the receivers it had not read, in plugin
-    /// order: a plugin may still deliver a start failure it had decided, until it returns.
+    /// `shutdown` came first, or a hop ended without deciding, with nothing to report yet. `unread` is the decision
+    /// of the hop that was starting, if it had not been read: that hop may still deliver a start failure it had
+    /// decided, until it returns.
     Preempted {
-        unread: Vec<oneshot::Receiver<Result<PluginReady, StartError>>>,
+        unread: Option<oneshot::Receiver<Decision>>,
     },
 }
 
@@ -466,8 +404,8 @@ pub(crate) enum Readiness {
 pub(crate) struct ReadyGate {
     ready_tx: Option<oneshot::Sender<Result<ChainReady, StartError>>>,
     failure: Option<StartError>,
-    /// The receivers a preempted aggregation had not read.
-    unread: Vec<oneshot::Receiver<Result<PluginReady, StartError>>>,
+    /// The decision a preempted start had not read.
+    unread: Option<oneshot::Receiver<Decision>>,
 }
 
 impl ReadyGate {
@@ -475,13 +413,8 @@ impl ReadyGate {
         Self {
             ready_tx,
             failure: None,
-            unread: Vec::new(),
+            unread: None,
         }
-    }
-
-    /// Whether anyone listens for readiness.
-    pub(crate) fn wants_readiness(&self) -> bool {
-        self.ready_tx.is_some()
     }
 
     pub(crate) fn absorb(&mut self, readiness: Readiness) {
@@ -497,15 +430,16 @@ impl ReadyGate {
     }
 
     /// Sends the failure to report, if there is one; otherwise drops the sender unsent, which the receiver sees as
-    /// `RecvError`. The failure is the one the aggregator found, or else the first typed one a preempted plugin has
-    /// delivered since, in plugin order. A delivered `Ok(PluginReady)` is not rescued, as in the aggregator:
-    /// `shutdown` is chain-wide and nothing shows the chain is still viable.
+    /// `RecvError`. The failure is the one the start found, or else the one a preempted hop has delivered since. A
+    /// delivered `Ready` is not rescued: `shutdown` is chain-wide and nothing shows the chain is still viable.
     pub(crate) fn release(self) {
         let Some(ready_tx) = self.ready_tx else { return };
         let delivered_since = || {
-            self.unread.into_iter().find_map(|mut unread| match unread.try_recv() {
-                Ok(Err(error)) => Some(error),
-                _ => None,
+            self.unread.and_then(|mut unread| match unread.try_recv() {
+                Ok(Decision::Failed(error)) => Some(error),
+                Ok(Decision::Ready { .. }) => None,
+                Ok(Decision::Dropped) => None,
+                Err(_) => None,
             })
         };
         if let Some(error) = self.failure.or_else(delivered_since) {
@@ -514,85 +448,185 @@ impl ReadyGate {
     }
 }
 
-/// Aggregate the N per-plugin readiness results into a single chain-level
-/// [`Readiness`].
-///
-/// Awaits each plugin's `ready` receiver in turn, racing the shared
-/// `shutdown` token so a cancel during startup doesn't hang. The
-/// position-0 plugin's reported `listen` is the chain's public address in
-/// Client mode; in Server mode it is position N-1. The chain's transports
-/// are the intersection across all hops.
-///
-/// Reports nothing itself: [`ChainRunner::run`] owns the caller's sender (see
-/// [`ReadyGate`]). A start failure leaves the chain no longer viable, so this
-/// cancels `shutdown` (the other plugins stop cooperatively) before returning it.
-pub(crate) async fn run_readiness_aggregator(
-    ready_rxs: Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)>,
-    n: usize,
+/// What the chain makes of one hop's [`Decision`].
+#[derive(Debug)]
+pub(crate) enum Verdict {
+    /// The hop is up: start the next one.
+    Ready { given: SocketAddr, report: PluginReady },
+    /// The start failed, and the chain was cancelled for it.
+    Failed(StartError),
+    /// The chain was already stopping, or the hop ended without deciding: nothing to report.
+    Preempted,
+}
+
+/// Judges `decision` against `shutdown`. A start failure the hop delivered stands whoever cancelled the chain, because
+/// `BindConflict` is the only retryable class and discarding one turns a collision into a hard failure. A `Ready` or a
+/// dropped sender after the cancel is the cancel's doing, so it is preempted rather than reported. A start failure
+/// cancels `shutdown`: the other plugins stop cooperatively.
+pub(crate) fn judge(decision: Result<Decision, oneshot::error::RecvError>, shutdown: &CancellationToken) -> Verdict {
+    match decision {
+        Ok(Decision::Failed(error)) => {
+            shutdown.cancel();
+            Verdict::Failed(error)
+        }
+        Ok(Decision::Ready { given, report }) => {
+            if shutdown.is_cancelled() {
+                return Verdict::Preempted;
+            }
+            Verdict::Ready { given, report }
+        }
+        Ok(Decision::Dropped) => {
+            if shutdown.is_cancelled() {
+                return Verdict::Preempted;
+            }
+            // The hop dropped its sender unsent, so it exited before readying. The same exit is independently observed by
+            // the Phase-1 `record_exit`, which sets `first_error` and cancels: that is the lifecycle channel that becomes
+            // `run`'s return, and this is the typed cause for `on_ready`. The two are separate observers of one event.
+            shutdown.cancel();
+            Verdict::Failed(StartError::Fatal {
+                detail: "plugin exited before becoming ready".into(),
+                errno: None,
+            })
+        }
+        Err(_) => Verdict::Preempted,
+    }
+}
+
+/// What the start does after a decision.
+enum Step {
+    /// The hop was ready and the next one is launched.
+    Launched,
+    /// The start is over, one way or another.
+    Settled(Readiness),
+}
+
+/// The chain's start: launches the hops one at a time in [`Flow`] order and reads each one's [`Decision`] before the
+/// next launch.
+struct StartSequence {
+    plugins: Vec<Arc<dyn ChainPlugin>>,
     mode: Mode,
-    shutdown: CancellationToken,
-) -> Readiness {
-    let mut plugin_listens: Vec<Option<SocketAddr>> = vec![None; n];
-    // Intersection identity (the full transport set); each plugin's
-    // reported transports narrow this. `all()` lives on the
-    // `bitflags::Flags` trait for this generated type.
-    let mut transports = <Transports as bitflags::Flags>::all();
-    let public_index = match mode {
-        Mode::Client => 0,
-        Mode::Server => n - 1,
-    };
-    let mut unread = ready_rxs.into_iter();
-    while let Some((i, mut rrx)) = unread.next() {
-        let outcome = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => match rrx.try_recv() {
-                // A plugin that reports a failure and exits cancels `shutdown`
-                // itself (`record_exit` cancels on every plugin exit), so this
-                // arm can win the race against a typed error already sitting
-                // in the channel. The error stands whoever cancelled.
-                Ok(Err(start_err)) => Ok(Err(start_err)),
-                // Anything else returns as before. A delivered `Ok(PluginReady)`
-                // is NOT rescued: `shutdown` is chain-wide and may have been
-                // cancelled by another plugin's exit or an external cancel, so
-                // nothing here shows the chain is still viable. A failure the
-                // plugin delivers later is found by `ReadyGate::release`.
-                _ => {
-                    return Readiness::Preempted {
-                        unread: std::iter::once(rrx).chain(unread.map(|(_, rx)| rx)).collect(),
-                    }
-                }
-            },
-            r = &mut rrx => r,
-        };
-        match outcome {
-            Ok(Ok(pr)) => {
-                plugin_listens[i] = Some(pr.listen);
-                transports &= pr.transports;
-            }
-            Ok(Err(start_err)) => {
-                shutdown.cancel();
-                return Readiness::Failed(start_err);
-            }
-            Err(_recv) => {
-                // Plugin dropped its sender unsent → it exited before
-                // readying. Synthesize a process-exit Fatal. This is the
-                // START-GATE channel; the SAME exit is independently
-                // observed by the Phase-1 record_exit loop, which sets
-                // first_error + cancels — that is the LIFECYCLE channel that
-                // becomes run()'s return. The two are intentionally separate
-                // observers of one event (typed cause to on_ready AND
-                // lifecycle error to teardown). Do NOT try to reconcile them
-                // into one value.
-                shutdown.cancel();
-                return Readiness::Failed(StartError::Fatal {
-                    detail: "plugin exited before becoming ready".into(),
-                    errno: None,
+    flow: Flow,
+    /// Position in `flow.order` of the next hop to launch.
+    next: usize,
+    /// What the next hop forwards to: the destination, then each hop's `given`.
+    forward_to: SocketAddr,
+    /// Ports an intermediate pick must not return: the ends of the chain and the ports already given.
+    taken: Vec<u16>,
+    transports: Transports,
+    /// The decision of the hop that was launched last, until it is read.
+    pending: Option<oneshot::Receiver<Decision>>,
+    #[cfg(test)]
+    probe: Option<Arc<std::sync::Mutex<Probe>>>,
+}
+
+impl StartSequence {
+    fn new(plugins: Vec<Arc<dyn ChainPlugin>>, mode: Mode, flow: Flow) -> Self {
+        let taken = [flow.public.port(), flow.destination.port()]
+            .into_iter()
+            .filter(|&port| port != 0)
+            .collect();
+        Self {
+            plugins,
+            mode,
+            next: 0,
+            forward_to: flow.destination,
+            taken,
+            // Intersection identity (the full transport set); each hop's reported transports narrow this. `all()`
+            // lives on the `bitflags::Flags` trait for this generated type.
+            transports: <Transports as bitflags::Flags>::all(),
+            pending: None,
+            flow,
+            #[cfg(test)]
+            probe: None,
+        }
+    }
+
+    /// The probe an intermediate hop picks its port with.
+    fn probe(&self) -> Probe {
+        #[cfg(test)]
+        {
+            if let Some(shared) = &self.probe {
+                let shared = shared.clone();
+                return Box::new(move || {
+                    let mut probe = shared.lock().unwrap();
+                    probe()
                 });
             }
         }
+        port::os_probe(Ipv4Addr::LOCALHOST.into())
     }
-    let listen = plugin_listens[public_index].expect("public plugin must have reported a listen address");
-    Readiness::Ready(ChainReady { listen, transports })
+
+    /// Launches the hop at `next`; its decision arrives on `pending`.
+    fn launch(&mut self, set: &mut tokio::task::JoinSet<(String, crate::Result<()>)>, shutdown: &CancellationToken) {
+        debug_assert!(
+            self.pending.is_none(),
+            "a hop is launched only after the last one decided"
+        );
+        let position = self.flow.order[self.next];
+        let plugin = self.plugins[position].clone();
+        let placement = if self.next + 1 == self.flow.order.len() {
+            Placement::Public(self.flow.public)
+        } else {
+            Placement::Intermediate {
+                ip: Ipv4Addr::LOCALHOST.into(),
+                taken: self.taken.clone(),
+                probe: self.probe(),
+            }
+        };
+        let (decided_tx, decided_rx) = oneshot::channel();
+        self.pending = Some(decided_rx);
+
+        let name = plugin.name().to_string();
+        let span = tracing::info_span!("plugin", name = %name, position, chain_mode = ?self.mode);
+        let token = shutdown.child_token();
+        let remote = self.forward_to;
+        set.spawn(async move {
+            let result = run_hop(plugin, placement, remote, token, decided_tx)
+                .instrument(span)
+                .await;
+            (name, result)
+        });
+    }
+
+    /// Takes one hop's `decision` and launches the next hop if the chain is still starting.
+    fn advance(
+        &mut self,
+        decision: Result<Decision, oneshot::error::RecvError>,
+        set: &mut tokio::task::JoinSet<(String, crate::Result<()>)>,
+        shutdown: &CancellationToken,
+    ) -> Step {
+        match judge(decision, shutdown) {
+            Verdict::Failed(error) => Step::Settled(Readiness::Failed(error)),
+            Verdict::Preempted => Step::Settled(Readiness::Preempted { unread: None }),
+            Verdict::Ready { given, report } => {
+                self.transports &= report.transports;
+                self.next += 1;
+                if self.next == self.flow.order.len() {
+                    // The public hop is the last one started; its reported address is the chain's.
+                    return Step::Settled(Readiness::Ready(ChainReady {
+                        listen: report.listen,
+                        transports: self.transports,
+                    }));
+                }
+                if given.port() != 0 {
+                    self.taken.push(given.port());
+                }
+                self.forward_to = given;
+                self.launch(set, shutdown);
+                Step::Launched
+            }
+        }
+    }
+}
+
+/// Waits for the decision of the hop that is starting; never ends when there is none.
+async fn await_decision(
+    pending: &mut Option<oneshot::Receiver<Decision>>,
+) -> Result<Decision, oneshot::error::RecvError> {
+    match pending {
+        Some(decision) => decision.await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Shared handler for a single plugin-task exit result. Updates
@@ -663,49 +697,5 @@ pub(crate) async fn poll_ready(addr: SocketAddr, shutdown: CancellationToken) ->
         if !backoff.pause(&shutdown).await {
             return None;
         }
-    }
-}
-
-#[cfg(all(test, windows))]
-pub(crate) mod test_hook {
-    use std::cell::RefCell;
-
-    type HookFn = Box<dyn FnMut(u16)>;
-
-    thread_local! {
-        static HOOK: RefCell<Option<HookFn>> = const { RefCell::new(None) };
-    }
-
-    pub(crate) struct Guard;
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            HOOK.with(|h| *h.borrow_mut() = None);
-        }
-    }
-
-    /// Install a callback that fires between `drop(listener)` and the rebind
-    /// inside `allocate_one_port`. Only valid when the caller of
-    /// `allocate_ports` runs synchronously on the same thread that called
-    /// `set`. Do NOT use this hook with `ChainRunner::run` on a
-    /// multi-threaded tokio runtime — `allocate_ports` would then fire on a
-    /// worker thread with an empty `HOOK` and the injection is silently
-    /// skipped.
-    pub(crate) fn set<F: FnMut(u16) + 'static>(f: F) -> Guard {
-        HOOK.with(|h| {
-            assert!(
-                h.borrow().is_none(),
-                "test_hook::set called with a hook already installed"
-            );
-            *h.borrow_mut() = Some(Box::new(f));
-        });
-        Guard
-    }
-
-    pub(crate) fn fire(port: u16) {
-        HOOK.with(|h| {
-            if let Some(cb) = h.borrow_mut().as_mut() {
-                cb(port);
-            }
-        });
     }
 }

@@ -1,7 +1,6 @@
 // `CancellationToken::new` is the cancel-test harness root; module-level
 // allow per the hole workspace clippy.toml's "Bridge cancellation contract"
-// sanctioned-test-file exception. Also covers this file's `allocate_ports`
-// calls, the TCP-only chain-port allocator under test here.
+// sanctioned-test-file exception.
 #![allow(clippy::disallowed_methods)]
 
 use std::net::SocketAddr;
@@ -11,108 +10,18 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::chain::{allocate_ports, ChainReady, ChainRunner};
+use crate::chain::{ChainReady, ChainRunner};
 use crate::once::Once;
 use crate::plugin::ChainPlugin;
+use crate::port::free_loopback_port;
 use crate::sitrep::{PluginReady, StartError, Transports};
-
-// Port allocation tests ===============================================================================================
-
-#[skuld::test]
-fn allocate_zero_ports() {
-    let ports = allocate_ports(0).unwrap();
-    assert!(ports.is_empty());
-}
-
-#[skuld::test]
-fn allocate_one_port() {
-    let ports = allocate_ports(1).unwrap();
-    assert_eq!(ports.len(), 1);
-    assert!(ports[0].port() > 0);
-    assert_eq!(ports[0].ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
-}
-
-#[skuld::test]
-fn allocate_multiple_ports_are_unique() {
-    let ports = allocate_ports(5).unwrap();
-    assert_eq!(ports.len(), 5);
-    let unique: std::collections::HashSet<u16> = ports.iter().map(|a| a.port()).collect();
-    assert_eq!(unique.len(), 5, "all allocated ports should be unique");
-}
-
-/// A transient `WSAEACCES` at the rebind step inside `allocate_one_port` must
-/// be absorbed (retry on a fresh ephemeral port, return `Ok`), the same as
-/// `WSAEADDRINUSE`. The test forces the `WSAEACCES` path deterministically via
-/// the asymmetric Winsock rule (a wildcard `SO_EXCLUSIVEADDRUSE` holder makes a
-/// later specific-address bind return `WSAEACCES`); see `allocate_one_port` in
-/// chain.rs for the full excluded-port-range rationale.
-///
-/// Serialized against the rest of the suite because the hook runs between
-/// `drop(listener)` and the holder's `bind`; a concurrent test that probed
-/// the same ephemeral port in that tiny window could take it before the
-/// holder can claim it, causing the holder's `bind` to spuriously fail.
-#[cfg(windows)]
-#[skuld::test(serial)]
-fn allocate_one_port_absorbs_transient_wsaeacces() {
-    use crate::chain::test_hook;
-    use socket2::{Domain, Protocol, Socket, Type};
-    use std::cell::{Cell, RefCell};
-    use std::net::SocketAddr;
-    use std::os::windows::io::AsRawSocket;
-    use std::rc::Rc;
-    use windows::Win32::Networking::WinSock::{setsockopt, SOCKET, SOL_SOCKET, SO_EXCLUSIVEADDRUSE};
-
-    /// Binds `0.0.0.0:port` with `SO_EXCLUSIVEADDRUSE`. A subsequent
-    /// non-exclusive bind to `127.0.0.1:port` will then return `WSAEACCES`
-    /// per the documented Winsock matrix.
-    fn hold_wildcard_exclusive(port: u16) -> Socket {
-        let s = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("create socket");
-        let raw = SOCKET(s.as_raw_socket() as usize);
-        let enable = 1i32.to_ne_bytes();
-        // Safety: the FFI call — `raw` is a valid SOCKET owned by `s`, and
-        // `&enable` is a live `[u8; 4]` on this stack frame.
-        let rc = unsafe { setsockopt(raw, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, Some(&enable)) };
-        assert_eq!(rc, 0, "setsockopt SO_EXCLUSIVEADDRUSE failed");
-        let addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-        s.bind(&addr.into())
-            .expect("bind 0.0.0.0:port with SO_EXCLUSIVEADDRUSE");
-        s
-    }
-
-    let holder: Rc<RefCell<Option<Socket>>> = Rc::new(RefCell::new(None));
-    let holder_cb = holder.clone();
-    let hook_count = Rc::new(Cell::new(0u32));
-    let hook_count_cb = hook_count.clone();
-
-    let _guard = test_hook::set(move |port| {
-        let n = hook_count_cb.get() + 1;
-        hook_count_cb.set(n);
-        if n == 1 {
-            *holder_cb.borrow_mut() = Some(hold_wildcard_exclusive(port));
-        }
-    });
-
-    let ports = allocate_ports(1).expect(
-        "allocate_ports must retry past a transient WSAEACCES; propagated error here means \
-         the retry arm does not yet cover ErrorKind::PermissionDenied — see GitHub #20",
-    );
-
-    assert_eq!(ports.len(), 1);
-    assert!(
-        hook_count.get() >= 2,
-        "expected at least one retry after the injected WSAEACCES; got {} hook fire(s)",
-        hook_count.get()
-    );
-    // `holder` drops at end-of-scope, releasing the exclusive bind; `_guard`
-    // drops after it, clearing the thread-local hook.
-}
 
 // Test helpers ========================================================================================================
 
 pub(crate) fn test_env() -> crate::sip003::PluginEnv {
     crate::sip003::PluginEnv {
         local_host: "127.0.0.1".parse().unwrap(),
-        local_port: 0, // will be overridden by allocate_ports
+        local_port: 0, // tests that bind it set a free port
         remote_host: "127.0.0.1".into(),
         remote_port: 20000,
         plugin_options: None,
@@ -138,7 +47,7 @@ impl ChainPlugin for InstantPlugin {
         _ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         // Exits immediately without ever readying; dropping `_ready` unsent
-        // is the "exited before ready" backstop the aggregator handles.
+        // is the "exited before ready" backstop the chain handles.
         Ok(())
     }
 }
@@ -175,7 +84,7 @@ impl ChainPlugin for ListeningPlugin {
 
 /// Plugin that binds a TCP listener, reports a caller-chosen transport
 /// set on readiness, then waits for shutdown. Used to exercise the
-/// aggregator's transports-intersection across hops without a real
+/// chain's transports-intersection across hops without a real
 /// subprocess.
 struct TransportsPlugin {
     name: String,
@@ -232,9 +141,9 @@ impl ChainPlugin for FailingPlugin {
     }
 }
 
-/// Plugin that never exits and deliberately ignores `shutdown`. Models a
-/// long-running plugin (e.g. v2ray-plugin) for drain-timeout regression
-/// tests.
+/// Plugin that reports ready, then never exits and deliberately ignores `shutdown`.
+/// Models a long-running plugin (e.g. v2ray-plugin) for drain-timeout regression
+/// tests. It readies so the hop behind it can start.
 struct StubbornPlugin {
     name: String,
 }
@@ -247,11 +156,15 @@ impl ChainPlugin for StubbornPlugin {
 
     async fn run(
         &self,
-        _local: SocketAddr,
+        local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
-        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
+        ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
+        let _ = ready.send(Ok(PluginReady {
+            listen: local,
+            transports: Transports::TCP,
+        }));
         std::future::pending::<crate::Result<()>>().await
     }
 }
@@ -315,7 +228,7 @@ async fn on_ready_fires_with_local_addr() {
 
     let mut env = test_env();
     // Use an ephemeral port so the plugin can actually bind.
-    let addr = allocate_ports(1).unwrap().pop().unwrap();
+    let addr = free_loopback_port();
     env.local_port = addr.port();
 
     let handle = tokio::spawn(runner.run(env));
@@ -343,9 +256,9 @@ async fn on_ready_dropped_on_plugin_failure() {
 
     let handle = tokio::spawn(runner.run(env));
 
-    // The plugin exits before readying, so the aggregator synthesizes a
+    // The plugin exits before readying, so the chain synthesizes a
     // process-exit `StartError::Fatal` and sends it through ready_tx.
-    let outcome = rx.await.expect("aggregator should report a start error, not drop");
+    let outcome = rx.await.expect("the chain should report a start error, not drop");
     match outcome {
         Err(StartError::Fatal { detail, .. }) => {
             assert!(
@@ -361,7 +274,7 @@ async fn on_ready_dropped_on_plugin_failure() {
     assert!(chain_result.is_err());
 }
 
-/// The aggregator reports the end-to-end transports as the intersection
+/// The chain reports the end-to-end transports as the intersection
 /// across every hop: a transport is carried only if EVERY plugin serves
 /// it. Here a TCP|UDP hop and a TCP-only hop must intersect to TCP. The
 /// `listen` must be the position-0 plugin's (Client mode), not whichever
@@ -372,8 +285,7 @@ async fn on_ready_transports_are_intersection_across_hops() {
 
     // Position 0 is the chain-public hop; it serves TCP+UDP. Position 1
     // (downstream) is TCP-only, so the end-to-end set narrows to TCP.
-    let addrs = allocate_ports(1).unwrap();
-    let public_addr = addrs[0];
+    let public_addr = free_loopback_port();
 
     let runner = ChainRunner::new()
         .add(Box::new(TransportsPlugin {
@@ -425,7 +337,7 @@ async fn cancel_token_triggers_graceful_shutdown() {
         .on_ready(ready_tx);
 
     let mut env = test_env();
-    let addr = allocate_ports(1).unwrap().pop().unwrap();
+    let addr = free_loopback_port();
     env.local_port = addr.port();
 
     let handle = tokio::spawn(runner.run(env));
@@ -447,8 +359,9 @@ async fn cancel_token_triggers_graceful_shutdown() {
 
 // Mode tests ==========================================================================================================
 
-/// Plugin that records its `(local, remote)` args and exits cleanly. Used
-/// to assert address wiring without doing real I/O. Backing storage is
+/// Plugin that records its `(local, remote)` args, reports ready and exits cleanly. Used
+/// to assert address wiring without doing real I/O. It readies because the chain starts a hop only
+/// after the hop it forwards to is ready. Backing storage is
 /// `Mutex<Option<(SocketAddr, SocketAddr)>>` initialized to `None` so a
 /// plugin that was never invoked is distinguishable from one whose
 /// recorded value happens to equal a sentinel; the assertion sites
@@ -469,9 +382,13 @@ impl ChainPlugin for RecordingPlugin {
         local: SocketAddr,
         remote: SocketAddr,
         _shutdown: CancellationToken,
-        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
+        ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         *self.record.lock().unwrap() = Some((local, remote));
+        let _ = ready.send(Ok(PluginReady {
+            listen: local,
+            transports: Transports::TCP,
+        }));
         Ok(())
     }
 }
@@ -486,7 +403,7 @@ async fn mode_default_is_client() {
 #[skuld::test]
 async fn chain_runner_server_mode_inverts_address_wiring() {
     let ss_local: SocketAddr = "127.0.0.1:11111".parse().unwrap();
-    let ss_remote_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    let ss_remote_port = free_loopback_port().port();
     let ss_remote: SocketAddr = format!("127.0.0.1:{ss_remote_port}").parse().unwrap();
 
     let rec0 = Arc::new(Mutex::new(None));
@@ -533,7 +450,7 @@ async fn chain_runner_server_mode_inverts_address_wiring() {
 #[skuld::test]
 async fn chain_runner_server_mode_inverts_on_ready_probe_target() {
     let (tx, rx) = oneshot::channel();
-    let listen_addr = allocate_ports(1).unwrap()[0];
+    let listen_addr = free_loopback_port();
 
     // `ListeningPlugin` binds whatever `local` it is given. In Server mode
     // the OUTER (position 1) plugin gets `local = SS_REMOTE`, so on_ready
@@ -550,7 +467,7 @@ async fn chain_runner_server_mode_inverts_on_ready_probe_target() {
         }))
         .on_ready(tx);
 
-    let ss_local_port = allocate_ports(1).unwrap()[0].port();
+    let ss_local_port = free_loopback_port().port();
     let env = crate::sip003::PluginEnv {
         local_host: "127.0.0.1".parse().unwrap(),
         local_port: ss_local_port,
@@ -572,7 +489,7 @@ async fn chain_runner_server_mode_inverts_on_ready_probe_target() {
 #[skuld::test]
 async fn chain_runner_default_matches_explicit_client_mode() {
     let ss_local: SocketAddr = "127.0.0.1:22222".parse().unwrap();
-    let ss_remote_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    let ss_remote_port = free_loopback_port().port();
     let ss_remote: SocketAddr = format!("127.0.0.1:{ss_remote_port}").parse().unwrap();
 
     let rec_default = Arc::new(Mutex::new(None));
@@ -754,7 +671,7 @@ async fn long_running_plugin_survives_past_drain_timeout() {
         .drain_timeout(drain_timeout);
 
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
 
     let handle = tokio::spawn(runner.run(env));
 
@@ -797,7 +714,7 @@ async fn first_error_preserved_across_drain() {
         .drain_timeout(drain_timeout);
 
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
 
     let handle = tokio::spawn(runner.run(env));
     let result = handle.await.expect("no JoinError");
@@ -823,7 +740,7 @@ async fn external_cancel_drains_empty_joinset_immediately() {
         .drain_timeout(drain_timeout);
 
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
 
     let start = std::time::Instant::now();
     let result = runner.run(env).await;
@@ -839,16 +756,46 @@ async fn external_cancel_drains_empty_joinset_immediately() {
     cancel.cancel();
 }
 
-/// External cancel fires concurrently with a plugin errors — the plugin's
+/// A member that signals it is running, then fails without readying.
+struct SignalsThenFails {
+    running: Once<oneshot::Sender<()>>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for SignalsThenFails {
+    fn name(&self) -> &str {
+        "signals-then-fails"
+    }
+
+    async fn run(
+        &self,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
+        let _ = self.running.take().send(());
+        Err(crate::Error::PluginExit {
+            name: "signals-then-fails".into(),
+            code: 1,
+        })
+    }
+}
+
+/// External cancel fires concurrently with a plugin error — the plugin's
 /// error must still win over any drain-timeout wrapping, regardless of
-/// which wins the Phase 1 `select!` race.
+/// which wins the Phase 1 `select!` race. The cancel is sent once the failing member is running: the chain starts
+/// it only after the stubborn one behind it is ready.
 #[skuld::test]
 async fn external_cancel_concurrent_with_plugin_error_preserves_plugin_error() {
     let cancel = CancellationToken::new();
     let drain_timeout = std::time::Duration::from_millis(200);
 
+    let (running_tx, running_rx) = oneshot::channel();
     let runner = ChainRunner::new()
-        .add(Box::new(FailingPlugin))
+        .add(Box::new(SignalsThenFails {
+            running: Once::new(running_tx),
+        }))
         .add(Box::new(StubbornPlugin {
             name: "stubborn".into(),
         }))
@@ -856,13 +803,14 @@ async fn external_cancel_concurrent_with_plugin_error_preserves_plugin_error() {
         .drain_timeout(drain_timeout);
 
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
 
     // Fire the external cancel as close as we can to the plugin error. Whether
     // Phase 1 observes the plugin exit first, or `shutdown.cancelled()` first,
     // `record_exit` must still have captured `first_error` by the time the
     // chain returns.
     let handle = tokio::spawn(runner.run(env));
+    running_rx.await.expect("the failing member ran");
     cancel.cancel();
 
     let result = handle.await.expect("no JoinError");
@@ -927,7 +875,7 @@ async fn the_default_drain_timeout_outlasts_a_members_take_down() {
         .add(Box::new(SlowToStop))
         .cancel_token(cancel.clone());
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
     let handle = tokio::spawn(runner.run(env));
 
     cancel.cancel();
@@ -984,7 +932,7 @@ async fn a_member_that_fails_in_the_abort_window_is_recorded() {
         .cancel_token(cancel.clone())
         .drain_timeout(std::time::Duration::from_millis(100));
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
     let handle = tokio::spawn(runner.run(env));
 
     cancel.cancel();
@@ -1085,7 +1033,7 @@ async fn plugin_panic_surfaces_as_chain_error() {
         .drain_timeout(std::time::Duration::from_millis(200));
 
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
 
     // Suppress the panic's backtrace noise in the test output.
     let prev_hook = std::panic::take_hook();
@@ -1099,141 +1047,127 @@ async fn plugin_panic_surfaces_as_chain_error() {
     }
 }
 
-use crate::chain::{run_readiness_aggregator, Mode, Readiness, ReadyGate};
+use crate::chain::{judge, Readiness, ReadyGate, Verdict};
+use crate::hop::Decision;
+
+fn ready_decision(port: u16) -> Decision {
+    Decision::Ready {
+        given: SocketAddr::from(([127, 0, 0, 1], port)),
+        report: PluginReady {
+            listen: SocketAddr::from(([127, 0, 0, 1], port)),
+            transports: Transports::TCP,
+        },
+    }
+}
 
 /// `BindConflict` is the only retryable class, so discarding one that the
 /// plugin already delivered turns a transient port collision into a hard
 /// start failure.
 #[skuld::test]
-async fn aggregator_reports_a_start_error_delivered_before_shutdown_won_the_race() {
-    let (tx0, rx0) = oneshot::channel();
+fn a_start_failure_delivered_before_shutdown_won_the_race_is_judged_a_failure() {
     let shutdown = CancellationToken::new();
-
-    tx0.send(Err(StartError::BindConflict {
-        errno: 98,
-        addr: "127.0.0.1:1080".parse().unwrap(),
-    }))
-    .unwrap();
     shutdown.cancel();
 
-    match run_readiness_aggregator(vec![(0, rx0)], 1, Mode::Client, shutdown).await {
-        Readiness::Failed(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
+    let decision = Decision::Failed(StartError::BindConflict {
+        errno: 98,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    });
+    match judge(Ok(decision), &shutdown) {
+        Verdict::Failed(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
         other => panic!("a delivered StartError must be reported, not discarded; got {other:?}"),
     }
 }
 
-/// A start failure ends the chain: the aggregator cancels the other plugins.
+/// A start failure ends the chain: judging it cancels the other plugins.
 #[skuld::test]
-async fn aggregator_returns_a_start_failure_and_cancels_the_chain() {
-    let (tx0, rx0) = oneshot::channel();
+fn judging_a_start_failure_cancels_the_chain() {
     let shutdown = CancellationToken::new();
 
-    tx0.send(Err(StartError::Fatal {
-        detail: "broke".into(),
-        errno: None,
-    }))
-    .unwrap();
-
-    let readiness = run_readiness_aggregator(vec![(0, rx0)], 1, Mode::Client, shutdown.clone()).await;
+    let verdict = judge(Ok(Decision::Failed(fatal())), &shutdown);
 
     assert!(
-        matches!(readiness, Readiness::Failed(StartError::Fatal { .. })),
-        "{readiness:?}"
+        matches!(verdict, Verdict::Failed(StartError::Fatal { .. })),
+        "{verdict:?}"
     );
     assert!(shutdown.is_cancelled(), "a start failure must stop the other plugins");
 }
 
 /// A plugin that drops its sender unsent exited before ready.
 #[skuld::test]
-async fn aggregator_synthesizes_a_failure_for_a_sender_dropped_unsent() {
-    let (tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+fn a_hop_that_dropped_its_sender_unsent_is_judged_a_failure() {
     let shutdown = CancellationToken::new();
 
-    drop(tx0);
-
-    let readiness = run_readiness_aggregator(vec![(0, rx0)], 1, Mode::Client, shutdown.clone()).await;
+    let verdict = judge(Ok(Decision::Dropped), &shutdown);
 
     assert!(
-        matches!(&readiness, Readiness::Failed(StartError::Fatal { detail, .. }) if detail.contains("exited before becoming ready")),
-        "{readiness:?}"
+        matches!(&verdict, Verdict::Failed(StartError::Fatal { detail, .. }) if detail.contains("exited before becoming ready")),
+        "{verdict:?}"
     );
     assert!(shutdown.is_cancelled());
 }
 
 #[skuld::test]
-async fn aggregator_returns_the_chain_ready_once_every_plugin_is() {
-    let (tx0, rx0) = oneshot::channel();
-    let (tx1, rx1) = oneshot::channel();
-    let ready = |port: u16| {
-        Ok(PluginReady {
-            listen: SocketAddr::from(([127, 0, 0, 1], port)),
-            transports: Transports::TCP,
-        })
-    };
-    tx0.send(ready(1080)).unwrap();
-    tx1.send(ready(1081)).unwrap();
+fn a_ready_hop_is_judged_ready() {
+    let verdict = judge(Ok(ready_decision(1080)), &CancellationToken::new());
 
-    let readiness = run_readiness_aggregator(vec![(0, rx0), (1, rx1)], 2, Mode::Client, CancellationToken::new()).await;
-
-    match readiness {
-        Readiness::Ready(chain) => assert_eq!(chain.listen.port(), 1080),
+    match verdict {
+        Verdict::Ready { given, report } => {
+            assert_eq!(given.port(), 1080);
+            assert_eq!(report.listen.port(), 1080);
+        }
         other => panic!("{other:?}"),
     }
 }
 
-/// A delivered `Ok(PluginReady)` must NOT be rescued (see the shutdown
-/// arm's comment for why).
+/// A delivered `Ok(PluginReady)` must NOT be rescued: `shutdown` is chain-wide and may have been cancelled by another
+/// plugin exit or an external cancel, so nothing here shows the chain is still viable.
 #[skuld::test]
-async fn aggregator_never_reports_ready_once_shutdown_won_the_race() {
-    let (tx0, rx0) = oneshot::channel();
+fn a_ready_hop_is_preempted_once_shutdown_won_the_race() {
     let shutdown = CancellationToken::new();
-
-    tx0.send(Ok(PluginReady {
-        listen: "127.0.0.1:1080".parse().unwrap(),
-        transports: Transports::TCP,
-    }))
-    .unwrap();
     shutdown.cancel();
 
-    let readiness = run_readiness_aggregator(vec![(0, rx0)], 1, Mode::Client, shutdown).await;
+    let verdict = judge(Ok(ready_decision(1080)), &shutdown);
 
     assert!(
-        matches!(readiness, Readiness::Preempted { .. }),
-        "a chain whose plugin already exited must never be reported ready: {readiness:?}"
+        matches!(verdict, Verdict::Preempted),
+        "a chain whose plugin already exited must never be reported ready: {verdict:?}"
     );
 }
 
-/// Shutdown preempting a plugin that delivered nothing. Covers `TryRecvError::Empty` — the sender is alive but unused.
+/// A sender dropped unsent after the chain was cancelled is the cancel doing, not a synthesized `Fatal`.
 #[skuld::test]
-async fn aggregator_is_preempted_by_shutdown_on_an_empty_receiver() {
-    let (tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+fn a_dropped_hop_is_preempted_once_shutdown_won_the_race() {
     let shutdown = CancellationToken::new();
-
     shutdown.cancel();
 
-    let readiness = run_readiness_aggregator(vec![(0, rx0)], 1, Mode::Client, shutdown).await;
-
-    assert!(matches!(readiness, Readiness::Preempted { .. }), "{readiness:?}");
-    drop(tx0);
-}
-
-/// Covers `TryRecvError::Closed` — the sender was dropped unsent BEFORE the
-/// arm runs. Distinct from the empty case above, and pinned so a later PR
-/// that gives `Closed` its own meaning has to do so deliberately.
-#[skuld::test]
-async fn aggregator_is_preempted_by_shutdown_on_a_closed_receiver() {
-    let (tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
-    let shutdown = CancellationToken::new();
-
-    drop(tx0);
-    shutdown.cancel();
-
-    let readiness = run_readiness_aggregator(vec![(0, rx0)], 1, Mode::Client, shutdown).await;
+    let verdict = judge(Ok(Decision::Dropped), &shutdown);
 
     assert!(
-        matches!(readiness, Readiness::Preempted { .. }),
-        "a sender dropped unsent must not become a synthesized Fatal in this arm: {readiness:?}"
+        matches!(verdict, Verdict::Preempted),
+        "a sender dropped unsent must not become a synthesized Fatal here: {verdict:?}"
     );
+}
+
+/// A hop supervisor that ended without deciding (it was cancelled while picking a port, or its plugin kept `ready`)
+/// has nothing to report, whether or not the chain was cancelled.
+#[skuld::test]
+fn a_supervisor_that_ended_without_a_decision_is_preempted() {
+    for cancelled in [false, true] {
+        let shutdown = CancellationToken::new();
+        if cancelled {
+            shutdown.cancel();
+        }
+        let (tx, rx) = oneshot::channel::<Decision>();
+        drop(tx);
+        let closed = rx.blocking_recv();
+
+        let verdict = judge(closed, &shutdown);
+
+        assert!(
+            matches!(verdict, Verdict::Preempted),
+            "cancelled={cancelled}: {verdict:?}"
+        );
+    }
 }
 
 // The gate on the caller's `ready` ------------------------------------------------------------------------------------
@@ -1276,50 +1210,45 @@ fn the_gate_holds_a_start_failure_until_released() {
     assert!(matches!(rx.try_recv(), Ok(Err(StartError::Fatal { .. }))));
 }
 
-/// Nothing to report: the sender stays open until the release, so the caller's channel does not close early.
+/// Nothing to report: the sender stays open until the release, so the caller channel does not close early.
 #[skuld::test]
 fn the_gate_keeps_the_sender_open_when_there_is_nothing_to_report_until_released() {
     let (tx, mut rx) = oneshot::channel();
     let mut gate = ReadyGate::new(Some(tx));
-    let (_member_tx, unread) = oneshot::channel();
+    let (_hop_tx, unread) = oneshot::channel();
 
-    gate.absorb(Readiness::Preempted { unread: vec![unread] });
+    gate.absorb(Readiness::Preempted { unread: Some(unread) });
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 
     gate.release();
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
 }
 
-/// What the preempted plugin delivers before the release is read at the release, and only a typed failure counts: a
-/// `PluginReady` does not rescue a chain whose `shutdown` already fired.
+/// What the preempted hop delivers before the release is read at the release, and only a typed failure counts: a
+/// `Ready` does not rescue a chain whose `shutdown` already fired.
 #[skuld::test]
-fn the_gate_reports_what_the_preempted_plugin_delivered_by_the_release() {
-    let ready = || {
-        Ok(PluginReady {
-            listen: "127.0.0.1:1080".parse().unwrap(),
-            transports: Transports::TCP,
-        })
-    };
-    // `member_drops_it`: the member dropped its sender before the release, instead of keeping it open.
-    for (delivered, member_drops_it, reported_fatal) in [
-        (Some(Err(fatal())), false, true),
-        (Some(ready()), false, false),
+fn the_gate_reports_what_the_preempted_hop_delivered_by_the_release() {
+    // `hop_drops_it`: the hop supervisor ended before the release without deciding, instead of staying open.
+    for (delivered, hop_drops_it, reported_fatal) in [
+        (Some(Decision::Failed(fatal())), false, true),
+        (Some(ready_decision(1080)), false, false),
+        (Some(Decision::Dropped), false, false),
         // Nothing delivered, sender still open.
         (None, false, false),
-        // Nothing delivered, sender dropped unsent: the receiver reads `Closed`, which is no failure to report.
+        // Nothing delivered, sender dropped: the receiver reads `Closed`, which is no failure to report.
         (None, true, false),
     ] {
         let (tx, mut rx) = oneshot::channel();
         let mut gate = ReadyGate::new(Some(tx));
-        let (member_tx, unread) = oneshot::channel();
-        gate.absorb(Readiness::Preempted { unread: vec![unread] });
+        let (hop_tx, unread) = oneshot::channel();
+        gate.absorb(Readiness::Preempted { unread: Some(unread) });
         assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 
-        let case = format!("{delivered:?}, dropped={member_drops_it}");
-        if let Some(delivered) = &delivered {
-            member_tx.send(delivered.clone()).unwrap();
-        } else if member_drops_it {
-            drop(member_tx);
+        let case = format!("{delivered:?}, dropped={hop_drops_it}");
+        if let Some(delivered) = delivered {
+            hop_tx.send(delivered).unwrap();
+        } else if hop_drops_it {
+            drop(hop_tx);
         }
         gate.release();
 
@@ -1331,7 +1260,19 @@ fn the_gate_reports_what_the_preempted_plugin_delivered_by_the_release() {
     }
 }
 
-/// A chain that never started aggregating is released the same way.
+/// A preemption with nothing left to read (the decision was already consumed) releases the same way.
+#[skuld::test]
+fn the_gate_keeps_the_sender_open_until_released_even_if_nothing_is_left_to_read() {
+    let (tx, mut rx) = oneshot::channel::<Result<ChainReady, StartError>>();
+    let mut gate = ReadyGate::new(Some(tx));
+    gate.absorb(Readiness::Preempted { unread: None });
+    assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+
+    gate.release();
+    assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
+}
+
+/// A gate that absorbed nothing is released the same way.
 #[skuld::test]
 fn the_gate_keeps_the_sender_open_until_released_even_if_it_never_absorbed_anything() {
     let (tx, mut rx) = oneshot::channel::<Result<ChainReady, StartError>>();
@@ -1448,28 +1389,26 @@ struct FailingChain {
 type Reported = Result<Result<ChainReady, StartError>, oneshot::error::RecvError>;
 
 impl FailingChain {
-    fn start(failing: Box<dyn ChainPlugin>, failing_position: usize, drain_timeout: std::time::Duration) -> Self {
+    /// The healthy member starts first and readies; `failing` starts behind it.
+    fn start(failing: Box<dyn ChainPlugin>, drain_timeout: std::time::Duration) -> Self {
         let (stopped_tx, stopped_rx) = oneshot::channel();
         let (gate_tx, gate_rx) = oneshot::channel();
         let relayed = Arc::new(AtomicBool::new(false));
         let healthy = Box::new(LastLineMember {
-            // The aggregator awaits the members in order: a healthy member in front of the failing one must have readied.
-            ready_first: failing_position == 1,
+            ready_first: true,
             stopped: Once::new(stopped_tx),
             gate: Once::new(gate_rx),
             relayed: relayed.clone(),
         });
         let (ready_tx, ready_rx) = oneshot::channel();
-        let runner = if failing_position == 0 {
-            ChainRunner::new().add(failing).add(healthy)
-        } else {
-            ChainRunner::new().add(healthy).add(failing)
-        }
-        .drain_timeout(drain_timeout)
-        .on_ready(ready_tx);
+        let runner = ChainRunner::new()
+            .add(failing)
+            .add(healthy)
+            .drain_timeout(drain_timeout)
+            .on_ready(ready_tx);
 
         let mut env = test_env();
-        env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+        env.local_port = free_loopback_port().port();
         let handle = tokio::spawn(runner.run(env));
         Self {
             ready_rx,
@@ -1507,17 +1446,16 @@ impl FailingChain {
 pub(crate) const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const DRAIN: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Runs a chain of `failing` at `failing_position` and a [`LastLineMember`] on a paused clock, and asserts the
+/// Runs a chain of a [`LastLineMember`] and, started behind it, `failing`, on a paused clock, and asserts the
 /// caller is not told of the failure until the healthy member was stopped and relayed the line it held back.
 ///
 /// On a paused current-thread runtime a timer fires only when no task can make progress, so `IDLE` elapsing means
 /// every task the chain's end woke has run: a failure not reported by then is being held, whatever the poll order.
 async fn assert_failure_waits_for_the_other_members_last_line(
     failing: Box<dyn ChainPlugin>,
-    failing_position: usize,
 ) -> (Reported, crate::Result<()>) {
     tokio::time::pause();
-    let mut chain = FailingChain::start(failing, failing_position, DRAIN);
+    let mut chain = FailingChain::start(failing, DRAIN);
     chain.until_the_healthy_member_is_stopped().await;
     tokio::select! {
         biased;
@@ -1529,13 +1467,10 @@ async fn assert_failure_waits_for_the_other_members_last_line(
 
 #[skuld::test]
 async fn a_typed_start_failure_waits_for_the_other_members_last_line() {
-    let (outcome, result) = assert_failure_waits_for_the_other_members_last_line(
-        Box::new(FailsAtStart {
-            how: StartFailure::Typed,
-            lingers: false,
-        }),
-        0,
-    )
+    let (outcome, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(FailsAtStart {
+        how: StartFailure::Typed,
+        lingers: false,
+    }))
     .await;
     let outcome = outcome.expect("the chain dropped `ready_tx` unsent");
 
@@ -1551,13 +1486,10 @@ async fn a_typed_start_failure_waits_for_the_other_members_last_line() {
 
 #[skuld::test]
 async fn an_exit_before_ready_waits_for_the_other_members_last_line() {
-    let (outcome, result) = assert_failure_waits_for_the_other_members_last_line(
-        Box::new(FailsAtStart {
-            how: StartFailure::Dropped,
-            lingers: false,
-        }),
-        0,
-    )
+    let (outcome, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(FailsAtStart {
+        how: StartFailure::Dropped,
+        lingers: false,
+    }))
     .await;
     let outcome = outcome.expect("the chain dropped `ready_tx` unsent");
 
@@ -1571,26 +1503,57 @@ async fn an_exit_before_ready_waits_for_the_other_members_last_line() {
     );
 }
 
-#[skuld::test]
-async fn a_start_failure_behind_a_ready_member_waits_for_the_other_members_last_line() {
-    let (outcome, result) = assert_failure_waits_for_the_other_members_last_line(
-        Box::new(FailsAtStart {
-            how: StartFailure::Typed,
-            lingers: false,
-        }),
-        1,
-    )
-    .await;
-    let outcome = outcome.expect("the chain dropped `ready_tx` unsent");
+/// A member behind the failing one is never started: it starts only once the failing one is ready.
+struct NeverStarted {
+    entered: Arc<AtomicBool>,
+}
 
-    assert!(
-        matches!(&outcome, Err(StartError::Fatal { detail, .. }) if detail == "member broke"),
-        "want the member's own Fatal, got {outcome:?}"
-    );
-    assert!(
-        matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
-        "run must return the failing member's error, got {result:?}"
-    );
+#[async_trait::async_trait]
+impl ChainPlugin for NeverStarted {
+    fn name(&self) -> &str {
+        "never-started"
+    }
+
+    async fn run(
+        &self,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
+        self.entered.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A start failure in the first-started member ends the chain with the member behind it never started, and the caller
+/// hears the typed failure.
+#[skuld::test]
+async fn a_start_failure_in_the_first_started_member_leaves_the_next_one_unstarted() {
+    for how in [StartFailure::Typed, StartFailure::Dropped] {
+        let entered = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = ChainRunner::new()
+            .add(Box::new(NeverStarted {
+                entered: entered.clone(),
+            }))
+            .add(Box::new(FailsAtStart { how, lingers: false }))
+            .on_ready(ready_tx);
+        let mut env = test_env();
+        env.local_port = free_loopback_port().port();
+
+        let result = runner.run(env).await;
+
+        assert!(
+            matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
+            "run must return the failing member's error, got {result:?}"
+        );
+        assert!(matches!(ready_rx.await, Ok(Err(StartError::Fatal { .. }))));
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "a member behind a failed start was started"
+        );
+    }
 }
 
 /// A member that reports a failure and keeps running does not leave the chain up: the start failure ends it.
@@ -1603,7 +1566,7 @@ async fn a_start_failure_from_a_member_that_keeps_running_ends_the_chain() {
             .on_ready(ready_tx);
 
         let mut env = test_env();
-        env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+        env.local_port = free_loopback_port().port();
         let handle = tokio::spawn(runner.run(env));
 
         let outcome = ready_rx.await.expect("the failure must be reported, not dropped");
@@ -1630,7 +1593,7 @@ async fn a_start_failure_is_delivered_once_the_drain_bound_expires_on_a_member_t
         .on_ready(ready_tx);
 
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
     let handle = tokio::spawn(runner.run(env));
 
     let outcome = ready_rx.await.expect("the held failure must be delivered, not dropped");
@@ -1727,10 +1690,10 @@ impl ChainPlugin for PanicsAtStart {
 }
 
 /// A member whose exit leaves `ready` open when the chain is cancelled reaches the caller as a dropped sender, and
-/// that too waits for the other members: the aggregator has nothing to report, but dropping the sender is a release.
+/// that too waits for the other members: the chain has nothing to report, but dropping the sender is a release.
 #[skuld::test]
 async fn an_exit_that_leaves_ready_open_waits_for_the_other_members_last_line() {
-    let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(ReadyHolderCrash), 0).await;
+    let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(ReadyHolderCrash)).await;
 
     assert!(reported.is_err(), "nothing was reported to the caller: {reported:?}");
     assert!(
@@ -1741,9 +1704,9 @@ async fn an_exit_that_leaves_ready_open_waits_for_the_other_members_last_line() 
 
 /// A probe-owned member that stops its probe before it exits is read as exited before ready, and the caller hears the
 /// typed `Fatal`, not a dropped sender, after the other members' last line.
-async fn assert_a_probe_owned_exit_before_ready_reports_the_typed_fatal(position: usize) {
-    let (reported, result) =
-        assert_failure_waits_for_the_other_members_last_line(Box::new(ProbeLikeCrash), position).await;
+#[skuld::test]
+async fn a_probe_owned_member_that_exits_before_ready_reports_the_typed_fatal() {
+    let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(ProbeLikeCrash)).await;
 
     assert!(
         matches!(&reported, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
@@ -1755,21 +1718,30 @@ async fn assert_a_probe_owned_exit_before_ready_reports_the_typed_fatal(position
     );
 }
 
+/// The same for the first-started member, with nobody to wait for.
 #[skuld::test]
-async fn a_probe_owned_first_member_that_exits_before_ready_reports_the_typed_fatal() {
-    assert_a_probe_owned_exit_before_ready_reports_the_typed_fatal(0).await;
-}
+async fn a_probe_owned_first_started_member_that_exits_before_ready_reports_the_typed_fatal() {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new().add(Box::new(ProbeLikeCrash)).on_ready(ready_tx);
+    let mut env = test_env();
+    env.local_port = free_loopback_port().port();
 
-#[skuld::test]
-async fn a_probe_owned_member_behind_a_ready_one_that_exits_before_ready_reports_the_typed_fatal() {
-    assert_a_probe_owned_exit_before_ready_reports_the_typed_fatal(1).await;
+    let result = runner.run(env).await;
+
+    assert!(
+        matches!(ready_rx.await, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready"))
+    );
+    assert!(
+        matches!(result, Err(crate::Error::PluginExit { code: 3, .. })),
+        "{result:?}"
+    );
 }
 
 #[skuld::test]
 async fn a_member_that_panics_at_start_waits_for_the_other_members_last_line() {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(PanicsAtStart), 0).await;
+    let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(PanicsAtStart)).await;
     std::panic::set_hook(prev_hook);
 
     assert!(
@@ -1803,7 +1775,7 @@ async fn an_external_cancel_before_ready_releases_the_caller_after_the_members_r
         .drain_timeout(DRAIN)
         .on_ready(ready_tx);
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
     let handle = tokio::spawn(runner.run(env));
 
     cancel.cancel();
@@ -1826,7 +1798,7 @@ async fn an_external_cancel_before_ready_releases_the_caller_after_the_members_r
     handle.await.unwrap().expect("a cancel is a clean end");
 }
 
-/// The same on a multi-thread runtime, where a member's exit and the aggregator run on different threads. The caller's
+/// The same on a multi-thread runtime, where a member's exit and the chain's start run on different threads. The caller's
 /// channel must not close until the member's last line was relayed, whichever thread gets there first. This does not
 /// control the order, so it cannot prove the absence of an early release; the paused-clock tests above do.
 #[skuld::test]
@@ -1844,7 +1816,7 @@ fn on_a_multi_thread_runtime_an_exit_before_ready_waits_for_the_other_members_la
                 lingers: false,
             }),
         ] {
-            let mut chain = FailingChain::start(failing, 0, DRAIN);
+            let mut chain = FailingChain::start(failing, DRAIN);
             chain.until_the_healthy_member_is_stopped().await;
             let (reported, result) = chain.open_the_gate().await;
             assert!(
@@ -1873,7 +1845,7 @@ async fn an_open_ready_is_released_once_the_drain_bound_expires_on_a_member_that
         .on_ready(ready_tx);
 
     let mut env = test_env();
-    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    env.local_port = free_loopback_port().port();
     let handle = tokio::spawn(runner.run(env));
 
     assert!(ready_rx.await.is_err(), "the caller must be released, not left waiting");

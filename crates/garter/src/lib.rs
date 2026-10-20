@@ -6,6 +6,7 @@ pub mod counting;
 pub mod error;
 #[cfg(target_os = "linux")]
 mod exit_watch;
+mod hop;
 pub mod plugin;
 mod port;
 pub mod shutdown;
@@ -40,6 +41,8 @@ mod binary_real_child_tests;
 mod binary_tests;
 #[cfg(test)]
 mod chain_failure_tests;
+#[cfg(test)]
+mod chain_order_tests;
 #[cfg(test)]
 mod chain_tests;
 #[cfg(test)]

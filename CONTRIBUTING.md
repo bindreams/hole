@@ -523,9 +523,10 @@ consumer is known, reserve the union over the possible consumers:
 `plugin_e2e::ports::reserve_ss_local` is generic over which client plugin will
 run, and that set includes galoshes, so it always reserves TCP+UDP —
 over-reserving UDP for a TCP-only plugin costs a retry, under-reserving it for
-galoshes costs a race. `garter::chain::allocate_ports` verifies TCP only and is
-clippy-banned outside garter's own chain-internal use, which carries a per-site
-allow.
+galoshes costs a race. The chain picks each intermediate port with
+`garter::port::pick_with`, uncapped, one hop at a time just before that hop
+starts, and verifies TCP only: every in-repo hop that is not the public one
+binds TCP alone.
 
 ### Route-command failure policy
 

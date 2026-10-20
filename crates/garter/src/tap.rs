@@ -60,7 +60,7 @@
 //! 4. Bind the tap's public listener on `local` (only after step 3, so the
 //!    public bind happens only once the data plane is actually wired
 //!    through), then report the tap's OWN readiness on the `ready` channel
-//!    passed to [`ChainPlugin::run`] — the chain aggregator awaits that.
+//!    passed to [`ChainPlugin::run`] — the chain awaits that before it starts the next hop.
 //! 5. Accept loop in a `JoinSet`; per-connection forwarder calls
 //!    `tokio::io::copy_bidirectional` with [`CountingStream`] wrappers. A forwarder
 //!    retries a refused connect to the inner until it connects, hits another

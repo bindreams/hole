@@ -23,7 +23,8 @@ pub trait ChainPlugin: Send + Sync {
     /// Run the plugin. Blocks until shutdown or fatal error.
     ///
     /// - `local`: bind here, accept from previous stage (or SS client)
-    /// - `remote`: forward here, to next stage (or SS server)
+    /// - `remote`: forward here, to next stage (or SS server). A chain runs a plugin only once the stage it forwards
+    ///   to has reported ready.
     /// - `shutdown`: fires when graceful shutdown is requested
     /// - `ready`: the plugin MUST send exactly one of:
     ///     - `Ok(PluginReady { .. })` once its listener is bound & accepting, OR
@@ -37,13 +38,11 @@ pub trait ChainPlugin: Send + Sync {
     ///   that task before `run` returns: a sender still held then is not read
     ///   as an exit before ready.
     ///
-    /// A start failure (an `Err` sent on `ready`, or `ready` dropped unsent) ends the chain only when the runner
-    /// listens for readiness, that is when [`ChainRunner::on_ready`](crate::ChainRunner::on_ready) is registered.
-    /// The runner then cancels `shutdown` at once, so the plugin must return rather than keep running, and reports
-    /// the failure to the caller after every plugin's `run` has returned, so output a plugin relays while it stops
-    /// comes first; a plugin that ignores `shutdown` is waited for at most
-    /// [`drain_timeout`](crate::ChainRunner::drain_timeout). Without `on_ready` the runner does not read `ready`: a
-    /// plugin that sends `Err` and keeps running leaves the chain up, and only its return ends it.
+    /// A start failure (an `Err` sent on `ready`, or `ready` dropped unsent) ends the chain. The runner cancels
+    /// `shutdown` at once, so the plugin must return rather than keep running, and reports the failure to the
+    /// caller, when [`ChainRunner::on_ready`](crate::ChainRunner::on_ready) is registered, after every plugin's `run`
+    /// has returned, so output a plugin relays while it stops comes first; a plugin that ignores `shutdown` is
+    /// waited for at most [`drain_timeout`](crate::ChainRunner::drain_timeout).
     async fn run(
         &self,
         local: SocketAddr,
