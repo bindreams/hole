@@ -1254,7 +1254,7 @@ impl garter::ChainPlugin for YamuxPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1282,7 +1282,7 @@ impl garter::ChainPlugin for YamuxPlugin {
                 let Ok(listen) = bound_rx.await else { return };
                 let _ = ready.send(Ok(garter::PluginReady { listen, transports }));
             });
-            let result = run_server(self.config, local, remote, shutdown, Some(bound_tx)).await;
+            let result = run_server(self.config.clone(), local, remote, shutdown, Some(bound_tx)).await;
             join_ready_holder(holder).await;
             result
         } else {
@@ -1295,7 +1295,7 @@ impl garter::ChainPlugin for YamuxPlugin {
                 }));
             });
             let result = run_client(
-                self.config,
+                self.config.clone(),
                 local,
                 remote,
                 self.udp_timeout,

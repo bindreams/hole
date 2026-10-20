@@ -211,7 +211,7 @@ impl ChainPlugin for BinaryPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         remote: SocketAddr,
         shutdown: CancellationToken,

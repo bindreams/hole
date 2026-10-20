@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::chain::{allocate_ports, ChainRunner};
+use crate::once::Once;
 use crate::plugin::ChainPlugin;
 use crate::sitrep::StartError;
 use crate::tap::TapPlugin;
@@ -53,7 +54,7 @@ fn drop_signal() -> (DropSignal, oneshot::Receiver<()>) {
 /// Does its prelude, then ignores its token: only an abort ends it.
 struct IgnoresStop {
     prelude: Prelude,
-    torn_down: DropSignal,
+    torn_down: Once<DropSignal>,
 }
 
 #[async_trait::async_trait]
@@ -63,13 +64,13 @@ impl ChainPlugin for IgnoresStop {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        let _torn_down = self.torn_down;
+        let _torn_down = self.torn_down.take();
         let _held_ready = announce(self.prelude, local, ready);
         std::future::pending().await
     }
@@ -96,7 +97,7 @@ impl ChainPlugin for EndsWhenStopped {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -150,7 +151,7 @@ async fn a_failed_start_aborts_an_inner_that_ignores_its_token_at_the_bound() {
         let (signal, torn_down) = drop_signal();
         let inner = Box::new(IgnoresStop {
             prelude,
-            torn_down: signal,
+            torn_down: Once::new(signal),
         });
         let calls = Arc::new(AtomicUsize::new(0));
         let probe = scripted(vec![Ok(addr(5001))], &calls);
@@ -201,7 +202,7 @@ async fn a_chain_over_an_inner_that_ignores_its_token_ends_at_the_bounds() {
     let runner = ChainRunner::new()
         .add(Box::new(TapPlugin::wrap(Box::new(IgnoresStop {
             prelude: Prelude::Silent,
-            torn_down: signal,
+            torn_down: Once::new(signal),
         }))))
         .on_ready(ready_tx);
     let mut env = crate::chain_tests::test_env();
@@ -244,7 +245,7 @@ async fn an_accept_failure_stops_the_inner_and_fails_the_tap_naming_it() {
         } else {
             Box::new(IgnoresStop {
                 prelude: Prelude::Ready,
-                torn_down: signal,
+                torn_down: Once::new(signal),
             })
         };
         let tap = Box::new(TapPlugin::wrap_with_accept_failure(
@@ -296,7 +297,7 @@ async fn an_aborted_tap_aborts_its_inner() {
     let (signal, torn_down) = drop_signal();
     let tap = Box::new(TapPlugin::wrap(Box::new(IgnoresStop {
         prelude: Prelude::Ready,
-        torn_down: signal,
+        torn_down: Once::new(signal),
     })));
     let (ready_tx, ready_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
@@ -378,7 +379,7 @@ impl ChainPlugin for ExitsOkBeforeReady {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -418,7 +419,7 @@ async fn an_inner_that_returns_ok_before_ready_fails_the_start_and_the_tap() {
 /// `BinaryPlugin` has, which delivers a failure it decided only at the end of its take-down.
 struct DeliversAfterStop {
     error: StartError,
-    running: oneshot::Sender<()>,
+    running: Once<oneshot::Sender<()>>,
 }
 
 #[async_trait::async_trait]
@@ -428,17 +429,17 @@ impl ChainPlugin for DeliversAfterStop {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        let _ = self.running.send(());
+        let _ = self.running.take().send(());
         shutdown.cancelled().await;
         // On a current-thread runtime this puts the delivery behind the tap, already woken by the same cancel.
         tokio::task::yield_now().await;
-        let _ = ready.send(Err(self.error));
+        let _ = ready.send(Err(self.error.clone()));
         Err(crate::Error::Chain("the stub decided its start failed".into()))
     }
 }
@@ -485,7 +486,7 @@ async fn a_start_failure_the_inner_delivers_while_the_tap_drains_it_is_still_rep
             let (running_tx, running_rx) = oneshot::channel();
             let inner = Box::new(DeliversAfterStop {
                 error: error.clone(),
-                running: running_tx,
+                running: Once::new(running_tx),
             });
             let plugin: Box<dyn ChainPlugin> = if tapped {
                 Box::new(TapPlugin::wrap(inner))
@@ -527,7 +528,7 @@ enum DeliversWhen {
 struct Delivers {
     error: StartError,
     when: DeliversWhen,
-    running: oneshot::Sender<()>,
+    running: Once<oneshot::Sender<()>>,
 }
 
 #[async_trait::async_trait]
@@ -537,24 +538,24 @@ impl ChainPlugin for Delivers {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        let _ = self.running.send(());
+        let _ = self.running.take().send(());
         match self.when {
             DeliversWhen::AfterStop => {
                 shutdown.cancelled().await;
                 tokio::task::yield_now().await;
-                let _ = ready.send(Err(self.error));
+                let _ = ready.send(Err(self.error.clone()));
             }
             DeliversWhen::ThenExits => {
-                let _ = ready.send(Err(self.error));
+                let _ = ready.send(Err(self.error.clone()));
             }
             DeliversWhen::ThenWaits => {
-                let _ = ready.send(Err(self.error));
+                let _ = ready.send(Err(self.error.clone()));
                 shutdown.cancelled().await;
             }
         }
@@ -597,7 +598,7 @@ async fn a_typed_start_failure_the_inner_delivers_is_reported_on_every_path_that
             let inner = Box::new(Delivers {
                 error: error.clone(),
                 when,
-                running: running_tx,
+                running: Once::new(running_tx),
             });
             let calls = Arc::new(AtomicUsize::new(0));
             let tap = Box::new(TapPlugin::wrap_with_probe(

@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::chain::{allocate_ports, ChainRunner};
 use crate::chain_tests::{test_env, DRAIN, IDLE};
+use crate::once::Once;
 use crate::plugin::ChainPlugin;
 use crate::sitrep::{PluginReady, StartError, Transports};
 
@@ -66,7 +67,7 @@ impl ChainPlugin for HoldsFailure {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -76,7 +77,7 @@ impl ChainPlugin for HoldsFailure {
             ready: Some(ready),
             error: Some(bind_conflict()),
         };
-        match self.finish {
+        match self.finish.clone() {
             Finish::Returns(gate) => {
                 gate.cancelled().await;
                 Err(crate::Error::PluginExit {
@@ -119,7 +120,7 @@ impl ChainPlugin for CauseMember {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -149,7 +150,7 @@ impl ChainPlugin for CauseMember {
 /// A healthy member that, once stopped, holds a last line back until `gate` opens.
 struct Drainer {
     gate: CancellationToken,
-    stopped: oneshot::Sender<()>,
+    stopped: Once<oneshot::Sender<()>>,
     relayed: Arc<AtomicBool>,
 }
 
@@ -160,7 +161,7 @@ impl ChainPlugin for Drainer {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -171,7 +172,7 @@ impl ChainPlugin for Drainer {
             transports: Transports::TCP,
         }));
         shutdown.cancelled().await;
-        let _ = self.stopped.send(());
+        let _ = self.stopped.take().send(());
         self.gate.cancelled().await;
         self.relayed.store(true, Ordering::SeqCst);
         Ok(())
@@ -247,7 +248,7 @@ async fn run_row(row: Row) -> Result<(), String> {
     if drains {
         members.push(Box::new(Drainer {
             gate: gate.clone(),
-            stopped: stopped_tx,
+            stopped: Once::new(stopped_tx),
             relayed: relayed.clone(),
         }));
     }

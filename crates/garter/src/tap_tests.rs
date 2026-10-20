@@ -53,6 +53,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::counting::CountingStream;
+use crate::once::Once;
 use crate::plugin::ChainPlugin;
 use crate::sitrep::{PluginReady, StartError};
 use crate::tap::{
@@ -112,7 +113,7 @@ impl ChainPlugin for StubPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -543,7 +544,7 @@ impl ChainPlugin for CountingStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -585,13 +586,13 @@ impl ChainPlugin for StolenPortStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        let _torn_down = SetOnDrop(self.torn_down);
+        let _torn_down = SetOnDrop(self.torn_down.clone());
         // A port this stub holds itself, so it cannot lose it to a third party.
         let other_process = std::net::TcpListener::bind(SocketAddr::new(local.ip(), 0)).expect("take a port");
         let taken = other_process.local_addr().unwrap();
@@ -618,14 +619,14 @@ impl ChainPlugin for FailingStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        if let Some(e) = self.report {
-            let _ = ready.send(Err(e));
+        if let Some(e) = &self.report {
+            let _ = ready.send(Err(e.clone()));
         }
         Err(crate::Error::Chain("stub failed".into()))
     }
@@ -643,7 +644,7 @@ impl ChainPlugin for ExitsHoldingReadyStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -667,7 +668,7 @@ impl ChainPlugin for ParkedStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -756,7 +757,7 @@ impl ChainPlugin for StealOnceStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1024,7 +1025,7 @@ impl ChainPlugin for RecordingStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -1220,13 +1221,13 @@ impl ChainPlugin for SilentStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        let _torn_down = SetOnDrop(self.torn_down);
+        let _torn_down = SetOnDrop(self.torn_down.clone());
         let _held = (!self.drop_ready).then_some(ready);
         shutdown.cancelled().await;
         Ok(())
@@ -1309,7 +1310,7 @@ impl ChainPlugin for ForeignListenStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1349,7 +1350,7 @@ impl ChainPlugin for OtherPortStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1440,7 +1441,7 @@ impl ChainPlugin for ReportsAnotherIpStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1637,7 +1638,7 @@ async fn a_short_run_of_refusals_never_warns() {
 /// Reports ready on the address it was given without binding it, then exits with an
 /// error once `die` fires.
 struct ReadiedStub {
-    die: oneshot::Receiver<()>,
+    die: Once<oneshot::Receiver<()>>,
 }
 
 #[async_trait::async_trait]
@@ -1647,7 +1648,7 @@ impl ChainPlugin for ReadiedStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -1657,7 +1658,7 @@ impl ChainPlugin for ReadiedStub {
             listen: local,
             transports: crate::sitrep::Transports::TCP,
         }));
-        let _ = self.die.await;
+        let _ = self.die.take().await;
         Err(crate::Error::Chain("stub died".into()))
     }
 }
@@ -1679,7 +1680,7 @@ async fn the_inner_exiting_ends_a_forwarder_still_retrying_its_connect() {
         ))))
     });
     let tap = Box::new(TapPlugin::wrap_with_connector(
-        Box::new(ReadiedStub { die: die_rx }),
+        Box::new(ReadiedStub { die: Once::new(die_rx) }),
         always_refused,
     ));
     // Never cancelled: only the inner's exit may end the tap and its forwarder.
@@ -1761,8 +1762,8 @@ pub(crate) fn announce(
 struct LastLineStub {
     prelude: Prelude,
     /// Fires when the inner has been told to stop.
-    stopped: oneshot::Sender<()>,
-    gate: oneshot::Receiver<()>,
+    stopped: Once<oneshot::Sender<()>>,
+    gate: Once<oneshot::Receiver<()>>,
     relayed: Arc<AtomicBool>,
 }
 
@@ -1773,7 +1774,7 @@ impl ChainPlugin for LastLineStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1781,8 +1782,8 @@ impl ChainPlugin for LastLineStub {
     ) -> crate::Result<()> {
         let _held_ready = announce(self.prelude, local, ready);
         shutdown.cancelled().await;
-        let _ = self.stopped.send(());
-        let _ = self.gate.await;
+        let _ = self.stopped.take().send(());
+        let _ = self.gate.take().await;
         self.relayed.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1799,8 +1800,8 @@ async fn assert_failure_waits_for_the_inners_last_line(
     let relayed = Arc::new(AtomicBool::new(false));
     let inner = Box::new(LastLineStub {
         prelude,
-        stopped: stopped_tx,
-        gate: gate_rx,
+        stopped: Once::new(stopped_tx),
+        gate: Once::new(gate_rx),
         relayed: relayed.clone(),
     });
     let calls = Arc::new(AtomicUsize::new(0));

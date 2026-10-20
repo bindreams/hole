@@ -48,6 +48,8 @@ mod error_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_watch_tests;
 #[cfg(test)]
+mod once;
+#[cfg(test)]
 mod plugin_tests;
 #[cfg(test)]
 mod sip003_tests;

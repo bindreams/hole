@@ -83,6 +83,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
@@ -115,7 +117,7 @@ pub(crate) const INNER_STOP_BOUND: Duration =
 /// Decorator that wraps any [`ChainPlugin`] in a counting loopback hop.
 ///
 /// `wrap(inner)` produces a new plugin whose `run` performs the lifecycle
-/// described in the module docs. The inner plugin is moved by value;
+/// described in the module docs. The inner plugin is shared with each run;
 /// `pid_sink` and other configuration on `BinaryPlugin` are preserved
 /// (the tap delegates to `inner.run`).
 ///
@@ -127,17 +129,19 @@ pub(crate) const INNER_STOP_BOUND: Duration =
 /// that took the inner port can also answer the probe: the inner then reports
 /// ready and dies on its own failed bind.
 pub struct TapPlugin {
-    inner: Box<dyn ChainPlugin>,
+    inner: Arc<dyn ChainPlugin>,
+    // The three seams below are taken by the first run that reads them: a later run uses the real probe, connect and
+    // accept.
     /// Replaces the OS probe in the inner-port pick, so a test can script the
     /// ports and errors the OS would return.
     #[cfg(test)]
-    probe: Option<Probe>,
+    probe: Mutex<Option<Probe>>,
     /// Replaces the forwarders' TCP connect, so a test can script the refusals the OS would return.
     #[cfg(test)]
-    connector: Option<Connector>,
+    connector: Mutex<Option<Connector>>,
     /// Fails the accept loop's first accept, as the OS does on fd exhaustion.
     #[cfg(test)]
-    accept_failure: Option<io::Error>,
+    accept_failure: Mutex<Option<io::Error>>,
 }
 
 /// One attempt to find a free port: the address a probe bound, or its error.
@@ -154,36 +158,36 @@ fn tcp_connector() -> Connector {
 impl TapPlugin {
     pub fn wrap(inner: Box<dyn ChainPlugin>) -> Self {
         Self {
-            inner,
+            inner: Arc::from(inner),
             #[cfg(test)]
-            probe: None,
+            probe: Mutex::new(None),
             #[cfg(test)]
-            connector: None,
+            connector: Mutex::new(None),
             #[cfg(test)]
-            accept_failure: None,
+            accept_failure: Mutex::new(None),
         }
     }
 
     /// The accept failure a test scripted, if any.
-    fn take_accept_failure(&mut self) -> Option<io::Error> {
+    fn take_accept_failure(&self) -> Option<io::Error> {
         #[cfg(test)]
-        return self.accept_failure.take();
+        return self.accept_failure.lock().unwrap().take();
         #[cfg(not(test))]
         None
     }
 
     /// The scripted probe a test installed, if any.
-    fn take_probe(&mut self) -> Option<Probe> {
+    fn take_probe(&self) -> Option<Probe> {
         #[cfg(test)]
-        return self.probe.take();
+        return self.probe.lock().unwrap().take();
         #[cfg(not(test))]
         None
     }
 
     /// The connector a test installed, else the real TCP connect.
-    fn take_connector(&mut self) -> Connector {
+    fn take_connector(&self) -> Connector {
         #[cfg(test)]
-        if let Some(connector) = self.connector.take() {
+        if let Some(connector) = self.connector.lock().unwrap().take() {
             return connector;
         }
         tcp_connector()
@@ -192,7 +196,7 @@ impl TapPlugin {
     #[cfg(test)]
     pub(crate) fn wrap_with_probe(inner: Box<dyn ChainPlugin>, probe: Probe) -> Self {
         Self {
-            probe: Some(probe),
+            probe: Mutex::new(Some(probe)),
             ..Self::wrap(inner)
         }
     }
@@ -200,7 +204,7 @@ impl TapPlugin {
     #[cfg(test)]
     pub(crate) fn wrap_with_connector(inner: Box<dyn ChainPlugin>, connector: Connector) -> Self {
         Self {
-            connector: Some(connector),
+            connector: Mutex::new(Some(connector)),
             ..Self::wrap(inner)
         }
     }
@@ -208,7 +212,7 @@ impl TapPlugin {
     #[cfg(test)]
     pub(crate) fn wrap_with_accept_failure(inner: Box<dyn ChainPlugin>, failure: io::Error) -> Self {
         Self {
-            accept_failure: Some(failure),
+            accept_failure: Mutex::new(Some(failure)),
             ..Self::wrap(inner)
         }
     }
@@ -221,7 +225,7 @@ impl ChainPlugin for TapPlugin {
     }
 
     async fn run(
-        mut self: Box<Self>,
+        &self,
         local: SocketAddr,
         remote: SocketAddr,
         shutdown: CancellationToken,
@@ -263,12 +267,10 @@ impl ChainPlugin for TapPlugin {
         let inner_stop = shutdown.child_token();
         let inner_shutdown = inner_stop.clone();
         let (inner_ready_tx, mut inner_ready_rx) = oneshot::channel();
-        let mut inner_handle = AbortOnDropHandle::new(tokio::spawn(self.inner.run(
-            inner_local,
-            remote,
-            inner_shutdown,
-            inner_ready_tx,
-        )));
+        let inner = self.inner.clone();
+        let mut inner_handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            inner.run(inner_local, remote, inner_shutdown, inner_ready_tx).await
+        }));
 
         // 3. Wait for the inner plugin's readiness report, racing the inner
         //    task itself so an early plugin failure doesn't leave us blocked.

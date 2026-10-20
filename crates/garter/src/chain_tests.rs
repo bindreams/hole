@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::chain::{allocate_ports, ChainReady, ChainRunner};
+use crate::once::Once;
 use crate::plugin::ChainPlugin;
 use crate::sitrep::{PluginReady, StartError, Transports};
 
@@ -130,7 +131,7 @@ impl ChainPlugin for InstantPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -154,7 +155,7 @@ impl ChainPlugin for ListeningPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -188,7 +189,7 @@ impl ChainPlugin for TransportsPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -216,7 +217,7 @@ impl ChainPlugin for FailingPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -245,7 +246,7 @@ impl ChainPlugin for StubbornPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -266,7 +267,7 @@ impl ChainPlugin for PanickingPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -464,7 +465,7 @@ impl ChainPlugin for RecordingPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -886,7 +887,7 @@ impl ChainPlugin for SlowToStop {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -959,7 +960,7 @@ impl ChainPlugin for PanicsWhenAborted {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -1367,7 +1368,7 @@ impl ChainPlugin for FailsAtStart {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1399,8 +1400,8 @@ struct LastLineMember {
     /// Reports ready at once; otherwise it holds `ready` and reports nothing.
     ready_first: bool,
     /// Fires when the chain has told the member to stop.
-    stopped: oneshot::Sender<()>,
-    gate: oneshot::Receiver<()>,
+    stopped: Once<oneshot::Sender<()>>,
+    gate: Once<oneshot::Receiver<()>>,
     relayed: Arc<AtomicBool>,
 }
 
@@ -1411,7 +1412,7 @@ impl ChainPlugin for LastLineMember {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1427,8 +1428,8 @@ impl ChainPlugin for LastLineMember {
             Some(ready)
         };
         shutdown.cancelled().await;
-        let _ = self.stopped.send(());
-        let _ = self.gate.await;
+        let _ = self.stopped.take().send(());
+        let _ = self.gate.take().await;
         self.relayed.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1454,8 +1455,8 @@ impl FailingChain {
         let healthy = Box::new(LastLineMember {
             // The aggregator awaits the members in order: a healthy member in front of the failing one must have readied.
             ready_first: failing_position == 1,
-            stopped: stopped_tx,
-            gate: gate_rx,
+            stopped: Once::new(stopped_tx),
+            gate: Once::new(gate_rx),
             relayed: relayed.clone(),
         });
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -1656,7 +1657,7 @@ impl ChainPlugin for ProbeLikeCrash {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1688,7 +1689,7 @@ impl ChainPlugin for ReadyHolderCrash {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1715,7 +1716,7 @@ impl ChainPlugin for PanicsAtStart {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -1794,8 +1795,8 @@ async fn an_external_cancel_before_ready_releases_the_caller_after_the_members_r
     let runner = ChainRunner::new()
         .add(Box::new(LastLineMember {
             ready_first: false,
-            stopped: stopped_tx,
-            gate: gate_rx,
+            stopped: Once::new(stopped_tx),
+            gate: Once::new(gate_rx),
             relayed: relayed.clone(),
         }))
         .cancel_token(cancel.clone())

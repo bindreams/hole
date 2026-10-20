@@ -1485,3 +1485,42 @@ fn a_hop_whose_bind_fails_reports_the_typed_start_failure() {
         }
     });
 }
+
+/// A `YamuxPlugin` is a description of a hop, not a running one: run again on the same value after a stop, it binds
+/// and readies again. Both roles, each on a port of its own.
+#[skuld::test]
+async fn a_yamux_plugin_is_re_runnable() {
+    for is_server in [false, true] {
+        let plugin: Arc<dyn garter::ChainPlugin> =
+            Arc::new(crate::yamux::YamuxPlugin::new(is_server, DEFAULT_UDP_TIMEOUT));
+
+        for run in 1..=2 {
+            let shutdown = CancellationToken::new();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let handle = tokio::spawn({
+                let (plugin, shutdown) = (plugin.clone(), shutdown.clone());
+                async move {
+                    plugin
+                        .run(
+                            "127.0.0.1:0".parse().unwrap(),
+                            "127.0.0.1:9".parse().unwrap(),
+                            shutdown,
+                            ready_tx,
+                        )
+                        .await
+                }
+            });
+
+            let reported = ready_rx
+                .await
+                .unwrap_or_else(|_| panic!("is_server={is_server} run {run}: `ready` was dropped unsent"));
+            reported.unwrap_or_else(|e| panic!("is_server={is_server} run {run}: failed to start: {e}"));
+
+            shutdown.cancel();
+            handle
+                .await
+                .expect("run task panicked")
+                .unwrap_or_else(|e| panic!("is_server={is_server} run {run}: returned an error after a stop: {e}"));
+        }
+    }
+}

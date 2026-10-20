@@ -1614,7 +1614,7 @@ async fn a_probe_owned_plugin_that_exits_before_ready_has_dropped_its_sender_whe
             plugin = plugin.env(*k, *v);
         }
         let (ready_tx, mut ready_rx) = oneshot::channel();
-        let run = Box::new(plugin)
+        let run = plugin
             .run(
                 local,
                 "127.0.0.1:9".parse().unwrap(),
@@ -1638,4 +1638,43 @@ async fn a_probe_owned_plugin_that_exits_before_ready_has_dropped_its_sender_whe
 
 fn main() {
     skuld::run_all();
+}
+
+/// A `BinaryPlugin` is a description of a child to spawn, not a child: run again on the same value after a stop, it
+/// spawns a fresh one and readies again.
+#[skuld::test]
+async fn a_binary_plugin_runs_again_after_it_was_stopped() {
+    use garter::ChainPlugin;
+
+    let plugin: Arc<dyn ChainPlugin> =
+        Arc::new(BinaryPlugin::new(mock_plugin_path(), None).readiness(garter::binary::ReadinessMode::ExpectSitrep));
+    // Never dialed: the mock forwards to it only on an accepted connection.
+    let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = remote_listener.local_addr().unwrap();
+
+    for run in 1..=2 {
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local.local_addr().unwrap();
+        drop(local);
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let handle = tokio::spawn({
+            let (plugin, shutdown) = (plugin.clone(), shutdown.clone());
+            async move { plugin.run(local_addr, remote, shutdown, ready_tx).await }
+        });
+
+        // A bound on a child that may never ready: the failure surfaced to a human, as in `expect_ready`.
+        let reported = tokio::time::timeout(READY_TIMEOUT, ready_rx)
+            .await
+            .unwrap_or_else(|_| panic!("run {run}: the child did not ready within {READY_TIMEOUT:?}"))
+            .unwrap_or_else(|_| panic!("run {run}: `ready` was dropped unsent"));
+        reported.unwrap_or_else(|e| panic!("run {run}: failed to start: {e}"));
+
+        shutdown.cancel();
+        handle
+            .await
+            .expect("run task panicked")
+            .unwrap_or_else(|e| panic!("run {run}: returned an error after a stop: {e}"));
+    }
 }

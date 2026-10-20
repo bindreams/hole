@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use contracts::debug_requires;
@@ -169,7 +170,7 @@ fn allocate_one_port() -> crate::Result<SocketAddr> {
 
 /// Orchestrates a chain of SIP003u plugins.
 pub struct ChainRunner {
-    plugins: Vec<Box<dyn ChainPlugin>>,
+    plugins: Vec<Arc<dyn ChainPlugin>>,
     drain_timeout: Duration,
     ready_tx: Option<oneshot::Sender<Result<ChainReady, StartError>>>,
     external_cancel: Option<CancellationToken>,
@@ -196,7 +197,7 @@ impl ChainRunner {
     /// Add a plugin to the end of the chain.
     #[debug_requires(self.plugins.len() <= 100, "chain is unreasonably long")]
     pub fn add(mut self, plugin: Box<dyn ChainPlugin>) -> Self {
-        self.plugins.push(plugin);
+        self.plugins.push(Arc::from(plugin));
         self
     }
 

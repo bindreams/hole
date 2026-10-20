@@ -11,8 +11,12 @@ use crate::sitrep::{PluginReady, StartError};
 /// (potentially transformed) traffic to a remote address. The plugin
 /// owns its runtime: it binds listeners, manages connections, reports
 /// readiness, and shuts down when the cancellation token fires.
+///
+/// A plugin is a description of a hop, not a running one: `run` may be called
+/// again after it returned, sequentially, and a return leaves no listener,
+/// child or task behind. The chain relies on this to restart one hop alone.
 #[async_trait::async_trait]
-pub trait ChainPlugin: Send {
+pub trait ChainPlugin: Send + Sync {
     /// Human-readable name for logging spans.
     fn name(&self) -> &str;
 
@@ -41,7 +45,7 @@ pub trait ChainPlugin: Send {
     /// [`drain_timeout`](crate::ChainRunner::drain_timeout). Without `on_ready` the runner does not read `ready`: a
     /// plugin that sends `Err` and keeps running leaves the chain up, and only its return ends it.
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         remote: SocketAddr,
         shutdown: CancellationToken,
