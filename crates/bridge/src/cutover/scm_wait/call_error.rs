@@ -125,6 +125,54 @@ pub fn io_error_is_absent_service(error: &io::Error) -> bool {
         .is_some_and(|typed| is_absent_service_code(typed.code))
 }
 
+/// Why the SCM has no service to act through, from the code it answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceGone {
+    /// `ERROR_SERVICE_DOES_NOT_EXIST`: no entry. A process of the service can
+    /// still be running, because the SCM removes an entry once the service is
+    /// not running, which is its state and not its process.
+    DoesNotExist,
+    /// `ERROR_SERVICE_MARKED_FOR_DELETE`: the entry is still there and a
+    /// handle opened before the mark still queries and carries a Stop, but no
+    /// notification can be armed on it and nothing can start it.
+    MarkedForDeletion,
+}
+
+impl ServiceGone {
+    /// The kind a Win32 `code` names, if it names one.
+    pub fn of_code(code: u32) -> Option<ServiceGone> {
+        match code {
+            ERROR_SERVICE_DOES_NOT_EXIST => Some(ServiceGone::DoesNotExist),
+            ERROR_SERVICE_MARKED_FOR_DELETE => Some(ServiceGone::MarkedForDeletion),
+            _ => None,
+        }
+    }
+
+    /// Whether a service gone this way still answers through a handle that was
+    /// open before it went. A service marked for deletion does (queries and a
+    /// Stop, measured), though no notification can be armed on it; an entry
+    /// that no longer exists answers nothing.
+    pub fn answers_through_an_open_handle(self) -> bool {
+        match self {
+            ServiceGone::DoesNotExist => false,
+            ServiceGone::MarkedForDeletion => true,
+        }
+    }
+}
+
+/// The [`ServiceGone`] kind `error` failed with, in either shape it travels in:
+/// a bare OS error, or a typed [`ScmCallError`] wrapped by
+/// [`ScmCallError::into_io`].
+pub fn service_gone(error: &io::Error) -> Option<ServiceGone> {
+    if let Some(code) = error.raw_os_error() {
+        return u32::try_from(code).ok().and_then(ServiceGone::of_code);
+    }
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ScmCallError>())
+        .and_then(|typed| ServiceGone::of_code(typed.code))
+}
+
 /// Whether `error` is a [`ScmCallError`] of the call that opens the service's
 /// process (see [`ScmCall::is_opening_the_service_process`]).
 pub fn io_error_is_a_refused_process_open(error: &io::Error) -> bool {

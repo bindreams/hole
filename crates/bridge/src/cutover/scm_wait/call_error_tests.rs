@@ -90,6 +90,76 @@ fn an_io_error_is_an_absent_service_in_either_shape() {
     assert!(!io_error_is_absent_service(&io::Error::other("1060")));
 }
 
+#[skuld::test]
+fn each_gone_code_names_its_own_kind() {
+    assert_eq!(ServiceGone::of_code(1060), Some(ServiceGone::DoesNotExist));
+    assert_eq!(ServiceGone::of_code(1072), Some(ServiceGone::MarkedForDeletion));
+    // Access denied, the two control answers, and a service-disabled start.
+    for code in [0, 5, 1061, 1062, 1058] {
+        assert_eq!(ServiceGone::of_code(code), None, "{code}");
+    }
+}
+
+#[skuld::test]
+fn only_a_service_marked_for_deletion_still_answers_through_an_open_handle() {
+    assert!(ServiceGone::MarkedForDeletion.answers_through_an_open_handle());
+    assert!(!ServiceGone::DoesNotExist.answers_through_an_open_handle());
+}
+
+#[skuld::test]
+fn a_gone_service_keeps_its_kind_in_every_shape_the_error_travels_in() {
+    let bare = |code| io::Error::from_raw_os_error(code);
+    let typed = |call, code| ScmCallError { call, code }.into_io();
+    let winapi = |call: ScmCall, code| call.failed_with(&io::Error::from_raw_os_error(code));
+    assert_eq!(service_gone(&bare(1060)), Some(ServiceGone::DoesNotExist));
+    assert_eq!(service_gone(&bare(1072)), Some(ServiceGone::MarkedForDeletion));
+    assert_eq!(
+        service_gone(&typed(ScmCall::OpenService, 1060)),
+        Some(ServiceGone::DoesNotExist)
+    );
+    assert_eq!(
+        service_gone(&typed(ScmCall::NotifyServiceStatusChange, 1072)),
+        Some(ServiceGone::MarkedForDeletion)
+    );
+    assert_eq!(
+        service_gone(&winapi(ScmCall::ChangeServiceConfig2, 1072)),
+        Some(ServiceGone::MarkedForDeletion)
+    );
+    assert_eq!(
+        service_gone(&winapi(ScmCall::OpenService, 1060)),
+        Some(ServiceGone::DoesNotExist)
+    );
+}
+
+#[skuld::test]
+fn a_failure_that_is_not_a_gone_service_has_no_kind() {
+    assert_eq!(service_gone(&io::Error::from_raw_os_error(5)), None);
+    assert_eq!(service_gone(&io::Error::other("1060")), None);
+    assert_eq!(service_gone(&io::Error::other("marked for deletion")), None);
+    assert_eq!(
+        service_gone(
+            &ScmCallError {
+                call: ScmCall::ControlService,
+                code: 1062
+            }
+            .into_io()
+        ),
+        None
+    );
+}
+
+/// The old and the new classification agree until the old one is deleted.
+#[skuld::test]
+fn the_gone_kinds_are_exactly_the_absent_service_codes() {
+    for code in 0..=2000_u32 {
+        assert_eq!(
+            ServiceGone::of_code(code).is_some(),
+            is_absent_service_code(code),
+            "{code}"
+        );
+    }
+}
+
 /// `windows_service::Error::Winapi` displays as "IO error in winapi call" and
 /// keeps the OS error only as its source, so a call that returns one reaches a
 /// log with neither its name nor its code unless it is re-typed here.

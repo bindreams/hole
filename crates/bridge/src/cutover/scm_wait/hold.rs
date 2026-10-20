@@ -45,6 +45,9 @@ pub enum ProcessFate {
 pub struct Look {
     pub observed: Observed,
     pub fate: ProcessFate,
+    /// Whether any process held so far has not exited, the named one or not:
+    /// a process outlives the STOPPED the SCM reports for it.
+    pub held_alive: bool,
 }
 
 /// What opening a process id found.
@@ -220,6 +223,10 @@ impl<P> ProcessHolds<P> {
     /// not be (START_PENDING, STOP_PENDING): the service's process may be alive
     /// under another id, so the wait rests on the SCM's own transition. One that
     /// names no process, or a process that is not the service's, is `Unheld`.
+    ///
+    /// `held_alive` is a state read of every held handle, not only the named
+    /// one: a process outlives the STOPPED the SCM reports for it, and then
+    /// the look names nothing.
     pub fn look<S: ProcessSource<Process = P>>(&mut self, source: &mut S) -> io::Result<Look> {
         let Hold { reading, named } = self.hold_current(source)?;
         let fate = named.fate(reading.observed, || {
@@ -231,9 +238,17 @@ impl<P> ProcessHolds<P> {
                 .expect("a process reported as held is held");
             source.has_exited(process)
         })?;
+        let mut held_alive = false;
+        for (_, process) in &self.held {
+            if !source.has_exited(process)? {
+                held_alive = true;
+                break;
+            }
+        }
         Ok(Look {
             observed: reading.observed,
             fate,
+            held_alive,
         })
     }
 }

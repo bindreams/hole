@@ -14,6 +14,7 @@ fn look(observed: Observed) -> Look {
         } else {
             ProcessFate::Unheld
         },
+        held_alive: false,
     }
 }
 
@@ -22,6 +23,7 @@ fn stale(observed: Observed) -> Look {
     Look {
         observed,
         fate: ProcessFate::Exited,
+        held_alive: false,
     }
 }
 
@@ -620,6 +622,7 @@ fn a_live_state_with_no_process_held_after_the_delete_waits_on_the_scm_not_on_a_
         Look {
             observed: Observed::StopPending,
             fate: ProcessFate::Unheld,
+            held_alive: false,
         },
         look(Observed::Stopped),
         look(Observed::Stopped),

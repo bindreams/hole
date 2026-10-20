@@ -281,7 +281,8 @@ fn a_process_without_the_service_sid_is_never_held_in_any_live_state() {
             got,
             Look {
                 observed: live,
-                fate: ProcessFate::Unheld
+                fate: ProcessFate::Unheld,
+                held_alive: false
             },
             "{live:?}"
         );
@@ -401,7 +402,8 @@ fn a_held_process_that_has_not_exited_is_alive_whatever_the_state() {
             got,
             Look {
                 observed: live,
-                fate: ProcessFate::Alive
+                fate: ProcessFate::Alive,
+                held_alive: true
             },
             "{live:?}"
         );
@@ -421,7 +423,8 @@ fn a_held_process_that_has_exited_is_exited_whatever_the_state_still_says() {
             got,
             Look {
                 observed: stale,
-                fate: ProcessFate::Exited
+                fate: ProcessFate::Exited,
+                held_alive: false
             },
             "{stale:?}"
         );
@@ -456,12 +459,86 @@ fn a_pending_service_whose_named_id_no_process_has_is_unheld_not_exited() {
             got,
             Look {
                 observed: pending,
-                fate: ProcessFate::Unheld
+                fate: ProcessFate::Unheld,
+                held_alive: false
             },
             "{pending:?}"
         );
         assert!(held_pids(&holds).is_empty(), "{pending:?}");
     }
+}
+
+/// The SCM reports STOPPED while the process it had named is still running;
+/// a look that names nothing still says a hold is alive.
+#[skuld::test]
+fn a_stopped_service_whose_earlier_process_still_runs_has_a_live_hold() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![
+            reading(Observed::Running, 100),
+            reading(Observed::Running, 100),
+            reading(Observed::Stopped, 0),
+        ],
+    );
+    let mut holds = ProcessHolds::default();
+    holds.look(&mut source).unwrap();
+    let got = holds.look(&mut source).unwrap();
+    assert_eq!(
+        got,
+        Look {
+            observed: Observed::Stopped,
+            fate: ProcessFate::Unheld,
+            held_alive: true
+        }
+    );
+}
+
+#[skuld::test]
+fn a_stopped_service_whose_earlier_process_has_exited_has_no_live_hold() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![
+            reading(Observed::Running, 100),
+            reading(Observed::Running, 100),
+            reading(Observed::Stopped, 0),
+        ],
+    );
+    let mut holds = ProcessHolds::default();
+    holds.look(&mut source).unwrap();
+    source.exited.push(100);
+    let got = holds.look(&mut source).unwrap();
+    assert_eq!(
+        got,
+        Look {
+            observed: Observed::Stopped,
+            fate: ProcessFate::Unheld,
+            held_alive: false
+        }
+    );
+}
+
+/// One process of two held is enough: `held_alive` is about every hold, not the
+/// one the latest look names.
+#[skuld::test]
+fn a_live_hold_other_than_the_one_named_keeps_the_look_alive() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![
+            reading(Observed::Running, 100),
+            reading(Observed::Running, 100),
+            reading(Observed::Running, 200),
+            reading(Observed::Running, 200),
+        ],
+    );
+    let mut holds = ProcessHolds::default();
+    holds.look(&mut source).unwrap();
+    source.exited.push(200);
+    let got = holds.look(&mut source).unwrap();
+    assert_eq!(got.fate, ProcessFate::Exited);
+    assert!(got.held_alive, "the first process, 100, is still held and not exited");
 }
 
 #[skuld::test]
