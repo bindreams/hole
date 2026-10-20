@@ -135,7 +135,7 @@ impl crate::routing::CoverGuard for Cover {
     /// Delegates to the platform guard's own `detach`, which releases whatever
     /// this process still holds, rather than `std::mem::forget` — that skipped
     /// the Windows FWPM engine handle close too, leaking one handle per call
-    /// for any caller that keeps running (see [`CoverGuard::disarm`]).
+    /// for any caller that keeps running (see `CoverGuard::disarm`).
     fn disarm(self) {
         self._inner.detach();
     }
@@ -221,7 +221,7 @@ pub(crate) enum RecoveryDispatch {
     Disengage,
 }
 
-/// Classify a [`CoverRecovery`] into whether it disengages the standing cover.
+/// Classify a [`CoverRecovery`](crate::routing::CoverRecovery) into whether it disengages the standing cover.
 /// Pure, exhaustive, and platform-free, so "`Adopt` never disengages the
 /// cover, on either platform" is a testable statement rather than a claim
 /// about two bodies of code.
@@ -241,7 +241,7 @@ pub(crate) fn recovery_dispatch(decision: crate::routing::CoverRecovery) -> Reco
     }
 }
 
-/// Act on a [`CoverRecovery`] decision for the standing lockdown cover at
+/// Act on a `CoverRecovery` decision for the standing lockdown cover at
 /// startup. cfg-free for `routing::recover_routes`. Best-effort: a `Sweep` that
 /// cannot disengage is logged, not propagated — startup recovery has no caller
 /// to act on it.

@@ -4,7 +4,7 @@
 //!
 //! - [`DirectConnector`] — plain direct connection to an upstream
 //!   resolver; used by tests.
-//! - [`Socks5Connector`] — production path; routes every outbound
+//! - `Socks5Connector` — production path; routes every outbound
 //!   connection through the local shadowsocks SOCKS5 listener so user
 //!   filter rules cannot strand the forwarder.
 //!

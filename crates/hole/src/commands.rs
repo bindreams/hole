@@ -595,7 +595,7 @@ pub async fn get_public_ip() -> Result<serde_json::Value, String> {
 
 /// Build a `ProxyConfig` from the currently selected server in app config.
 ///
-/// Always requests [`TunnelMode::Full`]; `TunnelMode::SocksOnly` is reachable
+/// Always requests `TunnelMode::Full`; `TunnelMode::SocksOnly` is reachable
 /// via `hole proxy start --tunnel-mode socks-only` and direct IPC.
 ///
 /// The "Local proxy server" master toggle (`proxy_server_enabled`) gates

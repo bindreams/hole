@@ -156,7 +156,7 @@ fn ensure_gitrepo_branch_matches(repo_root: &Path, subdir: &str, new_tag: &str) 
     }
 }
 
-/// Locates `dep_name`'s `## \`<dep>/\` — pinned **<version>**` heading in
+/// Locates `dep_name`'s ``## `<dep>/` — pinned **<version>**`` heading in
 /// `VENDORING.md`'s `contents` and returns the byte range of just the
 /// version text between the two `**` markers. Shared by the writer
 /// (`update_vendoring_note_and_commit`, which splices a new version into

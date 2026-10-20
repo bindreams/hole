@@ -212,14 +212,14 @@ pub struct AppConfig {
     /// `hole_bridge::proxy::config::build_ss_config`).
     pub local_port_http: u16,
     /// When true, the bridge wraps the plugin chain in
-    /// [`garter::TapPlugin`] so per-TCP-connection
+    /// `garter::TapPlugin` so per-TCP-connection
     /// `bytes_to_plugin` / `bytes_from_plugin` / `ttfb_ms` / `close_kind`
     /// land in `bridge.log`. Off by default — adds a loopback round-trip
     /// per byte, inappropriate at browser-traffic scale. Enable when
     /// reproducing a "tunnel returns nothing" failure (e.g. a plugin
     /// outbound that silently hangs). See CLAUDE.md "Plugin tap" section.
     ///
-    /// **Reaches service mode**: this flag travels via [`ProxyConfig`]
+    /// **Reaches service mode**: this flag travels via `ProxyConfig`
     /// in the IPC `BridgeRequest::Start` payload, unlike the
     /// `HOLE_BRIDGE_PLUGIN_TAP` env var which is dev-shell-only.
     pub diagnostic_plugin_tap: bool,

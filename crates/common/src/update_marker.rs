@@ -102,7 +102,7 @@ pub fn write(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io
 /// when the destination exists), and links the fully-written temp content so a
 /// reader never sees a partial file.
 ///
-/// `owner` chowns the marker to the elevated-run user (see [`write`]); `None`
+/// `owner` chowns the marker to the elevated-run user (see [`write()`]); `None`
 /// for the root daemon. A lost claim (`AlreadyExists`) only removes its own
 /// staged temp, so the existing marker's ownership is never disturbed.
 pub fn write_new(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io::Result<()> {
