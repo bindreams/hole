@@ -227,6 +227,11 @@ before editing; the sections linked below are the authoritative source.
   next connect. The password has a matching `Display`-less `Password` newtype
   and its own asymmetric limits. →
   [CONTRIBUTING.md#server-address-redaction](CONTRIBUTING.md#server-address-redaction)
+- **File lock.** Cross-process file locks use `file_lock::Exclusive`, which
+  refuses a lock file that is not a regular file with one link (and the expected
+  owner) instead of re-permissioning it, because the state directory may belong
+  to the interactive user. →
+  [CONTRIBUTING.md#file-lock](CONTRIBUTING.md#file-lock)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
   [CONTRIBUTING.md#logging--diagnostics](CONTRIBUTING.md#logging--diagnostics)

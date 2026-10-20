@@ -544,6 +544,24 @@ TCP only: every in-repo hop that is not the public one binds TCP alone. A hop th
 not speak sitrep (`ReadinessMode::Probe`) cannot, so its lost port is a failed
 start and is not restarted ([garter README](crates/garter/README.md)).
 
+### File lock
+
+A cross-process lock on a file goes through
+[`file_lock::Exclusive`](crates/file-lock/src/exclusive.rs) (`flock` /
+`LockFileEx`), not a second implementation. The bridge's liveness lock and
+`TargetExclusive` use it.
+
+The lock file sits in a state directory the interactive user may own, so
+whatever is at its name is attacker-chosen. `Exclusive` checks and changes the
+file only through the open descriptor/handle, and **refuses** — an `InvalidData`
+error naming the path, never a repair — an existing lock file that is not a
+regular file with exactly one link, or (unix, when an `owner` is passed) is
+owned by neither that owner nor the process. A hard link planted at the lock
+name defeats `O_NOFOLLOW`; before the check it made the privileged process
+`fchmod`/`fchown` an unrelated root-owned file. Windows applies no security
+descriptor, so it has no path-based security call to redirect. Callers that log
+the error own its path redaction.
+
 ### Route-command failure policy
 
 `netsh`/`route` subprocesses run through one of two phase runners in
