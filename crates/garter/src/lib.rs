@@ -4,6 +4,8 @@ pub mod binary;
 pub mod chain;
 pub mod counting;
 pub mod error;
+#[cfg(target_os = "linux")]
+mod exit_watch;
 pub mod plugin;
 pub mod shutdown;
 pub mod sip003;
@@ -41,6 +43,8 @@ mod chain_tests;
 mod counting_tests;
 #[cfg(test)]
 mod error_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod exit_watch_tests;
 #[cfg(test)]
 mod plugin_tests;
 #[cfg(test)]

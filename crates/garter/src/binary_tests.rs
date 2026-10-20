@@ -148,7 +148,9 @@ use cosca::Containment;
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use crate::binary::{drain_readers_after_exit, end_plugin, shut_plugin_down, supervise_plugin, PluginEnd, PluginTree};
+use crate::binary::{
+    drain_readers_after_exit, end_plugin, shut_plugin_down, supervise_plugin, PluginEnd, PluginTree, Supervised,
+};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -283,6 +285,8 @@ struct FakeTree<K> {
     /// `reap` waits for this to be notified: the root exits when the test says so.
     reap_waits_for: Option<Arc<Notify>>,
     probe_fails: bool,
+    /// What `reap` reports.
+    exit_status: std::process::ExitStatus,
     tree_killed: bool,
     graces: Arc<Mutex<Vec<Duration>>>,
     calls: Calls,
@@ -309,6 +313,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
             reap_never_completes: false,
             reap_waits_for: None,
             probe_fails: false,
+            exit_status: std::process::ExitStatus::default(),
             tree_killed: false,
             graces: Arc::default(),
             calls: Calls::default(),
@@ -412,7 +417,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
         if self.reap_fails {
             return Err(reap_failed());
         }
-        Ok(std::process::ExitStatus::default())
+        Ok(self.exit_status)
     }
 
     fn disarm(&mut self) {
@@ -943,7 +948,10 @@ async fn a_root_that_exits_on_its_own_after_a_start_failure_is_reported_as_exite
         .expect("the plugin must end")
         .unwrap();
 
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
         let mut expected = vec!["wait_root_exit", "wait_root_exit_within", "wait_root_exit_within"];
         expected.extend(killed_then_reaped(edge_awaited));
         assert_eq!(tree.calls(), expected, "{containment:?}: no terminate, no root kill");
@@ -980,7 +988,7 @@ async fn a_root_that_outlives_its_grace_after_a_start_failure_is_killed_without_
     .expect("the plugin must end")
     .unwrap();
 
-    assert!(matches!(end, PluginEnd::KilledAfterFailedStart));
+    assert!(matches!(end.end, PluginEnd::ShutDown) && end.start_failed);
     assert_eq!(
         tree.calls(),
         [
@@ -1092,6 +1100,77 @@ async fn an_unwatchable_root_whose_reap_fails_still_waits_for_its_output_at_the_
         "{}",
         writer.snapshot()
     );
+}
+
+// A decided failure is never dropped ----------------------------------------------------------------------------------
+
+/// A supervision that is dropped before it delivers (its task aborted, or unwinding) still reports what its reader
+/// decided.
+#[skuld::test]
+async fn a_hold_that_is_dropped_delivers_the_failure_it_holds() {
+    tokio::time::pause();
+    let (ready_rx, shutdown, failure) = decided_start_failure().await;
+    drop(shutdown);
+    drop(failure);
+
+    assert!(matches!(ready_rx.await, Ok(Err(StartError::Fatal { .. }))));
+}
+
+/// A reader that decides after the hold has ended finds nobody to hold the failure, and sends it itself. The hold has
+/// ended when it is delivered, dropped, or closed while still alive.
+#[skuld::test]
+async fn a_failure_decided_after_the_hold_ended_is_sent_by_the_reader() {
+    tokio::time::pause();
+    for ended_by in ["delivered", "dropped", "closed, still alive"] {
+        let freed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (mut plugin_stdout, host_stdout) = tokio::io::duplex(4096);
+        plugin_stdout
+            .write_all(hello(SITREP_PROTOCOL).as_bytes())
+            .await
+            .unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (reader, mut failure) = spawn_sitrep_stdout_reader(
+            host_stdout,
+            "p".into(),
+            freed,
+            CancellationToken::new(),
+            ready_tx,
+            false,
+            None,
+        );
+        let mut ready_rx = pin!(ready_rx);
+
+        // Nothing was decided yet, so the hold has nothing to deliver.
+        let _alive = match ended_by {
+            "delivered" => {
+                assert!(!failure.deliver(), "{ended_by}");
+                None
+            }
+            "dropped" => {
+                drop(failure);
+                None
+            }
+            _ => {
+                assert!(!failure.finish(), "{ended_by}");
+                Some(failure)
+            }
+        };
+        assert!(poll_once(ready_rx.as_mut()).is_pending(), "{ended_by}");
+
+        // Stdout closes: the reader decides the stream closed before `ready`.
+        drop(plugin_stdout);
+        reader.await.unwrap();
+        let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx)
+            .await
+            .unwrap_or_else(|_| panic!("{ended_by}: the failure was held for a hold that had ended"));
+        assert!(
+            matches!(&ready, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("closed its sitrep stream")),
+            "{ended_by}: {ready:?}"
+        );
+    }
 }
 
 // Teardown order ------------------------------------------------------------------------------------------------------
@@ -1222,7 +1301,7 @@ async fn a_shutdown_whose_terminate_fails_escalates_to_a_kill() {
 
 const GRACE: Duration = Duration::from_secs(5);
 
-async fn supervise(tree: &mut impl PluginTree, shutdown: &CancellationToken) -> PluginEnd {
+async fn supervise(tree: &mut impl PluginTree, shutdown: &CancellationToken) -> Supervised {
     tokio::time::timeout(
         VIRTUAL_HANG,
         supervise_plugin("p", tree, shutdown, GRACE, finished_reader(), finished_reader(), None),
@@ -1247,7 +1326,10 @@ async fn a_root_that_exits_on_its_own_has_its_tree_killed_before_it_is_reaped() 
         let mut tree = drained_tree(containment);
         let end = supervise(&mut tree, &CancellationToken::new()).await;
 
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
         let mut expected = vec!["wait_root_exit"];
         expected.extend(killed_then_reaped(edge_awaited));
         assert_eq!(tree.calls(), expected, "{containment:?}");
@@ -1263,7 +1345,7 @@ async fn a_shutdown_request_kills_the_tree_before_the_reap() {
         tree.root_never_exits = true;
         let end = supervise(&mut tree, &cancelled()).await;
 
-        assert!(matches!(end, PluginEnd::ShutDown), "{containment:?}");
+        assert!(matches!(end.end, PluginEnd::ShutDown), "{containment:?}");
         let mut expected = vec![
             "wait_root_exit",
             "wait_root_exit_within",
@@ -1284,7 +1366,7 @@ async fn a_shutdown_request_kills_a_root_that_outlives_its_grace_before_the_tree
     tree.root_outlives_grace = true;
     let end = supervise(&mut tree, &cancelled()).await;
 
-    assert!(matches!(end, PluginEnd::ShutDown));
+    assert!(matches!(end.end, PluginEnd::ShutDown));
     assert_eq!(
         tree.calls(),
         [
@@ -1309,7 +1391,10 @@ async fn an_exit_that_already_happened_outranks_a_shutdown_request() {
         let mut tree = drained_tree(containment);
         let end = supervise(&mut tree, &cancelled()).await;
 
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
         let mut expected = vec!["wait_root_exit"];
         expected.extend(killed_then_reaped(edge_awaited));
         assert_eq!(tree.calls(), expected, "{containment:?}");
@@ -1327,7 +1412,10 @@ async fn an_exit_the_watch_has_not_yet_delivered_outranks_a_pending_shutdown_req
         tree.exit_watch_pends_first_poll = true;
         let end = supervise(&mut tree, &cancelled()).await;
 
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
         let mut expected = vec!["wait_root_exit", "wait_root_exit_within"];
         expected.extend(killed_then_reaped(edge_awaited));
         assert_eq!(tree.calls(), expected, "{containment:?}");
@@ -1348,7 +1436,7 @@ async fn a_running_root_is_shut_down_when_its_pending_exit_watch_loses_to_the_re
     tree.exit_watch_pends_first_poll = true;
     let end = supervise(&mut tree, &cancelled()).await;
 
-    assert!(matches!(end, PluginEnd::ShutDown));
+    assert!(matches!(end.end, PluginEnd::ShutDown));
     assert_eq!(*tree.graces.lock().unwrap(), [Duration::ZERO, GRACE]);
 }
 
@@ -1362,7 +1450,7 @@ async fn a_shutdown_request_stands_when_the_probe_cannot_read_the_root() {
     tree.probe_fails = true;
     let end = supervise(&mut tree, &cancelled()).await;
 
-    assert!(matches!(end, PluginEnd::ShutDown));
+    assert!(matches!(end.end, PluginEnd::ShutDown));
 }
 
 /// The same holds when the exit could not be watched and the root is reaped instead.
@@ -1373,7 +1461,7 @@ async fn a_reaped_exit_outranks_a_shutdown_request_when_the_exit_cannot_be_watch
     tree.root_watch_fails = true;
     let end = supervise(&mut tree, &cancelled()).await;
 
-    assert!(matches!(&end, PluginEnd::Exited(s) if s.success()));
+    assert!(matches!(&end.end, PluginEnd::Exited(s) if s.success()));
     assert_eq!(tree.calls(), ["wait_root_exit", "reap", "disarm"]);
 }
 
@@ -1612,7 +1700,10 @@ async fn a_root_whose_exit_cannot_be_watched_is_reaped_first_and_a_pgid_tree_is_
         };
         tokio::time::timeout(VIRTUAL_HANG, out_dropped).await.unwrap().ok();
 
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
         let edge_awaited = CONTAINMENTS.iter().any(|(c, edge)| *c == containment && *edge);
         let expected: &[&str] = match (kills_by_pgid, edge_awaited) {
             (true, _) => &["wait_root_exit", "reap", "disarm"],
@@ -1638,120 +1729,6 @@ async fn a_root_whose_exit_cannot_be_watched_is_reaped_first_and_a_pgid_tree_is_
             1,
             "{containment:?}: the bounded wait warns:\n{log}"
         );
-    }
-}
-
-/// A shutdown that arrives while the root is being reaped (its exit could not be watched) asks the root to
-/// exit and gives it its grace, as for a watched root. One that outlives the grace is killed, its tree is
-/// killed before the reap, and not before the grace is over.
-#[skuld::test]
-async fn a_shutdown_while_the_exit_cannot_be_watched_gives_the_root_its_grace_then_kills_the_tree_before_the_reap() {
-    tokio::time::pause();
-    let mut tree = drained_tree(Containment::ProcessGroup);
-    tree.root_watch_fails = true;
-    tree.reap_waits_for_kill = true;
-    let calls = tree.calls.clone();
-    let shutdown = CancellationToken::new();
-    let end = supervise_plugin(
-        "p",
-        &mut tree,
-        &shutdown,
-        GRACE,
-        finished_reader(),
-        finished_reader(),
-        None,
-    );
-    let mut end = pin!(end);
-
-    assert!(
-        poll_once(end.as_mut()).is_pending(),
-        "the reap waits for the root to exit"
-    );
-    shutdown.cancel();
-    assert!(poll_once(end.as_mut()).is_pending(), "ended before the grace");
-    tokio::time::advance(GRACE - Duration::from_millis(1)).await;
-    assert!(poll_once(end.as_mut()).is_pending(), "ended inside the grace");
-    assert!(
-        !calls.lock().unwrap().contains(&"kill_root"),
-        "the root was killed inside its grace: {:?}",
-        calls.lock().unwrap()
-    );
-
-    tokio::time::advance(TIMER_SLACK).await;
-    let end = tokio::time::timeout(VIRTUAL_HANG, end)
-        .await
-        .expect("the shutdown must end the plugin")
-        .unwrap();
-
-    assert!(matches!(end, PluginEnd::ShutDown));
-    assert_eq!(
-        *calls.lock().unwrap(),
-        [
-            "wait_root_exit",
-            "terminate",
-            "kill_root",
-            "kill_tree",
-            "reap",
-            "disarm"
-        ]
-    );
-}
-
-/// A root that exits within the shutdown grace is not killed: it is reaped, and a pgid tree is left alone.
-#[skuld::test]
-async fn an_unwatchable_root_that_exits_within_the_shutdown_grace_is_not_killed() {
-    tokio::time::pause();
-    for (containment, kills_by_pgid) in KILLS_BY_PGID {
-        let exits = Arc::new(Notify::new());
-        let mut tree = drained_tree(containment);
-        tree.root_watch_fails = true;
-        tree.reap_waits_for = Some(exits.clone());
-        let calls = tree.calls.clone();
-        let shutdown = CancellationToken::new();
-        let end = supervise_plugin(
-            "p",
-            &mut tree,
-            &shutdown,
-            GRACE,
-            finished_reader(),
-            finished_reader(),
-            None,
-        );
-        let mut end = pin!(end);
-
-        assert!(poll_once(end.as_mut()).is_pending(), "{containment:?}");
-        shutdown.cancel();
-        assert!(
-            poll_once(end.as_mut()).is_pending(),
-            "{containment:?}: ended before the root exited"
-        );
-        tokio::time::advance(GRACE - Duration::from_millis(1)).await;
-        assert!(
-            poll_once(end.as_mut()).is_pending(),
-            "{containment:?}: ended inside the grace"
-        );
-
-        exits.notify_one();
-        let end = tokio::time::timeout(VIRTUAL_HANG, end)
-            .await
-            .unwrap_or_else(|_| panic!("{containment:?}: the plugin never ended"))
-            .unwrap();
-
-        assert!(matches!(end, PluginEnd::ShutDown), "{containment:?}");
-        let edge_awaited = CONTAINMENTS.iter().any(|(c, edge)| *c == containment && *edge);
-        let expected: &[&str] = match (kills_by_pgid, edge_awaited) {
-            (true, _) => &["wait_root_exit", "terminate", "reap", "disarm"],
-            (false, true) => &[
-                "wait_root_exit",
-                "terminate",
-                "reap",
-                "disarm",
-                "kill_tree",
-                "wait_tree_drained",
-            ],
-            (false, false) => &["wait_root_exit", "terminate", "reap", "disarm", "kill_tree"],
-        };
-        assert_eq!(*calls.lock().unwrap(), expected, "{containment:?}");
     }
 }
 
@@ -1783,7 +1760,7 @@ async fn an_unwatchable_root_that_cannot_be_asked_to_exit_is_killed_at_once() {
         .expect("must end")
         .unwrap();
 
-    assert!(matches!(end, PluginEnd::ShutDown));
+    assert!(matches!(end.end, PluginEnd::ShutDown));
     assert_eq!(
         *calls.lock().unwrap(),
         [
@@ -1797,10 +1774,10 @@ async fn an_unwatchable_root_that_cannot_be_asked_to_exit_is_killed_at_once() {
     );
 }
 
-// A start failure while the exit cannot be watched --------------------------------------------------------------------
+// A take-down while the exit cannot be watched ------------------------------------------------------------------------
 //
-// The grace a failed-start plugin gets to exit by itself, and the status it exits with, do not depend on the watch:
-// the reap is what waits for the exit then.
+// With no watch, reaping is the only way to see the root exit, and the reap frees its pid. A take-down therefore has no
+// grace to give: it kills the root, then the tree, then reaps, on every containment.
 
 /// A reader that has decided the start failed, so the plugin is to be taken down.
 async fn decided_start_failure() -> (
@@ -1813,106 +1790,47 @@ async fn decided_start_failure() -> (
     (ready_rx, shutdown, failure)
 }
 
-/// An unwatchable root that exits within the grace after a start failure is not signalled before it does, and is
-/// reported with its own status.
 #[skuld::test]
-async fn an_unwatchable_root_that_exits_within_its_grace_after_a_start_failure_is_reported_as_exited() {
+async fn a_take_down_of_an_unwatchable_root_kills_it_at_once_then_its_tree_then_reaps() {
     tokio::time::pause();
-    for (containment, kills_by_pgid) in KILLS_BY_PGID {
-        let (mut ready_rx, shutdown, failure) = decided_start_failure().await;
-        let exits = Arc::new(Notify::new());
-        let mut tree = drained_tree(containment);
-        tree.root_watch_fails = true;
-        tree.reap_waits_for = Some(exits.clone());
-        let calls = tree.calls.clone();
-        let sup = supervise_plugin(
-            "p",
-            &mut tree,
-            &shutdown,
-            GRACE,
-            finished_reader(),
-            finished_reader(),
-            Some(failure),
-        );
-        let mut sup = pin!(sup);
+    for taken_down_by in [TakenDownBy::Shutdown, TakenDownBy::StartFailure] {
+        for (containment, _) in KILLS_BY_PGID {
+            let (shutdown, failure) = match taken_down_by {
+                TakenDownBy::Shutdown => (cancelled(), None),
+                TakenDownBy::StartFailure => {
+                    let (_ready_rx, shutdown, failure) = decided_start_failure().await;
+                    (shutdown, Some(failure))
+                }
+            };
+            let mut tree = drained_tree(containment);
+            tree.root_watch_fails = true;
+            tree.reap_waits_for_kill = true;
+            let sup = supervise_plugin(
+                "p",
+                &mut tree,
+                &shutdown,
+                GRACE,
+                finished_reader(),
+                finished_reader(),
+                failure,
+            );
+            let ended = tokio::time::timeout(VIRTUAL_HANG, sup)
+                .await
+                .expect("the plugin must end")
+                .unwrap();
 
-        assert!(
-            poll_once(sup.as_mut()).is_pending(),
-            "{containment:?}: ended before the root exited"
-        );
-        tokio::time::advance(GRACE - Duration::from_millis(1)).await;
-        assert!(
-            poll_once(sup.as_mut()).is_pending(),
-            "{containment:?}: ended inside the grace"
-        );
-        assert!(
-            !calls.lock().unwrap().contains(&"kill_root"),
-            "{containment:?}: the root was killed inside its grace: {:?}",
-            calls.lock().unwrap()
-        );
-        assert!(
-            poll_once(pin!(&mut ready_rx)).is_pending(),
-            "{containment:?}: reported early"
-        );
-
-        exits.notify_one();
-        let end = tokio::time::timeout(VIRTUAL_HANG, sup)
-            .await
-            .unwrap_or_else(|_| panic!("{containment:?}: the plugin never ended"))
-            .unwrap();
-
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
-        let edge_awaited = CONTAINMENTS.iter().any(|(c, edge)| *c == containment && *edge);
-        let expected: &[&str] = match (kills_by_pgid, edge_awaited) {
-            (true, _) => &["wait_root_exit", "reap", "disarm"],
-            (false, true) => &["wait_root_exit", "reap", "disarm", "kill_tree", "wait_tree_drained"],
-            (false, false) => &["wait_root_exit", "reap", "disarm", "kill_tree"],
-        };
-        assert_eq!(*calls.lock().unwrap(), expected, "{containment:?}");
-        assert!(matches!(ready_rx.await, Ok(Err(_))), "{containment:?}");
+            assert!(
+                matches!(ended.end, PluginEnd::ShutDown),
+                "{taken_down_by:?}, {containment:?}"
+            );
+            let calls = tree.calls();
+            let position = |call: &str| calls.iter().position(|c| *c == call);
+            assert!(
+                position("kill_root") < position("kill_tree") && position("kill_tree") < position("reap"),
+                "{taken_down_by:?}, {containment:?}: {calls:?}"
+            );
+        }
     }
-}
-
-/// An unwatchable root that outlives the grace is killed once it is over, and not before.
-#[skuld::test]
-async fn an_unwatchable_root_that_outlives_its_grace_after_a_start_failure_is_killed_when_it_is_over() {
-    tokio::time::pause();
-    let (_ready_rx, shutdown, failure) = decided_start_failure().await;
-    let mut tree = drained_tree(Containment::ProcessGroup);
-    tree.root_watch_fails = true;
-    tree.reap_waits_for_kill = true;
-    let calls = tree.calls.clone();
-    let sup = supervise_plugin(
-        "p",
-        &mut tree,
-        &shutdown,
-        GRACE,
-        finished_reader(),
-        finished_reader(),
-        Some(failure),
-    );
-    let mut sup = pin!(sup);
-
-    assert!(poll_once(sup.as_mut()).is_pending());
-    tokio::time::advance(GRACE - Duration::from_millis(1)).await;
-    assert!(poll_once(sup.as_mut()).is_pending(), "ended inside the grace");
-    assert!(
-        !calls.lock().unwrap().contains(&"kill_root"),
-        "the root was killed inside its grace: {:?}",
-        calls.lock().unwrap()
-    );
-
-    tokio::time::advance(TIMER_SLACK).await;
-    let end = tokio::time::timeout(VIRTUAL_HANG, sup)
-        .await
-        .expect("the plugin must end")
-        .unwrap();
-
-    assert!(matches!(end, PluginEnd::KilledAfterFailedStart));
-    assert_eq!(
-        *calls.lock().unwrap(),
-        ["wait_root_exit", "kill_root", "kill_tree", "reap", "disarm"]
-    );
 }
 
 // What `BinaryPlugin::run` returns ------------------------------------------------------------------------------------
@@ -1928,16 +1846,22 @@ fn exit_status(code: i32) -> std::process::ExitStatus {
     }
 }
 
+fn supervised(end: PluginEnd, start_failed: bool) -> Supervised {
+    Supervised { end, start_failed }
+}
+
 #[skuld::test]
 fn a_plugin_ended_by_a_shutdown_or_exiting_cleanly_is_ok() {
-    assert!(PluginEnd::ShutDown.outcome("p").is_ok());
-    assert!(PluginEnd::Exited(exit_status(0)).outcome("p").is_ok());
+    assert!(supervised(PluginEnd::ShutDown, false).outcome("p").is_ok());
+    assert!(supervised(PluginEnd::Exited(exit_status(0)), false)
+        .outcome("p")
+        .is_ok());
 }
 
 #[skuld::test]
 fn a_plugin_that_exits_with_a_code_is_an_error_naming_it() {
     assert!(matches!(
-        PluginEnd::Exited(exit_status(3)).outcome("p"),
+        supervised(PluginEnd::Exited(exit_status(3)), false).outcome("p"),
         Err(crate::Error::PluginExit { name, code: 3 }) if name == "p"
     ));
 }
@@ -1947,19 +1871,264 @@ fn a_plugin_that_exits_with_a_code_is_an_error_naming_it() {
 fn a_plugin_that_dies_to_a_signal_is_an_error_naming_it() {
     let status = std::os::unix::process::ExitStatusExt::from_raw(9);
     assert!(matches!(
-        PluginEnd::Exited(status).outcome("p"),
+        supervised(PluginEnd::Exited(status), false).outcome("p"),
         Err(crate::Error::PluginKilled { name }) if name == "p"
     ));
 }
 
-/// A plugin whose start failed and that had to be killed did not run to a clean end: `run` must not return `Ok`.
+/// A plugin whose start failed did not run to a clean end, however it ended: `run` must not return `Ok`, and the
+/// error names the plugin and says the start failed.
 #[skuld::test]
-fn a_plugin_killed_after_a_failed_start_is_an_error_naming_it() {
-    let err = PluginEnd::KilledAfterFailedStart
-        .outcome("p")
-        .expect_err("a failed start is not a clean end");
+fn a_plugin_whose_start_failed_is_an_error_naming_it_unless_its_exit_status_already_is() {
+    for end in [PluginEnd::ShutDown, PluginEnd::Exited(exit_status(0))] {
+        let err = supervised(end, true)
+            .outcome("p")
+            .expect_err("a failed start is not a clean end");
+        assert!(
+            matches!(&err, crate::Error::Chain(msg) if msg.contains("'p'") && msg.contains("failed to start")),
+            "{err:?}"
+        );
+    }
+    assert!(matches!(
+        supervised(PluginEnd::Exited(exit_status(3)), true).outcome("p"),
+        Err(crate::Error::PluginExit { code: 3, .. })
+    ));
+}
+
+// A failed start never ends `Ok` --------------------------------------------------------------------------------------
+//
+// Whichever way a plugin whose start failed ends, `run` returns an error. Its exit code, or the signal that killed it,
+// still names the error when it has one.
+
+/// The result of `run`, as a tag: what kind of error, or `ok`.
+fn run_result(result: crate::Result<()>) -> String {
+    match result {
+        Ok(()) => "ok".into(),
+        Err(crate::Error::PluginExit { code, .. }) => format!("exit {code}"),
+        Err(crate::Error::PluginKilled { .. }) => "killed".into(),
+        Err(crate::Error::Chain(_)) => "chain error".into(),
+        Err(other) => format!("{other:?}"),
+    }
+}
+
+/// How the plugin's end comes about.
+#[derive(Clone, Copy, Debug)]
+enum EndsBy {
+    /// The root exits on its own, and its exit is watched.
+    ExitingItself,
+    /// The root exits on its own, and its exit cannot be watched.
+    ExitingItselfUnwatched,
+    /// The chain shuts down while the root runs; it exits within its grace.
+    Shutdown,
+    /// The reader decided the start failed; the root exits within its grace.
+    StartFailureThenExit,
+    /// The reader decided the start failed; the root outlives its grace and is killed.
+    StartFailureThenKill,
+}
+
+#[skuld::test]
+async fn a_plugin_whose_start_failed_never_ends_ok() {
+    tokio::time::pause();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut statuses = vec![
+        ("exit 0", exit_status(0), None),
+        ("exit 3", exit_status(3), Some("exit 3")),
+    ];
+    #[cfg(unix)]
+    statuses.push((
+        "signal",
+        std::os::unix::process::ExitStatusExt::from_raw(9),
+        Some("killed"),
+    ));
+
+    let mut failures = Vec::new();
+    for ends_by in [
+        EndsBy::ExitingItself,
+        EndsBy::ExitingItselfUnwatched,
+        EndsBy::Shutdown,
+        EndsBy::StartFailureThenExit,
+        EndsBy::StartFailureThenKill,
+    ] {
+        for start_failed in [false, true] {
+            if !start_failed && matches!(ends_by, EndsBy::StartFailureThenExit | EndsBy::StartFailureThenKill) {
+                continue;
+            }
+            for (status_name, status, status_error) in &statuses {
+                let (shutdown, failure) = if start_failed {
+                    let (_ready_rx, shutdown, failure) = decided_start_failure().await;
+                    (shutdown, Some(failure))
+                } else {
+                    (CancellationToken::new(), None)
+                };
+                let mut tree = drained_tree(Containment::ProcessGroup);
+                tree.exit_status = *status;
+                match ends_by {
+                    EndsBy::ExitingItself => {}
+                    EndsBy::ExitingItselfUnwatched => tree.root_watch_fails = true,
+                    EndsBy::Shutdown => {
+                        tree.root_never_exits = true;
+                        shutdown.cancel();
+                    }
+                    EndsBy::StartFailureThenExit => tree.root_never_exits = true,
+                    EndsBy::StartFailureThenKill => {
+                        tree.root_never_exits = true;
+                        tree.root_outlives_grace = true;
+                    }
+                }
+                let result = tokio::time::timeout(
+                    VIRTUAL_HANG,
+                    supervise_plugin(
+                        "p",
+                        &mut tree,
+                        &shutdown,
+                        GRACE,
+                        finished_reader(),
+                        finished_reader(),
+                        failure,
+                    ),
+                )
+                .await
+                .expect("the plugin must end")
+                .unwrap()
+                .outcome("p");
+
+                // Only an exit has a status to report; a plugin taken down ends on the take-down.
+                let exited = matches!(
+                    ends_by,
+                    EndsBy::ExitingItself | EndsBy::ExitingItselfUnwatched | EndsBy::StartFailureThenExit
+                );
+                let expected = match status_error {
+                    Some(tag) if exited => (*tag).to_owned(),
+                    _ if start_failed => "chain error".to_owned(),
+                    _ => "ok".to_owned(),
+                };
+                let got = run_result(result);
+                if got != expected {
+                    failures.push(format!(
+                        "{ends_by:?}, start_failed={start_failed}, {status_name}: want {expected}, got {got}"
+                    ));
+                }
+            }
+        }
+    }
     assert!(
-        matches!(&err, crate::Error::Chain(msg) if msg.contains("'p'") && msg.contains("start")),
-        "{err:?}"
+        failures.is_empty(),
+        "{} rows failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// A take-down leaves no descendant ------------------------------------------------------------------------------------
+//
+// Every take-down of a running plugin, on every containment, whether or not its exit can be watched, kills the plugin's
+// tree. Where the kill signals a process group id it happens while the root is unreaped, because the OS may recycle the
+// id the moment the root is reaped.
+
+#[derive(Clone, Copy, Debug)]
+enum TakenDownBy {
+    Shutdown,
+    StartFailure,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RootExit {
+    /// The root exits on its own while the take-down is under way.
+    WithinGrace,
+    /// The root keeps running until it is killed.
+    OutlivesGrace,
+}
+
+#[skuld::test]
+async fn every_take_down_kills_the_plugins_tree() {
+    tokio::time::pause();
+    let mut failures = Vec::new();
+    for taken_down_by in [TakenDownBy::Shutdown, TakenDownBy::StartFailure] {
+        for watched in [true, false] {
+            for root_exit in [RootExit::WithinGrace, RootExit::OutlivesGrace] {
+                for (containment, kills_by_pgid) in KILLS_BY_PGID {
+                    let row = format!("{taken_down_by:?}, watched={watched}, {root_exit:?}, {containment:?}");
+                    let (shutdown, failure) = match taken_down_by {
+                        TakenDownBy::Shutdown => (CancellationToken::new(), None),
+                        TakenDownBy::StartFailure => {
+                            let (_ready_rx, shutdown, failure) = decided_start_failure().await;
+                            (shutdown, Some(failure))
+                        }
+                    };
+                    let exits = Arc::new(Notify::new());
+                    let mut tree = drained_tree(containment);
+                    tree.root_never_exits = true;
+                    match (watched, root_exit) {
+                        (true, RootExit::WithinGrace) => {}
+                        (true, RootExit::OutlivesGrace) => tree.root_outlives_grace = true,
+                        (false, RootExit::WithinGrace) => {
+                            tree.root_watch_fails = true;
+                            tree.reap_waits_for = Some(exits.clone());
+                        }
+                        (false, RootExit::OutlivesGrace) => {
+                            tree.root_watch_fails = true;
+                            tree.reap_waits_for_kill = true;
+                        }
+                    }
+                    let calls = tree.calls.clone();
+                    let sup = supervise_plugin(
+                        "p",
+                        &mut tree,
+                        &shutdown,
+                        GRACE,
+                        finished_reader(),
+                        finished_reader(),
+                        failure,
+                    );
+                    let mut sup = pin!(sup);
+                    let _ = poll_once(sup.as_mut());
+                    if matches!(taken_down_by, TakenDownBy::Shutdown) {
+                        shutdown.cancel();
+                    }
+                    let _ = poll_once(sup.as_mut());
+                    exits.notify_one();
+                    if tokio::time::timeout(VIRTUAL_HANG, sup).await.is_err() {
+                        failures.push(format!("{row}: the plugin never ended"));
+                        continue;
+                    }
+
+                    let calls = calls.lock().unwrap().clone();
+                    let position = |call: &str| calls.iter().position(|c| *c == call);
+                    let Some(tree_killed) = position("kill_tree") else {
+                        failures.push(format!("{row}: the tree was never killed: {calls:?}"));
+                        continue;
+                    };
+                    let reaped = position("reap").expect("the root is reaped");
+                    if kills_by_pgid && tree_killed > reaped {
+                        failures.push(format!(
+                            "{row}: the process group was signalled after the reap: {calls:?}"
+                        ));
+                    }
+                    if position("disarm") != Some(reaped + 1) {
+                        failures.push(format!("{row}: the handle is disarmed right after the reap: {calls:?}"));
+                    }
+                    if watched {
+                        let killed_root = position("kill_root");
+                        match root_exit {
+                            RootExit::WithinGrace if killed_root.is_some() => {
+                                failures.push(format!("{row}: a root that exited by itself was killed: {calls:?}"))
+                            }
+                            RootExit::OutlivesGrace if !(killed_root < Some(tree_killed)) || killed_root.is_none() => {
+                                failures.push(format!(
+                                    "{row}: the root outlived its grace and was not killed first: {calls:?}"
+                                ))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} rows failed:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
 }

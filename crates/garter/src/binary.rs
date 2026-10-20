@@ -84,6 +84,11 @@ pub type PidSink = Arc<dyn Fn(u32) + Send + Sync>;
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A plugin backed by an external SIP003u binary.
+///
+/// In the sitrep readiness modes a start failure the plugin reports (or closing its sitrep stream before `ready`)
+/// takes the plugin down and makes [`run`](ChainPlugin::run) return an error however the plugin then ends, even
+/// with exit status 0. The failure itself reaches the chain's readiness channel once the plugin's output has been
+/// drained.
 pub struct BinaryPlugin {
     path: PathBuf,
     options: Option<String>,
@@ -408,6 +413,9 @@ struct HeldFailure {
 
 /// The reader's side of a held failure: `ready` moves here, unsent, and `failed` is cancelled so the
 /// plugin is taken down. Does nothing once readiness is decided (a `ready`, or an earlier failure).
+///
+/// A hold that is already gone (the supervision ended, or its future was dropped) leaves nobody to
+/// deliver the failure later, so it is sent at once: a decided failure is never dropped.
 async fn hold_failure(
     shared: &SharedReady,
     held: &mut Option<oneshot::Sender<HeldFailure>>,
@@ -417,15 +425,20 @@ async fn hold_failure(
     let Some(ready) = shared.lock().await.take() else {
         return;
     };
-    if let Some(held) = held.take() {
-        let _ = held.send(HeldFailure { ready, error });
+    let failure = HeldFailure { ready, error };
+    let undelivered = match held.take() {
+        Some(held) => held.send(failure).err(),
+        None => Some(failure),
+    };
+    if let Some(HeldFailure { ready, error }) = undelivered {
+        let _ = ready.send(Err(error));
     }
     failed.cancel();
 }
 
-/// Where a sitrep reader's start failure waits for the plugin's output. The failure is sent only by
-/// [`FailureHold::deliver`], so a caller that learns of it has already seen everything the plugin wrote
-/// before.
+/// Where a sitrep reader's start failure waits for the plugin's output. The failure is sent only when the
+/// hold ends ([`FailureHold::deliver`], or its drop when the supervision is aborted or unwinds), so a
+/// caller that learns of it has already seen everything the plugin wrote before.
 pub(crate) struct FailureHold {
     held: oneshot::Receiver<HeldFailure>,
     /// Cancelled once the reader has decided the start failed. A child of the chain's shutdown token.
@@ -438,12 +451,29 @@ impl FailureHold {
         self.failed.cancelled().await;
     }
 
-    /// Sends the failure the reader held, if it held one, on the plugin's readiness channel. Call it
-    /// once the plugin's output readers have finished or been given up on.
-    pub(crate) fn deliver(mut self) {
-        if let Ok(HeldFailure { ready, error }) = self.held.try_recv() {
-            let _ = ready.send(Err(error));
-        }
+    /// Sends the failure the reader held, if it held one, on the plugin's readiness channel, and
+    /// returns whether it did. Call it once the plugin's output readers have finished or been given up
+    /// on.
+    pub(crate) fn deliver(mut self) -> bool {
+        self.finish()
+    }
+
+    /// Closes the hold, then sends what reached it first: a reader deciding later finds the hold closed
+    /// and sends its own failure (see [`hold_failure`]), so every decided failure is sent exactly once.
+    pub(crate) fn finish(&mut self) -> bool {
+        self.held.close();
+        let Ok(HeldFailure { ready, error }) = self.held.try_recv() else {
+            return false;
+        };
+        let _ = ready.send(Err(error));
+        true
+    }
+}
+
+impl Drop for FailureHold {
+    /// A supervision that is aborted or unwinds still reports the failure its reader decided.
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -678,17 +708,44 @@ pub(crate) trait PluginTree {
     fn disarm(&mut self);
 }
 
+/// The exit watch for a root cosca cannot watch (on Linux, `pidfd_open` is missing before 5.3 or denied by a seccomp
+/// profile): `waitid(WNOWAIT)` where that exists, and `pidfd_error` otherwise. Either way the root stays unreaped.
+#[cfg(target_os = "linux")]
+async fn watch_exit_without_pidfd(pid: u32, pidfd_error: cosca::error::Error) -> Result<(), cosca::error::Error> {
+    tracing::debug!("the pidfd exit watch is unavailable ({pidfd_error}); watching the exit with waitid");
+    crate::exit_watch::wait_exit_without_reaping(pid)
+        .await
+        .map_err(cosca::error::Error::Io)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn watch_exit_without_pidfd(_pid: u32, pidfd_error: cosca::error::Error) -> Result<(), cosca::error::Error> {
+    Err(pidfd_error)
+}
+
 impl PluginTree for cosca::tokio::Child {
     fn containment(&self) -> Containment {
         cosca::tokio::Child::containment(self)
     }
 
     async fn wait_root_exit(&self) -> Result<(), cosca::error::Error> {
-        cosca::tokio::Process::from_id(self.id()).wait().await
+        match cosca::tokio::Process::from_id(self.id()).wait().await {
+            Err(pidfd_error) => watch_exit_without_pidfd(self.id().pid(), pidfd_error).await,
+            watched => watched,
+        }
     }
 
     async fn wait_root_exit_within(&self, grace: std::time::Duration) -> Result<bool, cosca::error::Error> {
-        cosca::tokio::Process::from_id(self.id()).wait_timeout(grace).await
+        match cosca::tokio::Process::from_id(self.id()).wait_timeout(grace).await {
+            Err(pidfd_error) => {
+                // A zero grace is still a probe: `timeout` polls the watch before its deadline.
+                match tokio::time::timeout(grace, watch_exit_without_pidfd(self.id().pid(), pidfd_error)).await {
+                    Ok(watched) => watched.map(|()| true),
+                    Err(_grace_over) => Ok(false),
+                }
+            }
+            watched => watched,
+        }
     }
 
     fn terminate(&self) -> Result<(), cosca::error::Error> {
@@ -737,27 +794,37 @@ impl PluginTree for cosca::tokio::Child {
 /// How long a plugin gets to exit on its own after being asked to, before it is killed.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How [`supervise_plugin`] ended a plugin.
+/// How a plugin's root came to its end.
 pub(crate) enum PluginEnd {
-    /// The plugin exited by itself, with this status.
+    /// The root exited, with this status: by itself, or within the grace a take-down gave it.
     Exited(std::process::ExitStatus),
-    /// `shutdown` fired; the plugin was taken down.
+    /// The root was taken down: asked to exit, or killed because it did not.
     ShutDown,
-    /// The plugin's start failed and it did not exit on its own within its grace; it was killed. The failure
-    /// reaches the caller through readiness, and `run` returns an error too, so a runner that registered no
-    /// `on_ready` still sees the chain fail.
-    KilledAfterFailedStart,
 }
 
-impl PluginEnd {
-    /// The result `BinaryPlugin::run` returns for this end.
+/// How [`supervise_plugin`] ended a plugin, and whether its start had failed.
+pub(crate) struct Supervised {
+    pub(crate) end: PluginEnd,
+    /// The sitrep reader decided the start failed. The failure itself reaches the caller through readiness.
+    pub(crate) start_failed: bool,
+}
+
+impl Supervised {
+    /// The result `BinaryPlugin::run` returns, and the only place it is derived. A plugin whose start failed never
+    /// ends `Ok`, however it ended: an exit status that is an error keeps naming the error, and anything else is a
+    /// [`Chain`](crate::Error::Chain) error saying the start failed. This is what makes a runner that registered no
+    /// `on_ready` see the chain fail.
     pub(crate) fn outcome(self, plugin: &str) -> crate::Result<()> {
-        match self {
-            PluginEnd::ShutDown => Ok(()),
-            PluginEnd::KilledAfterFailedStart => Err(crate::Error::Chain(format!(
-                "plugin '{plugin}' failed to start and did not exit; it was killed"
+        let start_failed = self.start_failed;
+        let ok_unless_start_failed = |how: &str| match start_failed {
+            true => Err(crate::Error::Chain(format!(
+                "plugin '{plugin}' failed to start and {how}"
             ))),
-            PluginEnd::Exited(status) if status.success() => Ok(()),
+            false => Ok(()),
+        };
+        match self.end {
+            PluginEnd::ShutDown => ok_unless_start_failed("was taken down"),
+            PluginEnd::Exited(status) if status.success() => ok_unless_start_failed("then exited cleanly"),
             PluginEnd::Exited(status) => match status.code() {
                 Some(code) => Err(crate::Error::PluginExit {
                     name: plugin.to_owned(),
@@ -779,21 +846,24 @@ impl PluginEnd {
 /// zombie. A take-down ends a plugin that is still running; an exit that lands after the probe ends as
 /// one (see [`Takedown`]).
 ///
-/// The exit watch is non-reaping and needs `pidfd_open` on Linux, which a kernel before 5.3 lacks
-/// and a seccomp profile may deny. Without it the root is reaped first (still ending on a take-down)
-/// and the tree is killed only where that stays safe (see [`end_reaped_plugin`]). The grace a shutdown
-/// or a failed start gives the root, and the status of a failed-start root that exits within it, do
-/// not depend on the watch.
+/// The exit watch is non-reaping. On Linux it is cosca's pidfd watch, or `waitid(WNOWAIT)` where
+/// `pidfd_open` is missing (before 5.3) or denied; either way every take-down of a running root kills
+/// its tree before the root is reaped, with the grace a shutdown or a failed start gives it. Only when
+/// no watch works can a root's exit be seen by reaping it alone. A root that exits by itself is then
+/// reaped first, and the tree is killed only where that stays safe (see [`end_reaped_plugin`]). A
+/// take-down that finds the exit unwatchable has no grace to give: the root is killed at once, then
+/// the tree, then the reap.
 ///
-/// A plugin whose start failed and that did not exit within its grace is killed and ends as
-/// [`PluginEnd::KilledAfterFailedStart`]: a failed start never ends `Ok`.
+/// The returned [`Supervised`] says whether the start failed, which makes `run` return an error
+/// however the plugin ended (see [`Supervised::outcome`]).
 ///
 /// The readiness sender (start-gate for `on_ready`) and the exit's `Err` (lifecycle error driving
 /// teardown) are two intentionally separate observers of one exit; a plugin that emits `fatal` then
 /// exits nonzero fires both, and neither must be suppressed. See `run_readiness_aggregator` in
 /// chain.rs for the full two-channel rationale. The start failure `failure` holds is delivered last,
 /// after the plugin's output has been drained (or given up on at its bound): whoever hears of it has
-/// been shown the plugin's last words.
+/// been shown the plugin's last words. If this future is dropped or unwinds first, dropping `failure`
+/// delivers it.
 ///
 /// Once the root is reaped the handle is disarmed (see [`PluginTree::disarm`]); on an `Err` it may
 /// not be, and dropping the handle then still kills the tree.
@@ -805,12 +875,13 @@ pub(crate) async fn supervise_plugin(
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
     failure: Option<FailureHold>,
-) -> Result<PluginEnd, cosca::error::Error> {
+) -> Result<Supervised, cosca::error::Error> {
     let end = supervise(plugin, tree, shutdown, failure.as_ref(), grace, stdout, stderr).await;
-    if let Some(failure) = failure {
-        failure.deliver();
-    }
-    end
+    let start_failed = failure.is_some_and(FailureHold::deliver);
+    Ok(Supervised {
+        end: end?,
+        start_failed,
+    })
 }
 
 /// Why a running plugin must come down, and how. One exhaustive match decides each.
@@ -836,22 +907,6 @@ impl Takedown {
         match self {
             Takedown::Shutdown => shut_down_on_request(plugin, tree, grace, stdout, stderr).await,
             Takedown::StartFailed => end_failed_start(plugin, tree, grace, stdout, stderr).await,
-        }
-    }
-
-    /// [`carry_out`](Self::carry_out) for a root whose exit cannot be watched: the reap is what waits for
-    /// the exit, so the grace of a shutdown or of a start failure is spent on it.
-    async fn carry_out_unwatched(
-        self,
-        plugin: &str,
-        tree: &mut impl PluginTree,
-        grace: std::time::Duration,
-        stdout: tokio::task::JoinHandle<()>,
-        stderr: tokio::task::JoinHandle<()>,
-    ) -> Result<PluginEnd, cosca::error::Error> {
-        match self {
-            Takedown::Shutdown => shut_down_unwatched(plugin, tree, grace, stdout, stderr).await,
-            Takedown::StartFailed => end_unwatched_failed_start(plugin, tree, grace, stdout, stderr).await,
         }
     }
 }
@@ -894,8 +949,10 @@ async fn supervise(
                 tokio::select! {
                     biased;
                     reaped = reap_root(tree) => end_after_reap(plugin, tree, stdout, stderr, reaped).await,
+                    // Nothing can say the root exited short of reaping it, which would leave the tree to a
+                    // recycled process group id: the take-down kills the root and then the tree first.
                     takedown = takedown_requested(shutdown, failure) => {
-                        takedown.carry_out_unwatched(plugin, tree, grace, stdout, stderr).await
+                        takedown.carry_out(plugin, tree, grace, stdout, stderr).await
                     }
                 }
             }
@@ -972,34 +1029,6 @@ async fn shut_down_on_request(
     Ok(PluginEnd::ShutDown)
 }
 
-/// [`shut_down_on_request`] for a root whose exit cannot be watched: asks the root to exit, then the reap
-/// waits for it for at most `grace`. A root that exits in time is not killed; one that does not, or that
-/// could not be asked, is killed and ended as [`shut_plugin_down`] does.
-async fn shut_down_unwatched(
-    plugin: &str,
-    tree: &mut impl PluginTree,
-    grace: std::time::Duration,
-    stdout: tokio::task::JoinHandle<()>,
-    stderr: tokio::task::JoinHandle<()>,
-) -> Result<PluginEnd, cosca::error::Error> {
-    tracing::info!(plugin = %plugin, "shutting down");
-    match tree.terminate() {
-        Ok(()) => match tokio::time::timeout(grace, reap_root(tree)).await {
-            Ok(reaped) => {
-                end_after_reap(plugin, tree, stdout, stderr, reaped).await?;
-            }
-            Err(_grace_over) => {
-                finish_plugin(plugin, tree, false, stdout, stderr).await?;
-            }
-        },
-        Err(e) => {
-            tracing::debug!(plugin = %plugin, "could not ask the plugin to exit: {e}");
-            finish_plugin(plugin, tree, false, stdout, stderr).await?;
-        }
-    }
-    Ok(PluginEnd::ShutDown)
-}
-
 /// Ends a plugin whose root has exited or been told to die: kills and drains its tree, waits for its
 /// output, and only then collects the root's status. The root stays unreaped until then, so a pgid-based
 /// kill cannot hit a recycled process group.
@@ -1048,27 +1077,8 @@ async fn end_failed_start(
     Ok(if exited {
         PluginEnd::Exited(status)
     } else {
-        PluginEnd::KilledAfterFailedStart
+        PluginEnd::ShutDown
     })
-}
-
-/// [`end_failed_start`] for a root whose exit cannot be watched: the reap waits for the exit for at most
-/// `grace`, and a root that exits in time keeps its status. One that does not is killed and ended as there.
-async fn end_unwatched_failed_start(
-    plugin: &str,
-    tree: &mut impl PluginTree,
-    grace: std::time::Duration,
-    stdout: tokio::task::JoinHandle<()>,
-    stderr: tokio::task::JoinHandle<()>,
-) -> Result<PluginEnd, cosca::error::Error> {
-    tracing::info!(plugin = %plugin, "the plugin's start failed; taking it down");
-    match tokio::time::timeout(grace, reap_root(tree)).await {
-        Ok(reaped) => end_after_reap(plugin, tree, stdout, stderr, reaped).await,
-        Err(_grace_over) => {
-            finish_plugin(plugin, tree, false, stdout, stderr).await?;
-            Ok(PluginEnd::KilledAfterFailedStart)
-        }
-    }
 }
 
 /// Whether the root exits within `grace`. `false` when it does not, or when it cannot be watched.
