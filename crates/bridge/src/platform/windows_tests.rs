@@ -196,8 +196,8 @@ fn sweep_recheck_uses_presence_not_schema() {
 // real failure would make an uninstall unrunnable on a host that merely has a
 // stale row with an open handle. Anything else is a genuine SCM error and must
 // stay one. The classification of a stop's own error, in each shape it travels
-// in, is `scm_wait::call_error::io_error_is_absent_service` and
-// `RetireError::means_service_is_gone`, tested where they live.
+// in, is `scm_wait::call_error::service_gone` and `RetireError::service_gone`,
+// tested where they live.
 
 fn winapi_error(code: u32) -> windows_service::Error {
     windows_service::Error::Winapi(std::io::Error::from_raw_os_error(code as i32))
@@ -206,17 +206,24 @@ fn winapi_error(code: u32) -> windows_service::Error {
 #[skuld::test]
 fn an_unregistered_or_deleted_service_has_nothing_to_stop() {
     use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE};
-    assert!(open_error_is_absent(&winapi_error(ERROR_SERVICE_DOES_NOT_EXIST.0)));
-    assert!(open_error_is_absent(&winapi_error(ERROR_SERVICE_MARKED_FOR_DELETE.0)));
+    assert_eq!(
+        open_error_gone(&winapi_error(ERROR_SERVICE_DOES_NOT_EXIST.0)),
+        Some(ServiceGone::DoesNotExist)
+    );
+    assert_eq!(
+        open_error_gone(&winapi_error(ERROR_SERVICE_MARKED_FOR_DELETE.0)),
+        Some(ServiceGone::MarkedForDeletion)
+    );
 }
 
 #[skuld::test]
 fn a_real_scm_failure_is_not_an_absent_service() {
     // Access denied: the caller is unprivileged, the service is very much there.
-    assert!(!open_error_is_absent(&winapi_error(5)));
-    assert!(!open_error_is_absent(
-        &windows_service::Error::LaunchArgumentsNotSupported
-    ));
+    assert_eq!(open_error_gone(&winapi_error(5)), None);
+    assert_eq!(
+        open_error_gone(&windows_service::Error::LaunchArgumentsNotSupported),
+        None
+    );
 }
 
 // The calls that give the service its SID type ========================================================================

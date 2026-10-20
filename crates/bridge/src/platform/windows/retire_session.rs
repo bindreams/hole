@@ -1,33 +1,47 @@
 //! The real SCM session behind [`retire`](crate::cutover::scm_wait::retire):
-//! one open `HoleBridge` service, used for the restart toggle, the stop wait,
+//! one open `HoleBridge` service, used for the hardening writes, the stop wait,
 //! the delete, the state query and the wait for the service's process.
 
 use std::io;
 use std::mem::MaybeUninit;
 
+use windows::core::PCWSTR;
 use windows::Win32::System::Services::{
-    QueryServiceStatusEx, SC_HANDLE, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+    ChangeServiceConfigW, QueryServiceStatusEx, ENUM_SERVICE_TYPE, SC_HANDLE, SC_STATUS_PROCESS_INFO, SERVICE_ERROR,
+    SERVICE_NO_CHANGE, SERVICE_START_TYPE, SERVICE_STATUS_PROCESS,
 };
 use windows_service::service::{
     Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
+    ServiceStartType,
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::service_processes::{has_exited, open_process, ServiceProcesses};
 use super::service_sid::ServiceSid;
-use super::{apply_failure_actions, scm_failure, SERVICE_NAME};
-use crate::cutover::scm_wait::call_error::{io_error_is_absent_service, win32_code_of_hresult, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessFate, ProcessSource, Reading};
-use crate::cutover::scm_wait::retire::ServiceSession;
-use crate::cutover::scm_wait::{observed_from_state, Observed, ScmActor, SystemScmActor, WantState};
+use super::{apply_failure_actions, open_error_gone, scm_failure, SERVICE_NAME};
+use crate::cutover::scm_wait::call_error::{service_gone, win32_code_of_hresult, ScmCall, ScmCallError, ServiceGone};
+use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessSource, Reading};
+use crate::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartType, StartWrite};
+use crate::cutover::scm_wait::settle::{StopActor, WaitKind};
+use crate::cutover::scm_wait::{observed_from_state, Observed, SystemScmActor};
 
-/// Both handles are opened before anything is changed, so the delete, which
-/// only marks the service, cannot take either away: a handle opened earlier
-/// keeps carrying controls and queries after the mark.
+/// What opening the session found.
+pub enum Opening {
+    /// The session, with its service handle.
+    Opened(RetireSession),
+    /// The SCM has no service to open: never registered, or marked for
+    /// deletion before the open.
+    Gone(ServiceGone),
+}
+
+/// One service handle, opened before anything is changed, carries the queries,
+/// the hardening writes, the Stop and the delete. The delete only marks the
+/// service, so it cannot take the handle away. Notifications are armed on
+/// handles of their own, opened per arm.
 pub struct RetireSession {
-    /// Restart toggle, delete and state query.
+    /// Queries, configuration, Stop and delete.
     service: Service,
-    /// The stop wait.
+    /// The notification arms and the sleep on them.
     actor: SystemScmActor,
     /// The SID a process of the service carries.
     sid: ServiceSid,
@@ -36,29 +50,38 @@ pub struct RetireSession {
 }
 
 impl RetireSession {
-    /// Opens the session, or `None` when the SCM has no `HoleBridge` to act on
-    /// (never registered, or already marked for deletion).
-    pub fn open() -> Result<Option<Self>, Box<dyn std::error::Error>> {
+    /// Opens the session, or says why the SCM has no service to open.
+    pub fn open() -> Result<Opening, Box<dyn std::error::Error>> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
         let service = match manager.open_service(
             SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG | ServiceAccess::DELETE,
+            ServiceAccess::QUERY_STATUS
+                | ServiceAccess::QUERY_CONFIG
+                | ServiceAccess::CHANGE_CONFIG
+                | ServiceAccess::STOP
+                | ServiceAccess::DELETE,
         ) {
             Ok(service) => service,
-            Err(e) if super::open_error_is_absent(&e) => return Ok(None),
-            Err(e) => return Err(scm_failure(ScmCall::OpenService, e).into()),
+            Err(e) => {
+                return match open_error_gone(&e) {
+                    Some(gone) => Ok(Opening::Gone(gone)),
+                    None => Err(scm_failure(ScmCall::OpenService, e).into()),
+                }
+            }
         };
         match SystemScmActor::open(SERVICE_NAME) {
-            Ok(actor) => Ok(Some(Self {
+            Ok(actor) => Ok(Opening::Opened(Self {
                 service,
                 actor,
                 sid: ServiceSid::of(SERVICE_NAME),
                 processes: ServiceProcesses::default(),
             })),
-            // Deleted between the two opens.
-            Err(e) if io_error_is_absent_service(&e) => Ok(None),
-            Err(e) => Err(e.into()),
+            // Gone between the two opens.
+            Err(e) => match service_gone(&e) {
+                Some(gone) => Ok(Opening::Gone(gone)),
+                None => Err(e.into()),
+            },
         }
     }
 
@@ -70,6 +93,10 @@ impl RetireSession {
             service: &self.service,
             sid: &self.sid,
         })
+    }
+
+    fn raw(&self) -> SC_HANDLE {
+        SC_HANDLE(self.service.raw_handle())
     }
 }
 
@@ -134,34 +161,79 @@ impl ServiceProbe<'_> {
     }
 }
 
-impl ScmActor for RetireSession {
-    fn arm(&mut self, want: WantState, except: Option<Observed>) -> io::Result<()> {
-        self.actor.arm(want, except)
+impl StopActor for RetireSession {
+    fn observe(&mut self) -> io::Result<Look> {
+        self.look()
     }
+
+    fn arm_leaving(&mut self, from: Observed) -> io::Result<()> {
+        self.actor.arm_leaving(from)
+    }
+
     fn control_stop(&mut self) -> io::Result<()> {
-        self.actor.control_stop()
+        self.service
+            .stop()
+            .map(drop)
+            .map_err(|e| scm_failure(ScmCall::ControlService, e))
     }
-    fn start(&mut self) -> io::Result<()> {
-        self.actor.start()
+
+    fn await_callback(&mut self, kind: WaitKind) -> io::Result<()> {
+        self.actor.await_callback(kind)
     }
-    fn wait_callback(&mut self) -> io::Result<Observed> {
-        self.actor.wait_callback()
+
+    fn await_held_exits(&mut self, _kind: WaitKind) -> io::Result<()> {
+        self.processes.await_exits()
     }
-    /// A bare session holds nothing on a callback; `retire` wraps it to.
-    fn process_fate(&mut self) -> io::Result<ProcessFate> {
-        Ok(ProcessFate::Unheld)
+
+    fn hold_scanned(&mut self) -> io::Result<()> {
+        self.processes.hold_scanned(&self.sid)
     }
 }
 
 impl ServiceSession for RetireSession {
-    fn disable_restart(&mut self) -> io::Result<()> {
+    fn start_type(&mut self) -> io::Result<StartType> {
         self.service
-            .update_failure_actions(no_restart_failure_actions())
-            .map_err(|e| scm_failure(ScmCall::ChangeServiceConfig2, e))
+            .query_config()
+            .map(|config| start_type_from(config.start_type))
+            .map_err(|e| scm_failure(ScmCall::QueryServiceConfig, e))
     }
 
-    fn restore_restart(&mut self) -> io::Result<()> {
-        apply_failure_actions(&self.service)
+    fn set_start_type(&mut self, to: StartWrite) -> io::Result<()> {
+        // SAFETY: the handle is the live one `self.service` owns; every pointer
+        // argument is null, which `SERVICE_NO_CHANGE` and the documented null
+        // defaults leave alone.
+        unsafe {
+            ChangeServiceConfigW(
+                self.raw(),
+                ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+                SERVICE_START_TYPE(scm_start_type(to).to_raw()),
+                SERVICE_ERROR(SERVICE_NO_CHANGE),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                None,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                PCWSTR::null(),
+            )
+        }
+        .map_err(|e| {
+            ScmCallError {
+                call: ScmCall::ChangeServiceConfig,
+                code: win32_code_of_hresult(e.code().0),
+            }
+            .into_io()
+        })
+    }
+
+    fn set_failure_actions(&mut self, actions: FailureActions) -> io::Result<()> {
+        match actions {
+            FailureActions::None => self
+                .service
+                .update_failure_actions(no_restart_failure_actions())
+                .map_err(|e| scm_failure(ScmCall::ChangeServiceConfig2, e)),
+            FailureActions::Restart => apply_failure_actions(&self.service),
+        }
     }
 
     fn delete(&mut self) -> io::Result<()> {
@@ -169,17 +241,25 @@ impl ServiceSession for RetireSession {
             .delete()
             .map_err(|e| scm_failure(ScmCall::DeleteService, e))
     }
+}
 
-    fn observe(&mut self) -> io::Result<Look> {
-        self.look()
+/// The retirement's start type for what the SCM reports.
+fn start_type_from(reported: ServiceStartType) -> StartType {
+    match reported {
+        ServiceStartType::AutoStart => StartType::Auto,
+        ServiceStartType::OnDemand => StartType::Demand,
+        ServiceStartType::Disabled => StartType::Disabled,
+        ServiceStartType::SystemStart => StartType::Other,
+        ServiceStartType::BootStart => StartType::Other,
     }
+}
 
-    fn hold_process(&mut self) -> io::Result<ProcessFate> {
-        Ok(self.look()?.fate)
-    }
-
-    fn await_exits(&mut self) -> io::Result<()> {
-        self.processes.await_exits()
+/// The SCM start type a write names.
+fn scm_start_type(written: StartWrite) -> ServiceStartType {
+    match written {
+        StartWrite::Auto => ServiceStartType::AutoStart,
+        StartWrite::Demand => ServiceStartType::OnDemand,
+        StartWrite::Disabled => ServiceStartType::Disabled,
     }
 }
 

@@ -3,49 +3,16 @@ use std::cell::RefCell;
 
 /// Records the granular SCM steps in call order and replays a scripted `Observed`
 /// for each `wait_callback`. The script asserts the pure ordering of
-/// `stop_via_notify` / `start_via_notify` without touching the real SCM.
+/// `start_via_notify` without touching the real SCM.
 struct FakeScm<'a> {
     log: &'a RefCell<Vec<&'static str>>,
     /// `Observed`s the next `wait_callback` calls return, front to back.
     waits: std::collections::VecDeque<Observed>,
-    /// Total `arm` calls, so the two-phase-arm re-arm behavior is checkable.
-    arms: usize,
-    /// When set, `arm` / `control_stop` log the call and then fail with it.
-    arm_error: Option<&'static str>,
-    /// What `control_stop` fails with, for its first `control_errors_left` calls.
-    control_error: Option<&'static str>,
-    control_errors_left: usize,
-    /// The fate each `wait_callback` leaves behind, front to back; `Unheld`
-    /// once they run out.
-    fates: std::collections::VecDeque<ProcessFate>,
-    last_fate: ProcessFate,
 }
 
 impl<'a> FakeScm<'a> {
     fn new(log: &'a RefCell<Vec<&'static str>>, waits: std::collections::VecDeque<Observed>) -> Self {
-        Self {
-            log,
-            waits,
-            arms: 0,
-            arm_error: None,
-            control_error: None,
-            control_errors_left: 0,
-            fates: Default::default(),
-            last_fate: ProcessFate::Unheld,
-        }
-    }
-
-    /// The process behind each callback has these fates, in order.
-    fn with_fates(mut self, fates: Vec<ProcessFate>) -> Self {
-        self.fates = fates.into();
-        self
-    }
-
-    /// `control_stop` fails with `error` on its first `times` calls.
-    fn failing_control(mut self, error: &'static str, times: usize) -> Self {
-        self.control_error = Some(error);
-        self.control_errors_left = times;
-        self
+        Self { log, waits }
     }
 
     /// A scripted actor with no call log, for the terminal-state assertions.
@@ -59,16 +26,7 @@ impl<'a> FakeScm<'a> {
 
 impl ScmActor for FakeScm<'_> {
     fn arm(&mut self, want: WantState, except: Option<Observed>) -> std::io::Result<()> {
-        self.arms += 1;
         self.log.borrow_mut().push(arm_label(want, except));
-        self.arm_error.map_or(Ok(()), |e| Err(std::io::Error::other(e)))
-    }
-    fn control_stop(&mut self) -> std::io::Result<()> {
-        self.log.borrow_mut().push("control_stop");
-        if self.control_errors_left > 0 {
-            self.control_errors_left -= 1;
-            return Err(std::io::Error::other(self.control_error.expect("a scripted error")));
-        }
         Ok(())
     }
     fn start(&mut self) -> std::io::Result<()> {
@@ -78,7 +36,6 @@ impl ScmActor for FakeScm<'_> {
     fn wait_callback(&mut self) -> std::io::Result<Observed> {
         self.log.borrow_mut().push("wait");
         let state = self.waits.pop_front().expect("script ran dry");
-        self.last_fate = self.fates.pop_front().unwrap_or(ProcessFate::Unheld);
         self.log.borrow_mut().push(match state {
             Observed::Stopped => "got_stopped",
             Observed::Running => "got_running",
@@ -86,9 +43,6 @@ impl ScmActor for FakeScm<'_> {
             Observed::StopPending => "got_stop_pending",
         });
         Ok(state)
-    }
-    fn process_fate(&mut self) -> std::io::Result<ProcessFate> {
-        Ok(self.last_fate)
     }
 }
 
@@ -126,281 +80,19 @@ impl ScmActor for ScriptedScm {
         self.arms += 1;
         Ok(())
     }
-    fn control_stop(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
     fn start(&mut self) -> std::io::Result<()> {
         Ok(())
     }
     fn wait_callback(&mut self) -> std::io::Result<Observed> {
         Ok(self.waits.pop_front().expect("script ran dry"))
     }
-    fn process_fate(&mut self) -> std::io::Result<ProcessFate> {
-        Ok(ProcessFate::Unheld)
-    }
-}
-
-/// A stop wait that finds the service already stopped sends nothing.
-#[skuld::test]
-fn stop_of_a_stopped_service_sends_no_control() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(&log, [Observed::Stopped].into());
-    stop_via_notify(&mut fake).unwrap();
-    assert_eq!(*log.borrow(), vec!["arm_stopped", "wait", "got_stopped"]);
-}
-
-/// The first thing the wait does is observe; a RUNNING observation is what
-/// earns the Stop, and the wait then re-arms for the result.
-#[skuld::test]
-fn stop_of_a_running_service_sends_one_control_after_observing_running() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(
-        &log,
-        [Observed::Running, Observed::StopPending, Observed::Stopped].into(),
-    );
-    stop_via_notify(&mut fake).unwrap();
-    assert_eq!(
-        *log.borrow(),
-        vec![
-            "arm_stopped",
-            "wait",
-            "got_running",
-            "control_stop",
-            // RUNNING would report again at once; the wait is for what the Stop causes.
-            "arm_stopped_except_running",
-            "wait",
-            "got_stop_pending",
-            "arm_stopped_except_stop_pending",
-            "wait",
-            "got_stopped",
-        ]
-    );
-}
-
-/// The #1099 window: a service the SCM just restarted is START_PENDING, where
-/// the SCM refuses a Stop. The wait observes first and sends nothing until the
-/// service is RUNNING.
-#[skuld::test]
-fn stop_of_a_start_pending_service_waits_for_running_before_sending_the_control() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(
-        &log,
-        [
-            Observed::StartPending,
-            Observed::Running,
-            Observed::StopPending,
-            Observed::Stopped,
-        ]
-        .into(),
-    );
-    stop_via_notify(&mut fake).unwrap();
-    assert_eq!(
-        *log.borrow(),
-        vec![
-            "arm_stopped",
-            "wait",
-            "got_start_pending",
-            "arm_stopped_except_start_pending",
-            "wait",
-            "got_running",
-            "control_stop",
-            "arm_stopped_except_running",
-            "wait",
-            "got_stop_pending",
-            "arm_stopped_except_stop_pending",
-            "wait",
-            "got_stopped",
-        ]
-    );
-}
-
-/// A service that fails its start (START_PENDING straight to STOPPED) is
-/// stopped; there is nothing to send.
-#[skuld::test]
-fn stop_of_a_service_that_fails_to_start_is_done_without_a_control() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(&log, [Observed::StartPending, Observed::Stopped].into());
-    stop_via_notify(&mut fake).unwrap();
-    assert!(!log.borrow().contains(&"control_stop"));
-}
-
-/// A service the SCM restarts while the wait is in flight (RUNNING, then back
-/// through START_PENDING to RUNNING) is sent a Stop each time it is RUNNING,
-/// and never while it is START_PENDING.
-#[skuld::test]
-fn stop_of_a_service_that_restarts_mid_wait_sends_a_control_per_running_observation() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(
-        &log,
-        [
-            Observed::Running,
-            Observed::StartPending,
-            Observed::Running,
-            Observed::StopPending,
-            Observed::Stopped,
-        ]
-        .into(),
-    );
-    stop_via_notify(&mut fake).unwrap();
-    let log = log.borrow();
-    assert_eq!(log.iter().filter(|c| **c == "control_stop").count(), 2);
-    assert_eq!(log.last(), Some(&"got_stopped"));
-}
-
-/// Every script the SCM can deliver: any run of non-terminal and RUNNING
-/// observations, then STOPPED. A control may go out only straight after a
-/// RUNNING observation, and every RUNNING observation gets one.
-#[skuld::test]
-fn a_stop_control_is_sent_exactly_when_running_is_observed() {
-    const NON_TERMINAL: [Observed; 3] = [Observed::Running, Observed::StartPending, Observed::StopPending];
-    let mut scripts: Vec<Vec<Observed>> = vec![vec![]];
-    let mut frontier = scripts.clone();
-    for _ in 0..4 {
-        frontier = frontier
-            .iter()
-            .flat_map(|prefix| {
-                NON_TERMINAL.iter().map(move |o| {
-                    let mut next = prefix.clone();
-                    next.push(*o);
-                    next
-                })
-            })
-            .collect();
-        scripts.extend(frontier.iter().cloned());
-    }
-    assert_eq!(scripts.len(), 1 + 3 + 9 + 27 + 81);
-    for prefix in scripts {
-        let mut script = prefix.clone();
-        script.push(Observed::Stopped);
-        let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-        let mut fake = FakeScm::new(&log, script.clone().into());
-        stop_via_notify(&mut fake).unwrap();
-        let log = log.borrow();
-        let controls = log.iter().filter(|c| **c == "control_stop").count();
-        let running = prefix.iter().filter(|o| **o == Observed::Running).count();
-        assert_eq!(controls, running, "script {script:?}: {log:?}");
-        for (i, call) in log.iter().enumerate() {
-            if *call == "control_stop" {
-                assert_eq!(log[i - 1], "got_running", "script {script:?}: {log:?}");
-            }
-            // Every re-arm leaves out the state the wait just acted on, so no
-            // unchanged state is reported back at once.
-            if i > 0 && call.starts_with("arm_stopped_except_") {
-                let acted_on = match log[i - 1] {
-                    "control_stop" => "running",
-                    got => got
-                        .strip_prefix("got_")
-                        .expect("a re-arm follows an observation or a Stop"),
-                };
-                assert_eq!(
-                    call.strip_prefix("arm_stopped_except_"),
-                    Some(acted_on),
-                    "script {script:?}: {log:?}"
-                );
-            }
-            if *call == "arm_stopped" {
-                assert_eq!(
-                    i, 0,
-                    "only the first arm asks for every state: script {script:?}: {log:?}"
-                );
-            }
-        }
-    }
-}
-
-#[skuld::test]
-fn stop_surfaces_a_control_error_and_goes_no_further() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    // Still RUNNING when looked at again: the Stop was refused by a service
-    // that can take it, which is a failure.
-    let mut fake = FakeScm::new(&log, [Observed::Running, Observed::Running].into()).failing_control("refused", 2);
-    let err = stop_via_notify(&mut fake).expect_err("the control failed");
-    assert_eq!(err.to_string(), "refused");
-    assert_eq!(
-        *log.borrow(),
-        vec![
-            "arm_stopped",
-            "wait",
-            "got_running",
-            "control_stop",
-            "arm_stopped",
-            "wait",
-            "got_running"
-        ]
-    );
-}
-
-/// A Stop sent on a RUNNING observation the service has since left (it stopped,
-/// or began stopping, on its own) can be refused with any code the SCM or the
-/// dying process answers with. The failure is read against a fresh look at the
-/// service: not RUNNING any more means there was nothing to refuse.
-#[skuld::test]
-fn a_refused_stop_on_a_service_that_has_since_stopped_is_not_a_failure() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(&log, [Observed::Running, Observed::Stopped].into()).failing_control("broken pipe", 1);
-    stop_via_notify(&mut fake).unwrap();
-    assert_eq!(
-        *log.borrow(),
-        vec![
-            "arm_stopped",
-            "wait",
-            "got_running",
-            "control_stop",
-            // the fresh look is a full arm: RUNNING included
-            "arm_stopped",
-            "wait",
-            "got_stopped",
-        ]
-    );
-}
-
-#[skuld::test]
-fn a_refused_stop_on_a_service_that_is_stopping_waits_for_it() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(
-        &log,
-        [Observed::Running, Observed::StopPending, Observed::Stopped].into(),
-    )
-    .failing_control("broken pipe", 1);
-    stop_via_notify(&mut fake).unwrap();
-    assert_eq!(
-        *log.borrow(),
-        vec![
-            "arm_stopped",
-            "wait",
-            "got_running",
-            "control_stop",
-            "arm_stopped",
-            "wait",
-            "got_stop_pending",
-            "arm_stopped_except_stop_pending",
-            "wait",
-            "got_stopped",
-        ]
-    );
-}
-
-/// A pending state an arm reports is reported again at once by an arm that
-/// still asks for it, so the re-arm leaves it out: the wait is then for a
-/// change, not a busy loop of SCM calls for as long as the state lasts.
-#[skuld::test]
-fn a_re_arm_after_an_observed_state_leaves_that_state_out() {
-    for (pending, label) in [
-        (Observed::StartPending, "arm_stopped_except_start_pending"),
-        (Observed::StopPending, "arm_stopped_except_stop_pending"),
-    ] {
-        let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-        let mut fake = FakeScm::new(&log, [pending, Observed::Stopped].into());
-        stop_via_notify(&mut fake).unwrap();
-        assert_eq!(log.borrow()[3], label, "{pending:?}: {:?}", log.borrow());
-    }
 }
 
 #[skuld::test]
 fn the_stop_wait_arms_every_state_at_first_and_the_start_wait_the_states_it_acts_on() {
     use Observed::*;
-    // The first arm reports the current state at once (see `Observed::for_stop_wait`),
-    // so it must cover every state the policy has an answer for.
+    // The first arm reports the current state at once, so it must cover every
+    // state a wait has an answer for.
     assert_eq!(
         states_to_arm(WantState::Stopped, false, None),
         vec![Stopped, StartPending, StopPending, Running]
@@ -458,169 +150,6 @@ fn no_arm_is_left_with_no_state_to_report() {
                 );
             }
         }
-    }
-}
-
-/// The bridge dies at the moment the Stop is sent: the Stop fails, and the
-/// SCM still reports RUNNING for the process it has not yet noticed gone. The
-/// held process says it has exited, so the service is stopped.
-#[skuld::test]
-fn a_refused_stop_on_a_running_status_whose_process_has_exited_is_not_a_failure() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(&log, [Observed::Running, Observed::Running].into())
-        .failing_control("broken pipe", 1)
-        .with_fates(vec![ProcessFate::Alive, ProcessFate::Exited]);
-    stop_via_notify(&mut fake).unwrap();
-    assert_eq!(
-        *log.borrow(),
-        vec![
-            "arm_stopped",
-            "wait",
-            "got_running",
-            "control_stop",
-            "arm_stopped",
-            "wait",
-            "got_running",
-        ]
-    );
-}
-
-/// The refusal is the wait's own only while the process is there to have taken
-/// the Stop.
-#[skuld::test]
-fn a_refused_stop_on_a_running_status_whose_process_is_alive_is_still_a_failure() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(&log, [Observed::Running, Observed::Running].into())
-        .failing_control("refused", 1)
-        .with_fates(vec![ProcessFate::Alive, ProcessFate::Alive]);
-    let err = stop_via_notify(&mut fake).expect_err("the Stop was refused by a live service");
-    assert_eq!(err.to_string(), "refused");
-}
-
-/// A status that lags a process's exit is not waited on: STOP_PENDING for a
-/// process that has gone ends the wait with no further arm, instead of blocking
-/// on the SCM's own bookkeeping.
-#[skuld::test]
-fn a_stop_pending_status_whose_process_has_exited_ends_the_wait() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(&log, [Observed::Running, Observed::StopPending].into())
-        .with_fates(vec![ProcessFate::Alive, ProcessFate::Exited]);
-    stop_via_notify(&mut fake).unwrap();
-    assert_eq!(
-        *log.borrow(),
-        vec![
-            "arm_stopped",
-            "wait",
-            "got_running",
-            "control_stop",
-            "arm_stopped_except_running",
-            "wait",
-            "got_stop_pending",
-        ]
-    );
-}
-
-/// The first report can already be stale: a RUNNING status over a dead process
-/// earns no Stop.
-#[skuld::test]
-fn a_running_status_whose_process_has_exited_is_sent_no_stop() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(&log, [Observed::Running].into()).with_fates(vec![ProcessFate::Exited]);
-    stop_via_notify(&mut fake).unwrap();
-    assert_eq!(*log.borrow(), vec!["arm_stopped", "wait", "got_running"]);
-}
-
-#[skuld::test]
-fn stop_surfaces_an_arm_error_before_waiting() {
-    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
-    let mut fake = FakeScm::new(&log, [Observed::Stopped].into());
-    fake.arm_error = Some("no arm");
-    let err = stop_via_notify(&mut fake).expect_err("the arm failed");
-    assert_eq!(err.to_string(), "no arm");
-    assert_eq!(*log.borrow(), vec!["arm_stopped"]);
-}
-
-#[skuld::test]
-fn each_state_has_the_stop_policy_its_cause_gives_it() {
-    // Written from the SCM's contract, not from the code: a Stop is accepted
-    // in RUNNING only.
-    let table = [
-        (Observed::Stopped, StopStep::Finished),
-        (Observed::Running, StopStep::SendStop),
-        (Observed::StartPending, StopStep::KeepWaiting),
-        (Observed::StopPending, StopStep::KeepWaiting),
-    ];
-    for (observed, step) in table {
-        for fate in [ProcessFate::Unheld, ProcessFate::Alive] {
-            assert_eq!(observed.for_stop_wait(fate), step, "{observed:?} {fate:?}");
-        }
-    }
-}
-
-/// A process that has exited is gone whatever the SCM still says: its status
-/// can lag the exit, and a Stop sent into it can only fail.
-#[skuld::test]
-fn an_exited_process_ends_the_stop_wait_whatever_state_the_scm_still_reports() {
-    for observed in [
-        Observed::Stopped,
-        Observed::Running,
-        Observed::StartPending,
-        Observed::StopPending,
-    ] {
-        assert_eq!(
-            observed.for_stop_wait(ProcessFate::Exited),
-            StopStep::Finished,
-            "{observed:?}"
-        );
-    }
-}
-
-/// Written from what the SCM does with a service marked for deletion, not from
-/// the code: a Stop is accepted in RUNNING only, a process in STOP_PENDING is
-/// already leaving, and a START_PENDING one cannot be stopped until it runs.
-/// With no process held to wait on, the only event left is the SCM's own.
-#[skuld::test]
-fn each_state_has_the_drain_policy_its_cause_gives_it() {
-    let alive = [
-        (Observed::Running, DrainStep::StopThenAwaitExit),
-        (Observed::StopPending, DrainStep::AwaitExit),
-        (Observed::StartPending, DrainStep::AwaitRunning),
-    ];
-    for (observed, step) in alive {
-        assert_eq!(
-            observed.for_drain_step(ProcessFate::Alive),
-            step,
-            "{observed:?} with a live process"
-        );
-    }
-    for observed in [Observed::Running, Observed::StopPending, Observed::StartPending] {
-        assert_eq!(
-            observed.for_drain_step(ProcessFate::Unheld),
-            DrainStep::AwaitStatus,
-            "{observed:?} with no process held"
-        );
-    }
-    assert_eq!(
-        Observed::Stopped.for_drain_step(ProcessFate::Unheld),
-        DrainStep::Finished
-    );
-}
-
-/// The process is ground truth for whether a look is current: one that has
-/// exited leaves nothing to drain, whatever the SCM still reports.
-#[skuld::test]
-fn an_exited_process_leaves_nothing_to_drain_whatever_state_the_scm_still_reports() {
-    for observed in [
-        Observed::Stopped,
-        Observed::Running,
-        Observed::StartPending,
-        Observed::StopPending,
-    ] {
-        assert_eq!(
-            observed.for_drain_step(ProcessFate::Exited),
-            DrainStep::Finished,
-            "{observed:?}"
-        );
     }
 }
 

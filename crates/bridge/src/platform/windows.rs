@@ -13,14 +13,14 @@ use windows_service::service::{
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use crate::cutover::scm_wait::call_error::{is_absent_service_code, ScmCall};
-use crate::cutover::scm_wait::retire::{retire, Disposition};
+use crate::cutover::scm_wait::call_error::{ScmCall, ServiceGone};
+use crate::cutover::scm_wait::retire::{on_service_gone, retire, Disposition};
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
 use crate::service_stop::{self, StopPhase, StopProgress};
 
 #[path = "windows/retire_session.rs"]
 mod retire_session;
-pub use retire_session::RetireSession;
+pub use retire_session::{Opening, RetireSession};
 #[path = "windows/registration.rs"]
 pub mod registration;
 #[path = "windows/service_processes.rs"]
@@ -630,28 +630,34 @@ pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
 /// act on, including one that went away under the stop; `Ok(true)` when the
 /// retirement ran.
 fn retire_service(disposition: Disposition) -> Result<bool, Box<dyn std::error::Error>> {
-    let Some(mut session) = RetireSession::open()? else {
-        info!("no Windows service registration to retire");
-        return Ok(false);
+    let mut session = match RetireSession::open()? {
+        Opening::Opened(session) => session,
+        Opening::Gone(gone) => {
+            info!(?gone, "no Windows service to retire");
+            return Ok(on_service_gone(gone)?);
+        }
     };
     match retire(&mut session, disposition) {
         Ok(()) => Ok(true),
-        Err(e) if e.means_service_is_gone() => {
-            info!("the Windows service went away under the retirement");
-            Ok(false)
-        }
-        Err(e) => Err(e.into()),
+        Err(e) => match e.service_gone() {
+            Some(gone) => {
+                info!(?gone, "the Windows service went away under the retirement");
+                Ok(on_service_gone(gone)?)
+            }
+            None => Err(e.into()),
+        },
     }
 }
 
-/// Whether an `open_service` failure means SCM has no service left to act on.
-fn open_error_is_absent(e: &windows_service::Error) -> bool {
+/// Why SCM has no service to act on, if that is what an `open_service` failure
+/// means.
+fn open_error_gone(e: &windows_service::Error) -> Option<ServiceGone> {
     let windows_service::Error::Winapi(io) = e else {
-        return false;
+        return None;
     };
     io.raw_os_error()
         .and_then(|code| u32::try_from(code).ok())
-        .is_some_and(is_absent_service_code)
+        .and_then(ServiceGone::of_code)
 }
 
 // Start/stop ==========================================================================================================

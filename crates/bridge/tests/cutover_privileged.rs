@@ -1410,7 +1410,7 @@ fn start_in_background() -> std::thread::JoinHandle<windows_service::Result<()>>
 
 /// The stop probe (bindreams/hole#1099): what the SCM answers a Stop sent to a
 /// service in each state a restart passes through, and what an arm for every
-/// state reports there. These are the facts `stop_via_notify`'s policy rests on,
+/// state reports there. These are the facts the stop wait's policy rests on,
 /// printed so a run states them instead of the code assuming them.
 ///
 /// The arm is measured first (it changes nothing), then the Stop. The held
@@ -2041,124 +2041,14 @@ fn cutover_global_net_state_stop_probe_open_process_synchronize_on_the_service_p
     );
 }
 
-/// The drain ends on a look taken before the last handle closes, so a start
-/// after it is covered only if the SCM refuses to start a service marked for
-/// deletion. This calls `StartService`, on the handle opened before the delete,
-/// on a STOPPED service with a restart pending and prints the answer, with the
-/// service's start type read before and after the delete (on a handle opened
-/// before it) so the line says where a refusal comes from. The restart is the
-/// SCM starting the service itself; `StartService` is the same start asked for
-/// by a client, so the answer says whether a marked service can be started at
-/// all. The restart delay is far off and never waited out.
-#[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_stop_probe_start_of_a_stopped_service_marked_for_delete() {
-    use hole_bridge::cutover::scm_wait::call_error::{ScmCall, ScmCallError, ERROR_SERVICE_MARKED_FOR_DELETE};
-    use hole_bridge::cutover::scm_wait::retire::{drain, ServiceSession};
-    use hole_bridge::cutover::scm_wait::ScmActor;
-    use hole_bridge::platform::os::SERVICE_NAME;
-    use windows::Win32::Foundation::ERROR_SERVICE_DISABLED;
-    use windows_service::service::{ServiceAccess, ServiceStartType};
-    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-
-    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let _service = ProvisionedService::install_with(helper, vec![], Some(std::time::Duration::from_secs(60 * 60)));
-    let mut os = WindowsCutoverOs {
-        images: vec![],
-        target_version: "test".into(),
-    };
-    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
-
-    // The handles that outlive the delete, then the kill that leaves the
-    // service STOPPED with its restart pending.
-    let mut session = hole_bridge::platform::os::RetireSession::open()
-        .expect("open the session")
-        .expect("the service is registered");
-    let config = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .expect("open the SCM")
-        .open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG)
-        .expect("open the service to read its start type");
-    let start_type_of = |service: &windows_service::service::Service| service.query_config().map(|c| c.start_type);
-    scm_probe::kill_service_process();
-    wait_until_stopped();
-    let before_delete = session.observe();
-    let start_type_before = start_type_of(&config);
-    session.delete().expect("mark the killed service for deletion");
-    let start_type_after = start_type_of(&config);
-    let started = session.start();
-    let refusal = started
-        .as_ref()
-        .err()
-        .and_then(|e| e.get_ref())
-        .and_then(|inner| inner.downcast_ref::<ScmCallError>())
-        .filter(|e| e.call == ScmCall::StartService)
-        .map(|e| e.code);
-    let disabled_after = matches!(start_type_after, Ok(ServiceStartType::Disabled));
-    let meaning = match (&started, refusal) {
-        (Ok(()), _) => {
-            "the SCM STARTS a marked service: a start after the drain's last look is possible, and the \
-             drain's restart coverage does not hold (the owner decides what covers that window)"
-        }
-        (Err(_), Some(ERROR_SERVICE_MARKED_FOR_DELETE)) => {
-            "the SCM refuses to start a marked service, as marked: a start after the drain's last look \
-             cannot happen, and the drain's restart coverage holds for a client's start"
-        }
-        (Err(_), Some(code)) if code == ERROR_SERVICE_DISABLED.0 && disabled_after => {
-            "the SCM refuses to start a marked service, as DISABLED: DeleteService left the start type \
-             Disabled (the retirement writes failure actions only, never the start type), and the \
-             disabled check answers before the marked one. Any refusal is a start that did not happen, \
-             so a start after the drain's last look cannot happen, and the drain's restart coverage \
-             holds for a client's start. The SCM's own failure-action restart is a different path; \
-             this does not measure it"
-        }
-        (Err(_), Some(code)) if code == ERROR_SERVICE_DISABLED.0 => {
-            "the SCM refuses to start a marked service, as DISABLED, but the start type read after the \
-             delete is not Disabled (or could not be read): the disabled answer comes from somewhere \
-             this run does not show. A start was still refused, so the drain's restart coverage holds \
-             for a client's start; the SCM's own failure-action restart is not measured"
-        }
-        (Err(_), _) => {
-            "StartService failed for a reason that is neither the delete mark nor a disabled service: \
-             this run does not say whether a marked service can be started (check that the look \
-             before the delete was STOPPED)"
-        }
-    };
-    eprintln!(
-        "SCM start probe, StartService on a handle opened before DeleteService of a STOPPED service with a restart pending: \
-         look before the delete -> {before_delete:?}; start type before the delete -> {start_type_before:?}, after -> \
-         {start_type_after:?}; StartService -> {started:?}\n  MEANS: {meaning}"
-    );
-
-    // Success left a live service; the drain stops it and awaits its process.
-    let drained = drain(&mut session);
-    eprintln!("SCM start probe: drain -> {drained:?}");
-    drop(config);
-    drop(session);
-    let _ = scm_deletion::wait_until_deleted(SERVICE_NAME);
-}
-
-/// When a [`ReleasingSession`] releases the parked helper.
-#[cfg(target_os = "windows")]
-#[derive(Clone, Copy)]
-enum ReleaseOn {
-    /// Once the first wait has returned and been recorded: the report was made
-    /// while the helper was parked, so it is the parked state by construction.
-    FirstReport,
-}
-
-#[cfg(target_os = "windows")]
-impl ReleaseOn {
-    fn releases_after_first_report(self) -> bool {
-        match self {
-            ReleaseOn::FirstReport => true,
-        }
-    }
-}
-
-/// A `ServiceSession` over the real one that releases a parked helper (when
-/// `release_on` says) and records what each wait reported. The code under test
-/// finds out what the helper did after its release from the SCM, not from this
+/// A `ServiceSession` over the real one that releases a parked helper on the
+/// first wait and records what each look reported. The code under test finds
+/// out what the helper did after its release from the SCM, not from this
 /// wrapper.
+///
+/// The release comes as the retirement goes to sleep: the service is parked in
+/// START_PENDING by construction, the look that said so is recorded, and the
+/// wait it is about to make is for a state change only the release produces.
 ///
 /// Its handles keep a deleted service registered, so a test that waits for the
 /// deletion must not hold it: [`finish`](Self::finish) is the only way to the
@@ -2167,21 +2057,21 @@ impl ReleaseOn {
 struct ReleasingSession<'a> {
     inner: hole_bridge::platform::os::RetireSession,
     release: &'a named_event::NamedEvent,
-    release_on: ReleaseOn,
     released: bool,
     reports: Vec<hole_bridge::cutover::scm_wait::Observed>,
 }
 
 #[cfg(target_os = "windows")]
 impl<'a> ReleasingSession<'a> {
-    fn open(release: &'a named_event::NamedEvent, release_on: ReleaseOn) -> Self {
-        let inner = hole_bridge::platform::os::RetireSession::open()
-            .expect("open the retire session")
-            .expect("the service is registered");
+    fn open(release: &'a named_event::NamedEvent) -> Self {
+        use hole_bridge::platform::os::{Opening, RetireSession};
+        let inner = match RetireSession::open().expect("open the retire session") {
+            Opening::Opened(session) => session,
+            Opening::Gone(gone) => panic!("the service is registered: {gone:?}"),
+        };
         Self {
             inner,
             release,
-            release_on,
             released: false,
             reports: vec![],
         }
@@ -2194,64 +2084,59 @@ impl<'a> ReleasingSession<'a> {
         }
     }
 
-    /// Closes the session's SCM handles and returns what each wait reported.
+    /// Closes the session's SCM handles and returns the state each look reported.
     fn finish(self) -> Vec<hole_bridge::cutover::scm_wait::Observed> {
         self.reports
     }
 }
 
 #[cfg(target_os = "windows")]
-impl hole_bridge::cutover::scm_wait::ScmActor for ReleasingSession<'_> {
-    fn arm(
-        &mut self,
-        want: hole_bridge::cutover::scm_wait::WantState,
-        except: Option<hole_bridge::cutover::scm_wait::Observed>,
-    ) -> std::io::Result<()> {
-        self.inner.arm(want, except)
+impl hole_bridge::cutover::scm_wait::settle::StopActor for ReleasingSession<'_> {
+    fn observe(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::Look> {
+        let look = self.inner.observe()?;
+        self.reports.push(look.observed);
+        Ok(look)
+    }
+    fn arm_leaving(&mut self, from: hole_bridge::cutover::scm_wait::Observed) -> std::io::Result<()> {
+        self.inner.arm_leaving(from)
     }
     fn control_stop(&mut self) -> std::io::Result<()> {
         self.inner.control_stop()
     }
-    fn start(&mut self) -> std::io::Result<()> {
-        self.inner.start()
+    fn await_callback(&mut self, kind: hole_bridge::cutover::scm_wait::settle::WaitKind) -> std::io::Result<()> {
+        self.release_once();
+        self.inner.await_callback(kind)
     }
-    fn wait_callback(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::Observed> {
-        let observed = self.inner.wait_callback()?;
-        self.reports.push(observed);
-        if self.release_on.releases_after_first_report() {
-            self.release_once();
-        }
-        Ok(observed)
+    fn await_held_exits(&mut self, kind: hole_bridge::cutover::scm_wait::settle::WaitKind) -> std::io::Result<()> {
+        self.release_once();
+        self.inner.await_held_exits(kind)
     }
-    fn process_fate(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::ProcessFate> {
-        self.inner.process_fate()
+    fn hold_scanned(&mut self) -> std::io::Result<()> {
+        self.inner.hold_scanned()
     }
 }
 
 #[cfg(target_os = "windows")]
 impl hole_bridge::cutover::scm_wait::retire::ServiceSession for ReleasingSession<'_> {
-    fn disable_restart(&mut self) -> std::io::Result<()> {
-        self.inner.disable_restart()
+    fn start_type(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::retire::StartType> {
+        self.inner.start_type()
     }
-    fn restore_restart(&mut self) -> std::io::Result<()> {
-        self.inner.restore_restart()
+    fn set_start_type(&mut self, to: hole_bridge::cutover::scm_wait::retire::StartWrite) -> std::io::Result<()> {
+        self.inner.set_start_type(to)
+    }
+    fn set_failure_actions(
+        &mut self,
+        actions: hole_bridge::cutover::scm_wait::retire::FailureActions,
+    ) -> std::io::Result<()> {
+        self.inner.set_failure_actions(actions)
     }
     fn delete(&mut self) -> std::io::Result<()> {
         self.inner.delete()
     }
-    fn observe(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::Look> {
-        self.inner.observe()
-    }
-    fn hold_process(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::ProcessFate> {
-        self.inner.hold_process()
-    }
-    fn await_exits(&mut self) -> std::io::Result<()> {
-        self.inner.await_exits()
-    }
 }
 
 /// Retires a service parked in START_PENDING by `flag`, through the production
-/// `retire`, and checks it ends up deregistered. The first report must be the
+/// `retire`, and checks it ends up deregistered. The first look must be the
 /// parked START_PENDING (the case a blind Stop used to be sent into), and the
 /// Stop must have come only after a later RUNNING.
 #[cfg(target_os = "windows")]
@@ -2277,7 +2162,7 @@ fn retire_a_parked_service(flag: &str) {
     let starter = start_in_background();
     parked.wait();
 
-    let mut session = ReleasingSession::open(&release, ReleaseOn::FirstReport);
+    let mut session = ReleasingSession::open(&release);
     retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
     let reports = session.finish();
 
@@ -2286,7 +2171,7 @@ fn retire_a_parked_service(flag: &str) {
     assert_eq!(
         reports.first(),
         Some(&Observed::StartPending),
-        "the first report is the parked state: {reports:?}"
+        "the first look is the parked state: {reports:?}"
     );
     assert!(
         reports.contains(&Observed::Running),
@@ -2344,14 +2229,14 @@ fn cutover_global_net_state_uninstall_lands_on_the_instance_the_scm_just_restart
     // The SCM restarts it; the new instance parks in START_PENDING.
     parked.wait();
 
-    let mut session = ReleasingSession::open(&release, ReleaseOn::FirstReport);
+    let mut session = ReleasingSession::open(&release);
     retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
     let reports = session.finish();
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
     assert_eq!(
         reports.first(),
         Some(&Observed::StartPending),
-        "the first report is the restarted instance's START_PENDING: {reports:?}"
+        "the first look is the restarted instance's START_PENDING: {reports:?}"
     );
 }
 
@@ -2466,37 +2351,6 @@ fn cutover_global_net_state_uninstall_leaves_nothing_whichever_side_of_the_scm_r
         left_behind::assert_none(&pid_log);
         scm_deletion::wait_until_deleted(SERVICE_NAME).unwrap_or_else(|e| panic!("round {round}: {e}"));
     }
-}
-
-/// The drain on a service already marked for deletion while RUNNING: the state
-/// the restart slip produces, made directly. The Stop and the wait for the
-/// process use no notification, so this passes whether or not an arm works on a
-/// marked service (the probe below prints that), and returns with the process gone.
-#[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_drain_stops_and_awaits_a_running_service_marked_for_delete() {
-    use hole_bridge::cutover::scm_wait::retire::{drain, ServiceSession};
-    use hole_bridge::platform::os::{RetireSession, SERVICE_NAME};
-
-    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    let dir = tempfile::tempdir().unwrap();
-    let pid_log = dir.path().join("pids.log");
-    let _service = ProvisionedService::install_with_args(helper, pid_log_args(&pid_log));
-    let mut os = WindowsCutoverOs {
-        images: vec![],
-        target_version: "test".into(),
-    };
-    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
-
-    let mut session = RetireSession::open()
-        .expect("open the session")
-        .expect("the service is registered");
-    session.hold_process().expect("hold the running service's process");
-    session.delete().expect("mark the running service for deletion");
-    drain(&mut session).expect("drain the marked service");
-    left_behind::assert_none(&pid_log);
-    drop(session);
-    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
 }
 
 /// macOS: renamex_np-swap the `.app` (a dir) + plain-rename the helper (a file)

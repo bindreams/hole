@@ -11,7 +11,9 @@ pub enum ScmCall {
     NotifyServiceStatusChange,
     ControlService,
     StartService,
+    ChangeServiceConfig,
     ChangeServiceConfig2,
+    QueryServiceConfig,
     QueryServiceConfig2,
     DeleteService,
     QueryServiceStatusEx,
@@ -32,7 +34,9 @@ impl ScmCall {
             ScmCall::NotifyServiceStatusChange => "NotifyServiceStatusChange",
             ScmCall::ControlService => "ControlService",
             ScmCall::StartService => "StartService",
+            ScmCall::ChangeServiceConfig => "ChangeServiceConfig",
             ScmCall::ChangeServiceConfig2 => "ChangeServiceConfig2",
+            ScmCall::QueryServiceConfig => "QueryServiceConfig",
             ScmCall::QueryServiceConfig2 => "QueryServiceConfig2",
             ScmCall::DeleteService => "DeleteService",
             ScmCall::QueryServiceStatusEx => "QueryServiceStatusEx",
@@ -61,7 +65,9 @@ impl ScmCall {
             ScmCall::NotifyServiceStatusChange => false,
             ScmCall::ControlService => false,
             ScmCall::StartService => false,
+            ScmCall::ChangeServiceConfig => false,
             ScmCall::ChangeServiceConfig2 => false,
+            ScmCall::QueryServiceConfig => false,
             ScmCall::QueryServiceConfig2 => false,
             ScmCall::DeleteService => false,
             ScmCall::QueryServiceStatusEx => false,
@@ -116,26 +122,6 @@ pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 /// `ERROR_SERVICE_MARKED_FOR_DELETE`.
 pub const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
 
-/// Whether `code` says the SCM has no service left to act through: never
-/// registered, or marked for deletion, which no handle opened afterwards can
-/// carry a control through.
-pub fn is_absent_service_code(code: u32) -> bool {
-    matches!(code, ERROR_SERVICE_DOES_NOT_EXIST | ERROR_SERVICE_MARKED_FOR_DELETE)
-}
-
-/// Whether `error` failed BECAUSE the SCM has no service left to act on, in
-/// either shape it travels in: a bare OS error, or a typed [`ScmCallError`]
-/// wrapped by [`ScmCallError::into_io`].
-pub fn io_error_is_absent_service(error: &io::Error) -> bool {
-    if let Some(code) = error.raw_os_error() {
-        return u32::try_from(code).is_ok_and(is_absent_service_code);
-    }
-    error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<ScmCallError>())
-        .is_some_and(|typed| is_absent_service_code(typed.code))
-}
-
 /// Why the SCM has no service to act through, from the code it answered with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceGone {
@@ -164,6 +150,16 @@ impl ServiceGone {
     /// Stop, measured), though no notification can be armed on it; an entry
     /// that no longer exists answers nothing.
     pub fn answers_through_an_open_handle(self) -> bool {
+        match self {
+            ServiceGone::DoesNotExist => false,
+            ServiceGone::MarkedForDeletion => true,
+        }
+    }
+
+    /// Whether `DeleteService` failing this way is the delete having been done:
+    /// the entry is already marked, so someone else's delete got there first.
+    /// With no entry there is nothing the call could have marked.
+    pub fn delete_is_done(self) -> bool {
         match self {
             ServiceGone::DoesNotExist => false,
             ServiceGone::MarkedForDeletion => true,

@@ -49,7 +49,9 @@ fn each_call_has_its_win32_name() {
         (ScmCall::NotifyServiceStatusChange, "NotifyServiceStatusChange"),
         (ScmCall::ControlService, "ControlService"),
         (ScmCall::StartService, "StartService"),
+        (ScmCall::ChangeServiceConfig, "ChangeServiceConfig"),
         (ScmCall::ChangeServiceConfig2, "ChangeServiceConfig2"),
+        (ScmCall::QueryServiceConfig, "QueryServiceConfig"),
         (ScmCall::QueryServiceConfig2, "QueryServiceConfig2"),
         (ScmCall::DeleteService, "DeleteService"),
         (ScmCall::QueryServiceStatusEx, "QueryServiceStatusEx"),
@@ -64,30 +66,6 @@ fn each_call_has_its_win32_name() {
     for (call, name) in table {
         assert_eq!(call.name(), name);
     }
-}
-
-#[skuld::test]
-fn the_absent_service_codes_are_does_not_exist_and_marked_for_delete() {
-    assert!(is_absent_service_code(1060));
-    assert!(is_absent_service_code(1072));
-    // Access denied, and the two control answers.
-    for code in [5, 1061, 1062] {
-        assert!(!is_absent_service_code(code), "{code}");
-    }
-}
-
-#[skuld::test]
-fn an_io_error_is_an_absent_service_in_either_shape() {
-    assert!(io_error_is_absent_service(&io::Error::from_raw_os_error(1060)));
-    assert!(io_error_is_absent_service(
-        &ScmCallError {
-            call: ScmCall::OpenService,
-            code: 1072
-        }
-        .into_io()
-    ));
-    assert!(!io_error_is_absent_service(&io::Error::from_raw_os_error(5)));
-    assert!(!io_error_is_absent_service(&io::Error::other("1060")));
 }
 
 #[skuld::test]
@@ -148,18 +126,6 @@ fn a_failure_that_is_not_a_gone_service_has_no_kind() {
     );
 }
 
-/// The old and the new classification agree until the old one is deleted.
-#[skuld::test]
-fn the_gone_kinds_are_exactly_the_absent_service_codes() {
-    for code in 0..=2000_u32 {
-        assert_eq!(
-            ServiceGone::of_code(code).is_some(),
-            is_absent_service_code(code),
-            "{code}"
-        );
-    }
-}
-
 /// `windows_service::Error::Winapi` displays as "IO error in winapi call" and
 /// keeps the OS error only as its source, so a call that returns one reaches a
 /// log with neither its name nor its code unless it is re-typed here.
@@ -187,15 +153,24 @@ fn a_winapi_failure_reads_with_its_call_and_its_code() {
 
 #[skuld::test]
 fn a_winapi_failure_still_says_the_service_is_gone_when_its_code_does() {
-    assert!(io_error_is_absent_service(
-        &ScmCall::OpenService.failed_with(&io::Error::from_raw_os_error(1060))
-    ));
-    assert!(io_error_is_absent_service(
-        &ScmCall::QueryServiceStatusEx.failed_with(&io::Error::from_raw_os_error(1072))
-    ));
-    assert!(!io_error_is_absent_service(
-        &ScmCall::DeleteService.failed_with(&io::Error::from_raw_os_error(5))
-    ));
+    assert_eq!(
+        service_gone(&ScmCall::OpenService.failed_with(&io::Error::from_raw_os_error(1060))),
+        Some(ServiceGone::DoesNotExist)
+    );
+    assert_eq!(
+        service_gone(&ScmCall::QueryServiceStatusEx.failed_with(&io::Error::from_raw_os_error(1072))),
+        Some(ServiceGone::MarkedForDeletion)
+    );
+    assert_eq!(
+        service_gone(&ScmCall::DeleteService.failed_with(&io::Error::from_raw_os_error(5))),
+        None
+    );
+}
+
+#[skuld::test]
+fn a_delete_is_done_only_where_the_entry_is_already_marked() {
+    assert!(ServiceGone::MarkedForDeletion.delete_is_done());
+    assert!(!ServiceGone::DoesNotExist.delete_is_done());
 }
 
 #[skuld::test]
@@ -218,7 +193,9 @@ fn only_opening_and_identifying_the_process_is_opening_the_service_process() {
         ScmCall::NotifyServiceStatusChange,
         ScmCall::ControlService,
         ScmCall::StartService,
+        ScmCall::ChangeServiceConfig,
         ScmCall::ChangeServiceConfig2,
+        ScmCall::QueryServiceConfig,
         ScmCall::QueryServiceConfig2,
         ScmCall::DeleteService,
         ScmCall::QueryServiceStatusEx,

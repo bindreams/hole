@@ -155,6 +155,15 @@ impl ServiceProcesses {
         self.holds.look(source)
     }
 
+    /// Holds every live process on the host that carries `service`'s token, so
+    /// the next [`look`](Self::look) shows it alive. A process the scan cannot
+    /// tell is warned about by the scan and never fails it.
+    pub(super) fn hold_scanned(&mut self, service: &ServiceSid) -> io::Result<()> {
+        self.holds
+            .hold_scanned(&mut HostProcesses { service })
+            .map(|_undetermined| ())
+    }
+
     /// Blocks until every held process has exited. An external event with no
     /// bound of its own to choose: the exit of a process the SCM has been told
     /// to stop.

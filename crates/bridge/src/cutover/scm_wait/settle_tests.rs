@@ -168,6 +168,10 @@ struct Recording {
     arms: VecDeque<Option<io::Error>>,
     /// One entry per `control_stop` call; `None` is acceptance. Acceptance once it runs dry.
     stops: VecDeque<Option<io::Error>>,
+    /// The error the next call of this wait fails with, once.
+    await_callback_error: Option<io::Error>,
+    await_exit_error: Option<io::Error>,
+    scan_error: Option<io::Error>,
 }
 
 impl Recording {
@@ -185,6 +189,21 @@ impl Recording {
 
     fn stop_fails_with(mut self, errors: Vec<Option<io::Error>>) -> Self {
         self.stops = errors.into();
+        self
+    }
+
+    fn await_callback_fails_with(mut self, error: io::Error) -> Self {
+        self.await_callback_error = Some(error);
+        self
+    }
+
+    fn await_exit_fails_with(mut self, error: io::Error) -> Self {
+        self.await_exit_error = Some(error);
+        self
+    }
+
+    fn scan_fails_with(mut self, error: io::Error) -> Self {
+        self.scan_error = Some(error);
         self
     }
 
@@ -215,17 +234,17 @@ impl StopActor for Recording {
 
     fn await_callback(&mut self, kind: WaitKind) -> io::Result<()> {
         self.log.push(format!("await_callback({kind:?})"));
-        Ok(())
+        self.await_callback_error.take().map_or(Ok(()), Err)
     }
 
     fn await_held_exits(&mut self, kind: WaitKind) -> io::Result<()> {
         self.log.push(format!("await_held_exits({kind:?})"));
-        Ok(())
+        self.await_exit_error.take().map_or(Ok(()), Err)
     }
 
     fn hold_scanned(&mut self) -> io::Result<()> {
         self.log.push("hold_scanned".into());
-        Ok(())
+        self.scan_error.take().map_or(Ok(()), Err)
     }
 }
 
@@ -332,7 +351,10 @@ fn a_stop_refused_by_a_service_that_stays_running_is_an_error() {
     for first in [running(), running_unheld()] {
         let mut actor = Recording::new(vec![first, first]).stop_fails_with(vec![Some(io::Error::other("refused"))]);
         let error = settle_stopped(&mut actor).unwrap_err();
-        assert_eq!(error.to_string(), "refused", "{first:?}");
+        assert!(
+            matches!(&error, SettleError::Stop(e) if e.to_string() == "refused"),
+            "{first:?}: {error:?}"
+        );
         assert_eq!(actor.count("control_stop"), 1, "{first:?}");
         assert_eq!(actor.count("await_held_exits(ExternalEvent)"), 0, "{first:?}");
         assert_eq!(actor.count("await_callback(ExternalEvent)"), 0, "{first:?}");
@@ -540,7 +562,10 @@ fn a_marked_service_with_no_process_to_wait_on_fails_with_the_refusal() {
     let mut actor = Recording::new(vec![pending(Observed::StopPending), pending(Observed::StopPending)])
         .arm_fails_with(vec![Some(marked())]);
     let error = settle_stopped(&mut actor).unwrap_err();
-    assert_eq!(service_gone(&error), Some(ServiceGone::MarkedForDeletion));
+    let SettleError::Arm(refusal) = &error else {
+        panic!("the arm's refusal is the result: {error:?}")
+    };
+    assert_eq!(service_gone(refusal), Some(ServiceGone::MarkedForDeletion));
     assert_eq!(actor.count("await_callback(ExternalEvent)"), 0);
     assert_eq!(actor.count("await_held_exits(ExternalEvent)"), 0);
 }
@@ -572,7 +597,10 @@ fn an_arm_that_fails_for_any_other_reason_ends_the_wait_before_the_stop() {
         let mut actor =
             Recording::new(vec![running_unheld()]).arm_fails_with(vec![Some(io::Error::from_raw_os_error(code))]);
         let error = settle_stopped(&mut actor).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(code));
+        assert!(
+            matches!(&error, SettleError::Arm(e) if e.raw_os_error() == Some(code)),
+            "{code}: {error:?}"
+        );
         assert_eq!(actor.count("control_stop"), 0, "{code}");
     }
 }
@@ -600,5 +628,70 @@ fn a_query_that_fails_ends_the_wait() {
             unreachable!()
         }
     }
-    assert_eq!(settle_stopped(&mut Failing).unwrap_err().to_string(), "query failed");
+    let error = settle_stopped(&mut Failing).unwrap_err();
+    assert!(
+        matches!(&error, SettleError::Observe(e) if e.to_string() == "query failed"),
+        "{error:?}"
+    );
+}
+
+/// Each act that can fail names itself in the error, so the retirement's
+/// policy per step does not have to guess it from the text.
+#[skuld::test]
+fn each_failing_act_is_its_own_error_variant() {
+    let failure = || io::Error::other("failed");
+    // The scan after STOPPED.
+    let error = settle_stopped(&mut Recording::new(vec![stopped()]).scan_fails_with(failure())).unwrap_err();
+    assert!(matches!(error, SettleError::Scan(_)), "{error:?}");
+    // The wait on a held process after an accepted Stop.
+    let error = settle_stopped(&mut Recording::new(vec![running()]).await_exit_fails_with(failure())).unwrap_err();
+    assert!(matches!(error, SettleError::AwaitExit(_)), "{error:?}");
+    // The sleep on the SCM's notification.
+    let looks = vec![pending(Observed::StopPending), pending(Observed::StopPending)];
+    let error = settle_stopped(&mut Recording::new(looks).await_callback_fails_with(failure())).unwrap_err();
+    assert!(matches!(error, SettleError::AwaitChange(_)), "{error:?}");
+    // A look after the first.
+    struct FailsOnTheSecondLook(u8);
+    impl StopActor for FailsOnTheSecondLook {
+        fn observe(&mut self) -> io::Result<Look> {
+            self.0 += 1;
+            if self.0 == 1 {
+                Ok(stopped())
+            } else {
+                Err(io::Error::other("failed"))
+            }
+        }
+        fn arm_leaving(&mut self, _: Observed) -> io::Result<()> {
+            unreachable!()
+        }
+        fn control_stop(&mut self) -> io::Result<()> {
+            unreachable!()
+        }
+        fn await_callback(&mut self, _: WaitKind) -> io::Result<()> {
+            unreachable!()
+        }
+        fn await_held_exits(&mut self, _: WaitKind) -> io::Result<()> {
+            unreachable!()
+        }
+        fn hold_scanned(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let error = settle_stopped(&mut FailsOnTheSecondLook(0)).unwrap_err();
+    assert!(matches!(error, SettleError::Observe(_)), "{error:?}");
+}
+
+/// The cutover reads the failure as the one the SCM or the OS gave.
+#[skuld::test]
+fn a_settle_error_gives_back_the_error_it_carries() {
+    for error in [
+        SettleError::Observe(io::Error::from_raw_os_error(5)),
+        SettleError::Arm(io::Error::from_raw_os_error(5)),
+        SettleError::Stop(io::Error::from_raw_os_error(5)),
+        SettleError::AwaitChange(io::Error::from_raw_os_error(5)),
+        SettleError::Scan(io::Error::from_raw_os_error(5)),
+        SettleError::AwaitExit(io::Error::from_raw_os_error(5)),
+    ] {
+        assert_eq!(error.into_io().raw_os_error(), Some(5));
+    }
 }
