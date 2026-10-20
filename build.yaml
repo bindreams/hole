@@ -344,11 +344,8 @@ targets:
     # with `--document-private-items` and allow `private_intra_doc_links` (their
     # docs are only read in source, never without private items); `garter` is
     # published and docs.rs omits private items, so it keeps the plain check.
-    # Libraries and binaries are separate commands: a plain `cargo doc` skips a
-    # bin named like its crate's lib. `--bins` also documents the lib, so the two
-    # rustdocs write one `target/doc/<name>/` and cargo warns of the collision. The
-    # bins command enables `tombstone/crash-child`: cargo skips a bin whose
-    # `required-features` are off.
+    # Libs and bins are separate commands, and the bins command enables
+    # `tombstone/crash-child`; why: CONTRIBUTING.md, rustdoc section.
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     run:
       - bash:

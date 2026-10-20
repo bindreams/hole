@@ -2647,16 +2647,17 @@ cargo xtask run doc-hole     # rustdoc, warnings denied (`doc-ex-galoshes` on Li
 
 CI runs the doc targets on every leg after clippy. Unpublished crates (every
 workspace crate except `garter`) are documented with `--document-private-items`
-and `-A rustdoc::private_intra_doc_links`: their docs are only read in source and
-the check always builds them with private items, so a public item may link a
-private one. No other lint is allowed. `garter` is built plain, because docs.rs
-omits private items: its docs may not link one.
+and `-A rustdoc::private_intra_doc_links`: their docs are only read in source, so a
+public item may link a private one. `garter` is built plain, because docs.rs omits
+private items: its docs may not link one.
 
 Libraries and binaries are separate `cargo doc` commands (`--lib`, `--bins`): a plain
 `cargo doc` skips a binary named like its crate's library, which leaves `crates/hole`'s
 binary-only modules unchecked. `--bins` also documents the library, so for `hole`, `xtask`,
 `dev-console` and `galoshes` two rustdoc runs write one `target/doc/<name>/` and cargo prints
-`output filename collision`; the check reads rustdoc's diagnostics, not the output. A binary
+`output filename collision`; the check reads rustdoc's diagnostics, not the output. The
+two never run at once: cargo makes the binary's documentation unit depend on the library's
+(`compute_deps_doc`, so the binary's docs can link the library's). A binary
 with `required-features` (`tombstone`'s `crash_child`) is skipped unless its command enables
 them; `xtask/src/doc_targets_tests.rs` fails on a target no command documents.
 

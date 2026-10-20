@@ -18,8 +18,7 @@ pub struct EngineConfig {
     /// existing connection drops.
     pub max_connections: usize,
 
-    /// Maximum concurrent calls to `TcpFlow::peek`
-    /// across all flows.
+    /// Maximum concurrent calls to `TcpFlow::peek` across all flows.
     pub max_sniffers: usize,
 
     /// smoltcp TCP socket receive buffer (per socket, bytes).

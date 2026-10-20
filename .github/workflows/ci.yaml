@@ -218,10 +218,8 @@ jobs:
 
       # rustdoc, warnings denied: a broken intra-doc link fails the leg; per leg
       # because a link to a `cfg`-gated item resolves on some targets and not
-      # others. It rebuilds dependencies clippy built (darwin/amd64 took 7m15s;
-      # the cause is unmeasured). Libs and bins are separate commands; the bins one should
-      # reuse the libs one's units, but that is unmeasured on CI, so the budget
-      # assumes it does not: 1.25 x (7m15s + 6m22s + 50s) rounds up to 20m.
+      # others. Budget assumes the bins command reuses nothing from the libs one:
+      # 1.25 x (7m15s + 6m22s + 50s) rounds up to 20m.
       - id: doc-hole
         name: Rustdoc (Hole workspace)
         if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole == true }}

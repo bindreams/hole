@@ -1,7 +1,6 @@
 //! `HoleRouter` — hole's [`tun_engine::Router`] impl.
 //!
-//! Wires two [`Endpoint`] mechanisms plus a
-//! [`DropSink`] into the filter engine and
+//! Wires two [`Endpoint`] mechanisms plus a [`DropSink`] into the filter engine and
 //! TUN dispatch shape of `tun-engine`:
 //!
 //! - `proxy`: [`Socks5Endpoint`] —
