@@ -8,6 +8,8 @@
 use std::cell::{Cell, RefCell};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use super::state::STATE_FILE_NAME;
 use super::*;
@@ -45,7 +47,7 @@ const WITH_UNKNOWN_FIELD: &str = r#"{
 /// Written by a release newer than this one; carries the server address.
 const NEWER: &str = r#"{"version": 5, "server_ip": "203.0.113.42", "tun_name": "hole-tun", "routes": []}"#;
 
-/// Each a file this release cannot read as a record, whatever the cause.
+/// Each a file this release cannot read as a record.
 const CORRUPT: [(&str, &str); 4] = [
     ("not json", "not json { ."),
     (
@@ -301,10 +303,7 @@ fn the_stale_bypass_clear_acts_on_a_record_that_has_an_unknown_field() {
 
 // A read that fails (as opposed to a record that cannot be read) ======================================================
 //
-// A read can fail with an I/O error (a sharing violation, a permission). That
-// says nothing about the bytes, but the record may name a leak, so it is
-// treated like a newer or corrupt one: left alone, never acted on, never
-// replaced, and the connect is refused naming the path.
+// Read failures (I/O error), as opposed to unreadable bytes.
 
 /// A file system whose reads are all denied; links and publishes are real.
 struct DeniedRead;
@@ -396,7 +395,12 @@ fn a_checkpoint_over_a_record_whose_read_fails_is_refused() {
         result = checkpoint_installed(&mut persisted, &file, None, &[RouteId::SplitV4Low]);
     });
 
-    let error = result.expect_err("the record must not be overwritten").to_string();
+    let failure = result.expect_err("the record must not be overwritten");
+    assert!(
+        matches!(&failure, CheckpointFailure::RecordUnreadable { path: named } if *named == path),
+        "{failure:?}"
+    );
+    let error = failure.to_string();
     assert!(!error.contains(&dir.path().display().to_string()), "{error}");
     assert!(logs.contains(&path.display().to_string()), "{logs}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), WITH_UNKNOWN_FIELD);
@@ -404,6 +408,51 @@ fn a_checkpoint_over_a_record_whose_read_fails_is_refused() {
         persisted.installed.is_empty(),
         "a refused write must not advance the in-memory value"
     );
+}
+
+/// Reads nothing the first time (the sweep finds no record), then fails every
+/// read: the record turned unreadable between the sweep and the first checkpoint.
+struct DeniedAfterFirstRead(AtomicBool);
+
+impl util::versioned_file::Fs for DeniedAfterFirstRead {
+    fn read(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+        if self.0.swap(true, Ordering::SeqCst) {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        Err(std::io::ErrorKind::NotFound.into())
+    }
+}
+
+/// A checkpoint refused mid-install is the record's fault, not the route
+/// command's: it fails the install as `StateUnreadable`, before any command ran.
+#[skuld::test]
+fn a_checkpoint_refused_mid_install_fails_the_install_as_state_unreadable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(STATE_FILE_NAME);
+    let routing = SystemRouting::new(dir.path().to_path_buf(), None)
+        .with_record_fs(Arc::new(DeniedAfterFirstRead(AtomicBool::new(false))));
+    let ran = Cell::new(false);
+
+    let result = routing.install_with(
+        "hole-tun",
+        server(),
+        &gateway(),
+        |_, _, _| {
+            ran.set(true);
+            Ok(())
+        },
+        |_, _, _| Ok(()),
+    );
+
+    match result {
+        Err(RoutingError::StateUnreadable { path: named }) => assert_eq!(named, path),
+        Err(other) => panic!("expected StateUnreadable, got: {other}"),
+        Ok(routes) => {
+            std::mem::forget(routes);
+            panic!("an install whose record turned unreadable must fail");
+        }
+    }
+    assert!(!ran.get(), "no route command may run once the checkpoint is refused");
 }
 
 #[skuld::test]
@@ -442,7 +491,12 @@ fn a_checkpoint_over_a_record_that_turned_unreadable_is_refused() {
         result = checkpoint_installed(&mut persisted, &state::file(dir.path()), None, &[RouteId::SplitV4Low]);
     });
 
-    let error = result.expect_err("the record must not be overwritten").to_string();
+    let failure = result.expect_err("the record must not be overwritten");
+    assert!(
+        matches!(&failure, CheckpointFailure::RecordUnreadable { path: named } if *named == path),
+        "{failure:?}"
+    );
+    let error = failure.to_string();
     assert!(!error.contains(&dir.path().display().to_string()), "{error}");
     assert!(logs.contains(&path.display().to_string()), "{logs}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), NEWER);
@@ -483,4 +537,296 @@ fn a_checkpoint_that_did_not_land_rolls_memory_back() {
 
     assert!(result.is_err());
     assert!(persisted.installed.is_empty());
+}
+
+// What each site makes of a removal ===================================================================================
+//
+// A site that has just emptied the record expects it gone. `Kept` means it
+// cannot be read now, so the site says so at ERROR and names the path; `Gone`
+// is silent.
+
+fn routes_over(record_file: state::RouteFile, installed: Vec<RouteId>) -> SystemRoutes {
+    SystemRoutes {
+        tun_name: "hole-tun".into(),
+        server_ip: server(),
+        interface_name: "en0".into(),
+        original_gateway: "192.168.1.1".parse().unwrap(),
+        route_form: state::RouteForm::Via,
+        record_file: Arc::new(record_file),
+        owner: None,
+        installed,
+        stale: Vec::new(),
+    }
+}
+
+/// Tears `routes` down with a runner that confirms every delete and notes it.
+/// Returns the deletes it issued.
+fn tear_down(mut routes: SystemRoutes) -> Vec<String> {
+    let commands = RefCell::new(Vec::new());
+    routes.teardown_with(|tool, args, _| {
+        commands.borrow_mut().push(argv_of(tool, args).join(" "));
+        Ok(())
+    });
+    // `SystemRoutes::drop` runs real route commands.
+    std::mem::forget(routes);
+    commands.into_inner()
+}
+
+fn a_current_record(dir: &Path) -> PathBuf {
+    state::write(&state::file(dir), &persisted_with_no_routes(), None).unwrap();
+    dir.join(STATE_FILE_NAME)
+}
+
+#[skuld::test]
+fn teardown_deletes_its_routes_and_leaves_an_unreadable_record_naming_it() {
+    for (what, bytes) in unreadable_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_record(dir.path(), bytes);
+        let routes = routes_over(state::file(dir.path()), vec![RouteId::SplitV4Low]);
+
+        let mut commands = Vec::new();
+        let logs = errors_of(|| commands = tear_down(routes));
+
+        assert!(
+            !commands.is_empty(),
+            "{what}: the routes this run installed are deleted"
+        );
+        assert!(logs.contains(&path.display().to_string()), "{what}: {logs}");
+        assert!(
+            !logs.contains("203.0.113.42"),
+            "{what}: the log must not echo the record: {logs}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes, "{what}");
+    }
+}
+
+#[skuld::test]
+fn teardown_leaves_a_record_whose_read_fails_and_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_record(dir.path(), WITH_UNKNOWN_FIELD);
+    let file = state::RouteFile::with_fs(dir.path(), Arc::new(DeniedRead));
+    let routes = routes_over(file, vec![RouteId::SplitV4Low]);
+
+    let logs = errors_of(|| {
+        tear_down(routes);
+    });
+
+    assert!(logs.contains(&path.display().to_string()), "{logs}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), WITH_UNKNOWN_FIELD);
+}
+
+#[skuld::test]
+fn teardown_clears_a_record_it_can_read_without_a_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = a_current_record(dir.path());
+    let routes = routes_over(state::file(dir.path()), vec![RouteId::SplitV4Low]);
+
+    let logs = errors_of(|| {
+        tear_down(routes);
+    });
+
+    assert!(!path.exists());
+    assert!(!logs.contains(&path.display().to_string()), "{logs}");
+}
+
+#[skuld::test]
+fn teardown_with_no_record_is_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = routes_over(state::file(dir.path()), vec![RouteId::SplitV4Low]);
+
+    let logs = errors_of(|| {
+        tear_down(routes);
+    });
+
+    assert!(!logs.contains(STATE_FILE_NAME), "{logs}");
+}
+
+/// A rollback that confirmed every delete: nothing is left to record.
+fn roll_back_everything(routing: &SystemRouting) {
+    routing.rollback_and_record(
+        "hole-tun",
+        server(),
+        "en0",
+        &[RouteId::SplitV4Low],
+        state::RouteState {
+            original_gateway: Some("192.168.1.1".parse().unwrap()),
+            ..persisted_with_no_routes()
+        },
+        Vec::new(),
+        |_, _, _| Ok(()),
+    );
+}
+
+#[skuld::test]
+fn a_rollback_that_drained_everything_leaves_an_unreadable_record_naming_it() {
+    for (what, bytes) in unreadable_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_record(dir.path(), bytes);
+        let routing = SystemRouting::new(dir.path().to_path_buf(), None);
+
+        let logs = errors_of(|| roll_back_everything(&routing));
+
+        assert!(logs.contains(&path.display().to_string()), "{what}: {logs}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes, "{what}");
+    }
+}
+
+#[skuld::test]
+fn a_rollback_that_drained_everything_leaves_a_record_whose_read_fails_and_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_record(dir.path(), WITH_UNKNOWN_FIELD);
+    let routing = SystemRouting::new(dir.path().to_path_buf(), None).with_record_fs(Arc::new(DeniedRead));
+
+    let logs = errors_of(|| roll_back_everything(&routing));
+
+    assert!(logs.contains(&path.display().to_string()), "{logs}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), WITH_UNKNOWN_FIELD);
+}
+
+#[skuld::test]
+fn a_rollback_that_drained_everything_clears_a_record_it_can_read_without_a_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = a_current_record(dir.path());
+    let routing = SystemRouting::new(dir.path().to_path_buf(), None);
+
+    let logs = errors_of(|| roll_back_everything(&routing));
+
+    assert!(!path.exists());
+    assert!(!logs.contains(&path.display().to_string()), "{logs}");
+}
+
+#[skuld::test]
+fn a_rollback_with_no_record_is_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = SystemRouting::new(dir.path().to_path_buf(), None);
+
+    let logs = errors_of(|| roll_back_everything(&routing));
+
+    assert!(!logs.contains(STATE_FILE_NAME), "{logs}");
+}
+
+/// Recovery over a readable `WITH_UNKNOWN_FIELD` record whose first delete runs
+/// `during`, to change the file under it. Returns the ERROR log.
+fn recover_while(dir: &Path, during: impl Fn()) -> String {
+    let first = Cell::new(true);
+    errors_of(|| {
+        recover_routes_with(
+            dir,
+            None,
+            Some("hole-tun"),
+            |_, _, _| {
+                if first.replace(false) {
+                    during();
+                }
+                Ok(())
+            },
+            |_, _| {},
+            failclosed::lockdown_state::Intent::Off,
+            || CoverPresence::Absent,
+            |_, _| {},
+        );
+    })
+}
+
+#[skuld::test]
+fn recovery_names_a_record_that_became_unreadable_under_it_and_leaves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_record(dir.path(), WITH_UNKNOWN_FIELD);
+
+    let logs = recover_while(dir.path(), || {
+        std::fs::write(&path, NEWER).unwrap();
+    });
+
+    assert!(logs.contains(&path.display().to_string()), "{logs}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), NEWER);
+}
+
+#[skuld::test]
+fn recovery_clears_a_record_it_can_read_without_a_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_record(dir.path(), WITH_UNKNOWN_FIELD);
+
+    let logs = recover_while(dir.path(), || {});
+
+    assert!(!path.exists());
+    assert!(!logs.contains(&path.display().to_string()), "{logs}");
+}
+
+#[skuld::test]
+fn recovery_is_silent_about_a_record_that_vanished_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_record(dir.path(), WITH_UNKNOWN_FIELD);
+
+    let logs = recover_while(dir.path(), || {
+        std::fs::remove_file(&path).unwrap();
+    });
+
+    assert!(!path.exists());
+    assert!(!logs.contains(&path.display().to_string()), "{logs}");
+}
+
+// What the install reports ============================================================================================
+
+/// The `Display` of `StateUnreadable` is for the log and names the path; the
+/// toast text names the file.
+#[skuld::test]
+fn a_toast_for_an_unreadable_record_names_the_file_and_not_the_path() {
+    let path = PathBuf::from("somebody-private").join(STATE_FILE_NAME);
+    let err = RoutingError::StateUnreadable { path: path.clone() };
+
+    assert!(err.to_string().contains(&path.display().to_string()), "{err}");
+    assert_eq!(
+        err.redacted(),
+        "the route record bridge-routes.json cannot be read; it is left as it is, and no route is installed over it"
+    );
+}
+
+#[skuld::test]
+fn a_toast_for_any_other_routing_error_is_its_text() {
+    for err in [
+        RoutingError::Gateway("no default route".into()),
+        RoutingError::RouteSetup("`route` (command 1 of 5) exited with code 1".into()),
+    ] {
+        assert_eq!(err.redacted(), err.to_string());
+    }
+}
+
+/// A checkpoint that could not be written says nothing about the route command
+/// that was about to run: no command is named.
+#[skuld::test]
+fn a_checkpoint_that_could_not_be_written_is_not_blamed_on_a_route_command() {
+    let failure = SetupFailure::Checkpoint(CheckpointFailure::Io(std::io::Error::other("disk full")));
+
+    match RoutingError::from(failure) {
+        RoutingError::RouteSetup(text) => {
+            assert_eq!(text, "the route record could not be written: disk full");
+        }
+        other => panic!("expected RouteSetup, got: {other}"),
+    }
+}
+
+#[skuld::test]
+fn a_failed_route_command_is_reported_as_that_command() {
+    let failure = SetupFailure::Command(RouteCommandError {
+        program: "netsh".into(),
+        index: 0,
+        total: 9,
+        failure: CommandFailure::Exit(1),
+    });
+
+    match RoutingError::from(failure) {
+        RoutingError::RouteSetup(text) => assert_eq!(text, "`netsh` (command 1 of 9) exited with code 1"),
+        other => panic!("expected RouteSetup, got: {other}"),
+    }
+}
+
+#[skuld::test]
+fn a_refused_checkpoint_over_an_unreadable_record_is_reported_as_that_record() {
+    let path = PathBuf::from("somewhere").join(STATE_FILE_NAME);
+    let failure = SetupFailure::Checkpoint(CheckpointFailure::RecordUnreadable { path: path.clone() });
+
+    match RoutingError::from(failure) {
+        RoutingError::StateUnreadable { path: named } => assert_eq!(named, path),
+        other => panic!("expected StateUnreadable, got: {other}"),
+    }
 }

@@ -362,13 +362,13 @@ impl Routing for MockRouting {
             installed: installed.clone(),
             stale: Vec::new(),
         };
-        route_state::save(&self.state_dir, &persisted, None)
+        route_state::write(&route_state::file(&self.state_dir), &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
 
         if self.state.fail_install.load(Ordering::SeqCst) {
             // Defensive: match `SystemRouting::install`'s error path —
             // clear the stale file we just wrote.
-            let _ = route_state::clear(&self.state_dir);
+            let _ = route_state::remove(&route_state::file(&self.state_dir));
             return Err(RoutingError::RouteSetup("mock install failure".into()));
         }
 
@@ -390,7 +390,7 @@ impl Routing for MockRouting {
             // rather than consulting `persisted.stale` — stale-group
             // interaction with fail-closed rollback is untested at this
             // layer and is covered only by routing_tests.rs.
-            let _ = route_state::clear(&self.state_dir);
+            let _ = route_state::remove(&route_state::file(&self.state_dir));
             return Err(RoutingError::RouteSetup(format!(
                 "route install incomplete: {}/{} routes confirmed",
                 installed.len(),
@@ -506,7 +506,7 @@ impl Drop for MockRoutes {
         self.state.teardown_calls.fetch_add(1, Ordering::SeqCst);
         self.state.teardown_order.lock().unwrap().push("routes");
         *self.state.last_teardown_installed.lock().unwrap() = Some(self.installed.clone());
-        let _ = route_state::clear(&self.state_dir);
+        let _ = route_state::remove(&route_state::file(&self.state_dir));
     }
 }
 

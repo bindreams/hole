@@ -9,7 +9,17 @@ use super::*;
 
 // Helpers =============================================================================================================
 
-/// The route record in `dir`, if it reads as a current one.
+fn command_failure(failure: SetupFailure) -> RouteCommandError {
+    match failure {
+        SetupFailure::Command(e) => e,
+        other => panic!("expected a failed command, got: {other}"),
+    }
+}
+
+fn save_record(dir: &Path, record: &RouteState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    state::write(&state::file(dir), record, owner)
+}
+
 fn load_record(dir: &Path) -> Option<RouteState> {
     match state::read(&state::file(dir)) {
         state::Found::Records(record) => Some(record),
@@ -653,7 +663,8 @@ fn a_host_with_ipv6_aborts_when_an_ipv6_add_fails() {
     let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw(), true);
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let mut installed = Vec::new();
-    let err = run_setup_commands(&cmds, &mut installed, fail_ipv6_splits(&seen), |_| Ok(())).unwrap_err();
+    let err =
+        command_failure(run_setup_commands(&cmds, &mut installed, fail_ipv6_splits(&seen), |_| Ok(())).unwrap_err());
 
     assert_eq!(err.index, 2, "the ::/1 add is command 3 of the phase");
     assert_eq!(seen.borrow().len(), 3, "no command after a fatal failure may be issued");
@@ -779,7 +790,9 @@ fn a_non_fatal_failure_does_not_mask_a_later_fatal_one() {
         fatal_exits(7),
     ];
     let mut installed = Vec::new();
-    let err = run_setup_commands(&cmds, &mut installed, exits_with_its_code::<FatalPhase>, |_| Ok(())).unwrap_err();
+    let err = command_failure(
+        run_setup_commands(&cmds, &mut installed, exits_with_its_code::<FatalPhase>, |_| Ok(())).unwrap_err(),
+    );
     assert_eq!(err.index, 1);
     assert!(err.to_string().contains("exited with code 7"), "got {err}");
 }
@@ -932,21 +945,23 @@ fn setup_stops_at_the_first_failing_command() {
         })
         .collect();
     let mut installed = Vec::new();
-    let err = run_setup_commands(
-        &cmds,
-        &mut installed,
-        |tool, args, _| {
-            let index = seen.borrow().len();
-            seen.borrow_mut().push(argv_of(tool, args).join(" "));
-            if index == 1 {
-                Err(CommandFailure::Exit(1))
-            } else {
-                Ok(())
-            }
-        },
-        |_| Ok(()),
-    )
-    .unwrap_err();
+    let err = command_failure(
+        run_setup_commands(
+            &cmds,
+            &mut installed,
+            |tool, args, _| {
+                let index = seen.borrow().len();
+                seen.borrow_mut().push(argv_of(tool, args).join(" "));
+                if index == 1 {
+                    Err(CommandFailure::Exit(1))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err(),
+    );
 
     assert_eq!(err.index, 1);
     assert_eq!(
@@ -1089,7 +1104,7 @@ fn routed_families_reports_only_the_splits_that_landed() {
         interface_name: "en0".into(),
         original_gateway: ipv4_gateway(),
         route_form: state::RouteForm::Via,
-        state_dir: tmp.path().to_path_buf(),
+        record_file: Arc::new(state::file(tmp.path())),
         owner: None,
         installed: vec![
             RouteId::SplitV4Low,
@@ -1111,7 +1126,7 @@ fn routed_families_reports_only_the_splits_that_landed() {
         interface_name: "en0".into(),
         original_gateway: ipv4_gateway(),
         route_form: state::RouteForm::Via,
-        state_dir: tmp.path().to_path_buf(),
+        record_file: Arc::new(state::file(tmp.path())),
         owner: None,
         installed: vec![RouteId::SplitV4Low, RouteId::SplitV4High],
         stale: Vec::new(),
@@ -1130,7 +1145,7 @@ fn routed_families_reports_only_the_splits_that_landed() {
         interface_name: "en0".into(),
         original_gateway: ipv4_gateway(),
         route_form: state::RouteForm::Via,
-        state_dir: tmp.path().to_path_buf(),
+        record_file: Arc::new(state::file(tmp.path())),
         owner: None,
         installed: vec![RouteId::SplitV4Low, RouteId::SplitV6High],
         stale: Vec::new(),
@@ -1193,7 +1208,7 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
         installed: planned_routes(ipv4_server()),
         stale: Vec::new(),
     };
-    state::save(tmp.path(), &persisted_state, None).unwrap();
+    save_record(tmp.path(), &persisted_state, None).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
     recover_routes_with(
@@ -1251,7 +1266,7 @@ fn recover_with_loopback_server_skips_bypass() {
         installed: planned_routes(loopback),
         stale: Vec::new(),
     };
-    state::save(tmp.path(), &persisted_state, None).unwrap();
+    save_record(tmp.path(), &persisted_state, None).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
     recover_routes_with(
@@ -1293,7 +1308,7 @@ fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
         installed: planned_routes(ipv4_server()),
         stale: Vec::new(),
     };
-    state::save(tmp.path(), &persisted_state, None).unwrap();
+    save_record(tmp.path(), &persisted_state, None).unwrap();
 
     let failing = |_, _cmd: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
         Err(CommandFailure::Spawn(std::io::Error::other("simulated runner failure")))
@@ -1329,7 +1344,7 @@ fn recover_narrows_the_state_file_to_the_command_that_failed_to_spawn() {
         installed: planned_routes(ipv4_server()),
         stale: Vec::new(),
     };
-    state::save(tmp.path(), &persisted_state, None).unwrap();
+    save_record(tmp.path(), &persisted_state, None).unwrap();
 
     let failing_one = |_, cmd: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
         if cmd.iter().any(|a| a == "::/1") {
@@ -1377,7 +1392,7 @@ fn recover_drops_an_unplannable_id_instead_of_looping_forever() {
         installed: vec![RouteId::ServerBypass], // unplannable: loopback never installs a bypass
         stale: Vec::new(),
     };
-    state::save(tmp.path(), &persisted_state, None).unwrap();
+    save_record(tmp.path(), &persisted_state, None).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
     recover_routes_with(
@@ -1843,7 +1858,7 @@ fn recover_prefers_its_own_route_state_tun_name_over_the_fallback() {
         installed: planned_routes(ipv4_server()),
         stale: Vec::new(),
     };
-    state::save(dir.path(), &persisted_state, None).unwrap();
+    save_record(dir.path(), &persisted_state, None).unwrap();
 
     let seen: RefCell<Option<Option<String>>> = RefCell::new(None);
     recover_routes_with(
@@ -2093,7 +2108,7 @@ fn teardown_omits_the_bypass_when_it_was_not_installed() {
 #[skuld::test]
 fn recovery_deletes_only_the_recorded_routes() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -2135,7 +2150,7 @@ fn recovery_deletes_only_the_recorded_routes() {
 #[skuld::test]
 fn recovery_bypass_phase_does_not_repeat_the_split_deletes() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -2183,7 +2198,7 @@ fn recovery_bypass_phase_does_not_repeat_the_split_deletes() {
 #[skuld::test]
 fn recover_attempts_a_stale_group_and_clears_the_file_once_everything_drains() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -2234,7 +2249,7 @@ fn recover_attempts_a_stale_group_and_clears_the_file_once_everything_drains() {
 #[skuld::test]
 fn recover_keeps_the_file_when_only_the_stale_group_fails_to_confirm_gone() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -2396,15 +2411,17 @@ fn setup_routes_aborts_when_a_pre_command_checkpoint_fails() {
             // Fail the pre-command checkpoint of the 2nd command (call
             // sequence: cmd1 pre, cmd1 post, cmd2 pre, ...).
             if checkpoint_calls == 3 {
-                Err(std::io::Error::other("simulated checkpoint failure"))
+                Err(CheckpointFailure::Io(std::io::Error::other(
+                    "simulated checkpoint failure",
+                )))
             } else {
                 Ok(())
             }
         },
     );
     assert!(
-        result.is_err(),
-        "a pre-command checkpoint failure must abort setup, not be swallowed"
+        matches!(result, Err(SetupFailure::Checkpoint(CheckpointFailure::Io(_)))),
+        "a pre-command checkpoint failure must abort setup as a checkpoint failure, not as a failed command: {result:?}"
     );
     assert_eq!(
         installed,
@@ -2432,7 +2449,9 @@ fn setup_routes_continues_when_a_post_command_checkpoint_fails() {
             // Fail the post-command checkpoint of the 1st command (call
             // sequence: cmd1 pre = 1, cmd1 post = 2, cmd2 pre = 3, ...).
             if checkpoint_calls == 2 {
-                Err(std::io::Error::other("simulated checkpoint failure"))
+                Err(CheckpointFailure::Io(std::io::Error::other(
+                    "simulated checkpoint failure",
+                )))
             } else {
                 Ok(())
             }
@@ -2866,7 +2885,7 @@ mod windows_bypass_teardown_scoping {
 fn install_sweep_carries_forward_a_still_unconfirmed_leftover_instead_of_losing_it() {
     let tmp = tempfile::tempdir().unwrap();
     // Prior run's retained record: teardown could not confirm ServerBypass gone.
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -2928,7 +2947,7 @@ fn install_sweep_carries_forward_a_still_unconfirmed_leftover_instead_of_losing_
 #[skuld::test]
 fn install_sweep_drops_a_fully_confirmed_leftover() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -2976,7 +2995,7 @@ fn install_sweep_drops_a_fully_confirmed_leftover() {
 #[skuld::test]
 fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -3055,7 +3074,7 @@ fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
 #[skuld::test]
 fn install_sweep_coalesces_a_stale_group_identical_to_the_leftover_primary() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -3113,7 +3132,7 @@ fn install_sweep_merges_a_new_leftover_into_an_existing_stale_group_of_the_same_
     // The file on disk right before sweep #2 runs: sweep #1's carried-forward
     // debt in `stale`, plus THIS install attempt's own leftover primary
     // record for the same server.
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -3176,7 +3195,7 @@ fn install_sweep_merges_a_new_leftover_into_an_existing_stale_group_of_the_same_
 fn install_sweep_drops_an_unplannable_stale_group() {
     let tmp = tempfile::tempdir().unwrap();
     let loopback: IpAddr = "127.0.0.1".parse().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -3231,7 +3250,7 @@ fn install_sweep_drops_an_unplannable_stale_group() {
 #[skuld::test]
 fn recovery_never_issues_the_same_split_delete_twice_across_groups() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "hole-tun".into(),
@@ -3288,7 +3307,7 @@ fn recovery_never_issues_the_same_split_delete_twice_across_groups() {
 #[skuld::test]
 fn recovery_never_issues_the_same_macos_split_delete_twice_across_different_tun_names() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "utun7".into(),
@@ -3350,7 +3369,7 @@ fn recovery_never_issues_the_same_macos_split_delete_twice_across_different_tun_
 #[skuld::test]
 fn recover_groups_issues_one_bypass_delete_for_two_unmerged_groups() {
     let tmp = tempfile::tempdir().unwrap();
-    state::save(
+    save_record(
         tmp.path(),
         &RouteState {
             tun_name: "utun7".into(),
@@ -3429,7 +3448,7 @@ fn rollback_never_erases_extra_unconfirmed_mid_loop() {
 
     // Model the file `setup_routes`'s own last checkpoint would have left on
     // disk before this rollback runs.
-    state::save(tmp.path(), &persisted, None).unwrap();
+    save_record(tmp.path(), &persisted, None).unwrap();
 
     let checked_mid_loop = std::cell::Cell::new(false);
     let runner = |_, _argv: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
@@ -3487,7 +3506,7 @@ fn a_stale_server_bypass_is_not_what_the_lookup_returns() {
         installed: vec![RouteId::ServerBypass],
         stale: Vec::new(),
     };
-    state::save(tmp.path(), &leftover, None).unwrap();
+    save_record(tmp.path(), &leftover, None).unwrap();
 
     let calls = std::cell::RefCell::new(Vec::new());
     clear_stale_server_bypass(&state::file(tmp.path()), None, ipv4_server(), |_, argv, _phase| {
@@ -3525,7 +3544,7 @@ fn a_stale_bypass_to_a_different_server_is_left_alone() {
         installed: vec![RouteId::ServerBypass],
         stale: Vec::new(),
     };
-    state::save(tmp.path(), &leftover, None).unwrap();
+    save_record(tmp.path(), &leftover, None).unwrap();
 
     let calls = std::cell::RefCell::new(Vec::new());
     // Query for a DIFFERENT destination than the leftover's own server_ip.
@@ -3564,7 +3583,7 @@ fn a_stale_server_bypass_inside_the_carried_forward_group_is_also_cleared() {
             installed: vec![RouteId::ServerBypass],
         }],
     };
-    state::save(tmp.path(), &leftover, None).unwrap();
+    save_record(tmp.path(), &leftover, None).unwrap();
 
     clear_stale_server_bypass(&state::file(tmp.path()), None, ipv4_server(), |_, _argv, _phase| Ok(()));
 

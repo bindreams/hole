@@ -99,7 +99,7 @@ rand = { version = "0.10", optional = true }
 
 [dev-dependencies]
 skuld = { workspace = true }
-# Route-record tests fail a read under the real state file (`util`'s file-system seam).
+# `test-support`: lets route-record tests fail a read.
 util = { path = "../util", features = ["test-support"] }
 hole-test-observability = { path = "../test-observability" }
 # Recovery-path redaction tests capture tracing output through a

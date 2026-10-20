@@ -280,12 +280,8 @@ impl From<tun_engine::RoutingError> for ProxyError {
         match e {
             tun_engine::RoutingError::Gateway(s) => ProxyError::Gateway(s),
             tun_engine::RoutingError::RouteSetup(s) => ProxyError::RouteSetup(s),
-            // The path is in the bridge log (tun-engine logged it); this text
-            // reaches a toast, so it names the file only.
-            tun_engine::RoutingError::StateUnreadable { .. } => ProxyError::RouteSetup(format!(
-                "the route record {} cannot be read; it is left as it is, and no route is installed over it",
-                tun_engine::routing::state::STATE_FILE_NAME
-            )),
+            // The path is in the bridge log (tun-engine logged it); the toast names the file only.
+            tun_engine::RoutingError::StateUnreadable { .. } => ProxyError::RouteSetup(e.redacted()),
         }
     }
 }

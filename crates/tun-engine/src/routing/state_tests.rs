@@ -2,6 +2,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use std::path::{Path, PathBuf};
 
+use util::versioned_file::CannotRead;
+
 use super::*;
 
 fn sample_ipv4() -> RouteState {
@@ -48,7 +50,14 @@ fn sample_ipv4_with_stale() -> RouteState {
     }
 }
 
-/// The record `dir` holds, if it reads as a current one.
+fn save(dir: &Path, state: &RouteState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    write(&file(dir), state, owner)
+}
+
+fn clear(dir: &Path) -> std::io::Result<Cleared> {
+    remove(&file(dir))
+}
+
 fn load_record(dir: &Path) -> Option<RouteState> {
     match read(&file(dir)) {
         Found::Records(record) => Some(record),
@@ -140,7 +149,7 @@ fn an_unreadable_record_is_reported_with_its_path_and_cause() {
         match read(&file(dir.path())) {
             Found::Unreadable { path: found, cause } => {
                 assert_eq!(found, path, "{what}");
-                assert_eq!(cause, Cause::CannotRead(expected), "{what}");
+                assert_eq!(cause, WhyUnreadable::CannotRead(expected), "{what}");
             }
             other => panic!("{what}: expected an unreadable record, got {other:?}"),
         }
@@ -180,9 +189,7 @@ fn file_whose_reads_fail(dir: &Path) -> RouteFile {
     RouteFile::with_fs(dir, std::sync::Arc::new(DeniedRead))
 }
 
-/// A read that fails says nothing about the bytes, but the record may name a
-/// leak: it is not one to act on, and it blocks a connect like a newer or
-/// corrupt one.
+/// A failed read is treated like a newer or corrupt record.
 #[skuld::test]
 fn a_read_that_fails_is_an_unreadable_record_with_its_kind() {
     let dir = tempfile::tempdir().unwrap();
@@ -190,7 +197,7 @@ fn a_read_that_fails_is_an_unreadable_record_with_its_kind() {
     match read(&file_whose_reads_fail(dir.path())) {
         Found::Unreadable { path: found, cause } => {
             assert_eq!(found, path);
-            assert_eq!(cause, Cause::ReadFailed(std::io::ErrorKind::PermissionDenied));
+            assert_eq!(cause, WhyUnreadable::ReadFailed(std::io::ErrorKind::PermissionDenied));
         }
         other => panic!("expected an unreadable record, got {other:?}"),
     }
@@ -205,7 +212,7 @@ fn a_record_whose_read_fails_blocks_a_connect() {
     assert!(matches!(
         read(&file(dir.path())),
         Found::Unreadable {
-            cause: Cause::ReadFailed(_),
+            cause: WhyUnreadable::ReadFailed(_),
             ..
         }
     ));
@@ -235,8 +242,9 @@ fn clear_over_a_record_whose_read_fails_keeps_it() {
     let bytes = r#"{"version": 4, "tun_name": "t"}"#;
     let path = write_raw(dir.path(), bytes);
 
-    remove(&file_whose_reads_fail(dir.path())).unwrap();
+    let cleared = remove(&file_whose_reads_fail(dir.path())).unwrap();
 
+    assert_eq!(cleared, Cleared::Kept);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
 }
 
@@ -264,16 +272,17 @@ fn clear_over_an_unreadable_record_keeps_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_raw(dir.path(), &bytes);
 
-        clear(dir.path()).expect(what);
+        let cleared = clear(dir.path()).expect(what);
 
+        assert_eq!(cleared, Cleared::Kept, "{what}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes, "{what}");
     }
 }
 
 #[skuld::test]
-fn clear_missing_is_ok() {
+fn clear_missing_leaves_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    clear(dir.path()).unwrap();
+    assert_eq!(clear(dir.path()).unwrap(), Cleared::Gone);
 }
 
 #[skuld::test]
@@ -281,7 +290,7 @@ fn clear_existing_removes_file() {
     let dir = tempfile::tempdir().unwrap();
     save(dir.path(), &sample_ipv4(), None).unwrap();
     assert!(dir.path().join(STATE_FILE_NAME).exists());
-    clear(dir.path()).unwrap();
+    assert_eq!(clear(dir.path()).unwrap(), Cleared::Gone);
     assert!(!dir.path().join(STATE_FILE_NAME).exists());
 }
 

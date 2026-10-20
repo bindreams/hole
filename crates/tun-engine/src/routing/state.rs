@@ -9,15 +9,14 @@
 //! evidence of what a run left in the routing table, so one this release
 //! cannot read (a newer schema, or corrupt) or whose read fails with an I/O
 //! error is never replaced, removed or acted on, and a connect is refused
-//! over it. Discarding an old or unreadable file is not an option: it strands
-//! the host on routes pointing at a dead TUN.
+//! over it.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use util::versioned_file::{
-    CannotRead, DefaultPlacement, Loaded, Obsolete, Removal, Role, Schema, StoreError, VersionedFile, VersionedState,
+    DefaultPlacement, Loaded, Obsolete, Removal, Role, Schema, StoreError, VersionedFile, VersionedState, WhyUnreadable,
 };
 
 use super::{planned_routes, RouteId};
@@ -227,8 +226,7 @@ impl VersionedState for RouteState {
     const ROLE: Role = Role::OsRecord;
 }
 
-// Every schema, not just the current one: a gap is reported by the build, not
-// by `cargo check`, unless each type's link is named.
+// Asserted per schema so a break in the Prev chain fails at the broken link.
 util::assert_contiguous!(RouteStateV1);
 util::assert_contiguous!(RouteStateV2);
 util::assert_contiguous!(RouteStateV3);
@@ -292,39 +290,10 @@ pub fn coalesce(groups: Vec<StaleRecord>) -> Vec<StaleRecord> {
 // I/O =================================================================================================================
 
 /// The route record's file. Every read and write of it goes through this type.
-pub(crate) type RouteFile = VersionedFile<RouteState>;
+pub type RouteFile = VersionedFile<RouteState>;
 
-pub(crate) fn file(state_dir: &Path) -> RouteFile {
+pub fn file(state_dir: &Path) -> RouteFile {
     VersionedFile::new(state_dir)
-}
-
-/// Why a route record that exists is not one to act on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Cause {
-    /// Newer or corrupt: the bytes were read and are not a record.
-    CannotRead(CannotRead),
-    /// The read failed with an I/O error: nothing is known about the bytes.
-    ReadFailed(std::io::ErrorKind),
-}
-
-impl Cause {
-    /// Whether a record in this state stops the bridge from connecting; the
-    /// route record's role decides, for either cause.
-    pub(crate) fn blocks_connect(self) -> bool {
-        match self {
-            Cause::CannotRead(why) => RouteState::ROLE.unreadable_blocks_connect(why),
-            Cause::ReadFailed(_) => RouteState::ROLE.io_failure_blocks_connect(),
-        }
-    }
-}
-
-impl std::fmt::Display for Cause {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Cause::CannotRead(why) => write!(f, "{why}"),
-            Cause::ReadFailed(kind) => write!(f, "the read failed ({kind})"),
-        }
-    }
 }
 
 /// What a caller that acts on route records finds in the file.
@@ -337,34 +306,22 @@ pub(crate) enum Found {
     /// A record this release cannot act on: newer, corrupt, or unread. It may
     /// name a leak nobody here can interpret, so nothing runs against it and
     /// nothing replaces it.
-    Unreadable { path: PathBuf, cause: Cause },
+    Unreadable { path: PathBuf, cause: WhyUnreadable },
 }
 
-/// Reads the record and classifies it. The one place a [`Loaded`] becomes an
-/// action, shared by every load site.
+/// Reads the record and classifies it, for every site that acts on it.
 pub(crate) fn read(file: &RouteFile) -> Found {
-    match file.load() {
-        Loaded::Current { value, .. } => Found::Records(value),
-        Loaded::Absent => Found::Nothing,
-        Loaded::Unreadable(e) => Found::Unreadable {
+    match file.load().into_actionable() {
+        Ok(Some(record)) => Found::Records(record),
+        Ok(None) => Found::Nothing,
+        Err(cause) => Found::Unreadable {
             path: file.path().to_path_buf(),
-            cause: Cause::ReadFailed(e.kind()),
+            cause,
         },
-        Loaded::Newer { .. } => Found::Unreadable {
-            path: file.path().to_path_buf(),
-            cause: Cause::CannotRead(CannotRead::Newer),
-        },
-        Loaded::Corrupt { .. } => Found::Unreadable {
-            path: file.path().to_path_buf(),
-            cause: Cause::CannotRead(CannotRead::Corrupt),
-        },
-        // The chain's floor is 0 and the framing reads version 0 as corrupt,
-        // so no file decodes to `Obsolete`.
-        Loaded::Obsolete { .. } => unreachable!("the route-state chain has no obsolete version"),
     }
 }
 
-/// Reads `<state_dir>/bridge-routes.json`.
+/// The raw load of the route record, for callers that need the [`Loaded`] variant.
 pub fn load(state_dir: &Path) -> Loaded<RouteState> {
     file(state_dir).load()
 }
@@ -374,44 +331,43 @@ pub fn load(state_dir: &Path) -> Loaded<RouteState> {
 /// record.
 pub fn blocking(state_dir: &Path) -> Option<PathBuf> {
     match read(&file(state_dir)) {
-        Found::Unreadable { path, cause } if cause.blocks_connect() => Some(path),
-        Found::Unreadable { .. } => None,
+        Found::Unreadable { path, cause } => {
+            assert!(
+                RouteState::ROLE.blocks_connect(cause),
+                "the route record is an OS record: every unreadable one blocks a connect ({cause})"
+            );
+            Some(path)
+        }
         Found::Records(_) => None,
         Found::Nothing => None,
     }
 }
 
 /// Writes `state` atomically (same-directory temp file, `sync_all`, rename),
-/// creating `state_dir` if missing. A record this release cannot read, or
+/// creating the directory if missing. A record this release cannot read, or
 /// whose read fails with an I/O error, is refused, never overwritten. An older
 /// record is replaced.
-pub fn save(state_dir: &Path, state: &RouteState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
-    write(&file(state_dir), state, owner)
-}
-
-pub(crate) fn write(file: &RouteFile, state: &RouteState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+pub fn write(file: &RouteFile, state: &RouteState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
     file.store(state, &DefaultPlacement { owner })
 }
 
-/// Deletes the record. Tolerates a missing file. A record this release cannot
-/// read, or whose read fails, is kept and named in the log: it is not this
-/// process's to remove.
-/// Returns `Err` only on actual I/O errors (permissions, etc.).
-pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    remove(&file(state_dir))
+/// What [`remove`] left of the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleared {
+    /// No record remains: deleted, or there was none.
+    Gone,
+    /// A record this release cannot read, or whose read fails, is still there:
+    /// it is not this process's to remove.
+    Kept,
 }
 
-pub(crate) fn remove(file: &RouteFile) -> std::io::Result<()> {
+/// Deletes the record. `Err` only on an I/O error.
+pub fn remove(file: &RouteFile) -> std::io::Result<Cleared> {
     match file.remove()? {
-        Removal::Removed | Removal::Absent => Ok(()),
-        Removal::Kept => {
-            tracing::error!(path = %file.path().display(), "route record cannot be read; left in place");
-            Ok(())
-        }
-        Removal::MovedAside(backup) => {
-            tracing::warn!(backup = %backup.display(), "route record moved aside");
-            Ok(())
-        }
+        Removal::Removed | Removal::Absent => Ok(Cleared::Gone),
+        Removal::Kept => Ok(Cleared::Kept),
+        // `Role::OsRecord` removes or keeps, never moves aside.
+        Removal::MovedAside(backup) => unreachable!("an OS record is never moved aside, but {backup:?} was"),
     }
 }
 
