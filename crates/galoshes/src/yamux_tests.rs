@@ -23,9 +23,9 @@ use crate::yamux::{
     bind_udp, connect_delay, connect_retrying, connection_task_fatal, deframe_udp_datagram, drive_connection,
     driver_panicked, enable_keepalive, frame_udp_datagram, next_failures, parse_udp_timeout, run_client,
     run_client_session, run_server, run_server_with_connections, saturating_deadline, serve_driven_connection,
-    session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, OpenStreamReply, SessionOutcome, SessionTransport,
-    StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN, LOOPBACK_CONNECT_RETRY,
-    REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
+    session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, ListenError, OpenStreamReply, SessionOutcome,
+    SessionTransport, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN,
+    LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
 
 #[skuld::test]
@@ -279,7 +279,7 @@ async fn setup_relay_inner(upstream: SocketAddr, udp_timeout: Duration) -> (Clie
         shutdown.clone(),
         Some(srv_tx),
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server task alive").expect("server bound");
 
     let (cli_tx, cli_rx) = oneshot::channel();
     tokio::spawn(run_client(
@@ -291,7 +291,7 @@ async fn setup_relay_inner(upstream: SocketAddr, udp_timeout: Duration) -> (Clie
         Some(cli_tx),
         None,
     ));
-    let addrs = cli_rx.await.expect("client bound");
+    let addrs = cli_rx.await.expect("client task alive").expect("client bound");
 
     (addrs, shutdown)
 }
@@ -710,7 +710,7 @@ async fn spawn_yamux_server(upstream: SocketAddr, shutdown: CancellationToken) -
         shutdown,
         Some(srv_tx),
     ));
-    srv_rx.await.expect("server bound")
+    srv_rx.await.expect("server task alive").expect("server bound")
 }
 
 /// Spawn a yamux client pointed at `remote`, with a typed reconnect observer.
@@ -731,7 +731,10 @@ async fn spawn_yamux_client(
         Some(cli_tx),
         Some(events_tx),
     ));
-    (cli_rx.await.expect("client bound"), events_rx)
+    (
+        cli_rx.await.expect("client task alive").expect("client bound"),
+        events_rx,
+    )
 }
 
 /// One TCP request/response through the client's local listener.
@@ -956,7 +959,7 @@ async fn shutdown_during_backoff_exits_promptly() {
         Some(cli_tx),
         Some(events_tx),
     ));
-    let _ = cli_rx.await.unwrap();
+    cli_rx.await.unwrap().expect("client bound");
 
     // Rendezvous (not the assertion): the observer event means the client has
     // reached the reconnect decision and is entering the backoff sleep.
@@ -984,7 +987,7 @@ async fn server_shutdown_is_prompt_while_client_connected() {
         shutdown.clone(),
         Some(srv_tx),
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server task alive").expect("server bound");
 
     let _conn = TcpStream::connect(server_addr).await.expect("connect server");
     wait_for_log(&writer, "accepted underlying connection").await;
@@ -1010,7 +1013,7 @@ async fn server_serves_a_client_while_an_idle_connection_is_open() {
         shutdown.clone(),
         Some(srv_tx),
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server task alive").expect("server bound");
 
     // The idle connection. Held for the whole test; never writes a frame.
     let _idle = TcpStream::connect(server_addr).await.expect("connect idle");
@@ -1026,7 +1029,7 @@ async fn server_serves_a_client_while_an_idle_connection_is_open() {
         Some(cli_tx),
         None,
     ));
-    let addrs = cli_rx.await.expect("client bound");
+    let addrs = cli_rx.await.expect("client task alive").expect("client bound");
 
     let mut app = TcpStream::connect(addrs.tcp).await.expect("connect client TCP");
     app.write_all(b"GET / HTTP/1.0\r\n\r\n").await.expect("write request");
@@ -1096,7 +1099,7 @@ async fn server_exits_on_a_panic_and_winds_down_its_other_connections() {
             }
         },
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server task alive").expect("server bound");
 
     let _sibling = TcpStream::connect(server_addr).await.expect("connect sibling");
     serving_rx.recv().await.expect("sibling is being served");
@@ -1136,7 +1139,7 @@ async fn server_exits_when_the_yamux_driver_panics() {
             serve_driven_connection(peer, remote, shutdown, driver, inbound_rx)
         },
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server task alive").expect("server bound");
 
     let _conn = TcpStream::connect(server_addr).await.expect("connect server");
 
@@ -1417,42 +1420,101 @@ async fn a_healthy_session_is_kept_alive_by_its_own_probe() {
     );
 }
 
-/// `run` returns with the readiness sender already gone when its bind fails, or the chain reads the exit as a plugin
-/// still starting. On the current-thread runtime nothing yields between the failed bind and the return, so a holder
-/// task `run` did not join has never run and the sender is still held: `Empty`, not `Closed`.
-#[skuld::test]
-async fn a_hop_whose_bind_fails_has_dropped_its_readiness_sender_when_run_returns() {
-    for is_server in [false, true] {
-        // Occupies the port the hop is told to bind.
-        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (ready_tx, mut ready_rx) = oneshot::channel();
-        let plugin: Box<dyn garter::ChainPlugin> =
-            Box::new(crate::yamux::YamuxPlugin::new(is_server, DEFAULT_UDP_TIMEOUT));
+/// A port whose bind a hop will lose, with the errno the OS gives for it, measured by binding it directly.
+struct LostBind {
+    /// The address the hop is told to bind.
+    addr: SocketAddr,
+    /// The raw OS error of losing that bind.
+    errno: i32,
+    _held: Box<dyn std::any::Any>,
+}
 
-        let result = plugin
-            .run(
-                occupied.local_addr().unwrap(),
-                "127.0.0.1:9".parse().unwrap(),
-                CancellationToken::new(),
-                ready_tx,
-            )
-            .await;
-
-        assert!(
-            result.is_err(),
-            "is_server={is_server}: a failed bind must fail `run`: {result:?}"
-        );
-        assert!(
-            matches!(ready_rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
-            "is_server={is_server}: `run` returned with the readiness sender still held"
-        );
+/// A TCP port another socket holds: the server's and the client's TCP bind both lose it.
+async fn lost_tcp_bind() -> LostBind {
+    let held = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = held.local_addr().unwrap();
+    let errno = std::net::TcpListener::bind(addr)
+        .expect_err("the port is held")
+        .raw_os_error()
+        .expect("a bind failure carries an errno");
+    LostBind {
+        addr,
+        errno,
+        _held: Box::new(held),
     }
 }
 
-/// End to end: a hop whose bind fails ends the chain with the typed exited-before-ready failure, not a closed
-/// `on_ready`. Multi-thread, as the bridge runs it.
+/// A port held for UDP only, so the client's TCP bind wins and its UDP bind loses. A TCP socket on the same number
+/// is not held: a port another process took for TCP too just sends the run through the TCP path, still a conflict.
+fn lost_udp_bind() -> LostBind {
+    loop {
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = held.local_addr().unwrap();
+        if std::net::TcpListener::bind(addr).is_err() {
+            continue;
+        }
+        let errno = std::net::UdpSocket::bind(addr)
+            .expect_err("the port is held")
+            .raw_os_error()
+            .expect("a bind failure carries an errno");
+        return LostBind {
+            addr,
+            errno,
+            _held: Box::new(held),
+        };
+    }
+}
+
+/// Runs a hop that cannot bind `lost.addr` and returns what `ready` holds the instant `run` returns. On the
+/// current-thread runtime nothing yields between `run` returning and the `try_recv`, so a failure still on its way
+/// through a task `run` did not join reads `Empty`.
+async fn ready_after_a_lost_bind(
+    is_server: bool,
+    lost: &LostBind,
+) -> (
+    garter::Result<()>,
+    Result<Result<garter::PluginReady, garter::StartError>, oneshot::error::TryRecvError>,
+) {
+    let (ready_tx, mut ready_rx) = oneshot::channel();
+    let plugin: Box<dyn garter::ChainPlugin> = Box::new(crate::yamux::YamuxPlugin::new(is_server, DEFAULT_UDP_TIMEOUT));
+    let result = plugin
+        .run(
+            lost.addr,
+            "127.0.0.1:9".parse().unwrap(),
+            CancellationToken::new(),
+            ready_tx,
+        )
+        .await;
+    (result, ready_rx.try_recv())
+}
+
+/// A hop that loses its bind says so, typed, before `run` returns: the chain restarts an intermediate hop on a
+/// `BindConflict` and the bridge retries a public one. The server's TCP bind, the client's TCP bind and the client's
+/// UDP bind are three separate sites.
 #[skuld::test]
-fn a_hop_whose_bind_fails_reports_the_typed_start_failure() {
+async fn a_hop_that_loses_its_bind_reports_a_bind_conflict_before_run_returns() {
+    for (site, is_server, lost) in [
+        ("server TCP", true, lost_tcp_bind().await),
+        ("client TCP", false, lost_tcp_bind().await),
+        ("client UDP", false, lost_udp_bind()),
+    ] {
+        let (result, ready) = ready_after_a_lost_bind(is_server, &lost).await;
+
+        assert!(result.is_err(), "{site}: a failed bind must fail `run`: {result:?}");
+        match ready {
+            Ok(Err(garter::StartError::BindConflict { errno, addr })) => {
+                assert_eq!(errno, lost.errno, "{site}: the OS error the bind failed with");
+                assert_eq!(addr, lost.addr, "{site}: the address the hop was told to bind");
+            }
+            other => panic!("{site}: want a BindConflict already in `ready`, got {other:?}"),
+        }
+    }
+}
+
+/// End to end, as the bridge runs it (multi-thread): a hop that loses its bind ends the chain with the typed
+/// conflict on `on_ready`, not an untyped exit-before-ready.
+#[skuld::test]
+fn a_hop_that_loses_its_bind_reports_the_conflict_through_a_chain() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -1460,15 +1522,14 @@ fn a_hop_whose_bind_fails_reports_the_typed_start_failure() {
         .unwrap();
     rt.block_on(async {
         for is_server in [false, true] {
-            // Occupies the port the hop is told to bind.
-            let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let lost = lost_tcp_bind().await;
             let (ready_tx, ready_rx) = oneshot::channel();
             let runner = garter::ChainRunner::new()
                 .add(Box::new(crate::yamux::YamuxPlugin::new(is_server, DEFAULT_UDP_TIMEOUT)))
                 .on_ready(ready_tx);
             let env = garter::PluginEnv {
                 local_host: "127.0.0.1".parse().unwrap(),
-                local_port: occupied.local_addr().unwrap().port(),
+                local_port: lost.addr.port(),
                 remote_host: "127.0.0.1".into(),
                 remote_port: 9,
                 plugin_options: None,
@@ -1479,11 +1540,36 @@ fn a_hop_whose_bind_fails_reports_the_typed_start_failure() {
 
             assert!(result.is_err(), "is_server={is_server}: a failed bind must fail `run`: {result:?}");
             assert!(
-                matches!(&reported, Ok(Err(garter::StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
-                "is_server={is_server}: want the typed exited-before-ready Fatal, got {reported:?}"
+                matches!(&reported, Ok(Err(garter::StartError::BindConflict { errno, addr })) if *errno == lost.errno && *addr == lost.addr),
+                "is_server={is_server}: want the typed BindConflict, got {reported:?}"
             );
         }
     });
+}
+
+/// Only a failed `bind` is a conflict. A listener that bound and then failed its setup is fatal, whatever the OS
+/// error's kind: no other port would help.
+#[skuld::test]
+fn a_listener_setup_failure_is_fatal_and_a_bind_failure_follows_the_classifier() {
+    let addr: SocketAddr = "127.0.0.1:1984".parse().unwrap();
+    let setup = ListenError::Setup {
+        what: "set non-blocking",
+        source: std::io::Error::from(std::io::ErrorKind::AddrInUse),
+    };
+    assert!(
+        matches!(setup.start_error(), garter::StartError::Fatal { .. }),
+        "a setup failure must be Fatal even when its error kind is a port race"
+    );
+
+    let bind = ListenError::Bind {
+        what: "bind local TCP",
+        addr,
+        source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+    };
+    assert!(
+        matches!(bind.start_error(), garter::StartError::Fatal { .. }),
+        "a bind failure that is not a port race must be Fatal"
+    );
 }
 
 /// A `YamuxPlugin` is a description of a hop, not a running one: run again on the same value after a stop, it binds
