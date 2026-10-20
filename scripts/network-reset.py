@@ -127,6 +127,11 @@ class DnsRestore:
         self.failed = self.failed or not succeeded
         return succeeded
 
+    def unrestorable(self, what: str) -> None:
+        """Record an entry this script cannot restore, so the record is kept."""
+        print(f"  Cannot restore {what}; keeping the record.")
+        self.failed = True
+
 
 def _netsh_dns(family: str, verb: str, alias: str, *rest: str) -> list[str]:
     return ["netsh", "interface", family, verb, "dnsservers", f"name={alias}", *rest]
@@ -141,9 +146,11 @@ def restore_dns_windows(state: dict, *, force: bool) -> DnsRestore:
     for adapter in state.get("adapters", []):
         id_obj = adapter.get("id", {})
         if id_obj.get("kind") != "windows_alias":
+            outcome.unrestorable(f"an adapter of kind {id_obj.get('kind')!r} on Windows")
             continue
         alias = id_obj.get("value")
         if not alias:
+            outcome.unrestorable("an adapter with no alias")
             continue
         for family, field, advertised_family in (
             ("ipv4", "v4", advertised_v4),
@@ -168,12 +175,16 @@ def restore_dns_windows(state: dict, *, force: bool) -> DnsRestore:
             elif kind == "static":
                 servers = prior.get("servers", [])
                 if not servers:
+                    # The bridge writes an empty static list as no servers, the same as `none`.
+                    outcome.attempt(_netsh_dns(family, "set", alias, "static", "none"))
                     continue
                 # The `add`s extend the list the `set` starts, so they need it to have succeeded.
                 if not outcome.attempt(_netsh_dns(family, "set", alias, "static", servers[0], "primary")):
                     continue
                 for idx, ip in enumerate(servers[1:], start=2):
                     outcome.attempt(_netsh_dns(family, "add", alias, ip, f"index={idx}"))
+            else:
+                outcome.unrestorable(f"{alias} ({family}): prior setting of kind {kind!r}")
     return outcome
 
 
@@ -185,9 +196,11 @@ def restore_dns_macos(state: dict, *, force: bool) -> DnsRestore:
     for adapter in state.get("adapters", []):
         id_obj = adapter.get("id", {})
         if id_obj.get("kind") != "macos_service_name":
+            outcome.unrestorable(f"an adapter of kind {id_obj.get('kind')!r} on macOS")
             continue
         svc = id_obj.get("value")
         if not svc:
+            outcome.unrestorable("a network service with no name")
             continue
 
         if not force:
@@ -206,6 +219,11 @@ def restore_dns_macos(state: dict, *, force: bool) -> DnsRestore:
                 outcome.skipped = True
                 continue
 
+        kinds = [adapter.get(field, {}).get("kind") for field in ("v4", "v6")]
+        unknown = [k for k in kinds if k not in ("dhcp", "none", "static")]
+        if unknown:
+            outcome.unrestorable(f"{svc}: prior setting of kind {unknown[0]!r}")
+            continue
         combined: list[str] = []
         saw_static = False
         for field in ("v4", "v6"):
