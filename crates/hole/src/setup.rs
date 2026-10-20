@@ -562,7 +562,7 @@ fn install_bridge_with(
     if !repaired.starts_service() {
         cli_log!(
             warn,
-            "bridge installed; the service is disabled on this computer and was left disabled, so it is not running.              Run `hole bridge enable` to enable and start it"
+            "bridge installed; the service is disabled on this computer and was left disabled, so it is not running. Run `hole bridge enable` to enable and start it"
         );
         return Ok(());
     }
