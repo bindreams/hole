@@ -114,11 +114,13 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     Ok(files)
 }
 
-/// `path` itself, or a "run `cargo xtask deps`" error when it is not a file.
+/// `path` itself, or a "run `cargo xtask deps`" error when it is not a file or is empty
+/// (`crates/hole/build.rs` stubs a missing host sidecar as an empty file).
 fn existing_file(path: PathBuf) -> Result<PathBuf> {
-    if !path.is_file() {
+    let non_empty = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > 0);
+    if !non_empty {
         return Err(anyhow!(
-            "{} does not exist. Did `cargo xtask deps` run?",
+            "{} is missing or empty. Did `cargo xtask deps` run?",
             path.display()
         ));
     }

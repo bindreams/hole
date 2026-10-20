@@ -159,3 +159,23 @@ fn bindir_picks_the_host_ex_ray_among_other_targets_stubs() {
     let sidecar = files.iter().find(|f| f.dest_name.starts_with("ex-ray")).unwrap();
     assert_eq!(sidecar.source.path(), ex_ray.join(crate::ex_ray::output_name()));
 }
+
+/// With `cargo xtask deps` not run, `crates/hole/build.rs` leaves an empty file under the host's
+/// own name; staging it would put a 0-byte sidecar in BINDIR.
+#[skuld::test]
+fn bindir_errors_when_the_host_ex_ray_is_an_empty_stub() {
+    let repo = fake_repo();
+    let ex_ray = repo
+        .path()
+        .join(".cache")
+        .join("ex-ray")
+        .join(crate::ex_ray::output_name());
+    fs::write(&ex_ray, b"").unwrap();
+
+    let err = bindir_files(Profile::Debug, repo.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&crate::ex_ray::output_name()) && msg.contains("cargo xtask deps"),
+        "expected the deps-did-not-run error for an empty host stub, got: {msg}"
+    );
+}
