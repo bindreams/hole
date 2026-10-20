@@ -17,7 +17,7 @@ use super::service_processes::{has_exited, open_process, ServiceProcesses};
 use super::service_sid::ServiceSid;
 use super::{apply_failure_actions, scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{io_error_is_absent_service, win32_code_of_hresult, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{Look, Opened, ProcessFate, ProcessSource, Reading};
+use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessFate, ProcessSource, Reading};
 use crate::cutover::scm_wait::retire::ServiceSession;
 use crate::cutover::scm_wait::{observed_from_state, Observed, ScmActor, SystemScmActor, WantState};
 
@@ -95,8 +95,8 @@ impl ProcessSource for ServiceProbe<'_> {
         Ok(Reading { observed, pid })
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Opened<Self::Process>> {
-        open_process(pid, self.sid)
+    fn open(&mut self, pid: u32, basis: Basis) -> io::Result<Opened<Self::Process>> {
+        open_process(pid, self.sid, basis)
     }
 
     fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool> {

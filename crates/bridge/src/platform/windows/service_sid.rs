@@ -180,6 +180,16 @@ impl ServiceSid {
         }
     }
 
+    /// `S-1-5-80-1` (revision 1, two sub-authorities, authority 5, then 80 and
+    /// 1), the `NT SERVICE` domain's first virtual account, which no ordinary
+    /// token carries.
+    #[cfg(test)]
+    pub(super) fn nothing_carries() -> Self {
+        Self {
+            sid: vec![0x0000_0201, 0x0500_0000, 80, 1],
+        }
+    }
+
     fn psid(&self) -> PSID {
         PSID(self.sid.as_ptr().cast_mut().cast())
     }

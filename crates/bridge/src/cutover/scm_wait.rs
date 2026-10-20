@@ -7,6 +7,7 @@
 pub mod call_error;
 pub mod hold;
 pub mod retire;
+pub mod scan;
 pub mod settle;
 
 use hold::ProcessFate;

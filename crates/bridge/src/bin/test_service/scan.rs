@@ -3,7 +3,9 @@
 //!
 //! The same `ServiceSid::is_in_token_of` check the uninstaller's hold runs, over
 //! every process, so a test reads off what an elevated administrator and
-//! LocalSystem can open and read.
+//! LocalSystem can open and read. Every failure is printed with its Win32 code,
+//! the kind the production code classifies it as, and what each `Basis` table
+//! row does about it, so the per-failure table is read off a run (probe P5).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -11,16 +13,20 @@ use std::fmt::Write as _;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 
-use hole_bridge::platform::os::ServiceSid;
+use hole_bridge::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
+use hole_bridge::cutover::scm_wait::hold::{Basis, ProbeFailure};
+use hole_bridge::cutover::scm_wait::ReportedPid;
+use hole_bridge::platform::os::{scan_service_processes, ServiceSid};
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, WAIT_OBJECT_0};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE,
 };
 
 /// `<service> <out-file> [done-event]`. Writes the measurement (or the panic
@@ -65,6 +71,7 @@ fn measure(service: &str) -> String {
     };
 
     let (mut total, mut opened, mut absent) = (0usize, 0usize, 0usize);
+    // Keyed by the call, the code and the kind and rows the production table gives it.
     let mut open_refused: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut token_unreadable: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut matches = Vec::new();
@@ -77,7 +84,16 @@ fn measure(service: &str) -> String {
             // SAFETY: `OpenProcess` returned a new handle this value now owns.
             Ok(handle) => unsafe { OwnedHandle::from_raw_handle(handle.0) },
             Err(e) => {
-                open_refused.entry(e.to_string()).or_default().push(who);
+                let code = (e.code().0 as u32) & 0xFFFF;
+                let failed = ScmCallError {
+                    call: ScmCall::OpenProcess,
+                    code,
+                }
+                .into_io_unlogged();
+                open_refused
+                    .entry(format!("{e}; {}", classified(&failed)))
+                    .or_default()
+                    .push(who);
                 continue;
             }
         };
@@ -86,7 +102,17 @@ fn measure(service: &str) -> String {
         match sid.is_in_token_of(&process) {
             Ok(true) => matches.push(who),
             Ok(false) => absent += 1,
-            Err(e) => token_unreadable.entry(e.to_string()).or_default().push(who),
+            Err(e) => {
+                let gone = if exited(&process) {
+                    "; the process has exited"
+                } else {
+                    ""
+                };
+                token_unreadable
+                    .entry(format!("{e}; {}{gone}", classified(&e)))
+                    .or_default()
+                    .push(who);
+            }
         }
     }
 
@@ -101,6 +127,17 @@ fn measure(service: &str) -> String {
     for (cause, who) in &token_unreadable {
         writeln!(report, "token unreadable ({cause}) x{}: {}", who.len(), who.join(", ")).unwrap();
     }
+    match &sid {
+        Some(sid) => match scan_service_processes(sid) {
+            Ok(found) => {
+                let alive: Vec<u32> = found.alive.iter().map(|(pid, _)| *pid).collect();
+                writeln!(report, "production scan, alive: {alive:?}").unwrap();
+                writeln!(report, "production scan, undetermined: {:?}", found.undetermined).unwrap();
+            }
+            Err(e) => writeln!(report, "production scan failed: {e}").unwrap(),
+        },
+        None => writeln!(report, "production scan: no service SID").unwrap(),
+    }
     let ids: Vec<&str> = matches.iter().filter_map(|who| who.split(':').next()).collect();
     writeln!(
         report,
@@ -110,6 +147,30 @@ fn measure(service: &str) -> String {
     .unwrap();
     writeln!(report, "matching processes: {}", matches.join(", ")).unwrap();
     report
+}
+
+/// How the production code classifies `failed` and what each table row does
+/// with it: `kind=...; scanned=...; named-valid=...; named-may-be-invalid=...`.
+fn classified(failed: &std::io::Error) -> String {
+    let kind = ProbeFailure::of_error(failed);
+    let code = failed
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ScmCallError>())
+        .map(|typed| format!("{} win32={}", typed.call.name(), typed.code))
+        .unwrap_or_default();
+    format!(
+        "{code}; kind={kind:?}; scanned={:?}; named-valid={:?}; named-may-be-invalid={:?}",
+        Basis::Scanned.verdict(kind),
+        Basis::Named(ReportedPid::Valid).verdict(kind),
+        Basis::Named(ReportedPid::MayBeInvalid).verdict(kind),
+    )
+}
+
+/// Whether `process` has exited (a zero-timeout wait).
+fn exited(process: &OwnedHandle) -> bool {
+    // SAFETY: `process` is a live handle this function only reads the state of.
+    let waited = unsafe { WaitForSingleObject(HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(process)), 0) };
+    waited == WAIT_OBJECT_0
 }
 
 /// Every process the snapshot lists, as (id, image name).

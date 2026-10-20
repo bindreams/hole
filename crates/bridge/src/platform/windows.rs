@@ -25,6 +25,7 @@ pub use retire_session::RetireSession;
 pub mod registration;
 #[path = "windows/service_processes.rs"]
 mod service_processes;
+pub use service_processes::scan_service_processes;
 #[path = "windows/service_sid.rs"]
 mod service_sid;
 pub use service_sid::{ServiceSid, SidRepair, SidRepairOutcome};

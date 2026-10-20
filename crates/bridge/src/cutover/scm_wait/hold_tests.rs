@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use super::*;
+use crate::cutover::scm_wait::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
+use crate::cutover::scm_wait::ReportedPid;
 
 /// What the fake OS did, in order: `read`, `open(pid)`, `close(pid)`.
 type Log = Rc<RefCell<Vec<String>>>;
@@ -29,6 +31,8 @@ struct Script {
     strangers: Vec<u32>,
     /// Ids of processes that are open but already signalled.
     exited: Vec<u32>,
+    /// The basis each `open` was asked on, in order.
+    bases: Vec<Basis>,
 }
 
 impl Script {
@@ -39,6 +43,7 @@ impl Script {
             gone: vec![],
             strangers: vec![],
             exited: vec![],
+            bases: vec![],
         }
     }
 }
@@ -51,8 +56,9 @@ impl ProcessSource for Script {
         Ok(self.reads.pop_front().expect("read script ran dry"))
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Opened<Handle>> {
+    fn open(&mut self, pid: u32, basis: Basis) -> io::Result<Opened<Handle>> {
         self.log.borrow_mut().push(format!("open({pid})"));
+        self.bases.push(basis);
         if self.gone.contains(&pid) {
             return Ok(Opened::NoSuchProcess);
         }
@@ -183,9 +189,10 @@ fn a_service_that_keeps_changing_process_is_followed_until_it_holds_still() {
     assert_eq!(held_pids(&holds), vec![5]);
 }
 
+/// 100 is dropped for 200, and 200 for 100: a dropped id is opened afresh when
+/// the service names it again, and the last confirmed one is held.
 #[skuld::test]
-fn a_process_dropped_as_unconfirmed_stays_dropped_when_the_service_names_it_again() {
-    // 100, then 200 (100 dropped), then 100 again after 200 was dropped too.
+fn a_process_dropped_as_unconfirmed_is_opened_afresh_when_the_service_names_it_again() {
     let log = Log::default();
     let mut source = Script::new(
         &log,
@@ -199,7 +206,20 @@ fn a_process_dropped_as_unconfirmed_stays_dropped_when_the_service_names_it_agai
     let mut holds = ProcessHolds::default();
     holds.hold_current(&mut source).unwrap();
     assert_eq!(held_pids(&holds), vec![100]);
-    assert_eq!(count(&log, "close(200)"), 1);
+    assert_eq!(
+        *log.borrow(),
+        vec![
+            "read",
+            "open(100)",
+            "read",
+            "close(100)",
+            "open(200)",
+            "read",
+            "close(200)",
+            "open(100)",
+            "read"
+        ]
+    );
 }
 
 #[skuld::test]
@@ -282,7 +302,8 @@ fn a_process_without_the_service_sid_is_never_held_in_any_live_state() {
             Look {
                 observed: live,
                 fate: ProcessFate::Unheld,
-                held_alive: false
+                held_alive: false,
+                ever_held: false
             },
             "{live:?}"
         );
@@ -351,8 +372,8 @@ fn a_failed_read_after_the_open_is_an_error_and_the_handle_is_let_go() {
             }
             self.0.read()
         }
-        fn open(&mut self, pid: u32) -> io::Result<Opened<Handle>> {
-            self.0.open(pid)
+        fn open(&mut self, pid: u32, basis: Basis) -> io::Result<Opened<Handle>> {
+            self.0.open(pid, basis)
         }
         fn has_exited(&mut self, process: &Handle) -> io::Result<bool> {
             self.0.has_exited(process)
@@ -403,18 +424,26 @@ fn a_held_process_that_has_not_exited_is_alive_whatever_the_state() {
             Look {
                 observed: live,
                 fate: ProcessFate::Alive,
-                held_alive: true
+                held_alive: true,
+                ever_held: true
             },
             "{live:?}"
         );
     }
 }
 
-/// The SCM can still say RUNNING or STOP_PENDING for a process that has gone;
-/// the held handle is the ground truth.
+/// The SCM can still say RUNNING for a process that has gone; the held handle
+/// is the ground truth. In START_PENDING and STOP_PENDING the id "may not be
+/// valid", so the exit of the process held under it says nothing about the
+/// service: the fate rests on the SCM's own transition.
 #[skuld::test]
-fn a_held_process_that_has_exited_is_exited_whatever_the_state_still_says() {
-    for stale in [Observed::StartPending, Observed::Running, Observed::StopPending] {
+fn a_held_process_that_has_exited_is_an_exit_only_where_the_id_is_valid() {
+    let table = [
+        (Observed::Running, ProcessFate::Exited),
+        (Observed::StartPending, ProcessFate::Unheld),
+        (Observed::StopPending, ProcessFate::Unheld),
+    ];
+    for (stale, fate) in table {
         let log = Log::default();
         let mut source = Script::new(&log, steady(stale, 100));
         source.exited.push(100);
@@ -423,8 +452,9 @@ fn a_held_process_that_has_exited_is_exited_whatever_the_state_still_says() {
             got,
             Look {
                 observed: stale,
-                fate: ProcessFate::Exited,
-                held_alive: false
+                fate,
+                held_alive: false,
+                ever_held: true
             },
             "{stale:?}"
         );
@@ -460,7 +490,8 @@ fn a_pending_service_whose_named_id_no_process_has_is_unheld_not_exited() {
             Look {
                 observed: pending,
                 fate: ProcessFate::Unheld,
-                held_alive: false
+                held_alive: false,
+                ever_held: false
             },
             "{pending:?}"
         );
@@ -489,7 +520,8 @@ fn a_stopped_service_whose_earlier_process_still_runs_has_a_live_hold() {
         Look {
             observed: Observed::Stopped,
             fate: ProcessFate::Unheld,
-            held_alive: true
+            held_alive: true,
+            ever_held: true
         }
     );
 }
@@ -514,7 +546,8 @@ fn a_stopped_service_whose_earlier_process_has_exited_has_no_live_hold() {
         Look {
             observed: Observed::Stopped,
             fate: ProcessFate::Unheld,
-            held_alive: false
+            held_alive: false,
+            ever_held: true
         }
     );
 }
@@ -558,18 +591,33 @@ fn a_look_that_names_no_process_has_an_unheld_fate() {
 }
 
 /// A process held from an earlier look is the ground truth for a later look
-/// that names the same id.
+/// that names the same id, where that id is valid.
 #[skuld::test]
-fn a_process_held_earlier_and_since_exited_is_exited_on_a_later_look() {
+fn a_process_held_earlier_and_since_exited_is_exited_on_a_later_look_naming_a_valid_id() {
     let log = Log::default();
     let mut source = Script::new(&log, steady(Observed::Running, 100));
     let mut holds = ProcessHolds::default();
     assert_eq!(holds.look(&mut source).unwrap().fate, ProcessFate::Alive);
     source.exited.push(100);
+    source.reads.push_back(reading(Observed::Running, 100));
+    let got = holds.look(&mut source).unwrap();
+    assert_eq!(got.fate, ProcessFate::Exited);
+}
+
+/// Under an id that may not be valid the same exit says nothing about the
+/// service.
+#[skuld::test]
+fn a_process_held_earlier_and_since_exited_is_unheld_on_a_later_look_naming_an_invalid_able_id() {
+    let log = Log::default();
+    let mut source = Script::new(&log, steady(Observed::Running, 100));
+    let mut holds = ProcessHolds::default();
+    holds.look(&mut source).unwrap();
+    source.exited.push(100);
     source.reads.push_back(reading(Observed::StopPending, 100));
     let got = holds.look(&mut source).unwrap();
     assert_eq!(got.observed, Observed::StopPending);
-    assert_eq!(got.fate, ProcessFate::Exited);
+    assert_eq!(got.fate, ProcessFate::Unheld);
+    assert!(!got.held_alive);
 }
 
 #[skuld::test]
@@ -580,8 +628,8 @@ fn a_failed_exit_check_is_an_error() {
         fn read(&mut self) -> io::Result<Reading> {
             self.0.read()
         }
-        fn open(&mut self, pid: u32) -> io::Result<Opened<Handle>> {
-            self.0.open(pid)
+        fn open(&mut self, pid: u32, basis: Basis) -> io::Result<Opened<Handle>> {
+            self.0.open(pid, basis)
         }
         fn has_exited(&mut self, _: &Handle) -> io::Result<bool> {
             Err(io::Error::other("wait failed"))
@@ -590,4 +638,278 @@ fn a_failed_exit_check_is_an_error() {
     let log = Log::default();
     let mut source = FailsCheck(Script::new(&log, steady(Observed::Running, 100)));
     assert!(ProcessHolds::default().look(&mut source).is_err());
+}
+
+// The per-failure table ===============================================================================================
+
+/// What a probe that failed with `failure` resolves to, per basis. Written out
+/// from the contract: the id of a RUNNING service is documented valid, so a
+/// process the SCM names there that cannot be opened or read is one the
+/// uninstall cannot let go of; where the id "may not be valid" a denial is a
+/// stranger that reused it, but an unexpected failure is not; a blind scan of
+/// the host has no prior that a process is the service's, so nothing but a
+/// missing process is decided from a failure, and an unknown code is reported.
+#[skuld::test]
+fn the_verdict_for_every_basis_and_failure() {
+    use ProbeFailure::{AccessDenied, NoSuchProcess, Other};
+    use Verdict::{Fatal, Gone, NotOurs, Undetermined};
+    let table = [
+        (Basis::Named(ReportedPid::Valid), NoSuchProcess, Gone),
+        (Basis::Named(ReportedPid::Valid), AccessDenied, Fatal),
+        (Basis::Named(ReportedPid::Valid), Other, Fatal),
+        (Basis::Named(ReportedPid::MayBeInvalid), NoSuchProcess, Gone),
+        (Basis::Named(ReportedPid::MayBeInvalid), AccessDenied, NotOurs),
+        (Basis::Named(ReportedPid::MayBeInvalid), Other, Fatal),
+        (Basis::Scanned, NoSuchProcess, Gone),
+        (Basis::Scanned, AccessDenied, NotOurs),
+        (Basis::Scanned, Other, Undetermined),
+    ];
+    for (basis, failure, want) in table {
+        assert_eq!(basis.verdict(failure), want, "{basis:?} {failure:?}");
+    }
+}
+
+/// A state with no process names none, so a probe on that basis is a bug.
+#[skuld::test]
+#[should_panic(expected = "names no process")]
+fn a_probe_on_a_state_that_names_no_process_is_a_contract_violation() {
+    Basis::Named(ReportedPid::Never).verdict(ProbeFailure::AccessDenied);
+}
+
+fn typed(call: ScmCall, code: u32) -> io::Error {
+    ScmCallError { call, code }.into_io()
+}
+
+#[skuld::test]
+fn a_failure_is_classified_once_from_the_call_and_its_win32_code() {
+    let table = [
+        // OpenProcess answers a pid no process has with ERROR_INVALID_PARAMETER.
+        (ScmCall::OpenProcess, 87, ProbeFailure::NoSuchProcess),
+        (ScmCall::OpenProcess, 5, ProbeFailure::AccessDenied),
+        (ScmCall::OpenProcessToken, 5, ProbeFailure::AccessDenied),
+        (ScmCall::GetTokenInformation, 5, ProbeFailure::AccessDenied),
+        (ScmCall::OpenProcess, 1, ProbeFailure::Other),
+        // 87 from a call on a handle already open names no missing process.
+        (ScmCall::OpenProcessToken, 87, ProbeFailure::Other),
+        (ScmCall::GetTokenInformation, 87, ProbeFailure::Other),
+    ];
+    for (call, code, want) in table {
+        assert_eq!(ProbeFailure::of_error(&typed(call, code)), want, "{call:?} {code}");
+    }
+    assert_eq!(
+        ProbeFailure::of_error(&io::Error::other("untyped")),
+        ProbeFailure::Other
+    );
+}
+
+/// Every verdict becomes the outcome the hold acts on; only a fatal one is an
+/// error, and it is the error the probe failed with.
+#[skuld::test]
+fn a_failed_probe_resolves_by_the_basis_table() {
+    let valid = Basis::Named(ReportedPid::Valid);
+    let may_be_invalid = Basis::Named(ReportedPid::MayBeInvalid);
+    let denied = || typed(ScmCall::OpenProcess, 5);
+
+    assert!(matches!(
+        Opened::<()>::of_failure(valid, typed(ScmCall::OpenProcess, 87)),
+        Ok(Opened::NoSuchProcess)
+    ));
+    assert!(matches!(
+        Opened::<()>::of_failure(may_be_invalid, denied()),
+        Ok(Opened::NotTheService)
+    ));
+    assert!(matches!(
+        Opened::<()>::of_failure(Basis::Scanned, denied()),
+        Ok(Opened::NotTheService)
+    ));
+    let fatal = Opened::<()>::of_failure(valid, denied()).expect_err("fatal");
+    assert!(io_error_is_a_refused_process_open(&fatal), "{fatal}");
+    assert!(matches!(
+        Opened::<()>::of_failure(Basis::Scanned, typed(ScmCall::GetTokenInformation, 1)),
+        Ok(Opened::Undetermined { code: Some(1) })
+    ));
+}
+
+/// The id is a claim in proportion to the state it was read in, and the open
+/// is told which.
+#[skuld::test]
+fn the_open_is_given_the_basis_of_the_state_the_id_was_read_in() {
+    let table = [
+        (Observed::Running, Basis::Named(ReportedPid::Valid)),
+        (Observed::StartPending, Basis::Named(ReportedPid::MayBeInvalid)),
+        (Observed::StopPending, Basis::Named(ReportedPid::MayBeInvalid)),
+    ];
+    for (observed, basis) in table {
+        let log = Log::default();
+        let mut source = Script::new(&log, steady(observed, 100));
+        look_of(&mut source);
+        assert_eq!(source.bases, vec![basis], "{observed:?}");
+    }
+}
+
+/// A source whose every open fails the way a denied token read does.
+struct DeniedToken(Script);
+
+impl ProcessSource for DeniedToken {
+    type Process = Handle;
+    fn read(&mut self) -> io::Result<Reading> {
+        self.0.read()
+    }
+    fn open(&mut self, _: u32, basis: Basis) -> io::Result<Opened<Handle>> {
+        Opened::of_failure(basis, typed(ScmCall::OpenProcessToken, 5))
+    }
+    fn has_exited(&mut self, process: &Handle) -> io::Result<bool> {
+        self.0.has_exited(process)
+    }
+}
+
+/// A token the uninstall cannot read on a process the SCM names while the id is
+/// valid fails the look with the open's own error, and holds nothing.
+#[skuld::test]
+fn a_denied_token_on_a_valid_id_ends_the_look_with_a_refused_open() {
+    let log = Log::default();
+    let mut source = DeniedToken(Script::new(&log, vec![reading(Observed::Running, 100)]));
+    let mut holds = ProcessHolds::default();
+    let error = holds.look(&mut source).expect_err("a denied token in RUNNING is fatal");
+    assert!(io_error_is_a_refused_process_open(&error), "{error}");
+    assert!(held_pids(&holds).is_empty());
+}
+
+/// Where the id may name a stranger, the same denial is that stranger.
+#[skuld::test]
+fn a_denied_token_on_an_id_that_may_be_invalid_is_a_stranger() {
+    for pending in [Observed::StartPending, Observed::StopPending] {
+        let log = Log::default();
+        let mut source = DeniedToken(Script::new(&log, steady(pending, 100)));
+        let got = ProcessHolds::default()
+            .look(&mut source)
+            .expect("a stranger is not an error");
+        assert_eq!(got.fate, ProcessFate::Unheld, "{pending:?}");
+    }
+}
+
+/// A scan-only outcome cannot come back for an id the SCM named.
+#[skuld::test]
+#[should_panic(expected = "Basis::verdict")]
+fn an_undetermined_outcome_for_an_id_the_scm_named_is_a_contract_violation() {
+    struct Undetermined;
+    impl ProcessSource for Undetermined {
+        type Process = Handle;
+        fn read(&mut self) -> io::Result<Reading> {
+            Ok(reading(Observed::Running, 100))
+        }
+        fn open(&mut self, _: u32, _: Basis) -> io::Result<Opened<Handle>> {
+            Ok(Opened::Undetermined { code: Some(1) })
+        }
+        fn has_exited(&mut self, _: &Handle) -> io::Result<bool> {
+            unreachable!()
+        }
+    }
+    let _ = ProcessHolds::default().hold_current(&mut Undetermined);
+}
+
+// A live process that fails the SID check =============================================================================
+
+/// Runs `f` under a per-test subscriber and returns what it logged.
+fn logged_during(f: impl FnOnce()) -> String {
+    use garter::test_utils::WaitableWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = set_default_in_current_thread(subscriber);
+    f();
+    writer.snapshot()
+}
+
+/// In RUNNING the id is documented valid, so a live process there that is not
+/// the service's means nothing of the service will be waited on: said once,
+/// with the id and the state.
+#[skuld::test]
+fn a_valid_state_process_that_fails_the_sid_check_is_logged_with_its_pid_and_state() {
+    let log = Log::default();
+    let mut source = Script::new(&log, steady(Observed::Running, 4242));
+    source.strangers.push(4242);
+    let logged = logged_during(|| {
+        look_of(&mut source);
+    });
+    assert!(logged.contains("WARN"), "{logged:?}");
+    assert!(logged.contains("4242"), "{logged:?}");
+    assert!(logged.contains("Running"), "{logged:?}");
+}
+
+/// Where the id may name anything, a process that fails the check is the
+/// expected case and says nothing.
+#[skuld::test]
+fn a_may_be_invalid_state_process_that_fails_the_sid_check_logs_nothing() {
+    for pending in [Observed::StartPending, Observed::StopPending] {
+        let log = Log::default();
+        let mut source = Script::new(&log, steady(pending, 4242));
+        source.strangers.push(4242);
+        let logged = logged_during(|| {
+            look_of(&mut source);
+        });
+        assert_eq!(logged, "", "{pending:?}");
+    }
+}
+
+// Holding what a scan finds ===========================================================================================
+
+fn process(log: &Log, pid: u32) -> Handle {
+    Handle { pid, log: log.clone() }
+}
+
+/// A process the scan adopts is one the holds have, so the next look sees it.
+#[skuld::test]
+fn a_process_adopted_from_a_scan_is_held_and_shows_in_the_next_look() {
+    let log = Log::default();
+    let mut source = Script::new(&log, vec![reading(Observed::Stopped, 0), reading(Observed::Stopped, 0)]);
+    let mut holds = ProcessHolds::default();
+    let before = holds.look(&mut source).unwrap();
+    assert!(!before.ever_held && !before.held_alive);
+
+    holds.adopt(300, process(&log, 300));
+    assert_eq!(held_pids(&holds), vec![300]);
+    let after = holds.look(&mut source).unwrap();
+    assert!(after.held_alive, "the adopted process has not exited");
+    assert!(after.ever_held);
+    assert_eq!(after.fate, ProcessFate::Unheld, "a STOPPED look names no process");
+}
+
+#[skuld::test]
+fn a_process_adopted_twice_or_already_held_is_kept_once() {
+    let log = Log::default();
+    let mut source = Script::new(&log, steady(Observed::Running, 100));
+    let mut holds = ProcessHolds::default();
+    holds.look(&mut source).unwrap();
+    holds.adopt(100, process(&log, 100));
+    holds.adopt(300, process(&log, 300));
+    holds.adopt(300, process(&log, 300));
+    assert_eq!(held_pids(&holds), vec![100, 300]);
+    // The redundant handles were let go, the held ones were not.
+    assert_eq!(count(&log, "close(100)"), 1);
+    assert_eq!(count(&log, "close(300)"), 1);
+}
+
+/// Having held something is remembered after it has exited.
+#[skuld::test]
+fn ever_held_outlasts_the_exit_of_everything_held() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![
+            reading(Observed::Running, 100),
+            reading(Observed::Running, 100),
+            reading(Observed::Stopped, 0),
+        ],
+    );
+    let mut holds = ProcessHolds::default();
+    holds.look(&mut source).unwrap();
+    source.exited.push(100);
+    let got = holds.look(&mut source).unwrap();
+    assert!(got.ever_held);
+    assert!(!got.held_alive);
 }

@@ -10,6 +10,18 @@ fn look(observed: Observed, fate: ProcessFate, held_alive: bool) -> Look {
         observed,
         fate,
         held_alive,
+        // A live hold was held.
+        ever_held: held_alive,
+    }
+}
+
+/// A look after every process held so far has exited.
+fn look_after_holds_exited(observed: Observed, fate: ProcessFate) -> Look {
+    Look {
+        observed,
+        fate,
+        held_alive: false,
+        ever_held: true,
     }
 }
 
@@ -85,7 +97,7 @@ fn the_step_for_every_state_fate_and_hold() {
         (Observed::Stopped, Exited, true, AwaitHeldExit),
     ];
     for (observed, fate, held_alive, want) in table {
-        let got = observed.settle_step(look(observed, fate, held_alive));
+        let got = look(observed, fate, held_alive).settle_step();
         assert_eq!(got, want, "{observed:?} {fate:?} held_alive={held_alive}");
     }
 }
@@ -477,6 +489,48 @@ fn no_arm_is_made_after_the_scm_refused_one() {
     assert_eq!(actor.count("arm_leaving(StopPending)"), 0);
     assert_eq!(actor.count("await_callback(ExternalEvent)"), 0);
     assert_eq!(actor.count("await_held_exits(ExternalEvent)"), 2);
+}
+
+/// Marked, the held process has exited and the scan finds nothing alive, but
+/// the SCM still reports STOP_PENDING: no process is left, and no arm can be
+/// made to learn more from the SCM, so the wait is over.
+#[skuld::test]
+fn a_marked_service_whose_held_processes_have_exited_is_settled_though_the_scm_lags() {
+    for lagging in [Observed::StopPending, Observed::StartPending] {
+        let mut actor = Recording::new(vec![
+            look(lagging, ProcessFate::Alive, true),
+            look_after_holds_exited(lagging, ProcessFate::Exited),
+        ])
+        .arm_fails_with(vec![Some(marked())]);
+        settle_stopped(&mut actor).unwrap();
+        assert_eq!(
+            actor.log(),
+            [
+                "observe",
+                format!("arm_leaving({lagging:?})").as_str(),
+                "hold_scanned",
+                "observe"
+            ],
+            "{lagging:?}"
+        );
+    }
+}
+
+/// The same for RUNNING over an exited process: the Stop is not sent, no arm is
+/// possible, and the scan decides.
+#[skuld::test]
+fn a_marked_running_service_over_an_exited_process_is_settled_when_the_scan_finds_nothing() {
+    let mut actor = Recording::new(vec![
+        look_after_holds_exited(Observed::Running, ProcessFate::Exited),
+        look_after_holds_exited(Observed::Running, ProcessFate::Exited),
+    ])
+    .arm_fails_with(vec![Some(marked())]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(actor.count("control_stop"), 0);
+    assert_eq!(
+        actor.log(),
+        ["observe", "arm_leaving(Running)", "hold_scanned", "observe"]
+    );
 }
 
 /// A live state with no process to wait on and no arm: the only event left is

@@ -52,9 +52,9 @@ pub enum SettleStep {
     AwaitChange(Observed),
 }
 
-impl Observed {
-    /// The one decision of the stop wait, from the state and the look at the
-    /// process it names. `look` is the look `self` was read in.
+impl Look {
+    /// The one decision of the stop wait, from the state the look read and
+    /// the process it names.
     ///
     /// A Stop goes out only into RUNNING, the one state that takes it, and
     /// only over a process that has not exited. In the pending states the
@@ -63,10 +63,9 @@ impl Observed {
     /// so no fate is trusted there: they are left by the SCM's own
     /// transition, even with a live hold (a hold that outlives STOPPED is
     /// then waited out). STOPPED is final only with nothing held alive.
-    pub fn settle_step(self, look: Look) -> SettleStep {
-        debug_assert_eq!(self, look.observed, "a look is read in the state it is decided on");
-        match self {
-            Observed::Running => match look.fate {
+    pub fn settle_step(self) -> SettleStep {
+        match self.observed {
+            Observed::Running => match self.fate {
                 ProcessFate::Unheld => SettleStep::SendStop,
                 ProcessFate::Alive => SettleStep::SendStop,
                 // The process is gone and the status lags: the SCM catches up.
@@ -75,7 +74,7 @@ impl Observed {
             Observed::StartPending => SettleStep::AwaitChange(Observed::StartPending),
             Observed::StopPending => SettleStep::AwaitChange(Observed::StopPending),
             Observed::Stopped => {
-                if look.held_alive {
+                if self.held_alive {
                     SettleStep::AwaitHeldExit
                 } else {
                     SettleStep::Quiescent
@@ -83,7 +82,9 @@ impl Observed {
             }
         }
     }
+}
 
+impl Observed {
     /// The kind of the wait for the service to leave this state.
     ///
     /// RUNNING is left by a wait only when its process has already exited and
@@ -201,25 +202,39 @@ pub fn settle_stopped<A: StopActor>(actor: &mut A) -> io::Result<()> {
     let mut settle = Settle { actor, refused: None };
     let mut look = settle.actor.observe()?;
     loop {
-        let step = look.observed.settle_step(look);
-        match step {
+        let step = look.settle_step();
+        let next = match step {
             SettleStep::Quiescent => {
                 settle.actor.hold_scanned()?;
                 look = settle.actor.observe()?;
-                if look.observed.settle_step(look).ends_the_wait() {
+                if look.settle_step().ends_the_wait() {
                     info!("stop wait: the service is stopped and no process of it is left");
                     return Ok(());
                 }
+                Next::Look(look)
             }
-            SettleStep::SendStop => look = settle.stop(look)?,
+            SettleStep::SendStop => settle.stop(look)?,
             SettleStep::AwaitHeldExit => {
                 info!(?look, "stop wait: waiting for a process held past STOPPED");
                 settle.actor.await_held_exits(step.expected_wait_kind())?;
-                look = settle.actor.observe()?;
+                Next::Look(settle.actor.observe()?)
             }
-            SettleStep::AwaitChange(_) => look = settle.await_change(step)?,
+            SettleStep::AwaitChange(_) => settle.await_change(step)?,
+        };
+        match next {
+            Next::Look(again) => look = again,
+            Next::Settled => return Ok(()),
         }
     }
+}
+
+/// Where a step leaves the loop.
+enum Next {
+    /// On this look.
+    Look(Look),
+    /// Settled without a STOPPED look: the service is marked for deletion, so
+    /// the SCM cannot be asked again, and every process it showed has exited.
+    Settled,
 }
 
 struct Settle<'a, A> {
@@ -250,7 +265,7 @@ impl<A: StopActor> Settle<'_, A> {
     }
 
     /// Send the Stop `look` calls for and wait out its effect.
-    fn stop(&mut self, look: Look) -> io::Result<Look> {
+    fn stop(&mut self, look: Look) -> io::Result<Next> {
         let wait = look.fate.wait_after_stop();
         let armed = match wait {
             StopWait::HeldProcess => false,
@@ -260,11 +275,11 @@ impl<A: StopActor> Settle<'_, A> {
         info!(?look, "stop wait: sending Stop");
         if let Err(refused) = self.actor.control_stop() {
             let again = self.actor.observe()?;
-            if again.observed.settle_step(again).is_a_stop_the_service_takes() {
+            if again.settle_step().is_a_stop_the_service_takes() {
                 return Err(refused);
             }
             info!(?again, error = %refused, "stop wait: the Stop was refused, but the service is no longer running");
-            return Ok(again);
+            return Ok(Next::Look(again));
         }
         let kind = SettleStep::SendStop.expected_wait_kind();
         match wait {
@@ -272,11 +287,11 @@ impl<A: StopActor> Settle<'_, A> {
             StopWait::StatusChange if armed => self.actor.await_callback(kind)?,
             StopWait::StatusChange => return self.without_arm(),
         }
-        self.actor.observe()
+        Ok(Next::Look(self.actor.observe()?))
     }
 
     /// Wait for the service to leave the state `step` names.
-    fn await_change(&mut self, step: SettleStep) -> io::Result<Look> {
+    fn await_change(&mut self, step: SettleStep) -> io::Result<Next> {
         let SettleStep::AwaitChange(from) = step else {
             unreachable!("only a wait to leave a state is asked to await it: {step:?}")
         };
@@ -286,27 +301,36 @@ impl<A: StopActor> Settle<'_, A> {
         let again = self.actor.observe()?;
         // Not the same wait any more: the arm's mask does not cover where the
         // service is. Closing its handle cancels it.
-        if again.observed.settle_step(again) != step {
-            return Ok(again);
+        if again.settle_step() != step {
+            return Ok(Next::Look(again));
         }
         info!(?again, "stop wait: waiting for the service to leave its state");
         self.actor.await_callback(step.expected_wait_kind())?;
-        self.actor.observe()
+        Ok(Next::Look(self.actor.observe()?))
     }
 
     /// What the loop does where it would have armed and cannot: hold what the
-    /// scan finds and wait on that. With nothing held alive, a state other
-    /// than STOPPED is left with no event to wait on.
-    fn without_arm(&mut self) -> io::Result<Look> {
+    /// scan finds and wait on that. With nothing held alive and the SCM's
+    /// state still lagging, the processes that were held have exited and the
+    /// scan finds no other: settled. If none was ever held, the state is left
+    /// with no event to wait on.
+    fn without_arm(&mut self) -> io::Result<Next> {
         self.actor.hold_scanned()?;
         let look = self.actor.observe()?;
         if look.held_alive {
             self.actor
                 .await_held_exits(SettleStep::AwaitHeldExit.expected_wait_kind())?;
-            return self.actor.observe();
+            return Ok(Next::Look(self.actor.observe()?));
         }
-        if look.observed.settle_step(look).ends_the_wait() {
-            return Ok(look);
+        if look.settle_step().ends_the_wait() {
+            return Ok(Next::Look(look));
+        }
+        if look.ever_held {
+            info!(
+                ?look,
+                "stop wait: every process held has exited and none else carries the token"
+            );
+            return Ok(Next::Settled);
         }
         Err(self.refused.take().expect("only reached after the SCM refused an arm"))
     }

@@ -108,6 +108,25 @@ impl Scan {
             .collect()
     }
 
+    /// The ids the production scan (`scan_service_processes`) kept as alive.
+    fn production_alive(&self) -> Vec<u32> {
+        let list = self
+            .report
+            .lines()
+            .find_map(|line| line.strip_prefix("production scan, alive: ["))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the scan reported no production scan line:
+{}",
+                    self.report
+                )
+            });
+        list.trim_end_matches(']')
+            .split(',')
+            .filter_map(|id| id.trim().parse().ok())
+            .collect()
+    }
+
     fn caller(&self) -> &str {
         self.report
             .lines()
@@ -261,6 +280,11 @@ fn cutover_global_net_state_probe_scan_by_service_sid() {
     assert!(
         !admin.matches().contains(&std::process::id()),
         "the scan took this test's own process for the service's"
+    );
+    assert!(
+        admin.production_alive().contains(&pid),
+        "the production scan did not find the service's process {pid}: {:?}",
+        admin.production_alive()
     );
 
     let system = scan_as_system(SERVICE_NAME, dir.path(), "Running");

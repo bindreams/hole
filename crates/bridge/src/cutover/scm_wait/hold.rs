@@ -8,7 +8,11 @@
 
 use std::io;
 
-use super::Observed;
+use tracing::warn;
+
+use super::call_error::{scm_call_error, ScmCall, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+use super::scan::{scan, ProcessEnumerator, ScanResult, Undetermined};
+use super::{Observed, ReportedPid};
 
 /// One look at a service: its state and the process id it names (0: none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,13 +34,15 @@ impl Reading {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessFate {
     /// The look names no process to hold (STOPPED, or a live state with no id),
-    /// or the holder keeps none.
+    /// the holder keeps none, or the id is one that "may not be valid"
+    /// ([`Observed::reported_pid`]) and the process under it has gone: that
+    /// says nothing about the service, which the SCM's own transition does.
     Unheld,
     /// A held process that has not exited.
     Alive,
-    /// The named process has exited: a held one that is signalled, whatever
-    /// state the SCM still reports, or an id no process has in a state whose id
-    /// is valid ([`Observed::reported_pid`]).
+    /// The named process has exited, in a state whose id is valid: a held one
+    /// that is signalled, whatever state the SCM still reports, or an id no
+    /// process has.
     Exited,
 }
 
@@ -48,6 +54,11 @@ pub struct Look {
     /// Whether any process held so far has not exited, the named one or not:
     /// a process outlives the STOPPED the SCM reports for it.
     pub held_alive: bool,
+    /// Whether anything has been held so far, alive or since exited. A marked
+    /// service cannot be armed on, so once everything held has exited and a
+    /// scan finds nothing, this is what says that the SCM's lagging state is
+    /// about processes that are gone.
+    pub ever_held: bool,
 }
 
 /// What opening a process id found.
@@ -56,10 +67,138 @@ pub enum Opened<P> {
     /// No process has that id.
     NoSuchProcess,
     /// A live process that is not the service's: its token lacks the service
-    /// SID. The source closes it before returning this, so it is never held.
+    /// SID, or the basis says a refusal to read it is a stranger's. The source
+    /// closes it before returning this, so it is never held.
     NotTheService,
     /// A live process of the service, proven by its token.
     Service(P),
+    /// A process of a host-wide scan that failed in a way the
+    /// [`Basis::Scanned`] table does not decide ([`Verdict::Undetermined`]).
+    /// Never the answer for an id the SCM named.
+    Undetermined { code: Option<u32> },
+}
+
+impl<P> Opened<P> {
+    /// What a failed probe resolves to under `basis`'s table
+    /// ([`Basis::verdict`]); only a fatal verdict is an error, and it is the
+    /// one the probe failed with.
+    pub fn of_failure(basis: Basis, error: io::Error) -> io::Result<Opened<P>> {
+        match basis.verdict(ProbeFailure::of_error(&error)) {
+            Verdict::Gone => Ok(Opened::NoSuchProcess),
+            Verdict::NotOurs => Ok(Opened::NotTheService),
+            Verdict::Fatal => Err(error),
+            Verdict::Undetermined => Ok(Opened::Undetermined {
+                code: scm_call_error(&error).map(|typed| typed.code),
+            }),
+        }
+    }
+}
+
+/// How a probe of a process failed, from the call and the Win32 code it failed
+/// with. Classified here once; what each kind means is [`Basis::verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeFailure {
+    /// `OpenProcess` found no process with the id.
+    NoSuchProcess,
+    /// The caller may not open the process or read its token.
+    AccessDenied,
+    /// Any other code.
+    Other,
+}
+
+impl ProbeFailure {
+    /// The kind `error` is. Only a typed [`ScmCallError`](super::call_error::ScmCallError)
+    /// carries the call, and `ERROR_INVALID_PARAMETER` is a missing process
+    /// only from `OpenProcess`: from a call on a handle already open it is
+    /// not.
+    pub fn of_error(error: &io::Error) -> Self {
+        let Some(typed) = scm_call_error(error) else {
+            return ProbeFailure::Other;
+        };
+        match (typed.call, typed.code) {
+            (ScmCall::OpenProcess, ERROR_INVALID_PARAMETER) => ProbeFailure::NoSuchProcess,
+            (_, ERROR_ACCESS_DENIED) => ProbeFailure::AccessDenied,
+            _ => ProbeFailure::Other,
+        }
+    }
+}
+
+/// What a process being probed is known to be, which decides what a failed
+/// probe of it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// The SCM named the id, in a state whose id has this trust
+    /// ([`Observed::reported_pid`]).
+    Named(ReportedPid),
+    /// The id came from listing every process on the host: there is no prior
+    /// that it is the service's.
+    Scanned,
+}
+
+/// What a failed probe means for the question "is this the service's
+/// process, and is it alive".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// There is no such process.
+    Gone,
+    /// There is a process and it is not the service's.
+    NotOurs,
+    /// A process the retirement cannot let go of cannot be probed: the
+    /// retirement fails.
+    Fatal,
+    /// Nothing can be said; reported, and neither fatal nor dropped.
+    Undetermined,
+}
+
+impl Basis {
+    /// The one table from a failed probe to what is done about it. It is
+    /// derived from the documented error kinds; the whole-host probe
+    /// (`--scan-sid`) is what confirms the rows.
+    ///
+    /// - Named, valid id (RUNNING): the SCM holds the service's process while
+    ///   it reports it, so the id is not a stranger's; a process that cannot
+    ///   be opened or read is the service's own and an uninstall must not
+    ///   proceed past it. Fatal for a denial and for any other code.
+    /// - Named, id that "may not be valid" (START_PENDING, STOP_PENDING): a
+    ///   denial is a stranger that reused the id; any other code is unexpected
+    ///   and fatal.
+    /// - Scanned: a denial is a process of another principal; any other code
+    ///   proves nothing either way and is reported.
+    ///
+    /// A missing process is [`Verdict::Gone`] on every basis.
+    pub fn verdict(self, failure: ProbeFailure) -> Verdict {
+        match self {
+            Basis::Named(ReportedPid::Valid) => match failure {
+                ProbeFailure::NoSuchProcess => Verdict::Gone,
+                ProbeFailure::AccessDenied => Verdict::Fatal,
+                ProbeFailure::Other => Verdict::Fatal,
+            },
+            Basis::Named(ReportedPid::MayBeInvalid) => match failure {
+                ProbeFailure::NoSuchProcess => Verdict::Gone,
+                ProbeFailure::AccessDenied => Verdict::NotOurs,
+                ProbeFailure::Other => Verdict::Fatal,
+            },
+            Basis::Named(ReportedPid::Never) => {
+                panic!("Basis::Named(Never) names no process, so there is nothing to probe")
+            }
+            Basis::Scanned => match failure {
+                ProbeFailure::NoSuchProcess => Verdict::Gone,
+                ProbeFailure::AccessDenied => Verdict::NotOurs,
+                ProbeFailure::Other => Verdict::Undetermined,
+            },
+        }
+    }
+
+    /// Whether a live process that turns out not to be the service's is a
+    /// surprise worth saying: only where the id is documented valid.
+    pub fn expects_the_service(self) -> bool {
+        match self {
+            Basis::Named(ReportedPid::Valid) => true,
+            Basis::Named(ReportedPid::MayBeInvalid) => false,
+            Basis::Named(ReportedPid::Never) => false,
+            Basis::Scanned => false,
+        }
+    }
 }
 
 /// What the process a look names came to, once [`ProcessHolds::hold_current`]
@@ -86,10 +225,14 @@ impl Named {
         Ok(match self {
             Named::Nothing => ProcessFate::Unheld,
             Named::Held => {
-                if held_has_exited()? {
+                if !held_has_exited()? {
+                    ProcessFate::Alive
+                } else if observed.reported_pid().gone_id_is_an_exit() {
                     ProcessFate::Exited
                 } else {
-                    ProcessFate::Alive
+                    // The process held under an id that may not be valid has
+                    // gone; the service's may be another.
+                    ProcessFate::Unheld
                 }
             }
             Named::NoSuchProcess => {
@@ -119,8 +262,9 @@ pub trait ProcessSource {
     /// Read the service's state and process id.
     fn read(&mut self) -> io::Result<Reading>;
     /// Open process `pid` and prove it is the service's own by its token, not
-    /// by the id (see [`ProcessHolds::hold_current`]).
-    fn open(&mut self, pid: u32) -> io::Result<Opened<Self::Process>>;
+    /// by the id (see [`ProcessHolds::hold_current`]). A failure is resolved
+    /// by `basis` ([`Opened::of_failure`]).
+    fn open(&mut self, pid: u32, basis: Basis) -> io::Result<Opened<Self::Process>>;
     /// Whether `process` has exited. A state read, never a wait.
     fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool>;
 }
@@ -186,7 +330,7 @@ impl<P> ProcessHolds<P> {
                 });
             }
             // `None`: a live process that is not the service's, already closed.
-            let candidate = match source.open(pid)? {
+            let candidate = match source.open(pid, Basis::Named(reading.observed.reported_pid()))? {
                 // No process has this id, so there is nothing to hold.
                 Opened::NoSuchProcess => {
                     return Ok(Hold {
@@ -196,6 +340,9 @@ impl<P> ProcessHolds<P> {
                 }
                 Opened::NotTheService => None,
                 Opened::Service(process) => Some(process),
+                Opened::Undetermined { .. } => {
+                    unreachable!("an id the SCM named is never undetermined: Basis::verdict gives that only to a scan")
+                }
             };
             let again = source.read()?;
             if again.process_to_hold() != Some(pid) {
@@ -207,7 +354,16 @@ impl<P> ProcessHolds<P> {
                     self.held.push((pid, process));
                     Named::Held
                 }
-                None => Named::NotTheService,
+                None => {
+                    if Basis::Named(again.observed.reported_pid()).expects_the_service() {
+                        warn!(
+                            pid,
+                            state = ?again.observed,
+                            "the process the SCM names does not carry the service SID: it will not be waited on"
+                        );
+                    }
+                    Named::NotTheService
+                }
             };
             return Ok(Hold { reading: again, named });
         }
@@ -249,7 +405,30 @@ impl<P> ProcessHolds<P> {
             observed: reading.observed,
             fate,
             held_alive,
+            ever_held: !self.held.is_empty(),
         })
+    }
+
+    /// Hold `process`, the process `pid`, unless it is held already; the
+    /// redundant handle is dropped.
+    pub fn adopt(&mut self, pid: u32, process: P) {
+        if self.held.iter().all(|(held, _)| *held != pid) {
+            self.held.push((pid, process));
+        }
+    }
+
+    /// Hold every live process `enumerator` finds carrying the service's
+    /// token, so the next [`look`](Self::look) shows it alive. Returns the
+    /// processes the scan could not decide.
+    pub fn hold_scanned<E: ProcessEnumerator<Process = P>>(
+        &mut self,
+        enumerator: &mut E,
+    ) -> io::Result<Vec<Undetermined>> {
+        let ScanResult { alive, undetermined } = scan(enumerator)?;
+        for (pid, process) in alive {
+            self.adopt(pid, process);
+        }
+        Ok(undetermined)
     }
 }
 

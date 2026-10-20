@@ -15,6 +15,7 @@ fn look(observed: Observed) -> Look {
             ProcessFate::Unheld
         },
         held_alive: false,
+        ever_held: false,
     }
 }
 
@@ -24,6 +25,7 @@ fn stale(observed: Observed) -> Look {
         observed,
         fate: ProcessFate::Exited,
         held_alive: false,
+        ever_held: false,
     }
 }
 
@@ -623,6 +625,7 @@ fn a_live_state_with_no_process_held_after_the_delete_waits_on_the_scm_not_on_a_
             observed: Observed::StopPending,
             fate: ProcessFate::Unheld,
             held_alive: false,
+            ever_held: false,
         },
         look(Observed::Stopped),
         look(Observed::Stopped),
@@ -669,6 +672,23 @@ fn a_refused_process_open_in_the_drain_is_its_own_failure_not_a_failed_confirmat
     .refusing_the_process_open_at("observe", 2);
     let err = retire(&mut session, Disposition::Deregister).expect_err("the open was refused");
     assert!(matches!(err, RetireError::Hold(_)), "{err}");
+}
+
+/// Reading the token that proves a process is the service's is part of
+/// holding it: its refusal is the Hold step's, as the open's is.
+#[skuld::test]
+fn a_refused_token_read_is_the_hold_step_whichever_step_needed_the_process() {
+    for call in [
+        ScmCall::OpenProcess,
+        ScmCall::OpenProcessToken,
+        ScmCall::GetTokenInformation,
+    ] {
+        let refused = || ScmCallError { call, code: 5 }.into_io();
+        for step in [RetireError::Observe, RetireError::Stop, RetireError::Exit] {
+            let got = RetireError::of_step(step, refused());
+            assert!(matches!(got, RetireError::Hold(_)), "{call:?}: {got}");
+        }
+    }
 }
 
 /// Only the open of the process has its own step: any other SCM call failing

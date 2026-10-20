@@ -96,10 +96,21 @@ impl ScmCallError {
     /// log: the one line in `gui-cli.log` that names the call and the code.
     pub fn into_io(self) -> io::Error {
         tracing::info!(call = self.call.name(), win32_code = self.code, "SCM call failed");
+        self.into_io_unlogged()
+    }
+
+    /// [`into_io`](Self::into_io) without the log line, for a failure the
+    /// caller expects in bulk (a scan of every process on the host) and
+    /// resolves itself.
+    pub fn into_io_unlogged(self) -> io::Error {
         io::Error::other(self)
     }
 }
 
+/// `ERROR_ACCESS_DENIED`.
+pub const ERROR_ACCESS_DENIED: u32 = 5;
+/// `ERROR_INVALID_PARAMETER`: what `OpenProcess` answers for an id no process has.
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
 /// `ERROR_SERVICE_DOES_NOT_EXIST`.
 pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 /// `ERROR_SERVICE_MARKED_FOR_DELETE`.
@@ -173,13 +184,16 @@ pub fn service_gone(error: &io::Error) -> Option<ServiceGone> {
         .and_then(|typed| ServiceGone::of_code(typed.code))
 }
 
+/// The [`ScmCallError`] inside `error`, if it was wrapped by
+/// [`ScmCallError::into_io`].
+pub fn scm_call_error(error: &io::Error) -> Option<&ScmCallError> {
+    error.get_ref().and_then(|inner| inner.downcast_ref::<ScmCallError>())
+}
+
 /// Whether `error` is a [`ScmCallError`] of the call that opens the service's
 /// process (see [`ScmCall::is_opening_the_service_process`]).
 pub fn io_error_is_a_refused_process_open(error: &io::Error) -> bool {
-    error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<ScmCallError>())
-        .is_some_and(|typed| typed.call.is_opening_the_service_process())
+    scm_call_error(error).is_some_and(|typed| typed.call.is_opening_the_service_process())
 }
 
 /// The Win32 code inside an `HRESULT` the `windows` bindings report, when it is

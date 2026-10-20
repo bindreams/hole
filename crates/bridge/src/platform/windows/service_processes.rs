@@ -5,61 +5,70 @@
 //! offers names that exit once the state is STOPPED (`dwProcessId` is 0 there),
 //! so the process is opened while the service still names it, proven to be the
 //! service's by its token's service SID, and confirmed by
-//! [`ProcessHolds::look`].
+//! [`ProcessHolds::look`]. A process the SCM no longer names is found by its
+//! token alone, by [`scan_service_processes`].
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    GetCurrentProcessId, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE,
 };
 
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{Look, Opened, ProcessHolds, ProcessSource};
+use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessHolds, ProcessSource};
+use crate::cutover::scm_wait::scan::{scan, ProcessEnumerator, ScanResult};
 
 use super::service_sid::ServiceSid;
 
 /// Open process `pid` for waiting and for reading its token, and keep it only
-/// if the token carries the service SID. A process without it, or whose token
-/// cannot be read, is closed and reported as not the service's.
-pub(super) fn open_process(pid: u32, service: &ServiceSid) -> io::Result<Opened<OwnedHandle>> {
+/// if the token carries the service SID. A failure is resolved by `basis`
+/// ([`Opened::of_failure`]): what an id the SCM named in a state that makes it
+/// valid, one that may not be valid, and one found by scanning the host each
+/// mean is one table, `Basis::verdict`.
+pub(super) fn open_process(pid: u32, service: &ServiceSid, basis: Basis) -> io::Result<Opened<OwnedHandle>> {
     // SAFETY: plain FFI call; no pointer is passed.
     match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(handle) => {
             // SAFETY: `OpenProcess` returned a new handle this value now owns.
             let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
             let read = service.is_in_token_of(&process);
-            Ok(opened_from_token_read(process, pid, read))
+            opened_from_token_read(process, basis, read, has_exited)
         }
-        Err(e) => {
-            let code = win32_code_of_hresult(e.code().0);
-            if code == ERROR_INVALID_PARAMETER.0 {
-                return Ok(Opened::NoSuchProcess);
-            }
-            Err(ScmCallError {
+        Err(e) => Opened::of_failure(
+            basis,
+            ScmCallError {
                 call: ScmCall::OpenProcess,
-                code,
+                code: win32_code_of_hresult(e.code().0),
             }
-            .into_io())
-        }
+            .into_io_unlogged(),
+        ),
     }
 }
 
-/// `process` (the process `pid`), classified by what reading its token for the
-/// service SID gave. A token that cannot be read is not the service's: the
-/// service's own is readable by SYSTEM and by an elevated administrator
-/// (measured by the service-SID probes), so an unreadable one is some protected
-/// process that reused the id. It is not an error either, which would fail an
-/// uninstall for a process that has nothing to do with the service.
-fn opened_from_token_read<P>(process: P, pid: u32, read: io::Result<bool>) -> Opened<P> {
+/// `process`, classified by what reading its token for the service SID gave.
+/// A token that cannot be read is resolved by `basis`, unless the process has
+/// exited: a process that ends under the read explains the failure and is
+/// simply gone.
+fn opened_from_token_read<P>(
+    process: P,
+    basis: Basis,
+    read: io::Result<bool>,
+    has_exited: impl FnOnce(&P) -> io::Result<bool>,
+) -> io::Result<Opened<P>> {
     match read {
-        Ok(true) => Opened::Service(process),
-        Ok(false) => Opened::NotTheService,
-        Err(e) => {
-            tracing::warn!(pid, error = %e, "the token of the process the SCM names cannot be read: not the service's");
-            Opened::NotTheService
+        Ok(true) => Ok(Opened::Service(process)),
+        Ok(false) => Ok(Opened::NotTheService),
+        Err(error) if has_exited(&process)? => {
+            tracing::debug!(%error, "the token of a process that has exited cannot be read");
+            Ok(Opened::NoSuchProcess)
         }
+        Err(error) => Opened::of_failure(basis, error),
     }
 }
 
@@ -76,6 +85,61 @@ pub(super) fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
     } else {
         Err(ScmCall::WaitForSingleObject.failed_with(&io::Error::last_os_error()))
     }
+}
+
+/// Every process on the host, for [`scan_service_processes`].
+struct HostProcesses<'a> {
+    service: &'a ServiceSid,
+}
+
+impl ProcessEnumerator for HostProcesses<'_> {
+    type Process = OwnedHandle;
+
+    fn pids(&mut self) -> io::Result<Vec<u32>> {
+        // SAFETY: plain FFI call.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+            .map_err(|e| io::Error::from_raw_os_error(win32_code_of_hresult(e.code().0) as i32))?;
+        // SAFETY: `CreateToolhelp32Snapshot` returned a new handle this value now owns.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.0) };
+        let handle = HANDLE(snapshot.as_raw_handle());
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut pids = Vec::new();
+        // SAFETY: `handle` is the live snapshot just returned, and `entry` is
+        // a `PROCESSENTRY32W` with its size set, as both calls require.
+        let mut more = unsafe { Process32FirstW(handle, &mut entry) }.is_ok();
+        while more {
+            pids.push(entry.th32ProcessID);
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(handle, &mut entry) }.is_ok();
+        }
+        Ok(pids)
+    }
+
+    fn this_process(&self) -> u32 {
+        // SAFETY: plain FFI call.
+        unsafe { GetCurrentProcessId() }
+    }
+
+    fn open(&mut self, pid: u32) -> io::Result<Opened<OwnedHandle>> {
+        open_process(pid, self.service, Basis::Scanned)
+    }
+
+    fn has_exited(&mut self, process: &OwnedHandle) -> io::Result<bool> {
+        has_exited(process)
+    }
+}
+
+/// Every live process on the host whose token carries `service`, other than
+/// the calling one, descendants included. The SCM's state does not say that no
+/// such process is left (its id is never valid once STOPPED); this does.
+///
+/// A process that cannot be probed never fails the scan: see
+/// [`Basis::verdict`] for `Basis::Scanned`.
+pub fn scan_service_processes(service: &ServiceSid) -> io::Result<ScanResult<OwnedHandle>> {
+    scan(&mut HostProcesses { service })
 }
 
 /// Every process a retirement has seen its service run.
