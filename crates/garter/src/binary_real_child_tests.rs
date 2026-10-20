@@ -115,7 +115,15 @@ async fn dropping_a_reaped_roots_handle_does_not_signal_its_process_group() {
     let mut tree = UnwatchableRoot(child);
     let reader = || tokio::spawn(async {});
     let shutdown = CancellationToken::new();
-    let end = supervise_plugin("p", &mut tree, &shutdown, Duration::from_secs(5), reader(), reader());
+    let end = supervise_plugin(
+        "p",
+        &mut tree,
+        &shutdown,
+        Duration::from_secs(5),
+        reader(),
+        reader(),
+        None,
+    );
     let end = pin!(end).await.unwrap();
     assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "the root exited 0");
     drop(tree);
@@ -177,6 +185,7 @@ async fn an_exited_root_is_reported_as_exited_when_a_shutdown_request_is_already
         Duration::from_secs(5),
         reader(),
         reader(),
+        None,
     )
     .await
     .unwrap();
@@ -204,6 +213,7 @@ async fn a_running_root_is_shut_down_when_a_shutdown_request_is_already_pending(
         Duration::from_secs(5),
         reader(),
         reader(),
+        None,
     )
     .await
     .unwrap();
