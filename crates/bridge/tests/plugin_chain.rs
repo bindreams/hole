@@ -186,11 +186,10 @@ async fn a_failed_chain_start_reports_the_plugin_ring() {
 
 /// A crash on STDERR (not stdout — the common shape for a Go panic under
 /// `GOTRACEBACK=crash`) must reach `warn_recent`'s ring too, not just a
-/// stdout crash. The sitrep stdout reader's readiness-failure path joins the
-/// stderr reader (bounded, not indefinite — see
-/// `spawn_sitrep_stdout_reader`'s doc in garter) before dropping the
-/// readiness sender, so this is a real rendezvous for the "exited before
-/// ready" case this test drives, not a scheduling bet.
+/// stdout crash. garter delivers a start failure only after the plugin's tree
+/// is down and both output readers have finished (or hit their failure bound;
+/// see `supervise_plugin`'s doc), so this is a real rendezvous for the
+/// stdout-closed-before-ready case this test drives, not a scheduling bet.
 #[skuld::test]
 async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
     use tracing_subscriber::layer::{Layer, SubscriberExt};

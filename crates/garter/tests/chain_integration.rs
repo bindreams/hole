@@ -413,6 +413,99 @@ async fn bind_conflict_start_error_surfaces_typed() {
     let _ = chain_task.await;
 }
 
+/// Run a single `ExpectSitrep` mock-plugin that spawns a stdio-inheriting grandchild, emits the
+/// typed failure `fail` and exits. The grandchild is up before the plugin emits, and still holds
+/// the plugin's stdout and stderr pipes when the plugin is gone.
+///
+/// The host's log sink parks the stdout reader on the typed line until the grandchild is dead, so
+/// the reader is still behind when the plugin's exit is observed. The typed failure therefore
+/// reaches `ready` only if the exit path kills the plugin's tree and then waits for the reader
+/// (which sees EOF once the grandchild is gone) instead of giving up on it. No clock decides
+/// anything here: the gate opens when the grandchild's control connection closes.
+fn typed_failure_with_a_descendant_holding_the_pipes(fail: &str) -> Result<ChainReady, StartError> {
+    // The sink blocks inside a task, which `block_in_place` allows only on a multi-thread runtime.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let chain_local = chain_listener.local_addr().unwrap();
+        drop(chain_listener);
+
+        // The grandchild dials this address once it is up and holds the connection; the connection
+        // closing means it is dead.
+        let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let grandchild_watch = tokio::spawn(async move {
+            let (mut control, _) = control_listener.accept().await.unwrap();
+            // EOF or a reset: either way the grandchild's process is gone.
+            let _ = control.read(&mut [0u8; 1]).await;
+            let _ = gate_tx.send(());
+        });
+
+        let gate_rx = Mutex::new(gate_rx);
+        let sink: garter::LogSink = Arc::new(move |line: &str| {
+            let typed_failure = ["\"event\":\"fatal\"", "\"event\":\"bind_conflict\""]
+                .iter()
+                .any(|event| line.contains(event));
+            if typed_failure {
+                // `recv` also returns when the watch task ended without opening the gate.
+                let _ = tokio::task::block_in_place(|| gate_rx.lock().unwrap().recv());
+            }
+        });
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = ChainRunner::new()
+            .add(Box::new(
+                BinaryPlugin::new(mock_plugin_path(), None)
+                    .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                    .log_sink(sink)
+                    .env("MOCK_PLUGIN_FAIL", fail)
+                    .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", control_addr.to_string()),
+            ))
+            .on_ready(ready_tx)
+            .drain_timeout(Duration::from_secs(3));
+        let env = PluginEnv {
+            local_host: chain_local.ip(),
+            local_port: chain_local.port(),
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 9,
+            plugin_options: None,
+        };
+        let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+        let outcome = expect_ready(ready_rx).await;
+        // The plugin has exited, so the chain ends by itself; a panic in `run`'s exit path surfaces here.
+        let run_result = chain_task.await.expect("the chain task must not panic");
+        assert!(
+            run_result.is_err(),
+            "a plugin that exited with a failure ends the chain with an error"
+        );
+        // The gate opened because the grandchild died, not because the watch task gave up.
+        grandchild_watch.await.expect("the grandchild watch must not panic");
+        outcome
+    })
+}
+
+#[skuld::test]
+fn bind_conflict_surfaces_typed_when_a_descendant_holds_the_output_pipes() {
+    match typed_failure_with_a_descendant_holding_the_pipes("bind_conflict") {
+        Err(StartError::BindConflict { errno, .. }) => assert_ne!(errno, 0),
+        other => panic!("expected StartError::BindConflict, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn fatal_surfaces_typed_when_a_descendant_holds_the_output_pipes() {
+    match typed_failure_with_a_descendant_holding_the_pipes("fatal") {
+        Err(StartError::Fatal { detail, .. }) => assert_eq!(detail, "injected fatal"),
+        other => panic!("expected StartError::Fatal, got {other:?}"),
+    }
+}
+
 /// A `ready` event that lists an empty transports set is a SITREP
 /// protocol violation; the consumer rejects it as `StartError::Fatal`.
 #[skuld::test]
@@ -1343,6 +1436,204 @@ async fn sitrep_parser_sees_the_line_before_any_ansi_strip() {
     );
 
     chain_task.abort();
+}
+
+// A shutdown before ready is not a start failure ======================================================================
+
+/// A chain shut down while its plugin has not said `ready` ends `Ok`, and the caller of `on_ready` hears nothing: the
+/// plugin's stdout closing is the shutdown's doing, not a start failure. Every readiness mode, with a plugin that is
+/// silent on stdout and with one that has said `hello` and then holds.
+///
+/// The `Probe` rows and the `Auto` rows without a handshake never had the reader decide a failure at the end of
+/// stdout (a probe owns readiness), so they were green before the shutdown exception and guard that it stayed so. The
+/// `ExpectSitrep` rows and `Auto` with a handshake pin the order {cancel, then the take-down closes stdout}.
+#[skuld::test]
+async fn a_shutdown_before_ready_is_not_a_start_failure() {
+    use garter::binary::ReadinessMode;
+
+    let mut wrong = Vec::new();
+    for (mode, sitrep) in [
+        (ReadinessMode::ExpectSitrep, false),
+        (ReadinessMode::ExpectSitrep, true),
+        (ReadinessMode::Auto, false),
+        (ReadinessMode::Auto, true),
+        (ReadinessMode::Probe, false),
+        (ReadinessMode::Probe, true),
+    ] {
+        let label = format!("{mode:?}, hello={sitrep}");
+        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let chain_local = chain_listener.local_addr().unwrap();
+        drop(chain_listener);
+
+        // The shutdown comes once the plugin is in the state the row names: spawned, or (with a handshake) its
+        // `hello` read. The sink runs inside the reader's poll, before `hello` is processed, so the row is reached with
+        // the reader still reading and the plugin's stdout open.
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let reached_tx = Arc::new(Mutex::new(Some(reached_tx)));
+        let signal = move || {
+            if let Some(tx) = reached_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        };
+        let plugin = BinaryPlugin::new(mock_plugin_path(), None)
+            .readiness(mode)
+            .env("MOCK_PLUGIN_HOLD_BEFORE_READY", "1");
+        let plugin = if sitrep {
+            plugin.log_sink(Arc::new(move |_line: &str| signal()))
+        } else {
+            plugin
+                .pid_sink(Arc::new(move |_pid| signal()))
+                .env("MOCK_PLUGIN_NO_SITREP", "1")
+        };
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let runner = ChainRunner::new()
+            .add(Box::new(plugin))
+            .on_ready(ready_tx)
+            .cancel_token(cancel.clone())
+            .drain_timeout(Duration::from_secs(30));
+        let env = PluginEnv {
+            local_host: chain_local.ip(),
+            local_port: chain_local.port(),
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 9,
+            plugin_options: None,
+        };
+        let chain = tokio::spawn(async move { runner.run(env).await });
+
+        reached_rx.await.expect("the plugin reached the state of the row");
+        cancel.cancel();
+        let run = chain.await.expect("the chain task ended");
+        let heard = ready_rx.await;
+
+        if !(run.is_ok() && heard.is_err()) {
+            wrong.push(format!("{label}: run = {run:?}, on_ready = {heard:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} rows are wrong:
+{}",
+        wrong.len(),
+        wrong.join(
+            "
+"
+        )
+    );
+}
+
+// A probe-owned plugin that exits before ready ========================================================================
+
+/// A plugin whose readiness a self-probe owns (`Probe`; `Auto` without a supported `hello`; `ExpectSitrep` after an
+/// unknown protocol major handed readiness to the probe) that exits before it is ready is reported to the caller as
+/// the typed `Fatal`, and `run` returns the plugin's exit. The probe task holds the readiness sender, so it must be
+/// gone by the time the plugin's `run` returns.
+#[skuld::test]
+async fn a_probe_owned_plugin_that_exits_before_ready_reports_the_typed_fatal() {
+    use garter::binary::ReadinessMode;
+
+    let mut wrong = Vec::new();
+    for (mode, env_knobs) in [
+        (ReadinessMode::Probe, &[("MOCK_PLUGIN_NO_SITREP", "1")][..]),
+        (ReadinessMode::Auto, &[("MOCK_PLUGIN_NO_SITREP", "1")][..]),
+        (ReadinessMode::ExpectSitrep, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
+        (ReadinessMode::Auto, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
+    ] {
+        let label = format!("{mode:?}, {env_knobs:?}");
+        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let chain_local = chain_listener.local_addr().unwrap();
+        drop(chain_listener);
+
+        let mut plugin = BinaryPlugin::new(mock_plugin_path(), None)
+            .readiness(mode)
+            .env("MOCK_PLUGIN_FAIL", "fatal");
+        for (k, v) in env_knobs {
+            plugin = plugin.env(*k, *v);
+        }
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = ChainRunner::new()
+            .add(Box::new(plugin))
+            .on_ready(ready_tx)
+            .drain_timeout(Duration::from_secs(30));
+        let env = PluginEnv {
+            local_host: chain_local.ip(),
+            local_port: chain_local.port(),
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 9,
+            plugin_options: None,
+        };
+        let run = runner.run(env).await;
+        let heard = ready_rx.await;
+
+        let typed = matches!(
+            &heard,
+            Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")
+        );
+        let exit = matches!(&run, Err(garter::Error::PluginExit { code: 1, .. }));
+        if !(typed && exit) {
+            wrong.push(format!("{label}: run = {run:?}, on_ready = {heard:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} rows are wrong:
+{}",
+        wrong.len(),
+        wrong.join(
+            "
+"
+        )
+    );
+}
+
+/// The same plugins, run without a chain: when `run` returns, no probe task still holds the readiness sender. This is
+/// the guarantee the chain's reading of an exit rests on; nothing here yields after `run` returns, so a probe that
+/// had only been told to stop, not joined, would still hold it.
+#[skuld::test]
+async fn a_probe_owned_plugin_that_exits_before_ready_has_dropped_its_sender_when_run_returns() {
+    use garter::binary::ReadinessMode;
+    use garter::ChainPlugin;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    let mut wrong = Vec::new();
+    for (mode, env_knobs) in [
+        (ReadinessMode::Probe, &[("MOCK_PLUGIN_NO_SITREP", "1")][..]),
+        (ReadinessMode::Auto, &[("MOCK_PLUGIN_NO_SITREP", "1")][..]),
+        (ReadinessMode::ExpectSitrep, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
+        (ReadinessMode::Auto, &[("MOCK_PLUGIN_BAD_PROTOCOL", "1")][..]),
+    ] {
+        let label = format!("{mode:?}, {env_knobs:?}");
+        let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = chain_listener.local_addr().unwrap();
+        drop(chain_listener);
+
+        let mut plugin = BinaryPlugin::new(mock_plugin_path(), None)
+            .readiness(mode)
+            .env("MOCK_PLUGIN_FAIL", "fatal");
+        for (k, v) in env_knobs {
+            plugin = plugin.env(*k, *v);
+        }
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        let run = Box::new(plugin)
+            .run(
+                local,
+                "127.0.0.1:9".parse().unwrap(),
+                tokio_util::sync::CancellationToken::new(),
+                ready_tx,
+            )
+            .await;
+
+        let seen = ready_rx.try_recv();
+        if !(run.is_err() && matches!(seen, Err(TryRecvError::Closed))) {
+            wrong.push(format!("{label}: run = {run:?}, ready = {seen:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} rows are wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 fn main() {

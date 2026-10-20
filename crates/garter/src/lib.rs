@@ -1,8 +1,11 @@
 mod ansi;
+mod backoff;
 pub mod binary;
 pub mod chain;
 pub mod counting;
 pub mod error;
+#[cfg(target_os = "linux")]
+mod exit_watch;
 pub mod plugin;
 pub mod shutdown;
 pub mod sip003;
@@ -27,19 +30,31 @@ pub use tap::TapPlugin;
 #[cfg(test)]
 mod ansi_tests;
 #[cfg(test)]
+mod backoff_tests;
+#[cfg(test)]
+mod binary_probe_tests;
+#[cfg(all(test, unix))]
+mod binary_real_child_tests;
+#[cfg(test)]
 mod binary_tests;
+#[cfg(test)]
+mod chain_failure_tests;
 #[cfg(test)]
 mod chain_tests;
 #[cfg(test)]
 mod counting_tests;
 #[cfg(test)]
 mod error_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod exit_watch_tests;
 #[cfg(test)]
 mod plugin_tests;
 #[cfg(test)]
 mod sip003_tests;
 #[cfg(test)]
 mod sitrep_tests;
+#[cfg(test)]
+mod tap_failed_start_tests;
 #[cfg(test)]
 mod tap_tests;
 #[cfg(test)]

@@ -79,6 +79,10 @@ it owes.
   stdout.
 - Standard error is unconstrained: it carries the plugin's
   human-readable logs and is not part of the sitrep stream.
+- After `ready`, the plugin **MUST** keep its listener accepting for as
+  long as it runs. A plugin that can no longer accept connections
+  **MUST** exit: the wire has no "stopped serving" event, so exit is the
+  only signal a host can act on.
 
 ### Consumer (host) conformance
 
