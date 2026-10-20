@@ -102,8 +102,8 @@ pub struct GoneSession {
     processes: ServiceProcesses,
 }
 
-impl GoneSession {
-    pub fn new() -> Self {
+impl Default for GoneSession {
+    fn default() -> Self {
         Self {
             sid: ServiceSid::of(SERVICE_NAME),
             processes: ServiceProcesses::default(),

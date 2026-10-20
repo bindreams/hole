@@ -21,8 +21,7 @@ use crate::service_stop::{self, StopPhase, StopProgress};
 #[path = "windows/retire_session.rs"]
 mod retire_session;
 pub use crate::cutover::scm_wait::retire::Opening;
-use retire_session::GoneSession;
-pub use retire_session::RetireSession;
+pub use retire_session::{GoneSession, RetireSession};
 #[path = "windows/registration.rs"]
 pub mod registration;
 #[path = "windows/service_processes.rs"]
@@ -696,7 +695,7 @@ pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
 /// act on, after waiting out any process of it that outlived the entry;
 /// `Ok(true)` when the retirement ran.
 fn retire_service(disposition: Disposition) -> Result<bool, Box<dyn std::error::Error>> {
-    Ok(retire_over(RetireSession::open()?, GoneSession::new, disposition)?)
+    Ok(retire_over(RetireSession::open()?, GoneSession::default, disposition)?)
 }
 
 /// Whether an `open_service` failure means the entry does not exist.

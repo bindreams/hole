@@ -3,11 +3,23 @@
 //! outcome. The real session still does the work: the state a later look reads
 //! comes from the SCM.
 
+use hole_bridge::cutover::scm_wait::call_error::{service_gone, ServiceGone};
 use hole_bridge::cutover::scm_wait::hold::Look;
-use hole_bridge::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartType, StartWrite};
+use hole_bridge::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartType, StartWrite, Survivors};
 use hole_bridge::cutover::scm_wait::settle::StopActor;
 use hole_bridge::cutover::scm_wait::Observed;
 use hole_bridge::platform::os::{Opening, RetireSession};
+
+/// A call on the session the SCM can refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Call {
+    ReadStartType,
+    ArmLeaving,
+    ControlStop,
+    SetStartType,
+    SetFailureActions,
+    Delete,
+}
 
 /// One act on the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,19 +28,27 @@ pub enum Event {
     Observed(Look),
     ArmLeaving(Observed),
     /// A Stop, with the state of the last look before it and the start type
-    /// the SCM held at that moment.
+    /// the SCM held at that moment, if a read of it was answered: a service
+    /// marked for deletion may refuse the read.
     Stop {
         after: Option<Observed>,
-        start_type: StartType,
+        start_type: Option<StartType>,
     },
     AwaitCallback,
     AwaitHeldExits,
     HoldScanned,
     SetStartType(StartWrite),
     SetFailureActions(FailureActions),
-    /// The delete, with the start type the SCM held at that moment.
+    /// The delete, with the start type the SCM held at that moment, if a read
+    /// of it was answered.
     Delete {
-        start_type: StartType,
+        start_type: Option<StartType>,
+    },
+    /// The SCM refused `call` through the session's handle; `marked` is
+    /// whether it answered that the service is marked for deletion.
+    Refused {
+        call: Call,
+        marked: bool,
     },
 }
 
@@ -63,6 +83,15 @@ impl<'a, S> Recording<'a, S> {
         (self.hook)(&event);
     }
 
+    /// `result`, after recording it as a refusal of `call` if it is one.
+    fn note<T>(&mut self, call: Call, result: std::io::Result<T>) -> std::io::Result<T> {
+        if let Err(error) = &result {
+            let marked = service_gone(error) == Some(ServiceGone::MarkedForDeletion);
+            self.record(Event::Refused { call, marked });
+        }
+        result
+    }
+
     fn last_observed(&self) -> Option<Observed> {
         self.events.iter().rev().find_map(|event| match event {
             Event::Observed(look) => Some(look.observed),
@@ -89,16 +118,18 @@ impl<S: ServiceSession> StopActor for Recording<'_, S> {
 
     fn arm_leaving(&mut self, from: Observed) -> std::io::Result<()> {
         self.record(Event::ArmLeaving(from));
-        self.inner.arm_leaving(from)
+        let result = self.inner.arm_leaving(from);
+        self.note(Call::ArmLeaving, result)
     }
 
     fn control_stop(&mut self) -> std::io::Result<()> {
         // The read is the test's own, on the session's handle, and is not an
-        // act of the retirement.
-        let start_type = self.inner.start_type()?;
+        // act of the retirement. A marked service may refuse it.
+        let start_type = self.inner.start_type().ok();
         let after = self.last_observed();
         self.record(Event::Stop { after, start_type });
-        self.inner.control_stop()
+        let result = self.inner.control_stop();
+        self.note(Call::ControlStop, result)
     }
 
     fn await_callback(&mut self) -> std::io::Result<()> {
@@ -119,23 +150,28 @@ impl<S: ServiceSession> StopActor for Recording<'_, S> {
 
 impl<S: ServiceSession> ServiceSession for Recording<'_, S> {
     fn start_type(&mut self) -> std::io::Result<StartType> {
-        self.inner.start_type()
+        let result = self.inner.start_type();
+        self.note(Call::ReadStartType, result)
     }
 
     fn set_start_type(&mut self, to: StartWrite) -> std::io::Result<()> {
         self.record(Event::SetStartType(to));
-        self.inner.set_start_type(to)
+        let result = self.inner.set_start_type(to);
+        self.note(Call::SetStartType, result)
     }
 
     fn set_failure_actions(&mut self, actions: FailureActions) -> std::io::Result<()> {
         self.record(Event::SetFailureActions(actions));
-        self.inner.set_failure_actions(actions)
+        let result = self.inner.set_failure_actions(actions);
+        self.note(Call::SetFailureActions, result)
     }
 
     fn delete(&mut self) -> std::io::Result<()> {
-        let start_type = self.inner.start_type()?;
+        // The read is the test's own, as in `control_stop`.
+        let start_type = self.inner.start_type().ok();
         self.record(Event::Delete { start_type });
-        self.inner.delete()
+        let result = self.inner.delete();
+        self.note(Call::Delete, result)
     }
 }
 
@@ -150,6 +186,23 @@ impl Trace {
             .iter()
             .filter_map(|event| match event {
                 Event::Observed(look) => Some(look.observed),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every act, in order.
+    pub fn events(&self) -> &[Event] {
+        &self.0
+    }
+
+    /// The calls the SCM refused, in order, with whether each was answered as
+    /// marked for deletion.
+    pub fn refusals(&self) -> Vec<(Call, bool)> {
+        self.0
+            .iter()
+            .filter_map(|event| match event {
+                Event::Refused { call, marked } => Some((*call, *marked)),
                 _ => None,
             })
             .collect()
@@ -180,13 +233,13 @@ impl Trace {
                     );
                     assert_eq!(
                         *start_type,
-                        StartType::Disabled,
+                        Some(StartType::Disabled),
                         "a Stop went out with the start type not disabled: {self:#?}"
                     );
                 }
                 Event::Delete { start_type } => assert_eq!(
                     *start_type,
-                    StartType::Disabled,
+                    Some(StartType::Disabled),
                     "the delete came with the start type not disabled: {self:#?}"
                 ),
                 _ => {}
@@ -196,6 +249,51 @@ impl Trace {
             matches!(self.0.last(), Some(Event::Delete { .. })),
             "the session was used after the delete, or never deleted the service: {self:#?}"
         );
+    }
+
+    /// Fails unless a Stop went out only after a look that read RUNNING.
+    pub fn assert_every_stop_follows_a_running_look(&self) {
+        for event in &self.0 {
+            if let Event::Stop { after, .. } = event {
+                assert_eq!(
+                    *after,
+                    Some(Observed::Running),
+                    "a Stop went out after a look that did not read RUNNING: {self:#?}"
+                );
+            }
+        }
+    }
+
+    /// What a retirement of a service found marked for deletion must satisfy:
+    /// the one refusal is a start-type read or write answered as marked, every
+    /// start-type write was that refusal, and no failure-actions write, delete
+    /// or restore was issued.
+    pub fn assert_a_start_type_call_was_refused_as_marked_and_nothing_changed(&self) {
+        assert!(
+            matches!(
+                self.refusals().as_slice(),
+                [(Call::ReadStartType | Call::SetStartType, true)]
+            ),
+            "the one refusal must be a start-type call answered as marked: {self:#?}"
+        );
+        for (at, event) in self.0.iter().enumerate() {
+            match event {
+                Event::SetStartType(_) => assert!(
+                    matches!(
+                        self.0.get(at + 1),
+                        Some(Event::Refused {
+                            call: Call::SetStartType,
+                            ..
+                        })
+                    ),
+                    "a start-type write was not refused: {self:#?}"
+                ),
+                Event::SetFailureActions(_) | Event::Delete { .. } => {
+                    panic!("the retirement changed a service that was marked for deletion: {self:#?}")
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Fails unless every Stop came straight after an arm for the states
@@ -213,5 +311,50 @@ impl Trace {
                 "a Stop was not preceded by an arm leaving RUNNING: {self:#?}"
             );
         }
+    }
+}
+
+/// One act on the survivors of a removed service entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurvivorEvent {
+    HoldScanned,
+    /// The answer to the state read of every held process.
+    AnyAlive(bool),
+    AwaitExits,
+}
+
+/// Called for each act after it is recorded and before the real survivors
+/// perform it, so a wait is announced before it blocks.
+pub type SurvivorHook<'a> = Box<dyn FnMut(&SurvivorEvent) + 'a>;
+
+/// Survivors over the real ones that report every act to a hook. The hook is
+/// the record: `retire_over` consumes the survivors it builds, so nothing is
+/// left to read after it returns.
+pub struct RecordingSurvivors<'a, W> {
+    inner: W,
+    hook: SurvivorHook<'a>,
+}
+
+impl<'a, W> RecordingSurvivors<'a, W> {
+    pub fn new(inner: W, hook: SurvivorHook<'a>) -> Self {
+        Self { inner, hook }
+    }
+}
+
+impl<W: Survivors> Survivors for RecordingSurvivors<'_, W> {
+    fn hold_scanned(&mut self) -> std::io::Result<()> {
+        (self.hook)(&SurvivorEvent::HoldScanned);
+        self.inner.hold_scanned()
+    }
+
+    fn any_alive(&mut self) -> std::io::Result<bool> {
+        let alive = self.inner.any_alive()?;
+        (self.hook)(&SurvivorEvent::AnyAlive(alive));
+        Ok(alive)
+    }
+
+    fn await_exits(&mut self) -> std::io::Result<()> {
+        (self.hook)(&SurvivorEvent::AwaitExits);
+        self.inner.await_exits()
     }
 }

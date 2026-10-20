@@ -115,8 +115,7 @@ mod scm_deletion {
 
     use windows::core::{HRESULT, PCWSTR};
     use windows::Win32::Foundation::{
-        LocalFree, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING,
-        HLOCAL,
+        LocalFree, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, HLOCAL,
     };
     use windows::Win32::System::Services::{
         CloseServiceHandle, NotifyServiceStatusChangeW, OpenSCManagerW, OpenServiceW, SC_HANDLE, SC_MANAGER_CONNECT,
@@ -182,10 +181,9 @@ mod scm_deletion {
                 return Err(HRESULT::from_win32(rc).into());
             }
             match unsafe { OpenServiceW(scm.0, PCWSTR(wide.as_ptr()), SERVICE_QUERY_STATUS) } {
+                // Still listed: a service marked for deletion opens.
                 Ok(service) => drop(ScHandle(service)),
                 Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_DOES_NOT_EXIST.0) => return Ok(()),
-                // Still listed, with the deletion pending.
-                Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_MARKED_FOR_DELETE.0) => {}
                 Err(e) => return Err(e),
             }
             // The APC runs inside this alertable wait; an unrelated APC just
@@ -323,10 +321,10 @@ impl ProvisionedService {
     /// service marked for deletion stays registered for as long as that process
     /// does, so waiting for the deletion would wait on an exit nothing in this
     /// test will cause, and an arm on it may not report at all. Every later test
-    /// would hang at `starting`, with nothing naming why (bindreams/hole#1099).
+    /// would hang at `starting`, with nothing naming why.
     fn require_no_leftover() {
         use hole_bridge::platform::os::SERVICE_NAME;
-        use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE};
+        use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
         use windows_service::service::ServiceAccess;
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -335,11 +333,6 @@ impl ProvisionedService {
         let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
             Ok(service) => service,
             Err(e) if Self::open_error_is(&e, ERROR_SERVICE_DOES_NOT_EXIST) => return,
-            Err(e) if Self::open_error_is(&e, ERROR_SERVICE_MARKED_FOR_DELETE) => panic!(
-                "a leftover {SERVICE_NAME} service is marked for deletion: an earlier run was killed before it \
-                 cleaned up, and the deletion cannot finish while that run's service process is alive. \
-                 Stop or kill test_service.exe and run again"
-            ),
             Err(e) => panic!("opening {SERVICE_NAME} to look for a leftover failed: {e}"),
         };
         match service.query_status() {
@@ -361,12 +354,13 @@ impl ProvisionedService {
     /// Kills the throwaway service's process and deletes the service, returning
     /// only once it no longer exists. It acts on the service as it finds it: a
     /// probe that panicked can leave it running, or marked for deletion with
-    /// its process alive, and no cooperative Stop is waited on in either state.
+    /// its process alive (which still opens), and no cooperative Stop is waited
+    /// on in either state.
     /// Best-effort: failures are reported on stderr, never panicked on, because
     /// this also runs from `Drop`.
     fn teardown() {
         use hole_bridge::platform::os::SERVICE_NAME;
-        use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE};
+        use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
         use windows_service::service::ServiceAccess;
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -388,9 +382,6 @@ impl ProvisionedService {
             }
             // Not present: nothing to clean.
             Err(e) if Self::open_error_is(&e, ERROR_SERVICE_DOES_NOT_EXIST) => return,
-            // Deleted but not yet gone, should the open itself report it: only
-            // the wait below applies.
-            Err(e) if Self::open_error_is(&e, ERROR_SERVICE_MARKED_FOR_DELETE) => {}
             Err(e) => eprintln!("teardown: opening the throwaway service failed (awaiting deletion anyway): {e}"),
         }
         drop(manager);
@@ -1347,6 +1338,28 @@ mod scm_probe {
             }
             let _ = CloseHandle(process);
         }
+    }
+
+    /// A handle on process `pid`, taken while it is the service's, so a later
+    /// [`wait_for_exit`] cannot land on a process that reused its id.
+    pub fn watch_process(pid: u32) -> std::os::windows::io::OwnedHandle {
+        use std::os::windows::io::FromRawHandle;
+        use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+
+        // SAFETY: plain FFI call.
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.expect("open the service process");
+        // SAFETY: `OpenProcess` returned a new handle this value now owns.
+        unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(process.0) }
+    }
+
+    /// Returns once the process `process` watches has exited. Unbounded on
+    /// purpose: the caller has already made it exit.
+    pub fn wait_for_exit(process: &std::os::windows::io::OwnedHandle) {
+        use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+
+        let handle = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(process));
+        // SAFETY: `handle` is the live handle `process` owns.
+        unsafe { WaitForSingleObject(handle, INFINITE) };
     }
 
     /// Kills process `pid` the way Task Manager would.
@@ -2524,6 +2537,298 @@ fn cutover_global_net_state_ensure_stopped_leaves_the_failure_actions_as_it_foun
     left_behind::assert_none(&pid_log);
 
     assert_eq!(read(), before, "the retirement put the failure actions back");
+}
+
+/// A handle on the registered service, held by the test, that can delete it.
+/// While it is open it keeps the entry, so a delete through it leaves the
+/// service marked for deletion and still listed.
+#[cfg(target_os = "windows")]
+fn open_to_delete() -> windows_service::service::Service {
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .expect("open the SCM to hold the service");
+    manager
+        .open_service(SERVICE_NAME, ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS)
+        .expect("open the registered service to delete it")
+}
+
+/// Marks the service for deletion through `holder`, and checks it is marked: a
+/// second delete is answered `ERROR_SERVICE_MARKED_FOR_DELETE`, as documented
+/// for `DeleteService`.
+#[cfg(target_os = "windows")]
+fn mark_for_deletion(holder: &windows_service::service::Service) {
+    use windows::Win32::Foundation::ERROR_SERVICE_MARKED_FOR_DELETE;
+
+    holder.delete().expect("mark the service for deletion");
+    match holder.delete() {
+        Err(windows_service::Error::Winapi(io))
+            if io.raw_os_error() == Some(ERROR_SERVICE_MARKED_FOR_DELETE.0 as i32) => {}
+        other => panic!("a second delete of a marked service is answered marked-for-delete: {other:?}"),
+    }
+}
+
+/// A service already marked for deletion by someone else, running, when the
+/// production retirement opens it: it opens, the start-type call is answered
+/// as marked, the Stop goes through the open handle, and the retirement waits
+/// out the process and succeeds without a delete of its own or a restore.
+///
+/// Proves: the retirement succeeds and the process is dead (so the marked
+/// service was stopped through its handle), with no change issued after the
+/// refusal. Red under: a start-type call answered as marked read as a
+/// failure (`ServiceGone::harden_goes_on_marked` false for `MarkedForDeletion`),
+/// or marked mode skipping the stop wait.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_stops_a_service_marked_before_it_was_opened() {
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let _service = ProvisionedService::install_with_args(helper, pid_log_args(&pid_log));
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    let holder = open_to_delete();
+    mark_for_deletion(&holder);
+
+    let trace = deregister_recorded(Box::new(|_| {}));
+    drop(holder);
+
+    left_behind::assert_none(&pid_log);
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    trace.assert_a_start_type_call_was_refused_as_marked_and_nothing_changed();
+    trace.assert_every_stop_follows_a_running_look();
+    assert!(trace.stops() > 0, "the running service needed a Stop: {trace:#?}");
+}
+
+/// The mark lands after the hardening and before the Stop: the hook marks the
+/// service through a handle the test holds, at the first look. The start-type
+/// write succeeded, the Stop goes through the open handle, the delete is
+/// answered as marked and counts as done, and nothing is restored.
+///
+/// Proves: the delete's 1072 is not a failure and the Stop reaches a service
+/// that was marked mid-retirement. Red under: `ServiceGone::delete_is_done`
+/// false for `MarkedForDeletion` (the delete fails and the restore runs).
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_stops_a_service_marked_between_the_hardening_and_the_stop() {
+    use hole_bridge::cutover::scm_wait::retire::{FailureActions, StartWrite};
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let _service = ProvisionedService::install_with_args(helper, pid_log_args(&pid_log));
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+
+    // The first look comes after the hardening, so the write has already
+    // succeeded. The handle closes with the hook, when the session is
+    // finished.
+    let holder = open_to_delete();
+    let mut marked = false;
+    let hook: recording::Hook<'_> = Box::new(move |event| {
+        if !marked && matches!(event, recording::Event::Observed(_)) {
+            marked = true;
+            mark_for_deletion(&holder);
+        }
+    });
+    let trace = deregister_recorded(hook);
+
+    left_behind::assert_none(&pid_log);
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    trace.assert_every_stop_follows_a_running_look();
+    assert!(trace.stops() > 0, "the running service needed a Stop: {trace:#?}");
+    let events = trace.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, recording::Event::SetStartType(_)))
+            .collect::<Vec<_>>(),
+        [&recording::Event::SetStartType(StartWrite::Disabled)],
+        "one start-type write, the hardening's, and no restore: {trace:#?}"
+    );
+    assert!(
+        !events.contains(&recording::Event::SetFailureActions(FailureActions::Restart)),
+        "restart-on-failure was put back on a deleted service: {trace:#?}"
+    );
+    assert_eq!(
+        trace.refusals(),
+        [(recording::Call::Delete, true)],
+        "the only refusal is the delete, answered as marked: {trace:#?}"
+    );
+}
+
+/// A service marked for deletion that has already stopped, its process gone,
+/// while a handle held elsewhere keeps the entry. Nothing is left to stop, so
+/// no Stop is sent and the retirement succeeds.
+///
+/// Proves: a marked, stopped service with no process is not a failure. Red
+/// under: a start-type call answered as marked read as a failure.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_of_a_marked_and_already_stopped_service_succeeds() {
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let _service = ProvisionedService::install_with_args(helper, pid_log_args(&pid_log));
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    let service_pids = left_behind::logged(&pid_log);
+    assert_eq!(service_pids.len(), 1, "one service process so far: {service_pids:?}");
+    let process = scm_probe::watch_process(service_pids[0]);
+
+    scm_probe::Probe::open().stop().expect("the test stops the service");
+    wait_until_stopped();
+    scm_probe::wait_for_exit(&process);
+    let holder = open_to_delete();
+    mark_for_deletion(&holder);
+
+    let trace = deregister_recorded(Box::new(|_| {}));
+    drop(holder);
+
+    left_behind::assert_none(&pid_log);
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+    assert_eq!(trace.stops(), 0, "a stopped service takes no Stop: {trace:#?}");
+    trace.assert_a_start_type_call_was_refused_as_marked_and_nothing_changed();
+}
+
+/// A process that outlives an entry the SCM no longer has. The service is
+/// stopped by the test, its helper parked after reporting STOPPED, and deleted
+/// with no other handle open: the SCM drops the entry while the process lives.
+/// The setup waits for the entry to go (no sooner than the SCM drops it): if
+/// the SCM kept the marked entry while its process lives, this test would not
+/// get past that wait, and the case would be the marked one above.
+///
+/// The retirement runs on a thread over survivors that report every act on one
+/// channel. The test lets the helper exit only on the wait announced for it,
+/// with the helper alive, so a retirement that returns first never waited. No
+/// timing: the thread's next message is whatever the retirement does next.
+///
+/// Proves: the entry is absent at open, the retirement scans, waits on the
+/// process, scans again, and returns `Ok(false)`, and no process is left. Red
+/// under: `wait_out_survivors` returning without waiting.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_waits_out_a_process_whose_entry_is_already_gone() {
+    use hole_bridge::cutover::scm_wait::retire::{retire_over, Disposition, RetireError};
+    use hole_bridge::platform::os::{GoneSession, RetireSession, SERVICE_NAME};
+    use recording::SurvivorEvent;
+
+    #[derive(Debug)]
+    enum Message {
+        Survivor(SurvivorEvent),
+        Returned(Result<bool, RetireError>),
+    }
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let parked = named_event::NamedEvent::create("GoneParked");
+    let exit = named_event::NamedEvent::create("GoneExit");
+    let mut args = pid_log_args(&pid_log);
+    args.extend([
+        "--outlive-stopped".into(),
+        exit.name().into(),
+        "--parked-event".into(),
+        parked.name().into(),
+    ]);
+    let _service = ProvisionedService::install_with_args(helper, args);
+    let _exit_on_drop = exit.release_on_drop();
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    let service_pids = left_behind::logged(&pid_log);
+    assert_eq!(service_pids.len(), 1, "one service process so far: {service_pids:?}");
+
+    scm_probe::Probe::open().stop().expect("the test stops the service");
+    // The helper parks only after reporting STOPPED.
+    parked.wait();
+    let holder = open_to_delete();
+    holder.delete().expect("delete the stopped service");
+    drop(holder);
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the entry goes while its process lives");
+    assert_eq!(
+        left_behind::still_running(&pid_log),
+        service_pids,
+        "the process outlives its entry"
+    );
+
+    let (messages, inbox) = std::sync::mpsc::channel();
+    let retirement = std::thread::spawn(move || {
+        let sink = messages.clone();
+        let hook: recording::SurvivorHook<'_> = Box::new(move |event| {
+            let _ = sink.send(Message::Survivor(*event));
+        });
+        let opening = RetireSession::open().expect("open the retire session");
+        let result = retire_over(
+            opening,
+            || recording::RecordingSurvivors::new(GoneSession::default(), hook),
+            Disposition::Deregister,
+        );
+        let _ = messages.send(Message::Returned(result));
+    });
+
+    let mut seen = vec![];
+    let result = loop {
+        match inbox.recv().expect("the retirement ended without returning") {
+            Message::Survivor(event) => {
+                seen.push(event);
+                if event == SurvivorEvent::AwaitExits {
+                    assert_eq!(
+                        left_behind::still_running(&pid_log),
+                        service_pids,
+                        "the process waited on is the helper's, and it is alive"
+                    );
+                    exit.signal();
+                }
+            }
+            Message::Returned(result) => break result,
+        }
+    };
+    retirement.join().expect("the retirement thread");
+    assert!(
+        matches!(result, Ok(false)),
+        "the entry is absent, so nothing was retired: {result:?}"
+    );
+    assert_eq!(
+        seen,
+        [
+            SurvivorEvent::HoldScanned,
+            SurvivorEvent::AnyAlive(true),
+            SurvivorEvent::AwaitExits,
+            SurvivorEvent::HoldScanned,
+            SurvivorEvent::AnyAlive(false),
+        ],
+        "scan, wait on the process, and scan again until nothing is left"
+    );
+    left_behind::assert_none(&pid_log);
+    hole_bridge::platform::os::ensure_stopped().expect("nothing is left to stop");
+}
+
+/// A name the SCM has no entry for, and no process carrying its token: there
+/// is nothing to stop, which is success.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_ensure_stopped_on_an_unregistered_name_is_ok() {
+    ProvisionedService::require_no_leftover();
+    hole_bridge::platform::os::ensure_stopped().expect("an unregistered service is already stopped");
 }
 
 /// The helper's `--pid-log <path>` arguments.
