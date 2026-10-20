@@ -553,6 +553,8 @@ def main() -> None:
     # An adapter name the console code page cannot encode must not crash the reset.
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name)
+        if stream is None:  # started with no such handle: `print` is a no-op, as before
+            continue
         if isinstance(stream, io.TextIOWrapper):
             stream.reconfigure(errors="backslashreplace")
         setattr(sys, name, _ControlEscaping(stream))
