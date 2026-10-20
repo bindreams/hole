@@ -2772,7 +2772,7 @@ fn install_rollback_clears_the_file_when_a_checkpoint_write_failure_leaves_nothi
     );
 
     assert!(
-        load_record(tmp.path()).is_none(),
+        matches!(state::read(&state::file(tmp.path())), state::Found::Nothing),
         "nothing was confirmed installed and nothing is uncertain, so rollback must clear the \
          state file, not leave a phantom `installed: [SplitV4Low]` record for the next start's \
          recovery to act on"
