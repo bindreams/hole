@@ -1237,3 +1237,49 @@ fn redaction_is_armed_only_by_the_wire_funnel() {
     let connect_at = body.find("BridgeClient::connect(").expect("the driver must connect");
     assert!(arm_at < connect_at, "arming must precede the connect");
 }
+
+// `bridge enable` and `bridge status` =================================================================================
+
+#[skuld::test]
+fn bridge_enable_parses_with_and_without_a_log_dir() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "enable"]).expect("parse bridge enable");
+    let Some(Command::Bridge {
+        action: BridgeAction::Enable { log_dir },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Enable");
+    };
+    assert!(log_dir.is_none());
+
+    let cli = Cli::try_parse_from(["hole", "bridge", "enable", "--log-dir", "/tmp/L"]).expect("parse with --log-dir");
+    let Some(Command::Bridge {
+        action: BridgeAction::Enable { log_dir },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Enable");
+    };
+    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/L")));
+}
+
+#[skuld::test]
+fn bridge_enable_writes_its_gui_cli_log_where_the_gui_reads_it_back() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "enable", "--log-dir", "/tmp/L"]).unwrap();
+    let command = cli.command.expect("a command");
+    assert!(
+        should_install_cli_log_guard(&command),
+        "enable is a write action with an audit trail"
+    );
+    assert_eq!(resolve_cli_log_dir(&command), Some(std::path::PathBuf::from("/tmp/L")));
+}
+
+#[skuld::test]
+fn bridge_status_prints_disabled_with_its_own_exit_code() {
+    use crate::setup::BridgeInstallStatus::*;
+    use hole_bridge::disable_record::DisabledBy;
+    assert_eq!(status_report(Running), ("installed (running)", 0));
+    assert_eq!(status_report(Installed), ("installed (stopped)", 1));
+    assert_eq!(status_report(NotInstalled), ("not installed", 2));
+    for by in [DisabledBy::InterruptedUninstall, DisabledBy::Elsewhere] {
+        assert_eq!(status_report(Disabled(by)), ("installed (disabled)", 3), "{by:?}");
+    }
+}

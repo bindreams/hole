@@ -470,6 +470,153 @@ fn uninstall_keep_covers_tears_down_without_releasing() {
     );
 }
 
+// Bridge status and what the GUI offers ===============================================================================
+
+const DISABLED_BYS: [Option<DisabledBy>; 3] = [
+    None,
+    Some(DisabledBy::InterruptedUninstall),
+    Some(DisabledBy::Elsewhere),
+];
+
+#[skuld::test]
+fn status_precedence_is_not_installed_then_running_then_disabled_then_installed() {
+    for installed in [false, true] {
+        for running in [false, true] {
+            for disabled in DISABLED_BYS {
+                let status = bridge_install_status_with(|| installed, || running, || disabled);
+                // Written out from the rule, not from the code: a service that is not
+                // registered is not running or disabled; a running one works, whatever its
+                // start type says; a stopped one is disabled only if it says so.
+                let expected = if !installed {
+                    BridgeInstallStatus::NotInstalled
+                } else if running {
+                    BridgeInstallStatus::Running
+                } else if let Some(by) = disabled {
+                    BridgeInstallStatus::Disabled(by)
+                } else {
+                    BridgeInstallStatus::Installed
+                };
+                assert_eq!(
+                    status, expected,
+                    "installed={installed} running={running} disabled={disabled:?}"
+                );
+            }
+        }
+    }
+}
+
+#[skuld::test]
+fn status_probes_only_what_the_answer_before_leaves_open() {
+    use std::cell::Cell;
+    let (ran, disabled_read) = (Cell::new(false), Cell::new(false));
+    bridge_install_status_with(
+        || false,
+        || {
+            ran.set(true);
+            false
+        },
+        || {
+            disabled_read.set(true);
+            None
+        },
+    );
+    assert!(
+        !ran.get() && !disabled_read.get(),
+        "nothing is asked about a service that is not there"
+    );
+
+    bridge_install_status_with(
+        || true,
+        || true,
+        || {
+            disabled_read.set(true);
+            None
+        },
+    );
+    assert!(!disabled_read.get(), "a running service's start type is never read");
+}
+
+#[skuld::test]
+fn install_prompt_per_variant() {
+    use BridgeInstallStatus::*;
+    assert_eq!(NotInstalled.install_prompt(), Some(InstallPrompt::Install));
+    assert_eq!(
+        Disabled(DisabledBy::InterruptedUninstall).install_prompt(),
+        Some(InstallPrompt::Repair)
+    );
+    assert_eq!(
+        Disabled(DisabledBy::Elsewhere).install_prompt(),
+        Some(InstallPrompt::Enable)
+    );
+    assert_eq!(Installed.install_prompt(), None);
+    assert_eq!(Running.install_prompt(), None);
+}
+
+#[skuld::test]
+fn each_prompt_text_carries_its_own_words() {
+    let repair = "an interrupted uninstall left hole's service disabled";
+    let enable = "the hole service is disabled on this computer";
+    for (prompt, own, other) in [
+        (InstallPrompt::Repair, repair, enable),
+        (InstallPrompt::Enable, enable, repair),
+    ] {
+        for text in [prompt.body(), prompt.unattended_error(), prompt.declined_error()] {
+            assert!(text.to_lowercase().contains(own), "{prompt:?}: {text}");
+            assert!(!text.to_lowercase().contains(other), "{prompt:?}: {text}");
+        }
+    }
+    // The install's words are the ones the gate always had.
+    assert!(InstallPrompt::Install.body().contains("not installed"));
+    assert!(InstallPrompt::Install.unattended_error().contains("not installed"));
+    // Three prompts, three buttons, three titles: none shows another's.
+    let all = [InstallPrompt::Install, InstallPrompt::Repair, InstallPrompt::Enable];
+    let confirms: std::collections::BTreeSet<_> = all.map(InstallPrompt::confirm_label).into();
+    assert_eq!(confirms, ["Enable", "Install", "Repair"].into());
+    let titles: std::collections::BTreeSet<_> = all.map(InstallPrompt::title).into();
+    assert_eq!(titles.len(), 3);
+}
+
+#[skuld::test]
+fn every_prompt_has_a_failure_headline_naming_what_failed() {
+    assert!(InstallPrompt::Install
+        .failure_headline()
+        .to_lowercase()
+        .contains("install"));
+    assert!(InstallPrompt::Repair
+        .failure_headline()
+        .to_lowercase()
+        .contains("repair"));
+    assert!(InstallPrompt::Enable
+        .failure_headline()
+        .to_lowercase()
+        .contains("enable"));
+}
+
+#[skuld::test]
+fn the_elevated_run_per_prompt_is_install_install_enable_and_only_install_reclaims_the_data_dir() {
+    let args = |prompt, repair| elevated_bridge_args(prompt, "LOG", repair);
+    let install = [
+        "bridge",
+        "install",
+        "--log-dir",
+        "LOG",
+        "--repair-user-data-dir",
+        "DATA",
+    ];
+    assert_eq!(args(InstallPrompt::Install, Some("DATA")), install);
+    assert_eq!(
+        args(InstallPrompt::Install, None),
+        ["bridge", "install", "--log-dir", "LOG"]
+    );
+    // A repair re-registers the service: the same run as the install.
+    assert_eq!(args(InstallPrompt::Repair, Some("DATA")), install);
+    // Enable edits the one registration it finds; the data dir is not its business.
+    assert_eq!(
+        args(InstallPrompt::Enable, Some("DATA")),
+        ["bridge", "enable", "--log-dir", "LOG"]
+    );
+}
+
 // `bridge install` orchestration ======================================================================================
 
 // An administrator's Disabled start type survives a reinstall (the service is

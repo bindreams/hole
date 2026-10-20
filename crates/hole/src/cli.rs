@@ -170,6 +170,13 @@ pub(crate) enum BridgeAction {
         #[arg(long)]
         repair_user_data_dir: Option<std::path::PathBuf>,
     },
+    /// Set the bridge service to start automatically and start it (requires elevation)
+    Enable {
+        /// Override the log directory. The GUI's elevated path passes a
+        /// per-invocation temp dir here, as `install` does.
+        #[arg(long)]
+        log_dir: Option<std::path::PathBuf>,
+    },
     /// Stop and remove the bridge service
     Uninstall {
         /// Internal (the MSI's major-upgrade path): tear the service down but
@@ -355,6 +362,17 @@ pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
     )
 }
 
+/// What `hole bridge status` prints and exits with. Each status has its own
+/// exit code, so a script can tell a stopped service from a disabled one.
+pub(crate) fn status_report(status: crate::setup::BridgeInstallStatus) -> (&'static str, i32) {
+    match status {
+        crate::setup::BridgeInstallStatus::Running => ("installed (running)", 0),
+        crate::setup::BridgeInstallStatus::Installed => ("installed (stopped)", 1),
+        crate::setup::BridgeInstallStatus::NotInstalled => ("not installed", 2),
+        crate::setup::BridgeInstallStatus::Disabled(_) => ("installed (disabled)", 3),
+    }
+}
+
 /// Resolve the directory where `dispatch` should install the `gui-cli.log`
 /// guard for `command`. `None` means "don't install a guard" — see
 /// [`should_install_cli_log_guard`]. A `Some` result means "install in this
@@ -374,6 +392,7 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
         Command::Bridge {
             action:
                 BridgeAction::Install { log_dir: Some(d), .. }
+                | BridgeAction::Enable { log_dir: Some(d) }
                 | BridgeAction::Uninstall { log_dir: Some(d), .. }
                 | BridgeAction::ReleaseCovers { log_dir: Some(d) },
         } => Some(d.clone()),
@@ -769,22 +788,19 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             }
             0
         }
-        BridgeAction::Status => {
-            use crate::setup::BridgeInstallStatus;
-            match crate::setup::bridge_install_status() {
-                BridgeInstallStatus::Running => {
-                    println!("installed (running)");
-                    0
-                }
-                BridgeInstallStatus::Installed => {
-                    println!("installed (stopped)");
-                    1
-                }
-                BridgeInstallStatus::NotInstalled => {
-                    println!("not installed");
-                    2
-                }
+        BridgeAction::Enable {
+            log_dir: _, // consumed by `resolve_cli_log_dir` already
+        } => {
+            if let Err(e) = crate::setup::enable_bridge() {
+                cli_log!(error, "bridge enable failed: {e}{}", elevation_hint());
+                return 1;
             }
+            0
+        }
+        BridgeAction::Status => {
+            let (line, code) = status_report(crate::setup::bridge_install_status());
+            println!("{line}");
+            code
         }
         BridgeAction::Log { log_dir, action } => handle_bridge_log(log_dir, action),
         BridgeAction::GrantAccess {

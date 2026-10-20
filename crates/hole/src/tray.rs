@@ -222,11 +222,17 @@ pub(crate) fn persist_intended_enabled(
 /// dev mode demands admin to install a service over an already-running bridge.
 /// `status_fn` is lazy so the production status probe (a stat, and on macOS a
 /// `launchctl` subprocess) is skipped entirely when externally supervised.
-pub(crate) fn should_prompt_install(
+///
+/// What the gate offers depends on the status: an install for a missing
+/// service, a repair or an enable for a disabled one.
+pub(crate) fn install_prompt_for(
     externally_supervised: bool,
     status_fn: impl FnOnce() -> crate::setup::BridgeInstallStatus,
-) -> bool {
-    !externally_supervised && status_fn() == crate::setup::BridgeInstallStatus::NotInstalled
+) -> Option<crate::setup::InstallPrompt> {
+    if externally_supervised {
+        return None;
+    }
+    status_fn().install_prompt()
 }
 
 // Menu IDs ============================================================================================================
@@ -710,24 +716,24 @@ async fn set_proxy_enabled_inner(
 ) -> Result<ToggleOutcome, String> {
     let state = app.state::<AppState>();
 
-    // Bridge install gate: when the GUI owns the bridge lifecycle and no
-    // production service is installed, prompt to install BEFORE anything else.
+    // Bridge install gate: when the GUI owns the bridge lifecycle and the
+    // production service is missing or disabled, prompt BEFORE anything else.
     // An externally-supervised bridge (HOLE_BRIDGE_SOCKET, dev) skips this
     // entirely — it is already reachable on its own socket (#569).
-    if enable
-        && should_prompt_install(
+    if enable {
+        if let Some(prompt) = install_prompt_for(
             state.bridge_is_externally_supervised(),
             crate::setup::bridge_install_status,
-        )
-    {
-        match prompts {
-            Prompts::Allowed => {
-                if !crate::setup::prompt_bridge_install(app.clone()).await {
-                    return Err("The Hole bridge must be installed to connect.".into());
+        ) {
+            match prompts {
+                Prompts::Allowed => {
+                    if !crate::setup::prompt_bridge_install(app.clone(), prompt).await {
+                        return Err(prompt.declined_error().into());
+                    }
                 }
+                // Startup must not throw an admin install wizard at a login.
+                Prompts::Forbidden => return Err(prompt.unattended_error().into()),
             }
-            // Startup must not throw an admin install wizard at a login.
-            Prompts::Forbidden => return Err("The Hole bridge is not installed.".into()),
         }
     }
 

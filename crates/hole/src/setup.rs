@@ -15,19 +15,121 @@ pub enum BridgeInstallStatus {
     Running,
     /// Service is registered but not currently running.
     Installed,
+    /// Service is registered with its start type disabled, so it cannot start;
+    /// who disabled it decides what the GUI offers.
+    Disabled(DisabledBy),
     /// Service is not registered.
     NotInstalled,
 }
 
 /// Query the current bridge installation status.
 pub fn bridge_install_status() -> BridgeInstallStatus {
-    if !hole_bridge::platform::os::is_installed() {
+    bridge_install_status_with(
+        hole_bridge::platform::os::is_installed,
+        hole_bridge::platform::os::is_running,
+        hole_bridge::platform::os::disabled_state,
+    )
+}
+
+/// [`bridge_install_status`] over the probes, each asked only when the answer
+/// before it leaves the question open. A running service is not "disabled": it
+/// works, whatever its start type says.
+pub fn bridge_install_status_with(
+    installed: impl FnOnce() -> bool,
+    running: impl FnOnce() -> bool,
+    disabled: impl FnOnce() -> Option<DisabledBy>,
+) -> BridgeInstallStatus {
+    if !installed() {
         return BridgeInstallStatus::NotInstalled;
     }
-    if hole_bridge::platform::os::is_running() {
-        BridgeInstallStatus::Running
-    } else {
-        BridgeInstallStatus::Installed
+    if running() {
+        return BridgeInstallStatus::Running;
+    }
+    match disabled() {
+        Some(by) => BridgeInstallStatus::Disabled(by),
+        None => BridgeInstallStatus::Installed,
+    }
+}
+
+/// What the GUI offers to do about the bridge before it connects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPrompt {
+    /// Register the service.
+    Install,
+    /// Undo the disable an interrupted uninstall left.
+    Repair,
+    /// Enable a service an administrator disabled.
+    Enable,
+}
+
+impl BridgeInstallStatus {
+    /// What to offer, if the status needs something done before a connect.
+    pub fn install_prompt(self) -> Option<InstallPrompt> {
+        match self {
+            BridgeInstallStatus::Running => None,
+            BridgeInstallStatus::Installed => None,
+            BridgeInstallStatus::Disabled(DisabledBy::InterruptedUninstall) => Some(InstallPrompt::Repair),
+            BridgeInstallStatus::Disabled(DisabledBy::Elsewhere) => Some(InstallPrompt::Enable),
+            BridgeInstallStatus::NotInstalled => Some(InstallPrompt::Install),
+        }
+    }
+}
+
+impl InstallPrompt {
+    /// The dialog's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "Hole — First-Time Setup",
+            InstallPrompt::Repair => "Hole — Repair",
+            InstallPrompt::Enable => "Hole — Service Disabled",
+        }
+    }
+
+    /// The dialog's question.
+    pub fn body(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "The Hole bridge is not installed. It is required for the transparent proxy to work.\n\nInstall it now? (requires administrator privileges)",
+            InstallPrompt::Repair => "An interrupted uninstall left Hole's service disabled, so the bridge cannot start.\n\nRepair it now? (requires administrator privileges)",
+            InstallPrompt::Enable => "The Hole service is disabled on this computer, so the bridge cannot start.\n\nEnable and start it now? (requires administrator privileges)",
+        }
+    }
+
+    /// The label of the button that goes ahead.
+    pub fn confirm_label(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "Install",
+            InstallPrompt::Repair => "Repair",
+            InstallPrompt::Enable => "Enable",
+        }
+    }
+
+    /// The connect's failure when the user declines.
+    pub fn declined_error(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "The Hole bridge must be installed to connect.",
+            InstallPrompt::Repair => {
+                "An interrupted uninstall left Hole's service disabled; it must be repaired to connect."
+            }
+            InstallPrompt::Enable => "The Hole service is disabled on this computer; it must be enabled to connect.",
+        }
+    }
+
+    /// The headline of the dialog that reports the elevated run failing.
+    pub fn failure_headline(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "Failed to install the Hole bridge.",
+            InstallPrompt::Repair => "Failed to repair the Hole bridge.",
+            InstallPrompt::Enable => "Failed to enable the Hole bridge.",
+        }
+    }
+
+    /// The connect's failure when it may not prompt (unattended startup).
+    pub fn unattended_error(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "The Hole bridge is not installed.",
+            InstallPrompt::Repair => "An interrupted uninstall left Hole's service disabled.",
+            InstallPrompt::Enable => "The Hole service is disabled on this computer.",
+        }
     }
 }
 
@@ -584,23 +686,54 @@ fn uninstall_bridge_with(
     }
 }
 
+/// The arguments of the elevated `hole bridge` run that does what `prompt`
+/// offers. `--repair-user-data-dir` belongs to the install alone.
+pub(crate) fn elevated_bridge_args(
+    prompt: InstallPrompt,
+    log_dir: &str,
+    repair_user_data_dir: Option<&str>,
+) -> Vec<String> {
+    let build = |verb: &str, user_data_dir: Option<&str>| {
+        let mut args: Vec<String> = ["bridge", verb, "--log-dir", log_dir].map(String::from).into();
+        if let Some(dir) = user_data_dir {
+            args.extend(["--repair-user-data-dir".to_string(), dir.to_string()]);
+        }
+        args
+    };
+    match prompt {
+        InstallPrompt::Install => build("install", repair_user_data_dir),
+        InstallPrompt::Repair => build("install", repair_user_data_dir),
+        InstallPrompt::Enable => build("enable", None),
+    }
+}
+
+/// Run `bridge enable`: set the service to start automatically and start it.
+pub fn enable_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    hole_bridge::platform::os::enable()?;
+    cli_log!(info, "bridge enabled and started");
+    Ok(())
+}
+
 // GUI install prompt ==================================================================================================
 
 /// Prompt the user to install the bridge, run the elevated install, and
 /// return whether the bridge is now reachable. Returns `false` on cancel,
 /// elevation failure, or post-install IPC unreachability.
-pub async fn prompt_bridge_install(app: tauri::AppHandle) -> bool {
+pub async fn prompt_bridge_install(app: tauri::AppHandle, prompt: InstallPrompt) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
     let confirmed = app
         .dialog()
-        .message("The Hole bridge is not installed. It is required for the transparent proxy to work.\n\nInstall it now? (requires administrator privileges)")
-        .title("Hole — First-Time Setup")
-        .buttons(MessageDialogButtons::OkCancelCustom("Install".into(), "Later".into()))
+        .message(prompt.body())
+        .title(prompt.title())
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            prompt.confirm_label().into(),
+            "Later".into(),
+        ))
         .blocking_show();
 
     if !confirmed {
-        tracing::info!("user declined bridge install");
+        tracing::info!(?prompt, "user declined the bridge prompt");
         return false;
     }
 
@@ -624,13 +757,13 @@ pub async fn prompt_bridge_install(app: tauri::AppHandle) -> bool {
     let result = tokio::task::spawn_blocking({
         let exe = exe.clone();
         let user_data_dir_arg = user_data_dir_arg.clone();
-        move || run_elevated_install(&exe, user_data_dir_arg.as_deref())
+        move || run_elevated_bridge(&exe, prompt, user_data_dir_arg.as_deref())
     })
     .await;
 
     match result {
         Ok(Ok(())) => {
-            tracing::info!("bridge installed successfully via elevation");
+            tracing::info!(?prompt, "bridge prompt succeeded via elevation");
             // Poll IPC to verify bridge is reachable
             let reachable = poll_bridge_ipc().await;
             if !reachable {
@@ -650,7 +783,7 @@ pub async fn prompt_bridge_install(app: tauri::AppHandle) -> bool {
         Ok(Err(e)) => {
             tracing::error!("elevation failed: {e}");
             app.dialog()
-                .message(format!("Failed to install the Hole bridge.\n\n{e}"))
+                .message(format!("{}\n\n{e}", prompt.failure_headline()))
                 .title("Setup Error")
                 .blocking_show();
             false
@@ -672,15 +805,16 @@ pub async fn prompt_bridge_install(app: tauri::AppHandle) -> bool {
 /// becomes the `log_path` of `SetupError::ExitCode`, so the user can
 /// attach the full file to support if the truncated copy in the dialog
 /// isn't sufficient.
-fn run_elevated_install(exe: &Path, repair_user_data_dir: Option<&str>) -> Result<(), SetupError> {
+fn run_elevated_bridge(
+    exe: &Path,
+    prompt: InstallPrompt,
+    repair_user_data_dir: Option<&str>,
+) -> Result<(), SetupError> {
     let tempdir = tempfile::TempDir::with_prefix("hole-install-")?;
     let log_dir_arg = tempdir.path().to_string_lossy().into_owned();
 
-    let mut args: Vec<&str> = vec!["bridge", "install", "--log-dir", &log_dir_arg];
-    if let Some(d) = repair_user_data_dir {
-        args.push("--repair-user-data-dir");
-        args.push(d);
-    }
+    let args = elevated_bridge_args(prompt, &log_dir_arg, repair_user_data_dir);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
     match run_elevated(exe, &args) {
         Ok(()) => Ok(()),

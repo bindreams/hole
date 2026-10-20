@@ -343,7 +343,7 @@ fn transport_after_elevation_toast_points_to_log() {
     assert!(toast.contains("connection refused"), "{toast}");
 }
 
-// should_prompt_install ===============================================================================================
+// install_prompt_for ==================================================================================================
 
 #[skuld::test]
 fn install_gate_skips_externally_supervised_bridge() {
@@ -351,20 +351,34 @@ fn install_gate_skips_externally_supervised_bridge() {
     // Externally supervised (HOLE_BRIDGE_SOCKET / dev): never prompt, and the
     // production status probe is never even consulted (it may spawn launchctl).
     let mut probed = false;
-    assert!(!should_prompt_install(true, || {
-        probed = true;
-        NotInstalled
-    }));
+    assert_eq!(
+        install_prompt_for(true, || {
+            probed = true;
+            NotInstalled
+        }),
+        None
+    );
     assert!(!probed, "external bridge must short-circuit before the status probe");
 }
 
 #[skuld::test]
-fn install_gate_prompts_only_when_production_service_absent() {
+fn install_gate_offers_what_the_production_service_needs() {
     use crate::setup::BridgeInstallStatus::*;
-    // GUI owns the bridge: prompt iff the production service is absent.
-    assert!(should_prompt_install(false, || NotInstalled));
-    assert!(!should_prompt_install(false, || Installed));
-    assert!(!should_prompt_install(false, || Running));
+    use crate::setup::InstallPrompt;
+    use hole_bridge::disable_record::DisabledBy;
+    // GUI owns the bridge: an install for a missing service, a repair or an
+    // enable for a disabled one, and nothing for one that is there.
+    assert_eq!(install_prompt_for(false, || NotInstalled), Some(InstallPrompt::Install));
+    assert_eq!(
+        install_prompt_for(false, || Disabled(DisabledBy::InterruptedUninstall)),
+        Some(InstallPrompt::Repair)
+    );
+    assert_eq!(
+        install_prompt_for(false, || Disabled(DisabledBy::Elsewhere)),
+        Some(InstallPrompt::Enable)
+    );
+    assert_eq!(install_prompt_for(false, || Installed), None);
+    assert_eq!(install_prompt_for(false, || Running), None);
 }
 
 // decide_elevation ====================================================================================================
