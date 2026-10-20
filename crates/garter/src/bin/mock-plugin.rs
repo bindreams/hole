@@ -393,6 +393,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::io::stdout().flush();
     }
 
+    // Knob: MOCK_PLUGIN_HOLD_BEFORE_READY — after the handshake, park forever without binding or emitting
+    // `ready`: a plugin that has not said ready when the chain shuts down.
+    if std::env::var_os("MOCK_PLUGIN_HOLD_BEFORE_READY").is_some() {
+        std::future::pending::<()>().await;
+    }
+
     // Fault-injection knob: MOCK_PLUGIN_FAIL=fatal | bind_conflict | bind_conflict_once
     let fail = std::env::var("MOCK_PLUGIN_FAIL").unwrap_or_default();
     // Combined with a fault knob, the grandchild is spawned BEFORE the fault is emitted, so a plugin

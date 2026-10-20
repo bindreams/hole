@@ -34,7 +34,8 @@ semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+# `rt`: `task::AbortOnDropHandle`, which keeps the tap from leaving its inner running. 0.7.12 is the first release with it.
+tokio-util = { version = "0.7.12", features = ["compat", "rt"] }
 tracing = "0.1"
 regex = "1"
 # Optional: needed only by `test_utils::WaitableWriter`'s `MakeWriter`
@@ -85,6 +86,10 @@ harness = false
 name = "handle_hygiene"
 path = "tests/handle_hygiene.rs"
 harness = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `exit_watch`: waitid(WNOWAIT), the exit watch for a kernel without pidfd_open. cosca depends on the same crate.
+rustix = { version = "1", features = ["process"] }
 
 # Both target blocks below exist for `src/bin/mock-plugin.rs`, the test fixture.
 # The published crate excludes `src/bin/`, so neither reaches a consumer's build.

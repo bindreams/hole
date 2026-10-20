@@ -140,6 +140,7 @@ fn fixed_env_sets_no_color() {
 
 use std::future::Future;
 use std::pin::{pin, Pin};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -148,7 +149,9 @@ use cosca::Containment;
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use crate::binary::{drain_readers_after_exit, end_plugin, shut_plugin_down, supervise_plugin, PluginEnd, PluginTree};
+use crate::binary::{
+    drain_readers_after_exit, end_plugin, shut_plugin_down, supervise_plugin, PluginEnd, PluginTree, Supervised,
+};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -179,6 +182,17 @@ const CONTAINMENTS: [(Containment, bool); 8] = [
 
 fn poll_once<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
     f.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// Awaits `future`, which must end without the clock moving. The bound has passed, so only the aborted readers are left
+/// to end, and the scheduler does that without any time going by.
+async fn ends_without_time_passing<F: Future>(what: &str, future: Pin<&mut F>) -> F::Output {
+    let before = tokio::time::Instant::now();
+    let output = tokio::time::timeout(VIRTUAL_HANG, future)
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    assert_eq!(tokio::time::Instant::now(), before, "{what}: waited past the bound");
+    output
 }
 
 fn subscriber() -> (impl tracing::Subscriber + Send + Sync, WaitableWriter) {
@@ -269,6 +283,8 @@ struct FakeTree<K> {
     kill: Option<K>,
     edge: Arc<Notify>,
     edge_fails: bool,
+    /// What a failing edge answers; the platform gap by default.
+    edge_error: fn() -> cosca::error::Error,
     root_outlives_grace: bool,
     root_watch_fails: bool,
     root_never_exits: bool,
@@ -280,7 +296,13 @@ struct FakeTree<K> {
     exit_watch_pends_first_poll: bool,
     root_survives_tree_kill: bool,
     reap_never_completes: bool,
+    /// `reap` waits for this to be notified: the root exits when the test says so.
+    reap_waits_for: Option<Arc<Notify>>,
     probe_fails: bool,
+    /// Runs at the top of `terminate` and `kill_root`, before the plugin is sent anything.
+    before_signal: Option<Box<dyn Fn() + Send + Sync>>,
+    /// What `reap` reports.
+    exit_status: std::process::ExitStatus,
     tree_killed: bool,
     graces: Arc<Mutex<Vec<Duration>>>,
     calls: Calls,
@@ -294,6 +316,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
             kill: Some(kill),
             edge: Arc::new(Notify::new()),
             edge_fails: false,
+            edge_error: unsupported,
             root_outlives_grace: false,
             root_watch_fails: false,
             root_never_exits: false,
@@ -305,7 +328,10 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
             exit_watch_pends_first_poll: false,
             root_survives_tree_kill: false,
             reap_never_completes: false,
+            reap_waits_for: None,
             probe_fails: false,
+            before_signal: None,
+            exit_status: std::process::ExitStatus::default(),
             tree_killed: false,
             graces: Arc::default(),
             calls: Calls::default(),
@@ -321,6 +347,12 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> FakeTree<K> {
 
     fn record(&self, call: &'static str) {
         self.calls.lock().unwrap().push(call);
+    }
+
+    fn signal_is_about_to_be_sent(&self) {
+        if let Some(hook) = &self.before_signal {
+            hook();
+        }
     }
 
     fn calls(&self) -> Vec<&'static str> {
@@ -363,6 +395,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
     }
 
     fn terminate(&self) -> Result<(), cosca::error::Error> {
+        self.signal_is_about_to_be_sent();
         self.record("terminate");
         if self.terminate_fails {
             return Err(unsupported());
@@ -371,6 +404,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
     }
 
     fn kill_root(&mut self) -> Result<(), cosca::error::Error> {
+        self.signal_is_about_to_be_sent();
         self.record("kill_root");
         self.root_killed.notify_one();
         if self.kill_root_fails {
@@ -388,7 +422,7 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
     async fn wait_tree_drained(&self) -> Result<(), cosca::error::Error> {
         self.record("wait_tree_drained");
         if self.edge_fails {
-            return Err(unsupported());
+            return Err((self.edge_error)());
         }
         self.edge.notified().await;
         Ok(())
@@ -402,11 +436,14 @@ impl<K: FnOnce() -> Result<(), cosca::error::Error>> PluginTree for FakeTree<K> 
         if self.reap_waits_for_kill {
             self.root_killed.notified().await;
         }
+        if let Some(exits) = &self.reap_waits_for {
+            exits.notified().await;
+        }
         self.record("reap");
         if self.reap_fails {
             return Err(reap_failed());
         }
-        Ok(std::process::ExitStatus::default())
+        Ok(self.exit_status)
     }
 
     fn disarm(&mut self) {
@@ -464,10 +501,7 @@ async fn a_reader_held_outside_a_drained_tree_ends_at_the_bound_with_a_warning()
             "{containment:?}: ended before the bound"
         );
         tokio::time::advance(TIMER_SLACK).await;
-        assert!(
-            poll_once(drain.as_mut()).is_ready(),
-            "{containment:?}: still waiting at the bound"
-        );
+        ends_without_time_passing(&format!("{containment:?}: still waiting at the bound"), drain.as_mut()).await;
 
         tokio::time::timeout(VIRTUAL_HANG, out_dropped)
             .await
@@ -547,10 +581,7 @@ async fn a_weak_containment_join_ends_at_the_bound_with_a_warning_and_aborts_the
         );
 
         tokio::time::advance(TIMER_SLACK).await;
-        assert!(
-            poll_once(drain.as_mut()).is_ready(),
-            "{containment:?}: still waiting at the bound"
-        );
+        ends_without_time_passing(&format!("{containment:?}: still waiting at the bound"), drain.as_mut()).await;
 
         // Aborted, not detached: both reader tasks are dropped.
         tokio::time::timeout(VIRTUAL_HANG, async {
@@ -588,7 +619,7 @@ async fn a_failed_kill_skips_the_exit_edge_and_gives_even_a_kernel_owned_join_th
 
     assert!(poll_once(drain.as_mut()).is_pending());
     tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
-    assert!(poll_once(drain.as_mut()).is_ready());
+    ends_without_time_passing("still waiting at the bound", drain.as_mut()).await;
     tokio::time::timeout(VIRTUAL_HANG, dropped)
         .await
         .expect("the reader must be aborted at the bound")
@@ -596,9 +627,39 @@ async fn a_failed_kill_skips_the_exit_edge_and_gives_even_a_kernel_owned_join_th
     assert_eq!(*calls.lock().unwrap(), ["kill_tree"]);
 }
 
-/// An exit edge that cannot be awaited does not strand the drain: the readers still get the bound.
+/// An exit edge that cannot be awaited does not strand the drain: the readers still get the bound. A platform that
+/// cannot observe the edge (bindreams/hole#1124) is logged at debug only, by plugin name: it is every take-down there.
 #[skuld::test]
 async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
+    let log = drain_with_an_edge_that_errors(unsupported).await;
+    assert_eq!(
+        edge_lines(&log, "WARN"),
+        0,
+        "a platform gap must not warn:
+{log}"
+    );
+    assert_eq!(
+        edge_lines(&log, "DEBUG"),
+        1,
+        "want one debug line naming the plugin:
+{log}"
+    );
+}
+
+/// Any other edge failure is a warning, once per take-down, by plugin name: the edge the ordering rests on was not
+/// observed on a platform that should observe it.
+#[skuld::test]
+async fn an_exit_edge_that_fails_otherwise_warns() {
+    let log = drain_with_an_edge_that_errors(|| std::io::Error::other("edge broke").into()).await;
+    assert_eq!(
+        edge_lines(&log, "WARN"),
+        1,
+        "want one warning naming the plugin:
+{log}"
+    );
+}
+
+async fn drain_with_an_edge_that_errors(error: fn() -> cosca::error::Error) -> String {
     tokio::time::pause();
     let (subscriber, writer) = subscriber();
     let _g = set_default_in_current_thread(subscriber);
@@ -606,17 +667,24 @@ async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
     let (dropped, stdout) = held_reader();
     let mut tree = FakeTree::new(Containment::CgroupV2, || Ok(()));
     tree.edge_fails = true;
-    let drain = drain_readers_after_exit("p", &mut tree, stdout, finished_reader());
+    tree.edge_error = error;
+    let drain = drain_readers_after_exit("edge-plugin", &mut tree, stdout, finished_reader());
     let mut drain = pin!(drain);
 
     assert!(poll_once(drain.as_mut()).is_pending());
     tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
-    assert!(poll_once(drain.as_mut()).is_ready());
+    ends_without_time_passing("still waiting at the bound", drain.as_mut()).await;
     tokio::time::timeout(VIRTUAL_HANG, dropped)
         .await
         .expect("the reader must be aborted at the bound")
         .ok();
-    assert!(writer.snapshot().contains("DEBUG"), "{}", writer.snapshot());
+    writer.snapshot()
+}
+
+fn edge_lines(log: &str, level: &str) -> usize {
+    log.lines()
+        .filter(|l| l.contains(level) && l.contains("edge-plugin") && l.contains("drain cannot be observed"))
+        .count()
 }
 
 /// A join that completes inside the bound is silent.
@@ -681,7 +749,7 @@ async fn a_kill_error_on_a_tree_that_cannot_tear_down_is_logged_at_debug() {
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::binary::spawn_sitrep_stdout_reader;
+use crate::binary::{spawn_sitrep_stdout_reader, FailureHold, ReadinessProbes};
 use crate::sitrep::{PluginReady, SitrepEvent, StartError, Transports, SITREP_PROTOCOL};
 
 type ReadyResult = Result<PluginReady, StartError>;
@@ -697,11 +765,16 @@ fn hello(protocol: &str) -> String {
 }
 
 /// Runs the sitrep stdout reader over `stdout_lines`, then EOF on a plugin whose stderr is still open.
-/// `local` refuses connections, so a probe never readies it.
+/// `local` refuses connections, so a probe never readies it. The token is the chain's shutdown.
 async fn sitrep_reader_over(
     stdout_lines: &str,
     auto: bool,
-) -> (oneshot::Receiver<ReadyResult>, JoinHandle<()>, CancellationToken) {
+) -> (
+    oneshot::Receiver<ReadyResult>,
+    JoinHandle<()>,
+    CancellationToken,
+    FailureHold,
+) {
     let freed = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -711,22 +784,23 @@ async fn sitrep_reader_over(
     drop(plugin_stdout);
     let (ready_tx, ready_rx) = oneshot::channel();
     let shutdown = CancellationToken::new();
-    let reader = spawn_sitrep_stdout_reader(
+    let (reader, failure) = spawn_sitrep_stdout_reader(
         host_stdout,
-        "eof-plugin".into(),
         freed,
         shutdown.clone(),
         ready_tx,
         auto,
         None,
+        &ReadinessProbes::new("eof-plugin", &shutdown),
     );
-    (ready_rx, reader, shutdown)
+    (ready_rx, reader, shutdown, failure)
 }
 
 /// A sitrep plugin's readiness travels on stdout, so once stdout is closed without `ready` it never
-/// readies: the start fails at once, however long its stderr stays open.
+/// readies: the reader has the plugin taken down however long its stderr stays open, and the failure
+/// it held is what `deliver` sends.
 #[skuld::test]
-async fn at_sitrep_stdout_eof_without_ready_the_start_fails_at_once() {
+async fn at_sitrep_stdout_eof_without_ready_the_plugin_is_taken_down_and_the_failure_held() {
     tokio::time::pause();
     for (lines, auto) in [
         (String::new(), false),
@@ -734,11 +808,22 @@ async fn at_sitrep_stdout_eof_without_ready_the_start_fails_at_once() {
         // `Auto` stands its probe down on a supported hello.
         (hello(SITREP_PROTOCOL), true),
     ] {
-        let (ready_rx, _reader, _shutdown) = sitrep_reader_over(&lines, auto).await;
-
-        let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx)
+        let (mut ready_rx, reader, _shutdown, failure) = sitrep_reader_over(&lines, auto).await;
+        tokio::time::timeout(VIRTUAL_HANG, reader)
             .await
-            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the start waited on a stderr that stays open"));
+            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the reader waited on a stderr that stays open"))
+            .unwrap();
+
+        assert!(
+            poll_once(pin!(failure.failed())).is_ready(),
+            "auto={auto}, {lines:?}: the plugin was not taken down"
+        );
+        assert!(
+            poll_once(pin!(&mut ready_rx)).is_pending(),
+            "auto={auto}, {lines:?}: the reader sent the failure itself"
+        );
+        failure.deliver();
+        let ready = ready_rx.await;
         assert!(
             matches!(&ready, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("closed its sitrep stream")),
             "auto={auto}, {lines:?}: {ready:?}"
@@ -746,8 +831,161 @@ async fn at_sitrep_stdout_eof_without_ready_the_start_fails_at_once() {
     }
 }
 
+/// Order {taken down, then closed}: a stdout that closes because the supervision took the plugin down on a chain
+/// shutdown is the take-down's doing, not a start failure. The reader decides nothing, so no failure is held, the
+/// readiness sender drops unsent, and the run does not end in a start failure. The plugin closes its stdout from
+/// inside the signal sent to it (`terminate`, or `kill_root` when the ask fails), where the take-down must already be
+/// recorded.
+#[skuld::test]
+async fn a_stdout_that_closes_after_the_plugin_is_taken_down_is_not_a_start_failure() {
+    tokio::time::pause();
+    for (lines, auto, terminate_fails) in [
+        (String::new(), false, false),
+        (hello(SITREP_PROTOCOL), false, false),
+        (hello(SITREP_PROTOCOL), true, false),
+        (String::new(), false, true),
+        (hello(SITREP_PROTOCOL), false, true),
+        (hello(SITREP_PROTOCOL), true, true),
+    ] {
+        let case = format!("auto={auto}, terminate_fails={terminate_fails}, {lines:?}");
+        let freed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (mut plugin_stdout, host_stdout) = tokio::io::duplex(4096);
+        plugin_stdout.write_all(lines.as_bytes()).await.unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        let (reader, failure) = spawn_sitrep_stdout_reader(
+            host_stdout,
+            freed,
+            shutdown.clone(),
+            ready_tx,
+            auto,
+            None,
+            &ReadinessProbes::new("p", &shutdown),
+        );
+
+        let taken_down = failure.taken_down_signal();
+        let plugin_stdout = Mutex::new(Some(plugin_stdout));
+        let mut tree = drained_tree(Containment::ProcessGroup);
+        tree.root_never_exits = true;
+        tree.terminate_fails = terminate_fails;
+        tree.before_signal = Some(Box::new({
+            let case = case.clone();
+            move || {
+                assert!(
+                    taken_down.load(Ordering::SeqCst),
+                    "{case}: the plugin was sent a signal before its take-down was recorded"
+                );
+                drop(plugin_stdout.lock().unwrap().take());
+            }
+        }));
+        shutdown.cancel();
+        let end = tokio::time::timeout(
+            VIRTUAL_HANG,
+            supervise_plugin(
+                "p",
+                &mut tree,
+                &shutdown,
+                GRACE,
+                reader,
+                finished_reader(),
+                Some(failure),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: the plugin never ended"))
+        .unwrap();
+
+        assert!(
+            matches!(end.end, PluginEnd::ShutDown) && !end.start_failed,
+            "{case}: the reader held a start failure"
+        );
+        let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx)
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the readiness sender was kept"));
+        assert!(ready.is_err(), "{case}: the caller was told {ready:?}");
+    }
+}
+
+/// Order {closed, reader decided, then cancelled}: a stdout that closed before any shutdown was requested is a start
+/// failure the reader decided, and a shutdown that follows does not take it back. Guards that the shutdown exception
+/// does not swallow a decided failure.
+#[skuld::test]
+async fn a_stdout_that_closed_before_a_shutdown_stays_a_start_failure() {
+    tokio::time::pause();
+    for (lines, auto) in [
+        (String::new(), false),
+        (hello(SITREP_PROTOCOL), false),
+        (hello(SITREP_PROTOCOL), true),
+    ] {
+        let (ready_rx, reader, shutdown, failure) = sitrep_reader_over(&lines, auto).await;
+        tokio::time::timeout(VIRTUAL_HANG, reader)
+            .await
+            .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the reader never ended"))
+            .unwrap();
+        shutdown.cancel();
+
+        assert!(failure.deliver(), "auto={auto}, {lines:?}: the failure was dropped");
+        let ready = ready_rx.await;
+        assert!(
+            matches!(&ready, Ok(Err(StartError::Fatal { .. }))),
+            "auto={auto}, {lines:?}: {ready:?}"
+        );
+    }
+}
+
+/// The third order: a plugin that exits by itself before `ready` (exit 0, stdout closed) and a chain cancel that
+/// lands before the plugin's reader is first scheduled. Nothing was sent to the plugin, so its closed stdout is
+/// not the shutdown's doing and the start failure stands.
+#[skuld::test]
+async fn a_plugin_that_exited_by_itself_keeps_its_start_failure_when_a_cancel_lands_before_its_reader_runs() {
+    tokio::time::pause();
+    for (lines, auto) in [
+        (String::new(), false),
+        (hello(SITREP_PROTOCOL), false),
+        (hello(SITREP_PROTOCOL), true),
+    ] {
+        let (ready_rx, reader, shutdown, failure) = sitrep_reader_over(&lines, auto).await;
+        shutdown.cancel();
+        let mut tree = drained_tree(Containment::CgroupV2);
+        let end = tokio::time::timeout(
+            VIRTUAL_HANG,
+            supervise_plugin(
+                "p",
+                &mut tree,
+                &shutdown,
+                GRACE,
+                reader,
+                finished_reader(),
+                Some(failure),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the plugin never ended"))
+        .unwrap();
+
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()) && end.start_failed,
+            "auto={auto}, {lines:?}: exit 0 before ready ended without its start failure"
+        );
+        assert!(
+            !tree.calls().contains(&"terminate") && !tree.calls().contains(&"kill_root"),
+            "auto={auto}, {lines:?}: the plugin was told to go: {:?}",
+            tree.calls()
+        );
+        let ready = ready_rx.await;
+        assert!(
+            matches!(&ready, Ok(Err(StartError::Fatal { .. }))),
+            "auto={auto}, {lines:?}: {ready:?}"
+        );
+    }
+}
+
 /// Where a probe owns readiness (`Auto` with no supported hello, or after an unknown-major
-/// fallback), closed stdout says nothing about the plugin's listener: the probe decides.
+/// fallback), closed stdout says nothing about the plugin's listener: the probe decides. The reader decides nothing
+/// there, shutdown or not.
 #[skuld::test]
 async fn at_stdout_eof_a_probe_that_owns_readiness_decides() {
     tokio::time::pause();
@@ -756,12 +994,17 @@ async fn at_stdout_eof_a_probe_that_owns_readiness_decides() {
         (hello("sitrep-9.0.0"), false),
         (hello("sitrep-9.0.0"), true),
     ] {
-        let (mut ready_rx, reader, shutdown) = sitrep_reader_over(&lines, auto).await;
+        let (mut ready_rx, reader, shutdown, failure) = sitrep_reader_over(&lines, auto).await;
         tokio::time::timeout(VIRTUAL_HANG, reader)
             .await
             .unwrap_or_else(|_| panic!("auto={auto}, {lines:?}: the reader never ended"))
             .unwrap();
 
+        assert!(
+            poll_once(pin!(failure.failed())).is_pending(),
+            "auto={auto}, {lines:?}: the plugin was taken down while a probe owns readiness"
+        );
+        failure.deliver();
         assert!(
             poll_once(pin!(&mut ready_rx)).is_pending(),
             "auto={auto}, {lines:?}: the reader failed a start the probe still owns"
@@ -781,10 +1024,374 @@ async fn a_ready_before_stdout_eof_is_not_overwritten() {
             listen,
             transports: Transports::TCP,
         });
-    let (ready_rx, _reader, _shutdown) = sitrep_reader_over(&lines, false).await;
+    let (ready_rx, _reader, _shutdown, failure) = sitrep_reader_over(&lines, false).await;
 
     let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx).await.unwrap();
+    assert!(
+        poll_once(pin!(failure.failed())).is_pending(),
+        "a ready is not a failure"
+    );
     assert!(matches!(&ready, Ok(Ok(r)) if r.listen == listen), "{ready:?}");
+}
+
+// A start failure follows the plugin's output -------------------------------------------------------------------------
+
+const STDERR_LINE: &str = "fatal: injected crash on stderr";
+
+/// Stands in for the stderr reader, held back until the returned sender fires: it then relays
+/// [`STDERR_LINE`] into `relayed` and finishes.
+fn held_back_stderr(relayed: Arc<Mutex<Vec<&'static str>>>) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    let (release, gate) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = gate.await;
+        relayed.lock().unwrap().push(STDERR_LINE);
+    });
+    (release, task)
+}
+
+/// Every way the sitrep stdout reader fails a start: stdout closing before `ready`, and each failing
+/// event. Each pairs with whether the plugin's root is still running when the reader decides.
+fn start_failures() -> Vec<(&'static str, String, bool)> {
+    let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let after_hello = |event| hello(SITREP_PROTOCOL) + &sitrep_line(&event);
+    vec![
+        ("stdout closed, root exited", hello(SITREP_PROTOCOL), false),
+        ("stdout closed, root alive", hello(SITREP_PROTOCOL), true),
+        (
+            "fatal, root exited",
+            after_hello(SitrepEvent::Fatal {
+                detail: "boom".into(),
+                errno: None,
+            }),
+            false,
+        ),
+        (
+            "fatal, root alive",
+            after_hello(SitrepEvent::Fatal {
+                detail: "boom".into(),
+                errno: None,
+            }),
+            true,
+        ),
+        (
+            "bind conflict, root alive",
+            after_hello(SitrepEvent::BindConflict { errno: 98, addr }),
+            true,
+        ),
+        (
+            "empty transports, root alive",
+            after_hello(SitrepEvent::Ready {
+                listen: addr,
+                transports: Transports::empty(),
+            }),
+            true,
+        ),
+    ]
+}
+
+/// A plugin's last words on stderr reach the log before the start failure reaches the caller, whichever
+/// way the failure is found and whether or not the plugin is still running. The stderr reader is held
+/// back by the test, so the order is the code's, not the scheduler's.
+#[skuld::test]
+async fn a_start_failure_is_not_delivered_before_the_plugins_stderr() {
+    tokio::time::pause();
+    for (case, lines, root_alive) in start_failures() {
+        let relayed = Arc::new(Mutex::new(Vec::new()));
+        let (release_stderr, stderr) = held_back_stderr(relayed.clone());
+        let (mut ready_rx, reader, shutdown, failure) = sitrep_reader_over(&lines, false).await;
+        let (stdout_done_tx, stdout_done) = oneshot::channel::<()>();
+        let stdout = tokio::spawn(async move {
+            reader.await.unwrap();
+            let _ = stdout_done_tx.send(());
+        });
+        let mut tree = drained_tree(Containment::ProcessGroup);
+        tree.root_never_exits = root_alive;
+        let sup = supervise_plugin("p", &mut tree, &shutdown, GRACE, stdout, stderr, Some(failure));
+        let mut sup = pin!(sup);
+
+        // The reader has decided, and the stderr line is still unrelayed.
+        tokio::select! {
+            biased;
+            _ = stdout_done => {}
+            _ = &mut sup => panic!("{case}: the plugin ended with its stderr held back"),
+        }
+        assert!(
+            poll_once(pin!(&mut ready_rx)).is_pending(),
+            "{case}: the start failed before the plugin's stderr was relayed"
+        );
+
+        release_stderr.send(()).unwrap();
+        tokio::time::timeout(VIRTUAL_HANG, sup)
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the plugin never ended"))
+            .unwrap();
+        let ready = ready_rx.await;
+        assert!(matches!(ready, Ok(Err(_))), "{case}: {ready:?}");
+        assert_eq!(*relayed.lock().unwrap(), [STDERR_LINE], "{case}");
+    }
+}
+
+/// A plugin whose start failed is not asked to exit: it gets its grace to exit on its own, and a root
+/// that does is reported with its own status, so a `fatal` followed by a nonzero exit still reaches
+/// the lifecycle channel.
+#[skuld::test]
+async fn a_root_that_exits_on_its_own_after_a_start_failure_is_reported_as_exited_and_never_signalled() {
+    tokio::time::pause();
+    for (containment, edge_awaited) in CONTAINMENTS {
+        let (_ready_rx, reader, shutdown, failure) = sitrep_reader_over(&hello(SITREP_PROTOCOL), false).await;
+        reader.await.unwrap();
+        let mut tree = drained_tree(containment);
+        tree.root_never_exits = true;
+        let end = tokio::time::timeout(
+            VIRTUAL_HANG,
+            supervise_plugin(
+                "p",
+                &mut tree,
+                &shutdown,
+                GRACE,
+                finished_reader(),
+                finished_reader(),
+                Some(failure),
+            ),
+        )
+        .await
+        .expect("the plugin must end")
+        .unwrap();
+
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
+        let mut expected = vec!["wait_root_exit", "wait_root_exit_within", "wait_root_exit_within"];
+        expected.extend(killed_then_reaped(edge_awaited));
+        assert_eq!(tree.calls(), expected, "{containment:?}: no terminate, no root kill");
+        assert_eq!(
+            *tree.graces.lock().unwrap(),
+            [Duration::ZERO, GRACE],
+            "{containment:?}: a probe, then the grace"
+        );
+    }
+}
+
+/// A root that outlives its grace after a start failure is killed, and ends as a shutdown does.
+#[skuld::test]
+async fn a_root_that_outlives_its_grace_after_a_start_failure_is_killed_without_being_asked() {
+    tokio::time::pause();
+    let (_ready_rx, reader, shutdown, failure) = sitrep_reader_over(&hello(SITREP_PROTOCOL), false).await;
+    reader.await.unwrap();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_never_exits = true;
+    tree.root_outlives_grace = true;
+    let end = tokio::time::timeout(
+        VIRTUAL_HANG,
+        supervise_plugin(
+            "p",
+            &mut tree,
+            &shutdown,
+            GRACE,
+            finished_reader(),
+            finished_reader(),
+            Some(failure),
+        ),
+    )
+    .await
+    .expect("the plugin must end")
+    .unwrap();
+
+    assert!(matches!(end.end, PluginEnd::ShutDown) && end.start_failed);
+    assert_eq!(
+        tree.calls(),
+        [
+            "wait_root_exit",
+            "wait_root_exit_within",
+            "wait_root_exit_within",
+            "kill_root",
+            "kill_tree",
+            "reap",
+            "disarm"
+        ]
+    );
+}
+
+/// A chain shutdown outranks a failed start: the plugin is asked to exit, as for any shutdown.
+#[skuld::test]
+async fn a_shutdown_outranks_a_start_failure() {
+    tokio::time::pause();
+    let (_ready_rx, reader, shutdown, failure) = sitrep_reader_over(&hello(SITREP_PROTOCOL), false).await;
+    reader.await.unwrap();
+    shutdown.cancel();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_never_exits = true;
+    tokio::time::timeout(
+        VIRTUAL_HANG,
+        supervise_plugin(
+            "p",
+            &mut tree,
+            &shutdown,
+            GRACE,
+            finished_reader(),
+            finished_reader(),
+            Some(failure),
+        ),
+    )
+    .await
+    .expect("the plugin must end")
+    .unwrap();
+
+    assert!(tree.calls().contains(&"terminate"), "{:?}", tree.calls());
+}
+
+/// A reader still holding its pipe at the bound is given up on, so it holds no failure: the readiness
+/// sender drops unsent, after that bound, and the caller's "exited before ready" follows the drain.
+#[skuld::test]
+async fn a_stdout_reader_given_up_on_at_the_bound_leaves_the_readiness_sender_to_drop() {
+    tokio::time::pause();
+    let (subscriber, writer) = subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+    let freed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    // The plugin's end of stdout stays open: a process outside the tree holds it.
+    let (_held_open, host_stdout) = tokio::io::duplex(4096);
+    let (ready_tx, mut ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+    let (reader, failure) = spawn_sitrep_stdout_reader(
+        host_stdout,
+        freed,
+        shutdown.clone(),
+        ready_tx,
+        false,
+        None,
+        &ReadinessProbes::new("held-plugin", &shutdown),
+    );
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    let end = supervise_plugin(
+        "held-plugin",
+        &mut tree,
+        &shutdown,
+        GRACE,
+        reader,
+        finished_reader(),
+        Some(failure),
+    );
+    let mut end = pin!(end);
+
+    assert!(poll_once(end.as_mut()).is_pending());
+    assert!(poll_once(pin!(&mut ready_rx)).is_pending(), "the start failed early");
+    tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
+    ends_without_time_passing("still waiting at the bound", end.as_mut())
+        .await
+        .ok();
+
+    assert!(ready_rx.await.is_err(), "no failure was held, so none is delivered");
+    assert!(
+        writer
+            .snapshot()
+            .lines()
+            .any(|l| l.contains("WARN") && l.contains("held-plugin") && l.contains("output pipes were still open")),
+        "{}",
+        writer.snapshot()
+    );
+}
+
+/// An unwatchable root whose reap fails ends without a tree kill, but its output wait is still bounded
+/// and surfaced, so a failure delivered after it is behind what the plugin wrote.
+#[skuld::test]
+async fn an_unwatchable_root_whose_reap_fails_still_waits_for_its_output_at_the_bound() {
+    tokio::time::pause();
+    let (subscriber, writer) = subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+    let (out_dropped, stdout) = held_reader();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_watch_fails = true;
+    tree.reap_fails = true;
+    let shutdown = CancellationToken::new();
+    let end = supervise_plugin("p", &mut tree, &shutdown, GRACE, stdout, finished_reader(), None);
+    let mut end = pin!(end);
+
+    assert!(poll_once(end.as_mut()).is_pending(), "ended before the output did");
+    tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
+    assert!(ends_without_time_passing("still waiting at the bound", end.as_mut())
+        .await
+        .is_err());
+    tokio::time::timeout(VIRTUAL_HANG, out_dropped).await.unwrap().ok();
+    assert!(
+        writer.snapshot().contains("the plugin's output pipes were still open"),
+        "{}",
+        writer.snapshot()
+    );
+}
+
+// A decided failure is never dropped ----------------------------------------------------------------------------------
+
+/// A supervision that is dropped before it delivers (its task aborted, or unwinding) still reports what its reader
+/// decided.
+#[skuld::test]
+async fn a_hold_that_is_dropped_delivers_the_failure_it_holds() {
+    tokio::time::pause();
+    let (ready_rx, shutdown, failure) = decided_start_failure().await;
+    drop(shutdown);
+    drop(failure);
+
+    assert!(matches!(ready_rx.await, Ok(Err(StartError::Fatal { .. }))));
+}
+
+/// A reader that decides after the hold has ended finds nobody to hold the failure, and sends it itself. The hold has
+/// ended when it is delivered, dropped, or closed while still alive.
+#[skuld::test]
+async fn a_failure_decided_after_the_hold_ended_is_sent_by_the_reader() {
+    tokio::time::pause();
+    for ended_by in ["delivered", "dropped", "closed, still alive"] {
+        let freed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (mut plugin_stdout, host_stdout) = tokio::io::duplex(4096);
+        plugin_stdout
+            .write_all(hello(SITREP_PROTOCOL).as_bytes())
+            .await
+            .unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (reader, mut failure) = spawn_sitrep_stdout_reader(
+            host_stdout,
+            freed,
+            CancellationToken::new(),
+            ready_tx,
+            false,
+            None,
+            &ReadinessProbes::new("p", &CancellationToken::new()),
+        );
+        let mut ready_rx = pin!(ready_rx);
+
+        // Nothing was decided yet, so the hold has nothing to deliver.
+        let _alive = match ended_by {
+            "delivered" => {
+                assert!(!failure.deliver(), "{ended_by}");
+                None
+            }
+            "dropped" => {
+                drop(failure);
+                None
+            }
+            _ => {
+                assert!(!failure.finish(), "{ended_by}");
+                Some(failure)
+            }
+        };
+        assert!(poll_once(ready_rx.as_mut()).is_pending(), "{ended_by}");
+
+        // Stdout closes: the reader decides the stream closed before `ready`.
+        drop(plugin_stdout);
+        reader.await.unwrap();
+        let ready = tokio::time::timeout(VIRTUAL_HANG, ready_rx)
+            .await
+            .unwrap_or_else(|_| panic!("{ended_by}: the failure was held for a hold that had ended"));
+        assert!(
+            matches!(&ready, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("closed its sitrep stream")),
+            "{ended_by}: {ready:?}"
+        );
+    }
 }
 
 // Teardown order ------------------------------------------------------------------------------------------------------
@@ -915,10 +1522,10 @@ async fn a_shutdown_whose_terminate_fails_escalates_to_a_kill() {
 
 const GRACE: Duration = Duration::from_secs(5);
 
-async fn supervise(tree: &mut impl PluginTree, shutdown: &CancellationToken) -> PluginEnd {
+async fn supervise(tree: &mut impl PluginTree, shutdown: &CancellationToken) -> Supervised {
     tokio::time::timeout(
         VIRTUAL_HANG,
-        supervise_plugin("p", tree, shutdown, GRACE, finished_reader(), finished_reader()),
+        supervise_plugin("p", tree, shutdown, GRACE, finished_reader(), finished_reader(), None),
     )
     .await
     .expect("the plugin must end")
@@ -940,7 +1547,10 @@ async fn a_root_that_exits_on_its_own_has_its_tree_killed_before_it_is_reaped() 
         let mut tree = drained_tree(containment);
         let end = supervise(&mut tree, &CancellationToken::new()).await;
 
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
         let mut expected = vec!["wait_root_exit"];
         expected.extend(killed_then_reaped(edge_awaited));
         assert_eq!(tree.calls(), expected, "{containment:?}");
@@ -956,7 +1566,7 @@ async fn a_shutdown_request_kills_the_tree_before_the_reap() {
         tree.root_never_exits = true;
         let end = supervise(&mut tree, &cancelled()).await;
 
-        assert!(matches!(end, PluginEnd::ShutDown), "{containment:?}");
+        assert!(matches!(end.end, PluginEnd::ShutDown), "{containment:?}");
         let mut expected = vec![
             "wait_root_exit",
             "wait_root_exit_within",
@@ -977,7 +1587,7 @@ async fn a_shutdown_request_kills_a_root_that_outlives_its_grace_before_the_tree
     tree.root_outlives_grace = true;
     let end = supervise(&mut tree, &cancelled()).await;
 
-    assert!(matches!(end, PluginEnd::ShutDown));
+    assert!(matches!(end.end, PluginEnd::ShutDown));
     assert_eq!(
         tree.calls(),
         [
@@ -1002,7 +1612,10 @@ async fn an_exit_that_already_happened_outranks_a_shutdown_request() {
         let mut tree = drained_tree(containment);
         let end = supervise(&mut tree, &cancelled()).await;
 
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
         let mut expected = vec!["wait_root_exit"];
         expected.extend(killed_then_reaped(edge_awaited));
         assert_eq!(tree.calls(), expected, "{containment:?}");
@@ -1020,7 +1633,10 @@ async fn an_exit_the_watch_has_not_yet_delivered_outranks_a_pending_shutdown_req
         tree.exit_watch_pends_first_poll = true;
         let end = supervise(&mut tree, &cancelled()).await;
 
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
         let mut expected = vec!["wait_root_exit", "wait_root_exit_within"];
         expected.extend(killed_then_reaped(edge_awaited));
         assert_eq!(tree.calls(), expected, "{containment:?}");
@@ -1041,7 +1657,7 @@ async fn a_running_root_is_shut_down_when_its_pending_exit_watch_loses_to_the_re
     tree.exit_watch_pends_first_poll = true;
     let end = supervise(&mut tree, &cancelled()).await;
 
-    assert!(matches!(end, PluginEnd::ShutDown));
+    assert!(matches!(end.end, PluginEnd::ShutDown));
     assert_eq!(*tree.graces.lock().unwrap(), [Duration::ZERO, GRACE]);
 }
 
@@ -1055,7 +1671,7 @@ async fn a_shutdown_request_stands_when_the_probe_cannot_read_the_root() {
     tree.probe_fails = true;
     let end = supervise(&mut tree, &cancelled()).await;
 
-    assert!(matches!(end, PluginEnd::ShutDown));
+    assert!(matches!(end.end, PluginEnd::ShutDown));
 }
 
 /// The same holds when the exit could not be watched and the root is reaped instead.
@@ -1066,7 +1682,7 @@ async fn a_reaped_exit_outranks_a_shutdown_request_when_the_exit_cannot_be_watch
     tree.root_watch_fails = true;
     let end = supervise(&mut tree, &cancelled()).await;
 
-    assert!(matches!(&end, PluginEnd::Exited(s) if s.success()));
+    assert!(matches!(&end.end, PluginEnd::Exited(s) if s.success()));
     assert_eq!(tree.calls(), ["wait_root_exit", "reap", "disarm"]);
 }
 
@@ -1102,6 +1718,7 @@ async fn an_unwatchable_root_whose_reap_fails_is_not_disarmed() {
             GRACE,
             finished_reader(),
             finished_reader(),
+            None,
         ),
     )
     .await
@@ -1120,7 +1737,15 @@ async fn a_shutdown_that_interrupts_the_reap_disarms_only_after_its_own_reap() {
     tree.reap_waits_for_kill = true;
     let calls = tree.calls.clone();
     let shutdown = CancellationToken::new();
-    let end = supervise_plugin("p", &mut tree, &shutdown, GRACE, finished_reader(), finished_reader());
+    let end = supervise_plugin(
+        "p",
+        &mut tree,
+        &shutdown,
+        GRACE,
+        finished_reader(),
+        finished_reader(),
+        None,
+    );
     let mut end = pin!(end);
     assert!(poll_once(end.as_mut()).is_pending());
     assert!(
@@ -1276,19 +1901,29 @@ async fn a_root_whose_exit_cannot_be_watched_is_reaped_first_and_a_pgid_tree_is_
         tree.root_watch_fails = true;
         let calls = tree.calls.clone();
         let shutdown = CancellationToken::new();
-        let end = supervise_plugin("unwatched", &mut tree, &shutdown, GRACE, stdout, finished_reader());
+        let end = supervise_plugin(
+            "unwatched",
+            &mut tree,
+            &shutdown,
+            GRACE,
+            stdout,
+            finished_reader(),
+            None,
+        );
         let mut end = pin!(end);
 
         // The held stdout ends the wait for the output at its bound, on every containment.
         assert!(poll_once(end.as_mut()).is_pending(), "{containment:?}");
         tokio::time::advance(EOF_BOUND + TIMER_SLACK).await;
-        let end = match poll_once(end.as_mut()) {
-            Poll::Ready(end) => end.unwrap(),
-            Poll::Pending => panic!("{containment:?}: still waiting at the bound"),
-        };
+        let end = ends_without_time_passing(&format!("{containment:?}: still waiting at the bound"), end.as_mut())
+            .await
+            .unwrap();
         tokio::time::timeout(VIRTUAL_HANG, out_dropped).await.unwrap().ok();
 
-        assert!(matches!(&end, PluginEnd::Exited(s) if s.success()), "{containment:?}");
+        assert!(
+            matches!(&end.end, PluginEnd::Exited(s) if s.success()),
+            "{containment:?}"
+        );
         let edge_awaited = CONTAINMENTS.iter().any(|(c, edge)| *c == containment && *edge);
         let expected: &[&str] = match (kills_by_pgid, edge_awaited) {
             (true, _) => &["wait_root_exit", "reap", "disarm"],
@@ -1305,8 +1940,8 @@ async fn a_root_whose_exit_cannot_be_watched_is_reaped_first_and_a_pgid_tree_is_
             "{containment:?}: the fallback is logged once:\n{log}"
         );
         assert!(
-            fallback[0].contains("DEBUG") && fallback[0].contains("unwatched"),
-            "{containment:?}: the fallback is a debug line naming the plugin: {}",
+            fallback[0].contains("WARN") && fallback[0].contains("unwatched"),
+            "{containment:?}: the fallback is a warning naming the plugin: {}",
             fallback[0]
         );
         assert_eq!(
@@ -1317,40 +1952,604 @@ async fn a_root_whose_exit_cannot_be_watched_is_reaped_first_and_a_pgid_tree_is_
     }
 }
 
-/// A shutdown that arrives while the root is being reaped (its exit could not be watched) ends the
-/// plugin as any shutdown does: the root is still unreaped, so its tree is killed before the reap.
+/// A root that cannot be asked to exit has no grace to spend: it is killed at once.
 #[skuld::test]
-async fn a_shutdown_while_the_exit_cannot_be_watched_still_kills_the_tree_before_the_reap() {
+async fn an_unwatchable_root_that_cannot_be_asked_to_exit_is_killed_at_once() {
     tokio::time::pause();
     let mut tree = drained_tree(Containment::ProcessGroup);
     tree.root_watch_fails = true;
+    tree.terminate_fails = true;
     tree.reap_waits_for_kill = true;
     let calls = tree.calls.clone();
     let shutdown = CancellationToken::new();
-    let end = supervise_plugin("p", &mut tree, &shutdown, GRACE, finished_reader(), finished_reader());
+    let end = supervise_plugin(
+        "p",
+        &mut tree,
+        &shutdown,
+        GRACE,
+        finished_reader(),
+        finished_reader(),
+        None,
+    );
     let mut end = pin!(end);
 
-    assert!(
-        poll_once(end.as_mut()).is_pending(),
-        "the reap waits for the root to exit"
-    );
+    assert!(poll_once(end.as_mut()).is_pending());
     shutdown.cancel();
     let end = tokio::time::timeout(VIRTUAL_HANG, end)
         .await
-        .expect("the shutdown must end the plugin")
+        .expect("must end")
         .unwrap();
 
-    assert!(matches!(end, PluginEnd::ShutDown));
+    assert!(matches!(end.end, PluginEnd::ShutDown));
     assert_eq!(
         *calls.lock().unwrap(),
         [
             "wait_root_exit",
             "terminate",
-            "wait_root_exit_within",
             "kill_root",
             "kill_tree",
             "reap",
             "disarm"
         ]
     );
+}
+
+// A take-down while the exit cannot be watched ------------------------------------------------------------------------
+//
+// With no watch, reaping is the only way to see the root exit, and the reap frees its pid. A take-down therefore has no
+// grace to give: it kills the root, then the tree, then reaps, on every containment.
+
+/// A reader that has decided the start failed, so the plugin is to be taken down.
+async fn decided_start_failure() -> (
+    oneshot::Receiver<Result<PluginReady, StartError>>,
+    CancellationToken,
+    FailureHold,
+) {
+    let (ready_rx, reader, shutdown, failure) = sitrep_reader_over(&hello(SITREP_PROTOCOL), false).await;
+    reader.await.unwrap();
+    (ready_rx, shutdown, failure)
+}
+
+#[skuld::test]
+async fn a_take_down_of_an_unwatchable_root_kills_it_at_once_then_its_tree_then_reaps() {
+    tokio::time::pause();
+    for taken_down_by in [TakenDownBy::Shutdown, TakenDownBy::StartFailure] {
+        for (containment, _) in KILLS_BY_PGID {
+            let (shutdown, failure) = match taken_down_by {
+                TakenDownBy::Shutdown => (cancelled(), None),
+                TakenDownBy::StartFailure => {
+                    let (_ready_rx, shutdown, failure) = decided_start_failure().await;
+                    (shutdown, Some(failure))
+                }
+            };
+            let mut tree = drained_tree(containment);
+            tree.root_watch_fails = true;
+            tree.reap_waits_for_kill = true;
+            let sup = supervise_plugin(
+                "p",
+                &mut tree,
+                &shutdown,
+                GRACE,
+                finished_reader(),
+                finished_reader(),
+                failure,
+            );
+            let ended = tokio::time::timeout(VIRTUAL_HANG, sup)
+                .await
+                .expect("the plugin must end")
+                .unwrap();
+
+            assert!(
+                matches!(ended.end, PluginEnd::ShutDown),
+                "{taken_down_by:?}, {containment:?}"
+            );
+            let calls = tree.calls();
+            let position = |call: &str| {
+                calls
+                    .iter()
+                    .position(|c| *c == call)
+                    .unwrap_or_else(|| panic!("{taken_down_by:?}, {containment:?}: {call} was never called: {calls:?}"))
+            };
+            match taken_down_by {
+                // A failed start is not asked anything.
+                TakenDownBy::StartFailure => assert!(
+                    !calls.contains(&"terminate"),
+                    "{taken_down_by:?}, {containment:?}: a failed start was asked to exit: {calls:?}"
+                ),
+                // A shutdown asks, finds the exit unwatchable, and so has no grace to give: the kill follows at once.
+                TakenDownBy::Shutdown => assert!(
+                    position("terminate") < position("kill_root"),
+                    "{taken_down_by:?}, {containment:?}: {calls:?}"
+                ),
+            }
+            assert!(
+                position("kill_root") < position("kill_tree") && position("kill_tree") < position("reap"),
+                "{taken_down_by:?}, {containment:?}: {calls:?}"
+            );
+        }
+    }
+}
+
+// What `BinaryPlugin::run` returns ------------------------------------------------------------------------------------
+
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::process::ExitStatusExt::from_raw(code as u32)
+    }
+}
+
+fn supervised(end: PluginEnd, start_failed: bool) -> Supervised {
+    Supervised { end, start_failed }
+}
+
+#[skuld::test]
+fn a_plugin_ended_by_a_shutdown_or_exiting_cleanly_is_ok() {
+    assert!(supervised(PluginEnd::ShutDown, false).outcome("p").is_ok());
+    assert!(supervised(PluginEnd::Exited(exit_status(0)), false)
+        .outcome("p")
+        .is_ok());
+}
+
+#[skuld::test]
+fn a_plugin_that_exits_with_a_code_is_an_error_naming_it() {
+    assert!(matches!(
+        supervised(PluginEnd::Exited(exit_status(3)), false).outcome("p"),
+        Err(crate::Error::PluginExit { name, code: 3 }) if name == "p"
+    ));
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_plugin_that_dies_to_a_signal_is_an_error_naming_it() {
+    let status = std::os::unix::process::ExitStatusExt::from_raw(9);
+    assert!(matches!(
+        supervised(PluginEnd::Exited(status), false).outcome("p"),
+        Err(crate::Error::PluginKilled { name }) if name == "p"
+    ));
+}
+
+/// A plugin whose start failed did not run to a clean end, however it ended: `run` must not return `Ok`, and the
+/// error names the plugin and says the start failed.
+#[skuld::test]
+fn a_plugin_whose_start_failed_is_an_error_naming_it_unless_its_exit_status_already_is() {
+    for end in [PluginEnd::ShutDown, PluginEnd::Exited(exit_status(0))] {
+        let err = supervised(end, true)
+            .outcome("p")
+            .expect_err("a failed start is not a clean end");
+        assert!(
+            matches!(&err, crate::Error::Chain(msg) if msg.contains("'p'") && msg.contains("failed to start")),
+            "{err:?}"
+        );
+    }
+    assert!(matches!(
+        supervised(PluginEnd::Exited(exit_status(3)), true).outcome("p"),
+        Err(crate::Error::PluginExit { code: 3, .. })
+    ));
+}
+
+// A failed start never ends `Ok` --------------------------------------------------------------------------------------
+
+/// The result of `run`, as a tag: what kind of error, or `ok`.
+fn run_result(result: crate::Result<()>) -> String {
+    match result {
+        Ok(()) => "ok".into(),
+        Err(crate::Error::PluginExit { code, .. }) => format!("exit {code}"),
+        Err(crate::Error::PluginKilled { .. }) => "killed".into(),
+        Err(crate::Error::Chain(_)) => "chain error".into(),
+        Err(other) => format!("{other:?}"),
+    }
+}
+
+/// How the plugin's end comes about.
+#[derive(Clone, Copy, Debug)]
+enum EndsBy {
+    /// The root exits on its own, and its exit is watched.
+    ExitingItself,
+    /// The root exits on its own, and its exit cannot be watched.
+    ExitingItselfUnwatched,
+    /// The chain shuts down while the root runs; it exits within its grace.
+    Shutdown,
+    /// The reader decided the start failed; the root exits within its grace.
+    StartFailureThenExit,
+    /// The reader decided the start failed; the root outlives its grace and is killed.
+    StartFailureThenKill,
+}
+
+#[skuld::test]
+async fn a_plugin_whose_start_failed_never_ends_ok() {
+    tokio::time::pause();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut statuses = vec![
+        ("exit 0", exit_status(0), None),
+        ("exit 3", exit_status(3), Some("exit 3")),
+    ];
+    #[cfg(unix)]
+    statuses.push((
+        "signal",
+        std::os::unix::process::ExitStatusExt::from_raw(9),
+        Some("killed"),
+    ));
+
+    let mut failures = Vec::new();
+    for ends_by in [
+        EndsBy::ExitingItself,
+        EndsBy::ExitingItselfUnwatched,
+        EndsBy::Shutdown,
+        EndsBy::StartFailureThenExit,
+        EndsBy::StartFailureThenKill,
+    ] {
+        for start_failed in [false, true] {
+            if !start_failed && matches!(ends_by, EndsBy::StartFailureThenExit | EndsBy::StartFailureThenKill) {
+                continue;
+            }
+            for (status_name, status, status_error) in &statuses {
+                let (shutdown, failure) = if start_failed {
+                    let (_ready_rx, shutdown, failure) = decided_start_failure().await;
+                    (shutdown, Some(failure))
+                } else {
+                    (CancellationToken::new(), None)
+                };
+                let mut tree = drained_tree(Containment::ProcessGroup);
+                tree.exit_status = *status;
+                match ends_by {
+                    EndsBy::ExitingItself => {}
+                    EndsBy::ExitingItselfUnwatched => tree.root_watch_fails = true,
+                    EndsBy::Shutdown => {
+                        tree.root_never_exits = true;
+                        shutdown.cancel();
+                    }
+                    EndsBy::StartFailureThenExit => tree.root_never_exits = true,
+                    EndsBy::StartFailureThenKill => {
+                        tree.root_never_exits = true;
+                        tree.root_outlives_grace = true;
+                    }
+                }
+                let result = tokio::time::timeout(
+                    VIRTUAL_HANG,
+                    supervise_plugin(
+                        "p",
+                        &mut tree,
+                        &shutdown,
+                        GRACE,
+                        finished_reader(),
+                        finished_reader(),
+                        failure,
+                    ),
+                )
+                .await
+                .expect("the plugin must end")
+                .unwrap()
+                .outcome("p");
+
+                // Only an exit has a status to report; a plugin taken down ends on the take-down.
+                let exited = matches!(
+                    ends_by,
+                    EndsBy::ExitingItself | EndsBy::ExitingItselfUnwatched | EndsBy::StartFailureThenExit
+                );
+                let expected = match status_error {
+                    Some(tag) if exited => (*tag).to_owned(),
+                    _ if start_failed => "chain error".to_owned(),
+                    _ => "ok".to_owned(),
+                };
+                let got = run_result(result);
+                if got != expected {
+                    failures.push(format!(
+                        "{ends_by:?}, start_failed={start_failed}, {status_name}: want {expected}, got {got}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} rows failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// A `stdout` whose read blocks its thread until released, then reports end of file: a reader caught inside one poll,
+/// which `abort` cannot interrupt.
+struct BlockedRead {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl tokio::io::AsyncRead for BlockedRead {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let _ = self.entered.send(());
+        let _ = self.release.recv();
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A reader that is aborted at the bound while it is still deciding the start failed (its poll runs on another thread,
+/// so the abort takes effect only once the poll ends) still makes `run` an error: whatever the caller of `on_ready` is
+/// told, `run` agrees. The reader is released only after `supervise_plugin` has had its chance to return.
+#[skuld::test]
+async fn a_failure_decided_by_a_reader_aborted_at_the_bound_never_ends_ok() {
+    tokio::time::pause();
+    let mut failures = Vec::new();
+    for watched in [true, false] {
+        let freed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        // The reader runs on a runtime of its own, so a blocked poll leaves this one free.
+        let reader_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (reader, failure) = {
+            let _in_reader_runtime = reader_runtime.enter();
+            spawn_sitrep_stdout_reader(
+                BlockedRead {
+                    entered: entered_tx,
+                    release: release_rx,
+                },
+                freed,
+                shutdown.clone(),
+                ready_tx,
+                false,
+                None,
+                &ReadinessProbes::new("p", &shutdown),
+            )
+        };
+        entered_rx.recv().expect("the reader started its read");
+
+        let mut tree = drained_tree(Containment::ProcessGroup);
+        tree.root_watch_fails = !watched;
+        let mut sup = pin!(supervise_plugin(
+            "p",
+            &mut tree,
+            &shutdown,
+            GRACE,
+            reader,
+            finished_reader(),
+            Some(failure),
+        ));
+        let supervised = match tokio::time::timeout(VIRTUAL_HANG, sup.as_mut()).await {
+            Ok(done) => {
+                release_tx.send(()).unwrap();
+                done
+            }
+            Err(_waiting_for_the_reader) => {
+                release_tx.send(()).unwrap();
+                sup.await
+            }
+        };
+        let told = ready_rx.await;
+        reader_runtime.shutdown_background();
+
+        let run = run_result(supervised.unwrap().outcome("p"));
+        if matches!(told, Ok(Err(_))) && run == "ok" {
+            failures.push(format!(
+                "watched={watched}: the caller was told {told:?} and run was {run}"
+            ));
+        }
+        if !matches!(told, Ok(Err(_))) {
+            failures.push(format!("watched={watched}: the failure was never delivered: {told:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} rows failed:
+{}",
+        failures.len(),
+        failures.join(
+            "
+"
+        )
+    );
+}
+
+// A take-down leaves no descendant ------------------------------------------------------------------------------------
+//
+// Every take-down of a running plugin kills its tree (see `end_reaped_plugin` for the process-group-id constraint).
+
+#[derive(Clone, Copy, Debug)]
+enum TakenDownBy {
+    Shutdown,
+    StartFailure,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RootExit {
+    /// The root exits on its own while the take-down is under way.
+    WithinGrace,
+    /// The root keeps running until it is killed.
+    OutlivesGrace,
+}
+
+#[skuld::test]
+async fn every_take_down_kills_the_plugins_tree() {
+    tokio::time::pause();
+    let mut failures = Vec::new();
+    for taken_down_by in [TakenDownBy::Shutdown, TakenDownBy::StartFailure] {
+        for watched in [true, false] {
+            for root_exit in [RootExit::WithinGrace, RootExit::OutlivesGrace] {
+                for (containment, kills_by_pgid) in KILLS_BY_PGID {
+                    let row = format!("{taken_down_by:?}, watched={watched}, {root_exit:?}, {containment:?}");
+                    let (shutdown, failure) = match taken_down_by {
+                        TakenDownBy::Shutdown => (CancellationToken::new(), None),
+                        TakenDownBy::StartFailure => {
+                            let (_ready_rx, shutdown, failure) = decided_start_failure().await;
+                            (shutdown, Some(failure))
+                        }
+                    };
+                    let exits = Arc::new(Notify::new());
+                    let mut tree = drained_tree(containment);
+                    tree.root_never_exits = true;
+                    match (watched, root_exit) {
+                        (true, RootExit::WithinGrace) => {}
+                        (true, RootExit::OutlivesGrace) => tree.root_outlives_grace = true,
+                        (false, RootExit::WithinGrace) => {
+                            tree.root_watch_fails = true;
+                            tree.reap_waits_for = Some(exits.clone());
+                        }
+                        (false, RootExit::OutlivesGrace) => {
+                            tree.root_watch_fails = true;
+                            tree.reap_waits_for_kill = true;
+                        }
+                    }
+                    let calls = tree.calls.clone();
+                    let sup = supervise_plugin(
+                        "p",
+                        &mut tree,
+                        &shutdown,
+                        GRACE,
+                        finished_reader(),
+                        finished_reader(),
+                        failure,
+                    );
+                    let mut sup = pin!(sup);
+                    let _ = poll_once(sup.as_mut());
+                    if matches!(taken_down_by, TakenDownBy::Shutdown) {
+                        shutdown.cancel();
+                    }
+                    let _ = poll_once(sup.as_mut());
+                    exits.notify_one();
+                    if tokio::time::timeout(VIRTUAL_HANG, sup).await.is_err() {
+                        failures.push(format!("{row}: the plugin never ended"));
+                        continue;
+                    }
+
+                    let calls = calls.lock().unwrap().clone();
+                    let position = |call: &str| calls.iter().position(|c| *c == call);
+                    let Some(tree_killed) = position("kill_tree") else {
+                        failures.push(format!("{row}: the tree was never killed: {calls:?}"));
+                        continue;
+                    };
+                    let reaped = position("reap").expect("the root is reaped");
+                    if kills_by_pgid && tree_killed > reaped {
+                        failures.push(format!(
+                            "{row}: the process group was signalled after the reap: {calls:?}"
+                        ));
+                    }
+                    if position("disarm") != Some(reaped + 1) {
+                        failures.push(format!("{row}: the handle is disarmed right after the reap: {calls:?}"));
+                    }
+                    if watched {
+                        let killed_root = position("kill_root");
+                        match root_exit {
+                            RootExit::WithinGrace if killed_root.is_some() => {
+                                failures.push(format!("{row}: a root that exited by itself was killed: {calls:?}"))
+                            }
+                            RootExit::OutlivesGrace if !(killed_root < Some(tree_killed)) || killed_root.is_none() => {
+                                failures.push(format!(
+                                    "{row}: the root outlived its grace and was not killed first: {calls:?}"
+                                ))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} rows failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// A failure reported after readiness was decided ----------------------------------------------------------------------
+
+/// A failure the plugin reports once readiness is decided (a `ready` before it, or an earlier failure) cannot change
+/// the start, but it is not lost: it is logged naming the plugin and the event, whether or not a log sink is set.
+#[skuld::test]
+async fn a_failure_reported_after_readiness_was_decided_is_logged() {
+    tokio::time::pause();
+    let listen: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let ready = SitrepEvent::Ready {
+        listen,
+        transports: Transports::TCP,
+    };
+    let fatal = |detail: &str| SitrepEvent::Fatal {
+        detail: detail.into(),
+        errno: None,
+    };
+    // (stdout lines, level, text of the event that was ignored)
+    let rows = [
+        (
+            hello(SITREP_PROTOCOL) + &sitrep_line(&ready) + &sitrep_line(&fatal("late-fatal")),
+            "WARN",
+            "late-fatal",
+        ),
+        (
+            hello(SITREP_PROTOCOL)
+                + &sitrep_line(&ready)
+                + &sitrep_line(&SitrepEvent::BindConflict {
+                    errno: 98,
+                    addr: listen,
+                }),
+            "WARN",
+            "bind conflict on",
+        ),
+        (
+            hello(SITREP_PROTOCOL) + &sitrep_line(&fatal("first-fatal")) + &sitrep_line(&fatal("second-fatal")),
+            "DEBUG",
+            "second-fatal",
+        ),
+    ];
+    for (lines, level, text) in rows {
+        let (subscriber, writer) = subscriber();
+        let _g = set_default_in_current_thread(subscriber);
+        let (_ready_rx, reader, _shutdown, _failure) = sitrep_reader_over(&lines, false).await;
+        tokio::time::timeout(VIRTUAL_HANG, reader).await.unwrap().unwrap();
+
+        let log = writer.snapshot();
+        assert!(
+            log.lines().any(|l| l.contains(level)
+                && l.contains("eof-plugin")
+                && l.contains("already decided")
+                && l.contains(text)),
+            "{level} line naming the plugin, {text:?} and that readiness was decided is missing:\n{log}"
+        );
+    }
+}
+
+/// The reader's own end-of-stream close is not an event the plugin reported: once readiness is decided it logs no
+/// "already decided" line at any level, after a `ready` or after a held failure.
+#[skuld::test]
+async fn a_stdout_close_after_readiness_was_decided_logs_no_ignored_failure() {
+    tokio::time::pause();
+    let ready = SitrepEvent::Ready {
+        listen: "127.0.0.1:9".parse().unwrap(),
+        transports: Transports::TCP,
+    };
+    let fatal = SitrepEvent::Fatal {
+        detail: "first-fatal".into(),
+        errno: None,
+    };
+    for lines in [
+        hello(SITREP_PROTOCOL) + &sitrep_line(&ready),
+        hello(SITREP_PROTOCOL) + &sitrep_line(&fatal),
+    ] {
+        let (subscriber, writer) = subscriber();
+        let _g = set_default_in_current_thread(subscriber);
+        let (_ready_rx, reader, _shutdown, _failure) = sitrep_reader_over(&lines, false).await;
+        tokio::time::timeout(VIRTUAL_HANG, reader).await.unwrap().unwrap();
+
+        let log = writer.snapshot();
+        assert!(
+            !log.contains("already decided"),
+            "{lines:?}: the end of the stream was logged as a reported failure:\n{log}"
+        );
+    }
 }
