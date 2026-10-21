@@ -261,6 +261,32 @@ pub(crate) fn conformant_membership(
     bail!(msg)
 }
 
+// unbounded_scm_tests =================================================================================================
+
+/// The integration binary whose tests wait on the real SCM or the start-type
+/// lock with no bound of their own.
+const SCM_BINARY: &str = "cutover_privileged";
+
+/// What the `terminate-after` override in `.config/nextest.toml` matches by
+/// name: the only bound those waits have.
+const SCM_BOUND_PREFIX: &str = "cutover_global_net_state_";
+
+/// The tests of [`SCM_BINARY`] in `membership` that the `terminate-after`
+/// override does not match (`"<binary id>: <name>"`), so a hang in one would
+/// run to the job wall instead of failing with the test's name.
+pub(crate) fn unbounded_scm_tests(membership: &BTreeMap<String, BTreeSet<String>>) -> Vec<String> {
+    membership
+        .iter()
+        .filter(|(binary_id, _)| binary_id.ends_with(SCM_BINARY))
+        .flat_map(|(binary_id, names)| {
+            names
+                .iter()
+                .filter(|name| !name.starts_with(SCM_BOUND_PREFIX))
+                .map(move |name| format!("{binary_id}: {name}"))
+        })
+        .collect()
+}
+
 // verify ==============================================================================================================
 
 /// Run guard 2 for `job_id`: confirm the `global_net_state` test-group's
@@ -308,6 +334,14 @@ pub(crate) fn verify_with(
     let label_matched = list(repo_root, &template, Some(LABEL_NAME))?;
 
     let label_matched = conformant_membership(name_matched, label_matched, job_id, &cfg.filter)?;
+    let unbounded = unbounded_scm_tests(&label_matched);
+    ensure!(
+        unbounded.is_empty(),
+        "job {job_id:?}: tests of {SCM_BINARY} that wait on the real SCM or the start-type lock are not matched          by the `terminate-after` override (it matches names starting {SCM_BOUND_PREFIX:?}), so a hang in one          would run to the job wall:
+  {}",
+        unbounded.join("
+  ")
+    );
     println!(
         "xtask: global_net_state label conformance OK for job {job_id:?} — the nextest.toml \
          filter and the {LABEL_NAME:?} label select the exact same tests"
