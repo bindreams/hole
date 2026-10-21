@@ -6,7 +6,9 @@ pub mod counting;
 pub mod error;
 #[cfg(target_os = "linux")]
 mod exit_watch;
+mod hop;
 pub mod plugin;
+mod port;
 pub mod shutdown;
 pub mod sip003;
 pub mod sitrep;
@@ -40,6 +42,12 @@ mod binary_tests;
 #[cfg(test)]
 mod chain_failure_tests;
 #[cfg(test)]
+mod chain_order_tests;
+#[cfg(test)]
+mod chain_restart_tests;
+#[cfg(test)]
+mod chain_start_result_tests;
+#[cfg(test)]
 mod chain_tests;
 #[cfg(test)]
 mod counting_tests;
@@ -48,7 +56,11 @@ mod error_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_watch_tests;
 #[cfg(test)]
+mod once;
+#[cfg(test)]
 mod plugin_tests;
+#[cfg(test)]
+mod port_tests;
 #[cfg(test)]
 mod sip003_tests;
 #[cfg(test)]

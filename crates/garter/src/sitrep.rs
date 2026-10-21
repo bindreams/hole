@@ -50,6 +50,33 @@ pub enum StartError {
     Fatal { detail: String, errno: Option<i32> },
 }
 
+impl StartError {
+    /// The start failure for a plugin whose `bind(2)` of `addr` failed with `err`.
+    ///
+    /// A plugin that binds its own listener reports its bind failure through here, so every plugin draws the
+    /// retryable line in one place. [`BindConflict`](StartError::BindConflict) when `err` is a port race
+    /// (`AddrInUse`, `PermissionDenied`, `AddrNotAvailable`), carrying the raw errno (0 if `err` has none);
+    /// [`Fatal`](StartError::Fatal) otherwise.
+    ///
+    /// `PermissionDenied` and `AddrNotAvailable` are a race only for a port the plugin did not choose: an
+    /// ephemeral one, or one a [`ChainRunner`](crate::ChainRunner) picked for an intermediate hop (on Windows the
+    /// excluded-port-range tables can refuse a port the OS just handed out). The chain retries only an
+    /// intermediate hop's `BindConflict` on a fresh port. A conflict on the public hop's port, or on a port the
+    /// caller fixed, repeats until the caller changes it, and the retry is the caller's.
+    pub fn from_bind_failure(err: &std::io::Error, addr: SocketAddr) -> StartError {
+        if crate::port::is_port_race(err) {
+            return StartError::BindConflict {
+                errno: err.raw_os_error().unwrap_or(0),
+                addr,
+            };
+        }
+        StartError::Fatal {
+            detail: format!("bind {addr}: {err}"),
+            errno: err.raw_os_error(),
+        }
+    }
+}
+
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

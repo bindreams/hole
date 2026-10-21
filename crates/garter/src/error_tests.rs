@@ -40,3 +40,18 @@ fn env_error_displays_var_and_reason() {
         "environment variable 'SS_LOCAL_PORT' missing or invalid: not set"
     );
 }
+
+#[skuld::test]
+fn start_failed_error_displays_plugin_and_cause() {
+    let err = Error::StartFailed {
+        plugin: "v2ray-plugin".into(),
+        cause: crate::StartError::BindConflict {
+            errno: 98,
+            addr: "127.0.0.1:1080".parse().unwrap(),
+        },
+    };
+    assert_eq!(
+        err.to_string(),
+        "plugin 'v2ray-plugin' failed to start: bind conflict on 127.0.0.1:1080 (errno 98)"
+    );
+}

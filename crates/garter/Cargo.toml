@@ -52,6 +52,7 @@ harness = false
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
 socket2 = "0.6"
+tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Enable `tokio::time::pause` / `advance` / `resume` for tests that need
 # virtual-clock control. Cargo unions this with the main deps `full`
