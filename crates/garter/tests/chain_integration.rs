@@ -961,6 +961,63 @@ async fn auto_readies_sitrep_plugin() {
     let _ = chain_task.await;
 }
 
+/// `Auto` with a sitrep plugin on a concrete public port: the probe can connect and the plugin sends `ready`, so both
+/// paths can succeed. Whichever reports first, the chain readies once, on the plugin's address, and relays.
+#[skuld::test]
+async fn auto_readies_sitrep_plugin_on_a_probed_port() {
+    rerun_on_lost_port(auto_readies_sitrep_plugin_on_a_probed_port_attempt).await;
+}
+
+async fn auto_readies_sitrep_plugin_on_a_probed_port_attempt(attempt: Attempt) {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            match echo_listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut r, mut w) = tokio::io::split(stream);
+                        let _ = tokio::io::copy(&mut r, &mut w).await;
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let (verdict_key, verdict_path) = attempt.plugin_env();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(mock_plugin_path(), None)
+                .env(verdict_key, verdict_path)
+                .readiness(garter::binary::ReadinessMode::Auto),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+    let env = PluginEnv {
+        local_host: attempt.addr.ip(),
+        local_port: attempt.addr.port(),
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let chain_ready = expect_ready(ready_rx).await.expect("Auto should ready a sitrep plugin");
+    assert_eq!(chain_ready.listen, attempt.addr);
+    let mut client = TcpStream::connect(chain_ready.listen).await.expect("connect");
+    client.write_all(b"hello auto sitrep on a probed port").await.unwrap();
+    let mut buf = [0u8; 1024];
+    let n = client.read(&mut buf).await.expect("read");
+    assert_eq!(&buf[..n], b"hello auto sitrep on a probed port");
+
+    drop(client);
+    echo_task.abort();
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
 /// `Auto` surfaces a typed `BindConflict` (the launcher's retry signal). This
 /// is DETERMINISTIC under Auto: on a bind conflict the port never binds, so the
 /// concurrent probe can never connect — only the sitrep `bind_conflict` fires.
