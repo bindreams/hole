@@ -419,4 +419,11 @@ fn cutover_global_net_state_probe_service_sid_type_takes_effect_at_the_next_serv
             "DID NOT TAKE EFFECT AT"
         }
     );
+    // Measured in CI: the type applies at a service restart, which the design
+    // relies on for a service an in-app update registered without it.
+    assert_ne!(second, first, "the restart did not make a new process");
+    assert!(
+        carries,
+        "the SID type did not take effect at a service restart: the restarted process {second} lacks it"
+    );
 }

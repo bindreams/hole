@@ -362,6 +362,13 @@ fn restart_probe(variant: &str, disable_before_the_crash: bool) {
         }
     };
     eprintln!("P1 {variant} VERDICT: {verdict}.");
+    // Measured in CI in both modes: a disable written while the restart is
+    // queued, or before the crash, leaves the service stopped.
+    assert!(
+        precondition,
+        "P1 {variant}: NOT MEASURED, the restart fired before the disable was written"
+    );
+    assert!(!restarted, "P1 {variant}: the disabled service was restarted");
 }
 
 /// S is disabled while its restart is queued.

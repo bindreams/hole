@@ -71,6 +71,10 @@ mod start_type_lock_proofs;
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 #[cfg(target_os = "windows")]
 use hole_bridge::cutover::os::CutoverOs;
+#[cfg(target_os = "windows")]
+use hole_bridge::cutover::scm_wait::Observed;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{ERROR_INVALID_SERVICE_CONTROL, ERROR_SERVICE_NOT_ACTIVE};
 
 /// The on-disk image identity must FLIP across a rename-away-then-move-in swap
 /// (the GUI self-heal precondition: `same_file::Handle` inequality is what makes
@@ -1448,6 +1452,9 @@ mod stop_probe {
     use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
 
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::WIN32_ERROR;
+
     use super::named_event::NamedEvent;
     use super::scm_probe::{state_name, Probe};
     use super::ProvisionedService;
@@ -1469,6 +1476,19 @@ mod stop_probe {
             state_name(reading.state_before),
             reading.first_report,
         );
+    }
+
+    /// Fails unless the scenario read as it did in CI: the Stop was delivered
+    /// (`refused` is `None`) or refused with that code, and the arm for every
+    /// state reported the state the service was in, at once.
+    pub fn assert_measured(reading: &Reading, refused: Option<WIN32_ERROR>, first_report: Observed) {
+        match (&reading.stop, refused) {
+            (Ok(_), None) => {}
+            (Err(e), Some(code)) => assert_eq!(e.code(), HRESULT::from_win32(code.0), "the Stop's refusal"),
+            (Ok(_), Some(code)) => panic!("the Stop was delivered, where CI measured its refusal with {}", code.0),
+            (Err(e), None) => panic!("the Stop was refused ({e}), where CI measured it delivered"),
+        }
+        assert_eq!(reading.first_report, first_report, "the arm's first report");
     }
 
     /// Arms for every state on a fresh actor, sends a Stop, and takes the first
@@ -1547,37 +1567,36 @@ mod stop_probe {
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_stop_probe_running() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    stop_probe::print("RUNNING", &stop_probe::running(helper));
+    let reading = stop_probe::running(helper);
+    stop_probe::print("RUNNING", &reading);
+    stop_probe::assert_measured(&reading, None, Observed::Running);
 }
 
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_stop_probe_stopped_with_a_restart_pending() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    stop_probe::print(
-        "STOPPED, restart pending",
-        &stop_probe::stopped_with_a_restart_pending(helper),
-    );
+    let reading = stop_probe::stopped_with_a_restart_pending(helper);
+    stop_probe::print("STOPPED, restart pending", &reading);
+    stop_probe::assert_measured(&reading, Some(ERROR_SERVICE_NOT_ACTIVE), Observed::Stopped);
 }
 
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_stop_probe_start_pending_after_attach() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    stop_probe::print(
-        "START_PENDING, attached",
-        &stop_probe::held_start_pending(helper, "--hold-start"),
-    );
+    let reading = stop_probe::held_start_pending(helper, "--hold-start");
+    stop_probe::print("START_PENDING, attached", &reading);
+    stop_probe::assert_measured(&reading, Some(ERROR_INVALID_SERVICE_CONTROL), Observed::StartPending);
 }
 
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_stop_probe_start_pending_before_attach() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
-    stop_probe::print(
-        "START_PENDING, process not attached",
-        &stop_probe::held_start_pending(helper, "--delay-attach"),
-    );
+    let reading = stop_probe::held_start_pending(helper, "--delay-attach");
+    stop_probe::print("START_PENDING, process not attached", &reading);
+    stop_probe::assert_measured(&reading, Some(ERROR_SERVICE_NOT_ACTIVE), Observed::StartPending);
 }
 
 /// The service-SID probe: whether the token of a process carries the
@@ -1900,6 +1919,13 @@ fn cutover_global_net_state_service_sid_probe_start_pending() {
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let (reported, measure) = service_sid_probe_of_a_service(helper, Some("--hold-start"));
     sid_probe::print("START_PENDING (--hold-start), service SID type set", reported, &measure);
+    // The SCM names no process in START_PENDING, so there is nothing to open.
+    assert_eq!(reported, None, "the SCM named a process in START_PENDING");
+    assert!(
+        matches!(measure.production_check, sid_probe::ProductionCheck::NoProcessId),
+        "the production check was expected to find no process id, got {:?}",
+        measure.production_check
+    );
 }
 
 /// What a service process started before the SID type was set looks like: its
@@ -2064,6 +2090,12 @@ fn cutover_global_net_state_stop_probe_open_process_synchronize_on_the_service_p
          administrator fails with RetireError::Hold (\"the service's process could not be opened ...: OpenProcess failed\"), \
          where it worked before the hold existed, and the exit has to be awaited another way (an owner question). \
          SYSTEM (the MSI custom action) is not measured here."
+    );
+    // Measured in CI: the open succeeds and the process is running, which the
+    // process hold and the exit check rely on.
+    assert!(
+        outcome.starts_with("Ok; ") && outcome.contains("not signalled"),
+        "OpenProcess(PROCESS_SYNCHRONIZE) on the service process: {outcome}"
     );
 }
 
