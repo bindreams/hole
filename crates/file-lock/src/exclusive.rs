@@ -180,8 +180,15 @@ impl Exclusive {
     /// (or has another owner, above) is refused with an `InvalidData` error
     /// holding a [`Refused`]; it is never re-permissioned.
     pub fn try_acquire(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Option<Self>> {
+        Self::try_acquire_as(path, owner, platform::caller())
+    }
+
+    /// [`Self::try_acquire`] as `caller`. The seam lets a test drive a file the
+    /// real caller owns through the owner rule, which an unprivileged test cannot
+    /// otherwise make fail.
+    fn try_acquire_as(path: &Path, owner: Option<(u32, u32)>, caller: platform::Caller) -> io::Result<Option<Self>> {
         on_acquire_entry();
-        match platform::open_locked(path, false, owner)? {
+        match platform::open_locked(path, false, owner, caller)? {
             Some(file) => {
                 platform::chown_fd(&file, owner)?;
                 Ok(Some(Exclusive { file }))
@@ -200,8 +207,13 @@ impl Exclusive {
     /// core currently ships with) — `Exclusive` itself does not and cannot
     /// enforce that; it is a per-newtype contract, not a core one.
     pub fn acquire(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Self> {
+        Self::acquire_as(path, owner, platform::caller())
+    }
+
+    /// [`Self::acquire`] as `caller`; see [`Self::try_acquire_as`].
+    fn acquire_as(path: &Path, owner: Option<(u32, u32)>, caller: platform::Caller) -> io::Result<Self> {
         on_acquire_entry();
-        let file = platform::open_locked(path, true, owner)?.expect("blocking open_locked always returns Some");
+        let file = platform::open_locked(path, true, owner, caller)?.expect("blocking open_locked always returns Some");
         platform::chown_fd(&file, owner)?;
         Ok(Exclusive { file })
     }

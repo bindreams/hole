@@ -75,6 +75,87 @@ fn try_acquire_chowns_the_fd_to_the_given_owner() {
     );
 }
 
+/// `Some(owner)` that no unprivileged process owns a file as, and the uid a process would need to be to own one.
+#[cfg(unix)]
+fn foreign_owner_and_caller() -> ((u32, u32), u32) {
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let mine = unsafe { libc::getuid() };
+    ((mine + 2, mine + 2), mine + 1)
+}
+
+#[skuld::test]
+#[cfg(unix)]
+fn both_entries_hand_the_owner_to_the_vet() {
+    use std::os::unix::fs::MetadataExt;
+    // The file is ours but the pretend caller is not its owner and the expected
+    // owner is someone else: the vet must refuse, and leave the file alone.
+    let (owner, pretend) = foreign_owner_and_caller();
+    let tmp = tempfile::tempdir().unwrap();
+
+    for entry in ["try_acquire_as", "acquire_as"] {
+        let path = tmp.path().join(entry);
+        std::fs::write(&path, b"").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        let err = match entry {
+            "try_acquire_as" => Exclusive::try_acquire_as(&path, Some(owner), pretend).map(|_| ()),
+            _ => Exclusive::acquire_as(&path, Some(owner), pretend).map(|_| ()),
+        }
+        .expect_err(entry);
+
+        assert!(Refused::from_error(&err).is_some(), "{entry}: {err}");
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!((after.uid(), after.mode()), (before.uid(), before.mode()), "{entry}");
+    }
+}
+
+#[skuld::test]
+#[cfg(unix)]
+fn both_entries_hand_the_owner_to_the_fchown() {
+    use std::os::unix::fs::MetadataExt;
+    // An existing file of our own passes the vet under any `owner`, so a foreign
+    // owner is visible only at `fchown`: `EPERM` unprivileged, applied as root;
+    // `None` would do neither. The expectation is what the OS says about the
+    // same chown on a scratch file, not what the code under test returns.
+    let ((foreign, _), _) = foreign_owner_and_caller();
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = tmp.path().join("scratch");
+    std::fs::write(&scratch, b"").unwrap();
+    let chown_allowed = std::os::unix::fs::chown(&scratch, Some(foreign), Some(foreign)).is_ok();
+
+    for entry in ["try_acquire", "acquire"] {
+        let path = tmp.path().join(entry);
+        std::fs::write(&path, b"").unwrap();
+
+        let result = match entry {
+            "try_acquire" => Exclusive::try_acquire(&path, Some((foreign, foreign))).map(|guard| guard.is_some()),
+            _ => Exclusive::acquire(&path, Some((foreign, foreign))).map(|_| true),
+        };
+
+        match result {
+            Ok(acquired) => {
+                assert!(
+                    chown_allowed,
+                    "{entry}: acquired, but the OS would have refused the chown"
+                );
+                assert!(acquired, "{entry}");
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().uid(),
+                    foreign,
+                    "{entry}: owner not applied"
+                );
+            }
+            Err(err) => {
+                assert!(!chown_allowed, "{entry}: failed although the chown is allowed: {err}");
+                assert!(
+                    Refused::from_error(&err).is_none(),
+                    "{entry}: our own file must not be refused for a foreign owner: {err}"
+                );
+            }
+        }
+    }
+}
+
 // acquire (blocking) ==================================================================================================
 
 #[skuld::test]
