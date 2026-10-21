@@ -14,9 +14,11 @@
 use std::io;
 
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
-use windows::Win32::Foundation::{FILETIME, STATUS_INFO_LENGTH_MISMATCH};
+use windows::Win32::Foundation::{FILETIME, HANDLE, STATUS_INFO_LENGTH_MISMATCH};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetProcessTimes};
 use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION;
+
+use crate::cutover::scm_wait::call_error::win32_code_of_hresult;
 
 /// `SystemProcessInformation`.
 const SYSTEM_PROCESS_INFORMATION_CLASS: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(5);
@@ -27,6 +29,25 @@ const SYSTEM_PROCESS_INFORMATION_CLASS: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORM
 /// 24 bytes in, an 8-byte `FILETIME` value. A test compares it with
 /// `GetProcessTimes`, so a layout that moved fails there.
 const CREATE_TIME_AT: usize = 24;
+
+/// The creation `FILETIME` of the process `process` is open on, 100 ns ticks
+/// since 1601. Works on an exited process.
+///
+/// # Safety
+/// `process` must be a live process handle with `PROCESS_QUERY_LIMITED_INFORMATION`
+/// (or the current-process pseudo-handle).
+pub(crate) unsafe fn creation_time_of(process: HANDLE) -> io::Result<u64> {
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    // SAFETY: the caller's handle is live with the query right; the out-values are locals.
+    unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) }
+        .map_err(|e| io::Error::from_raw_os_error(win32_code_of_hresult(e.code().0) as i32))?;
+    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
 
 /// A process, by id and creation time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,20 +60,11 @@ pub struct Stamp {
 impl Stamp {
     /// This process.
     pub fn current() -> Self {
-        let (mut created, mut exited, mut kernel, mut user) = (
-            FILETIME::default(),
-            FILETIME::default(),
-            FILETIME::default(),
-            FILETIME::default(),
-        );
-        // SAFETY: the pseudo-handle needs no access check and no close; the
-        // out-values are locals.
-        unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) }
-            .expect("a process can read its own times");
         Self {
             // SAFETY: no arguments.
             pid: unsafe { GetCurrentProcessId() },
-            created: (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
+            // SAFETY: the pseudo-handle needs no access check and no close.
+            created: unsafe { creation_time_of(GetCurrentProcess()) }.expect("a process can read its own times"),
         }
     }
 

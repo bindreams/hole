@@ -292,6 +292,11 @@ impl<P> ProcessHolds<P> {
         self.held.iter().map(|(_, process)| process)
     }
 
+    /// The held processes with the ids they were opened under.
+    pub fn held(&self) -> impl Iterator<Item = (u32, &P)> {
+        self.held.iter().map(|(pid, process)| (*pid, process))
+    }
+
     /// Read the service and hold the process it names.
     ///
     /// The id is a claim, not an identity. Microsoft documents it

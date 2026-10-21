@@ -114,9 +114,12 @@ pub trait ProcessEnumerator {
     fn list(&mut self) -> io::Result<Vec<ListedProcess>>;
     /// The id of the calling process, which a scan never waits on.
     fn this_process(&self) -> u32;
-    /// Open process `pid` and read its token for the service SID, resolving a
-    /// failure by the [`Basis::Scanned`](super::hold::Basis) table.
-    fn open(&mut self, pid: u32) -> io::Result<Opened<Self::Process>>;
+    /// Open the process the listing named and read its token for the service
+    /// SID, resolving a failure by the [`Basis::Scanned`](super::hold::Basis)
+    /// table. A process that holds the id with another creation time is not
+    /// the listed one (the OS reused the id): it is [`Opened::NoSuchProcess`],
+    /// whatever its token carries.
+    fn open(&mut self, listed: ListedProcess) -> io::Result<Opened<Self::Process>>;
     /// Whether `process` has exited. A state read, never a wait.
     fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool>;
 }
@@ -146,7 +149,7 @@ pub fn scan<E: ProcessEnumerator>(
         if pid == this {
             continue;
         }
-        match host.open(pid)? {
+        match host.open(listed)? {
             Opened::NoSuchProcess => result.gone_at_probe(listed, vanished_before),
             Opened::NotTheService => {}
             Opened::Service(process) => {

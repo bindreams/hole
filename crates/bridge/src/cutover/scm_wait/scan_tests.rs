@@ -35,6 +35,9 @@ struct Host {
     processes: BTreeMap<u32, Process>,
     /// The creation time the listing gives an id; 0 unless set.
     created: BTreeMap<u32, u64>,
+    /// Handed to a new process right after the listing names the old one:
+    /// `(pid, created, what)`.
+    reuse_after_list: Option<(u32, u64, Process)>,
 }
 
 impl Host {
@@ -44,6 +47,7 @@ impl Host {
             this,
             processes: processes.into_iter().collect(),
             created: BTreeMap::new(),
+            reuse_after_list: None,
         }
     }
 
@@ -76,19 +80,27 @@ impl ProcessEnumerator for Host {
     type Process = Handle;
 
     fn list(&mut self) -> io::Result<Vec<ListedProcess>> {
-        Ok(self.processes.keys().map(|pid| self.listed(*pid)).collect())
+        let listing = self.processes.keys().map(|pid| self.listed(*pid)).collect();
+        if let Some((pid, created, what)) = self.reuse_after_list.take() {
+            self.reuse(pid, created, what);
+        }
+        Ok(listing)
     }
 
     fn this_process(&self) -> u32 {
         self.this
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Opened<Handle>> {
+    fn open(&mut self, listed: ListedProcess) -> io::Result<Opened<Handle>> {
+        let pid = listed.pid;
         self.log.borrow_mut().push(format!("open({pid})"));
         let handle = || Handle {
             pid,
             log: self.log.clone(),
         };
+        if listed != self.listed(pid) {
+            return Ok(Opened::NoSuchProcess);
+        }
         Ok(match &self.processes[&pid] {
             Process::Gone => Opened::NoSuchProcess,
             Process::Stranger => Opened::NotTheService,
@@ -215,6 +227,27 @@ fn an_id_given_to_a_new_process_that_does_not_open_is_vanished_again() {
     );
 }
 
+/// A listed service process can have started a child and exited, and its id be
+/// given to a stranger before the probe. The probe opens the stranger, whose
+/// token lacks the SID; reading that as "a process that is not the service's"
+/// would end the scan with the child alive. The listed process is gone: lost.
+#[skuld::test]
+fn an_id_reused_by_a_stranger_between_the_listing_and_the_probe_is_a_lost_process() {
+    let mut host = Host::new(1, vec![(7, Process::Service)]);
+    host.created.insert(7, 100);
+    host.reuse_after_list = Some((7, 200, Process::Stranger));
+    let result = scan(&mut host, &[]).unwrap();
+    assert_eq!(result.vanished, vec![ListedProcess { pid: 7, created: 100 }]);
+    assert_eq!(result.finding(), ScanFinding::Vanished);
+
+    let next = scan(&mut host, &result.unprobeable).unwrap();
+    assert_eq!(
+        next.finding(),
+        ScanFinding::Nothing,
+        "the next listing names the stranger"
+    );
+}
+
 /// An exempt id stays exempt while it is listed, however many scans, and a
 /// vanishing of another id in between does not lift it.
 #[skuld::test]
@@ -331,7 +364,7 @@ fn a_failure_that_is_not_a_verdict_ends_the_scan() {
         fn this_process(&self) -> u32 {
             1
         }
-        fn open(&mut self, _: u32) -> io::Result<Opened<Handle>> {
+        fn open(&mut self, _: ListedProcess) -> io::Result<Opened<Handle>> {
             unreachable!()
         }
         fn has_exited(&mut self, _: &Handle) -> io::Result<bool> {

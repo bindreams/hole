@@ -22,7 +22,7 @@ use super::{scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessSource, Reading};
 use crate::cutover::scm_wait::scan::ScanFinding;
-use crate::cutover::scm_wait::settle::StopActor;
+use crate::cutover::scm_wait::settle::{ExitWait, StopActor};
 use crate::cutover::scm_wait::{observed_from_state, Observed, SystemScmActor};
 
 /// The rights the session's handle is opened with: exactly those its calls
@@ -94,8 +94,8 @@ impl StopActor for StopSession {
         self.actor.await_callback()
     }
 
-    fn await_held_exits(&mut self) -> io::Result<()> {
-        self.processes.await_exits()
+    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()> {
+        self.processes.await_exits(wait)
     }
 
     /// Holds every live process that carries the service's token, other than

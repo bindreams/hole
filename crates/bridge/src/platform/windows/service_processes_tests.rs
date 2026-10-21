@@ -4,13 +4,15 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE};
 
 use super::{
-    has_exited, open_process, opened_from_token_read, scan_service_processes, HostProcesses, ServiceProcesses,
-    ServiceSid,
+    has_exited, open_process, opened_from_token_read, scan_service_processes, ExitWait, HostProcesses,
+    ServiceProcesses, ServiceSid,
 };
 use crate::cutover::scm_wait::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Opened};
-use crate::cutover::scm_wait::scan::ProcessEnumerator;
+use crate::cutover::scm_wait::scan::{ListedProcess, ProcessEnumerator};
 use crate::cutover::scm_wait::ReportedPid;
+use crate::disable_record::Stamp;
+use crate::test_support::reap_child::EchoChild;
 
 const VALID: Basis = Basis::Named(ReportedPid::Valid);
 const MAY_BE_INVALID: Basis = Basis::Named(ReportedPid::MayBeInvalid);
@@ -163,4 +165,62 @@ fn the_listing_has_this_process_and_not_the_idle_process() {
     let pids: Vec<u32> = listed.iter().map(|process| process.pid).collect();
     assert!(pids.contains(&std::process::id()), "{pids:?}");
     assert!(!pids.contains(&0), "the idle process is listed");
+}
+
+/// The listing names a process by id and creation time. An id held by a process
+/// created at another time is the OS's reuse of it: the listed process is gone,
+/// and the stranger's token (whatever it carries) says nothing about it.
+#[skuld::test]
+fn an_id_held_by_a_process_with_another_creation_time_is_no_process() {
+    let child = EchoChild::spawn();
+    let stamp = Stamp::of_listed_process(child.pid())
+        .expect("snapshot")
+        .expect("the child is listed");
+    for (service, same) in [
+        (ServiceSid::everyone(), "Service"),
+        (ServiceSid::nothing_carries(), "NotTheService"),
+    ] {
+        let mut host = HostProcesses { service: &service };
+        let open = |host: &mut HostProcesses<'_>, created: u64| {
+            host.open(ListedProcess {
+                pid: stamp.pid,
+                created,
+            })
+            .expect("open")
+        };
+        for created in [stamp.created.wrapping_add(1), stamp.created.wrapping_sub(1), 0] {
+            let got = open(&mut host, created);
+            assert!(matches!(got, Opened::NoSuchProcess), "{same}, created {created}");
+        }
+        match (open(&mut host, stamp.created), same) {
+            (Opened::Service(_), "Service") | (Opened::NotTheService, "NotTheService") => {}
+            (_, _) => panic!("the process with the listed creation time is {same}"),
+        }
+    }
+}
+
+/// A held process the SCM never told to stop does not exit on its own: the
+/// terminating wait ends it, where a wait on its own exit would never return.
+/// The child parks until its control socket closes, which this test keeps open.
+#[skuld::test]
+fn the_terminating_wait_ends_a_held_process_that_would_not_exit() {
+    let child = EchoChild::spawn();
+    // SAFETY: plain FFI call.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, child.pid()) }.expect("open the child");
+    // SAFETY: `OpenProcess` returned a new handle this value now owns.
+    let held = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let mut processes = ServiceProcesses::default();
+    processes.holds.adopt(child.pid(), held);
+    assert!(
+        processes.holds.any_alive(has_exited).expect("state read"),
+        "the child is up"
+    );
+
+    processes
+        .await_exits(ExitWait::TerminateThenWait)
+        .expect("terminate and wait");
+    assert!(
+        !processes.holds.any_alive(has_exited).expect("state read"),
+        "a held process is still alive after the terminating wait"
+    );
 }

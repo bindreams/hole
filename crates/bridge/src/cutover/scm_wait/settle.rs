@@ -136,6 +136,34 @@ impl ProcessFate {
     }
 }
 
+/// How the wait on the held processes goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitWait {
+    /// The processes exit on their own: the SCM's Stop is on its way to them,
+    /// or the service is still going down.
+    OnTheirOwn,
+    /// The SCM reports STOPPED, so nothing of the service is owed a graceful
+    /// exit: whatever carries its SID is terminated, then waited on. A process
+    /// the SCM never told to stop (a plugin left by a crashed bridge, a
+    /// cutover child left suspended) would otherwise be waited on for ever
+    /// while the machine-wide lock is held. The service is Disabled, so
+    /// nothing starts another.
+    TerminateThenWait,
+}
+
+impl Look {
+    /// How to wait on the held processes after this look: the one place that
+    /// says when a held process is terminated instead of waited for.
+    pub fn exit_wait(self) -> ExitWait {
+        match self.observed {
+            Observed::Running => ExitWait::OnTheirOwn,
+            Observed::StartPending => ExitWait::OnTheirOwn,
+            Observed::StopPending => ExitWait::OnTheirOwn,
+            Observed::Stopped => ExitWait::TerminateThenWait,
+        }
+    }
+}
+
 /// What the stop wait does to the service and waits on, behind a seam so the
 /// loop is testable without an SCM.
 pub trait StopActor {
@@ -150,8 +178,8 @@ pub trait StopActor {
     fn control_stop(&mut self) -> io::Result<()>;
     /// Sleep until the armed notification fires.
     fn await_callback(&mut self) -> io::Result<()>;
-    /// Wait until every held process has exited.
-    fn await_held_exits(&mut self) -> io::Result<()>;
+    /// Wait until every held process has exited, as `wait` says.
+    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()>;
     /// Scan for the live processes that carry the service's token, other than
     /// the calling one, and hold them. Says what the scan itself found: only
     /// [`ScanFinding::Nothing`] lets the wait end.
@@ -231,7 +259,7 @@ pub fn settle_stopped<A: StopActor>(actor: &mut A) -> Result<(), SettleError> {
             SettleStep::SendStop => settle.stop(look)?,
             SettleStep::AwaitHeldExit => {
                 info!(?look, "stop wait: waiting for a process held past STOPPED");
-                settle.await_held_exits()?;
+                settle.await_held_exits(look.exit_wait())?;
                 Next::Look(settle.observe()?)
             }
             SettleStep::AwaitChange(_) => settle.await_change(step)?,
@@ -268,8 +296,8 @@ impl<A: StopActor> Settle<'_, A> {
         self.actor.hold_scanned().map_err(SettleError::Scan)
     }
 
-    fn await_held_exits(&mut self) -> Result<(), SettleError> {
-        self.actor.await_held_exits().map_err(SettleError::AwaitExit)
+    fn await_held_exits(&mut self, wait: ExitWait) -> Result<(), SettleError> {
+        self.actor.await_held_exits(wait).map_err(SettleError::AwaitExit)
     }
 
     fn await_callback(&mut self) -> Result<(), SettleError> {
@@ -313,7 +341,7 @@ impl<A: StopActor> Settle<'_, A> {
             return Ok(Next::Look(again));
         }
         match wait {
-            StopWait::HeldProcess => self.await_held_exits()?,
+            StopWait::HeldProcess => self.await_held_exits(look.exit_wait())?,
             StopWait::StatusChange if armed => self.await_callback()?,
             StopWait::StatusChange => return self.without_arm(),
         }
@@ -349,7 +377,7 @@ impl<A: StopActor> Settle<'_, A> {
         let finding = self.hold_scanned()?;
         let look = self.observe()?;
         if look.held_alive {
-            self.await_held_exits()?;
+            self.await_held_exits(look.exit_wait())?;
             return Ok(Next::Look(self.observe()?));
         }
         if look.settle_step().ends_the_wait() {

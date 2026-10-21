@@ -153,6 +153,8 @@ struct Recording {
     scan_error: Option<io::Error>,
     /// What each scan finds, in order. Nothing once it runs dry.
     findings: VecDeque<ScanFinding>,
+    /// How each wait on the held processes was asked to go.
+    exit_waits: Vec<ExitWait>,
 }
 
 impl Recording {
@@ -223,8 +225,9 @@ impl StopActor for Recording {
         self.await_callback_error.take().map_or(Ok(()), Err)
     }
 
-    fn await_held_exits(&mut self) -> io::Result<()> {
+    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()> {
         self.log.push("await_held_exits".into());
+        self.exit_waits.push(wait);
         self.await_exit_error.take().map_or(Ok(()), Err)
     }
 
@@ -272,6 +275,49 @@ fn a_stopped_service_with_a_live_hold_is_waited_on_and_looked_at_again() {
         actor.log(),
         ["observe", "await_held_exits", "observe", "hold_scanned", "observe"]
     );
+}
+
+/// Only a service the SCM reports STOPPED is owed no graceful exit: every other
+/// state's wait is for the service's own exit.
+#[skuld::test]
+fn only_a_stopped_look_terminates_what_is_held() {
+    for (observed, want) in [
+        (Observed::Running, ExitWait::OnTheirOwn),
+        (Observed::StartPending, ExitWait::OnTheirOwn),
+        (Observed::StopPending, ExitWait::OnTheirOwn),
+        (Observed::Stopped, ExitWait::TerminateThenWait),
+    ] {
+        for fate in [ProcessFate::Unheld, ProcessFate::Alive, ProcessFate::Exited] {
+            assert_eq!(look(observed, fate, true).exit_wait(), want, "{observed:?} {fate:?}");
+        }
+    }
+}
+
+/// The wait the loop asks for follows the state of the look that decided it: a
+/// process held past STOPPED is terminated; the process a Stop was just sent
+/// to, and one held while the SCM refuses arms, are waited out on their own.
+#[skuld::test]
+fn the_loop_terminates_what_outlives_stopped_and_waits_out_a_service_that_is_still_stopping() {
+    let after_stopped = |looks: Vec<Look>| {
+        let mut actor = Recording::new(looks);
+        settle_stopped(&mut actor).unwrap();
+        actor.exit_waits
+    };
+    assert_eq!(
+        after_stopped(vec![stopped_over_a_live_hold(), stopped(), stopped()]),
+        [ExitWait::TerminateThenWait]
+    );
+    assert_eq!(
+        after_stopped(vec![running(), stopped(), stopped()]),
+        [ExitWait::OnTheirOwn]
+    );
+
+    // The SCM refuses the arm (marked for deletion): the wait is on the held
+    // process, and follows the state each look reads.
+    let held = look(Observed::StopPending, ProcessFate::Alive, true);
+    let mut actor = Recording::new(vec![held, held, stopped(), stopped()]).arm_fails_with(vec![Some(marked())]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(actor.exit_waits, [ExitWait::OnTheirOwn]);
 }
 
 /// A held process takes the Stop and is waited on by its handle: a handle keeps
@@ -654,7 +700,7 @@ fn a_query_that_fails_ends_the_wait() {
         fn await_callback(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn await_held_exits(&mut self) -> io::Result<()> {
+        fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
             unreachable!()
         }
         fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
@@ -703,7 +749,7 @@ fn each_failing_act_is_its_own_error_variant() {
         fn await_callback(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn await_held_exits(&mut self) -> io::Result<()> {
+        fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
             unreachable!()
         }
         fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
@@ -753,7 +799,7 @@ impl StopActor for ModelStop {
         unreachable!("a STOPPED service is not armed on")
     }
 
-    fn await_held_exits(&mut self) -> io::Result<()> {
+    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
         self.0.await_exits();
         Ok(())
     }

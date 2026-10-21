@@ -143,9 +143,9 @@ impl<S: ServiceSession> StopActor for Recording<'_, S> {
         self.inner.await_callback()
     }
 
-    fn await_held_exits(&mut self) -> std::io::Result<()> {
+    fn await_held_exits(&mut self, wait: hole_bridge::cutover::scm_wait::settle::ExitWait) -> std::io::Result<()> {
         self.record(Event::AwaitHeldExits);
-        self.inner.await_held_exits()
+        self.inner.await_held_exits(wait)
     }
 
     fn hold_scanned(&mut self) -> std::io::Result<ScanFinding> {

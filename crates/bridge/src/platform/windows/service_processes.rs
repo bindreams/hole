@@ -11,16 +11,22 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use tracing::{info, warn};
+use windows::Win32::Foundation::{GetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+};
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE,
+    GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
+    INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessHolds, ProcessSource};
 use crate::cutover::scm_wait::scan::{scan, ListedProcess, ProcessEnumerator, ScanFinding, ScanResult};
-use crate::disable_record::Stamp;
+use crate::cutover::scm_wait::settle::ExitWait;
+use crate::disable_record::{creation_time_of, Stamp};
 
 use super::service_sid::ServiceSid;
 
@@ -30,11 +36,40 @@ use super::service_sid::ServiceSid;
 /// valid, one that may not be valid, and one found by scanning the host each
 /// mean is one table, `Basis::verdict`.
 pub(super) fn open_process(pid: u32, service: &ServiceSid, basis: Basis) -> io::Result<Opened<OwnedHandle>> {
+    open_process_where(pid, service, basis, |_| Ok(true))
+}
+
+/// [`open_process`] for the process a listing named: the id held by a process
+/// with another creation time is the OS's reuse of it, and the listed process
+/// is gone ([`Opened::NoSuchProcess`]) whatever the stranger's token carries.
+pub(super) fn open_listed_process(listed: ListedProcess, service: &ServiceSid) -> io::Result<Opened<OwnedHandle>> {
+    open_process_where(listed.pid, service, Basis::Scanned, |process| {
+        // SAFETY: `process` is the live handle opened with the query right.
+        let created = unsafe { creation_time_of(HANDLE(process.as_raw_handle())) }
+            .map_err(|error| ScmCall::GetProcessTimes.failed_with(&error))?;
+        Ok(created == listed.created)
+    })
+}
+
+/// [`open_process`] that keeps the process only if `is_the_one` says it is the
+/// one wanted, which is read before its token. A failed read is resolved by
+/// `basis` like a failed open.
+fn open_process_where(
+    pid: u32,
+    service: &ServiceSid,
+    basis: Basis,
+    is_the_one: impl FnOnce(&OwnedHandle) -> io::Result<bool>,
+) -> io::Result<Opened<OwnedHandle>> {
     // SAFETY: plain FFI call; no pointer is passed.
     match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(handle) => {
             // SAFETY: `OpenProcess` returned a new handle this value now owns.
             let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+            match is_the_one(&process) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Opened::NoSuchProcess),
+                Err(error) => return Opened::of_failure(basis, error),
+            }
             let read = service.is_in_token_of(&process);
             opened_from_token_read(process, basis, read, has_exited)
         }
@@ -116,8 +151,8 @@ impl ProcessEnumerator for HostProcesses<'_> {
         unsafe { GetCurrentProcessId() }
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Opened<OwnedHandle>> {
-        open_process(pid, self.service, Basis::Scanned)
+    fn open(&mut self, listed: ListedProcess) -> io::Result<Opened<OwnedHandle>> {
+        open_listed_process(listed, self.service)
     }
 
     fn has_exited(&mut self, process: &OwnedHandle) -> io::Result<bool> {
@@ -136,6 +171,66 @@ impl ProcessEnumerator for HostProcesses<'_> {
 /// [`ServiceProcesses::hold_scanned`], which remembers the last.
 pub fn scan_service_processes(service: &ServiceSid) -> io::Result<ScanResult<OwnedHandle>> {
     scan(&mut HostProcesses { service }, &[])
+}
+
+/// Terminates the live process `held` is open on, whose id is `pid`. A failure
+/// is an error unless the process had exited by then: `TerminateProcess`
+/// answers an exited process with `ERROR_ACCESS_DENIED`.
+fn terminate(pid: u32, held: &OwnedHandle) -> io::Result<()> {
+    // The held handle has no `PROCESS_TERMINATE` right: asking for it there
+    // would turn a denial for a SYSTEM process into "not the service's".
+    // SAFETY: plain FFI call; no pointer is passed.
+    let opened = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) };
+    let terminated = opened.and_then(|handle| {
+        // SAFETY: `OpenProcess` returned a new handle this value now owns.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        // SAFETY: `handle` is the live handle just opened with the terminate right.
+        unsafe { TerminateProcess(HANDLE(handle.as_raw_handle()), 1) }
+    });
+    match terminated {
+        Ok(()) => Ok(()),
+        Err(_) if has_exited(held)? => Ok(()),
+        Err(e) => Err(ScmCallError {
+            call: ScmCall::TerminateProcess,
+            code: win32_code_of_hresult(e.code().0),
+        }
+        .into_io()),
+    }
+}
+
+/// Enables `SeDebugPrivilege` on this process's token, which an elevated
+/// administrator holds disabled. With it enabled `OpenProcess` grants the
+/// requested access whatever the process's security descriptor says
+/// ([`OpenProcess`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess#remarks)),
+/// which a SYSTEM process's descriptor otherwise refuses an administrator for
+/// `PROCESS_TERMINATE`. A token that does not hold it is warned about; the
+/// terminate that needed it then fails with its own error.
+fn enable_debug_privilege() {
+    let mut token = HANDLE::default();
+    // SAFETY: plain FFI calls on this process's own token, closed by `OwnedHandle`.
+    let enabled = unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token).and_then(|()| {
+            let token = OwnedHandle::from_raw_handle(token.0);
+            let mut luid = Default::default();
+            LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid)?;
+            let privileges = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            AdjustTokenPrivileges(HANDLE(token.as_raw_handle()), false, Some(&privileges), 0, None, None)?;
+            // Succeeds even when nothing was assigned; the last error says which.
+            if GetLastError() == ERROR_NOT_ALL_ASSIGNED {
+                return Err(windows::core::Error::from(ERROR_NOT_ALL_ASSIGNED));
+            }
+            Ok(())
+        })
+    };
+    if let Err(error) = enabled {
+        warn!(%error, "SeDebugPrivilege could not be enabled; terminating a process of another principal may be refused");
+    }
 }
 
 /// Every process a retirement has seen its service run.
@@ -166,10 +261,33 @@ impl ServiceProcesses {
         self.holds.processes().count()
     }
 
+    /// Terminates every held process that has not exited. Each is proven the
+    /// service's by its token, and the held handle keeps its id from being
+    /// reused, so the id names the same process at the second open.
+    fn terminate_live(&self) -> io::Result<()> {
+        let mut debug_enabled = false;
+        for (pid, process) in self.holds.held() {
+            if has_exited(process)? {
+                continue;
+            }
+            if !debug_enabled {
+                enable_debug_privilege();
+                debug_enabled = true;
+            }
+            info!(pid, "terminating a process of the stopped service");
+            terminate(pid, process)?;
+        }
+        Ok(())
+    }
+
     /// Blocks until every held process has exited. An external event with no
     /// bound of its own to choose: the exit of a process the SCM has been told
-    /// to stop.
-    pub(super) fn await_exits(&self) -> io::Result<()> {
+    /// to stop, or one [`terminate_live`](Self::terminate_live) just ended.
+    pub(super) fn await_exits(&self, wait: ExitWait) -> io::Result<()> {
+        match wait {
+            ExitWait::OnTheirOwn => {}
+            ExitWait::TerminateThenWait => self.terminate_live()?,
+        }
         for process in self.holds.processes() {
             let handle = HANDLE(process.as_raw_handle());
             // SAFETY: `handle` is the live handle `process` owns.

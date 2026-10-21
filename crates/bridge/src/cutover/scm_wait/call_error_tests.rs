@@ -58,8 +58,10 @@ fn each_call_has_its_win32_name() {
         (ScmCall::OpenProcess, "OpenProcess"),
         (ScmCall::OpenProcessToken, "OpenProcessToken"),
         (ScmCall::GetTokenInformation, "GetTokenInformation"),
+        (ScmCall::GetProcessTimes, "GetProcessTimes"),
         (ScmCall::LookupAccountName, "LookupAccountName"),
         (ScmCall::WaitForSingleObject, "WaitForSingleObject"),
+        (ScmCall::TerminateProcess, "TerminateProcess"),
         (ScmCall::CreateService, "CreateService"),
         (ScmCall::StartServiceCtrlDispatcher, "StartServiceCtrlDispatcher"),
     ];
@@ -200,6 +202,7 @@ fn only_opening_and_identifying_the_process_is_opening_the_service_process() {
         ScmCall::DeleteService,
         ScmCall::QueryServiceStatusEx,
         ScmCall::WaitForSingleObject,
+        ScmCall::TerminateProcess,
         ScmCall::CreateService,
         ScmCall::StartServiceCtrlDispatcher,
         ScmCall::LookupAccountName,
@@ -207,6 +210,7 @@ fn only_opening_and_identifying_the_process_is_opening_the_service_process() {
     assert!(ScmCall::OpenProcess.is_opening_the_service_process());
     assert!(ScmCall::OpenProcessToken.is_opening_the_service_process());
     assert!(ScmCall::GetTokenInformation.is_opening_the_service_process());
+    assert!(ScmCall::GetProcessTimes.is_opening_the_service_process());
     for call in others {
         assert!(!call.is_opening_the_service_process(), "{call:?}");
     }

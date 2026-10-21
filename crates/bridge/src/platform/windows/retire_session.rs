@@ -24,7 +24,7 @@ use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCa
 use crate::cutover::scm_wait::hold::Look;
 use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, StartConfig, StartWrite, Survivors};
 use crate::cutover::scm_wait::scan::ScanFinding;
-use crate::cutover::scm_wait::settle::StopActor;
+use crate::cutover::scm_wait::settle::{ExitWait, StopActor};
 use crate::cutover::scm_wait::Observed;
 use crate::disable_record::{Changer, RecordKey, RecordState};
 use crate::service_start::StartType;
@@ -116,7 +116,7 @@ impl Survivors for GoneSession {
             held = self.processes.held(),
             "waiting for the processes of a removed service entry to exit"
         );
-        self.processes.await_exits()
+        self.processes.await_exits(ExitWait::TerminateThenWait)
     }
 }
 
@@ -137,8 +137,8 @@ impl StopActor for RetireSession {
         self.stop.await_callback()
     }
 
-    fn await_held_exits(&mut self) -> io::Result<()> {
-        self.stop.await_held_exits()
+    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()> {
+        self.stop.await_held_exits(wait)
     }
 
     fn hold_scanned(&mut self) -> io::Result<ScanFinding> {

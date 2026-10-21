@@ -2332,7 +2332,9 @@ enum StoppedBy {
     TheRetirement,
     /// The test, before the stop wait begins: the first look is already
     /// STOPPED, which names no process, so only the scan for the service's
-    /// token can find the one that is left.
+    /// token can find the one that is left. A process found only so, after
+    /// STOPPED, is terminated rather than waited out
+    /// (`ExitWait::TerminateThenWait`); the test's release then finds it gone.
     TheTest,
 }
 
@@ -2477,9 +2479,9 @@ impl hole_bridge::cutover::scm_wait::settle::StopActor for WatchedStop<'_> {
         self.inner.await_callback()
     }
 
-    fn await_held_exits(&mut self) -> std::io::Result<()> {
+    fn await_held_exits(&mut self, wait: hole_bridge::cutover::scm_wait::settle::ExitWait) -> std::io::Result<()> {
         (self.on_await_held_exits)();
-        self.inner.await_held_exits()
+        self.inner.await_held_exits(wait)
     }
 
     fn hold_scanned(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::scan::ScanFinding> {
@@ -2585,6 +2587,59 @@ fn cutover_global_net_state_cutover_stop_waits_out_a_service_process_that_outliv
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_cutover_stop_finds_a_service_process_that_outlived_stopped_before_it_began() {
     cutover_stop_waits_out_a_process_that_outlives_stopped(StoppedBy::TheTest);
+}
+
+/// A service that left behind a process of its own token which the SCM never
+/// told to stop (a plugin outliving a crashed bridge, a cutover child left
+/// suspended). The helper starts it as a child that parks for ever. Its id is
+/// logged beside the service's own, so the checks below see both.
+#[cfg(target_os = "windows")]
+fn install_a_service_with_an_orphan(pid_log: &std::path::Path) -> (ProvisionedService, Vec<u32>) {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let mut args = pid_log_args(pid_log);
+    args.extend(["--spawn-orphan".into(), pid_log.as_os_str().to_owned()]);
+    let service = ProvisionedService::install_with_args(helper, args);
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
+    let pids = left_behind::logged(pid_log);
+    assert_eq!(pids.len(), 2, "the service and its orphan: {pids:?}");
+    (service, pids)
+}
+
+/// The uninstall ends a process that carries the service's token and that
+/// nothing will ever stop, instead of waiting on it for ever while it holds the
+/// machine-wide lock.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_terminates_a_service_process_nothing_stops() {
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let (_service, _pids) = install_a_service_with_an_orphan(&pid_log);
+
+    hole_bridge::platform::os::uninstall().expect("uninstall returns with the orphan terminated");
+    left_behind::assert_none(&pid_log);
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+}
+
+/// The cutover's stop wait does the same over its own session.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_cutover_stop_terminates_a_service_process_nothing_stops() {
+    use hole_bridge::cutover::scm_wait::settle::settle_stopped;
+    use hole_bridge::platform::os::StopSession;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pid_log = dir.path().join("pids.log");
+    let (_service, _pids) = install_a_service_with_an_orphan(&pid_log);
+
+    let mut session = StopSession::open().expect("open the stop session");
+    settle_stopped(&mut session).expect("the stop wait returns with the orphan terminated");
+    left_behind::assert_none(&pid_log);
 }
 
 /// A service whose process the retirement cannot hold (one started before the

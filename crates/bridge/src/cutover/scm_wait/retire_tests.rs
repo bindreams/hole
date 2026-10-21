@@ -5,6 +5,7 @@ use super::*;
 use crate::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Look, ProcessFate};
 use crate::cutover::scm_wait::scan::ScanFinding;
+use crate::cutover::scm_wait::settle::ExitWait;
 use crate::cutover::scm_wait::Observed;
 use crate::disable_record::RecordState;
 
@@ -129,7 +130,7 @@ impl StopActor for FakeSession<'_> {
     fn await_callback(&mut self) -> io::Result<()> {
         self.call("await_callback")
     }
-    fn await_held_exits(&mut self) -> io::Result<()> {
+    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
         self.call("await_held_exits")
     }
     fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
@@ -1110,7 +1111,7 @@ impl StopActor for Model {
     fn await_callback(&mut self) -> io::Result<()> {
         self.step(None, |_| {})
     }
-    fn await_held_exits(&mut self) -> io::Result<()> {
+    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
         self.step(None, |_| {})
     }
     fn hold_scanned(&mut self) -> io::Result<ScanFinding> {

@@ -43,9 +43,16 @@
 //!   service takes, create `<marker>` and exit without reporting STOPPED, so
 //!   the SCM sees the service fail and applies its failure actions. Later
 //!   instances (the marker exists) stop as usual.
+//! - `--spawn-orphan <path>`: before reporting RUNNING, start a child of this
+//!   process (it carries the service's token, SID included) that parks for
+//!   ever, and append its id to `<path>`. The SCM never tells it to stop, as
+//!   with a plugin left behind by a crashed bridge.
 //! - `--running-event <event>`: signalled right after the service reports
 //!   RUNNING, once per start. A test that resets it before it kills the service
 //!   learns the SCM's restarted instance is up from the signal.
+//!
+//! A first argument of `--park-forever` makes this the child `--spawn-orphan`
+//! starts: it does nothing, for ever.
 //!
 //! A first argument of `--scan-sid` makes this a one-shot scanner instead of a
 //! service: `--scan-sid <service> <out-file> [done-event]` looks for the
@@ -53,6 +60,8 @@
 //! hold does, writes what it measured to `<out-file>` and signals `done-event`
 //! (when given) whichever way it ended. A test runs it as itself and as
 //! LocalSystem (a scheduled task) to measure what each caller can read.
+
+#![allow(clippy::disallowed_methods)] // test helper, never shipped
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;
@@ -92,6 +101,7 @@ struct Args {
     crash_on_first_stop: Option<PathBuf>,
     pid_log: Option<PathBuf>,
     sid_repair_log: Option<PathBuf>,
+    spawn_orphan: Option<PathBuf>,
 }
 
 #[cfg(target_os = "windows")]
@@ -107,6 +117,7 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
             Some("--release-event") => args.release_event = Some(value.into_string().expect("event name is UTF-8")),
             Some("--pid-log") => args.pid_log = Some(PathBuf::from(value)),
             Some("--sid-repair-log") => args.sid_repair_log = Some(PathBuf::from(value)),
+            Some("--spawn-orphan") => args.spawn_orphan = Some(PathBuf::from(value)),
             Some("--crash-on-first-stop") => args.crash_on_first_stop = Some(PathBuf::from(value)),
             Some("--hold-start") => args.hold_start = Some(value.into_string().expect("event name is UTF-8")),
             Some("--parked-event") => args.parked_event = Some(value.into_string().expect("event name is UTF-8")),
@@ -137,6 +148,11 @@ fn main() -> Result<(), windows_service::Error> {
         raw.next();
         scan::run(raw);
         return Ok(());
+    }
+    if raw.peek().is_some_and(|first| first == "--park-forever") {
+        loop {
+            std::thread::park();
+        }
     }
     ARGS.set(parse_args(std::env::args_os().skip(1))).ok();
     let args = ARGS.get().expect("set above");
@@ -255,6 +271,22 @@ fn service_main(_arguments: Vec<OsString>) {
     else {
         return;
     };
+    if let Some(path) = &args.spawn_orphan {
+        #[allow(clippy::zombie_processes)] // left running on purpose
+        let orphan = std::process::Command::new(std::env::current_exe().expect("this executable"))
+            .arg("--park-forever")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the orphan");
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open the orphan log");
+        writeln!(log, "{}", orphan.id()).expect("write the orphan log");
+    }
     if let Some(path) = &args.sid_repair_log {
         let line = match hole_bridge::platform::os::registration::run_startup_repairs().service_sid {
             Ok(outcome) => format!("{outcome:?}"),

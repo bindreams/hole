@@ -147,7 +147,8 @@ impl ProcessEnumerator for Host {
         1
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Opened<Handle>> {
+    fn open(&mut self, listed: ListedProcess) -> io::Result<Opened<Handle>> {
+        let pid = listed.pid;
         let mut state = (self.0).0.borrow_mut();
         if !state.processes.contains_key(&pid) {
             return Ok(Opened::NoSuchProcess);
