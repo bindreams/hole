@@ -2220,8 +2220,9 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   for the holder that waits for it. The only one that takes the lock is the
   cutover child (`bridge cutover`, spawned by the service): it tries the lock
   once, before anything else (`run_while_holding`), and if a change holds it
-  the update is abandoned, the marker is left as a crashed child leaves it and
-  the next start reconciles it; if it took the lock first it holds it for the
+  the update is abandoned and its marker cleared, as for any graceful failure
+  (the holder may leave the old bridge running, so no new bridge would bind to
+  sweep it); if it took the lock first it holds it for the
   whole cutover and the other change waits for it. The service process
   (`bridge run`) and the plugins it starts never take the lock.
   Proofs: the lock's own tests (a second thread waits and gets it once the

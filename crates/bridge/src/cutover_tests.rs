@@ -855,6 +855,16 @@ mod child_and_lock {
     use super::super::run_while_holding;
     use crate::platform::os::StartTypeLock;
 
+    fn write_marker(dir: &std::path::Path) {
+        let info = hole_common::update_marker::MarkerInfo {
+            version: hole_common::update_marker::MARKER_VERSION,
+            driver: cosca::identity::ProcessId::current()
+                .to_record()
+                .expect("persist this process's identity"),
+        };
+        hole_common::update_marker::write(dir, &info, None).unwrap();
+    }
+
     /// Holder first: the holder waits for the child's exit (the join) while the
     /// child tries the lock. A child that waited for it would wait for ever;
     /// this one abandons the update, runs nothing, and the holder's wait ends.
@@ -862,11 +872,14 @@ mod child_and_lock {
     fn a_child_that_finds_the_lock_held_abandons_the_update_and_the_holder_waiting_for_it_finishes() {
         let lock = StartTypeLock::scratch("child-after-holder");
         let held = lock.acquire().expect("the holder takes the lock");
+        let marker_dir = tempfile::tempdir().unwrap();
+        write_marker(marker_dir.path());
         let ran = AtomicBool::new(false);
         let outcome = std::thread::scope(|s| {
             let child = s.spawn(|| {
                 run_while_holding(
                     || lock.try_acquire(),
+                    marker_dir.path(),
                     || {
                         ran.store(true, Ordering::SeqCst);
                         Ok(())
@@ -879,6 +892,10 @@ mod child_and_lock {
         let error = outcome.expect_err("the update is abandoned");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
         assert!(!ran.load(Ordering::SeqCst), "nothing of the cutover ran");
+        assert!(
+            !hole_common::update_marker::is_present(marker_dir.path()),
+            "an abandoned update clears its claim, or no later update can start and a plain stop reads as a cutover"
+        );
         assert!(lock.is_held_for_another_thread(), "the holder still holds it");
         drop(held);
     }
@@ -889,6 +906,7 @@ mod child_and_lock {
     #[skuld::test]
     fn a_holder_that_arrives_during_a_cutover_waits_for_it_and_then_finishes() {
         let lock = StartTypeLock::scratch("holder-after-child");
+        let marker_dir = tempfile::tempdir().unwrap();
         let cutover_done = AtomicBool::new(false);
         let (inside_tx, inside_rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel::<()>();
@@ -898,6 +916,7 @@ mod child_and_lock {
                 let go_rx = go_rx;
                 run_while_holding(
                     || lock.try_acquire(),
+                    marker_dir.path(),
                     || {
                         inside_tx.send(()).expect("tell the holder");
                         go_rx.recv().expect("the holder says go");
@@ -929,8 +948,10 @@ mod child_and_lock {
     #[skuld::test]
     fn the_lock_is_free_again_after_a_cutover_that_failed() {
         let lock = StartTypeLock::scratch("child-fails");
+        let marker_dir = tempfile::tempdir().unwrap();
         let outcome = run_while_holding(
             || lock.try_acquire(),
+            marker_dir.path(),
             || Err::<(), _>(io::Error::other("the swap failed")),
         );
         assert_eq!(outcome.expect_err("failed").to_string(), "the swap failed");

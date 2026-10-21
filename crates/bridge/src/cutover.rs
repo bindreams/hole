@@ -56,28 +56,33 @@ pub fn service_state_dir() -> PathBuf {
 /// The child carries the service's SID, so a retirement or install that holds
 /// the start-type lock waits for the child to exit (it scans for the service's
 /// processes). The child therefore never waits for the lock: it tries it once,
-/// and if a change holds it the update is abandoned, the update marker is left
-/// as it is, and the next start reconciles as it does after a crashed child. A
-/// child that took it first holds it for the whole cutover, and the other
-/// change waits for the child. No other process that carries the service's SID
+/// and if a change holds it the update is abandoned and its marker cleared, as
+/// for any graceful failure: the holder may leave the old bridge running, and
+/// then no new bridge would bind to sweep the marker. A child that took it first
+/// holds it for the whole cutover, and the other change waits for the child. No other process that carries the service's SID
 /// takes the lock: the service itself and the plugins it starts never do.
 #[cfg(target_os = "windows")]
 pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()> {
-    run_while_holding(crate::platform::os::try_hold_start_type, || {
-        run_held(payload, target_version)
-    })
+    run_while_holding(
+        crate::platform::os::try_hold_start_type,
+        &hole_common::update_marker::service_log_dir(),
+        || run_held(payload, target_version),
+    )
 }
 
 /// Runs `run` while holding the start-type lock `try_hold` takes, or, when
-/// another change holds it, does not run it and fails with `WouldBlock`. The
-/// lock belongs to this thread, so every step of `run` takes it again on this
-/// thread without waiting.
+/// another change holds it, does not run it, clears the update marker in
+/// `log_dir` (the update did nothing, and the holder may leave the old bridge
+/// running) and fails with `WouldBlock`. The lock belongs to this thread, so
+/// every step of `run` takes it again on this thread without waiting.
 #[cfg(target_os = "windows")]
 fn run_while_holding<H, T>(
     try_hold: impl FnOnce() -> std::io::Result<Option<H>>,
+    log_dir: &Path,
     run: impl FnOnce() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     let Some(_held) = try_hold()? else {
+        clear_marker(log_dir);
         tracing::warn!(
             "cutover: an uninstall, install, repair or enable holds the service's start type, so this update is abandoned"
         );
@@ -136,6 +141,12 @@ fn settle_marker(result: &std::io::Result<crate::cutover::os::CutoverOutcome>, l
     if leaves_marker {
         return;
     }
+    clear_marker(log_dir);
+}
+
+/// Clear the marker no new bridge will sweep; a failure is logged, not fatal.
+#[cfg(target_os = "windows")]
+fn clear_marker(log_dir: &Path) {
     if let Err(e) = hole_common::update_marker::clear(log_dir) {
         tracing::warn!(error = %e, "cutover child: failed to clear the marker no new bridge will sweep");
     }
