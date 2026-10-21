@@ -570,19 +570,20 @@ The directory above the lock is as attacker-writable as the name (every
 component under the user's profile is theirs to replace), so `Exclusive` opens it
 first as a [`util::dir::Dir`](crates/util/src/dir.rs): one component at a
 time, relative to the handle already held (`openat` with `O_NOFOLLOW` and
-`mkdirat` on unix; `NtCreateFile` relative to the parent handle on Windows, then
-the handle's attributes refuse a reparse point). Every later step on the lock
+`mkdirat` on unix; `NtCreateFile` relative to the parent handle on Windows, which
+opens a reparse point as itself so it can be judged). Every later step on the lock
 file (the open, the name check, the unlink of a leftover) goes through that
 handle. A path call would resolve the whole path again and follow whatever the
 user swapped in.
 
-- **Which symlinks are followed.** Unix follows one only when root owns it *and*
-  the directory it sits in and nobody else can write that directory: that is
-  system configuration (macOS's `/var`, `/tmp` and `/etc`, hence `temp_dir()`),
-  and a user cannot plant one there. A user-owned symlink is refused, including
-  one a user made on purpose in their own profile (a `~/Library` moved to another
-  disk). Windows follows no reparse point at all, junctions and mount points
-  included. The refusal is a `Refused` that names the lock path and carries a
+- **Which links are followed.** Under the ownership-transition rule of
+  [Privileged code in folders a user may own](#privileged-code-in-folders-a-user-may-own):
+  a link the system owns (macOS's `/var`, `/tmp` and `/etc`, hence `temp_dir()`;
+  Windows's `C:\Documents and Settings`) is followed, and so is a user's link to a
+  folder that user owns (a `~/Library` moved to another disk); a user's link into
+  a folder the system or another account owns is refused. Windows follows symlinks,
+  junctions and mount points under the same rule and refuses any other reparse
+  point. The refusal is a `Refused` that names the lock path and carries a
   `util::dir::Refusal`.
 - **Ownership.** With an `owner`, the final directory must be owned by it or by
   this process (the second covers a directory a previous run created and died
@@ -604,8 +605,10 @@ user swapped in.
   their parent's handle, never by `create_dir_all` on a path.
 
 A symlink (on Windows any reparse point), directory, socket or other non-regular
-file at the name, a file owned by a third party, or a directory in the path that `Dir` refuses, is **refused**: an
-`InvalidData` error holding a `file_lock::Refused`.
+file at the name, a file owned by a third party, or a directory in the path that
+`Dir` refuses, is **refused**: an `InvalidData` error holding a
+`file_lock::Refused`. A second name for the lock file is not: the count can change
+after it is read.
 
 State-file writers use the same handle. `bridge-target.json`,
 `bridge-startup.json`, `bridge-plugins.json` and the four fail-closed files
@@ -622,6 +625,8 @@ every step inside that handle: the read, the staged temp file (sealed through it
 own handle), the backup hard link, the no-clobber rename, the replace and the
 directory flush. A symlink at the file's own name is never read through: it is a
 file this release cannot read, and the file's role decides what happens to it.
+The update marker (`hole_common::update_marker`) and the log directory
+(`hole_common::logging::init_dual`, with `DirRotate`) are written the same way.
 
 `Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
 lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
@@ -629,6 +634,53 @@ the path, and logging the error with `%e` or `?e` cannot put a username in
 `bridge.log` (which the support bundle collects). `Refused::path()` is the one way
 out; a caller that wants it chooses a sink that may hold a path (`gui.log`), never
 the bridge log or the bundle.
+
+### Privileged code in folders a user may own
+
+The bridge runs as root or SYSTEM, and some of what it reads and writes sits under the interactive user's
+profile: the state directory, the log directory, the update marker. Every component of such a path is the
+user's to replace between any two calls, so a path call (`create_dir_all`, `chown`, `rename`, `remove_file`,
+`File::create`) resolves the whole path again and can be sent anywhere. Code that acts in such a folder
+follows these rules, which [`util::dir::Dir`](crates/util/src/dir.rs) implements once; use it, do not
+re-derive them.
+
+1. **Walk through handles.** Open the directory once, one component at a time, each relative to the handle
+   already held (`openat` on unix, `NtCreateFile` relative to the parent handle on Windows). Every later step
+   names a file by one name *inside that handle*.
+
+1. **The ownership-transition rule.** A link is followed only if the walk never moves from a folder an
+   unprivileged user owns into one somebody else owns. This is systemd's `chase()` with `CHASE_SAFE`
+   (`safe_transition`), tightened in two places:
+
+   - A link is judged by its own owner as well as by the folder it sits in. A link the system owns (unix: root;
+     Windows: SYSTEM, Administrators, TrustedInstaller) is followed in a folder the system owns (macOS's `/var`,
+     Windows's `C:\Documents and Settings`), and refused in a user's folder, where it can only be a hard link the
+     user planted.
+   - A link an unprivileged user owns binds the walk to that user. The walk may pass through anyone's folders
+     (an absolute target restarts at the root), but it creates only in folders that user owns and ends only in
+     one. A user's link to their own relocated profile is followed; their link to `/etc` is refused, and so
+     is a link whose target is another user's.
+
+   Without the second tightening a link a user plants in a folder the system owns (`/tmp`) leads anywhere:
+   `safe_transition` lets any step away from a system-owned folder pass and never sees who owns the link. The
+   cautionary case is that check, and CVE-2026-16552 (NVD status: Rejected, as out of its component's threat
+   model). The rule is one decision in one place (`dir/trail.rs`, `Owner::may_enter` and `Trail`), decided on
+   each link, never at a call site.
+
+1. **Never follow the final name.** A file operation opens its name with `O_NOFOLLOW` / `FILE_OPEN_REPARSE_POINT`
+   and creates with `O_EXCL`. A link there is renamed, linked or unlinked as itself and never read or written
+   through.
+
+1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a
+   temp file, before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
+
+1. **Never touch a path after a rename.** Once the temp file has its final name the writer does nothing to that
+   name: a name swapped for a hard link or a symlink after the rename changes nothing.
+
+`the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps the state-file writers on the handle. A test of
+a walk plants links with `util::dir::testing` (`plant_link`, `user_dir`, `SystemScratch`), which hand what they
+make to an unprivileged owner whoever runs the test: a link to a folder the system owns must be refused, a link
+to a folder its own owner owns must be followed, and the same through each writer.
 
 ### Route-command failure policy
 
