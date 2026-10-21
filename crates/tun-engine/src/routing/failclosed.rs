@@ -1082,6 +1082,11 @@ pub(crate) fn build_lockdown_spec_for_test(
 #[path = "failclosed/facade_tests.rs"]
 mod facade_tests;
 
+// Not platform-gated: the state writers and the symlink they must refuse are on every host.
+#[cfg(test)]
+#[path = "failclosed/state_symlink_tests.rs"]
+mod state_symlink_tests;
+
 // Deliberately NOT platform-gated. The clearance fold is the decision the
 // uninstall gate reads, and the key class it exists for is Windows-only — so
 // gating its tests to Windows would put the proof on the same platform as the

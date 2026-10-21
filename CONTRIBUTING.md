@@ -566,9 +566,51 @@ protocol and what it guarantees are in the
 `FILE_SHARE_DELETE` so the name stays bound to the vetted file while the lock is
 held.
 
+The directory above the lock is as attacker-writable as the name (every
+component under the user's profile is theirs to replace), so `Exclusive` opens it
+first as a [`file_lock::Dir`](crates/file-lock/src/dir.rs): one component at a
+time, relative to the handle already held (`openat` with `O_NOFOLLOW` and
+`mkdirat` on unix; `NtCreateFile` relative to the parent handle on Windows, then
+the handle's attributes refuse a reparse point). Every later step on the lock
+file (the open, the name check, the unlink of a leftover) goes through that
+handle. A path call would resolve the whole path again and follow whatever the
+user swapped in.
+
+- **Which symlinks are followed.** Unix follows one only when root owns it *and*
+  the directory it sits in and nobody else can write that directory: that is
+  system configuration (macOS's `/var`, `/tmp` and `/etc`, hence `temp_dir()`),
+  and a user cannot plant one there. A user-owned symlink is refused, including
+  one a user made on purpose in their own profile (a `~/Library` moved to another
+  disk). Windows follows no reparse point at all, junctions and mount points
+  included. The refusal is a `Refused` that names the lock path and carries a
+  `file_lock::dir::Refusal`.
+- **Ownership.** With an `owner`, the final directory must be owned by it or by
+  this process (the second covers a directory a previous run created and died
+  before handing over); any other owner is refused. Windows has no unix ids and
+  does not check.
+- **OS floor.** `openat`, `mkdirat`, `fstatat`, `unlinkat`, `renameat` (Linux
+  2.6.16, macOS 10.10) and `NtCreateFile` / `NtSetInformationFile` with a root
+  directory (every NT version). Neither `openat2(RESOLVE_NO_SYMLINKS)` (Linux 5.6)
+  nor `O_NOFOLLOW_ANY` (macOS 10.15) is used, so one code path serves every
+  version and there is no fallback to path resolution. The Windows replace uses
+  `FileRenameInformationEx` with POSIX semantics (Windows 10 1607, NTFS) and the
+  plain replace where the volume rejects it, as `versioned_file` does.
+- **Missing directories** above the file are created the same way, relative to
+  their parent's handle, never by `create_dir_all` on a path.
+
 A symlink (on Windows any reparse point), directory, socket or other non-regular
-file at the name, a kept file with a second name, or a file owned by a third
-party, is **refused**: an `InvalidData` error holding a `file_lock::Refused`.
+file at the name, a kept file with a second name, a file owned by a third
+party, or a directory in the path that `Dir` refuses, is **refused**: an
+`InvalidData` error holding a `file_lock::Refused`.
+
+State-file writers use the same handle. `bridge-target.json`,
+`bridge-startup.json`, `bridge-plugins.json` and the four fail-closed files
+(`bridge-failclosed.json`, `bridge-lockdown.json`, `bridge-lockdown-pf.json`,
+`bridge-boottime.json`) are written by `Dir::write_atomic` (most through
+`file_lock::dir::write_state_file`): the temp file's owner, mode and ACL are set
+on its own handle before the rename and nothing touches the final name after it,
+so a name swapped for a hard link or symlink after the rename changes nothing.
+`the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps them on it.
 
 `Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
 lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
@@ -2595,7 +2637,7 @@ Each publishable member declares a release group in
 | `crates/tun-engine[-macros]/`      | GPL · hole                             | TUN + routing + packet-loop engine (+ `#[freeze]` macro)                         |
 | `crates/dump[-macros]/`            | GPL · hole                             | YAML-shaped logging representation (+ derive)                                    |
 | `crates/handle-holders/`           | GPL · hole                             | File-handle introspection (Win NtQuery / mac lsof)                               |
-| `crates/file-lock/`                | GPL · —                                | `Exclusive`: cross-process file lock safe in a directory another user can write  |
+| `crates/file-lock/`                | GPL · —                                | `Exclusive` lock + `Dir` no-follow handle, safe in a user-writable directory     |
 | `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                          |
 | `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                                |
 | `crates/stepstool/`                | Apache · —                             | Elevation primitives: sudo priming + wrapping (POSIX), elevation detection (Win) |

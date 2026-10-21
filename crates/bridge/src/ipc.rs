@@ -1304,18 +1304,61 @@ pub(crate) const SDDL_BASE: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 #[cfg(target_os = "windows")]
 pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
     use windows::core::HSTRING;
+    use windows::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+
+    let path_wide = HSTRING::from(path.as_os_str());
+    with_sddl_dacl(sddl, protect, |dacl, security_info| {
+        // SAFETY: `path_wide` is alive for the call. `dacl` points into the still-live
+        // security descriptor `with_sddl_dacl` holds. Owner/group pointers are correctly None.
+        unsafe { SetNamedSecurityInfoW(&path_wide, SE_FILE_OBJECT, security_info, None, None, Some(dacl), None) }
+    })
+}
+
+/// [`set_dacl_from_sddl`] on an open file or directory instead of a path: nothing is resolved by name,
+/// so a path swapped for a symlink cannot redirect it. The handle needs `WRITE_DAC`.
+#[cfg(target_os = "windows")]
+pub fn set_dacl_from_sddl_on_handle(handle: &std::fs::File, sddl: &str, protect: bool) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+
+    with_sddl_dacl(sddl, protect, |dacl, security_info| {
+        // SAFETY: `handle` is open for the call. `dacl` points into the still-live security
+        // descriptor `with_sddl_dacl` holds. Owner/group pointers are correctly None.
+        unsafe {
+            SetSecurityInfo(
+                HANDLE(handle.as_raw_handle()),
+                SE_FILE_OBJECT,
+                security_info,
+                None,
+                None,
+                Some(dacl),
+                None,
+            )
+        }
+    })
+}
+
+/// Parses `sddl`, hands its DACL and the `SECURITY_INFORMATION` for `protect` to `apply`, and frees
+/// the descriptor on every path.
+#[cfg(target_os = "windows")]
+fn with_sddl_dacl(
+    sddl: &str,
+    protect: bool,
+    apply: impl FnOnce(
+        *const windows::Win32::Security::ACL,
+        windows::Win32::Security::OBJECT_SECURITY_INFORMATION,
+    ) -> windows::Win32::Foundation::WIN32_ERROR,
+) -> std::io::Result<()> {
+    use windows::core::HSTRING;
     use windows::Win32::Foundation::LocalFree;
-    use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
-    };
+    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows::Win32::Security::{
         GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
 
     let sddl_wide = HSTRING::from(sddl);
-    let path_wide = HSTRING::from(path.as_os_str());
-
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `sddl_wide` is a valid HSTRING kept alive for the call.
     // `sd` is an out-parameter that Windows allocates via LocalAlloc on success;
@@ -1370,19 +1413,7 @@ pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Re
             UNPROTECTED_DACL_SECURITY_INFORMATION
         };
 
-    // SAFETY: `path_wide` is alive for the call. `dacl` points into the still-live
-    // `sd` allocation. Owner/group pointers are correctly None.
-    let result = unsafe {
-        SetNamedSecurityInfoW(
-            &path_wide,
-            SE_FILE_OBJECT,
-            security_info,
-            None,
-            None,
-            Some(dacl.cast()),
-            None,
-        )
-    };
+    let result = apply(dacl.cast(), security_info);
 
     // SAFETY: same as the early-return LocalFree above — `sd.0` was allocated by
     // Windows via LocalAlloc and is freed exactly once here.

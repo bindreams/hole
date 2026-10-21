@@ -8554,6 +8554,7 @@ dependencies = [
  "bytes",
  "core-foundation 0.9.4",
  "default-net",
+ "file-lock",
  "garter",
  "hole-test-observability",
  "libc",

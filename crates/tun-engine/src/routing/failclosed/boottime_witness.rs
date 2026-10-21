@@ -98,7 +98,6 @@
 //!   very twins go, and keeps reporting. Over-report, the same direction as
 //!   `Cover::drop` above.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -161,21 +160,13 @@ pub fn load(state_dir: &Path) -> ArmingWitness {
 /// Atomically persist `armed` (temp file + same-dir rename, `sync_all` before
 /// persist), the same write shape `lockdown_state` uses. Creates `state_dir`.
 fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    util::ownership::chown_if_some(state_dir, owner);
     let state = BootTimeState {
         version: SCHEMA_VERSION,
         armed,
     };
     let json =
         serde_json::to_vec_pretty(&state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let path = state_file(state_dir);
-    let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
-    tmp.write_all(&json)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
-    Ok(())
+    file_lock::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
 }
 
 /// Record that a twin is outstanding on this host.
