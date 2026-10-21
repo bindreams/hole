@@ -38,10 +38,10 @@
 //! The refusals are an `InvalidData` [`io::Error`] holding a [`Refusal`]; they
 //! carry no path.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -101,6 +101,13 @@ pub enum OpenFile {
     CreateNew { mode: u32 },
     /// Open what is there, `NotFound` if nothing. A symlink (Windows: reparse point) is opened as itself, not followed.
     Existing,
+    /// Open what is there to read, `NotFound` if nothing. Never follows a symlink. Shares everything
+    /// with other handles, delete included, so a replace of the file does not wait for the reader.
+    Read,
+    /// Open to append, creating the file if missing (unix: with `mode`, before the umask; Windows
+    /// ignores `mode`). Never follows a symlink. Shares everything with other handles, delete
+    /// included, so a reader or a rename of the name does not wait for the writer.
+    Append { mode: u32 },
 }
 
 /// What a name in a [`Dir`] is, not following a symlink.
@@ -168,6 +175,72 @@ impl Dir {
         platform::kind_of(&self.file, name)
     }
 
+    /// The whole file `name`, read through a handle that shares delete, so a replace of the file does not wait for
+    /// the read. A symlink at the name is an error, not followed.
+    pub fn read(&self, name: &OsStr) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.open_file(name, OpenFile::Read)?.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Gives the file `existing` a second name `new`, which must be free: `AlreadyExists` otherwise. A symlink is
+    /// linked as itself, never what it points at.
+    pub fn link(&self, existing: &OsStr, new: &OsStr) -> io::Result<()> {
+        single_component(existing)?;
+        single_component(new)?;
+        platform::link(&self.file, existing, new)
+    }
+
+    /// Renames `from` to `to`, replacing `to` if it is there. Both are names in this directory.
+    pub fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        single_component(from)?;
+        single_component(to)?;
+        platform::rename_by_name(&self.file, from, to)
+    }
+
+    /// Renames `from` to `to` in one atomic step, `AlreadyExists` if `to` is there. `Unsupported` where the platform
+    /// or the filesystem cannot: the caller must not fall back to an exists-then-rename check, which is the race this
+    /// call closes.
+    pub fn rename_noreplace(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        single_component(from)?;
+        single_component(to)?;
+        platform::rename_noreplace(&self.file, from, to)
+    }
+
+    /// Flushes the directory, making the renames and unlinks done in it durable. A volume with no directory flush
+    /// answers an error ([`io::Error::raw_os_error`]) the caller decides on.
+    pub fn sync(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    /// Writes `bytes` to a new same-directory temp file, syncs it, seals it to `owner` (unix: `fchmod 0600`,
+    /// `fchown(owner)`) and passes it to `protect` (the place for a Windows ACL, or a wider unix mode), but does not
+    /// give it `name`: [`Staged::publish`] replaces `name` with it and [`Staged::claim`] takes `name` only if it is
+    /// free. Dropped, it removes the temp file.
+    pub fn stage(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        protect: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<Staged<'_>> {
+        single_component(name)?;
+        let (temp_name, temp) = self.create_temp(name)?;
+        let mut staged = Staged {
+            dir: self,
+            name: name.to_os_string(),
+            temp_name,
+            temp: Some(temp),
+            pending: true,
+        };
+        let temp = staged.temp.as_mut().expect("just set");
+        temp.write_all(bytes)?;
+        temp.sync_all()?;
+        platform::seal(temp, owner)?;
+        protect(temp)?;
+        Ok(staged)
+    }
+
     /// Removes the name, whatever it is, but not what it points at. `NotFound` if there is none.
     pub fn unlink(&self, name: &OsStr) -> io::Result<()> {
         single_component(name)?;
@@ -214,32 +287,14 @@ impl Dir {
         protect: impl FnOnce(&File) -> io::Result<()>,
         after_rename: impl FnOnce(),
     ) -> io::Result<()> {
-        single_component(name)?;
-        let (temp_name, mut temp) = self.create_temp(name)?;
-        let written = (|| {
-            temp.write_all(bytes)?;
-            temp.sync_all()?;
-            platform::seal(&temp, owner)?;
-            protect(&temp)?;
-            platform::rename(&self.file, &temp, &temp_name, name)?;
-            // Right after the rename, so that any step added below it runs on the swapped name.
-            after_rename();
-            Ok(())
-        })();
-        // Closed first: Windows does not let a name be deleted while a handle that does not share delete is open.
-        drop(temp);
-        if written.is_err() {
-            // The temp name may be gone already (a failed rename leaves it); either way it is not ours to keep.
-            let _ = platform::unlink(&self.file, &temp_name);
-        }
-        written
+        self.stage(name, bytes, owner, protect)?.publish_with(after_rename)
     }
 
     /// A new file named after `name` that nobody else holds, and its name.
-    fn create_temp(&self, name: &OsStr) -> io::Result<(std::ffi::OsString, File)> {
+    fn create_temp(&self, name: &OsStr) -> io::Result<(OsString, File)> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
-            let mut temp_name = std::ffi::OsString::from(".");
+            let mut temp_name = OsString::from(".");
             temp_name.push(name);
             temp_name.push(format!(
                 ".{}.{}.tmp",
@@ -251,6 +306,50 @@ impl Dir {
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(err) => return Err(err),
             }
+        }
+    }
+}
+
+/// A complete temp file in a [`Dir`] that does not yet have its final name; see [`Dir::stage`].
+pub struct Staged<'a> {
+    dir: &'a Dir,
+    name: OsString,
+    temp_name: OsString,
+    temp: Option<File>,
+    /// The temp name still exists and is ours to remove.
+    pending: bool,
+}
+
+impl Staged<'_> {
+    /// Renames the temp file over the final name, replacing what is there.
+    pub fn publish(self) -> io::Result<()> {
+        self.publish_with(|| {})
+    }
+
+    /// [`Self::publish`] with `after_rename` run right after the rename.
+    pub(crate) fn publish_with(mut self, after_rename: impl FnOnce()) -> io::Result<()> {
+        let temp = self.temp.as_ref().expect("held until dropped");
+        platform::rename(&self.dir.file, temp, &self.temp_name, &self.name)?;
+        // The temp name is gone: it is the final name now.
+        self.pending = false;
+        after_rename();
+        Ok(())
+    }
+
+    /// Gives the temp file the final name if that is free (`AlreadyExists` otherwise), by a hard link, then removes
+    /// the temp name. Two claims of one name cannot both win, and a reader never sees a partial file.
+    pub fn claim(self) -> io::Result<()> {
+        self.dir.link(&self.temp_name, &self.name)
+    }
+}
+
+impl Drop for Staged<'_> {
+    fn drop(&mut self) {
+        // Closed first: Windows does not let a name be deleted while a handle that does not share delete is open.
+        drop(self.temp.take());
+        if self.pending {
+            // Not ours to keep, and nothing to report to: the caller already has its answer.
+            let _ = platform::unlink(&self.dir.file, &self.temp_name);
         }
     }
 }
