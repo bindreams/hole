@@ -247,3 +247,20 @@ fn a_lock_over_no_key_is_taken_without_a_mark() {
     drop(lock.acquire().expect("acquire"));
     assert!(!scratch.exists(), "no key was made");
 }
+
+/// A caller who is inside the boundary but not in the namespace's DACL cannot
+/// put the lock's mutex there, so it cannot squat the name before the first
+/// Hole process: opening a namespace is not checked against the DACL (measured:
+/// an open from another alias succeeds), making an object in it is. SYSTEM
+/// alone is in the DACL, and no test runs as SYSTEM.
+#[skuld::test]
+fn a_caller_the_namespace_dacl_leaves_out_cannot_make_the_mutex_in_it() {
+    let name = format!("hole-test-{}-dacl", std::process::id());
+    let lock = StartTypeLock::at(&name, "WD", &name, Some("D:(A;;GA;;;SY)"), None);
+    let refused = lock.acquire().err().expect("the DACL leaves the caller out");
+    assert_eq!(
+        refused.raw_os_error(),
+        Some(ERROR_ACCESS_DENIED.0 as i32),
+        "making the mutex in a namespace whose DACL names only SYSTEM: {refused}"
+    );
+}

@@ -2,8 +2,9 @@
 //! (`hole_bridge::platform::os::StartTypeLock`), on the real object and, where
 //! a test needs one, a real service:
 //!
-//! - a token without Administrators can neither make, open nor wait on the
-//!   lock's namespace or the lock, whether the lock is held or free;
+//! - a token without Administrators can neither make the lock's namespace,
+//!   make or open the mutex in it, nor wait on the lock, whether the lock is
+//!   held or free;
 //! - a retirement, and the update cutover's hold, are holders for every other
 //!   thread, and the GUI's status read says a change is in progress meanwhile;
 //! - an install's hold over the start type stays in force through every step it
@@ -14,7 +15,7 @@ use std::path::Path;
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 use hole_bridge::cutover::os::CutoverOs;
 use hole_bridge::disable_record::{DisabledState, RecordState};
-use hole_bridge::platform::os::{self, Opening, RetireSession, StartTypeLock, BOUNDARY_NAME, REQUIRED_SID};
+use hole_bridge::platform::os::{self, Opening, RetireSession, StartTypeLock, BOUNDARY_NAME, MUTEX_LEAF, REQUIRED_SID};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
@@ -23,12 +24,13 @@ use windows::Win32::Security::{
     SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
 };
 use windows::Win32::System::Threading::{
-    AddSIDToBoundaryDescriptor, CreateBoundaryDescriptorW, CreatePrivateNamespaceW, DeleteBoundaryDescriptor,
-    GetCurrentProcess, OpenPrivateNamespaceW, OpenProcessToken, SetThreadToken,
+    AddSIDToBoundaryDescriptor, CreateBoundaryDescriptorW, CreateMutexExW, CreatePrivateNamespaceW,
+    DeleteBoundaryDescriptor, GetCurrentProcess, OpenPrivateNamespaceW, OpenProcessToken, SetThreadToken,
 };
 use windows_service::service::{ServiceAccess, ServiceActionType, ServiceStartType};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use super::record_proofs::set_start_type;
 use super::{ProvisionedService, GLOBAL_NET_STATE, TUN};
 
 fn helper() -> &'static Path {
@@ -133,58 +135,117 @@ fn namespace_refusal(alias: &str, make: bool) -> Option<u32> {
     }
 }
 
+/// What a caller meets on the way to the lock's mutex by name: opening the
+/// namespace under `alias`, then making (or opening, if it exists) the mutex
+/// there. Microsoft: "a process can open an existing namespace even if it is
+/// not within the boundary unless the creator restricted access", and the
+/// open is measured to succeed for a token the namespace's DACL leaves out, so
+/// what keeps a caller out is the second step.
+#[derive(Debug)]
+struct Reach {
+    /// The Win32 error of the namespace open; `None`: it opened.
+    opened: Option<u32>,
+    /// The Win32 error of making or opening the mutex; `None`: the caller has
+    /// a handle to it.
+    mutex: Option<u32>,
+}
+
+impl Reach {
+    fn of(alias: &str) -> Self {
+        let opened = namespace_refusal(alias, false);
+        let name = wide(&format!(r"{alias}\{MUTEX_LEAF}"));
+        // SAFETY: `name` is NUL-terminated and outlives the call; the handle, if
+        // any, is closed at once.
+        let mutex = match unsafe { CreateMutexExW(None, PCWSTR(name.as_ptr()), 0, SYNCHRONIZE) } {
+            Ok(handle) => {
+                // SAFETY: just made, and closed only here.
+                let _ = unsafe { CloseHandle(handle) };
+                None
+            }
+            // The Win32 half of the HRESULT the call reports.
+            Err(error) => Some(error.code().0 as u32 & 0xFFFF),
+        };
+        Self { opened, mutex }
+    }
+
+    /// Whether the caller was kept from the mutex, at the open or at the mutex.
+    fn refused(&self) -> bool {
+        let denied = Some(ERROR_ACCESS_DENIED.0);
+        self.opened == denied || self.mutex == denied
+    }
+}
+
+/// `SYNCHRONIZE`: all a wait needs.
+const SYNCHRONIZE: u32 = 0x0010_0000;
+
 /// Proves: a token without Administrators (what the GUI runs as) can neither
-/// make the lock's namespace before any Hole process does, nor open it, nor
-/// take or wait on the lock, whether an administrator holds it or it is free,
-/// and an administrator's token takes it. Red under: a boundary without the
-/// Administrators SID, a DACL that admits another group, or a right to wait
-/// given to anyone but SYSTEM and Administrators.
+/// make the lock's namespace before any Hole process does, nor make or open the
+/// mutex in it (the squat of the name), nor take or wait on the lock, whether an
+/// administrator holds it or it is free, and an administrator's token reaches
+/// the same mutex both ways. Red under: a boundary without the Administrators
+/// SID, a DACL on the namespace or the mutex that admits another group, or a
+/// right to wait given to anyone but SYSTEM and Administrators.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_a_token_without_administrators_can_neither_make_open_nor_wait_on_the_start_type_lock() {
     let held = StartTypeLock::machine_wide()
         .acquire()
         .expect("an administrator takes the lock");
-    assert_eq!(
-        namespace_refusal("hole-proof-control", false),
-        None,
-        "control: an administrator's token opens the namespace (this lane runs elevated)"
-    );
-    let while_held = as_a_standard_user(|| {
+    let control_held = Reach::of("hole-proof-control-held");
+    let user_held = as_a_standard_user(|| {
         (
             StartTypeLock::machine_wide()
                 .try_acquire()
                 .err()
                 .and_then(|e| e.raw_os_error()),
             namespace_refusal("hole-proof-squat", true),
-            namespace_refusal("hole-proof-open", false),
+            Reach::of("hole-proof-user-held"),
         )
     });
     drop(held);
-    let when_free = as_a_standard_user(|| {
+    let control_free = Reach::of("hole-proof-control-free");
+    let user_free = as_a_standard_user(|| {
         (
             StartTypeLock::machine_wide()
                 .acquire()
                 .err()
                 .and_then(|e| e.raw_os_error()),
             namespace_refusal("hole-proof-squat-free", true),
+            Reach::of("hole-proof-user-free"),
         )
     });
     let denied = Some(ERROR_ACCESS_DENIED.0);
+    assert!(
+        control_held.opened.is_none() && control_held.mutex.is_none(),
+        "control: an administrator opens the namespace and the held mutex: {control_held:?}"
+    );
+    assert!(
+        control_free.opened.is_none() && control_free.mutex.is_none(),
+        "control: an administrator opens the namespace and makes the free mutex: {control_free:?}"
+    );
     assert_eq!(
-        while_held.0.map(|e| e as u32),
+        user_held.0.map(|e| e as u32),
         denied,
         "a standard user's try on a held lock"
     );
-    assert_eq!(while_held.1, denied, "a standard user's make of the namespace");
-    assert_eq!(while_held.2, denied, "a standard user's open of the namespace");
+    assert_eq!(user_held.1, denied, "a standard user's make of the namespace");
+    assert!(
+        user_held.2.refused(),
+        "a standard user reaching the held lock's mutex by name: {:?}",
+        user_held.2
+    );
     assert_eq!(
-        when_free.0.map(|e| e as u32),
+        user_free.0.map(|e| e as u32),
         denied,
         "a standard user's take of a free lock"
     );
     assert_eq!(
-        when_free.1, denied,
+        user_free.1, denied,
         "a standard user's make of the namespace, lock free"
+    );
+    assert!(
+        user_free.2.refused(),
+        "a standard user making the free lock's mutex by name (the squat): {:?}",
+        user_free.2
     );
     assert!(
         StartTypeLock::machine_wide().try_acquire().expect("try").is_some(),
@@ -264,7 +325,14 @@ fn cutover_global_net_state_the_cutover_hold_hardens_the_service_and_restores_it
     let _service = ProvisionedService::install(helper());
     os::ensure_failure_actions().expect("give the service its restart-on-failure");
     assert!(restarts_on_failure(), "the fixture restarts on failure");
-    assert_eq!(start_type(), ServiceStartType::AutoStart);
+    // The fixture is registered OnDemand; the restore puts back the start type
+    // it found, so the service starts out as an installed one is.
+    set_start_type(ServiceStartType::AutoStart);
+    assert_eq!(
+        start_type(),
+        ServiceStartType::AutoStart,
+        "precondition: the start type the hold will find"
+    );
 
     let mut os_actor = WindowsCutoverOs {
         images: vec![],
@@ -286,8 +354,12 @@ fn cutover_global_net_state_the_cutover_hold_hardens_the_service_and_restores_it
     );
 
     hold.restore();
-    assert_eq!(start_type(), ServiceStartType::AutoStart);
-    assert!(restarts_on_failure());
+    assert_eq!(
+        start_type(),
+        ServiceStartType::AutoStart,
+        "the restore puts back the start type the hold found"
+    );
+    assert!(restarts_on_failure(), "the restore puts restart-on-failure back");
     assert_eq!(
         hole_bridge::disable_record::RecordKey::service().state(),
         RecordState::Absent

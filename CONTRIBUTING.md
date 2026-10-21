@@ -2207,9 +2207,11 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   even if it is not within the boundary unless the creator restricted access".
   "Each namespace is uniquely identified by its name and boundaries", so a
   namespace made under the same name with another SID is another namespace and
-  cannot stand in for ours (measured). A standard user can therefore neither
-  create the namespace before any Hole process does (squat it), open it, nor
-  wait on the lock; SYSTEM's token holds Administrators, so the cutover child
+  cannot stand in for ours (measured). Opening the namespace is not checked
+  against the DACL (measured: a caller it leaves out opens it), but making or
+  opening an object in it is, so a standard user can neither create the
+  namespace before any Hole process does, make or open the mutex in it (squat
+  the name), nor wait on the lock; SYSTEM's token holds Administrators, so the cutover child
   and an elevated administrator meet on the one lock. Each process makes or
   opens the namespace once and keeps the handle: the namespace lives while any
   process holds one (measured), and the mutex is reachable by name only

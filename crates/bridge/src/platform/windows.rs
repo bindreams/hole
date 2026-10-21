@@ -30,7 +30,7 @@ mod stop_session;
 pub use stop_session::StopSession;
 #[path = "windows/start_type_lock.rs"]
 mod start_type_lock;
-pub use start_type_lock::{Held, StartTypeLock, BOUNDARY_NAME, REQUIRED_SID};
+pub use start_type_lock::{Held, StartTypeLock, BOUNDARY_NAME, MUTEX_LEAF, REQUIRED_SID};
 #[path = "windows/repair_session.rs"]
 mod repair_session;
 use repair_session::{RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};

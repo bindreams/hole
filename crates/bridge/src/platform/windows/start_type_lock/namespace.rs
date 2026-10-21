@@ -9,7 +9,9 @@
 //! neither squat the lock's name before any Hole process runs nor take the
 //! lock. Microsoft is explicit that "a process can open an existing namespace
 //! even if it is not within the boundary unless the creator restricted
-//! access", so the namespace carries a DACL of its own.
+//! access", so the namespace carries a DACL of its own. The open itself is not
+//! checked against it (measured); making or opening an object in the
+//! namespace is.
 //!
 //! Each process makes or opens the namespace once and keeps the handle for as
 //! long as it lives. The namespace outlives the handle that made it for as

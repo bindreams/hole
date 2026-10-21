@@ -71,7 +71,7 @@ fn must_start_type() -> ServiceStartType {
 }
 
 /// Writes the start type the way an administrator's `sc config start=` does.
-fn set_start_type(to: ServiceStartType) {
+pub(super) fn set_start_type(to: ServiceStartType) {
     let service = open_service(ServiceAccess::CHANGE_CONFIG);
     // SAFETY: the handle is the live one `service` owns; every pointer
     // argument is null, which `SERVICE_NO_CHANGE` and the documented null

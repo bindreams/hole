@@ -11,8 +11,8 @@
 //!
 //! The mutex lives in a private namespace ([`namespace`]) whose boundary
 //! requires the Administrators SID and whose DACL admits SYSTEM and
-//! Administrators only: an unprivileged user can neither create, squat, open
-//! nor wait on it. A wait on a mutex takes it, so a right to wait is a right to
+//! Administrators only: an unprivileged user can neither create the namespace,
+//! make or open the mutex in it, nor wait on it. A wait on a mutex takes it, so a right to wait is a right to
 //! hold the lock for ever; no one outside those two is given one.
 //!
 //! A holder that ends without releasing hands the lock on abandoned, which
@@ -54,7 +54,7 @@ pub const REQUIRED_SID: &str = "BA";
 const DACL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 
 /// The mutex's name inside the namespace.
-const MUTEX_LEAF: &str = "Lock";
+pub const MUTEX_LEAF: &str = "Lock";
 
 /// `SYNCHRONIZE`: all a wait needs.
 const SYNCHRONIZE: u32 = 0x0010_0000;
