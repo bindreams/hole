@@ -21,22 +21,21 @@
 //!
 //! ## Concurrency
 //!
-//! Two layers protect `run_stage` from racing with itself:
+//! `xtask::run_stage` replaces each file's content by atomic rename (on Windows the
+//! name can briefly fail to open); two layers also keep stagers from overlapping,
+//! so every test sees one complete staging pass:
 //!
 //! 1. **Cross-process** — `serial = DIST_BIN` on the fixture. Skuld's
 //!    SQLite coordinator blocks concurrent tests in different nextest
 //!    binaries that both depend on `dist_dir` from staging simultaneously.
+//!    The panic-hook test carries the same label because its child process
+//!    stages through [`stage_dist_bin_dir`] without the fixture.
 //! 2. **In-process** — a `OnceLock` around the staging call. Skuld's
 //!    process-scoped fixture cache has a narrow race: the "not in cache"
 //!    check and the `(setup)()` call happen under different lock
 //!    acquisitions in `skuld::fixture::ensure_process_fixture`, so two
-//!    threads inside a single test binary can both invoke the setup.
-//!    Without the `OnceLock`, two parallel `run_stage` calls would race
-//!    on the same destination files (`remove_file` by one thread +
-//!    `hard_link` by another → `os error 32` on Windows).
-//!
-//! Both layers are load-bearing: serial covers cross-binary, OnceLock
-//! covers within-binary.
+//!    threads inside a single test binary can both invoke the setup. The
+//!    `OnceLock` makes that a single staging pass.
 
 use crate::test_support::skuld_fixtures::DIST_BIN;
 use std::path::PathBuf;

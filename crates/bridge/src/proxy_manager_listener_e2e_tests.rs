@@ -21,7 +21,7 @@ use crate::test_support::http_target::HttpTarget;
 use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
-use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
+use crate::test_support::socks5_client::{http_get_request, socks5_request};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, StartError, TunnelMode};
 use std::net::SocketAddr;
@@ -152,24 +152,26 @@ async fn assert_port_unbound_recorded(what: &str, addr: SocketAddr) {
     eprintln!("[listener-e2e] {what} port {addr} is unbound; evidence: {evidence:?}");
 }
 
-async fn roundtrip_socks5(proxy: SocketAddr, target: SocketAddr) {
+/// A roundtrip through the SOCKS5 listener, asserted to have crossed the ss server.
+async fn roundtrip_socks5(harness: &mut DistHarness, proxy: SocketAddr, target: &HttpTarget) {
     wait_for_port(proxy, Duration::from_secs(10)).await;
-    let request = http_get_request(&target, "/");
-    let response = socks5_request(proxy, target, &request, 8192)
-        .await
-        .expect("socks5 roundtrip");
-    let body = http_response_body(&response).expect("response has header terminator");
-    assert_eq!(body, crate::test_support::http_target::SENTINEL_BODY);
+    let totals_before = harness.tunnel_totals().await;
+    let accepted_before = target.mark();
+    let request = http_get_request(&target.addr, "/");
+    let result = socks5_request(proxy, target.addr, &request, 8192).await;
+    target.assert_sentinel_roundtrip(accepted_before, "socks5 roundtrip", result);
+    harness.assert_tunnel_traffic_since(totals_before).await;
 }
 
-async fn roundtrip_http_connect(proxy: SocketAddr, target: SocketAddr) {
+/// A roundtrip through the HTTP CONNECT listener, asserted to have crossed the ss server.
+async fn roundtrip_http_connect(harness: &mut DistHarness, proxy: SocketAddr, target: &HttpTarget) {
     wait_for_port(proxy, Duration::from_secs(10)).await;
-    let request = http_get_request(&target, "/");
-    let response = http_connect_request(proxy, &target.to_string(), &request, 8192)
-        .await
-        .expect("HTTP CONNECT roundtrip");
-    let body = http_response_body(&response).expect("response has header terminator");
-    assert_eq!(body, crate::test_support::http_target::SENTINEL_BODY);
+    let totals_before = harness.tunnel_totals().await;
+    let accepted_before = target.mark();
+    let request = http_get_request(&target.addr, "/");
+    let result = http_connect_request(proxy, &target.addr.to_string(), &request, 8192).await;
+    target.assert_sentinel_roundtrip(accepted_before, "HTTP CONNECT roundtrip", result);
+    harness.assert_tunnel_traffic_since(totals_before).await;
 }
 
 #[skuld::test]
@@ -189,7 +191,7 @@ async fn assert_port_unbound_observes_a_refusal() {
 fn e2e_socks5_only_http_port_unbound(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(async {
         let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -202,7 +204,7 @@ fn e2e_socks5_only_http_port_unbound(
         let socks_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
         let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
 
-        roundtrip_socks5(socks_addr, http.addr).await;
+        roundtrip_socks5(&mut harness, socks_addr, http).await;
         assert_port_unbound_recorded("http", http_addr).await;
 
         harness.send(BridgeRequest::Stop).await.expect("send Stop");
@@ -213,7 +215,7 @@ fn e2e_socks5_only_http_port_unbound(
 fn e2e_http_only_socks_port_unbound(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(async {
         let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -228,7 +230,7 @@ fn e2e_http_only_socks_port_unbound(
         let socks_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
         let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
 
-        roundtrip_http_connect(http_addr, http.addr).await;
+        roundtrip_http_connect(&mut harness, http_addr, http).await;
         assert_port_unbound_recorded("socks5", socks_addr).await;
 
         harness.send(BridgeRequest::Stop).await.expect("send Stop");
@@ -239,7 +241,7 @@ fn e2e_http_only_socks_port_unbound(
 fn e2e_both_listeners_bound(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(async {
         let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -253,8 +255,8 @@ fn e2e_both_listeners_bound(
         let socks_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
         let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
 
-        roundtrip_socks5(socks_addr, http.addr).await;
-        roundtrip_http_connect(http_addr, http.addr).await;
+        roundtrip_socks5(&mut harness, socks_addr, http).await;
+        roundtrip_http_connect(&mut harness, http_addr, http).await;
 
         harness.send(BridgeRequest::Stop).await.expect("send Stop");
     });
@@ -270,7 +272,7 @@ fn e2e_both_listeners_bound(
 fn e2e_reload_toggling_http_listener_rebinds(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(async {
         let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -293,7 +295,7 @@ fn e2e_reload_toggling_http_listener_rebinds(
             .expect("send Reload");
         assert!(matches!(resp, BridgeResponse::Ack), "reload should Ack, got {resp:?}");
 
-        roundtrip_http_connect(http_addr, http.addr).await;
+        roundtrip_http_connect(&mut harness, http_addr, http).await;
 
         harness.send(BridgeRequest::Stop).await.expect("send Stop");
     });

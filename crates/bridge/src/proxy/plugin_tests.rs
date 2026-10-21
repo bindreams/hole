@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{proxy_err_to_io_err, start_plugin_chain};
+use super::{proxy_err_to_io_err, start_plugin_chain, ChainTask};
 use crate::proxy::ProxyError;
 
 #[skuld::test]
@@ -99,6 +99,34 @@ fn cancelled_is_not_a_bind_race() {
         !util::retry::is_bind_race(&io_err),
         "ProxyError::Cancelled must NOT classify as a bind race"
     );
+}
+
+// ChainTask ownership =================================================================================================
+
+/// Dropping a `ChainTask` signals shutdown and aborts the task, with no clock:
+/// the token is read back, and a current-thread runtime processes the abort
+/// before the test task resumes from one `yield_now`.
+///
+/// This is the cause the `tests/plugin_chain.rs` Drop tests guard end to end;
+/// those go red only by taking ~a minute (a leaked chain ends on garter's own
+/// bounds), this one fails by assertion.
+#[skuld::test]
+async fn dropping_a_chain_task_cancels_its_token_and_aborts_its_task() {
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(std::future::pending::<garter::Result<()>>());
+    let abort = handle.abort_handle();
+    let task = ChainTask {
+        handle,
+        cancel: cancel.clone(),
+    };
+    assert!(!cancel.is_cancelled(), "the token starts unsignalled");
+    assert!(!abort.is_finished(), "the task starts running");
+
+    drop(task);
+    tokio::task::yield_now().await;
+
+    assert!(cancel.is_cancelled(), "Drop must signal the chain's shutdown token");
+    assert!(abort.is_finished(), "Drop must abort the chain's task");
 }
 
 // Plugin identity: spawn-time record, stop-time reap ==================================================================

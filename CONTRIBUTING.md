@@ -417,6 +417,20 @@ the token by reference. A fresh `CancellationToken::new()` inside
 `crates/bridge/src/` would shadow the chain and is banned by `clippy.toml`
 (sanctioned exceptions carry a per-site `#[allow]` + citation). See #397.
 
+**A start's token does not outlive the start.** It stays registered in
+`handle_start` until the session has committed and persisted, so a Cancel can
+still reach it after the proxy is running. State that lives as long as the
+session therefore must not descend from it: the plugin chain owns its own
+shutdown token (`spawn_plugin_runner_at`) and honours the start token explicitly
+while the start is in progress. The chain's task and token live in one
+`ChainTask` whose `Drop` ends the chain, so every way out of a start, the start
+future being dropped included, tears the plugin down. Afterwards the chain ends
+only when the session drops the chain or when a plugin exits, which
+`check_health` reads as a death. garter's `ChainRunner` given a `cancel_token`
+registers no signal handler of its own (one without a token keeps it), so a
+SIGTERM or Ctrl+C reaches the chain only through the bridge's own shutdown, never
+as an apparent plugin death.
+
 Three invariants:
 
 1. **Cooperative observation between phases** —

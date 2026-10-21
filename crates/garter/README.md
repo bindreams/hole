@@ -123,6 +123,9 @@ async fn main() -> garter::Result<()> {
 }
 ```
 
+Without a `.cancel_token(...)`, `run` ends the chain on SIGTERM/SIGINT/Ctrl+C. With one, `run` registers no signal handler:
+the embedder routes signals into its token.
+
 See [the SIP003 spec][sip003] for the broader context on shadowsocks
 plugins, and the [`hole`](https://github.com/bindreams/hole) repository
 for a worked example (the `galoshes` plugin embeds `garter` to compose a

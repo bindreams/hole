@@ -29,8 +29,8 @@ pub(crate) fn test_env() -> crate::sip003::PluginEnv {
 }
 
 /// Plugin that readies and exits cleanly at once.
-struct InstantPlugin {
-    name: String,
+pub(crate) struct InstantPlugin {
+    pub(crate) name: String,
 }
 
 #[async_trait::async_trait]

@@ -109,6 +109,224 @@ async fn a_bind_conflict_is_retried_on_a_fresh_port() {
     drop(chain);
 }
 
+/// Waits until the far end of `stream` is gone: EOF on a clean close, an error
+/// on a reset (a killed process on Windows resets rather than closes). Whatever
+/// the peer sent first is discarded.
+async fn peer_is_gone(stream: &mut tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 16];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return true,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// `test_plugin`'s `LIVE_MARKER`: written once the plugin has bound its local
+/// address, which only the attempt that becomes the chain does.
+const LIVE_MARKER: u8 = b'L';
+
+/// The `connect-back` stream of the plugin that bound its local address. An
+/// attempt that lost a bind race dialed back too, so the first stream accepted
+/// is not necessarily the chain's plugin; a loser's stream reaches EOF without
+/// the marker and is skipped. Ports and arrival order identify nothing: a retry
+/// may be handed the loser's port, and either attempt may connect first.
+async fn accept_live_attempt(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    use tokio::io::AsyncReadExt;
+    loop {
+        let (mut stream, _) = listener.accept().await.expect("a plugin dials back");
+        let mut byte = [0u8; 1];
+        if stream.read_exact(&mut byte).await.is_ok() && byte[0] == LIVE_MARKER {
+            return stream;
+        }
+    }
+}
+
+/// Whether the far end of `stream` is demonstrably still there: nothing to read,
+/// not even an EOF. An attempt that already exited has its EOF queued, so this is
+/// what makes a dead stream picked by mistake fail an assertion instead of
+/// satisfying "the plugin is gone" for free.
+fn peer_is_still_there(stream: &tokio::net::TcpStream) -> bool {
+    let mut buf = [0u8; 1];
+    matches!(stream.try_read(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+/// The chain lives as long as the session, not as long as the start that made
+/// it. Cancelling the start token after the chain is ready must leave the
+/// plugin running; ending the session (dropping the chain) must still stop it.
+/// The first attempt loses a bind race, so the stream held is picked by the
+/// live marker and cannot be the dead attempt's. This test goes red by assertion
+/// only through `peer_is_still_there`; a leaked chain's plugin otherwise ends on
+/// garter's own bounds, so "the plugin is gone" turns true a minute late.
+#[skuld::test]
+async fn a_cancel_of_the_start_after_the_chain_is_ready_leaves_the_chain_running() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sentinel = dir.path().join("bind-once");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let opts = format!(
+        "host=example.com;fail-bind-once={};connect-back={}",
+        sentinel.display(),
+        listener.local_addr().expect("addr")
+    );
+
+    let start = CancellationToken::new();
+    let chain = start_plugin_chain(
+        "v2ray-plugin",
+        test_plugin_path().to_str().expect("utf-8 path"),
+        Some(&opts),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &start,
+        None,
+    )
+    .await
+    .expect("the stub plugin becomes ready");
+    assert!(sentinel.exists(), "the first attempt must have lost its bind race");
+    let mut held = accept_live_attempt(&listener).await;
+
+    start.cancel();
+
+    assert!(
+        !chain.is_cancelled(),
+        "cancelling the start token must not cancel a ready chain"
+    );
+    assert!(chain.is_alive());
+    assert!(
+        peer_is_still_there(&held),
+        "the plugin must keep running after the start token is cancelled"
+    );
+
+    drop(chain);
+    assert!(
+        peer_is_gone(&mut held).await,
+        "dropping the chain (the session ending) must stop the plugin"
+    );
+}
+
+/// The other half: a cancel DURING the start still stops the plugin it had
+/// already spawned, and the start reports `Cancelled`.
+#[skuld::test]
+async fn a_cancel_during_the_start_stops_the_plugin_it_spawned() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let opts = format!(
+        "host=example.com;never-ready;connect-back={}",
+        listener.local_addr().expect("addr")
+    );
+
+    let start = CancellationToken::new();
+    let starting = tokio::spawn({
+        let start = start.clone();
+        async move {
+            start_plugin_chain(
+                "v2ray-plugin",
+                test_plugin_path().to_str().expect("utf-8 path"),
+                Some(&opts),
+                "127.0.0.1",
+                9,
+                None,
+                None,
+                false,
+                &start,
+                None,
+            )
+            .await
+            .err()
+        }
+    });
+    // The plugin has dialed back, so it is running and cannot be ready yet.
+    let (mut held, _) = listener.accept().await.expect("the plugin dials back");
+
+    start.cancel();
+
+    let err = starting.await.expect("start task").expect("a cancelled start fails");
+    assert!(matches!(err, hole_bridge::proxy::ProxyError::Cancelled), "got: {err:?}");
+    assert!(
+        peer_is_gone(&mut held).await,
+        "a cancel during the start must stop the plugin"
+    );
+}
+
+/// A start future dropped before it returns (the task around it aborted) must
+/// not orphan the plugin it spawned. Without the fix a leaked chain's plugin
+/// still ends, on garter's own readiness bound, so this goes red by taking about
+/// a minute; the by-assertion guard is `plugin_tests`' `ChainTask` drop test.
+#[skuld::test]
+async fn dropping_the_start_future_stops_the_plugin_it_spawned() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let opts = format!(
+        "host=example.com;never-ready;connect-back={}",
+        listener.local_addr().expect("addr")
+    );
+
+    let start = CancellationToken::new();
+    let plugin_path = test_plugin_path();
+    let mut starting = Box::pin(start_plugin_chain(
+        "v2ray-plugin",
+        plugin_path.to_str().expect("utf-8 path"),
+        Some(&opts),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &start,
+        None,
+    ));
+    // The plugin has dialed back, so it is running and cannot be ready yet.
+    let mut held = tokio::select! {
+        biased;
+        _ = &mut starting => panic!("a plugin that never readies cannot finish its start"),
+        accepted = listener.accept() => accepted.expect("the plugin dials back").0,
+    };
+
+    drop(starting);
+
+    assert!(
+        peer_is_gone(&mut held).await,
+        "dropping the start future must stop the plugin"
+    );
+}
+
+/// A plugin that exits after it is ready ends the chain's task: the property
+/// `check_health` reads through `is_alive`. Waits on the real condition, the
+/// task having finished, after the plugin's end of the connection has closed.
+#[skuld::test]
+async fn a_plugin_that_exits_after_ready_ends_the_chain_task() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let opts = format!(
+        "host=example.com;exit-after-ready;connect-back={}",
+        listener.local_addr().expect("addr")
+    );
+
+    let start = CancellationToken::new();
+    let chain = start_plugin_chain(
+        "v2ray-plugin",
+        test_plugin_path().to_str().expect("utf-8 path"),
+        Some(&opts),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &start,
+        None,
+    )
+    .await
+    .expect("the stub plugin becomes ready before it exits");
+    // A plain accept: the plugin exits right after its marker, and on Windows the exit can
+    // reset the stream before the marker is read.
+    let (mut held, _) = listener.accept().await.expect("the plugin dials back");
+
+    assert!(peer_is_gone(&mut held).await, "the plugin exits after it is ready");
+    while chain.is_alive() {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Capturing `MakeWriter` — the bridge's own `test_support::log_capture` is a
 /// private module, unreachable from an integration target.
 #[derive(Clone, Default)]

@@ -62,6 +62,8 @@ mod plugin_tests;
 #[cfg(test)]
 mod port_tests;
 #[cfg(test)]
+mod shutdown_tests;
+#[cfg(test)]
 mod sip003_tests;
 #[cfg(test)]
 mod sitrep_tests;
