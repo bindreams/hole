@@ -177,8 +177,8 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
 
 #[cfg(target_os = "windows")]
 mod system {
-    //! Real `windows`-crate SCM impl. Raw FFI is sanctioned here (the #165
-    //! isolation contract): the alertable `SleepEx(INFINITE, TRUE)` wait is a
+    //! Real `windows`-crate SCM impl. Raw FFI is sanctioned here (the isolation
+    //! contract): the alertable `SleepEx(INFINITE, TRUE)` wait is a
     //! kernel rendezvous for an SCM-delivered APC, not a timeout-poll.
 
     use std::cell::UnsafeCell;

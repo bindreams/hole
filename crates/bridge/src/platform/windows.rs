@@ -373,10 +373,8 @@ where
     }
 
     async fn reconcile(&mut self) {
-        // Reconcile the persisted target now, before any GUI or client has had a
-        // chance to connect (narrows, does not close, #617's boot->first-connect
-        // gap: a failed connect engages nothing) — must run after recovery above, see
-        // crate::reconciler::reconcile_once's own doc.
+        // Reconcile the persisted target before any GUI or client can connect.
+        // Must run after route recovery; see reconcile_once.
         crate::reconciler::reconcile_once(&self.state_dir, None, &self.proxy, &self.shutdown).await;
     }
 
@@ -390,9 +388,9 @@ where
     }
 
     async fn sweep_crash_markers(&mut self) {
-        // Native-crash observability (bindreams/hole#438): sweep crash
-        // markers left by a previously-crashed service bridge. Markers land
-        // in the service log dir (C:\ProgramData\hole\logs), NOT state_dir.
+        // Native-crash observability: sweep crash markers left by a
+        // previously-crashed service bridge. Markers land in the service log dir
+        // (C:\ProgramData\hole\logs), NOT state_dir.
         let log_dir = self.log_dir.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir)).await {
             tracing::warn!(error = %e, "crash sweep task panicked");
