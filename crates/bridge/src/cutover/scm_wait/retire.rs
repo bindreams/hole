@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use super::call_error::{io_error_is_a_refused_process_open, service_gone, ServiceGone};
 use super::scan::ScanFinding;
 use super::settle::{settle_stopped, SettleError, StopActor};
-use crate::disable_record::{Changer, RecordState};
+use crate::disable_record::{ChangeMark, Changer, RecordState};
 use crate::service_start::StartType;
 
 /// What a retirement leaves behind once the service is stopped.
@@ -190,6 +190,9 @@ pub trait StartRead {
     /// Whether the process that stamped the record is still running: `None`
     /// when there is no record.
     fn read_changer(&mut self) -> Option<Changer>;
+    /// The change mark: the lock holder's, and a value that differs after any
+    /// holder began or ended a change in between.
+    fn read_mark(&mut self) -> ChangeMark;
 }
 
 impl<S: StartConfig> StartRead for S {
@@ -199,6 +202,11 @@ impl<S: StartConfig> StartRead for S {
 
     fn read_changer(&mut self) -> Option<Changer> {
         self.record_changer()
+    }
+
+    /// Holding the lock, nothing changes under the reads.
+    fn read_mark(&mut self) -> ChangeMark {
+        ChangeMark::unchanging()
     }
 }
 

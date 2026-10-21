@@ -1,5 +1,6 @@
 use super::*;
-use crate::disable_record::{Changer, DisabledBy, DisabledState, RecordState};
+use crate::cutover::scm_wait::retire::StartRead;
+use crate::disable_record::{ChangeMark, Changer, DisabledBy, DisabledState, RecordState};
 use crate::service_start::{RepairStep, StartType};
 
 const STARTS: [StartType; 4] = [
@@ -357,4 +358,139 @@ fn a_gui_reading_that_cannot_read_the_start_type_says_nothing_of_a_disable_but_s
         .failing("start_type")
         .stamped_by(Changer::Running);
     assert_eq!(display(&mut config), DisabledState::InChange);
+}
+
+// Displaying while a writer changes the service -----------------------------------------------------------------------
+
+/// What a writer changes: the start type, the record's changer and the change
+/// mark.
+struct Service {
+    start: StartType,
+    changer: Option<Changer>,
+    mark: ChangeMark,
+}
+
+/// What a writer does to the service.
+type Event = Box<dyn FnMut(&mut Service)>;
+
+/// A status reader over a service that a writer changes between the reader's
+/// reads: `events` run once, each after the reader's n-th read (counted from 1).
+struct Straddled {
+    service: Service,
+    reads: usize,
+    events: Vec<(usize, Event)>,
+}
+
+impl Straddled {
+    fn new(service: Service) -> Self {
+        Self {
+            service,
+            reads: 0,
+            events: vec![],
+        }
+    }
+
+    fn after_read(mut self, n: usize, event: impl FnMut(&mut Service) + 'static) -> Self {
+        self.events.push((n, Box::new(event)));
+        self
+    }
+
+    fn read<T>(&mut self, read: impl FnOnce(&Service) -> T) -> T {
+        let answer = read(&self.service);
+        self.reads += 1;
+        for (n, event) in &mut self.events {
+            if *n == self.reads {
+                event(&mut self.service);
+            }
+        }
+        answer
+    }
+}
+
+impl StartRead for Straddled {
+    fn read_start_type(&mut self) -> io::Result<StartType> {
+        Ok(self.read(|service| service.start))
+    }
+
+    fn read_changer(&mut self) -> Option<Changer> {
+        self.read(|service| service.changer)
+    }
+
+    fn read_mark(&mut self) -> ChangeMark {
+        self.read(|service| service.mark.clone())
+    }
+}
+
+fn idle(generation: u32) -> ChangeMark {
+    ChangeMark::new(Some(generation.to_string()), None)
+}
+
+fn busy(generation: u32, holder: Changer) -> ChangeMark {
+    ChangeMark::new(Some(format!("{generation}:holder")), Some(holder))
+}
+
+/// A whole retirement (it begins, stamps, disables, restores, clears and ends)
+/// inside one status read: the start type read while it was disabling and the
+/// record read after it cleared it would say an administrator disabled the
+/// service, so the read goes again.
+#[skuld::test]
+fn a_status_read_that_a_whole_change_straddles_reads_again() {
+    let mut reader = Straddled::new(Service {
+        start: StartType::Auto,
+        changer: None,
+        mark: idle(0),
+    })
+    .after_read(1, |service| {
+        service.mark = busy(1, Changer::Running);
+        service.changer = Some(Changer::Running);
+        service.start = StartType::Disabled;
+    })
+    .after_read(2, |service| {
+        service.start = StartType::Auto;
+        service.changer = None;
+        service.mark = idle(2);
+    });
+    assert_eq!(display(&mut reader), DisabledState::NotDisabled);
+}
+
+/// A holder that stamps nothing is still a change in progress.
+#[skuld::test]
+fn a_status_read_while_a_holder_runs_is_a_change_in_progress_with_no_record() {
+    let mut reader = Straddled::new(Service {
+        start: StartType::Disabled,
+        changer: None,
+        mark: busy(1, Changer::Running),
+    });
+    assert_eq!(display(&mut reader), DisabledState::InChange);
+}
+
+/// A holder that crashed leaves its mark busy for good; reads go on as if
+/// nothing held the lock, and are not repeated for ever.
+#[skuld::test]
+fn a_status_read_over_a_holder_that_is_gone_answers_from_the_record() {
+    let mut reader = Straddled::new(Service {
+        start: StartType::Disabled,
+        changer: Some(Changer::NotRunning),
+        mark: busy(1, Changer::NotRunning),
+    });
+    assert_eq!(display(&mut reader), DisabledState::By(DisabledBy::InterruptedChange));
+    assert_eq!(reader.reads, 4, "one pass: mark, start type, record, mark");
+}
+
+/// Another change begins between two passes: the read goes again until two
+/// marks match.
+#[skuld::test]
+fn a_status_read_goes_again_until_two_marks_match() {
+    let mut reader = Straddled::new(Service {
+        start: StartType::Auto,
+        changer: None,
+        mark: idle(0),
+    })
+    .after_read(3, |service| service.mark = idle(2))
+    .after_read(7, |service| service.mark = idle(4));
+    assert_eq!(display(&mut reader), DisabledState::NotDisabled);
+    assert_eq!(
+        reader.reads, 12,
+        "passes of four reads: the first two differ, the third matches"
+    );
 }

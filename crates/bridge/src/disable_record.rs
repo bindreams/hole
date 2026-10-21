@@ -22,12 +22,23 @@
 //! ([`DisabledState::InChange`]); gone, the change was interrupted and the
 //! record's usual answer stands. The record sits in the service's key, which no
 //! user can write, so no user can forge a live stamp.
+//!
+//! The reads of a status call are separate, so every holder of the lock also
+//! sets a change mark (`ChangeKey`) when its outermost hold begins and ends,
+//! and the status read goes again if the mark moved between its reads.
 
 #[cfg(windows)]
 #[path = "disable_record/record_key.rs"]
 mod record_key;
 #[cfg(windows)]
 pub use record_key::RecordKey;
+#[cfg(windows)]
+#[path = "disable_record/change_mark.rs"]
+mod change_mark;
+#[cfg(all(windows, test))]
+pub(crate) use change_mark::scratch::ScratchChangeKey;
+#[cfg(windows)]
+pub use change_mark::ChangeKey;
 #[cfg(windows)]
 #[path = "disable_record/stamp.rs"]
 mod stamp;
@@ -73,6 +84,33 @@ impl Changer {
     }
 }
 
+/// What a status read saw of the change mark ([`ChangeKey`] on Windows): the
+/// value exactly as read, and whether the process it names, if any, runs. Two
+/// reads that see equal marks saw no change begin or end between them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangeMark {
+    raw: Option<String>,
+    holder: Option<Changer>,
+}
+
+impl ChangeMark {
+    pub fn new(raw: Option<String>, holder: Option<Changer>) -> Self {
+        Self { raw, holder }
+    }
+
+    /// The mark of a reader that holds the start-type lock itself: nothing can
+    /// change under it, so it never differs from itself.
+    pub fn unchanging() -> Self {
+        Self::default()
+    }
+
+    /// The process holding the start-type lock to change the service, if the
+    /// mark names one, and whether it still runs.
+    pub fn holder(&self) -> Option<Changer> {
+        self.holder
+    }
+}
+
 /// What the GUI's status read finds about the service being disabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisabledState {
@@ -86,17 +124,23 @@ pub enum DisabledState {
 }
 
 impl DisabledState {
-    /// The state for what a read found: who stamped the record, if there is
-    /// one, and who disabled the service, if it is disabled. A running changer
-    /// is a change in progress whatever the start type says, since the start
-    /// type is being changed.
-    pub fn of(changer: Option<Changer>, disabled_by: Option<DisabledBy>) -> DisabledState {
-        match (changer, disabled_by) {
-            (Some(Changer::Running), _) => DisabledState::InChange,
-            (Some(Changer::NotRunning), Some(by)) => DisabledState::By(by),
-            (Some(Changer::NotRunning), None) => DisabledState::NotDisabled,
-            (None, Some(by)) => DisabledState::By(by),
-            (None, None) => DisabledState::NotDisabled,
+    /// The state for what a read found: the process holding the start-type
+    /// lock, if the change mark names one; who stamped the record, if there is
+    /// one; and who disabled the service, if it is disabled. A running holder
+    /// or changer is a change in progress whatever the start type says, since
+    /// the start type is being changed.
+    pub fn of(holder: Option<Changer>, changer: Option<Changer>, disabled_by: Option<DisabledBy>) -> DisabledState {
+        let running = |who: Option<Changer>| match who {
+            Some(Changer::Running) => true,
+            Some(Changer::NotRunning) => false,
+            None => false,
+        };
+        if running(holder) || running(changer) {
+            return DisabledState::InChange;
+        }
+        match disabled_by {
+            Some(by) => DisabledState::By(by),
+            None => DisabledState::NotDisabled,
         }
     }
 }

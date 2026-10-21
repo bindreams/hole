@@ -1,8 +1,8 @@
 //! The SCM handle behind the GUI's read of whether the service is disabled.
 //!
 //! It holds no start-type lock and cannot write: a change in progress is read
-//! from the record's stamp ([`crate::disable_record`]), not from the lock,
-//! which an unprivileged user has no right to open.
+//! from the change mark and the record's stamp ([`crate::disable_record`]),
+//! not from the lock, which an unprivileged user has no right to open.
 
 use std::io;
 
@@ -14,13 +14,15 @@ use super::retire_session::read_start_type;
 use super::{open_error_is_absent, scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::ScmCall;
 use crate::cutover::scm_wait::retire::StartRead;
-use crate::disable_record::{Changer, RecordKey};
+use crate::disable_record::{ChangeKey, ChangeMark, Changer, RecordKey};
 use crate::service_start::StartType;
 
-/// An open `HoleBridge` service and the key its record lives in, for reading.
+/// An open `HoleBridge` service and the key its record and change mark live in,
+/// for reading.
 pub(super) struct StatusSession {
     service: Service,
     record: RecordKey,
+    mark: ChangeKey,
 }
 
 impl StatusSession {
@@ -32,6 +34,7 @@ impl StatusSession {
             Ok(service) => Ok(Some(Self {
                 service,
                 record: RecordKey::service(),
+                mark: ChangeKey::service(),
             })),
             Err(e) if open_error_is_absent(&e) => Ok(None),
             Err(e) => Err(scm_failure(ScmCall::OpenService, e)),
@@ -46,5 +49,9 @@ impl StartRead for StatusSession {
 
     fn read_changer(&mut self) -> Option<Changer> {
         self.record.changer()
+    }
+
+    fn read_mark(&mut self) -> ChangeMark {
+        self.mark.read()
     }
 }

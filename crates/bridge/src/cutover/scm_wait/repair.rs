@@ -39,22 +39,35 @@ pub fn observe<S: StartConfig>(session: &mut S) -> io::Result<RepairStep> {
 }
 
 /// What the GUI's status shows of the service: a reader that must never fail.
-/// It reads the start type, then the record's changer, and writes nothing. A
-/// record whose writer is still running is a change in progress, whatever the
-/// start type says (or whether it could be read); otherwise a start type that
-/// could not be read says nothing is disabled.
+/// It reads the change mark, the start type and the record's changer, and
+/// writes nothing. A lock holder or record writer that still runs is a change
+/// in progress, whatever the start type says (or whether it could be read);
+/// otherwise a start type that could not be read says nothing is disabled.
+///
+/// The reads are separate, so a change that begins or ends between them would
+/// be read half done. The mark is read before and after, and a pass counts
+/// only if the second equals the first (no holder began or ended in between);
+/// else it is read again. The passes have no count or timer; each re-reads the
+/// real values, and a holder that crashed leaves its mark as it is, so they
+/// end.
 pub fn display<S: StartRead>(session: &mut S) -> DisabledState {
-    let start = session.read_start_type();
-    let changer = session.read_changer();
-    let record = match changer {
-        Some(_) => RecordState::Present,
-        None => RecordState::Absent,
-    };
-    if let Err(error) = &start {
-        warn!(%error, "could not read the service's start type, so it is taken as not disabled");
+    loop {
+        let before = session.read_mark();
+        let start = session.read_start_type();
+        let changer = session.read_changer();
+        if session.read_mark() != before {
+            continue;
+        }
+        let record = match changer {
+            Some(_) => RecordState::Present,
+            None => RecordState::Absent,
+        };
+        if let Err(error) = &start {
+            warn!(%error, "could not read the service's start type, so it is taken as not disabled");
+        }
+        let disabled_by = start.ok().and_then(|start| RepairStep::of(record, start).disabled_by());
+        return DisabledState::of(before.holder(), changer, disabled_by);
     }
-    let disabled_by = start.ok().and_then(|start| RepairStep::of(record, start).disabled_by());
-    DisabledState::of(changer, disabled_by)
 }
 
 /// Stamps the record with this process before a repair or an enable changes

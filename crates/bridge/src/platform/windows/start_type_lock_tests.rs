@@ -4,6 +4,7 @@ use std::sync::{mpsc, Barrier};
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 use super::*;
+use crate::disable_record::{ChangeMark, Changer, ScratchChangeKey};
 
 #[skuld::test]
 fn a_free_lock_is_taken_and_is_then_taken_for_every_other_thread() {
@@ -144,4 +145,105 @@ fn a_boundary_of_the_same_name_but_another_sid_is_another_namespace() {
         .expect("try")
         .expect("the squatter's lock is not ours");
     drop((squatting, held));
+}
+
+// The change mark -----------------------------------------------------------------------------------------------------
+
+/// A lock of the test's own that sets the mark in a scratch key.
+fn marking(test: &str) -> (StartTypeLock, ScratchChangeKey) {
+    let (scratch, _key) = ScratchChangeKey::created(test);
+    let lock = StartTypeLock::scratch_marking(test, scratch.mark());
+    (lock, scratch)
+}
+
+fn holder_of_the_mark(scratch: &ScratchChangeKey) -> Option<Changer> {
+    scratch.mark().read().holder()
+}
+
+/// A reader of the mark that sees no holder must be able to trust that no
+/// change runs: the mark names this process from the moment the lock is taken
+/// to the moment it is let go.
+#[skuld::test]
+fn holding_the_lock_marks_a_change_in_progress_until_it_is_let_go() {
+    let (lock, scratch) = marking("marks");
+    assert_eq!(holder_of_the_mark(&scratch), None);
+    let held = lock.acquire().expect("acquire");
+    assert_eq!(
+        holder_of_the_mark(&scratch),
+        Some(Changer::Running),
+        "this process holds it"
+    );
+    drop(held);
+    assert_eq!(holder_of_the_mark(&scratch), None, "let go");
+}
+
+/// The thread that holds the lock takes it again for each step of a change; the
+/// first hold is the change, and the mark stays until it is let go.
+#[skuld::test]
+fn a_nested_hold_leaves_the_mark_until_the_outermost_is_let_go() {
+    let (lock, scratch) = marking("nested");
+    let outer = lock.acquire().expect("acquire");
+    let at_the_outer = scratch.mark().read();
+    let inner = lock.acquire().expect("acquire again");
+    let tried = lock.try_acquire().expect("try").expect("this thread holds it");
+    assert_eq!(scratch.mark().read(), at_the_outer, "taking it again is no transition");
+    drop(tried);
+    drop(inner);
+    assert_eq!(scratch.mark().read(), at_the_outer, "an inner let-go is no transition");
+    assert_eq!(holder_of_the_mark(&scratch), Some(Changer::Running));
+    drop(outer);
+    assert_eq!(holder_of_the_mark(&scratch), None);
+    assert_ne!(scratch.mark().read(), at_the_outer);
+}
+
+/// A thread that does not get the lock changes nothing, and one that waits
+/// marks nothing until it has it.
+#[skuld::test]
+fn a_thread_that_does_not_hold_the_lock_leaves_the_mark_alone() {
+    let (lock, scratch) = marking("others");
+    let held = lock.acquire().expect("acquire");
+    let at_the_hold = scratch.mark().read();
+    assert!(lock.is_held_for_another_thread());
+    assert_eq!(scratch.mark().read(), at_the_hold, "a failed try is no transition");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|s| {
+        let waiter = s.spawn(|| {
+            let acquired = lock
+                .acquire_noting_wait(move || tx.send(()).unwrap())
+                .expect("the waiter acquired");
+            drop(acquired);
+        });
+        rx.recv().expect("the waiter ended without waiting");
+        assert_eq!(scratch.mark().read(), at_the_hold, "waiting is no transition");
+        drop(held);
+        waiter.join().expect("the waiter");
+    });
+    assert_eq!(holder_of_the_mark(&scratch), None);
+}
+
+/// Each hold, by whichever thread, is a begin and an end.
+#[skuld::test]
+fn every_hold_by_every_thread_changes_the_mark_twice() {
+    let (lock, scratch) = marking("counted");
+    for _ in 0..2 {
+        drop(lock.acquire().expect("acquire"));
+        std::thread::scope(|s| {
+            s.spawn(|| drop(lock.acquire().expect("acquire")))
+                .join()
+                .expect("the thread");
+        });
+    }
+    let raw = scratch.mark().read();
+    assert_eq!(raw, ChangeMark::new(Some("8".to_string()), None));
+}
+
+/// No service yet (the first install): there is no key to mark, and the hold
+/// is taken all the same.
+#[skuld::test]
+fn a_lock_over_no_key_is_taken_without_a_mark() {
+    let scratch = ScratchChangeKey::named("no-key");
+    let lock = StartTypeLock::scratch_marking("no-key", scratch.mark());
+    drop(lock.acquire().expect("acquire"));
+    assert!(!scratch.exists(), "no key was made");
 }

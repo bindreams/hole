@@ -2281,6 +2281,23 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   with `GetProcessTimes`. A lock that cannot be read costs nothing here, since
   the GUI never takes it; a start type that cannot be read says nothing is
   disabled, but a running changer is still seen.
+  **The change mark** makes the lock-free read exact. The start type and the
+  record are separate reads, so a change that began or ended between them would
+  be read half done (a retirement's whole Disable-to-restore span inside one
+  read says "disabled by someone else"). Every holder of the lock sets a
+  `HoleChangeMark` value in the service's key (`ChangeKey`,
+  [`change_mark.rs`](crates/bridge/src/disable_record/change_mark.rs)) when its
+  outermost hold on a thread begins, `<n>:<pid>:<creation>`, and again when that
+  hold ends, `<n>` (`n` counts transitions; the nested holds of a change's own
+  steps are no transition). `display` reads the mark, the start type, the
+  record and the mark again, and goes again unless the two marks are equal; a
+  mark that names a running holder is `InChange` too, so a holder that stamps
+  nothing (an administrator-disabled service's hardening, a first install, the
+  failure-actions repair) is seen as well. A holder that crashed leaves its mark
+  naming a dead process, which reads as no holder and does not change, so the
+  passes end; the next holder takes it over. The passes have no count or timer.
+  A failed write of the mark is a warning at the holder (a status read may see
+  that change half done); no key is no service, so nothing is written.
 - **An administrator's Disable survives every Hole path that is not an explicit
   enable.** The retirement's restore, the in-app update's cutover, `hole bridge install` and the GUI's status read leave it. A reinstall deletes and recreates
   the service, so `bridge install` reads who disabled it first, registers the new

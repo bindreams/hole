@@ -131,12 +131,12 @@ impl RecordKey {
 
 /// Whether `error` says the key or value is not there (`ERROR_FILE_NOT_FOUND`,
 /// what `RegOpenKeyEx` and `RegQueryValueEx` answer for either).
-fn missing(error: &Error) -> bool {
+pub(super) fn missing(error: &Error) -> bool {
     win32_code_of_hresult(error.code().0) == ERROR_FILE_NOT_FOUND.0
 }
 
 /// `error` as the `io::Error` of its Win32 code, so that `kind()` is right.
-fn io_error(error: Error) -> io::Error {
+pub(super) fn io_error(error: Error) -> io::Error {
     io::Error::from_raw_os_error(win32_code_of_hresult(error.code().0) as i32)
 }
 
