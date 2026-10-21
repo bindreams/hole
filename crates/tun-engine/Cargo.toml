@@ -99,6 +99,8 @@ rand = { version = "0.10", optional = true }
 
 [dev-dependencies]
 skuld = { workspace = true }
+# `test-support`: lets route-record tests fail a read.
+util = { path = "../util", features = ["test-support"] }
 hole-test-observability = { path = "../test-observability" }
 # Recovery-path redaction tests capture tracing output through a
 # `RedactingWriter`: `WaitableWriter` (garter's `test-utils` feature) as the

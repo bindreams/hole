@@ -12,6 +12,14 @@ pub enum Error {
     #[error("{0}")]
     Chain(String),
 
+    /// A chain's hop failed to start, so [`ChainRunner::run`](crate::ChainRunner::run) ended the chain. `cause` is the
+    /// typed failure the hop reported (or the exit-before-ready one the chain synthesized).
+    #[error("plugin '{plugin}' failed to start: {cause}")]
+    StartFailed {
+        plugin: String,
+        cause: crate::sitrep::StartError,
+    },
+
     #[error("environment variable '{var}' missing or invalid: {reason}")]
     Env { var: String, reason: String },
 

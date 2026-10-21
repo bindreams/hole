@@ -523,9 +523,12 @@ consumer is known, reserve the union over the possible consumers:
 `plugin_e2e::ports::reserve_ss_local` is generic over which client plugin will
 run, and that set includes galoshes, so it always reserves TCP+UDP —
 over-reserving UDP for a TCP-only plugin costs a retry, under-reserving it for
-galoshes costs a race. `garter::chain::allocate_ports` verifies TCP only and is
-clippy-banned outside garter's own chain-internal use, which carries a per-site
-allow.
+galoshes costs a race. `garter::ChainRunner` picks each intermediate port
+itself, uncapped, one hop at a time just before that hop starts, and verifies
+TCP only: every in-repo hop that is not the public one binds TCP alone. A hop that loses that port to another process reports a typed
+`BindConflict` and is run again alone on a fresh pick, uncapped; a hop that does
+not speak sitrep (`ReadinessMode::Probe`) cannot, so its lost port is a failed
+start and is not restarted ([garter README](crates/garter/README.md)).
 
 ### Route-command failure policy
 
@@ -2642,7 +2645,27 @@ cargo xtask deps             # build ex-ray (Go) + download/verify wintun.dll (c
 cargo xtask build hole       # deps + cargo build (debug) + stage to target/debug/dist
 cargo xtask run hole         # dev mode (build cascade, then dev-console supervises)
 cargo xtask run hole-tests   # canonical local nextest invocation
+cargo xtask run doc-hole     # rustdoc, warnings denied (`doc-ex-galoshes` on Linux and Windows/arm64)
 ```
+
+CI runs the doc targets on every leg after clippy. Unpublished crates (every
+workspace crate except `garter`) are documented with `--document-private-items`
+and `-A rustdoc::private_intra_doc_links`: their docs are only read in source, so a
+public item may link a private one. `garter` is built plain, because docs.rs omits
+private items: its docs may not link one.
+
+Libraries and binaries are separate `cargo doc` commands (`--lib`, `--bins`): a plain
+`cargo doc` skips a binary named like its crate's library, which leaves `crates/hole`'s
+binary-only modules unchecked. `--bins` also documents the library, so for `hole`, `xtask`,
+`dev-console` and `galoshes` two rustdoc runs write one `target/doc/<name>/` and cargo prints
+`output filename collision`; the check reads rustdoc's diagnostics, not the output. The
+two never run at once: cargo makes the binary's documentation unit depend on the library's
+(`compute_deps_doc`, so the binary's docs can link the library's). A binary
+with `required-features` (`tombstone`'s `crash_child`) is skipped unless its command enables
+them; `xtask/src/doc_targets_tests.rs` fails on a target no command documents.
+
+A reference to an item that is `cfg`-gated away on some target or `#[cfg(test)]`
+still breaks the check; write it in backticks without brackets.
 
 ### Tauri dev/prod feature toggle
 

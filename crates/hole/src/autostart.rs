@@ -26,7 +26,7 @@ impl Autostart for AutoLaunchManager {
 }
 
 /// Which step of the toggle failed. The Display form may embed filesystem
-/// paths (auto-launch's "app path doesn't exist: <exe path>") and must only
+/// paths (auto-launch's "app path doesn't exist: `<exe path>`") and must only
 /// reach gui.log; dialogs use [`ToggleError::user_message`].
 #[derive(Debug, thiserror::Error)]
 pub enum ToggleError {

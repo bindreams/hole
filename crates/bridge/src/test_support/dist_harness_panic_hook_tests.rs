@@ -25,6 +25,7 @@
 use crate::test_support::dist_fixture::stage_dist_bin_dir;
 use crate::test_support::dist_harness::DistHarness;
 use crate::test_support::rt;
+use crate::test_support::skuld_fixtures::DIST_BIN;
 use std::process::Command;
 
 /// Child-side: spawn a `DistHarness`, then panic. The installed panic
@@ -74,7 +75,7 @@ pub(crate) fn run_child() {
     std::process::exit(2);
 }
 
-#[skuld::test]
+#[skuld::test(labels = [DIST_BIN], serial = DIST_BIN)]
 fn panic_hook_chain_dumps_bridge_log_and_libtest_message() {
     let exe = std::env::current_exe().expect("current_exe");
     let output = Command::new(&exe)
@@ -172,5 +173,28 @@ fn panic_hook_chain_dumps_bridge_log_and_libtest_message() {
         pos_tracing < pos_libtest,
         "hole_common tracing-emit hook must run before libtest's panic printer; \
          tracing@{pos_tracing}, libtest@{pos_libtest}. stderr:\n{stderr}"
+    );
+}
+
+/// The child process re-stages `target/debug/dist/bin` itself, outside this test binary's
+/// `dist_dir` fixture, so the parent must hold the `DIST_BIN` lock: labelled, because
+/// `serial = X` only excludes tests that carry label X.
+#[skuld::test]
+fn panic_hook_test_holds_the_dist_bin_lock() {
+    let def = skuld::test_registry()
+        .values()
+        .find(|d| d.name == "panic_hook_chain_dumps_bridge_log_and_libtest_message")
+        .expect("the panic-hook test is registered");
+
+    let dist_bin = DIST_BIN.name();
+    assert!(
+        def.labels.iter().any(|l| l.name() == dist_bin),
+        "the panic-hook test must carry the {dist_bin} label, has {:?}",
+        def.labels.iter().map(|l| l.name()).collect::<Vec<_>>()
+    );
+    assert!(
+        def.serial.eq_ignore_ascii_case(dist_bin),
+        "the panic-hook test must be serial against {dist_bin}, has {:?}",
+        def.serial
     );
 }

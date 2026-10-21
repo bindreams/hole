@@ -23,11 +23,9 @@ anyhow = "1"
 # `version` feature, adds no new crate to the graph.
 toml = "1.0"
 cargo_metadata = "0.23"
+regex = "1" # `renovate_prek_tests` runs the Renovate managers' patterns over `prek.toml`
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3" # transparent-launcher interrupt handling (#568): a handler (not SIG_IGN) resets to default across exec, so children stay interruptible while xtask survives Ctrl+C and propagates the child's exit status
-# `bindir::unique_glob_match` locates the single file a BINDIR name maps to
-# under a glob pattern (e.g. the platform-specific ex-ray/galoshes binaries).
-glob = "0.3"
 # `tauri-config` is for the `frontend_dist` tests: the nextest lanes select `-p xtask-lib` without `hole`,
 # which is the only other consumer that turns the feature on.
 xtask-lib = { path = "../xtask-lib", features = ["serde", "clap", "version", "tauri-config"] }
@@ -84,6 +82,11 @@ typst-layout = "=0.15.1"
 typst-render = "=0.15.1"
 typst-utils = "=0.15.1"
 png = "0.18"
+
+# `stage` replaces a file by a POSIX-semantics rename that also ignores the read-only attribute,
+# which std's `rename` does not expose.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # `check_vendoring_integrity_tests`'s real-`prek`-hook e2e fixtures: `std::env::temp_dir()`

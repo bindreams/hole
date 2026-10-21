@@ -95,7 +95,7 @@ impl TestConfig {
 /// 1. Pre-flight DNS + raw TCP probe to detect "the server endpoint is plainly
 ///    unreachable" without spending the cost of a plugin spawn.
 /// 2. Optional v2ray-plugin (or any SIP003 plugin) spawn. The
-///    [`Plugin`] guard's `Drop` impl tears down the child process on every
+///    `Plugin` guard's `Drop` impl tears down the child process on every
 ///    exit path, including panics.
 /// 3. A real shadowsocks tunnel via [`ProxyClientStream::connect`], with a
 ///    `HEAD /` request sent through to a public sentinel and the response
@@ -343,7 +343,7 @@ fn build_server_config(entry: &ServerEntry, server_ip: IpAddr) -> Result<ServerC
 /// server address to point at the plugin chain's local port.
 ///
 /// Returns `Ok(None)` if no plugin is configured (plain shadowsocks). Returns
-/// the [`PluginChain`] guard otherwise — its [`Drop`] cancels the chain
+/// the [`PluginChain`](crate::proxy::plugin::PluginChain) guard otherwise — its [`Drop`] cancels the chain
 /// (SIP003u graceful shutdown).
 async fn maybe_start_plugin(
     entry: &ServerEntry,

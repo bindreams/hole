@@ -1,11 +1,14 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use std::path::{Path, PathBuf};
+
+use util::versioned_file::CannotRead;
+
 use super::*;
 
 fn sample_ipv4() -> RouteState {
     let server_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
     RouteState {
-        version: SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip,
         interface_name: "en0".into(),
@@ -19,7 +22,6 @@ fn sample_ipv4() -> RouteState {
 fn sample_ipv6() -> RouteState {
     let server_ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
     RouteState {
-        version: SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip,
         interface_name: "Wi-Fi".into(),
@@ -48,12 +50,37 @@ fn sample_ipv4_with_stale() -> RouteState {
     }
 }
 
+fn save(dir: &Path, state: &RouteState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    write(&file(dir), state, owner)
+}
+
+fn clear(dir: &Path) -> std::io::Result<Cleared> {
+    remove(&file(dir))
+}
+
+fn load_record(dir: &Path) -> Option<RouteState> {
+    match read(&file(dir)) {
+        Found::Records(record) => Some(record),
+        Found::Nothing | Found::Unreadable { .. } => None,
+    }
+}
+
+fn state_file(dir: &Path) -> PathBuf {
+    dir.join(STATE_FILE_NAME)
+}
+
+fn write_raw(dir: &Path, bytes: &str) -> PathBuf {
+    let path = state_file(dir);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
 #[skuld::test]
 fn save_then_load_roundtrip_ipv4() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_ipv4();
     save(dir.path(), &state, None).unwrap();
-    let loaded = load(dir.path()).unwrap();
+    let loaded = load_record(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
 
@@ -62,7 +89,7 @@ fn save_then_load_roundtrip_ipv6() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_ipv6();
     save(dir.path(), &state, None).unwrap();
-    let loaded = load(dir.path()).unwrap();
+    let loaded = load_record(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
 
@@ -71,57 +98,191 @@ fn save_then_load_roundtrip_with_stale_groups() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_ipv4_with_stale();
     save(dir.path(), &state, None).unwrap();
-    let loaded = load(dir.path()).unwrap();
+    let loaded = load_record(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
 
 #[skuld::test]
-fn load_missing_returns_none() {
+fn load_missing_is_absent() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(load(dir.path()).is_none());
+    assert!(matches!(load(dir.path()), Loaded::Absent));
+    assert!(matches!(read(&file(dir.path())), Found::Nothing));
+    assert_eq!(blocking(dir.path()), None);
+}
+
+/// Every cause that makes a record unreadable, with what `read` must report.
+fn unreadable_cases() -> Vec<(&'static str, String, CannotRead)> {
+    vec![
+        ("not json", "not valid json { .".into(), CannotRead::Corrupt),
+        ("empty", String::new(), CannotRead::Corrupt),
+        (
+            "wrong shape",
+            r#"{"version": 4, "server_ip": "203.0.113.1"}"#.into(),
+            CannotRead::Corrupt,
+        ),
+        (
+            "version zero",
+            r#"{"version": 0, "tun_name": "t"}"#.into(),
+            CannotRead::Corrupt,
+        ),
+        ("version a string", r#"{"version": "4"}"#.into(), CannotRead::Corrupt),
+        ("version fractional", r#"{"version": 4.5}"#.into(), CannotRead::Corrupt),
+        (
+            "no version",
+            r#"{"tun_name": "hole-tun", "server_ip": "203.0.113.1", "interface_name": "en0"}"#.into(),
+            CannotRead::Corrupt,
+        ),
+        (
+            "newer",
+            r#"{"version": 5, "tun_name": "hole-tun", "server_ip": "203.0.113.1"}"#.into(),
+            CannotRead::Newer,
+        ),
+        ("far newer", r#"{"version": 99}"#.into(), CannotRead::Newer),
+    ]
 }
 
 #[skuld::test]
-fn load_corrupted_returns_none() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(STATE_FILE_NAME), b"not valid json { .").unwrap();
-    assert!(load(dir.path()).is_none());
+fn an_unreadable_record_is_reported_with_its_path_and_cause() {
+    for (what, bytes, expected) in unreadable_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_raw(dir.path(), &bytes);
+        match read(&file(dir.path())) {
+            Found::Unreadable { path: found, cause } => {
+                assert_eq!(found, path, "{what}");
+                assert_eq!(cause, WhyUnreadable::CannotRead(expected), "{what}");
+            }
+            other => panic!("{what}: expected an unreadable record, got {other:?}"),
+        }
+    }
 }
 
 #[skuld::test]
-fn load_wrong_version_returns_none() {
+fn only_an_unreadable_record_blocks_a_connect() {
+    for (what, bytes, _) in unreadable_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_raw(dir.path(), &bytes);
+        assert_eq!(blocking(dir.path()), Some(path), "{what}");
+    }
+
     let dir = tempfile::tempdir().unwrap();
-    let json = serde_json::json!({
-        "version": 99,
-        "tun_name": "hole-tun",
-        "server_ip": "203.0.113.1",
-        "interface_name": "en0",
-    });
-    std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
-    assert!(load(dir.path()).is_none());
+    assert_eq!(blocking(dir.path()), None, "no record");
+    save(dir.path(), &sample_ipv4(), None).unwrap();
+    assert_eq!(blocking(dir.path()), None, "a current record");
+    write_raw(
+        dir.path(),
+        r#"{"version": 1, "tun_name": "t", "server_ip": "1.1.1.1", "interface_name": "e"}"#,
+    );
+    assert_eq!(blocking(dir.path()), None, "an older record migrates");
+}
+
+/// A file system whose reads are all denied; links and publishes are real.
+struct DeniedRead;
+
+impl util::versioned_file::Fs for DeniedRead {
+    fn read(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+/// A record that is readable bytes on disk, whose read fails.
+fn file_whose_reads_fail(dir: &Path) -> RouteFile {
+    RouteFile::with_fs(dir, std::sync::Arc::new(DeniedRead))
+}
+
+/// A failed read is treated like a newer or corrupt record.
+#[skuld::test]
+fn a_read_that_fails_is_an_unreadable_record_with_its_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_raw(dir.path(), r#"{"version": 4}"#);
+    match read(&file_whose_reads_fail(dir.path())) {
+        Found::Unreadable { path: found, cause } => {
+            assert_eq!(found, path);
+            assert_eq!(cause, WhyUnreadable::ReadFailed(std::io::ErrorKind::PermissionDenied));
+        }
+        other => panic!("expected an unreadable record, got {other:?}"),
+    }
+}
+
+/// The path where the record should be is a directory, so the real read fails.
+#[skuld::test]
+fn a_record_whose_read_fails_blocks_a_connect() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = state_file(dir.path());
+    std::fs::create_dir(&path).unwrap();
+    assert!(matches!(
+        read(&file(dir.path())),
+        Found::Unreadable {
+            cause: WhyUnreadable::ReadFailed(_),
+            ..
+        }
+    ));
+    assert_eq!(blocking(dir.path()), Some(path));
 }
 
 #[skuld::test]
-fn load_unknown_field_returns_none() {
+fn save_over_a_record_whose_read_fails_is_refused_and_leaves_it() {
     let dir = tempfile::tempdir().unwrap();
-    let json = serde_json::json!({
-        "version": SCHEMA_VERSION,
-        "tun_name": "hole-tun",
-        "server_ip": "203.0.113.1",
-        "interface_name": "en0",
-        "original_gateway": null,
-        "installed": ["split-v4-low"],
-        "stale": [],
-        "extra_field": "should be rejected",
-    });
-    std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
-    assert!(load(dir.path()).is_none());
+    let bytes = r#"{"version": 4, "tun_name": "t"}"#;
+    let path = write_raw(dir.path(), bytes);
+
+    let err = write(&file_whose_reads_fail(dir.path()), &sample_ipv4(), None).expect_err("must refuse");
+
+    assert!(
+        matches!(&err, StoreError::ReadFailed { path: p, kind } if *p == path && *kind == std::io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+    assert_eq!(leftovers.len(), 1, "no temp file or backup may appear");
 }
 
 #[skuld::test]
-fn clear_missing_is_ok() {
+fn clear_over_a_record_whose_read_fails_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
-    clear(dir.path()).unwrap();
+    let bytes = r#"{"version": 4, "tun_name": "t"}"#;
+    let path = write_raw(dir.path(), bytes);
+
+    let cleared = remove(&file_whose_reads_fail(dir.path())).unwrap();
+
+    assert_eq!(cleared, Cleared::Kept);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+}
+
+#[skuld::test]
+fn save_over_an_unreadable_record_is_refused_and_leaves_it() {
+    for (what, bytes, cause) in unreadable_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_raw(dir.path(), &bytes);
+
+        let err = save(dir.path(), &sample_ipv4(), None).expect_err(what);
+
+        assert!(
+            matches!(err, StoreError::Unreadable { cause: c, .. } if c == cause),
+            "{what}: {err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes, "{what}");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(leftovers.len(), 1, "{what}: no temp file or backup may appear");
+    }
+}
+
+#[skuld::test]
+fn clear_over_an_unreadable_record_keeps_it() {
+    for (what, bytes, _) in unreadable_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_raw(dir.path(), &bytes);
+
+        let cleared = clear(dir.path()).expect(what);
+
+        assert_eq!(cleared, Cleared::Kept, "{what}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes, "{what}");
+    }
+}
+
+#[skuld::test]
+fn clear_missing_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(clear(dir.path()).unwrap(), Cleared::Gone);
 }
 
 #[skuld::test]
@@ -129,7 +290,7 @@ fn clear_existing_removes_file() {
     let dir = tempfile::tempdir().unwrap();
     save(dir.path(), &sample_ipv4(), None).unwrap();
     assert!(dir.path().join(STATE_FILE_NAME).exists());
-    clear(dir.path()).unwrap();
+    assert_eq!(clear(dir.path()).unwrap(), Cleared::Gone);
     assert!(!dir.path().join(STATE_FILE_NAME).exists());
 }
 
@@ -139,6 +300,133 @@ fn save_creates_missing_dir() {
     let nested = parent.path().join("a").join("b").join("c");
     save(&nested, &sample_ipv4(), None).unwrap();
     assert!(nested.join(STATE_FILE_NAME).exists());
+}
+
+// Golden files ========================================================================================================
+//
+// Bytes a shipped release wrote, hand-written from its `save` (v0.6.0 wrote
+// schema 4 with this exact layout), so a change to the type cannot also move
+// what it is checked against.
+
+const V4_ON_DISK: &str = r#"{
+  "version": 4,
+  "tun_name": "hole-tun",
+  "server_ip": "203.0.113.42",
+  "interface_name": "en0",
+  "original_gateway": "203.0.113.1",
+  "route_form": "via",
+  "installed": [
+    "split-v4-low",
+    "split-v4-high",
+    "split-v6-low",
+    "split-v6-high",
+    "server-bypass"
+  ],
+  "stale": [
+    {
+      "tun_name": "hole-tun",
+      "server_ip": "9.9.9.9",
+      "interface_name": "en1",
+      "original_gateway": "9.9.9.1",
+      "route_form": "via",
+      "installed": [
+        "server-bypass"
+      ]
+    }
+  ]
+}"#;
+
+#[skuld::test]
+fn a_v4_file_written_by_v0_6_0_loads_as_it_was_written() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(state_file(dir.path()), V4_ON_DISK).unwrap();
+    assert_eq!(load_record(dir.path()), Some(sample_ipv4_with_stale()));
+}
+
+#[skuld::test]
+fn save_writes_the_bytes_v0_6_0_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    save(dir.path(), &sample_ipv4_with_stale(), None).unwrap();
+    assert_eq!(std::fs::read_to_string(state_file(dir.path())).unwrap(), V4_ON_DISK);
+}
+
+// Unknown fields ======================================================================================================
+//
+// A record is the only evidence of what a run left in the routing table, so a
+// field this release does not know must not make it unreadable: it is
+// ignored, at every depth and in every version.
+
+#[skuld::test]
+fn route_record_with_an_unknown_field_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(V4_ON_DISK).unwrap();
+    json["from_the_future"] = serde_json::json!({"anything": [1, 2]});
+    json["stale"][0]["also_from_the_future"] = serde_json::json!("x");
+    std::fs::write(state_file(dir.path()), json.to_string()).unwrap();
+
+    assert_eq!(
+        load_record(dir.path()),
+        Some(sample_ipv4_with_stale()),
+        "an extra key at the top and inside a stale group must not discard the record"
+    );
+}
+
+#[skuld::test]
+fn older_route_records_ignore_unknown_fields_at_every_level() {
+    let server_ip: IpAddr = "203.0.113.1".parse().unwrap();
+    let expected = |installed: Vec<RouteId>, original_gateway: Option<IpAddr>, stale: Vec<StaleRecord>| RouteState {
+        tun_name: "hole-tun".into(),
+        server_ip,
+        interface_name: "en0".into(),
+        original_gateway,
+        route_form: RouteForm::Via,
+        installed,
+        stale,
+    };
+    let stale_group = StaleRecord {
+        tun_name: "hole-tun".into(),
+        server_ip: "9.9.9.9".parse().unwrap(),
+        interface_name: "en1".into(),
+        original_gateway: Some("9.9.9.1".parse().unwrap()),
+        route_form: RouteForm::Via,
+        installed: vec![RouteId::ServerBypass],
+    };
+    let cases = [
+        (
+            serde_json::json!({
+                "version": 1, "tun_name": "hole-tun", "server_ip": "203.0.113.1", "interface_name": "en0",
+                "extra": true,
+            }),
+            expected(planned_routes(server_ip), None, Vec::new()),
+        ),
+        (
+            serde_json::json!({
+                "version": 2, "tun_name": "hole-tun", "server_ip": "203.0.113.1", "interface_name": "en0",
+                "installed": ["split-v4-low"], "extra": true,
+            }),
+            expected(vec![RouteId::SplitV4Low], None, Vec::new()),
+        ),
+        (
+            serde_json::json!({
+                "version": 3, "tun_name": "hole-tun", "server_ip": "203.0.113.1", "interface_name": "en0",
+                "original_gateway": "203.0.113.254", "installed": ["split-v4-low"], "extra": true,
+                "stale": [{
+                    "tun_name": "hole-tun", "server_ip": "9.9.9.9", "interface_name": "en1",
+                    "original_gateway": "9.9.9.1", "installed": ["server-bypass"], "extra": true,
+                }],
+            }),
+            expected(
+                vec![RouteId::SplitV4Low],
+                Some("203.0.113.254".parse().unwrap()),
+                vec![stale_group],
+            ),
+        ),
+    ];
+    for (json, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(state_file(dir.path()), json.to_string()).unwrap();
+        assert_eq!(load_record(dir.path()), Some(expected), "{json}");
+    }
 }
 
 // Schema migration ====================================================================================================
@@ -158,8 +446,7 @@ fn load_v1_migrates_to_the_full_planned_set() {
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
 
-    let loaded = load(dir.path()).expect("a v1 file must still drive recovery, not be discarded");
-    assert_eq!(loaded.version, SCHEMA_VERSION);
+    let loaded = load_record(dir.path()).expect("a v1 file must still drive recovery, not be discarded");
     assert_eq!(loaded.tun_name, "hole-tun");
     assert_eq!(loaded.interface_name, "en0");
     assert_eq!(
@@ -183,8 +470,7 @@ fn load_v2_migrates_preserving_installed_and_leaving_gateway_unknown() {
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
 
-    let loaded = load(dir.path()).expect("a v2 file must still drive recovery, not be discarded");
-    assert_eq!(loaded.version, SCHEMA_VERSION);
+    let loaded = load_record(dir.path()).expect("a v2 file must still drive recovery, not be discarded");
     assert_eq!(loaded.tun_name, "hole-tun");
     assert_eq!(loaded.interface_name, "en0");
     assert_eq!(
@@ -217,8 +503,7 @@ fn a_record_without_a_form_field_migrates_to_via() {
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
 
-    let loaded = load(dir.path()).expect("a v3 file must still drive recovery, not be discarded");
-    assert_eq!(loaded.version, SCHEMA_VERSION);
+    let loaded = load_record(dir.path()).expect("a v3 file must still drive recovery, not be discarded");
     assert_eq!(
         loaded.route_form,
         RouteForm::Via,
@@ -250,24 +535,9 @@ fn a_stale_group_without_a_form_field_migrates_to_via() {
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
 
-    let loaded = load(dir.path()).expect("a v3 file must still drive recovery, not be discarded");
+    let loaded = load_record(dir.path()).expect("a v3 file must still drive recovery, not be discarded");
     assert_eq!(loaded.stale.len(), 1);
     assert_eq!(loaded.stale[0].route_form, RouteForm::Via);
-}
-
-#[skuld::test]
-fn load_v2_with_unknown_field_returns_none() {
-    let dir = tempfile::tempdir().unwrap();
-    let json = serde_json::json!({
-        "version": 2,
-        "tun_name": "hole-tun",
-        "server_ip": "203.0.113.1",
-        "interface_name": "en0",
-        "installed": ["split-v4-low"],
-        "extra_field": "should be rejected",
-    });
-    std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
-    assert!(load(dir.path()).is_none());
 }
 
 #[skuld::test]
@@ -281,26 +551,12 @@ fn load_v1_loopback_migrates_without_the_bypass() {
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
 
-    let loaded = load(dir.path()).unwrap();
+    let loaded = load_record(dir.path()).unwrap();
     assert!(
         !loaded.installed.contains(&RouteId::ServerBypass),
         "a loopback server never installs a bypass, got {:?}",
         loaded.installed
     );
-}
-
-#[skuld::test]
-fn load_v1_with_unknown_field_returns_none() {
-    let dir = tempfile::tempdir().unwrap();
-    let json = serde_json::json!({
-        "version": 1,
-        "tun_name": "hole-tun",
-        "server_ip": "203.0.113.1",
-        "interface_name": "en0",
-        "extra_field": "should be rejected",
-    });
-    std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
-    assert!(load(dir.path()).is_none());
 }
 
 // Canonical form ======================================================================================================
@@ -407,7 +663,7 @@ fn coalesce_sanitizes_a_plannable_id_alongside_an_unplannable_one() {
 
 /// Pin `installed`'s wire names: they are the persisted schema-2 format a
 /// newer binary must read back from an older run's crash-leftover file, so
-/// renaming a `RouteId` variant is a schema break needing a `SCHEMA_VERSION`
+/// renaming a `RouteId` variant is a schema break needing a version
 /// bump and a migration arm, same as the v1 migration below.
 #[skuld::test]
 fn installed_routes_serialize_as_kebab_case() {
@@ -453,15 +709,20 @@ fn captured(body: impl FnOnce()) -> String {
     writer.snapshot()
 }
 
-/// The version probe is the first parse, so a file skewed badly enough to
-/// put an address where the schema version belongs fails here.
+/// The version is read first, so a file skewed badly enough to put an address
+/// where the schema version belongs fails here.
 #[skuld::test]
 fn a_corrupt_route_state_never_echoes_its_contents_into_the_log() {
     const SECRET_ADDR: &str = "203.0.113.42";
     let json = format!(r#"{{"version":"{SECRET_ADDR}"}}"#);
 
     // Guard: without it this passes against a serde_json that stopped echoing.
-    let raw = serde_json::from_str::<VersionProbe>(&json)
+    #[derive(Debug, Deserialize)]
+    struct Probe {
+        #[allow(dead_code)]
+        version: u32,
+    }
+    let raw = serde_json::from_str::<Probe>(&json)
         .expect_err("must not parse")
         .to_string();
     assert!(raw.contains(SECRET_ADDR), "guard: serde_json echoes the value: {raw}");
@@ -470,12 +731,12 @@ fn a_corrupt_route_state_never_echoes_its_contents_into_the_log() {
     std::fs::write(state_file(dir.path()), &json).unwrap();
 
     let mut loaded = Some(sample_ipv4());
-    let logs = captured(|| loaded = load(dir.path()));
+    let logs = captured(|| loaded = load_record(dir.path()));
     assert!(loaded.is_none(), "a corrupt record must not be acted on");
     assert!(!logs.contains(SECRET_ADDR), "the address reached bridge.log: {logs}");
     assert!(
-        logs.contains("line 1"),
-        "position must survive so the warning stays actionable: {logs}"
+        logs.contains("version is not a positive integer"),
+        "the cause must survive so the warning stays actionable: {logs}"
     );
 }
 
@@ -485,9 +746,11 @@ fn a_corrupt_route_state_never_echoes_its_contents_into_the_log() {
 #[skuld::test]
 fn a_corrupt_route_state_body_never_echoes_its_contents_into_the_log() {
     const SECRET_ADDR: &str = "203.0.113.42";
-    let json = serde_json::to_string(&sample_ipv4())
-        .unwrap()
-        .replace(r#""route_form":"via""#, &format!(r#""route_form":"{SECRET_ADDR}""#));
+    let json = V4_ON_DISK.replacen(
+        r#""route_form": "via""#,
+        &format!(r#""route_form": "{SECRET_ADDR}""#),
+        1,
+    );
     assert!(json.contains(SECRET_ADDR), "the fixture must carry the address: {json}");
 
     let raw = serde_json::from_str::<RouteState>(&json)
@@ -499,11 +762,11 @@ fn a_corrupt_route_state_body_never_echoes_its_contents_into_the_log() {
     std::fs::write(state_file(dir.path()), &json).unwrap();
 
     let mut loaded = Some(sample_ipv4());
-    let logs = captured(|| loaded = load(dir.path()));
+    let logs = captured(|| loaded = load_record(dir.path()));
     assert!(loaded.is_none(), "a corrupt record must not be acted on");
     assert!(!logs.contains(SECRET_ADDR), "the address reached bridge.log: {logs}");
     assert!(
-        logs.contains("line 1"),
+        logs.contains("line 7"),
         "position must survive so the warning stays actionable: {logs}"
     );
 }

@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 
 use crate::manifest::Os;
 use crate::Profile;
@@ -84,13 +84,12 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     let host = host_os()?;
     let target_dir = repo_root.join("target").join(profile.dir_name());
 
-    // ex-ray is built per-target-triple into `.cache/ex-ray/ex-ray-<triple>{.exe}`;
-    // the triple varies, so glob + assert exactly one match.
-    let ex_ray_glob = if host == Os::Windows {
-        ".cache/ex-ray/ex-ray-*.exe"
-    } else {
-        ".cache/ex-ray/ex-ray-*"
-    };
+    // `cargo xtask ex-ray` writes `.cache/ex-ray/ex-ray-<host triple>{.exe}`. Other targets' sidecars
+    // (cross-target builds leave stubs there) are not the host's, so look it up by exact name.
+    let ex_ray = repo_root
+        .join(".cache")
+        .join("ex-ray")
+        .join(crate::ex_ray::output_name());
 
     let mut files = Vec::new();
     for name in bindir_dest_names(host) {
@@ -101,7 +100,7 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
             "hole.pdb" => BindirFile::new(target_dir.join("hole.pdb"), name),
             // macOS `split-debuginfo = "packed"` emits a self-contained `.dSYM` bundle.
             "hole.dSYM" => BindirFile::directory(target_dir.join("hole.dSYM"), name),
-            "ex-ray" | "ex-ray.exe" => BindirFile::new(unique_glob_match(repo_root, ex_ray_glob)?, name),
+            "ex-ray" | "ex-ray.exe" => BindirFile::new(existing_file(ex_ray.clone())?, name),
             // galoshes is a workspace member, built into the unified `target/release/`.
             "galoshes" | "galoshes.exe" => BindirFile::new(repo_root.join("target").join("release").join(&name), name),
             // wintun.dll — downloaded by `cargo xtask wintun` into `.cache/wintun/`.
@@ -115,26 +114,15 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     Ok(files)
 }
 
-/// Find exactly one file matching `pattern` (a glob relative to `repo_root`).
-/// Returns the absolute path. Errors if zero or more than one match.
-fn unique_glob_match(repo_root: &Path, pattern: &str) -> Result<PathBuf> {
-    let abs_pattern = repo_root.join(pattern);
-    let pattern_str = abs_pattern
-        .to_str()
-        .ok_or_else(|| anyhow!("glob pattern is not valid UTF-8: {abs_pattern:?}"))?;
-
-    let mut matches = Vec::new();
-    for entry in glob::glob(pattern_str).with_context(|| format!("invalid glob pattern: {pattern_str}"))? {
-        matches.push(entry?);
+/// `path` itself, or a "run `cargo xtask deps`" error when it is not a file or is empty
+/// (`crates/hole/build.rs` stubs a missing host sidecar as an empty file).
+fn existing_file(path: PathBuf) -> Result<PathBuf> {
+    let non_empty = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > 0);
+    if !non_empty {
+        return Err(anyhow!(
+            "{} is missing or empty. Did `cargo xtask deps` run?",
+            path.display()
+        ));
     }
-
-    match matches.len() {
-        0 => Err(anyhow!(
-            "no files matched glob {pattern_str}. Did `cargo xtask deps` run?"
-        )),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        n => Err(anyhow!(
-            "expected exactly 1 file matching {pattern_str}, found {n}: {matches:?}"
-        )),
-    }
+    Ok(path)
 }

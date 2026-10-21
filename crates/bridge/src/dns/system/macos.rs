@@ -6,7 +6,7 @@
 //! via `scutil`.
 //!
 //! [`MacDnsBackend`] — the **inner test seam**, mirroring
-//! [`super::windows::WinDnsBackend`] and the `Routing` precedent from
+//! `super::windows::WinDnsBackend` and the `Routing` precedent from
 //! [bindreams/hole#165](https://github.com/bindreams/hole/issues/165).
 //! Production goes through [`Networksetup`]; unit tests substitute
 //! `MockMacBackend` via [`crate::dns::system::SystemDns::new_with_mac_backend`].
@@ -19,7 +19,7 @@
 //! [`MacDnsSteerer`] instead.
 //!
 //! [`MacDnsSteerer`] / [`SteeringHandle`] — the apply-path seam, mirroring
-//! [`super::windows::DnsConfiner`]'s shape but not its `Box<dyn Any + Send>`
+//! `super::windows::DnsConfiner`'s shape but not its `Box<dyn Any + Send>`
 //! erasure: `DnsApplied::shutdown` needs to *call* `withdraw`
 //! (confirmable, not `Drop`-only — Decided-without-asking #6), not merely
 //! hold and drop the guard. Production goes through [`RealMacDnsSteerer`],

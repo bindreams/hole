@@ -22,7 +22,7 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Owns the tokio task running the chain and a cancellation token for
 /// graceful shutdown. Drop cancels the token (SIP003u: SIGTERM on Unix,
-/// CTRL_BREAK on Windows, 5s drain timeout) and aborts the task as a
+/// CTRL_BREAK on Windows, garter's 12s default drain timeout) and aborts the task as a
 /// safety net.
 ///
 /// `Drop` does not touch the plugin state file. It aborts the chain's task
@@ -436,7 +436,7 @@ async fn spawn_plugin_runner_at(
 }
 
 /// Convert a [`ProxyError`] from `spawn_plugin_runner_at` into an
-/// [`io::Error`] so [`port_alloc::bind_ephemeral`] can classify it.
+/// [`io::Error`](std::io::Error) so [`port_alloc::bind_ephemeral`] can classify it.
 ///
 /// `spawn_plugin_runner_at` emits exactly three variants:
 ///
@@ -1310,7 +1310,7 @@ fn inject_plugin_directives(
 /// transports — the UDP-drop policy needs `tcp,udp` from galoshes, which the
 /// `Probe` self-probe (a TCP connect, hardcoded TCP-only) would discard (#536).
 /// An unknown plugin (an arbitrary binary resolved via PATH — see
-/// [`resolve_plugin_path`] / #414) may not speak sitrep, so it keeps the
+/// [`resolve_plugin_path`](super::config::resolve_plugin_path) / #414) may not speak sitrep, so it keeps the
 /// conservative `Probe` readiness rather than hanging until the readiness
 /// timeout waiting for a sitrep that never comes.
 ///

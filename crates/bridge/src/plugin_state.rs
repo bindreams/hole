@@ -54,7 +54,7 @@ fn state_file(state_dir: &Path) -> PathBuf {
 // I/O =================================================================================================================
 
 /// Write `state` to `<state_dir>/bridge-plugins.json` atomically.
-/// Same atomic-write pattern as `routing::state::save`.
+/// Same atomic-write pattern as `routing::state::write`.
 pub fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     util::ownership::chown_if_some(state_dir, owner);

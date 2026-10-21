@@ -12,6 +12,78 @@ pub enum RoutingError {
     Gateway(String),
     #[error("route setup failed: {0}")]
     RouteSetup(String),
+    /// The route record is newer than this release, corrupt, or its read fails.
+    /// It may name routes an earlier run left behind, so nothing is installed
+    /// over it and it is left as it is. `Display` names the path: it is for
+    /// the log, not a toast; use [`RoutingError::redacted`] for a toast.
+    #[error("{}", state_unreadable(&path.display()))]
+    StateUnreadable { path: PathBuf },
+}
+
+fn state_unreadable(record: &dyn std::fmt::Display) -> String {
+    format!("the route record {record} cannot be read; it is left as it is, and no route is installed over it")
+}
+
+impl RoutingError {
+    /// The text for a toast: `Display`, with the record named by its file name
+    /// instead of its path. One exhaustive match, so a new variant must choose.
+    ///
+    /// `RouteSetup` and `Gateway` text is built path-free at its sources: a
+    /// write failure names the `io::ErrorKind` only (`state_write_failed`), and
+    /// the full error is logged.
+    pub fn redacted(&self) -> String {
+        match self {
+            RoutingError::Gateway(_) => self.to_string(),
+            RoutingError::RouteSetup(_) => self.to_string(),
+            RoutingError::StateUnreadable { .. } => state_unreadable(&crate::routing::state::STATE_FILE_NAME),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl RoutingError {
+    /// A state file under `what` could not be written. The toast text names the
+    /// error's kind only (`tempfile`'s error text names the path); the full
+    /// error goes to the log.
+    pub(crate) fn state_write_failed(what: &str, e: &std::io::Error) -> Self {
+        tracing::error!(error = %e, "{what} could not be written");
+        RoutingError::RouteSetup(format!("{what} could not be written ({})", e.kind()))
+    }
+}
+
+/// A checkpoint of the route record that did not land.
+#[derive(Debug, Error)]
+pub(crate) enum CheckpointFailure {
+    /// Only the kind: an `io::Error`'s text can name a path (`tempfile`'s does),
+    /// and this reaches a toast. The full error is logged where the write failed.
+    #[error("the route record could not be written ({kind})")]
+    Io { kind: std::io::ErrorKind },
+    /// Newer, corrupt, or its read fails: refused, not replaced. Carries the
+    /// path for the log; `Display` omits it.
+    #[error("the route record cannot be read")]
+    RecordUnreadable { path: PathBuf },
+}
+
+/// Why `setup_routes` stopped.
+#[derive(Debug, Error)]
+pub(crate) enum SetupFailure {
+    #[error(transparent)]
+    Command(RouteCommandError),
+    /// The record of the next command could not be written, so it did not run.
+    #[error(transparent)]
+    Checkpoint(CheckpointFailure),
+}
+
+impl From<SetupFailure> for RoutingError {
+    fn from(failure: SetupFailure) -> Self {
+        match failure {
+            SetupFailure::Command(e) => RoutingError::RouteSetup(e.to_string()),
+            SetupFailure::Checkpoint(e @ CheckpointFailure::Io { .. }) => RoutingError::RouteSetup(e.to_string()),
+            SetupFailure::Checkpoint(CheckpointFailure::RecordUnreadable { path }) => {
+                RoutingError::StateUnreadable { path }
+            }
+        }
+    }
 }
 
 /// A route command that did not succeed: the spawn failed, or the child exited

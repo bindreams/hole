@@ -250,7 +250,6 @@ impl Routing for MockRouting {
         // any mutation, so tests that assert on `bridge-routes.json`
         // see the same write-then-clear lifecycle as production.
         let persisted = route_state::RouteState {
-            version: route_state::SCHEMA_VERSION,
             tun_name: tun.alias().to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
@@ -262,7 +261,7 @@ impl Routing for MockRouting {
             installed: routing::planned_routes(server_ip),
             stale: Vec::new(),
         };
-        route_state::save(&self.state_dir, &persisted, None)
+        route_state::write(&route_state::file(&self.state_dir), &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
         Ok(MockRoutes {
             state_dir: self.state_dir.clone(),
@@ -348,7 +347,7 @@ struct MockRoutes {
 
 impl Drop for MockRoutes {
     fn drop(&mut self) {
-        let _ = route_state::clear(&self.state_dir);
+        let _ = route_state::remove(&route_state::file(&self.state_dir));
     }
 }
 

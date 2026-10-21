@@ -1,6 +1,6 @@
 //! What a file that cannot be read means, per kind of file.
 
-use super::loaded::CannotRead;
+use super::loaded::{CannotRead, WhyUnreadable};
 
 /// What a file is for, and so what it means when this release cannot read it.
 ///
@@ -91,6 +91,27 @@ impl Role {
             Role::OsRecord => RemoveOver::Keep,
             Role::LegacyRecord => RemoveOver::Keep,
             Role::Config => RemoveOver::MoveAside,
+        }
+    }
+
+    /// Whether a file of this role, unreadable for `why`, stops the bridge from
+    /// connecting.
+    pub fn blocks_connect(self, why: WhyUnreadable) -> bool {
+        match why {
+            WhyUnreadable::CannotRead(why) => self.unreadable_blocks_connect(why),
+            WhyUnreadable::ReadFailed(_) => self.io_failure_blocks_connect(),
+        }
+    }
+
+    /// Whether a file of this role whose read failed with an I/O error stops the
+    /// bridge from connecting. The bytes were never seen, so the file may name
+    /// what an OS record exists to clean up.
+    pub fn io_failure_blocks_connect(self) -> bool {
+        match self {
+            Role::Decision => false,
+            Role::OsRecord => true,
+            Role::LegacyRecord => false,
+            Role::Config => false,
         }
     }
 

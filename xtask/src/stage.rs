@@ -1,23 +1,46 @@
 //! Stage BINDIR files into a destination directory.
 //!
 //! For each [`crate::bindir::BindirFile`], try a hard link first, fall back to
-//! a copy if hardlinking fails (cross-device, permissions, file already exists
-//! at the destination, etc.). The hardlink path is faster and saves disk for
-//! release builds; the copy fallback keeps things working in dev temp dirs
-//! that may be on a different volume.
+//! a copy if hardlinking fails (cross-device, permissions, etc.). The hardlink
+//! path is faster and saves disk for release builds; the copy fallback keeps
+//! things working in dev temp dirs that may be on a different volume.
+//!
+//! Every entry is built under a unique scratch directory beside the destination
+//! and renamed into place, so concurrent stagers never write through each
+//! other's (or the source's) inode. A reader of a file destination never sees a
+//! short or wrong file, and the destination ends complete. On Windows a reader
+//! can additionally find the destination `NotFound` or `PermissionDenied` while a
+//! replace is in flight; Unix `rename(2)` has no such window.
+//!
+//! A stage returns `Err` when the source is missing, when the scratch directory or the copy
+//! cannot be made, or when the OS refuses the replace; the last is not retried. On Windows
+//! that is a destination that is a running image (`ERROR_ACCESS_DENIED`), open without
+//! share-delete access (`ERROR_SHARING_VIOLATION`) or delete-pending (`ERROR_ACCESS_DENIED`);
+//! a read-only destination is replaced.
 //!
 //! This logic was previously duplicated in
 //! `msi-installer/src/msi_installer/__init__.py:link_or_copy()` and (via
 //! `shutil.copy2`) in the late `scripts/dev.py`. See issue #143.
 
+use std::io::{self, ErrorKind};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 
 use crate::bindir::{BindirFile, BindirSource};
 
+mod replace;
+
+/// Makes `staged` a hard link of `src`. An `Err` sends the entry down the copy fallback.
+pub(crate) type LinkFn<'a> = &'a (dyn Fn(&Path, &Path) -> io::Result<()> + Sync);
+
 /// Stage `files` into `out_dir`. Creates `out_dir` if missing.
 pub fn stage(out_dir: &Path, files: &[BindirFile]) -> Result<()> {
+    stage_with(out_dir, files, &|src, staged| std::fs::hard_link(src, staged))
+}
+
+/// [`stage`] with the link step injectable, so tests can drive the copy fallback.
+pub(crate) fn stage_with(out_dir: &Path, files: &[BindirFile], link: LinkFn<'_>) -> Result<()> {
     std::fs::create_dir_all(out_dir).with_context(|| format!("failed to create out_dir {}", out_dir.display()))?;
 
     for f in files {
@@ -34,7 +57,7 @@ pub fn stage(out_dir: &Path, files: &[BindirFile]) -> Result<()> {
         let dest = out_dir.join(&f.dest_name);
 
         match &f.source {
-            BindirSource::File(src) => stage_file(src, &dest)?,
+            BindirSource::File(src) => stage_file(src, &dest, link)?,
             BindirSource::Directory(src) => stage_directory(src, &dest)?,
         }
     }
@@ -42,7 +65,7 @@ pub fn stage(out_dir: &Path, files: &[BindirFile]) -> Result<()> {
     Ok(())
 }
 
-fn stage_file(src: &Path, dest: &Path) -> Result<()> {
+fn stage_file(src: &Path, dest: &Path, link: LinkFn<'_>) -> Result<()> {
     // Validate the source exists with a clear error message — much more
     // useful than the cryptic "No such file or directory" you'd get
     // from std::fs::hard_link.
@@ -54,32 +77,32 @@ fn stage_file(src: &Path, dest: &Path) -> Result<()> {
         ));
     }
 
-    // Remove any pre-existing file at the destination so hard_link can
-    // succeed (it errors if the destination exists). This matches what
-    // shutil.copy2 and the existing link_or_copy helper do implicitly.
-    if dest.exists() {
-        std::fs::remove_file(dest).with_context(|| format!("failed to remove pre-existing dest {}", dest.display()))?;
+    let scratch = scratch_dir_beside(dest)?;
+    let staged = scratch.path().join(dest_file_name(dest)?);
+
+    // `staged` is a fresh path, so the copy fallback can never write through a
+    // hard link of `src`.
+    if link(src, &staged).is_err() {
+        // Link errors are expected (e.g. cross-volume dev temp dirs) and deliberately not logged.
+        std::fs::copy(src, &staged)
+            .with_context(|| format!("failed to copy {} to {}", src.display(), staged.display()))?;
     }
 
-    match std::fs::hard_link(src, dest) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Hardlink failed (cross-device, permissions, etc.). Fall back
-            // to a copy. We deliberately do not log the hardlink error —
-            // it's expected on a fresh dev temp dir on a different volume.
-            std::fs::copy(src, dest)
-                .map(|_| ())
-                .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))
-        }
-    }
+    // `dest` only ever holds complete content. On Windows a replace briefly leaves the name
+    // unopenable (`NotFound`/`PermissionDenied`) to a concurrent reader.
+    replace::replace_file(&staged, dest)
+        .with_context(|| format!("failed to move {} over {}", staged.display(), dest.display()))
 }
 
 /// Recursively copy `src` directory into `dest`. Used for macOS `.dSYM`
 /// bundles. Hard-link is not attempted — these bundles are needed as
 /// real directory trees for Spotlight/Finder/lldb.
 ///
-/// The recursion is depth-first, idempotent (pre-existing `dest` is
-/// removed first), and propagates the first I/O error encountered.
+/// The tree is built under a unique scratch directory beside `dest`, then the
+/// old `dest` is renamed aside and the new tree renamed into place. A directory
+/// cannot be renamed over a non-empty one, so there is a gap with no `dest`;
+/// bundles are debug symbols, never executed. On Windows, concurrent stagers of
+/// one directory can fail with access denied; only macOS stages a bundle.
 fn stage_directory(src: &Path, dest: &Path) -> Result<()> {
     if !src.is_dir() {
         return Err(anyhow!(
@@ -89,13 +112,48 @@ fn stage_directory(src: &Path, dest: &Path) -> Result<()> {
         ));
     }
 
-    if dest.exists() {
-        std::fs::remove_dir_all(dest)
-            .with_context(|| format!("failed to remove pre-existing dest {}", dest.display()))?;
+    // `new/` holds the tree being built and `old` the bundle moved aside, so no `dest` name
+    // can make the two collide.
+    let scratch = scratch_dir_beside(dest)?;
+    let new_dir = scratch.path().join("new");
+    std::fs::create_dir(&new_dir).with_context(|| format!("failed to create {}", new_dir.display()))?;
+    let staged = new_dir.join(dest_file_name(dest)?);
+    copy_dir_recursive(src, &staged)
+        .with_context(|| format!("failed to copy directory {} to {}", src.display(), staged.display()))?;
+
+    // Move any pre-existing bundle aside (the scratch dir's drop deletes it). NotFound:
+    // there is none, or a concurrent stager moved it first.
+    match std::fs::rename(dest, scratch.path().join("old")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("failed to move pre-existing dest {} aside", dest.display())),
     }
 
-    copy_dir_recursive(src, dest)
-        .with_context(|| format!("failed to copy directory {} to {}", src.display(), dest.display()))
+    match std::fs::rename(&staged, dest) {
+        Ok(()) => Ok(()),
+        // `dest` only ever appears by a complete rename, so a non-empty or existing `dest` is a
+        // concurrent stager's finished bundle of the same source.
+        Err(e) if matches!(e.kind(), ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists) => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to move {} to {}", staged.display(), dest.display())),
+    }
+}
+
+/// A uniquely named (created exclusively) scratch directory in `dest`'s parent,
+/// so a staged entry can be renamed onto `dest` within one filesystem. Removed on
+/// drop, together with whatever was moved into it.
+fn scratch_dir_beside(dest: &Path) -> Result<tempfile::TempDir> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow!("BINDIR dest has no parent directory: {}", dest.display()))?;
+    tempfile::Builder::new()
+        .prefix(".stage-")
+        .tempdir_in(parent)
+        .with_context(|| format!("failed to create a scratch directory in {}", parent.display()))
+}
+
+fn dest_file_name(dest: &Path) -> Result<&std::ffi::OsStr> {
+    dest.file_name()
+        .ok_or_else(|| anyhow!("BINDIR dest has no file name: {}", dest.display()))
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
