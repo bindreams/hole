@@ -234,3 +234,34 @@ fn an_unreadable_append_writes_nothing_and_reports_the_error() {
         "a failed read must write nothing: the prior record was dropped"
     );
 }
+
+#[skuld::test]
+fn save_refuses_a_symlinked_state_directory_and_writes_nothing_outside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let link = tmp.path().join("state");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        #[cfg(target_os = "macos")]
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::lchown(&link, Some(65534), Some(65534)).unwrap();
+        }
+    }
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&outside, &link).unwrap();
+
+    assert!(save(
+        &link,
+        &PluginState {
+            version: SCHEMA_VERSION,
+            plugins: vec![]
+        },
+        None
+    )
+    .is_err());
+
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+}

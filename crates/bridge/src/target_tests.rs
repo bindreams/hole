@@ -773,3 +773,125 @@ fn the_persisted_file_shapes_still_carry_their_non_secret_payload() {
     let text = yaml(PersistedTarget::Off.dump());
     assert!(text.contains("off"), "and `Off` still names itself: {text}");
 }
+
+// A symlink among the components of the state directory ===============================================================
+//
+// The elevated bridge writes here as root while the directory sits under the interactive user's profile,
+// so every component of its path is theirs to replace.
+
+/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant. Run as
+/// root, the link is given away so that it is no longer root's own.
+fn plant_symlink(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(target_os = "macos")]
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
+        }
+    }
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(target, link).unwrap();
+}
+
+#[skuld::test]
+fn every_state_file_writer_refuses_a_symlinked_state_directory_and_writes_nothing_outside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let link = tmp.path().join("hole");
+    plant_symlink(&outside, &link);
+    let pref = StartupPreference::default();
+
+    // The link itself, and a directory that does not exist below it.
+    for state_dir in [link.clone(), link.join("state")] {
+        assert!(save(&state_dir, &Target::Off, None).is_err(), "save {state_dir:?}");
+        assert!(
+            save_startup_preference(&state_dir, &pref, None).is_err(),
+            "save_startup_preference {state_dir:?}"
+        );
+        assert!(apply(&state_dir, None, |_| Target::Off).is_err(), "apply {state_dir:?}");
+        assert!(
+            apply_startup_preference(&state_dir, None, |_| {}).is_err(),
+            "apply_startup_preference {state_dir:?}"
+        );
+    }
+
+    assert!(
+        std::fs::read_dir(&outside).unwrap().next().is_none(),
+        "something was written outside the state directory"
+    );
+}
+
+#[skuld::test]
+fn a_leftover_temp_file_is_not_kept_when_the_write_fails() {
+    // A directory at the final name makes the rename fail after the temp file was written.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(STATE_FILE_NAME)).unwrap();
+
+    let err = save(tmp.path(), &Target::Off, None).expect_err("a directory is in the way");
+
+    assert!(matches!(err, TargetError::Write(_)), "{err:?}");
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|name| name != STATE_FILE_NAME)
+        .collect();
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+}
+
+/// The writers the Troyka finding names, and the ones that share their pattern: a temp file written in
+/// a state directory the user may own, then owned, permissioned and renamed. Every one goes through
+/// `file_lock`'s directory handle; going back to a path for any step brings the swap attacks back.
+#[skuld::test]
+fn the_state_file_writers_never_chown_chmod_or_rename_by_path() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let writers = [
+        "bridge/src/target.rs",
+        "bridge/src/plugin_state.rs",
+        "tun-engine/src/routing/failclosed/boottime_witness.rs",
+        "tun-engine/src/routing/failclosed/failclosed_state.rs",
+        "tun-engine/src/routing/failclosed/lockdown_pf_state.rs",
+        "tun-engine/src/routing/failclosed/lockdown_state.rs",
+    ];
+    // Each of these resolves a path again (or follows it) after the directory was chosen.
+    let by_path = [
+        "chown_if_some",
+        "create_dir_all",
+        "NamedTempFile",
+        ".persist(",
+        "std::fs::set_permissions",
+        "set_dacl_from_sddl(",
+    ];
+
+    let mut offenders = Vec::new();
+    for writer in writers {
+        let text = std::fs::read_to_string(crates.join(writer)).unwrap();
+        let code: Vec<(usize, &str)> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            code.iter()
+                .any(|(_, line)| line.contains("write_state_file(") || line.contains("Dir::open")),
+            "{writer} no longer writes through the directory handle"
+        );
+        for (idx, line) in code {
+            if let Some(call) = by_path.iter().find(|call| line.contains(**call)) {
+                offenders.push(format!("{writer}:{}: {call}", idx + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a state file is written by path:
+  {}",
+        offenders.join(
+            "
+  "
+        )
+    );
+}

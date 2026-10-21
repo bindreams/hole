@@ -18,7 +18,6 @@
 //! [`Target::Unreadable`]).
 
 use std::io;
-use std::io::Write;
 use std::marker::PhantomData;
 use std::path::Path;
 
@@ -233,40 +232,43 @@ pub(crate) fn save(state_dir: &Path, target: &Target, owner: Option<(u32, u32)>)
         target: persisted,
     };
     let json = serde_json::to_vec_pretty(&file).map_err(TargetError::Serialize)?;
-    write_state_file(state_dir, &state_dir.join(STATE_FILE_NAME), json, owner)
+    write_state_file(state_dir, STATE_FILE_NAME, json, owner)
 }
 
 /// Atomic temp-file-then-rename write shared by [`save`] and
-/// [`save_startup_preference`]: `create_dir_all` + chown + 0700 on the
-/// directory, then a same-dir temp file written, `sync_all`'d, explicitly
-/// 0600'd, persisted (renamed) over `path`, chowned and 0600'd again on the
-/// final path — belt-and-braces because rename is not guaranteed to
-/// preserve a temp file's mode on every filesystem.
-fn write_state_file(
-    state_dir: &Path,
-    path: &Path,
-    json: Vec<u8>,
-    owner: Option<(u32, u32)>,
-) -> Result<(), TargetError> {
-    std::fs::create_dir_all(state_dir).map_err(TargetError::CreateDir)?;
-    util::ownership::chown_if_some(state_dir, owner);
-    set_dir_mode(state_dir)?;
+/// [`save_startup_preference`].
+///
+/// The state directory may belong to the interactive user, so it is opened
+/// once without following a symlink (`file_lock::Dir`: created if missing,
+/// handed to `owner`, 0700 on unix / the state DACL on Windows) and the file is
+/// written through that handle. The temp file's owner and mode are set on its
+/// own handle before the rename, and nothing touches the final name afterwards:
+/// a name swapped for a hard link or symlink after the rename would otherwise
+/// be re-permissioned or chowned instead of our file.
+fn write_state_file(state_dir: &Path, name: &str, json: Vec<u8>, owner: Option<(u32, u32)>) -> Result<(), TargetError> {
+    let dir = open_state_dir(state_dir, owner).map_err(TargetError::CreateDir)?;
+    dir.secure(owner, Some(0o700)).map_err(TargetError::SetPermissions)?;
+    protect_dir(&dir).map_err(TargetError::SetPermissions)?;
 
-    let mut tmp = tempfile::NamedTempFile::new_in(state_dir).map_err(TargetError::Write)?;
-    tmp.write_all(&json).map_err(TargetError::Write)?;
-    tmp.as_file().sync_all().map_err(TargetError::Write)?;
-    set_file_mode(tmp.path()).map_err(TargetError::SetPermissions)?;
-    tmp.persist(path).map_err(|e| TargetError::Write(e.error))?;
-    util::ownership::chown_if_some(path, owner);
-    set_file_mode(path).map_err(TargetError::SetPermissions)?;
-
-    Ok(())
+    let permissions_failed = std::cell::Cell::new(false);
+    dir.write_atomic(name.as_ref(), &json, owner, |temp| {
+        protect_file(temp).inspect_err(|_| permissions_failed.set(true))
+    })
+    .map_err(|e| match permissions_failed.get() {
+        true => TargetError::SetPermissions(e),
+        false => TargetError::Write(e),
+    })
 }
 
-#[cfg(unix)]
-fn set_dir_mode(dir: &Path) -> Result<(), TargetError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(TargetError::SetPermissions)
+#[cfg(not(windows))]
+fn open_state_dir(state_dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<file_lock::Dir> {
+    file_lock::Dir::open(state_dir, true, owner)
+}
+
+/// Opened with the right to rewrite its ACL, which [`protect_dir`] does.
+#[cfg(windows)]
+fn open_state_dir(state_dir: &Path, _owner: Option<(u32, u32)>) -> std::io::Result<file_lock::Dir> {
+    file_lock::Dir::open_for_acl(state_dir, true)
 }
 
 /// The SID of the user this process runs as, as an SDDL string.
@@ -275,7 +277,7 @@ fn set_dir_mode(dir: &Path) -> Result<(), TargetError> {
 /// nothing about a Windows principal. Under the `--service` daemon this is
 /// SYSTEM (already in [`crate::ipc::SDDL_BASE`], so the extra ACE is
 /// redundant and harmless); under elevation it is the invoking user, whose
-/// access the unix arm preserves via `chown_if_some` and which a bare
+/// access the unix arm preserves via `fchown` and which a bare
 /// SYSTEM+Administrators DACL would otherwise revoke on their own state dir.
 #[cfg(windows)]
 pub(crate) fn current_user_sid() -> std::io::Result<String> {
@@ -360,34 +362,30 @@ fn state_sddl() -> String {
 /// `BUILTIN\Users` read ACE. Without it this call changes nothing that
 /// matters.
 #[cfg(windows)]
-fn set_dir_mode(dir: &Path) -> Result<(), TargetError> {
+fn protect_dir(dir: &file_lock::Dir) -> std::io::Result<()> {
     // `OICI` on every ACE: object- and container-inherit. Without it a
     // PROTECTED directory DACL leaves children inheriting NOTHING, so state
     // files written later by other modules (`bridge-routes.json`,
     // `bridge-lockdown.json`, the lock files) fall back to whatever default
     // the creating token supplies instead of the policy set here.
     let sddl = state_sddl().replace("(A;;", "(A;OICI;");
-    crate::ipc::set_dacl_from_sddl(dir, &sddl, true).map_err(TargetError::SetPermissions)
+    crate::ipc::set_dacl_from_sddl_on_handle(dir.file(), &sddl, true)
 }
 
-#[cfg(not(any(unix, windows)))]
-fn set_dir_mode(_dir: &Path) -> Result<(), TargetError> {
+/// The mode is the unix half of [`file_lock::Dir::secure`] and
+/// [`file_lock::Dir::write_atomic`]; there is no ACL to set.
+#[cfg(not(windows))]
+fn protect_dir(_dir: &file_lock::Dir) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_file_mode(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-
 #[cfg(windows)]
-fn set_file_mode(path: &Path) -> std::io::Result<()> {
-    crate::ipc::set_dacl_from_sddl(path, &state_sddl(), true)
+fn protect_file(file: &std::fs::File) -> std::io::Result<()> {
+    crate::ipc::set_dacl_from_sddl_on_handle(file, &state_sddl(), true)
 }
 
-#[cfg(not(any(unix, windows)))]
-fn set_file_mode(_path: &Path) -> std::io::Result<()> {
+#[cfg(not(windows))]
+fn protect_file(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -401,9 +399,10 @@ const LOCK_FILE_NAME: &str = "bridge-target.json.lock";
 /// The bridge's one leaf lock. Held only across [`apply`]'s
 /// load-apply-save critical section — microseconds of pure file I/O, never
 /// for a session's lifetime — over the shared [`file_lock::Exclusive`]
-/// core (see its module doc for the open discipline: `O_NOFOLLOW`, a vet of
-/// the opened file, then `mode(0o600)` + `fchown` on the fd, all
-/// security-relevant on the user-writable elevation-mode state directory).
+/// core (see its module doc for the open discipline: a state directory opened
+/// without following a symlink, `O_EXCL`, a vet of the opened file, then
+/// `fchmod` + `fchown` on the fd, all security-relevant on the user-writable
+/// elevation-mode state directory).
 ///
 /// **Leaf-lock contract (1): nothing may be acquired while this is held, and
 /// the critical section stays pure file I/O** — no `Routing`/OS/network/
@@ -439,7 +438,6 @@ impl TargetExclusive {
     /// wants to wait, never to poll; see the leaf-lock contract above for why
     /// blocking here cannot deadlock.
     fn acquire(state_dir: &Path, owner: Option<(u32, u32)>) -> io::Result<Self> {
-        std::fs::create_dir_all(state_dir)?;
         let inner = Exclusive::acquire(&state_dir.join(LOCK_FILE_NAME), owner)?;
         Ok(TargetExclusive {
             _inner: inner,
@@ -682,7 +680,7 @@ pub(crate) fn save_startup_preference(
         candidate: pref.candidate.clone(),
     };
     let json = serde_json::to_vec_pretty(&file).map_err(TargetError::Serialize)?;
-    write_state_file(state_dir, &state_dir.join(STARTUP_PREFERENCE_FILE_NAME), json, owner)
+    write_state_file(state_dir, STARTUP_PREFERENCE_FILE_NAME, json, owner)
 }
 
 // Dump ================================================================================================================

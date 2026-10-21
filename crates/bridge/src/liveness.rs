@@ -35,7 +35,6 @@ impl BridgeLiveness {
     /// second real bridge instance never reaches this call — the IPC socket
     /// bind already refuses it first.
     pub fn acquire(state_dir: &Path, owner: Option<(u32, u32)>) -> io::Result<Self> {
-        std::fs::create_dir_all(state_dir)?;
         Ok(Self(Exclusive::acquire(&state_dir.join(LOCK_FILE_NAME), owner)?))
     }
 
@@ -46,7 +45,6 @@ impl BridgeLiveness {
     /// that starts afterward contends on this same lock instead of
     /// interleaving with them.
     pub fn try_acquire(state_dir: &Path, owner: Option<(u32, u32)>) -> io::Result<Option<Self>> {
-        std::fs::create_dir_all(state_dir)?;
         Ok(Exclusive::try_acquire(&state_dir.join(LOCK_FILE_NAME), owner)?.map(Self))
     }
 }
