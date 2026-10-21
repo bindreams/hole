@@ -139,23 +139,24 @@ impl ProcessFate {
 /// How the wait on the held processes goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitWait {
-    /// The processes the SCM named exit on their own: its Stop is on its way to
-    /// them, or the service is still going down. A process only a scan found has
-    /// no Stop on its way and may be a live bridge's plugin still being torn down,
-    /// so it is neither waited on nor ended: it waits for the SCM's STOPPED.
+    /// The processes the SCM named, validly or not, exit on their own: its Stop
+    /// is on its way to them, or the service is still going down. A process only
+    /// a scan found has no Stop on its way and may be a live bridge's plugin
+    /// still being torn down, so it is neither waited on nor ended: it waits for
+    /// the SCM's STOPPED.
     OnTheirOwn,
-    /// The SCM reports STOPPED. A held process the SCM never told to stop (a
-    /// plugin left by a crashed bridge, a cutover child left suspended) is
-    /// terminated, or it would be waited on for ever while the machine-wide
+    /// The SCM reports STOPPED. An orphan (a plugin left by a crashed bridge, a
+    /// cutover child left suspended, or a process held only on an id the SCM
+    /// named in a pending state, which a SID-carrying stranger may have taken)
+    /// is terminated, or it would be waited on for ever while the machine-wide
     /// lock is held; the service is Disabled, so nothing starts another. The
-    /// service's own process, which the SCM did tell to stop, is waited on with
-    /// no bound, as before STOPPED. Then every held process is waited on.
+    /// service's own process, named in a state whose id is valid, is waited on
+    /// with no bound, as before STOPPED. Then every held process is waited on.
     TerminateOrphansThenWait,
 }
 
 impl ExitWait {
-    /// Whether a wait of this kind terminates the held processes the SCM never
-    /// told to stop before it waits.
+    /// Whether a wait of this kind terminates the orphans before it waits.
     pub fn terminates_orphans(self) -> bool {
         match self {
             ExitWait::OnTheirOwn => false,
@@ -163,8 +164,7 @@ impl ExitWait {
         }
     }
 
-    /// Whether a wait of this kind covers the held processes the SCM never told
-    /// to stop.
+    /// Whether a wait of this kind covers the orphans.
     pub fn waits_on_orphans(self) -> bool {
         match self {
             ExitWait::OnTheirOwn => false,

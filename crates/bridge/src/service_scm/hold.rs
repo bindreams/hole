@@ -55,10 +55,10 @@ pub struct Look {
     /// Whether any process held so far has not exited, the named one or not:
     /// a process outlives the STOPPED the SCM reports for it.
     pub held_alive: bool,
-    /// Whether a held process the SCM named (the service's own, the one its Stop
-    /// reaches) has not exited. Outside STOPPED only these are waited on: a
-    /// process only a scan found has no Stop on its way and is dealt with once
-    /// the SCM reports STOPPED.
+    /// Whether a held process the SCM named, validly or not (the service's own,
+    /// or one held on a pending-state id), has not exited. Outside STOPPED only
+    /// these are waited on: a process only a scan found has no Stop on its way
+    /// and is dealt with once the SCM reports STOPPED.
     pub named_alive: bool,
     /// Whether anything has been held so far, alive or since exited. A marked
     /// service cannot be armed on, so once everything held has exited and a
@@ -277,12 +277,21 @@ pub trait ProcessSource {
 }
 
 /// How a held process came to be held: what the SCM did, or could have done,
-/// about its exit.
+/// about its exit. Every policy question about a held process is one match
+/// here, never a match at a call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
-    /// The SCM named it as the service's process ([`ProcessHolds::hold_current`]),
-    /// so the SCM's Stop is on its way to it and its exit is the service's own.
+    /// The SCM named it in a state whose id is valid ([`ReportedPid::Valid`]), so
+    /// it is the service's own, the SCM's Stop is on its way to it, and its exit
+    /// is the service's own.
     Named,
+    /// The SCM named it in a state whose id "may not be valid"
+    /// ([`ReportedPid::MayBeInvalid`]) and its token carries the service SID. It
+    /// may be the real service mid-stop, or a SID-carrying process that took a
+    /// stale id. Before STOPPED it is waited on, like [`Named`](Self::Named); at
+    /// STOPPED the SCM's Stop is done and teardown with it, so it is ended like
+    /// [`Scanned`](Self::Scanned). A valid claim on it later makes it `Named`.
+    Claimed,
     /// Only a scan found it carrying the service's token: a plugin a crashed
     /// bridge left, a cutover child left suspended. The SCM never named it, so
     /// no Stop is on its way to it.
@@ -290,12 +299,45 @@ enum Origin {
 }
 
 impl Origin {
-    /// Whether the SCM's Stop reaches a process held this way. The one place
-    /// that says which held processes may be terminated.
-    fn is_stopped_by_the_scm(self) -> bool {
+    /// The origin of a process first held on the SCM's claim `claim`. A state
+    /// whose claim names no process holds nothing, so it never gets here.
+    fn first_held_on(claim: ReportedPid) -> Self {
+        match claim {
+            ReportedPid::Valid => Origin::Named,
+            ReportedPid::MayBeInvalid => Origin::Claimed,
+            ReportedPid::Never => unreachable!("a state that names no process holds none"),
+        }
+    }
+
+    /// The origin of this held process once the SCM names it again, on `claim`.
+    fn after_claim(self, claim: ReportedPid) -> Self {
+        let settles = claim.is_a_claim_about_the_service();
+        match self {
+            Origin::Named => Origin::Named,
+            Origin::Claimed if settles => Origin::Named,
+            Origin::Claimed => Origin::Claimed,
+            Origin::Scanned if settles => Origin::Named,
+            Origin::Scanned => Origin::Scanned,
+        }
+    }
+
+    /// Whether a wait outside STOPPED covers a process held this way: the
+    /// ones the SCM named, validly or not.
+    fn is_awaited_before_stopped(self) -> bool {
         match self {
             Origin::Named => true,
+            Origin::Claimed => true,
             Origin::Scanned => false,
+        }
+    }
+
+    /// Whether the STOPPED wait ends a process held this way. The one place that
+    /// says which held processes may be terminated.
+    fn is_terminated_at_stopped(self) -> bool {
+        match self {
+            Origin::Named => false,
+            Origin::Claimed => true,
+            Origin::Scanned => true,
         }
     }
 }
@@ -331,22 +373,24 @@ impl<P> ProcessHolds<P> {
         self.held.iter().map(|held| &held.process)
     }
 
-    /// The held processes a wait of this kind covers: the ones the SCM told to
-    /// stop, and the orphans only where the wait says so
+    /// The held processes a wait of this kind covers: the ones the SCM named,
+    /// and the orphans only where the wait says so
     /// ([`ExitWait::waits_on_orphans`]).
     pub fn awaited(&self, wait: ExitWait) -> impl Iterator<Item = &P> {
         self.held
             .iter()
-            .filter(move |held| held.origin.is_stopped_by_the_scm() || wait.waits_on_orphans())
+            .filter(move |held| held.origin.is_awaited_before_stopped() || wait.waits_on_orphans())
             .map(|held| &held.process)
     }
 
-    /// The held processes the SCM never told to stop, with their ids: the
-    /// service's own process is not one, however long it outlives STOPPED.
+    /// The orphans, with their ids: the held processes the STOPPED wait ends,
+    /// which the SCM never named, or named only in a state whose id may be
+    /// invalid. A process named in a valid state is not one, however long it
+    /// outlives STOPPED.
     pub fn orphans(&self) -> impl Iterator<Item = (u32, &P)> {
         self.held
             .iter()
-            .filter(|held| !held.origin.is_stopped_by_the_scm())
+            .filter(|held| held.origin.is_terminated_at_stopped())
             .map(|held| (held.pid, &held.process))
     }
 
@@ -388,11 +432,9 @@ impl<P> ProcessHolds<P> {
                 });
             };
             if let Some(held) = self.held.iter_mut().find(|held| held.pid == pid) {
-                // Found by a scan before the SCM named it: it is the service's,
-                // if the SCM's claim is one ([`ReportedPid::is_a_claim_about_the_service`]).
-                if reading.observed.reported_pid().is_a_claim_about_the_service() {
-                    held.origin = Origin::Named;
-                }
+                // Held before this claim: it is the service's only if the SCM's
+                // claim is evidence of it ([`Origin::after_claim`]).
+                held.origin = held.origin.after_claim(reading.observed.reported_pid());
                 return Ok(Hold {
                     reading,
                     named: Named::Held,
@@ -423,7 +465,7 @@ impl<P> ProcessHolds<P> {
                     self.held.push(Held {
                         pid,
                         process,
-                        origin: Origin::Named,
+                        origin: Origin::first_held_on(again.observed.reported_pid()),
                     });
                     Named::Held
                 }

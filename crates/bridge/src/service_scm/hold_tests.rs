@@ -920,7 +920,7 @@ fn ever_held_outlasts_the_exit_of_everything_held() {
     assert!(!got.held_alive);
 }
 
-// Which held processes the SCM was never told to stop =================================================================
+// Which held processes are orphans ====================================================================================
 
 fn orphan_pids(holds: &ProcessHolds<Handle>) -> Vec<u32> {
     holds.orphans().map(|(pid, _)| pid).collect()
@@ -1023,6 +1023,104 @@ fn a_wait_covers_the_processes_its_kind_covers() {
     let pids = |wait| holds.awaited(wait).map(|handle| handle.pid).collect::<Vec<_>>();
     assert_eq!(pids(ExitWait::OnTheirOwn), vec![100]);
     assert_eq!(pids(ExitWait::TerminateOrphansThenWait), vec![100, 300]);
+}
+
+/// What a wait after `look` does to the holds: the pids it terminates, then
+/// the pids it waits on. The same two reads `ServiceProcesses::await_exits`
+/// makes, off the wait the look asks for.
+fn wait_plan(holds: &ProcessHolds<Handle>, look: Look) -> (Vec<u32>, Vec<u32>) {
+    let wait = look.exit_wait();
+    let terminated = if wait.terminates_orphans() {
+        orphan_pids(holds)
+    } else {
+        Vec::new()
+    };
+    let waited = holds.awaited(wait).map(|handle| handle.pid).collect();
+    (terminated, waited)
+}
+
+/// A process first held on an id the SCM named in a pending state (an id that
+/// "may not be valid") may be a SID-carrying stranger that took the id: it is
+/// waited on while the service is not STOPPED, as the real service mid-stop
+/// would be, and ended at STOPPED, when only process exit remains.
+#[skuld::test]
+fn a_process_held_on_a_pending_claim_is_waited_on_until_stopped_then_terminated() {
+    for pending in [Observed::StartPending, Observed::StopPending] {
+        let log = Log::default();
+        let mut source = Script::new(
+            &log,
+            vec![
+                // The first look reads twice (open, then confirm); a held id once.
+                reading(pending, 100),
+                reading(pending, 100),
+                reading(pending, 100),
+                reading(Observed::Stopped, 0),
+            ],
+        );
+        let mut holds = ProcessHolds::default();
+        let held = holds.look(&mut source).unwrap();
+        assert_eq!(
+            wait_plan(&holds, held),
+            (vec![], vec![100]),
+            "{pending:?} before STOPPED"
+        );
+        let again = holds.look(&mut source).unwrap();
+        assert_eq!(
+            wait_plan(&holds, again),
+            (vec![], vec![100]),
+            "{pending:?}, held already"
+        );
+        let stopped = holds.look(&mut source).unwrap();
+        assert_eq!(stopped.observed, Observed::Stopped);
+        assert_eq!(
+            wait_plan(&holds, stopped),
+            (vec![100], vec![100]),
+            "{pending:?} at STOPPED: ended, then waited on"
+        );
+    }
+}
+
+/// A process held on a RUNNING claim, whose id is valid, is the service's own:
+/// never terminated, at STOPPED or before.
+#[skuld::test]
+fn a_process_held_on_a_running_claim_is_never_terminated() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![
+            reading(Observed::Running, 100),
+            reading(Observed::Running, 100),
+            reading(Observed::Stopped, 0),
+        ],
+    );
+    let mut holds = ProcessHolds::default();
+    let running = holds.look(&mut source).unwrap();
+    assert_eq!(wait_plan(&holds, running), (vec![], vec![100]));
+    let stopped = holds.look(&mut source).unwrap();
+    assert_eq!(wait_plan(&holds, stopped), (vec![], vec![100]));
+}
+
+/// A claim made in a pending state is settled by the valid one that follows
+/// (START_PENDING, then RUNNING): the process is the service's own.
+#[skuld::test]
+fn a_pending_claim_is_settled_by_a_later_valid_one() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![
+            reading(Observed::StartPending, 100),
+            reading(Observed::StartPending, 100),
+            reading(Observed::Running, 100),
+            reading(Observed::Stopped, 0),
+        ],
+    );
+    let mut holds = ProcessHolds::default();
+    holds.look(&mut source).unwrap();
+    assert_eq!(orphan_pids(&holds), vec![100], "unproven while only claimed");
+    holds.look(&mut source).unwrap();
+    assert!(orphan_pids(&holds).is_empty(), "a valid claim makes it the service's");
+    let stopped = holds.look(&mut source).unwrap();
+    assert_eq!(wait_plan(&holds, stopped), (vec![], vec![100]));
 }
 
 // Whether anything held is still alive ================================================================================

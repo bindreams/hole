@@ -1992,29 +1992,38 @@ state read before its act loses that race, so four rules close it:
   the trail a hang leaves is the `stop wait:` and `held = N` lines the wait logs
   (bridge.log for the service, `gui-cli.log` for the CLI) beside the SCM's own
   checkpoints. A wait later seen to hang is fixed at its cause. That holds for
-  the service's own process, the one the SCM named and told to stop, even when
-  it outlives its STOPPED: it is waited on, with no bound. The one exception is
-  a process the SCM's Stop cannot reach, because the SCM never named it: once
-  the SCM reports STOPPED (`ExitWait::TerminateOrphansThenWait`, chosen from the
-  look alone), or the entry is gone, every held process that only a scan found
-  carrying the service's token, and not the process the SCM named, is terminated
-  (`TerminateProcess`, with `SeDebugPrivilege` enabled first, which an elevated
-  administrator holds disabled) and then waited on. A plugin left by a crashed
-  bridge, or a cutover child left suspended, is told nothing by the SCM and
-  would hold the machine-wide lock for ever; the service is Disabled, so
-  nothing starts another. A scan that finds the process the SCM named does not
-  make it an orphan, and the SCM naming a process a scan found first makes it
-  the service's only in a state whose id is documented valid
-  (`ReportedPid::is_a_claim_about_the_service`: RUNNING): an id read in
-  START_PENDING or STOP_PENDING may name any process. While the service is not
-  STOPPED, the wait covers only the processes the SCM named
-  (`ProcessHolds::awaited`): an orphan has no Stop on its way and may be a live
-  bridge's plugin still being torn down, so it is neither waited on nor
-  terminated until the SCM reports STOPPED or the entry is gone. A service
-  marked for deletion refuses every arm, so there the loop has no event but a
-  named process's exit; with only an orphan alive outside STOPPED it has none,
-  and the result is the SCM's refusal of the arm (as for any live state with
-  nothing to wait on), not a wait on the orphan.
+  the service's own process, the one the SCM named in a state whose id is valid
+  (RUNNING, `Origin::Named`) and told to stop, even when it outlives its
+  STOPPED: it is waited on, with no bound. The exception is a process the SCM's
+  Stop is not known to reach. Once the SCM reports STOPPED
+  (`ExitWait::TerminateOrphansThenWait`, chosen from the look alone), or the
+  entry is gone, every such **orphan** is terminated (`TerminateProcess`, with
+  `SeDebugPrivilege` enabled first, which an elevated administrator holds
+  disabled) and then waited on. Two kinds are orphans: a process only a scan
+  found carrying the service's token (a plugin left by a crashed bridge, a
+  cutover child left suspended: the SCM tells them nothing, and they would hold
+  the machine-wide lock for ever), and a process first held on an id the SCM
+  named in START_PENDING or STOP_PENDING (`Origin::Claimed`: the id "may not be
+  valid", so a SID-carrying stranger that took it would otherwise be waited on
+  for ever). The service is Disabled, so nothing starts another. A claimed
+  process is the real service mid-stop as often as not, so before STOPPED it is
+  waited on like a named one; at STOPPED the SCM's Stop and the bridge's
+  teardown are done, and only process exit remains, which is what owner
+  2026-10-20 [2/7] a asks not to bound for a bridge that never finishes its stop,
+  not for one found only by a late scan. A claim that settles makes a process the
+  service's: the SCM naming a held process again in RUNNING makes it `Named`
+  (`ReportedPid::is_a_claim_about_the_service`), and nothing else does. A scan
+  that finds the process the SCM named does not make it an orphan. While the
+  service is not STOPPED, the wait covers only the processes the SCM named,
+  validly or not (`ProcessHolds::awaited`): a scanned orphan has no Stop on its
+  way and may be a live bridge's plugin still being torn down, so it is neither
+  waited on nor terminated until the SCM reports STOPPED or the entry is gone.
+  Which of these a process is, and what each is waited on or ended for, is one
+  exhaustive match per question on `Origin`, never a match at a call site. A
+  service marked for deletion refuses every arm, so there the loop has no event
+  but a named process's exit; with only a scanned orphan alive outside STOPPED
+  it has none, and the result is the SCM's refusal of the arm (as for any live
+  state with nothing to wait on), not a wait on the orphan.
 - **A process id the SCM names is a claim; the service SID in the token is the
   identity.** Microsoft documents that the id
   ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks))

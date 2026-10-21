@@ -261,9 +261,9 @@ impl ServiceProcesses {
         self.holds.processes().count()
     }
 
-    /// Terminates every held orphan that has not exited: a process only a scan
-    /// found, which the SCM never told to stop. The service's own process is
-    /// not one. Each is proven the service's by its token, and the held handle
+    /// Terminates every held orphan that has not exited ([`ProcessHolds::orphans`]):
+    /// a process only a scan found, or held only on an id the SCM named in a
+    /// pending state. A process named in a valid state is not one. Each is proven the service's by its token, and the held handle
     /// keeps its id from being reused, so the id names the same process at the
     /// second open.
     fn terminate_live(&self) -> io::Result<()> {
@@ -276,7 +276,10 @@ impl ServiceProcesses {
                 enable_debug_privilege();
                 debug_enabled = true;
             }
-            info!(pid, "terminating a process of the service the SCM never told to stop");
+            info!(
+                pid,
+                "terminating a process of the service the SCM has not proven it told to stop"
+            );
             terminate(pid, process)?;
         }
         Ok(())
