@@ -98,7 +98,7 @@
 //!   very twins go, and keeps reporting. Over-report, the same direction as
 //!   `Cover::drop` above.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -120,10 +120,6 @@ struct BootTimeState {
     /// Whether a boot-time twin is outstanding on this host: armed at some
     /// point and never since watched being removed.
     armed: bool,
-}
-
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join(STATE_FILE_NAME)
 }
 
 /// Classify the record. Never collapses a failure into a recorded value — see
@@ -268,7 +264,7 @@ fn write_or_warn(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) {
         tracing::warn!(
             error = %e,
             armed,
-            path = %state_file(state_dir).display(),
+            file = STATE_FILE_NAME,
             "the boot-time witness could not be written; a later sweep that can no longer see a \
              standing cover's PERSISTENT sibling will have nothing to fall back on"
         );

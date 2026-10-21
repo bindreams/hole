@@ -513,6 +513,42 @@ fn the_by_path_scan_tells_a_read_from_a_comment() {
     assert!(by_path_reads("util::dir::read_state_file(dir, name)").is_empty());
 }
 
+// No state module logs a path -----------------------------------------------------------------------------------------
+//
+// `bridge.log` ships in the support bundle, and the state directory sits in the user's profile when the bridge runs
+// for a user: the path names the user. The modules that read and write the state files log the file's name.
+
+const STATE_MODULES: &[&str] = &[
+    "crates/bridge/src/dns_state.rs",
+    "crates/bridge/src/plugin_state.rs",
+    "crates/bridge/src/plugin_recovery.rs",
+    "crates/bridge/src/target.rs",
+    "crates/common/src/update_marker.rs",
+    "crates/tun-engine/src/routing/failclosed/boottime_witness.rs",
+    "crates/tun-engine/src/routing/failclosed/failclosed_state.rs",
+    "crates/tun-engine/src/routing/failclosed/lockdown_pf_state.rs",
+    "crates/tun-engine/src/routing/failclosed/lockdown_state.rs",
+];
+
+#[skuld::test]
+fn no_state_module_logs_a_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let mut hits = Vec::new();
+    for module in STATE_MODULES {
+        let text = std::fs::read_to_string(root.join(module)).unwrap_or_else(|err| panic!("{module}: {err}"));
+        for (n, line) in text.lines().enumerate() {
+            if !line.trim_start().starts_with("//") && line.contains(".display()") {
+                hits.push(format!("{module}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "a state module formats a path (log the file's name): {hits:#?}"
+    );
+}
+
 // The list is complete ------------------------------------------------------------------------------------------------
 
 fn sources_in(dir: &Path, found: &mut Vec<PathBuf>) {
