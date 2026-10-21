@@ -554,13 +554,21 @@ A cross-process lock on a file goes through
 The lock file sits in a state directory the interactive user may own, so
 whatever is at its name is attacker-chosen. `Exclusive` checks and changes the
 file only through the open descriptor/handle, and **refuses** — an `InvalidData`
-error naming the path, never a repair — an existing lock file that is not a
-regular file with exactly one link, or (unix, when an `owner` is passed) is
-owned by neither that owner nor the process. A hard link planted at the lock
+error holding a `file_lock::Refused`, never a repair — an existing lock file that
+is not a regular file with exactly one link, or (unix, when an `owner` is passed)
+is owned by neither that owner nor the process. A hard link planted at the lock
 name defeats `O_NOFOLLOW`; before the check it made the privileged process
 `fchmod`/`fchown` an unrelated root-owned file. Windows applies no security
-descriptor, so it has no path-based security call to redirect. Callers that log
-the error own its path redaction.
+descriptor, so it has no path-based security call to redirect.
+
+`Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
+lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
+the path, and logging the error with `%e` or `?e` cannot put a username in
+`bridge.log` (which the support bundle collects). `Refused::path()` is the one way
+out; no caller reads it, so no refusal logs a path today. A caller that wants it
+chooses a sink that may hold a path (`gui.log`), never the bridge log or the
+bundle. The unix symlink refusal is the OS's `ELOOP` from `O_NOFOLLOW`, not a
+`Refused`.
 
 ### Route-command failure policy
 

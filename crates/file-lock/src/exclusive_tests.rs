@@ -1,4 +1,5 @@
 use super::*;
+use std::io;
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -59,27 +60,10 @@ fn the_lock_file_is_owner_only() {
 
 #[skuld::test]
 #[cfg(unix)]
-fn try_acquire_refuses_a_symlinked_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let real = tmp.path().join("elsewhere.json");
-    std::fs::write(&real, b"not a lock file").unwrap();
-    let link = tmp.path().join("target.json.lock");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-
-    let result = Exclusive::try_acquire(&link, None);
-    assert!(
-        result.is_err(),
-        "a symlinked lock path must be refused (O_NOFOLLOW), never silently followed"
-    );
-}
-
-#[skuld::test]
-#[cfg(unix)]
 fn try_acquire_chowns_the_fd_to_the_given_owner() {
-    // No root locally, so a *different*-owner chown cannot be exercised here
-    // (disclosed, not mocked — see the deputy's gotcha list). Chowning to the
-    // caller's own current uid/gid is always permitted without privilege and
-    // still exercises the `Some(owner)` code path end-to-end.
+    // A different-owner chown is observable only as root (see
+    // `observable_owner` and the hard-link test). Chowning to the caller's own
+    // ids is always permitted and still exercises the `Some(owner)` path.
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("target.json.lock");
     // SAFETY: getuid/getgid take no arguments and cannot fail.
@@ -147,19 +131,82 @@ fn observable_owner() -> Option<(u32, u32)> {
     None
 }
 
-/// Runs `open` through both entry points and asserts each refuses `path`, naming it.
-fn assert_refused(path: &Path, owner: Option<(u32, u32)>) {
+/// Runs both entry points against `path` and returns each one's error; panics if either acquires.
+fn both_entries_fail(path: &Path, owner: Option<(u32, u32)>) -> [(&'static str, io::Error); 2] {
     let attempts = [
         ("try_acquire", Exclusive::try_acquire(path, owner).map(|_| ())),
         ("acquire", Exclusive::acquire(path, owner).map(|_| ())),
     ];
-    for (entry, result) in attempts {
+    attempts.map(|(entry, result)| {
         let err = result.expect_err(&format!("{entry} must refuse {}", path.display()));
+        (entry, err)
+    })
+}
+
+/// Asserts both entry points refuse `path` with a [`Refused`] that carries the path
+/// but whose `Display` and `Debug` do not.
+fn assert_refused(path: &Path, owner: Option<(u32, u32)>) {
+    let shown = path.to_string_lossy();
+    for (entry, err) in both_entries_fail(path, owner) {
+        let refused = Refused::from_error(&err).unwrap_or_else(|| panic!("{entry}: not a Refused: {err:?}"));
+        assert_eq!(refused.path(), path, "{entry}");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{entry}");
         assert!(
-            err.to_string().contains(&*path.to_string_lossy()),
-            "{entry}: the refusal must name the path, got: {err}"
+            !err.to_string().contains(&*shown),
+            "{entry}: Display must not carry the path, got: {err}"
+        );
+        assert!(
+            !format!("{err:?}").contains(&*shown),
+            "{entry}: Debug must not carry the path, got: {err:?}"
         );
     }
+}
+
+fn symlink(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, link);
+    // Never a skip: a host that cannot make a symlink cannot run this defense's test.
+    made.expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+}
+
+#[skuld::test]
+fn a_lock_path_that_is_a_symlink_is_refused_and_its_target_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let victim = tmp.path().join("victim.json");
+    std::fs::write(&victim, b"not a lock file").unwrap();
+    let path = tmp.path().join("target.json.lock");
+    symlink(&victim, &path);
+
+    both_entries_fail(&path, None);
+
+    assert_eq!(std::fs::read(&victim).unwrap(), b"not a lock file");
+}
+
+#[skuld::test]
+fn a_lock_path_that_is_a_dangling_symlink_is_refused_and_its_target_not_created() {
+    let tmp = tempfile::tempdir().unwrap();
+    let victim = tmp.path().join("victim.json");
+    let path = tmp.path().join("target.json.lock");
+    symlink(&victim, &path);
+
+    both_entries_fail(&path, None);
+
+    assert!(
+        std::fs::symlink_metadata(&victim).is_err(),
+        "a privileged open must not create the file a planted symlink points at"
+    );
+}
+
+#[skuld::test]
+#[cfg(windows)]
+fn a_symlink_at_the_lock_path_is_a_typed_refusal_on_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("target.json.lock");
+    symlink(&tmp.path().join("victim.json"), &path);
+
+    assert_refused(&path, None);
 }
 
 #[skuld::test]

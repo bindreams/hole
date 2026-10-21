@@ -40,6 +40,20 @@ pub(super) fn vet(facts: Facts, euid: u32, owner: Option<(u32, u32)>) -> Result<
 /// `Ok(None)` only when `block` is false and the lock is held elsewhere; a
 /// blocking open always resolves to `Ok(Some(_))` or `Err`.
 pub(super) fn open_locked(path: &Path, block: bool, owner: Option<(u32, u32)>) -> io::Result<Option<File>> {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    open_locked_as(path, block, owner, euid)
+}
+
+/// [`open_locked`] as a process whose effective uid is `euid`. The seam lets a
+/// test drive a file the real euid owns through the owner rule, which an
+/// unprivileged test cannot otherwise make fail.
+pub(super) fn open_locked_as(
+    path: &Path,
+    block: bool,
+    owner: Option<(u32, u32)>,
+    euid: u32,
+) -> io::Result<Option<File>> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -54,8 +68,6 @@ pub(super) fn open_locked(path: &Path, block: bool, owner: Option<(u32, u32)>) -
         links: meta.nlink(),
         uid: meta.uid(),
     };
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    let euid = unsafe { libc::geteuid() };
     vet(facts, euid, owner).map_err(|why| {
         Refused {
             path: path.to_path_buf(),

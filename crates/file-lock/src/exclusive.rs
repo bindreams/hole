@@ -29,8 +29,8 @@
 //!   when an `owner` is given) owned by that owner or by the process itself.
 //!   A hard link planted at the lock name to some other file passes
 //!   `O_NOFOLLOW`; without this check the `fchmod`/`fchown` below would
-//!   re-permission that file. A file that fails is refused with an error
-//!   naming the path, never repaired;
+//!   re-permission that file. A file that fails is refused with a path-free
+//!   error ([`Refused`]), never repaired;
 //! - only a file that passed is `fchmod`ed to `0600` and `fchown`ed to
 //!   `owner`. Windows applies no security descriptor at all, by path or by
 //!   handle: the owner-only DACL comes from the install path.
@@ -97,25 +97,40 @@ enum Refusal {
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Refusal::NotRegular => f.write_str("it is not a regular file"),
-            Refusal::ExtraLinks { links } => write!(f, "it has {links} links, not 1"),
+            Refusal::NotRegular => f.write_str("the lock file is not a regular file"),
+            Refusal::ExtraLinks { links } => write!(f, "the lock file has {links} links, not 1"),
             #[cfg(windows)]
-            Refusal::ReparsePoint => f.write_str("it is a symbolic link or other reparse point"),
+            Refusal::ReparsePoint => f.write_str("the lock file is a symbolic link or other reparse point"),
             #[cfg(unix)]
-            Refusal::ForeignOwner { uid } => write!(f, "it is owned by uid {uid}"),
+            Refusal::ForeignOwner { uid } => write!(f, "the lock file is owned by uid {uid}"),
         }
     }
 }
 
-/// A [`Refusal`] together with the path it was made for; the payload of the
-/// `io::Error` the acquire functions return.
-#[derive(Debug)]
-struct Refused {
+/// The payload of the `InvalidData` [`io::Error`] that [`Exclusive::try_acquire`]
+/// and [`Exclusive::acquire`] return for a refused lock file; recover it with
+/// [`Refused::from_error`].
+///
+/// The path is a filesystem path, so it can name an account (the lock sits in a
+/// user's profile). Neither `Display` nor `Debug` carries it: logging the error
+/// with `%e` or `?e` cannot leak it. [`Refused::path`] is the one way out, for
+/// a caller whose sink may hold a path.
+pub struct Refused {
     path: PathBuf,
     why: Refusal,
 }
 
 impl Refused {
+    /// The refusal inside `err`, or `None` if `err` is not one.
+    pub fn from_error(err: &io::Error) -> Option<&Refused> {
+        err.get_ref()?.downcast_ref()
+    }
+
+    /// The lock path that was refused.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     fn into_io_error(self) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, self)
     }
@@ -123,7 +138,15 @@ impl Refused {
 
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "refusing to lock {}: {}", self.path.display(), self.why)
+        write!(f, "refusing to lock: {}", self.why)
+    }
+}
+
+impl fmt::Debug for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Refused")
+            .field("why", &self.why)
+            .finish_non_exhaustive()
     }
 }
 
@@ -155,7 +178,7 @@ impl Exclusive {
     ///
     /// An existing lock file that is not a regular file with exactly one link
     /// (or has another owner, above) is refused with an `InvalidData` error
-    /// naming the path; it is never re-permissioned.
+    /// holding a [`Refused`]; it is never re-permissioned.
     pub fn try_acquire(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Option<Self>> {
         on_acquire_entry();
         match platform::open_locked(path, false, owner)? {
