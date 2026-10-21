@@ -1,7 +1,7 @@
 #![allow(clippy::disallowed_methods)] // test fixture: re-execs its own binary, not an OS tool
 use std::net::SocketAddr;
 
-use garter::sitrep::{SitrepEvent, Transports, SITREP_PROTOCOL};
+use garter::sitrep::{SitrepEvent, StartError, Transports, SITREP_PROTOCOL};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -58,7 +58,7 @@ fn ignore_cooperative_signal() {
 /// made it fail, `<file>.bound` when it succeeded. A bind that failed for any other reason writes nothing: it fails the
 /// same way on every port, so it is not a lost race. A test that picked the port itself reads the files to tell a lost
 /// race from its own failure (tests/common/lost_port.rs).
-fn record_bind_verdict(outcome: &io::Result<TcpListener>) {
+fn record_bind_verdict(outcome: &io::Result<TcpListener>, addr: SocketAddr) {
     let Some(path) = std::env::var_os("MOCK_PLUGIN_BIND_VERDICT") else {
         return;
     };
@@ -69,18 +69,10 @@ fn record_bind_verdict(outcome: &io::Result<TcpListener>) {
             name.push(".bound");
             file = name.into();
         }
-        Err(e) if is_port_race(e) => {}
+        Err(e) if matches!(StartError::from_bind_failure(e, addr), StartError::BindConflict { .. }) => {}
         Err(_) => return,
     }
     std::fs::write(&file, b"").expect("write the bind verdict");
-}
-
-/// The classes of `garter::port::is_port_race`, which the fixture cannot reach (it is private to the crate).
-fn is_port_race(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied | io::ErrorKind::AddrNotAvailable
-    )
 }
 
 /// Knob: `MOCK_PLUGIN_BIND_GATE=<addr>` — before binding, connect to `<addr>` and wait for the peer to close the
@@ -97,12 +89,11 @@ async fn wait_for_bind_gate() {
     let _ = gate.read(&mut [0u8; 1]).await;
 }
 
-/// Knob: `MOCK_PLUGIN_BIND_ERROR=<addr_in_use|invalid_input>` — fail the listener bind with an error of that kind instead
-/// of binding. A test cannot make the OS refuse a bind for a reason that is not a port race.
+/// Knob: `MOCK_PLUGIN_BIND_ERROR=invalid_input` — fail the listener bind with an error of that kind instead of binding.
+/// A test cannot make the OS refuse a bind for a reason that is not a port race.
 async fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
     match std::env::var("MOCK_PLUGIN_BIND_ERROR").as_deref() {
         Err(_) => TcpListener::bind(addr).await,
-        Ok("addr_in_use") => Err(io::ErrorKind::AddrInUse.into()),
         Ok("invalid_input") => Err(io::ErrorKind::InvalidInput.into()),
         Ok(other) => panic!("MOCK_PLUGIN_BIND_ERROR={other:?} is not a known kind"),
     }
@@ -506,7 +497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("mock-plugin: listening on {local_addr}, forwarding to {remote_addr}");
     wait_for_bind_gate().await;
     let bound = bind_listener(local_addr).await;
-    record_bind_verdict(&bound);
+    record_bind_verdict(&bound, local_addr);
     let listener = bound?;
 
     // sitrep ready: listener is bound & accepting. With

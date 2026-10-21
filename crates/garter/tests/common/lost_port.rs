@@ -2,8 +2,8 @@
 //!
 //! A probe-mode chain test has to hand the plugin a concrete public port: the readiness probe connects to it, so the
 //! plugin cannot choose it. The port is picked, freed and rebound by the plugin, and another process may take it in
-//! between. `mock-plugin` records that outcome in a file; [`rerun_on_lost_port`] reads it and reruns the body on a new
-//! port.
+//! between. `mock-plugin` records a bind that failed for that reason in a file; [`rerun_on_lost_port`] reads it and
+//! reruns the body on a new port. A bind that failed for another reason records nothing, and the body's failure stands.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Environment variable naming the verdict file of one attempt. `mock-plugin` creates that file when its listener
-/// bind fails, and `<file>.bound` when it succeeds.
+/// bind fails because of a port race, and `<file>.bound` when it succeeds. Any other bind failure creates neither.
 pub const BIND_VERDICT_ENV: &str = "MOCK_PLUGIN_BIND_VERDICT";
 
 /// One run of a test body: the public address to chain on, and where the plugin reports its bind.
@@ -78,8 +78,8 @@ impl Verdict {
     ///
     /// The verdict may not exist yet: a probe answered by whatever holds the port lets a body fail before the plugin
     /// has tried to bind. So this waits for the plugin to write one, or for every chain of the attempt to end, which
-    /// is final: a plugin that never reached its bind (never spawned, or exited first) writes no verdict, and its
-    /// chain's run returns after the plugin's tree is gone. A plugin that is alive and neither binds nor exits holds
+    /// is final: a plugin that never reached its bind (never spawned, or exited first) or whose bind failed for
+    /// a reason that is not a port race writes no verdict, and its chain's run returns after the plugin's tree is gone. A plugin that is alive and neither binds nor exits holds
     /// this waiting, as it would hold a body waiting for its readiness.
     async fn lost_the_bind(&self, chains: &Chains) -> bool {
         loop {
