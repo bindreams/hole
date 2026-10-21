@@ -504,15 +504,14 @@ pub(crate) enum Verdict {
 /// cancels `shutdown`: the other plugins stop cooperatively.
 pub(crate) fn judge(decision: Result<Decision, oneshot::error::RecvError>, shutdown: &CancellationToken) -> Verdict {
     // A hop task that returned without deciding is a readiness its plugin dropped.
-    let decision = decision.unwrap_or(Decision::Dropped);
-    if let Some(error) = decision.failure() {
-        shutdown.cancel();
-        return Verdict::Failed(error.clone());
-    }
-    match decision.ready() {
-        Some(_) if shutdown.is_cancelled() => Verdict::Preempted,
-        Some((given, report)) => Verdict::Ready { given, report },
-        None => ended_undecided(shutdown),
+    match decision.unwrap_or(Decision::Dropped) {
+        Decision::Failed(error) => {
+            shutdown.cancel();
+            Verdict::Failed(error)
+        }
+        Decision::Ready { .. } if shutdown.is_cancelled() => Verdict::Preempted,
+        Decision::Ready { given, report } => Verdict::Ready { given, report },
+        Decision::Dropped => ended_undecided(shutdown),
     }
 }
 

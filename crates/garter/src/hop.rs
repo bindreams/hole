@@ -35,15 +35,6 @@ impl Decision {
         }
     }
 
-    /// The `(given, report)` of a hop that is up.
-    pub(crate) fn ready(self) -> Option<(SocketAddr, PluginReady)> {
-        match self {
-            Decision::Ready { given, report } => Some((given, report)),
-            Decision::Dropped => None,
-            Decision::Failed(_) => None,
-        }
-    }
-
     /// The conflict that makes the hop run again instead of being reported, if this decision is one.
     ///
     /// Only an intermediate hop's bind conflict qualifies: its port was the chain's pick, so a fresh pick can win,
