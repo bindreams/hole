@@ -425,7 +425,7 @@ shutdown token (`spawn_plugin_runner_at`) and honours the start token explicitly
 while the start is in progress. The chain's task and token live in one
 `ChainTask` whose `Drop` ends the chain, so every way out of a start, the start
 future being dropped included, tears the plugin down. Afterwards the chain ends
-only with the session (`PluginChain::Drop`) or when a plugin exits, which
+only when the session drops the chain or when a plugin exits, which
 `check_health` reads as a death. garter's `ChainRunner` given a `cancel_token`
 registers no signal handler of its own (one without a token keeps it), so a
 SIGTERM or Ctrl+C reaches the chain only through the bridge's own shutdown, never
