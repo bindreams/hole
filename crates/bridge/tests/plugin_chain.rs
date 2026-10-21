@@ -109,6 +109,103 @@ async fn a_bind_conflict_is_retried_on_a_fresh_port() {
     drop(chain);
 }
 
+/// Whether the far end of `stream` is gone: EOF on a clean close, an error on a
+/// reset (a killed process on Windows resets rather than closes).
+async fn peer_is_gone(stream: &mut tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 1];
+    matches!(stream.read(&mut buf).await, Ok(0) | Err(_))
+}
+
+/// The chain lives as long as the session, not as long as the start that made
+/// it. Cancelling the start token after the chain is ready (the user's Cancel
+/// landing in the window before the start request is answered) must leave the
+/// plugin running; ending the session (dropping the chain) must still stop it.
+#[skuld::test]
+async fn a_cancel_of_the_start_after_the_chain_is_ready_leaves_the_chain_running() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let opts = format!("host=example.com;connect-back={}", listener.local_addr().expect("addr"));
+
+    let start = CancellationToken::new();
+    let chain = start_plugin_chain(
+        "v2ray-plugin",
+        test_plugin_path().to_str().expect("utf-8 path"),
+        Some(&opts),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &start,
+        None,
+    )
+    .await
+    .expect("the stub plugin becomes ready");
+    let (mut held, _) = listener
+        .accept()
+        .await
+        .expect("the plugin dials back before it is ready");
+
+    start.cancel();
+
+    // Cancellation of a parent token marks its children synchronously, so this
+    // is a state read, not a wait: no timing is involved.
+    assert!(
+        !chain.is_cancelled(),
+        "cancelling the start token must not cancel a ready chain"
+    );
+    assert!(chain.is_alive());
+
+    drop(chain);
+    assert!(
+        peer_is_gone(&mut held).await,
+        "dropping the chain (the session ending) must stop the plugin"
+    );
+}
+
+/// The other half: a cancel DURING the start still stops the plugin it had
+/// already spawned, and the start reports `Cancelled`.
+#[skuld::test]
+async fn a_cancel_during_the_start_stops_the_plugin_it_spawned() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let opts = format!(
+        "host=example.com;never-ready;connect-back={}",
+        listener.local_addr().expect("addr")
+    );
+
+    let start = CancellationToken::new();
+    let starting = tokio::spawn({
+        let start = start.clone();
+        async move {
+            start_plugin_chain(
+                "v2ray-plugin",
+                test_plugin_path().to_str().expect("utf-8 path"),
+                Some(&opts),
+                "127.0.0.1",
+                9,
+                None,
+                None,
+                false,
+                &start,
+                None,
+            )
+            .await
+            .err()
+        }
+    });
+    // The plugin has dialed back, so it is running and cannot be ready yet.
+    let (mut held, _) = listener.accept().await.expect("the plugin dials back");
+
+    start.cancel();
+
+    let err = starting.await.expect("start task").expect("a cancelled start fails");
+    assert!(matches!(err, hole_bridge::proxy::ProxyError::Cancelled), "got: {err:?}");
+    assert!(
+        peer_is_gone(&mut held).await,
+        "a cancel during the start must stop the plugin"
+    );
+}
+
 /// Capturing `MakeWriter` — the bridge's own `test_support::log_capture` is a
 /// private module, unreachable from an integration target.
 #[derive(Clone, Default)]

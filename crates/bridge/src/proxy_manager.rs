@@ -828,8 +828,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    drop in reverse-declaration order as the function unwinds.
     /// 3. **Cancel right after `start_inner` returns `Ok(started)`.**
     ///    Commit to `self` happens after `start_inner` yields, so the
-    ///    late cancel cannot race the commit. The started proxy is left
-    ///    running; the client sees `Ok(())`. A caller that wanted to
+    ///    late cancel cannot race the commit. The started session is left
+    ///    running, plugin chain included (the chain's shutdown scope is not
+    ///    this token's); the client sees `Ok(())`. A caller that wanted to
     ///    cancel that late can follow up with an explicit stop.
     pub async fn start_cancellable(
         &mut self,

@@ -57,6 +57,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Fault-injection knob: `connect-back=<addr>` dials `<addr>` and holds the
+    // stream until this process dies, so the test's end of it reads EOF exactly
+    // when the plugin is gone (and proves the plugin got this far).
+    let _held = match opts.split(';').find_map(|s| s.strip_prefix("connect-back=")) {
+        Some(addr) => Some(tokio::net::TcpStream::connect(addr).await?),
+        None => None,
+    };
+
+    // Fault-injection knob: `never-ready` parks here, before the chain can
+    // become ready — models a plugin still starting when the user cancels.
+    if opts.split(';').any(|s| s == "never-ready") {
+        std::future::pending::<()>().await;
+    }
+
     // A lost port race must be reported as `bind_conflict`, the only class
     // `bind_ephemeral` retries on a fresh port — exiting with a bare error
     // instead would turn the residual probe-drop-to-bind TOCTOU into an
