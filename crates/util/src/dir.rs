@@ -36,10 +36,12 @@
 //! system or another account owns is refused. A walk follows at most as many links
 //! as the OS itself follows in one path (Linux 40, macOS 32, Windows 63), which
 //! also refuses a loop; a link met again after its target was walked counts again.
-//! A folder the walk makes below a user's link is given to that user (unix `fchown`;
-//! Windows: the owner is set, which needs the restore privilege an elevated token
-//! holds), so the next walk through the link finds it theirs. The final name of a
-//! file operation is never followed.
+//! A folder the walk makes below a user's link is given to that user, so the next walk
+//! through the link finds it theirs. Unix opens the made name once, requires the
+//! handle to be a directory the process itself owns (the user can swap the name
+//! after the `mkdirat`) and `fchown`s that handle; Windows sets the owner, which needs
+//! the restore privilege an elevated token holds. The final name of a file operation
+//! is never followed.
 //!
 //! Given an `owner` (unix ids), the final directory must be owned by it or by
 //! this process; any other owner is refused. Windows has no unix ids and does not
@@ -286,6 +288,7 @@ impl Dir {
     /// For a log in a folder a user may own, where a name the user planted must not make a privileged writer
     /// change a file it did not make.
     pub fn append_own_file(&self, name: &OsStr, mode: u32, owner: Option<(u32, u32)>) -> io::Result<File> {
+        // Each pass after the first means the user changed the name since the last one; the loop ends once they stop.
         loop {
             match self.open_file(name, OpenFile::CreateAppend { mode }) {
                 Ok(file) => {

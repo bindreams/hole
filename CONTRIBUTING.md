@@ -670,9 +670,15 @@ re-derive them.
    (`MAXSYMLINKS` 40 on Linux, 32 on macOS; 63 reparse points on Windows), which also ends a loop: a user plants
    the links and each can name the next several times, so without the bound a chain of forty costs exponential
    time in a process that runs as root. And a folder the walk makes below a user's link is given to that user at
-   once (unix `fchown`; Windows: the owner is set, which takes the restore privilege an elevated token holds),
-   because a folder the bridge made is the bridge's on disk and the next walk through the link would refuse it.
-   A folder made on a path with no user's link is left as its maker's.
+   once, because a folder the bridge made is the bridge's on disk and the next walk through the link would refuse
+   it. The user owns the parent, so the name can be swapped between making the folder and giving it; the hand-over
+   therefore opens the name once (unix: `O_DIRECTORY | O_NOFOLLOW`), requires the handle to be a directory the
+   bridge itself owns (a swapped-in folder is the user's, a hard link is not a directory), and gives that handle
+   (`fchown`). On Windows the owner is set through a handle re-opened for the purpose and compared with the made
+   one (it takes the restore privilege an elevated token holds). A folder made on a path with no user's link is
+   left as its maker's, on Windows too: a folder SYSTEM made there is Administrators-owned, and if a user later
+   puts a link they own above it, the walk refuses it on every start after (unix hands the final folder over in
+   `Dir::secure`; Windows has no counterpart).
 
 1. **Never follow the final name.** A file operation opens its name with `O_NOFOLLOW` / `FILE_OPEN_REPARSE_POINT`
    and creates with `O_EXCL`. A link there is renamed, linked or unlinked as itself and never read or written
@@ -685,6 +691,12 @@ re-derive them.
    file, a link, a FIFO) is unlinked and replaced, never written through, and an existing file's owner and mode are
    left alone.
 
+1. **Read through the handle too.** A privileged read of a fixed name in such a folder is `Dir::read` after the
+   same walk (`util::dir::read_state_file` for a state file). `std::fs::read` opens by path without `O_NONBLOCK`: a
+   FIFO the user plants at the name hangs the bridge (at start, before it serves; at shutdown, before it tears
+   down), a link to `/dev/zero` is read without end, and a link is read as any path the user names. A read by
+   path stays only where the reader is the unprivileged GUI.
+
 1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a
    temp file, before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
 
@@ -695,7 +707,16 @@ re-derive them.
 `crates/bridge/src/dir_writers_tests.rs` holds every writer that opens a `Dir` to two properties: a hard link, a
 symlink or a FIFO planted at a name it writes to changes nothing it leads to, and a second run in the same layout,
 with or without a user's link on the path, succeeds. A source file that opens a `Dir` and has no row in its table
-fails `every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. A test of
+fails `every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. The readers have the same kind
+of table (`no_reader_reads_through_a_symlink_planted_at_its_name`, `no_reader_waits_on_a_fifo_planted_at_its_name`,
+and `state_symlink_tests.rs` in `tun-engine`): each writes a valid file, plants the name, and the reader must not
+report the file the name leads to. A hard link is the file's own inode, so a reader cannot tell it from the file;
+what a reader takes from a folder the user owns is parsed as that state's schema and never echoed.
+Three source scans close the class: `no_privileged_dir_code_changes_an_owner_or_a_mode_by_name` (nothing in
+`util::dir` or in a file that opens a `Dir` calls `fchownat`, `fchmodat`, `chown`, `chmod`, `set_permissions` or a
+Windows by-path ACL call), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates open no file by
+path, except the files listed in `BY_PATH_ALLOWED`, each with its reason) and `no_state_module_logs_a_path` (the
+state modules log the file's name). A test of
 a walk plants links with `util::dir::testing` (`plant_link`, `user_dir`, `SystemScratch`), which hand what they
 make to an unprivileged owner whoever runs the test: a link to a folder the system owns must be refused, a link
 to a folder its own owner owns must be followed, and the same through each writer.
@@ -2577,10 +2598,12 @@ The **marker** (`update-in-progress.json` in the service log dir, world-readable
 of flashing Disconnected while it is set, the bridge shutdown disarms the cover
 while it is set, and it is the PR3 banner source. It is cleared unconditionally
 (remove-by-name, never parse-then-clear) on the next bridge's post-bind sweep.
-Every write and the clear go through the log directory's no-follow `Dir` handle
-(a temp file staged and sealed through its own handle, then renamed or, for the
-single-occupancy claim, hard-linked); reads stay by path, since the GUI reads the
-marker as the user.
+Every write, the clear and the read go through the log directory's no-follow `Dir`
+handle (a temp file staged and sealed through its own handle, then renamed or, for
+the single-occupancy claim, hard-linked). The read is the same for the GUI as the
+user and for the bridge as root: the bridge reads it in a log directory a user may
+own, where a FIFO planted at the name must not be waited for. A link or a FIFO at
+the name reads as `Marker::Indeterminate`, a claim of no cutover.
 
 ### Config corruption recovery
 
