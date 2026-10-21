@@ -1,4 +1,5 @@
-//! Every privileged writer that goes through [`util::dir::Dir`], held to the same two properties.
+//! Every privileged writer that goes through [`util::dir::Dir`], held to the same two properties, and the readers of
+//! the same names held to a third (below).
 //!
 //! These code paths run as root/SYSTEM in folders the interactive user may own, so the user can plant a name and
 //! shape the layout above it:
