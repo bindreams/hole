@@ -591,6 +591,19 @@ fn append_does_not_follow_a_symlink_at_the_name() {
     assert_eq!(std::fs::read(&target).unwrap(), b"theirs");
 }
 
+#[cfg(unix)]
+#[skuld::test]
+fn append_to_a_fifo_with_no_reader_fails_and_does_not_wait_for_one() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let fifo = std::ffi::CString::new(tmp.path().join(LOG).as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    assert!(dir.open_file(&name(LOG), OpenFile::Append).is_err());
+}
+
 #[skuld::test]
 fn an_appended_file_can_be_renamed_by_anyone_who_shares_delete() {
     // The log writer keeps its file open while a reader or a scanner looks at it.
