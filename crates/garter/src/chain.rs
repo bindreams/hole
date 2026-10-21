@@ -241,6 +241,9 @@ impl ChainRunner {
 
     /// Set an external cancellation token. When cancelled, the runner
     /// gracefully stops all plugins (SIP003u shutdown sequence).
+    ///
+    /// A runner given a token leaves SIGTERM/SIGINT/Ctrl+C to its embedder and registers no handler of its own: the
+    /// embedder routes signals into this token. A runner without one ends the chain on those signals itself.
     pub fn cancel_token(mut self, token: CancellationToken) -> Self {
         self.external_cancel = Some(token);
         self
@@ -255,6 +258,9 @@ impl ChainRunner {
     }
 
     /// Run the full chain. Blocks until all plugins exit or shutdown is requested.
+    ///
+    /// Without a [`cancel_token`](ChainRunner::cancel_token), a SIGTERM/SIGINT/Ctrl+C is a shutdown request. With one, the
+    /// runner installs no signal handler.
     ///
     /// The hops start one at a time, in the order [`Mode`] gives (the hop that forwards to the destination first), each
     /// only once the hop it forwards to has reported ready. Every hop but the last-started listens on a port the chain
@@ -288,7 +294,7 @@ impl ChainRunner {
         #[allow(clippy::disallowed_methods)]
         // Garter's chain-shutdown root: distinct from any caller cancel scope. See hole's clippy.toml CancellationToken::new rule.
         let shutdown = CancellationToken::new();
-        shutdown::register_signal_handler(shutdown.clone());
+        shutdown::SignalOwner::of(self.external_cancel.as_ref()).register(&shutdown);
 
         // Wire external cancellation into the shared shutdown token.
         // Selects on both tokens so the forwarder task terminates when
