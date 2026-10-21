@@ -460,12 +460,16 @@ impl<P> ProcessHolds<P> {
                 reading = again;
                 continue;
             }
+            // The open and the confirming read are two claims on the same
+            // process: a valid one on either is evidence it is the service's.
+            let claimed =
+                Origin::first_held_on(reading.observed.reported_pid()).after_claim(again.observed.reported_pid());
             let named = match candidate {
                 Some(process) => {
                     self.held.push(Held {
                         pid,
                         process,
-                        origin: Origin::first_held_on(again.observed.reported_pid()),
+                        origin: claimed,
                     });
                     Named::Held
                 }

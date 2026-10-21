@@ -1123,6 +1123,49 @@ fn a_pending_claim_is_settled_by_a_later_valid_one() {
     assert_eq!(wait_plan(&holds, stopped), (vec![], vec![100]));
 }
 
+/// A fresh hold folds both reads it made (the one the open used, the one that
+/// confirmed it): a valid claim on either makes the process the service's own,
+/// so a service that starts stopping between the two reads keeps a process the
+/// RUNNING read already proved.
+#[skuld::test]
+fn a_fresh_hold_is_the_services_if_either_of_its_reads_was_a_valid_claim() {
+    use Observed::{Running, StartPending, StopPending};
+    // (first read, confirming read, whether the process is then an orphan)
+    let cases = [
+        (Running, StopPending, false),
+        (Running, Running, false),
+        (StartPending, Running, false),
+        (StartPending, StopPending, true),
+        (StopPending, StopPending, true),
+        (StopPending, Running, false),
+    ];
+    for (first, confirming, orphan) in cases {
+        let log = Log::default();
+        let mut source = Script::new(
+            &log,
+            vec![
+                reading(first, 100),
+                reading(confirming, 100),
+                reading(Observed::Stopped, 0),
+            ],
+        );
+        let mut holds = ProcessHolds::default();
+        holds.look(&mut source).unwrap();
+        assert_eq!(
+            orphan_pids(&holds) == vec![100],
+            orphan,
+            "{first:?} then {confirming:?}"
+        );
+        let stopped = holds.look(&mut source).unwrap();
+        let terminated = wait_plan(&holds, stopped).0;
+        assert_eq!(
+            terminated == vec![100],
+            orphan,
+            "{first:?} then {confirming:?}, at STOPPED"
+        );
+    }
+}
+
 // Whether anything held is still alive ================================================================================
 
 #[skuld::test]
