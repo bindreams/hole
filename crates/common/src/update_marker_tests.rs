@@ -1,4 +1,5 @@
 use super::*;
+use util::dir::testing::{plant_link, user_dir, SystemScratch};
 
 /// A marker naming a chosen pid. Synthetic, so a test can pick the pid it
 /// discriminates on; inert data, so a `Windows` record builds on every host.
@@ -290,28 +291,15 @@ fn service_log_dir_matches_log_collector_constants() {
 
 // The log directory is the user's to swap =============================================================================
 
-/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant.
-fn plant_symlink(target: &std::path::Path, link: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link).unwrap();
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
-        }
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(target, link).unwrap();
-}
-
-/// `root/outside` holding a marker of another cutover, and `root/logs` as a symlink to it.
-fn symlinked_log_dir(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let outside = root.join("outside");
-    std::fs::create_dir(&outside).unwrap();
-    write(&outside, &info(5), None).unwrap();
+/// `root/logs` as a link to the folder the system owns, and where the marker this test must never see written or
+/// removed would be in it: the system's folder is shared, so what it held before is what it must hold after.
+fn log_dir_linked_to_the_system(
+    root: &std::path::Path,
+    scratch: &SystemScratch,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let logs = root.join("logs");
-    plant_symlink(&outside, &logs);
-    (outside, logs)
+    plant_link(scratch.root(), &logs);
+    (logs, scratch.root().join(MARKER_FILE))
 }
 
 fn listing(dir: &std::path::Path) -> Vec<String> {
@@ -324,39 +312,56 @@ fn listing(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[skuld::test]
-fn writing_through_a_symlinked_log_dir_is_refused_and_writes_nothing_outside() {
+fn writing_through_a_link_to_a_folder_the_system_owns_is_refused_and_writes_nothing_there() {
     let root = tempfile::tempdir().unwrap();
-    let (outside, logs) = symlinked_log_dir(root.path());
+    let scratch = SystemScratch::new();
+    let (logs, marker) = log_dir_linked_to_the_system(root.path(), &scratch);
+    let before = marker.exists();
 
     assert!(write(&logs, &info(1), None).is_err());
     assert!(write_new(&logs, &info(2), None).is_err());
 
-    assert_eq!(listing(&outside), [MARKER_FILE]);
-    assert_eq!(present(&outside).driver.pid, 5);
+    assert_eq!(marker.exists(), before, "a marker was written in the system's folder");
 }
 
 #[skuld::test]
-fn clearing_through_a_symlinked_log_dir_removes_nothing_outside() {
+fn clearing_through_a_link_to_a_folder_the_system_owns_removes_nothing_there() {
     let root = tempfile::tempdir().unwrap();
-    let (outside, logs) = symlinked_log_dir(root.path());
+    let scratch = SystemScratch::new();
+    let (logs, marker) = log_dir_linked_to_the_system(root.path(), &scratch);
+    let before = marker.exists();
 
     assert!(clear(&logs).is_err());
     assert!(stamp_driver(&logs, &info(1).driver).is_err());
 
-    assert_eq!(present(&outside).driver.pid, 5);
+    assert_eq!(marker.exists(), before, "a marker was removed from the system's folder");
 }
 
 #[skuld::test]
-fn writing_below_a_symlinked_parent_creates_nothing_outside() {
+fn writing_below_a_link_to_a_folder_the_system_owns_creates_nothing_there() {
     let root = tempfile::tempdir().unwrap();
-    let outside = root.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    let scratch = SystemScratch::new();
     let link = root.path().join("hole");
-    plant_symlink(&outside, &link);
+    plant_link(scratch.root(), &link);
 
-    assert!(write(&link.join("logs"), &info(1), None).is_err());
+    assert!(write(&link.join(scratch.name()).join("logs"), &info(1), None).is_err());
 
-    assert!(listing(&outside).is_empty());
+    assert!(!scratch.path().exists(), "something was made in the system's folder");
+}
+
+#[skuld::test]
+fn writing_and_clearing_through_a_users_link_to_the_users_folder_work() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    user_dir(&real);
+    let logs = root.path().join("logs");
+    plant_link(&real, &logs);
+
+    write(&logs, &info(1), None).unwrap();
+    assert_eq!(present(&real).driver.pid, 1);
+    clear(&logs).unwrap();
+
+    assert!(listing(&real).is_empty());
 }
 
 #[skuld::test]

@@ -74,6 +74,8 @@ yaml_serde = "0.10"
 
 [dev-dependencies]
 skuld = { workspace = true }
+# `util::dir::testing`: the links and folders a test of the walk needs.
+util = { path = "../util", features = ["test-support"] }
 # Compile-fail probes pinning that `Password`/`ServerAddress` cannot grow a
 # second exit (`Display`, `Deref`). See `tests/secret_shape/`.
 trybuild = { workspace = true }

@@ -47,7 +47,7 @@
 //! the count can change after it is read, so a check on it would not protect.
 //!
 //! The directory part of `path` is opened once, as a [`Dir`] (missing components
-//! created, no symlink another user could have planted followed, and with an
+//! created, a link followed only under `Dir`'s ownership-transition rule, and with an
 //! `owner` the directory must be owned by it or by this process), and every step
 //! on the lock file above goes through that handle: the open, the name check and
 //! the unlink of a leftover. A path swapped after the directory is open is never

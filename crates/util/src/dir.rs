@@ -1,11 +1,11 @@
-//! A directory opened without following a symlink, and file operations relative to it.
+//! A directory opened through handles, following a link only where that is safe, and file operations relative to it.
 //!
 //! A state directory can sit under the interactive user's profile while a
 //! privileged process writes to it, so every component of its path is the user's
 //! to replace. A path call (`create_dir_all`, `chown`, `rename`) re-resolves the
 //! whole path each time, so a component swapped for a symlink between two calls
-//! sends the next one anywhere. [`Dir`] resolves the path once, refusing a
-//! symlink at every component, and then every operation names a file by its
+//! sends the next one anywhere. [`Dir`] resolves the path once, judging every
+//! link it meets, and then every operation names a file by its
 //! single name *inside the handle*: there is no path left to swap.
 //!
 //! # Resolution
@@ -22,14 +22,19 @@
 //!   whole-path no-follow flag in use (`openat2(RESOLVE_NO_SYMLINKS)` is Linux
 //!   5.6, `O_NOFOLLOW_ANY` macOS 10.15), so one code path serves every version.
 //! - Windows: `NtCreateFile` relative to the parent handle with
-//!   `FILE_OPEN_REPARSE_POINT`, then the handle's attributes refuse a reparse
-//!   point (symlink, junction, mount point). Present in every NT version.
+//!   `FILE_OPEN_REPARSE_POINT`, which opens a symlink, junction or mount point as
+//!   itself so it can be judged and read (`FSCTL_GET_REPARSE_POINT`). Present in
+//!   every NT version; any other kind of reparse point is refused.
 //!
-//! A symlink a non-root user could have planted is refused. On unix a symlink is
-//! followed when root owns it *and* the directory it sits in, and nobody else can
-//! write that directory: that is system configuration (macOS's `/var`, `/tmp` and
-//! `/etc`, and with them `temp_dir()`), and a user cannot plant one there. On
-//! Windows no reparse point is followed.
+//! A link is followed under the ownership-transition rule (see `trail` and
+//! CONTRIBUTING.md, "Privileged code in folders a user may own"): the walk never
+//! moves from a folder an unprivileged user owns into one somebody else owns.
+//! Links the system owns (unix: root; Windows: SYSTEM, Administrators,
+//! TrustedInstaller) stay trusted, which keeps macOS's `/var`, `/tmp` and `/etc`
+//! (and with them `temp_dir()`) working; a user's link to a folder that user owns
+//! is followed (a profile moved to another disk); a user's link to a folder the
+//! system or another account owns is refused. A link the walk meets twice is a
+//! loop and is refused. The final name of a file operation is never followed.
 //!
 //! Given an `owner` (unix ids), the final directory must be owned by it or by
 //! this process; any other owner is refused. Windows has no unix ids and does not
@@ -58,6 +63,11 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod trail;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -73,7 +83,8 @@ pub use platform::Caller;
 /// Why a path was not opened as a directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// A symlink (Windows: any reparse point) in the path that a non-root user could have planted.
+    /// A link (Windows: reparse point) in the path that the ownership-transition rule does not let the walk follow,
+    /// a link that is not one the walk can read, or a link met twice.
     Symlink,
     /// A component that exists and is not a directory.
     NotDirectory,
@@ -88,7 +99,7 @@ impl Refusal {
         err.get_ref()?.downcast_ref()
     }
 
-    fn into_io_error(self) -> io::Error {
+    pub(crate) fn into_io_error(self) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, self)
     }
 }
@@ -152,7 +163,7 @@ pub struct Dir {
 }
 
 impl Dir {
-    /// Opens the directory at `path` without following a symlink a non-root user could have planted.
+    /// Opens the directory at `path`, following a link only under the ownership-transition rule (module doc).
     /// With `create`, a missing component is created relative to its parent's handle (unix: mode
     /// `0o777` before the umask, as `create_dir_all`). `owner`: see the module doc.
     pub fn open(path: &Path, create: bool, owner: Option<(u32, u32)>) -> io::Result<Dir> {

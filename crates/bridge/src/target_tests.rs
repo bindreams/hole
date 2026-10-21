@@ -3,6 +3,7 @@ use hole_common::config::ServerEntry;
 use hole_common::protocol::TunnelMode;
 use std::sync::mpsc;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
+use util::dir::testing::{plant_link, user_dir, SystemScratch};
 
 use crate::test_support::log_capture::VecWriter;
 
@@ -779,33 +780,18 @@ fn the_persisted_file_shapes_still_carry_their_non_secret_payload() {
 // The elevated bridge writes here as root while the directory sits under the interactive user's profile,
 // so every component of its path is theirs to replace.
 
-/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant. Run as
-/// root, the link is given away so that it is no longer root's own.
-fn plant_symlink(target: &std::path::Path, link: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link).unwrap();
-        #[cfg(target_os = "macos")]
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
-        }
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(target, link).unwrap();
-}
-
 #[skuld::test]
-fn every_state_file_writer_refuses_a_symlinked_state_directory_and_writes_nothing_outside() {
+fn every_state_file_writer_refuses_a_link_to_a_folder_the_system_owns_and_writes_nothing_there() {
     let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    let scratch = SystemScratch::new();
     let link = tmp.path().join("hole");
-    plant_symlink(&outside, &link);
+    plant_link(scratch.root(), &link);
     let pref = StartupPreference::default();
+    let written = [STATE_FILE_NAME, STARTUP_PREFERENCE_FILE_NAME].map(|name| scratch.root().join(name));
+    let before = written.clone().map(|path| path.exists());
 
     // The link itself, and a directory that does not exist below it.
-    for state_dir in [link.clone(), link.join("state")] {
+    for state_dir in [link.clone(), link.join(scratch.name()).join("state")] {
         assert!(save(&state_dir, &Target::Off, None).is_err(), "save {state_dir:?}");
         assert!(
             save_startup_preference(&state_dir, &pref, None).is_err(),
@@ -818,10 +804,27 @@ fn every_state_file_writer_refuses_a_symlinked_state_directory_and_writes_nothin
         );
     }
 
-    assert!(
-        std::fs::read_dir(&outside).unwrap().next().is_none(),
-        "something was written outside the state directory"
+    assert_eq!(
+        written.map(|path| path.exists()),
+        before,
+        "a state file was written in the system's folder"
     );
+    assert!(!scratch.path().exists(), "a folder was made in the system's folder");
+}
+
+#[skuld::test]
+fn the_state_file_writers_write_through_a_users_link_to_the_users_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    let link = tmp.path().join("hole");
+    plant_link(&real, &link);
+
+    save(&link, &Target::Off, None).unwrap();
+    save_startup_preference(&link, &StartupPreference::default(), None).unwrap();
+
+    assert!(real.join(STATE_FILE_NAME).is_file());
+    assert!(real.join(STARTUP_PREFERENCE_FILE_NAME).is_file());
 }
 
 #[skuld::test]

@@ -1,0 +1,191 @@
+// `mklink /J` makes a junction, the link an unprivileged user can create; `std` has no call for it.
+#![allow(clippy::disallowed_methods)] // test fixtures, never privileged
+
+//! Fixtures for tests of code that walks a path through [`Dir`](super::Dir): a link a user could have
+//! planted, a folder a user owns, and a folder the system owns that the test may nonetheless write in.
+//!
+//! A test cannot make a link or folder that belongs to another principal without being privileged, and
+//! a privileged test run would make every one of them the system's own. So each fixture hands what it
+//! makes to an *unprivileged* owner whoever runs the test: a runner who is one already (unix: not
+//! root; Windows: not elevated) owns it; a privileged one (root; an elevated Windows token, whose files
+//! belong to Administrators) gives it away (`nobody`; the `Users` group).
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Makes `path`, or the link itself if it is one, belong to an unprivileged principal.
+pub fn own(path: &Path) {
+    platform::own(path);
+}
+
+/// Creates the directory `path` (and the folders above it) owned by an unprivileged principal.
+pub fn user_dir(path: &Path) {
+    std::fs::create_dir_all(path).unwrap();
+    own(path);
+}
+
+/// A link to the directory `target` at `link`, owned by an unprivileged principal: unix a symlink,
+/// Windows a junction.
+pub fn plant_link(target: &Path, link: &Path) {
+    platform::link(target, link);
+    own(link);
+}
+
+/// A name nothing in a folder the system owns has, removed again when dropped: the place to look for what a
+/// walk wrongly made in that folder.
+pub struct SystemScratch {
+    root: PathBuf,
+    name: String,
+}
+
+impl SystemScratch {
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        SystemScratch {
+            root: platform::system_scratch(),
+            name: format!(
+                "hole-dir-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ),
+        }
+    }
+
+    /// The folder the system owns and anyone may write in.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The name in [`Self::root`] that must stay free.
+    pub fn name(&self) -> &OsStr {
+        OsStr::new(&self.name)
+    }
+
+    /// Where the name would be.
+    pub fn path(&self) -> PathBuf {
+        self.root.join(&self.name)
+    }
+}
+
+impl Default for SystemScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SystemScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.path());
+    }
+}
+
+#[cfg(unix)]
+mod platform {
+    use std::path::{Path, PathBuf};
+
+    /// The uid root gives a path to.
+    const NOBODY: u32 = 65534;
+
+    pub(super) fn own(path: &Path) {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::lchown(path, Some(NOBODY), Some(NOBODY)).unwrap();
+        }
+    }
+
+    pub(super) fn link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    pub(super) fn system_scratch() -> PathBuf {
+        PathBuf::from("/tmp")
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
+
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION, PSID, SE_PRIVILEGE_ENABLED,
+        SE_RESTORE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_OWNER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use super::super::trail::Owner;
+
+    /// `S-1-5-32-545`, the `Users` group: a principal that is not the system.
+    const USERS: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 33, 2, 0, 0];
+
+    pub(super) fn own(path: &Path) {
+        // The link itself (not what it points at), with the rights to read and to change its owner.
+        let file = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL.0 | WRITE_OWNER.0)
+            .share_mode(7)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(path)
+            .unwrap_or_else(|err| panic!("open {path:?} to read and change its owner: {err}"));
+        if matches!(super::super::windows::owner_of(&file).unwrap(), Owner::User(_)) {
+            return;
+        }
+        // An elevated token's files belong to Administrators; giving one away takes the restore privilege,
+        // which an elevated token has and keeps disabled.
+        enable_restore_privilege();
+        // SAFETY: the handle is open with `WRITE_OWNER` and `USERS` is a valid SID that outlives the call.
+        let status = unsafe {
+            SetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(PSID(USERS.as_ptr().cast_mut().cast())),
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(status.0, 0, "give {path:?} to the Users group: error {}", status.0);
+    }
+
+    fn enable_restore_privilege() {
+        let mut token = HANDLE::default();
+        // SAFETY: the pseudo handle of this process is always valid; `token` is a live local.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
+            .expect("open this process's token to enable the restore privilege");
+        let mut privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            ..Default::default()
+        };
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        // SAFETY: the privilege name is a static wide string and the LUID a field of a live local.
+        unsafe { LookupPrivilegeValueW(None, SE_RESTORE_NAME, &mut privileges.Privileges[0].Luid) }
+            .expect("look up the restore privilege");
+        // SAFETY: `token` is open with `TOKEN_ADJUST_PRIVILEGES` and `privileges` is live for the call.
+        let adjusted = unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) };
+        // SAFETY: `token` is open and owned here.
+        unsafe { CloseHandle(token) }.ok();
+        adjusted.expect("enable the restore privilege (a token without it cannot give a file to another owner)");
+    }
+
+    pub(super) fn link(target: &Path, link: &Path) {
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J: {made:?}");
+    }
+
+    /// `C:\Users\Public`: the system's, and writable by every interactive user.
+    pub(super) fn system_scratch() -> PathBuf {
+        PathBuf::from(std::env::var_os("PUBLIC").expect("PUBLIC names the shared profile folder"))
+    }
+}

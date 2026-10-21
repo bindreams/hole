@@ -25,5 +25,7 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_Fil
 
 [dev-dependencies]
 skuld = { workspace = true }
+# `util::dir::testing`: the links and folders a test of the walk needs.
+util = { path = "../util", features = ["test-support"] }
 hole-test-observability = { path = "../test-observability" }
 tempfile = "3"

@@ -1,19 +1,10 @@
 use super::*;
+use crate::dir::testing::{plant_link as plant, user_dir, SystemScratch};
 use crate::dir::Dir;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 const ROOT: u32 = 0;
-const USER: u32 = 1000;
-
-fn meta(uid: u32, mode: u32) -> Meta {
-    Meta {
-        dev: 1,
-        ino: 1,
-        uid,
-        mode,
-    }
-}
 
 fn is_root() -> bool {
     caller() == ROOT
@@ -24,86 +15,186 @@ fn refusal(result: io::Result<Dir>) -> Refusal {
     *Refusal::from_error(&err).unwrap_or_else(|| panic!("not a typed refusal: {err:?}"))
 }
 
-// trusted_symlink =====================================================================================================
+// Links ---------------------------------------------------------------------------------------------------------------
+//
+// A test cannot make a root-owned link, or a folder of another user, without being root, and cannot
+// be sure what the host's `/` holds. So each case is stated for any runner: the fixtures give what they
+// make to an unprivileged user whoever runs the test.
 
-#[skuld::test]
-fn a_symlink_root_owns_in_a_directory_only_root_can_write_is_trusted() {
-    assert!(trusted_symlink(meta(ROOT, 0o120755), meta(ROOT, 0o040755)));
-    assert!(trusted_symlink(meta(ROOT, 0o120755), meta(ROOT, 0o040700)));
+/// The first symlink in `/` that root owns and that leads to a directory: macOS's `/var`, `/etc` and
+/// `/tmp`, a merged-usr Linux's `/bin` and `/lib`.
+fn system_link() -> PathBuf {
+    std::fs::read_dir("/")
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            meta.file_type().is_symlink() && meta.uid() == ROOT && path.is_dir()
+        })
+        .expect(
+            "no link owned by root in `/` leads to a directory: this host cannot run the test of the system's links",
+        )
 }
 
 #[skuld::test]
-fn a_symlink_owned_by_anyone_but_root_is_not_trusted() {
-    assert!(!trusted_symlink(meta(USER, 0o120755), meta(ROOT, 0o040755)));
+fn a_link_the_system_owns_in_a_folder_the_system_owns_is_followed() {
+    let link = system_link();
+
+    let dir = Dir::open(&link, false, None).unwrap_or_else(|err| panic!("{link:?}: {err:?}"));
+
+    assert_eq!(
+        FileIdOf::of(dir.file()),
+        FileIdOf::of(&std::fs::File::open(&link).unwrap())
+    );
 }
 
 #[skuld::test]
-fn a_symlink_in_a_directory_root_does_not_own_is_not_trusted() {
-    // A user can hard-link a root-owned symlink into a directory they own.
-    assert!(!trusted_symlink(meta(ROOT, 0o120755), meta(USER, 0o040755)));
-}
+fn root_is_the_system_and_every_other_uid_a_user() {
+    let meta = |uid| Meta {
+        dev: 1,
+        ino: 1,
+        uid,
+        mode: 0,
+    };
 
-#[skuld::test]
-fn a_symlink_in_a_directory_others_can_write_is_not_trusted() {
-    for mode in [0o040775, 0o040757, 0o041777, 0o040777] {
-        assert!(!trusted_symlink(meta(ROOT, 0o120755), meta(ROOT, mode)), "{mode:o}");
+    assert_eq!(meta(0).owner(), Owner::Privileged);
+    for uid in [1, 1000, 65534, u32::MAX] {
+        assert_eq!(meta(uid).owner(), Owner::User(uid), "uid {uid}");
     }
 }
 
-// The real walk -------------------------------------------------------------------------------------------------------
-//
-// A test cannot make a root-owned symlink without being root, so each of these says what it must do
-// as root and as anyone else: both are real behavior, neither is skipped.
-
 #[skuld::test]
-fn a_symlink_the_caller_owns_is_followed_only_when_the_caller_is_root() {
+fn a_link_the_runner_owns_to_a_folder_a_user_owns_is_followed() {
+    // As root this is a link the system owns to a user's folder (macOS's `/var/folders/.../T`): followed, and
+    // not binding the walk to a user. As anyone else it is that user's link to their own folder.
     let tmp = tempfile::tempdir().unwrap();
     let real = tmp.path().join("real");
-    std::fs::create_dir(&real).unwrap();
+    user_dir(&real);
     std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
 
-    let opened = Dir::open(&tmp.path().join("link"), false, None);
+    let dir = Dir::open(&tmp.path().join("link"), false, None).unwrap();
 
-    match is_root() {
-        true => assert!(opened.is_ok(), "a root-owned link in a root-only directory is followed"),
-        false => assert_eq!(refusal(opened), Refusal::Symlink),
-    }
+    assert_eq!(
+        FileIdOf::of(dir.file()),
+        FileIdOf::of(&std::fs::File::open(&real).unwrap())
+    );
+}
+
+#[skuld::test]
+fn a_users_link_to_a_folder_the_same_user_owns_is_followed() {
+    // A profile folder moved to another disk and linked back.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    plant(&real, &tmp.path().join("link"));
+
+    let dir = Dir::open(&tmp.path().join("link"), false, None).unwrap();
+
+    assert_eq!(
+        FileIdOf::of(dir.file()),
+        FileIdOf::of(&std::fs::File::open(&real).unwrap())
+    );
+}
+
+#[skuld::test]
+fn a_users_link_to_a_folder_the_system_owns_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    plant(Path::new("/etc"), &tmp.path().join("link"));
+
+    assert_eq!(
+        refusal(Dir::open(&tmp.path().join("link"), false, None)),
+        Refusal::Symlink
+    );
+}
+
+#[skuld::test]
+fn a_users_link_to_a_folder_the_system_owns_is_refused_below_the_link_too() {
+    // `/etc` has `ssl`; the folder below the link is still not the user's.
+    let tmp = tempfile::tempdir().unwrap();
+    plant(Path::new("/etc"), &tmp.path().join("link"));
+
+    assert_eq!(
+        refusal(Dir::open(&tmp.path().join("link").join("ssl"), false, None)),
+        Refusal::Symlink
+    );
+}
+
+#[skuld::test]
+fn nothing_is_made_in_a_folder_the_system_owns_through_a_users_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = SystemScratch::new();
+    plant(scratch.root(), &tmp.path().join("link"));
+    let through = tmp.path().join("link").join(scratch.name()).join("state");
+
+    assert_eq!(refusal(Dir::open(&through, true, None)), Refusal::Symlink);
+
+    assert!(
+        !scratch.path().exists(),
+        "a folder was made in the system's scratch folder"
+    );
+}
+
+#[skuld::test]
+fn a_folder_missing_below_a_users_link_is_made_in_the_users_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    plant(&real, &tmp.path().join("link"));
+
+    Dir::open(&tmp.path().join("link").join("a").join("b"), true, None).unwrap();
+
+    assert!(real.join("a").join("b").is_dir());
+}
+
+#[skuld::test]
+fn a_users_link_to_a_missing_folder_makes_the_folder_in_the_users_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    user_dir(&base);
+    let target = base.join("not-yet").join("deeper");
+    plant(&target, &tmp.path().join("link"));
+
+    Dir::open(&tmp.path().join("link"), true, None).unwrap();
+
+    assert!(target.is_dir());
+}
+
+#[skuld::test]
+fn a_users_link_in_a_users_folder_to_the_system_is_refused_after_a_followed_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    plant(Path::new("/etc"), &real.join("inner"));
+    plant(&real, &tmp.path().join("link"));
+
+    assert_eq!(
+        refusal(Dir::open(&tmp.path().join("link").join("inner"), false, None)),
+        Refusal::Symlink
+    );
 }
 
 #[skuld::test]
 fn a_followed_relative_link_resolves_from_the_directory_it_sits_in() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("a").join("real")).unwrap();
-    std::fs::create_dir(tmp.path().join("b")).unwrap();
-    std::os::unix::fs::symlink("../a/real", tmp.path().join("b").join("link")).unwrap();
+    user_dir(&tmp.path().join("a").join("real"));
+    user_dir(&tmp.path().join("b"));
+    plant(Path::new("../a/real"), &tmp.path().join("b").join("link"));
 
-    let opened = Dir::open(&tmp.path().join("b").join("link").join("made"), true, None);
+    Dir::open(&tmp.path().join("b").join("link").join("made"), true, None).unwrap();
 
-    match is_root() {
-        true => {
-            opened.unwrap();
-            assert!(tmp.path().join("a").join("real").join("made").is_dir());
-        }
-        false => assert_eq!(refusal(opened), Refusal::Symlink),
-    }
+    assert!(tmp.path().join("a").join("real").join("made").is_dir());
 }
 
 #[skuld::test]
 fn a_followed_absolute_link_resolves_from_the_root() {
     let tmp = tempfile::tempdir().unwrap();
     let real = tmp.path().join("real");
-    std::fs::create_dir(&real).unwrap();
-    std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+    user_dir(&real);
+    plant(&real, &tmp.path().join("link"));
 
-    let opened = Dir::open(&tmp.path().join("link").join("made"), true, None);
+    Dir::open(&tmp.path().join("link").join("made"), true, None).unwrap();
 
-    match is_root() {
-        true => {
-            opened.unwrap();
-            assert!(real.join("made").is_dir());
-        }
-        false => assert_eq!(refusal(opened), Refusal::Symlink),
-    }
+    assert!(real.join("made").is_dir());
 }
 
 #[skuld::test]
@@ -336,20 +427,17 @@ fn a_missing_directory_is_created_below_one_the_caller_can_search_but_not_read()
 }
 
 #[skuld::test]
-fn a_symlink_below_a_directory_the_caller_can_only_search_is_still_refused() {
+fn a_symlink_below_a_directory_the_caller_can_only_search_is_followed_by_the_same_rule() {
     let tmp = tempfile::tempdir().unwrap();
     let guarded = tmp.path().join("a");
-    std::fs::create_dir_all(guarded.join("real")).unwrap();
-    std::os::unix::fs::symlink(guarded.join("real"), guarded.join("link")).unwrap();
+    user_dir(&guarded.join("real"));
+    plant(&guarded.join("real"), &guarded.join("link"));
+    plant(Path::new("/etc"), &guarded.join("etc"));
     let _restore = Restore(guarded.clone(), 0o755);
     std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o311)).unwrap();
 
-    let opened = Dir::open(&guarded.join("link"), false, None);
-
-    match is_root() {
-        true => assert!(opened.is_ok(), "root owns the link in a root-only directory"),
-        false => assert_eq!(refusal(opened), Refusal::Symlink),
-    }
+    assert!(Dir::open(&guarded.join("link"), false, None).is_ok());
+    assert_eq!(refusal(Dir::open(&guarded.join("etc"), false, None)), Refusal::Symlink);
 }
 
 // rename_noreplace ----------------------------------------------------------------------------------------------------

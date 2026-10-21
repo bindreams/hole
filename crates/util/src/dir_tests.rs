@@ -1,23 +1,9 @@
+use super::testing::{plant_link, user_dir, SystemScratch};
 use super::*;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 // Fixtures ------------------------------------------------------------------------------------------------------------
-
-/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant. Run as
-/// root, the link is given away so that it is no longer root's own.
-fn plant_symlink(target: &Path, link: &Path) {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link).unwrap();
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
-        }
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(target, link).unwrap();
-}
 
 /// A symlink to the file `target` at `link`, of the kind an unprivileged user can plant.
 fn plant_file_symlink(target: &Path, link: &Path) {
@@ -89,12 +75,11 @@ fn a_directory_that_exists_is_opened_not_recreated_when_asked_to_create() {
 }
 
 #[skuld::test]
-fn a_symlink_as_the_last_component_is_refused_and_nothing_is_made_through_it() {
+fn a_link_to_a_folder_the_system_owns_as_the_last_component_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    let scratch = SystemScratch::new();
     let link = tmp.path().join("state");
-    plant_symlink(&outside, &link);
+    plant_link(scratch.root(), &link);
 
     for create in [false, true] {
         assert_eq!(
@@ -103,33 +88,21 @@ fn a_symlink_as_the_last_component_is_refused_and_nothing_is_made_through_it() {
             "create {create}"
         );
     }
-    assert!(names(&outside).is_empty());
 }
 
 #[skuld::test]
-fn a_symlink_as_a_parent_component_is_refused_and_nothing_is_made_through_it() {
+fn nothing_is_made_through_a_link_to_a_folder_the_system_owns_as_a_parent_component() {
     let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    let scratch = SystemScratch::new();
     let link = tmp.path().join("hole");
-    plant_symlink(&outside, &link);
+    plant_link(scratch.root(), &link);
+    let below = link.join(scratch.name());
 
     // Both the state directory and a missing directory below it.
-    for path in [link.join("state"), link.join("state").join("deeper")] {
+    for path in [below.join("state"), below.join("state").join("deeper")] {
         assert_eq!(refusal(Dir::open(&path, true, None)), Refusal::Symlink, "{path:?}");
     }
-    assert!(names(&outside).is_empty(), "something was created outside");
-}
-
-#[skuld::test]
-fn a_symlink_to_a_missing_directory_is_refused_and_its_target_is_not_made() {
-    let tmp = tempfile::tempdir().unwrap();
-    let target = tmp.path().join("not-yet");
-    let link = tmp.path().join("state");
-    plant_symlink(&target, &link);
-
-    assert_eq!(refusal(Dir::open(&link, true, None)), Refusal::Symlink);
-    assert!(!target.exists());
+    assert!(!scratch.path().exists(), "something was made in the system's folder");
 }
 
 #[skuld::test]
@@ -153,17 +126,20 @@ fn a_relative_path_is_resolved_from_the_current_directory() {
 }
 
 #[skuld::test]
-fn a_symlink_below_the_root_is_not_trusted_for_being_in_the_system_temp_dir() {
-    // `temp_dir()` may itself be reached through system symlinks (macOS: `/var`), so this
-    // also proves those are followed; a symlink planted inside it is not.
+fn the_system_temp_dir_is_reachable_but_a_link_in_it_leads_only_to_the_users_folders() {
+    // `temp_dir()` may itself be reached through system links (macOS: `/var`).
     let tmp = tempfile::tempdir().unwrap();
-    let target = tmp.path().join("target");
-    std::fs::create_dir(&target).unwrap();
-    let link = tmp.path().join("link");
-    plant_symlink(&target, &link);
+    let mine = tmp.path().join("mine");
+    user_dir(&mine);
+    plant_link(&mine, &tmp.path().join("to-mine"));
+    plant_link(SystemScratch::new().root(), &tmp.path().join("to-the-system"));
 
     Dir::open(tmp.path(), false, None).unwrap();
-    assert_eq!(refusal(Dir::open(&link, false, None)), Refusal::Symlink);
+    Dir::open(&tmp.path().join("to-mine"), false, None).unwrap();
+    assert_eq!(
+        refusal(Dir::open(&tmp.path().join("to-the-system"), false, None)),
+        Refusal::Symlink
+    );
 }
 
 // open_file / id_of / unlink ==========================================================================================
@@ -221,7 +197,7 @@ fn unlink_removes_the_name_and_not_what_a_symlink_points_at() {
     std::fs::write(&victim, b"keep").unwrap();
     let file_target = tmp.path().join("target-dir");
     std::fs::create_dir(&file_target).unwrap();
-    plant_symlink(&file_target, &tmp.path().join("link"));
+    plant_link(&file_target, &tmp.path().join("link"));
 
     dir.unlink(&name("link")).unwrap();
 
@@ -346,17 +322,20 @@ fn write_state_file_creates_the_directory_and_writes_the_file() {
 }
 
 #[skuld::test]
-fn write_state_file_refuses_a_symlinked_state_directory_and_writes_nothing_outside() {
+fn write_state_file_refuses_a_link_to_a_folder_the_system_owns_and_writes_nothing_there() {
     let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    let scratch = SystemScratch::new();
     let state = tmp.path().join("state");
-    plant_symlink(&outside, &state);
+    plant_link(scratch.root(), &state);
+    let file = format!("{}.json", scratch.path().display());
 
-    let err = write_state_file(&state, &name("bridge-x.json"), b"{}", None).unwrap_err();
+    let err = write_state_file(&state, OsStr::new(&file), b"{}", None).unwrap_err();
 
     assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink));
-    assert!(names(&outside).is_empty());
+    assert!(
+        !Path::new(&file).exists(),
+        "a state file was written in the system's folder"
+    );
 }
 
 // read ================================================================================================================

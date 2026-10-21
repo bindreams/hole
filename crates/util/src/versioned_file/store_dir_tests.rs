@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use super::{DefaultPlacement, Loaded, Removal, VersionedFile};
+use crate::dir::testing::{plant_link, user_dir, SystemScratch};
 use crate::dir::Refusal;
 use crate::versioned_file::fixtures::{dir, DecisionFile};
 
@@ -13,34 +14,20 @@ fn decision(value: &str) -> DecisionFile {
     }
 }
 
-/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant.
-fn plant_symlink(target: &Path, link: &Path) {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link).unwrap();
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
-        }
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(target, link).unwrap();
-}
-
-/// `root/outside` holding an unrelated record, and `root/state` as a symlink to it.
-fn symlinked_state(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let outside = root.join("outside");
-    std::fs::create_dir(&outside).unwrap();
-    std::fs::write(outside.join("decision.json"), br#"{"version":1,"value":"theirs"}"#).unwrap();
+/// A link to the folder the system owns at `root/state`, and where the record this test must never see written
+/// (or removed) would be in it: the system's folder is shared, so what it held before is what it must hold after.
+fn state_linked_to_the_system(root: &Path, scratch: &SystemScratch) -> (std::path::PathBuf, std::path::PathBuf) {
     let state = root.join("state");
-    plant_symlink(&outside, &state);
-    (outside, state)
+    plant_link(scratch.root(), &state);
+    (state, scratch.root().join("decision.json"))
 }
 
 #[skuld::test]
-fn store_through_a_symlinked_state_directory_is_refused_and_writes_nothing_outside() {
+fn store_through_a_link_to_a_folder_the_system_owns_is_refused_and_writes_nothing_there() {
     let root = dir();
-    let (outside, state) = symlinked_state(root.path());
+    let scratch = SystemScratch::new();
+    let (state, record) = state_linked_to_the_system(root.path(), &scratch);
+    let before = record.exists();
 
     let err = VersionedFile::<DecisionFile>::new(&state)
         .store(&decision("new"), &DefaultPlacement::default())
@@ -50,46 +37,54 @@ fn store_through_a_symlinked_state_directory_is_refused_and_writes_nothing_outsi
         panic!("{err:?}")
     };
     assert_eq!(Refusal::from_error(io), Some(&Refusal::Symlink), "{err:?}");
-    assert_eq!(names_in(&outside), ["decision.json"]);
-    assert_eq!(
-        std::fs::read(outside.join("decision.json")).unwrap(),
-        br#"{"version":1,"value":"theirs"}"#
-    );
+    assert_eq!(record.exists(), before, "a record was written in the system's folder");
 }
 
 #[skuld::test]
-fn store_below_a_symlinked_parent_creates_nothing_outside() {
+fn store_below_a_link_to_a_folder_the_system_owns_creates_nothing_there() {
     let root = dir();
-    let outside = root.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    let scratch = SystemScratch::new();
     let link = root.path().join("hole");
-    plant_symlink(&outside, &link);
+    plant_link(scratch.root(), &link);
 
-    let result =
-        VersionedFile::<DecisionFile>::new(&link.join("state")).store(&decision("new"), &DefaultPlacement::default());
+    let result = VersionedFile::<DecisionFile>::new(&link.join(scratch.name()).join("state"))
+        .store(&decision("new"), &DefaultPlacement::default());
 
     assert!(result.is_err());
-    assert!(names_in(&outside).is_empty(), "something was made outside");
+    assert!(!scratch.path().exists(), "something was made in the system's folder");
 }
 
 #[skuld::test]
-fn load_remove_and_move_aside_through_a_symlinked_state_directory_touch_nothing_outside() {
+fn store_through_a_users_link_to_the_users_folder_writes_there() {
     let root = dir();
-    let (outside, state) = symlinked_state(root.path());
+    let real = root.path().join("real");
+    user_dir(&real);
+    let state = root.path().join("state");
+    plant_link(&real, &state);
+
+    VersionedFile::<DecisionFile>::new(&state)
+        .store(&decision("new"), &DefaultPlacement::default())
+        .unwrap();
+
+    assert_eq!(names_in(&real), ["decision.json"]);
+}
+
+#[skuld::test]
+fn load_remove_and_move_aside_through_a_link_to_a_folder_the_system_owns_touch_nothing_there() {
+    let root = dir();
+    let scratch = SystemScratch::new();
+    let (state, record) = state_linked_to_the_system(root.path(), &scratch);
+    let before = record.exists();
     let file = VersionedFile::<DecisionFile>::new(&state);
 
     assert!(
         matches!(file.load(), Loaded::Unreadable(_)),
-        "the record outside was read"
+        "the system's folder was read"
     );
-    assert!(file.remove().is_err(), "the record outside was removed");
-    assert!(file.move_aside().is_err(), "the record outside was moved");
+    assert!(file.remove().is_err(), "a record in the system's folder was removed");
+    assert!(file.move_aside().is_err(), "a record in the system's folder was moved");
 
-    assert_eq!(names_in(&outside), ["decision.json"]);
-    assert_eq!(
-        std::fs::read(outside.join("decision.json")).unwrap(),
-        br#"{"version":1,"value":"theirs"}"#
-    );
+    assert_eq!(record.exists(), before);
 }
 
 #[skuld::test]
@@ -120,7 +115,7 @@ fn a_directory_swapped_for_a_symlink_after_the_open_is_not_followed() {
     impl super::Placement for Swaps<'_> {
         fn prepare_dir(&self, _dir: &Dir) -> io::Result<()> {
             std::fs::rename(self.root.join("state"), self.root.join("moved"))?;
-            plant_symlink(&self.root.join("outside"), &self.root.join("state"));
+            plant_link(&self.root.join("outside"), &self.root.join("state"));
             Ok(())
         }
     }
@@ -199,7 +194,7 @@ impl super::Fs for SwapsOnRead {
     fn read(&self, dir: &crate::dir::Dir, name: &std::ffi::OsStr) -> std::io::Result<Vec<u8>> {
         if !self.swapped.swap(true, std::sync::atomic::Ordering::SeqCst) {
             std::fs::rename(self.root.join("state"), self.root.join("moved"))?;
-            plant_symlink(&self.root.join("outside"), &self.root.join("state"));
+            plant_link(&self.root.join("outside"), &self.root.join("state"));
         }
         dir.read(name)
     }

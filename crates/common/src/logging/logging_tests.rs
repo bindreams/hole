@@ -14,6 +14,7 @@ use skuld::temp_dir;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use util::dir::testing::{plant_link, user_dir, SystemScratch};
 use util::dir::Dir;
 
 /// Exact type of [`crate::logging::init`]. A regression to a different arity
@@ -763,26 +764,15 @@ fn the_console_tee_target_is_redacted(#[fixture(temp_dir)] dir: &Path) {
 
 // Tests: the log directory is the user's to swap ======================================================================
 
-/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant.
-fn plant_symlink(target: &Path, link: &Path) {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link).unwrap();
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
-        }
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(target, link).unwrap();
-}
-
 #[skuld::test]
-fn init_dual_through_a_symlinked_log_dir_writes_nothing_outside_and_says_so(#[fixture(temp_dir)] dir: &Path) {
-    let outside = dir.join("outside");
-    std::fs::create_dir(&outside).expect("create outside");
+fn init_dual_through_a_link_to_a_folder_the_system_owns_writes_nothing_there_and_says_so(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    let scratch = SystemScratch::new();
     let log_dir = dir.join("logs");
-    plant_symlink(&outside, &log_dir);
+    plant_link(scratch.root(), &log_dir);
+    let log_file = scratch.root().join("test.log");
+    let before = log_file.exists();
     let exe = std::env::current_exe().expect("current_exe");
 
     let out = Command::new(&exe)
@@ -798,10 +788,10 @@ fn init_dual_through_a_symlinked_log_dir_writes_nothing_outside_and_says_so(#[fi
         out.status.success(),
         "the bridge keeps running without a log file: {out:?}"
     );
-    let entries: Vec<_> = std::fs::read_dir(&outside).expect("read outside").collect();
-    assert!(
-        entries.is_empty(),
-        "a log file was written through the link: {entries:?}"
+    assert_eq!(
+        log_file.exists(),
+        before,
+        "a log file was written in the system's folder"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -812,6 +802,27 @@ fn init_dual_through_a_symlinked_log_dir_writes_nothing_outside_and_says_so(#[fi
         !stderr.contains(dir.to_string_lossy().as_ref()),
         "the message carries a path: {stderr}"
     );
+}
+
+#[skuld::test]
+fn init_dual_through_a_users_link_to_the_users_folder_writes_the_log_there(#[fixture(temp_dir)] dir: &Path) {
+    let real = dir.join("real");
+    user_dir(&real);
+    let log_dir = dir.join("logs");
+    plant_link(&real, &log_dir);
+    let exe = std::env::current_exe().expect("current_exe");
+
+    let status = Command::new(&exe)
+        .env("HOLE_LOGGING_TEST_KIND", "redact_file")
+        .env("HOLE_LOGGING_TEST_LOG_DIR", &log_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn child");
+
+    assert!(status.success(), "{status:?}");
+    assert!(real.join("test.log").is_file());
 }
 
 #[skuld::test]

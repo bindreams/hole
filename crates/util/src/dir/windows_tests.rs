@@ -1,19 +1,9 @@
-// `mklink /J` makes a junction, the reparse point an unprivileged user can create; `std` has no call for it.
-#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
-
 use super::*;
+use crate::dir::testing::{own, plant_link, user_dir, SystemScratch};
 use crate::dir::Dir;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
-
-fn junction(target: &Path, link: &Path) {
-    let status = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .unwrap();
-    assert!(status.status.success(), "mklink /J: {status:?}");
-}
+use windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
 fn refusal(result: io::Result<Dir>) -> Refusal {
     let err = result.err().expect("the path must be refused");
@@ -84,38 +74,170 @@ fn a_verbatim_path_with_a_parent_component_is_refused() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 }
 
-// Reparse points ------------------------------------------------------------------------------------------------------
+// Links ---------------------------------------------------------------------------------------------------------------
+//
+// A test cannot make a link or folder of another principal without privilege, so each case is stated for
+// any runner: the fixtures give what they make to an unprivileged owner whoever runs the test.
+
+fn file_id(path: &Path) -> (u64, u64) {
+    let file = std::fs::OpenOptions::new()
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .read(true)
+        .open(path)
+        .unwrap();
+    super::file_id(&file).unwrap()
+}
+
+/// The system's own links: `C:\Documents and Settings` is a junction and `C:\Users\All Users` a directory symlink,
+/// both owned by SYSTEM in a folder SYSTEM owns.
+const SYSTEM_JUNCTION: (&str, &str) = (r"C:\Documents and Settings\Public", r"C:\Users\Public");
+const SYSTEM_SYMLINK: (&str, &str) = (r"C:\Users\All Users", r"C:\ProgramData");
 
 #[skuld::test]
-fn a_junction_as_the_last_component_is_refused_and_nothing_is_made_through_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
-    let link = tmp.path().join("state");
-    junction(&outside, &link);
+fn a_junction_the_system_owns_in_a_folder_the_system_owns_is_followed() {
+    let (through, real) = SYSTEM_JUNCTION;
 
-    for create in [false, true] {
-        assert_eq!(
-            refusal(Dir::open(&link, create, None)),
-            Refusal::Symlink,
-            "create {create}"
-        );
-    }
-    assert!(is_empty(&outside));
+    let dir = Dir::open(Path::new(through), false, None).unwrap_or_else(|err| {
+        panic!("{through}: {err:?} (a Windows without the compatibility junction `Documents and Settings` cannot run this test)")
+    });
+
+    assert_eq!(super::file_id(dir.file()).unwrap(), file_id(Path::new(real)));
 }
 
 #[skuld::test]
-fn a_junction_as_a_parent_component_is_refused_and_nothing_is_made_through_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
-    let link = tmp.path().join("hole");
-    junction(&outside, &link);
+fn a_directory_symlink_the_system_owns_in_a_folder_the_system_owns_is_followed() {
+    let (through, real) = SYSTEM_SYMLINK;
 
-    for path in [link.join("state"), link.join("state").join("deeper")] {
-        assert_eq!(refusal(Dir::open(&path, true, None)), Refusal::Symlink, "{path:?}");
-    }
-    assert!(is_empty(&outside), "something was created outside");
+    let dir = Dir::open(Path::new(through), false, None).unwrap_or_else(|err| {
+        panic!("{through}: {err:?} (a Windows without the compatibility link `All Users` cannot run this test)")
+    });
+
+    assert_eq!(super::file_id(dir.file()).unwrap(), file_id(Path::new(real)));
+}
+
+#[skuld::test]
+fn a_users_junction_to_a_folder_the_same_user_owns_is_followed() {
+    // A profile folder moved to another disk and linked back.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    plant_link(&real, &tmp.path().join("link"));
+
+    let dir = Dir::open(&tmp.path().join("link"), false, None).unwrap();
+
+    assert_eq!(super::file_id(dir.file()).unwrap(), file_id(&real));
+}
+
+#[skuld::test]
+fn a_users_directory_symlink_to_a_folder_the_same_user_owns_is_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    let link = tmp.path().join("link");
+    std::os::windows::fs::symlink_dir(&real, &link)
+        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    own(&link);
+
+    let dir = Dir::open(&link, false, None).unwrap();
+
+    assert_eq!(super::file_id(dir.file()).unwrap(), file_id(&real));
+}
+
+#[skuld::test]
+fn a_users_relative_symlink_resolves_from_the_folder_it_is_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    user_dir(&tmp.path().join("a").join("real"));
+    user_dir(&tmp.path().join("b"));
+    let link = tmp.path().join("b").join("link");
+    std::os::windows::fs::symlink_dir(r"..\a\real", &link)
+        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    own(&link);
+
+    Dir::open(&link.join("made"), true, None).unwrap();
+
+    assert!(tmp.path().join("a").join("real").join("made").is_dir());
+}
+
+#[skuld::test]
+fn a_relative_symlink_that_ends_on_a_parent_opens_that_folder_for_use() {
+    let tmp = tempfile::tempdir().unwrap();
+    user_dir(&tmp.path().join("a").join("b"));
+    let link = tmp.path().join("a").join("b").join("up");
+    std::os::windows::fs::symlink_dir(r"..", &link)
+        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    own(&link);
+
+    let dir = Dir::open(&link, false, None).unwrap();
+
+    assert_eq!(super::file_id(dir.file()).unwrap(), file_id(&tmp.path().join("a")));
+    dir.write_atomic("state.json".as_ref(), b"x", None, |_| Ok(())).unwrap();
+}
+
+#[skuld::test]
+fn a_users_junction_to_a_folder_the_system_owns_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = SystemScratch::new();
+    plant_link(scratch.root(), &tmp.path().join("link"));
+
+    assert_eq!(
+        refusal(Dir::open(&tmp.path().join("link"), false, None)),
+        Refusal::Symlink
+    );
+}
+
+#[skuld::test]
+fn nothing_is_made_in_a_folder_the_system_owns_through_a_users_junction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = SystemScratch::new();
+    plant_link(scratch.root(), &tmp.path().join("link"));
+    let through = tmp.path().join("link").join(scratch.name()).join("state");
+
+    assert_eq!(refusal(Dir::open(&through, true, None)), Refusal::Symlink);
+
+    assert!(
+        !scratch.path().exists(),
+        "a folder was made in the system's scratch folder"
+    );
+}
+
+#[skuld::test]
+fn a_folder_missing_below_a_users_junction_is_made_in_the_users_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    plant_link(&real, &tmp.path().join("link"));
+
+    Dir::open(&tmp.path().join("link").join("a").join("b"), true, None).unwrap();
+
+    assert!(real.join("a").join("b").is_dir());
+}
+
+#[skuld::test]
+fn a_users_symlink_to_a_missing_folder_makes_the_folder_in_the_users_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    user_dir(&base);
+    let target = base.join("not-yet").join("deeper");
+    let link = tmp.path().join("link");
+    std::os::windows::fs::symlink_dir(&target, &link)
+        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    own(&link);
+
+    Dir::open(&link, true, None).unwrap();
+
+    assert!(target.is_dir());
+}
+
+#[skuld::test]
+fn a_loop_of_junctions_is_refused_not_followed_forever() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+    user_dir(&b);
+    plant_link(&b, &a);
+    std::fs::remove_dir(&b).unwrap();
+    plant_link(&a, &b);
+
+    assert_eq!(refusal(Dir::open(&a, false, None)), Refusal::Symlink);
 }
 
 // Name and handle rules -----------------------------------------------------------------------------------------------
