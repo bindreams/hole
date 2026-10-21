@@ -348,13 +348,24 @@ fn cutover_global_net_state_probe_scan_by_service_sid_finds_nothing_without_the_
     print_scan("RUNNING service without the SID type", &system);
 }
 
-/// Waits for process `pid` to exit.
-fn wait_for_exit(pid: u32) {
-    // SAFETY: plain FFI calls on a handle this function opens and closes.
-    unsafe {
-        let process: HANDLE = OpenProcess(PROCESS_SYNCHRONIZE, false, pid).expect("open the process to wait on");
-        WaitForSingleObject(process, INFINITE);
-        let _ = windows::Win32::Foundation::CloseHandle(process);
+/// A handle to a running process, opened while its pid is known to name it, so a wait after
+/// the process exits neither fails nor finds a process that reused the pid.
+struct ProcessExit(HANDLE);
+
+impl ProcessExit {
+    fn open(pid: u32) -> Self {
+        // SAFETY: plain FFI call; the handle is closed by `wait`.
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.expect("open the process to wait on");
+        Self(process)
+    }
+
+    /// Waits for the process to exit.
+    fn wait(self) {
+        // SAFETY: `self.0` is a live handle this value owns; it is closed once, here.
+        unsafe {
+            WaitForSingleObject(self.0, INFINITE);
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
     }
 }
 
@@ -386,8 +397,9 @@ fn cutover_global_net_state_probe_service_sid_type_takes_effect_at_the_next_serv
     );
     let applied = scan_as_administrator(SERVICE_NAME, dir.path());
 
+    let first_exit = ProcessExit::open(first);
     CutoverOs::stop_service_wait_stopped(&mut os).expect("stop the service");
-    wait_for_exit(first);
+    first_exit.wait();
     CutoverOs::start_service_wait_running(&mut os).expect("start the service again");
     let second = service_pid();
     let restarted = scan_as_administrator(SERVICE_NAME, dir.path());
