@@ -13,6 +13,10 @@ use std::net::SocketAddr;
 use garter::sitrep::{SitrepEvent, Transports, SITREP_PROTOCOL};
 use tokio::net::TcpListener;
 
+/// The byte a plugin that bound its local address writes on its `connect-back`
+/// stream. Mirrored by `tests/plugin_chain.rs`.
+const LIVE_MARKER: u8 = b'L';
+
 fn emit(ev: &SitrepEvent) {
     println!("{}", serde_json::to_string(ev).expect("serialize sitrep event"));
     let _ = std::io::stdout().flush();
@@ -57,6 +61,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Fault-injection knob: `connect-back=<addr>` dials `<addr>` and holds the
+    // stream until this process dies, so the test's end of it reads EOF exactly
+    // when the plugin is gone. Once the local bind succeeds the plugin writes
+    // `LIVE_MARKER` on it: a bind-race loser dials back too but never reaches
+    // that write, so the marker is what tells the live attempt's stream apart.
+    let mut held = match opts.split(';').find_map(|s| s.strip_prefix("connect-back=")) {
+        Some(addr) => Some(tokio::net::TcpStream::connect(addr).await?),
+        None => None,
+    };
+
+    // Fault-injection knob: `never-ready` parks here, before the chain can
+    // become ready — models a plugin still starting when the user cancels.
+    if opts.split(';').any(|s| s == "never-ready") {
+        std::future::pending::<()>().await;
+    }
+
     // A lost port race must be reported as `bind_conflict`, the only class
     // `bind_ephemeral` retries on a fresh port — exiting with a bare error
     // instead would turn the residual probe-drop-to-bind TOCTOU into an
@@ -76,10 +96,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    if let Some(stream) = held.as_mut() {
+        tokio::io::AsyncWriteExt::write_all(stream, &[LIVE_MARKER]).await?;
+    }
     emit(&SitrepEvent::Ready {
         listen: local_addr,
         transports: Transports::TCP,
     });
+
+    // Fault-injection knob: `exit-after-ready` exits as soon as `ready` is out
+    // — models a plugin dying mid-session.
+    if opts.split(';').any(|s| s == "exit-after-ready") {
+        std::process::exit(0);
+    }
 
     loop {
         let _ = listener.accept().await?;

@@ -501,6 +501,16 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
+    /// Test seam: install `chain` as the live session's plugin chain. Panics
+    /// when no session is running.
+    #[cfg(test)]
+    pub fn set_plugin_chain_for_test(&mut self, chain: crate::proxy::plugin::PluginChain) {
+        self.posture
+            .session_mut()
+            .expect("set_plugin_chain_for_test: no running session")
+            .plugin_chain = Some(chain);
+    }
+
     /// Sample cumulative tunnel-traffic totals and compute speeds over
     /// the window since the previous sample. Each call advances the
     /// window — the IPC metrics poll is the sampling event. `None` when
@@ -817,9 +827,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    drop in reverse-declaration order as the function unwinds.
     /// 3. **Cancel right after `start_inner` returns `Ok(started)`.**
     ///    Commit to `self` happens after `start_inner` yields, so the
-    ///    late cancel cannot race the commit. The started proxy is left
-    ///    running; the client sees `Ok(())`. A caller that wanted to
-    ///    cancel that late can follow up with an explicit stop.
+    ///    late cancel cannot race the commit. The started session is left
+    ///    running, plugin chain included; the client sees `Ok(())`. A caller
+    ///    that wanted to cancel that late can follow up with an explicit stop.
     pub async fn start_cancellable(
         &mut self,
         config: &ProxyConfig,
@@ -2192,12 +2202,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
-    /// Sync health check: detects a proxy task that exited on its own
-    /// (e.g. shadowsocks panic or upstream connection failure). Performs no
-    /// teardown itself — it only records the failure and reports it as a
-    /// [`SessionEvent::GaveUp`] for the caller to feed into
-    /// [`Self::stop_with`], so the give-up path and the cover decision it
-    /// drives share the one teardown implementation instead of a hand-copy.
+    /// Sync health check: detects a proxy task or plugin chain that exited on
+    /// its own (e.g. shadowsocks panic, upstream connection failure, or a
+    /// plugin process dying mid-session). Both report the same
+    /// [`DEATH_REASON`]. Performs no teardown itself — it only records the
+    /// failure and reports it as a [`SessionEvent::GaveUp`] for the caller to
+    /// feed into [`Self::stop_with`], so the give-up path and the cover
+    /// decision it drives share the one teardown implementation instead of a
+    /// hand-copy.
     ///
     /// **Error-discard note**: this function cannot await the dead
     /// handle, so the underlying task's `io::Result` is discarded.
@@ -2206,10 +2218,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// be made async too.
     pub fn check_health(&mut self) -> Option<SessionEvent> {
         let state = self.posture.session()?;
-        if state.proxy.is_alive() {
+        if !state.proxy.is_alive() {
+            error!("proxy task exited unexpectedly");
+        } else if state.plugin_chain.as_ref().is_some_and(|c| !c.is_alive()) {
+            error!("plugin chain exited unexpectedly");
+        } else {
             return None;
         }
-        error!("proxy task exited unexpectedly");
         self.last_error = Some(DEATH_REASON.into());
         // Path-free death reason for the GUI status/toast (#470).
         self.death_reason = Some(DEATH_REASON);
