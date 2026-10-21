@@ -1232,6 +1232,30 @@ fn a_completed_retirement_leaves_no_record() {
     }
 }
 
+/// What the update cutover puts back after its swap: [`restore_hardened`] undoes
+/// what [`harden`] found, and leaves a service marked for deletion as it was.
+#[skuld::test]
+fn restoring_what_was_hardened_puts_back_what_the_hardening_changed() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log);
+    let hardened = harden(&mut session).unwrap();
+    assert!(matches!(hardened, Hardened::Disabled(_)));
+    log.borrow_mut().clear();
+
+    restore_hardened(&mut session, &hardened);
+
+    assert_eq!(logged(&log), RESTORE_AUTO);
+    assert_eq!(session.record, RecordState::Absent);
+}
+
+#[skuld::test]
+fn restoring_a_service_found_marked_for_deletion_changes_nothing() {
+    let log = Log::default();
+    let mut session = FakeSession::running_then_stopped(&log);
+    restore_hardened(&mut session, &Hardened::Marked);
+    assert_eq!(logged(&log), Vec::<String>::new());
+}
+
 // The survivors wait on a model host ==================================================================================
 
 use crate::cutover::scm_wait::world_tests::{Act, StoppedService, When, World};
