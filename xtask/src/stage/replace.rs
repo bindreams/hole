@@ -11,13 +11,13 @@ use std::path::Path;
 /// Windows issues that rename itself.
 pub(super) fn replace_file(staged: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(windows)]
-    return windows::replace_file(staged, dest);
+    return windows_impl::replace_file(staged, dest);
     #[cfg(not(windows))]
     return std::fs::rename(staged, dest);
 }
 
 #[cfg(windows)]
-mod windows {
+mod windows_impl {
     use std::io;
     use std::mem::offset_of;
     use std::os::windows::ffi::OsStrExt;
@@ -69,19 +69,27 @@ mod windows {
         }
     }
 
+    /// The `FileName` of the rename: `dest` made absolute (`.`, `..` resolved) and in verbatim
+    /// form, `\\?\` or `\\?\UNC\`, which lifts MAX_PATH. No terminating NUL.
+    pub(super) fn target_name(dest: &Path) -> io::Result<Vec<u16>> {
+        let absolute: Vec<u16> = std::path::absolute(dest)?.as_os_str().encode_wide().collect();
+        let starts_with = |prefix: &str| absolute.starts_with(&prefix.encode_utf16().collect::<Vec<u16>>());
+
+        // Verbatim and device paths are already in the form the call reads as is.
+        if starts_with(r"\\?\") || starts_with(r"\\.\") {
+            return Ok(absolute);
+        }
+        let (prefix, rest) = match starts_with(r"\\") {
+            true => (r"\\?\UNC\", &absolute[2..]),
+            false => (r"\\?\", &absolute[..]),
+        };
+        let mut wide: Vec<u16> = prefix.encode_utf16().collect();
+        wide.extend_from_slice(rest);
+        Ok(wide)
+    }
+
     fn posix_rename(staged: &Path, dest: &Path) -> io::Result<()> {
-        // `FileName` must be an absolute path. A verbatim one also lifts MAX_PATH.
-        let parent = dest
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "dest has no parent directory"))?;
-        let file_name = dest
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "dest has no file name"))?;
-        let target: Vec<u16> = std::fs::canonicalize(parent)?
-            .join(file_name)
-            .as_os_str()
-            .encode_wide()
-            .collect();
+        let target = target_name(dest)?;
         let name_bytes = target.len() * 2;
 
         // The entry itself (not a link target) is renamed; DELETE is the right a rename needs.
