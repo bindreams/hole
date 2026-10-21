@@ -973,18 +973,12 @@ fn a_scan_failure_is_a_hold_error_and_a_wait_failure_an_exit_error() {
 #[skuld::test]
 fn an_absent_opening_goes_to_the_survivors_and_never_to_retire() {
     let log = Log::default();
-    let built = RefCell::new(0);
     let opened = retire_over(
-        Opening::<FakeSession<'_>>::Absent,
-        || {
-            *built.borrow_mut() += 1;
-            FakeSurvivors::new(&log, vec![ScanFinding::Alive, ScanFinding::Nothing])
-        },
+        Opening::<FakeSession<'_>, _>::Absent(FakeSurvivors::new(&log, vec![ScanFinding::Alive, ScanFinding::Nothing])),
         Disposition::Deregister,
     )
     .unwrap();
     assert!(!opened, "nothing was retired");
-    assert_eq!(*built.borrow(), 1);
     assert_eq!(logged(&log), ["hold_scanned", "await_exits", "hold_scanned"]);
 }
 
@@ -993,8 +987,7 @@ fn an_opened_session_never_scans_for_survivors() {
     let log = Log::default();
     let session = FakeSession::running_then_stopped(&log);
     let opened = retire_over(
-        Opening::Opened(session),
-        || -> FakeSurvivors<'_> { panic!("an opened session has no entry to be gone from") },
+        Opening::<_, FakeSurvivors<'_>>::Opened(session),
         Disposition::Deregister,
     )
     .unwrap();

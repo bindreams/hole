@@ -2957,7 +2957,7 @@ fn cutover_global_net_state_uninstall_of_a_marked_and_already_stopped_service_su
 fn cutover_global_net_state_uninstall_waits_out_a_process_whose_entry_is_already_gone() {
     use hole_bridge::cutover::scm_wait::retire::{retire_over, Disposition, RetireError};
     use hole_bridge::cutover::scm_wait::scan::ScanFinding;
-    use hole_bridge::platform::os::{GoneSession, RetireSession, SERVICE_NAME};
+    use hole_bridge::platform::os::{RetireSession, SERVICE_NAME};
     use recording::SurvivorEvent;
 
     #[derive(Debug)]
@@ -3009,8 +3009,7 @@ fn cutover_global_net_state_uninstall_waits_out_a_process_whose_entry_is_already
         });
         let opening = RetireSession::open().expect("open the retire session");
         let result = retire_over(
-            opening,
-            || recording::RecordingSurvivors::new(GoneSession::default(), hook),
+            opening.map_absent(|gone| recording::RecordingSurvivors::new(gone, hook)),
             Disposition::Deregister,
         );
         let _ = messages.send(Message::Returned(result));

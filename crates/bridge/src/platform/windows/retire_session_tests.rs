@@ -1,7 +1,7 @@
 use windows_service::service::{ServiceActionType, ServiceFailureResetPeriod, ServiceStartType};
 
 use super::{no_restart_failure_actions, scm_start_type, start_type_from, RetireSession};
-use crate::cutover::scm_wait::retire::StartWrite;
+use crate::cutover::scm_wait::retire::{Opening, StartWrite};
 use crate::platform::os::StartTypeLock;
 use crate::service_start::StartType;
 
@@ -41,6 +41,22 @@ fn each_start_type_the_retirement_writes_is_the_scm_one_it_names() {
     ] {
         assert_eq!(scm_start_type(written).to_raw(), raw, "{written:?}");
     }
+}
+
+/// An entry the SCM no longer has still has processes to wait out, and an
+/// install that registered and started the service meanwhile would hand that
+/// wait a live service: the survivors hold the lock until they are dropped.
+#[skuld::test]
+fn the_survivors_of_an_absent_entry_hold_the_start_type_lock() {
+    let lock = StartTypeLock::scratch("retire-absent");
+    let Ok(Opening::Absent(survivors)) =
+        RetireSession::open_named(&lock, "HoleBridgeNoSuchServiceForTests", || panic!("nothing holds it"))
+    else {
+        panic!("a service no one registered has no entry");
+    };
+    assert!(lock.is_held_for_another_thread(), "the survivors wait holds it");
+    drop(survivors);
+    assert!(!lock.is_held_for_another_thread(), "released with the survivors");
 }
 
 #[skuld::test]

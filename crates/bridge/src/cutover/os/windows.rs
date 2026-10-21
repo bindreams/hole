@@ -174,7 +174,7 @@ impl CutoverOs for WindowsCutoverOs {
     fn hold_service(&mut self) -> std::io::Result<Box<dyn ServiceHold>> {
         let mut session = match RetireSession::open().map_err(|e| std::io::Error::other(e.to_string()))? {
             Opening::Opened(session) => session,
-            Opening::Absent => return Ok(Box::new(WindowsServiceHold { held: None })),
+            Opening::Absent(_) => return Ok(Box::new(WindowsServiceHold { held: None })),
         };
         let hardened = retire::harden(&mut session).map_err(std::io::Error::other)?;
         Ok(Box::new(WindowsServiceHold {

@@ -62,7 +62,7 @@ impl RetireSession {
     /// start-type lock is held; the session keeps it until it is dropped. A
     /// service marked for deletion opens: its mark is met on a call through
     /// the handle.
-    pub fn open() -> Result<Opening<Self>, Box<dyn std::error::Error>> {
+    pub fn open() -> Result<Opening<Self, GoneSession>, Box<dyn std::error::Error>> {
         Self::open_noting(&StartTypeLock::machine_wide(), log_wait)
     }
 
@@ -70,13 +70,22 @@ impl RetireSession {
     pub(super) fn open_noting(
         lock: &StartTypeLock,
         on_busy: impl FnOnce(),
-    ) -> Result<Opening<Self>, Box<dyn std::error::Error>> {
+    ) -> Result<Opening<Self, GoneSession>, Box<dyn std::error::Error>> {
+        Self::open_named(lock, SERVICE_NAME, on_busy)
+    }
+
+    /// [`open_noting`](Self::open_noting) for the service `name`.
+    pub(super) fn open_named(
+        lock: &StartTypeLock,
+        name: &str,
+        on_busy: impl FnOnce(),
+    ) -> Result<Opening<Self, GoneSession>, Box<dyn std::error::Error>> {
         let held = lock.acquire_noting_wait(on_busy)?;
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
-        let service = match manager.open_service(SERVICE_NAME, session_access()) {
+        let service = match manager.open_service(name, session_access()) {
             Ok(service) => service,
-            Err(e) if open_error_is_absent(&e) => return Ok(Opening::Absent),
+            Err(e) if open_error_is_absent(&e) => return Ok(Opening::Absent(GoneSession::new(name, held))),
             Err(e) => return Err(scm_failure(ScmCall::OpenService, e).into()),
         };
         // The first handle keeps the entry, so this open cannot find it gone.
@@ -95,13 +104,17 @@ impl RetireSession {
 pub struct GoneSession {
     sid: ServiceSid,
     processes: ServiceProcesses,
+    /// The start-type lock the open took, held while the survivors are waited
+    /// out. Last, so it is released after the processes are closed.
+    _held: Held,
 }
 
-impl Default for GoneSession {
-    fn default() -> Self {
+impl GoneSession {
+    fn new(name: &str, held: Held) -> Self {
         Self {
-            sid: ServiceSid::of(SERVICE_NAME),
+            sid: ServiceSid::of(name),
             processes: ServiceProcesses::default(),
+            _held: held,
         }
     }
 }

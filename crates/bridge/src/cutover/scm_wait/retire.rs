@@ -35,12 +35,24 @@ pub enum Disposition {
 }
 
 /// What opening a retirement's session found.
-pub enum Opening<S> {
+pub enum Opening<S, G> {
     /// The session, with its service handle.
     Opened(S),
     /// The SCM has no entry for the service: never registered, or removed. A
-    /// process of it can still be running.
-    Absent,
+    /// process of it can still be running, which `G` waits out. `G` holds
+    /// whatever the open took (the start-type lock), so that wait runs under
+    /// it: an install cannot register and start the service meanwhile.
+    Absent(G),
+}
+
+impl<S, G> Opening<S, G> {
+    /// The same opening with its survivors replaced by `f` of them.
+    pub fn map_absent<H>(self, f: impl FnOnce(G) -> H) -> Opening<S, H> {
+        match self {
+            Opening::Opened(session) => Opening::Opened(session),
+            Opening::Absent(survivors) => Opening::Absent(f(survivors)),
+        }
+    }
 }
 
 /// A start type the retirement writes.
@@ -451,16 +463,14 @@ pub fn wait_out_survivors<W: Survivors>(survivors: &mut W) -> Result<(), RetireE
 
 /// [`retire`] on what opening the service found. `Ok(false)`: the SCM has no
 /// entry, and the processes of it that outlived the entry (if any) were waited
-/// out. `Ok(true)`: the retirement ran. `survivors` is built only for an absent
-/// entry.
+/// out. `Ok(true)`: the retirement ran.
 pub fn retire_over<S: ServiceSession, G: Survivors>(
-    opening: Opening<S>,
-    survivors: impl FnOnce() -> G,
+    opening: Opening<S, G>,
     disposition: Disposition,
 ) -> Result<bool, RetireError> {
     match opening {
-        Opening::Absent => {
-            wait_out_survivors(&mut survivors())?;
+        Opening::Absent(mut survivors) => {
+            wait_out_survivors(&mut survivors)?;
             Ok(false)
         }
         Opening::Opened(mut session) => {

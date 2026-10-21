@@ -110,7 +110,7 @@ impl<'a, S> Recording<'a, S> {
 pub fn open_retire_session<'a>(hook: Hook<'a>) -> Recording<'a, RetireSession> {
     let inner = match RetireSession::open().expect("open the retire session") {
         Opening::Opened(session) => session,
-        Opening::Absent => panic!("the service is registered"),
+        Opening::Absent(_) => panic!("the service is registered"),
     };
     Recording::new(inner, hook)
 }

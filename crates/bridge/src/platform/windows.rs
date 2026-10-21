@@ -752,7 +752,7 @@ pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
 /// act on, after waiting out any process of it that outlived the entry;
 /// `Ok(true)` when the retirement ran.
 fn retire_service(disposition: Disposition) -> Result<bool, Box<dyn std::error::Error>> {
-    Ok(retire_over(RetireSession::open()?, GoneSession::default, disposition)?)
+    Ok(retire_over(RetireSession::open()?, disposition)?)
 }
 
 /// Whether an `open_service` failure means the entry does not exist.
