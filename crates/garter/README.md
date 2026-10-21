@@ -71,8 +71,9 @@ description of a hop, and `run` may be called again after it returned.
 fails to start, whether it reported a failure or ended before it was ready
 (whatever it returned). The chain cancels every plugin first, with or without an
 `on_ready` callback, and the start failure outranks the plugins' own exit
-errors and the drain timeout. A shutdown before the chain is ready is not a
-start failure.
+errors and the drain timeout. A shutdown before the chain is ready is not
+itself a start failure, unless the hop that was starting had delivered one by
+then.
 
 A public `local_port` of `0` is passed through to the hop, which picks its own
 port. The chain reports it in `ChainReady::listen` when the hop says which port

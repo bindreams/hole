@@ -1,5 +1,4 @@
-//! One hop of a chain: it picks its listen port, runs its plugin, tells the chain how its start went, and runs the
-//! plugin again on a fresh port when an intermediate hop loses its port.
+//! One hop of a chain: port pick, run, restart on a lost intermediate port.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -25,8 +24,7 @@ pub(crate) enum Decision {
 }
 
 impl Decision {
-    /// The start failure this decision carries. It stands whoever cancelled the chain afterwards, which is what
-    /// separates it from a [`Decision::Ready`] or a [`Decision::Dropped`] that the cancel overtook.
+    /// The start failure this decision carries; it stands whoever cancelled the chain afterwards.
     pub(crate) fn failure(&self) -> Option<&StartError> {
         match self {
             Decision::Ready { .. } => None,
@@ -38,8 +36,7 @@ impl Decision {
     /// The conflict that makes the hop run again instead of being reported, if this decision is one.
     ///
     /// Only an intermediate hop's bind conflict qualifies: its port was the chain's pick, so a fresh pick can win,
-    /// while the public port is the caller's and a fatal failure is final. One match, so a new decision or failure
-    /// class has to choose here.
+    /// while the public port is the caller's and a fatal failure is final.
     fn restart_cause(&self, intermediate: bool) -> Option<&StartError> {
         match self {
             Decision::Ready { .. } => None,
@@ -78,10 +75,8 @@ impl Outlet {
 }
 
 /// Reads one attempt's readiness and routes it: to the chain, or to [`Outlet::restart`] when it is a conflict the hop
-/// recovers from. It does so on every path out of [`attempt`]: a readiness the plugin sent, the sender it dropped, and
-/// whatever it sent while it was being dropped. The last matters because the future of a hop that the chain aborts at
-/// its drain bound is dropped here, plugin first and then this, and a plugin may send its start failure from its own
-/// `Drop`.
+/// recovers from. It routes on every path out of [`attempt`], including a failure the plugin sends from its own `Drop`
+/// when the chain aborts the hop.
 struct Relay<'a> {
     ready: oneshot::Receiver<Result<PluginReady, StartError>>,
     given: SocketAddr,
@@ -134,9 +129,7 @@ enum First {
 /// `decided` the hop's [`Decision`] once its readiness, or its end, is known. Returns what the plugin returns.
 ///
 /// An intermediate hop that reports a bind conflict is stopped, waited for, and run again on a fresh pick, with no
-/// attempt cap: only `shutdown` ends it, and the backoff between attempts paces it and proves nothing. Neither the
-/// conflict nor the stopped attempt's own result is reported. Any other failure, and a conflict on the public port,
-/// is the hop's decision.
+/// attempt cap: only `shutdown` ends it. Any other failure, and a conflict on the public port, is the hop's decision.
 ///
 /// A pick that ends because `shutdown` fired starts nothing and decides nothing. A pick that fails for a reason that
 /// is not a race fails the hop with a [`StartError::Fatal`].
@@ -207,7 +200,6 @@ async fn attempt(
     let run = plugin.run(local, remote, stop.clone(), ready_tx);
     tokio::pin!(run);
 
-    // Either arm may win: what the plugin left in `ready` when it returned is read by the relay's drop.
     let first = tokio::select! {
         read = &mut relay.ready => First::Ready(read),
         result = &mut run => First::Exited(result),

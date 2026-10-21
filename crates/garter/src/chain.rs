@@ -194,10 +194,6 @@ impl ChainRunner {
     /// `Err(Chain("drain timeout expired"))` — unless a plugin-level error
     /// was already captured, in which case that error takes precedence, and a start
     /// failure ([`Error::StartFailed`](crate::Error::StartFailed)) outranks both.
-    /// The aborted tasks are joined before the function returns, so a
-    /// plugin that reports a start failure from its `Drop` is heard, and a
-    /// plugin that ends with an error or panics in the abort window is
-    /// recorded like any other exit.
     ///
     /// The default is 12 seconds. It must outlast the longest take-down a
     /// plugin may need after a shutdown: a `BinaryPlugin` gives its child 5
@@ -272,8 +268,9 @@ impl ChainRunner {
     /// plugin is cancelled, with or without an [`on_ready`](ChainRunner::on_ready) callback, and `run` returns
     /// [`Error::StartFailed`](crate::Error::StartFailed) with the hop and its typed cause once every plugin has returned.
     /// It does so whatever the failed hop's own `run` returned, and ahead of another member's exit error and of the
-    /// drain-timeout error. A hop's own exit error is logged when it exits. A shutdown before every hop is ready is not a
-    /// start failure: `run` then returns what its members returned.
+    /// drain-timeout error. A hop's own exit error is logged when it exits. A shutdown before every hop is ready is not
+    /// itself a start failure: `run` returns what its members returned, unless the hop that was starting had delivered a
+    /// start failure by the time every member returned, which is then reported as above.
     #[debug_requires(!self.plugins.is_empty(), "chain must have at least one plugin")]
     pub async fn run(self, env: crate::sip003::PluginEnv) -> crate::Result<()> {
         let n = self.plugins.len();
@@ -307,8 +304,7 @@ impl ChainRunner {
         }
 
         let mut set = tokio::task::JoinSet::new();
-        // Polled here, in Phase 1, rather than spawned: the caller's `ready` sender is owned by `gate` alone, so no
-        // path releases it before the other plugins have drained.
+        // `gate` alone owns the caller's `ready` sender, so nothing releases it before the plugins have drained.
         let mut gate = ReadyGate::new(self.ready_tx);
         let mut start = StartSequence::new(self.plugins, self.mode, flow);
         #[cfg(test)]
@@ -327,9 +323,7 @@ impl ChainRunner {
         // The start sequence goes first (`biased`): a hop that exits without
         // readying has decided so by the time `join_next` yields it, and that
         // exit must be read as "exited before ready" before `record_exit`
-        // cancels `shutdown` and turns it into a preempted start. It is also
-        // what launches the next hop, so an exit of a hop that is already
-        // running is seen while a later one is still starting.
+        // cancels `shutdown` and turns it into a preempted start.
         let mut first_error: Option<crate::Error> = None;
         loop {
             tokio::select! {
@@ -387,8 +381,7 @@ impl ChainRunner {
 
         // Every plugin has returned (or been given up on at the drain bound):
         // only now does the caller hear of a start failure, or find the
-        // channel closed. A start failure is `run`'s result whatever else ended the chain, a member's own exit
-        // (already logged by `record_exit`) and the drain bound included.
+        // channel closed.
         match gate.release() {
             Some(failure) => Err(failure.into()),
             None => drained,
@@ -434,12 +427,9 @@ pub(crate) struct Pending {
     pub(crate) decision: oneshot::Receiver<Decision>,
 }
 
-/// The sole owner of the caller's `ready` sender, and the one place that decides what the caller is told. A ready
-/// chain is reported at once; every other end (a start failure, a cancel, a member that kept `ready` until it was
-/// stopped) releases the sender only through [`ReadyGate::release`], which [`ChainRunner::run`] calls once every
-/// member's `run` has returned or been given up on at `drain_timeout`. A failure a member decided and delivered while
-/// it stopped is found by the release, whichever way the chain ended. The release also hands the failure back, so
-/// [`ChainRunner::run`] returns the one the caller was told.
+/// The sole owner of the caller's `ready` sender, and the one place that decides what the caller is told. A ready chain
+/// is reported at once; every other end releases the sender only through [`ReadyGate::release`], after every member's
+/// `run` has returned or been given up on at `drain_timeout`.
 pub(crate) struct ReadyGate {
     ready_tx: Option<oneshot::Sender<Result<ChainReady, StartError>>>,
     failure: Option<HopFailure>,
@@ -498,10 +488,8 @@ pub(crate) enum Verdict {
     Preempted,
 }
 
-/// Judges `decision` against `shutdown`. A start failure the hop delivered stands whoever cancelled the chain, because
-/// `BindConflict` is the only retryable class and discarding one turns a collision into a hard failure. A `Ready` or an
-/// end without a decision after the cancel is the cancel's doing, so it is preempted rather than reported. A start failure
-/// cancels `shutdown`: the other plugins stop cooperatively.
+/// Judges `decision` against `shutdown`. A delivered start failure stands whoever cancelled the chain and cancels
+/// `shutdown` itself; a `Ready` or undecided end after the cancel is the cancel's doing, so it is `Preempted`.
 pub(crate) fn judge(decision: Result<Decision, oneshot::error::RecvError>, shutdown: &CancellationToken) -> Verdict {
     // A hop task that returned without deciding is a readiness its plugin dropped.
     match decision.unwrap_or(Decision::Dropped) {
@@ -518,8 +506,7 @@ pub(crate) fn judge(decision: Result<Decision, oneshot::error::RecvError>, shutd
 /// The verdict for a hop that ended with no start to report: its plugin dropped `ready` unsent, or the hop's task
 /// returned without deciding (a plugin that handed `ready` to a task of its own and returned). After the cancel that is
 /// the cancel's doing, so it is preempted. Otherwise the hop exited before readying, which is a failed start: it
-/// cancels `shutdown`, and it is the typed cause for `on_ready`. The same exit is independently observed by the Phase-1
-/// `record_exit`, which sets `first_error` and cancels; a start failure outranks that error in `run`'s result.
+/// cancels `shutdown`, and it is the typed cause for `on_ready`.
 fn ended_undecided(shutdown: &CancellationToken) -> Verdict {
     if shutdown.is_cancelled() {
         return Verdict::Preempted;
@@ -652,9 +639,8 @@ impl StartSequence {
                         transports: self.transports,
                     }));
                 }
-                if given.port() != 0 {
-                    self.taken.push(given.port());
-                }
+                debug_assert!(given.port() != 0, "an intermediate hop is given a picked port, never 0");
+                self.taken.push(given.port());
                 self.forward_to = given;
                 self.launch(set, shutdown);
                 Step::Launched
@@ -686,10 +672,7 @@ pub(crate) fn record_exit(
             shutdown.cancel();
         }
         Ok((name, Err(e))) => {
-            // Surface the process exit code / signal as structured fields so
-            // a mid-run plugin death is loud + machine-parseable in bridge.log
-            // (bindreams/hole#438 — the "third silent gap": ex-ray vanished
-            // with no exit line).
+            // Structured fields keep a mid-run plugin death machine-parseable in the log.
             let exit_code = match &e {
                 crate::Error::PluginExit { code, .. } => Some(*code),
                 _ => None,

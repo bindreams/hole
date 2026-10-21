@@ -13,8 +13,7 @@ pub enum Error {
     Chain(String),
 
     /// A chain's hop failed to start, so [`ChainRunner::run`](crate::ChainRunner::run) ended the chain. `cause` is the
-    /// typed failure the hop reported (or the exit-before-ready one the chain synthesized): a caller with no
-    /// `on_ready` still tells a bind conflict from any other failure by matching it.
+    /// typed failure the hop reported (or the exit-before-ready one the chain synthesized).
     #[error("plugin '{plugin}' failed to start: {cause}")]
     StartFailed {
         plugin: String,
