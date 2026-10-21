@@ -156,8 +156,23 @@ const OS_LINK_LIMIT: usize = 63;
 #[cfg(not(any(target_os = "linux", windows)))]
 const OS_LINK_LIMIT: usize = 32;
 
-/// `dir/l1 -> dir/l2 -> ... -> dir/l<n> -> dir/real`, every link absolute and the user's; returns `dir/l1`.
+/// A temp dir and its path with no link in it. macOS's temp dir sits below `/var -> private/var`, and every
+/// absolute link target built on such a path walks that link again, so the OS's bound is hit by a chain much
+/// shorter than the one the test builds.
+fn tempdir_with_no_link_in_its_path() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().canonicalize().unwrap();
+    (tmp, path)
+}
+
+/// `dir/l1 -> dir/l2 -> ... -> dir/l<n> -> dir/real`, every link absolute and the user's; returns `dir/l1`. `dir`
+/// must have no link in its path (see [`tempdir_with_no_link_in_its_path`]).
 fn linear_chain(dir: &Path, n: usize) -> PathBuf {
+    assert_eq!(
+        dir.canonicalize().unwrap(),
+        dir,
+        "a link in the path of the chain's folder"
+    );
     user_dir(&dir.join("real"));
     // Last first: a junction cannot point at a name that is not there yet.
     for k in (1..=n).rev() {
@@ -185,8 +200,8 @@ fn branching_chain(dir: &Path, n: usize) -> PathBuf {
 
 #[skuld::test]
 fn a_chain_of_as_many_links_as_the_os_allows_in_a_path_is_walked() {
-    let tmp = tempfile::tempdir().unwrap();
-    let start = linear_chain(tmp.path(), OS_LINK_LIMIT);
+    let (_tmp, path) = tempdir_with_no_link_in_its_path();
+    let start = linear_chain(&path, OS_LINK_LIMIT);
     // The OS agrees that the path is fine.
     assert!(std::fs::metadata(&start).unwrap().is_dir());
 
@@ -194,14 +209,14 @@ fn a_chain_of_as_many_links_as_the_os_allows_in_a_path_is_walked() {
 
     assert_eq!(
         FileId::of(dir.file()).unwrap(),
-        FileId::of(Dir::open(&tmp.path().join("real"), false, None).unwrap().file()).unwrap()
+        FileId::of(Dir::open(&path.join("real"), false, None).unwrap().file()).unwrap()
     );
 }
 
 #[skuld::test]
 fn a_chain_of_one_more_link_than_the_os_allows_is_refused() {
-    let tmp = tempfile::tempdir().unwrap();
-    let start = linear_chain(tmp.path(), OS_LINK_LIMIT + 1);
+    let (_tmp, path) = tempdir_with_no_link_in_its_path();
+    let start = linear_chain(&path, OS_LINK_LIMIT + 1);
     // The OS refuses the path too.
     assert!(std::fs::metadata(&start).is_err());
 
@@ -210,8 +225,8 @@ fn a_chain_of_one_more_link_than_the_os_allows_is_refused() {
 
 #[skuld::test]
 fn links_that_each_name_the_next_twice_are_refused_and_not_walked_in_exponential_time() {
-    let tmp = tempfile::tempdir().unwrap();
-    let start = branching_chain(tmp.path(), 40);
+    let (_tmp, path) = tempdir_with_no_link_in_its_path();
+    let start = branching_chain(&path, 40);
 
     assert_eq!(refusal(Dir::open(&start, true, None)), Refusal::Symlink);
 }
