@@ -26,7 +26,7 @@ fn a_reparse_point_is_refused() {
         attributes: FILE_ATTRIBUTE_REPARSE_POINT.0,
         ..file()
     };
-    assert_eq!(vet(facts), Err(Refusal::ReparsePoint));
+    assert_eq!(vet(facts), Err(Refusal::Symlink));
 }
 
 #[skuld::test]

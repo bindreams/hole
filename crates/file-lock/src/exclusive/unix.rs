@@ -62,7 +62,8 @@ pub(super) fn open_locked(
         .create(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(path)
+        .map_err(|err| Refused::from_failed_open(path, err))?;
 
     let meta = file.metadata()?;
     let facts = Facts {
