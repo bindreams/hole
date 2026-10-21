@@ -1165,3 +1165,25 @@ fn redaction_is_armed_only_by_the_wire_funnel() {
     let connect_at = body.find("BridgeClient::connect(").expect("the driver must connect");
     assert!(arm_at < connect_at, "arming must precede the connect");
 }
+
+// The state directory the privileged walk judges ======================================================================
+
+/// The walk of `util::dir` refuses a link in the path because the user can plant one. A path resolved before the walk
+/// has no link left to refuse: the user's link to a folder of root's would be accepted, and handed to the user.
+#[skuld::test]
+fn the_state_dir_keeps_the_link_the_walk_must_judge(#[fixture(temp_dir)] temp_dir: &Path) {
+    let root = temp_dir.join("elsewhere");
+    std::fs::create_dir(&root).unwrap();
+    let link = temp_dir.join("state");
+    util::dir::testing::plant_link(&root, &link);
+
+    assert_eq!(super::absolute_state_dir(link.clone()), link);
+}
+
+#[skuld::test]
+fn a_relative_state_dir_is_joined_to_the_cwd_even_when_it_does_not_exist() {
+    let relative = std::path::PathBuf::from("no-such-folder").join("state");
+    let absolute = super::absolute_state_dir(relative.clone());
+
+    assert_eq!(absolute, std::env::current_dir().unwrap().join(relative));
+}
