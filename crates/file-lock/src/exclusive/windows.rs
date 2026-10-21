@@ -62,12 +62,25 @@ fn facts_of(file: &File) -> io::Result<Facts> {
     })
 }
 
+/// Who is acquiring. Nothing on Windows depends on it.
+pub(super) struct Caller;
+
+/// The running process as a [`Caller`].
+pub(super) fn caller() -> Caller {
+    Caller
+}
+
 /// Windows has no direct `O_NOFOLLOW`; the equivalent is to open with
 /// `FILE_FLAG_OPEN_REPARSE_POINT` (so `CreateFileW` does not transparently
 /// follow a symlink/junction planted at `path`) and then refuse, through the
 /// handle, a file that is a reparse point, not a regular disk file, or has
 /// more than one link. The `owner` is a POSIX concept and is ignored here.
-pub(super) fn open_locked(path: &Path, block: bool, _owner: Option<(u32, u32)>) -> io::Result<Option<File>> {
+pub(super) fn open_locked(
+    path: &Path,
+    block: bool,
+    _owner: Option<(u32, u32)>,
+    _caller: Caller,
+) -> io::Result<Option<File>> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

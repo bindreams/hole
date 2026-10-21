@@ -65,10 +65,10 @@ fn a_file_that_is_not_regular_is_refused_whoever_owns_it() {
     }
 }
 
-// open_locked_as ======================================================================================================
+// open_locked =========================================================================================================
 //
-// The owner rule reaches the real open path through `open_locked_as`, which
-// takes the effective uid as input: a test cannot make a file owned by someone
+// The owner rule reaches the real open path through `open_locked`, which
+// takes the caller's effective uid as input: a test cannot make a file owned by someone
 // else without root, but it can claim to be someone else.
 
 fn real_uid() -> u32 {
@@ -86,7 +86,7 @@ fn a_file_owned_by_neither_the_owner_nor_the_process_is_refused_by_the_real_open
     let mine = real_uid();
     let (pretend_euid, pretend_owner) = (mine + 1, mine + 2);
 
-    let err = open_locked_as(&path, false, Some((pretend_owner, pretend_owner)), pretend_euid)
+    let err = open_locked(&path, false, Some((pretend_owner, pretend_owner)), pretend_euid)
         .expect_err("a file owned by neither the owner nor the process must be refused");
 
     let refused = Refused::from_error(&err).expect("a typed refusal");
@@ -103,7 +103,7 @@ fn a_file_owned_by_the_pretend_process_is_accepted_by_the_real_open() {
     std::fs::write(&path, b"").unwrap();
     let mine = real_uid();
 
-    let file = open_locked_as(&path, false, Some((mine + 2, mine + 2)), mine).unwrap();
+    let file = open_locked(&path, false, Some((mine + 2, mine + 2)), mine).unwrap();
     assert!(file.is_some());
 }
 
@@ -114,7 +114,7 @@ fn a_file_owned_by_the_expected_owner_is_accepted_by_the_real_open() {
     std::fs::write(&path, b"").unwrap();
     let mine = real_uid();
 
-    let file = open_locked_as(&path, false, Some((mine, mine)), mine + 1).unwrap();
+    let file = open_locked(&path, false, Some((mine, mine)), mine + 1).unwrap();
     assert!(file.is_some());
 }
 
@@ -124,6 +124,17 @@ fn no_owner_means_no_ownership_check_in_the_real_open() {
     let path = tmp.path().join("target.json.lock");
     std::fs::write(&path, b"").unwrap();
 
-    let file = open_locked_as(&path, false, None, real_uid() + 1).unwrap();
+    let file = open_locked(&path, false, None, real_uid() + 1).unwrap();
     assert!(file.is_some());
+}
+
+#[skuld::test]
+fn the_caller_is_the_real_effective_uid() {
+    // A file this process creates is owned by its effective uid; the expectation
+    // is read off the file, not off `geteuid`.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("created");
+    std::fs::write(&path, b"").unwrap();
+
+    assert_eq!(caller(), std::fs::metadata(&path).unwrap().uid());
 }
