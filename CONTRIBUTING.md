@@ -1973,7 +1973,11 @@ state read before its act loses that race, so four rules close it:
   System Idle Process (id 0, which is listed and never opens, measured) is left out
   so it cannot read as vanished on every pass. A process that has exited is not in
   a later listing (measured, with its handle still held; the list's zero-thread
-  entries are dropped too). The exemption that ends the rescan of a process that never
+  entries are dropped too). A probe checks the creation time of the process it opened against
+  the listing's: an id held by a process created at another time is the OS's
+  reuse of it, the listed process is gone at its probe (a stranger's token says
+  nothing about a child the listed process started), and another scan follows.
+  The exemption that ends the rescan of a process that never
   opens keys it by id AND creation time (`scan::ListedProcess`), because the OS
   hands an id to a new process, and that process can have started a child after
   the listing and exited before its probe. Passes repeat without a count or a
@@ -1987,7 +1991,16 @@ state read before its act loses that race, so four rules close it:
   owner's ruling: no hang of that kind is on record, so no bound is built, and
   the trail a hang leaves is the `stop wait:` and `held = N` lines the wait logs
   (bridge.log for the service, `gui-cli.log` for the CLI) beside the SCM's own
-  checkpoints. A wait later seen to hang is fixed at its cause.
+  checkpoints. A wait later seen to hang is fixed at its cause. The one
+  exception is a wait the SCM's Stop cannot reach: once the SCM reports STOPPED
+  (`ExitWait::TerminateThenWait`, chosen from the look alone), or the entry is
+  gone, every held process, proven the service's by its token, is terminated
+  (`TerminateProcess`, with `SeDebugPrivilege` enabled first, which an
+  elevated administrator holds disabled) and then waited on. A plugin left by a
+  crashed bridge, or a cutover child left suspended, is told nothing by the SCM
+  and would hold the machine-wide lock for ever; the service is Disabled, so
+  nothing starts another. A process that outlives its own STOPPED is terminated
+  too. While the service is not STOPPED, the wait is for the process's own exit.
 - **A process id the SCM names is a claim; the service SID in the token is the
   identity.** Microsoft documents that the id
   ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks))
@@ -2076,9 +2089,11 @@ and waited out on process handles like any other. What Microsoft documents as 10
 
 **A gone entry** (1060 at open) is stopped as far as the SCM is concerned, so
 only the scan can see a process of it that lingers. `wait_out_survivors` scans,
-holds, waits for the held processes, and scans again until a scan finds nothing
-alive and loses no listed process; no hit is `Ok(false)`, the common
-never-registered answer.
+holds, terminates and waits for the held processes, and scans again until a scan
+finds nothing alive and loses no listed process; no hit is `Ok(false)`, the
+common never-registered answer. The survivors hold the start-type lock the open
+took (`Opening::Absent` carries them), so an install cannot register and start
+the service under the wait.
 
 What is measured and what is not. **Measured** in this project's Windows CI
 (privileged tests and probes, `cutover_global_net_state_*`): `OpenService` on a
@@ -2318,7 +2333,10 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   naming a dead process, which reads as no holder and does not change, so the
   passes end; the next holder takes it over. The passes have no count or timer.
   A failed write of the mark is a warning at the holder (a status read may see
-  that change half done); no key is no service, so nothing is written.
+  that change half done); no key is no service, so nothing is written. A reinstall
+  deletes the key and the mark with it, so the install marks the new key right
+  after the registration (`Held::mark_again`, before any other step), and the
+  hold's end still ends the change.
 - **An administrator's Disable survives every Hole path that is not an explicit
   enable.** The retirement's restore, the in-app update's cutover, `hole bridge install` and the GUI's status read leave it. A reinstall deletes and recreates
   the service, so `bridge install` reads who disabled it first, registers the new
@@ -2359,7 +2377,8 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   (running 0, stopped 1, not installed 2, being changed 4: see the lock above). A reinstall deletes the
   service and registers it again, and its change mark lives in the service's key, so between the delete
   and the registration the read says not installed rather than being changed (accepted, owner
-  2026-10-21: it lasts seconds, and an install started then waits on the lock). The GUI's read is unprivileged and
+  2026-10-21: it lasts seconds, and an install started then waits on the lock); from the
+  registration on, the new key is marked. The GUI's read is unprivileged and
   never fails (`disabled_state`: a start type it cannot read is none, a record it
   cannot read counts as present, as on every path). That read works as
   installed because nothing sets a security descriptor on the service or on its
