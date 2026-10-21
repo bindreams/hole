@@ -145,7 +145,11 @@ impl Drop for Held {
         // SAFETY: this thread took the mutex through `self.mutex`, and a mutex
         // is released by its owner. Releasing needs no access right beyond
         // the `SYNCHRONIZE` the handle was opened with.
-        let _ = unsafe { ReleaseMutex(self.mutex.0) };
+        let released = unsafe { ReleaseMutex(self.mutex.0) };
+        if let Err(error) = &released {
+            warn!(%error, "ReleaseMutex failed on the start-type lock this thread holds");
+        }
+        debug_assert!(released.is_ok(), "ReleaseMutex failed on a lock this thread holds");
     }
 }
 

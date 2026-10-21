@@ -210,6 +210,31 @@ fn a_key_made_during_a_change_is_marked_again_and_the_change_still_ends() {
     assert_eq!(holder_of_the_mark(&scratch), None, "let go");
 }
 
+/// A release that fails means the thread did not own the mutex, which a hold
+/// guarantees it does: said in the log, and a debug assertion.
+#[skuld::test]
+fn a_release_that_fails_is_warned_about_and_asserted() {
+    use garter::test_utils::WaitableWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+
+    let lock = StartTypeLock::scratch("release-fails");
+    let held = lock.acquire().expect("acquire");
+    // SAFETY: the handle is the live one `held` owns, and this thread owns the
+    // mutex; releasing it here makes the hold's own release the second one.
+    unsafe { ReleaseMutex(held.mutex.0) }.expect("release the mutex under the hold");
+
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = set_default_in_current_thread(subscriber);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(held)));
+    assert!(panicked.is_err(), "a failed release is a debug assertion");
+    let logged = writer.snapshot();
+    assert!(logged.contains("WARN") && logged.contains("ReleaseMutex"), "{logged:?}");
+}
+
 /// The thread that holds the lock takes it again for each step of a change; the
 /// first hold is the change, and the mark stays until it is let go.
 #[skuld::test]
