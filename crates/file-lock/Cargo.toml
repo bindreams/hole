@@ -3,7 +3,7 @@ name = "file-lock"
 version = "0.1.0"
 edition.workspace = true
 publish = false
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
 description = "Cross-process exclusive file lock (flock / LockFileEx), hardened for a directory another principal can write."
 
 [lints]
