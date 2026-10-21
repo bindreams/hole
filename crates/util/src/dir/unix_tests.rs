@@ -351,3 +351,42 @@ fn a_symlink_below_a_directory_the_caller_can_only_search_is_still_refused() {
         false => assert_eq!(refusal(opened), Refusal::Symlink),
     }
 }
+
+// rename_noreplace ----------------------------------------------------------------------------------------------------
+
+/// Only an answer that says the flag is unavailable falls back to the hard link. `EPERM` is a real refusal (a sticky
+/// directory, a security module): the link is allowed where the rename was not, and the delete that follows it is
+/// refused again, so the fallback would leave a backup and fail.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn only_renameat2_answers_that_mean_it_is_unavailable_fall_back_to_the_link() {
+    for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP] {
+        assert!(renameat2_unavailable(errno), "errno {errno}");
+    }
+    for errno in [
+        libc::EPERM,
+        libc::EEXIST,
+        libc::ENOENT,
+        libc::EACCES,
+        libc::EXDEV,
+        libc::EROFS,
+    ] {
+        assert!(!renameat2_unavailable(errno), "errno {errno}");
+    }
+}
+
+#[skuld::test]
+fn the_real_open_refuses_a_directory_of_a_third_party_only_when_the_caller_can_make_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let me = state.metadata().unwrap().uid();
+    let made = std::os::unix::fs::chown(&state, Some(me + 7), None).is_ok();
+
+    let opened = Dir::open(&state, false, Some((me + 3, me + 3)));
+
+    match made {
+        true => assert_eq!(refusal(opened), Refusal::ForeignOwner { uid: me + 7 }),
+        false => assert!(opened.is_ok()),
+    }
+}

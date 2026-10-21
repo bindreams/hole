@@ -213,3 +213,74 @@ fn a_path_longer_than_max_path_is_opened() {
 
     assert!(deep.as_os_str().len() > 260);
 }
+
+// Replace falls back to the plain rename ------------------------------------------------------------------------------
+
+fn os(code: u32) -> io::Error {
+    io::Error::from_raw_os_error(code as i32)
+}
+
+/// `ERROR_INVALID_PARAMETER` (87: measured on a 9P volume), `ERROR_NOT_SUPPORTED` (50) and `ERROR_INVALID_FUNCTION`
+/// (1) are what a volume that lacks POSIX rename answers; the same three `std` treats as "unsupported" for POSIX
+/// delete.
+#[skuld::test]
+fn only_the_unsupported_answers_select_the_legacy_replace() {
+    for code in [87, 50, 1] {
+        assert!(posix_rename_unsupported(&os(code)), "code {code}");
+    }
+    for code in [
+        5,   // ERROR_ACCESS_DENIED
+        2,   // ERROR_FILE_NOT_FOUND
+        3,   // ERROR_PATH_NOT_FOUND
+        32,  // ERROR_SHARING_VIOLATION
+        80,  // ERROR_FILE_EXISTS
+        112, // ERROR_DISK_FULL
+        120, // ERROR_CALL_NOT_IMPLEMENTED
+        183, // ERROR_ALREADY_EXISTS
+    ] {
+        assert!(!posix_rename_unsupported(&os(code)), "code {code}");
+    }
+    assert!(!posix_rename_unsupported(&io::Error::other("no os code")));
+}
+
+#[skuld::test]
+fn the_legacy_replace_runs_only_after_an_unsupported_answer() {
+    let legacy_calls = std::cell::Cell::new(0);
+    let mut legacy = || {
+        legacy_calls.set(legacy_calls.get() + 1);
+        Ok(())
+    };
+
+    posix_or_legacy(|| Ok(()), &mut legacy).unwrap();
+    assert_eq!(legacy_calls.get(), 0, "a rename that worked needs no fallback");
+
+    let refused = posix_or_legacy(|| Err(os(5)), &mut legacy).unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(5));
+    assert_eq!(legacy_calls.get(), 0, "any other error is returned as it is");
+
+    posix_or_legacy(|| Err(os(87)), &mut legacy).unwrap();
+    assert_eq!(legacy_calls.get(), 1);
+}
+
+#[skuld::test]
+fn a_failed_legacy_replace_is_returned() {
+    let err = posix_or_legacy(|| Err(os(87)), || Err(os(32))).unwrap_err();
+
+    assert_eq!(err.raw_os_error(), Some(32));
+}
+
+#[skuld::test]
+fn the_legacy_replace_replaces_an_existing_file_and_keeps_the_destination_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("dest"), b"old").unwrap();
+    let temp = open_file(&dir.file, "src".as_ref(), OpenFile::CreateNew { mode: 0o600 }).unwrap();
+    std::io::Write::write_all(&mut &temp, b"new").unwrap();
+    drop(temp);
+    let source = open_for_delete(&dir.file, "src".as_ref()).unwrap();
+
+    set_name(&dir.file, &source, &units("dest"), FileRenameInformation, REPLACE).unwrap();
+
+    assert_eq!(std::fs::read(tmp.path().join("dest")).unwrap(), b"new");
+    assert!(!tmp.path().join("src").exists());
+}

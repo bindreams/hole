@@ -555,3 +555,38 @@ fn a_failed_protect_leaves_no_staged_file() {
     assert_eq!(err.kind(), io::ErrorKind::Other);
     assert!(names(tmp.path()).is_empty());
 }
+
+#[skuld::test]
+fn link_and_rename_work_for_a_name_of_every_length() {
+    // Windows reads the new name out of a buffer sized by its length; a short name is the edge.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("source"), b"x").unwrap();
+
+    for len in 1..=40 {
+        let target = "n".repeat(len);
+        dir.link(&name("source"), &name(&target)).unwrap();
+        assert_eq!(
+            std::fs::read(tmp.path().join(&target)).unwrap(),
+            b"x",
+            "link, length {len}"
+        );
+
+        let moved = "m".repeat(len);
+        dir.rename(&name(&target), &name(&moved)).unwrap();
+        assert!(!tmp.path().join(&target).exists(), "rename, length {len}");
+        assert_eq!(
+            std::fs::read(tmp.path().join(&moved)).unwrap(),
+            b"x",
+            "rename, length {len}"
+        );
+
+        dir.rename_noreplace(&name(&moved), &name(&target)).unwrap();
+        assert_eq!(
+            std::fs::read(tmp.path().join(&target)).unwrap(),
+            b"x",
+            "noreplace, length {len}"
+        );
+        dir.unlink(&name(&target)).unwrap();
+    }
+}
