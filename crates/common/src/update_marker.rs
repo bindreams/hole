@@ -16,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use util::dir::{Dir, EntryKind, Staged};
+use util::dir::{Dir, EntryKind, ReadDir, Staged};
 
 /// Fixed marker filename (single-occupancy: one cutover per machine). The GUI
 /// finds it by this constant, not by enumeration.
@@ -143,11 +143,11 @@ fn readable_by_the_gui(_staged: &std::fs::File) -> io::Result<()> {
 /// claimed by a driver this build cannot identify" from "whether one was claimed
 /// could not be established".
 ///
-/// Through a [`Dir`], for the GUI and the bridge alike: the bridge reads it as root
+/// Through a [`ReadDir`], for the GUI and the bridge alike: the bridge reads it as root
 /// or SYSTEM in a log directory a user may own, where a link or a FIFO planted at
 /// the name must be neither followed nor waited for.
 pub fn read(log_dir: &Path) -> Marker {
-    let dir = match Dir::open_read(log_dir) {
+    let dir = match ReadDir::open(log_dir) {
         Ok(dir) => dir,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Marker::Absent,
         Err(e) => {
@@ -186,7 +186,7 @@ pub fn read(log_dir: &Path) -> Marker {
 /// at the name (a link, a FIFO, a directory) is not a marker and asserts nothing about a cutover. The name is never
 /// followed, so a link is classified as the anomaly it is instead of being resolved to whatever it points at; the
 /// marker is only ever published by rename or hard link, so hole never creates one.
-fn unopened(dir: &Dir, read_error: &io::Error) -> Marker {
+fn unopened(dir: &ReadDir, read_error: &io::Error) -> Marker {
     match dir.kind_of(MARKER_FILE.as_ref()) {
         Ok(Some(EntryKind::File)) => {
             tracing::warn!(error = %read_error, "update marker exists but could not be read");

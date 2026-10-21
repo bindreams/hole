@@ -561,59 +561,6 @@ fn read_state_file_refuses_a_fifo_at_the_name_and_does_not_block() {
     assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular));
 }
 
-// read ================================================================================================================
-
-#[skuld::test]
-fn read_returns_the_bytes_of_the_file_and_not_found_for_a_missing_one() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
-    std::fs::write(tmp.path().join("state.json"), b"{\"a\":1}").unwrap();
-
-    assert_eq!(dir.read(&name("state.json")).unwrap(), b"{\"a\":1}");
-    assert_eq!(kind(dir.read(&name("absent"))), Some(io::ErrorKind::NotFound));
-}
-
-#[skuld::test]
-fn read_does_not_follow_a_symlink_at_the_name() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
-    let target = tmp.path().join("secret");
-    std::fs::write(&target, b"theirs").unwrap();
-    plant_file_symlink(&target, &tmp.path().join("link"));
-
-    assert!(dir.read(&name("link")).is_err());
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn read_refuses_a_fifo_at_the_name_and_does_not_block() {
-    use std::os::unix::ffi::OsStrExt;
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
-    let fifo = std::ffi::CString::new(tmp.path().join("state.json").as_os_str().as_bytes()).unwrap();
-    // SAFETY: `fifo` is a valid NUL-terminated path.
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-
-    let err = dir.read(&name("state.json")).unwrap_err();
-
-    assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular));
-}
-
-#[skuld::test]
-fn a_file_open_for_reading_does_not_block_a_replace_of_it() {
-    // A reader that shares delete, as `std::fs::read` does: the store of a versioned file replaces the
-    // file under it.
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
-    dir.write_atomic(&name("state.json"), b"one", None, |_| Ok(())).unwrap();
-    let reader = dir.open_file(&name("state.json"), OpenFile::Read).unwrap();
-
-    dir.write_atomic(&name("state.json"), b"two", None, |_| Ok(())).unwrap();
-
-    assert_eq!(dir.read(&name("state.json")).unwrap(), b"two");
-    drop(reader);
-}
-
 // open_file: CreateAppend and Append ----------------------------------------------------------------------------------
 
 const LOG: &str = "log";

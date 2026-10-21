@@ -20,7 +20,7 @@ const ORIGINAL: &[u8] = b"bytes nobody could read: hunter2";
 struct DeniedRead;
 
 impl Fs for DeniedRead {
-    fn read(&self, _dir: &crate::dir::Dir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
+    fn read(&self, _dir: &crate::dir::ReadDir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }
@@ -29,7 +29,7 @@ impl Fs for DeniedRead {
 struct DeniedReadAndLink;
 
 impl Fs for DeniedReadAndLink {
-    fn read(&self, _dir: &crate::dir::Dir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
+    fn read(&self, _dir: &crate::dir::ReadDir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 

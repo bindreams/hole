@@ -47,12 +47,14 @@
 //! this process; any other owner is refused. Windows has no unix ids and does not
 //! check.
 //!
+//! A directory only read from is a [`ReadDir`]: the same walk, no write methods.
+//!
 //! The refusals are an `InvalidData` [`io::Error`] holding a [`Refusal`]; they
 //! carry no path.
 //!
 //! # Operations
 //!
-//! [`Dir::read`], [`Dir::open_file`], [`Dir::link`], [`Dir::rename`],
+//! [`ReadDir::read`], [`Dir::open_file`], [`Dir::link`], [`Dir::rename`],
 //! [`Dir::rename_noreplace`] and [`Dir::unlink`] take single names, and none
 //! follows a symlink at the name: a link is renamed, linked or removed as
 //! itself, and reading or appending through one is an error. [`Dir::stage`]
@@ -70,6 +72,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod read_dir;
 mod trail;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -86,6 +89,7 @@ mod windows;
 use windows as platform;
 
 pub use platform::Caller;
+pub use read_dir::ReadDir;
 
 /// Why a path was not opened as a directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,7 +176,8 @@ impl FileId {
     }
 }
 
-/// An open directory. Every operation takes a single file name inside it.
+/// An open directory to write in. Every operation takes a single file name inside it; what only reads is a
+/// [`ReadDir`], which has no write methods on any platform.
 pub struct Dir {
     file: File,
 }
@@ -183,16 +188,6 @@ impl Dir {
     /// `0o777` before the umask, as `create_dir_all`). `owner`: see the module doc.
     pub fn open(path: &Path, create: bool, owner: Option<(u32, u32)>) -> io::Result<Dir> {
         Self::open_as(path, create, owner, platform::caller())
-    }
-
-    /// [`Self::open`] for a directory that is only read from ([`Self::read`], [`Self::kind_of`]): the walk is the
-    /// same, but Windows is not asked for the right to add to the final directory, so a folder whose ACL allows
-    /// reading alone is still read. Writing through it fails there and not on unix: use [`Self::open`] to write.
-    pub fn open_read(path: &Path) -> io::Result<Dir> {
-        #[cfg(windows)]
-        return platform::open_dir_read(path).map(|file| Dir { file });
-        #[cfg(unix)]
-        return Self::open(path, false, None);
     }
 
     /// [`Self::open`] as `caller`; the seam lets a test claim to be another user.
@@ -224,12 +219,10 @@ impl Dir {
         platform::kind_of(&self.file, name)
     }
 
-    /// The whole file `name`, read through a handle that shares delete, so a replace of the file does not wait for
-    /// the read. A symlink at the name is an error, not followed.
-    pub fn read(&self, name: &OsStr) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        self.open_file(name, OpenFile::Read)?.read_to_end(&mut bytes)?;
-        Ok(bytes)
+    /// A read-only view of this directory, for what only reads: it holds a duplicate of the handle, so it stays
+    /// valid after `self` is dropped, and it has no way to write.
+    pub fn reader(&self) -> io::Result<ReadDir> {
+        Ok(ReadDir::from_handle(self.file.try_clone()?))
     }
 
     /// Gives the file `existing` a second name `new`, which must be free: `AlreadyExists` otherwise. A symlink is
@@ -467,11 +460,20 @@ pub fn write_state_file(state_dir: &Path, name: &OsStr, bytes: &[u8], owner: Opt
 }
 
 /// The whole file `name` in the state directory `state_dir`, the counterpart of [`write_state_file`] for a reader
-/// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`Dir::open_read`], and
-/// the name is read by [`Dir::read`]: a link at the name, or a FIFO a user planted there, is an error, never the
+/// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`ReadDir::open`], and
+/// the name is read by [`ReadDir::read`]: a link at the name, or a FIFO a user planted there, is an error, never the
 /// file it leads to and never a wait.
 pub fn read_state_file(state_dir: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
-    Dir::open_read(state_dir)?.read(name)
+    ReadDir::open(state_dir)?.read(name)
+}
+
+/// The whole file `name` in the directory `dir`, through a handle that shares delete, so a replace of the file does
+/// not wait for the read. A symlink at the name is an error, not followed.
+fn read_whole(dir: &File, name: &OsStr) -> io::Result<Vec<u8>> {
+    single_component(name)?;
+    let mut bytes = Vec::new();
+    platform::open_file(dir, name, OpenFile::Read)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// `name` must be one ordinary file name: no separator, and not empty, `.` or `..`.

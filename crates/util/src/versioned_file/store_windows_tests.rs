@@ -131,6 +131,19 @@ fn a_store_over_an_existing_file_keeps_the_attributes_a_placement_set_but_clears
     assert!(matches!(file.load(), Loaded::Current { value, .. } if value == record("two")));
 }
 
+// Reading =============================================================================================================
+
+#[skuld::test]
+fn load_reads_a_folder_nobody_may_add_to() {
+    // A load asks the folder for nothing a write needs: a machine that tightened its ACL to read-only still reads.
+    let dir = dir();
+    let file = VersionedFile::<OsRecordFile>::new(dir.path());
+    file.store(&record("one"), &DefaultPlacement::default()).unwrap();
+    let _denied = crate::dir::testing::AddDenied::to(dir.path());
+
+    assert!(matches!(file.load(), Loaded::Current { value, .. } if value == record("one")));
+}
+
 // Volumes without a directory flush ===================================================================================
 
 fn os(code: i32) -> io::Error {

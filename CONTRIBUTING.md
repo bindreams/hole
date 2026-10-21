@@ -696,13 +696,16 @@ re-derive them.
    file, a link, a FIFO) is unlinked and replaced, never written through, and an existing file's owner and mode are
    left alone.
 
-1. **Read through the handle too.** A privileged read of a fixed name in such a folder is `Dir::read` after the
+1. **Read through the handle too.** A privileged read of a fixed name in such a folder is `ReadDir::read` after the
    same walk (`util::dir::read_state_file` for a state file). `std::fs::read` opens by path without `O_NONBLOCK`: a
    FIFO the user plants at the name hangs the bridge (at start, before it serves; at shutdown, before it tears
    down), a link to `/dev/zero` is read without end, and a link is read as any path the user names. A read by
-   path stays only where the reader is the unprivileged GUI. A read opens the directory with `Dir::open_read`
-   (`read_state_file` does): Windows is then not asked for the right to add to it, so a folder whose ACL a
-   machine tightened to read-only for the reader (the GUI reads the update marker as the user) is still read.
+   path stays only where the reader is the unprivileged GUI. Code that only reads holds a `ReadDir`, not a `Dir`:
+   it has no method that writes, renames or removes, so writing through a directory opened for reading cannot be
+   written, on any platform. Windows is not asked for the right to add to a `ReadDir`'s directory, so a folder
+   whose ACL a machine tightened to read-only for the reader (the GUI reads the update marker as the user) is
+   still read. Code that also writes opens a `Dir` and takes a `ReadDir` view of it with `Dir::reader`
+   (`VersionedFile::store` and `remove` read the current file that way; `load` opens a `ReadDir`).
 
 1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a
    temp file, before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).

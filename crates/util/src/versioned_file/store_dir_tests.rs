@@ -191,7 +191,7 @@ struct SwapsOnRead {
 
 #[cfg(unix)]
 impl super::Fs for SwapsOnRead {
-    fn read(&self, dir: &crate::dir::Dir, name: &std::ffi::OsStr) -> std::io::Result<Vec<u8>> {
+    fn read(&self, dir: &crate::dir::ReadDir, name: &std::ffi::OsStr) -> std::io::Result<Vec<u8>> {
         if !self.swapped.swap(true, std::sync::atomic::Ordering::SeqCst) {
             std::fs::rename(self.root.join("state"), self.root.join("moved"))?;
             plant_link(&self.root.join("outside"), &self.root.join("state"));
