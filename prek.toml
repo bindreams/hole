@@ -242,5 +242,6 @@ rev = "v2.4.10"
 hooks = [
   # `ui/generated.ts` is machine-generated (gen-ui-constants) — exclude it so biome
   # never reformats it out of sync with the generator's output.
+  # renovate: datasource=npm depName=@biomejs/biome
   { id = "biome-check", additional_dependencies = ["@biomejs/biome@2.1.1"], exclude = "^ui/generated\\.ts$" },
 ]

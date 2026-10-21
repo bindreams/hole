@@ -675,7 +675,7 @@ pub struct DnsForwarder {
     /// cannot change without a reconfigure; log-first-1-forever is
     /// correct there.
     ipv6_skip_logged: Mutex<HashSet<IpAddr>>,
-    /// Cumulative upstream bytes — see [`UpstreamBytes`]. Written by
+    /// Cumulative upstream bytes — see `UpstreamBytes`. Written by
     /// `forward_one` on every attempt, read by snapshot/diff.
     upstream_read: AtomicU64,
     upstream_written: AtomicU64,

@@ -1,5 +1,5 @@
 //! TCP/UDP dispatcher — thin orchestrator around `tun_engine::Engine` and
-//! [`HoleRouter`](crate::hole_router::HoleRouter).
+//! [`HoleRouter`].
 //!
 //! Owned by `ProxyManager::start`, destroyed on `stop`. The actual
 //! packet-loop and smoltcp state live inside `tun_engine`; this struct

@@ -284,7 +284,7 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub filters: Vec<FilterRule>,
     /// Built-in DNS forwarder configuration. Defaults to
-    /// [`DnsConfig::default()`] (enabled, DoH to Cloudflare). Older clients
+    /// `DnsConfig::default()` (enabled, DoH to Cloudflare). Older clients
     /// that don't send this field get the default, which silently enables
     /// the forwarder on upgrade.
     #[serde(default)]
@@ -312,7 +312,7 @@ pub struct ProxyConfig {
     pub local_port_http: u16,
     /// Enable per-TCP-connection plugin tap diagnostics in `bridge.log`.
     /// Defaults to `false`. When `true`, the bridge wraps the plugin
-    /// chain in [`garter::TapPlugin`] so per-connection
+    /// chain in `garter::TapPlugin` so per-connection
     /// `bytes_to_plugin` / `bytes_from_plugin` / `ttfb_ms` / `close_kind`
     /// land in the log. Sourced from
     /// [`crate::config::AppConfig::diagnostic_plugin_tap`]; the bridge

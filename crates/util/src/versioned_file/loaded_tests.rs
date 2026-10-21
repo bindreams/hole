@@ -4,7 +4,7 @@ use std::sync::Arc;
 use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
-use super::{CannotRead, Loaded, Raw};
+use super::{CannotRead, Loaded, Raw, WhyUnreadable};
 use crate::parse_error::ParseFailure;
 use crate::versioned_file::fixtures::{dir, put, DroppedFile, MaxVersionFile, NoteV3, OsRecordFile, UnversionedConfig};
 use crate::versioned_file::store::Fs;
@@ -337,6 +337,69 @@ fn cannot_read_covers_exactly_newer_and_corrupt() {
     for (loaded, want) in all {
         assert_eq!(loaded.cannot_read(), want, "{loaded:?}");
     }
+}
+
+// into_actionable =====================================================================================================
+
+/// One row per `Loaded` variant, written out by hand.
+#[skuld::test]
+fn into_actionable_names_why_a_file_that_exists_is_not_one_to_act_on() {
+    let raw = || Raw::new(b"x".to_vec());
+    let corrupt = || Loaded::<NoteV3>::Corrupt {
+        failure: ParseFailure::framing("test"),
+        raw: raw(),
+    };
+    let newer = || Loaded::<NoteV3>::Newer {
+        found: Some(9),
+        raw: raw(),
+    };
+    let unreadable = || Loaded::<NoteV3>::Unreadable(io::Error::from(io::ErrorKind::PermissionDenied));
+
+    assert_eq!(
+        Loaded::<NoteV3>::Current {
+            value: note(&["a"], true),
+            found: 3,
+        }
+        .into_actionable()
+        .unwrap(),
+        Some(note(&["a"], true))
+    );
+    assert_eq!(Loaded::<NoteV3>::Absent.into_actionable().unwrap(), None);
+    // Dropped on purpose by the chain's floor: nothing to act on, nothing unreadable.
+    assert_eq!(
+        Loaded::<NoteV3>::Obsolete { found: 1, raw: raw() }
+            .into_actionable()
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        corrupt().into_actionable().unwrap_err(),
+        WhyUnreadable::CannotRead(CannotRead::Corrupt)
+    );
+    assert_eq!(
+        newer().into_actionable().unwrap_err(),
+        WhyUnreadable::CannotRead(CannotRead::Newer)
+    );
+    assert_eq!(
+        unreadable().into_actionable().unwrap_err(),
+        WhyUnreadable::ReadFailed(io::ErrorKind::PermissionDenied)
+    );
+}
+
+#[skuld::test]
+fn why_unreadable_reads_as_a_clause_that_names_the_cause() {
+    assert_eq!(
+        WhyUnreadable::CannotRead(CannotRead::Newer).to_string(),
+        "it is from a newer release"
+    );
+    assert_eq!(
+        WhyUnreadable::CannotRead(CannotRead::Corrupt).to_string(),
+        "it is corrupt"
+    );
+    assert_eq!(
+        WhyUnreadable::ReadFailed(io::ErrorKind::PermissionDenied).to_string(),
+        "the read failed (permission denied)"
+    );
 }
 
 // Raw and redaction ===================================================================================================

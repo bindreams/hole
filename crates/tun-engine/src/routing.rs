@@ -7,12 +7,14 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use util::system_tool::SystemTool;
+use util::versioned_file::StoreError;
 
-use crate::error::{CommandFailure, RouteCommandError, RoutingError};
+use crate::error::{CheckpointFailure, CommandFailure, RouteCommandError, RoutingError, SetupFailure};
 use crate::gateway::{self, get_default_gateway_info, tun_ipv6_available, GatewayInfo, NextHop};
 
 /// Total number of routing subprocess spawns this process has performed.
@@ -502,7 +504,8 @@ fn run_command<P: Phase>(mut command: Command, cmd: String, phase: P) -> Result<
 ///
 /// A pre-command checkpoint failure aborts immediately (mirrors the
 /// write-before-mutate ordering contract: this codebase must not run a
-/// mutation it failed to record first) and its `Err` propagates; the id is
+/// mutation it failed to record first) and propagates as
+/// [`SetupFailure::Checkpoint`], not as a failure of the command; the id is
 /// popped back out first — the write never durably happened, so the command
 /// is treated exactly like one that never ran. A post-command checkpoint
 /// failure does not abort — the record it failed to write is a narrowing,
@@ -522,8 +525,8 @@ pub(crate) fn setup_routes<R>(
     gateway: &GatewayInfo,
     installed: &mut Vec<RouteId>,
     runner: R,
-    checkpoint: impl FnMut(&[RouteId]) -> std::io::Result<()>,
-) -> Result<(), RouteCommandError>
+    checkpoint: impl FnMut(&[RouteId]) -> Result<(), CheckpointFailure>,
+) -> Result<(), SetupFailure>
 where
     R: Fn(SystemTool, &[String], FatalPhase) -> Result<(), CommandFailure>,
 {
@@ -542,8 +545,8 @@ fn run_setup_commands<R>(
     commands: &[SetupCommand],
     installed: &mut Vec<RouteId>,
     runner: R,
-    mut checkpoint: impl FnMut(&[RouteId]) -> std::io::Result<()>,
-) -> Result<(), RouteCommandError>
+    mut checkpoint: impl FnMut(&[RouteId]) -> Result<(), CheckpointFailure>,
+) -> Result<(), SetupFailure>
 where
     R: Fn(SystemTool, &[String], FatalPhase) -> Result<(), CommandFailure>,
 {
@@ -552,12 +555,7 @@ where
         installed.push(cmd.id);
         if let Err(e) = checkpoint(installed) {
             installed.pop();
-            return Err(RouteCommandError {
-                program: cmd.tool.name().to_string(),
-                index,
-                total,
-                failure: CommandFailure::Spawn(e),
-            });
+            return Err(SetupFailure::Checkpoint(e));
         }
         if let Err(failure) = runner(cmd.tool, &cmd.args, FatalPhase::Setup) {
             installed.pop();
@@ -586,12 +584,12 @@ where
                     warn!(error = %e, id = ?cmd.id, "failed to checkpoint route-state after fatal setup command");
                 }
             }
-            return Err(RouteCommandError {
+            return Err(SetupFailure::Command(RouteCommandError {
                 program: cmd.tool.name().to_string(),
                 index,
                 total,
                 failure,
-            });
+            }));
         }
         if let Err(e) = checkpoint(installed) {
             warn!(error = %e, id = ?cmd.id, "failed to checkpoint route-state after install command");
@@ -804,16 +802,26 @@ where
 /// identity with an already-carried-forward group merges into it instead of
 /// growing the list, and an unplannable-only group never reaches the runner.
 /// See CONTRIBUTING's Route ownership section.
+///
+/// Fails with [`RoutingError::StateUnreadable`], before anything is swept or
+/// written, over a record that cannot be read: an install over it would leave
+/// what it names untracked.
 fn sweep_leftover_before_install<R>(
-    state_dir: &Path,
+    record_file: &state::RouteFile,
     owner: Option<(u32, u32)>,
     persisted: &mut state::RouteState,
     runner: R,
-) where
+) -> Result<(), RoutingError>
+where
     R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
-    let Some(leftover) = state::load(state_dir) else {
-        return;
+    let leftover = match state::read(record_file) {
+        state::Found::Records(leftover) => leftover,
+        state::Found::Nothing => return Ok(()),
+        state::Found::Unreadable { path, cause } => {
+            error!(path = %path.display(), %cause, "route record cannot be read; refusing to install over it");
+            return Err(RoutingError::StateUnreadable { path });
+        }
     };
     let mut groups = leftover.stale;
     if !leftover.installed.is_empty() {
@@ -828,28 +836,29 @@ fn sweep_leftover_before_install<R>(
     }
     let groups = state::coalesce(groups);
     if groups.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Record the full carried-forward set up front — a superset is always
     // safe to persist, so this cannot lose information even if the process
     // crashes before a single sweep command below runs.
     persisted.stale = groups;
-    if let Err(e) = state::save(state_dir, persisted, owner) {
+    if let Err(e) = state::write(record_file, persisted, owner) {
         warn!(error = %e, "failed to checkpoint carried-forward stale route state before install");
     }
     warn!(groups = ?persisted.stale, "sweeping route records retained from a prior run before this install");
 
     persisted.stale = recover_groups(std::mem::take(&mut persisted.stale), &runner, |updated| {
         persisted.stale = updated.to_vec();
-        if let Err(e) = state::save(state_dir, persisted, owner) {
+        if let Err(e) = state::write(record_file, persisted, owner) {
             warn!(error = %e, "failed to checkpoint stale-route sweep");
         }
     });
     persisted.stale.retain(|g| !g.installed.is_empty());
-    if let Err(e) = state::save(state_dir, persisted, owner) {
+    if let Err(e) = state::write(record_file, persisted, owner) {
         warn!(error = %e, "failed to checkpoint stale-route sweep result");
     }
+    Ok(())
 }
 
 /// Best-effort delete a leftover `ServerBypass` route to `dest`, so
@@ -868,12 +877,21 @@ fn sweep_leftover_before_install<R>(
 /// deletion. Checks both the primary record and every carried-forward
 /// `stale` group, since either can hold a `ServerBypass` a prior sweep could
 /// not confirm gone.
-fn clear_stale_server_bypass<R>(state_dir: &Path, owner: Option<(u32, u32)>, dest: IpAddr, runner: R)
+fn clear_stale_server_bypass<R>(record_file: &state::RouteFile, owner: Option<(u32, u32)>, dest: IpAddr, runner: R)
 where
     R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
-    let Some(mut leftover) = state::load(state_dir) else {
-        return;
+    let mut leftover = match state::read(record_file) {
+        state::Found::Records(leftover) => leftover,
+        state::Found::Nothing => return,
+        state::Found::Unreadable { path, cause } => {
+            error!(
+                path = %path.display(),
+                %cause,
+                "route record cannot be read; its stale server-bypass route is not cleared"
+            );
+            return;
+        }
     };
     let mut changed = false;
 
@@ -902,7 +920,7 @@ where
     leftover.stale.retain(|g| !g.installed.is_empty());
 
     if changed {
-        if let Err(e) = state::save(state_dir, &leftover, owner) {
+        if let Err(e) = state::write(record_file, &leftover, owner) {
             warn!(error = %e, "failed to checkpoint stale server-bypass clear before gateway query");
         }
     }
@@ -944,14 +962,71 @@ where
 /// happened reads as "durably recorded, fate unknown" instead of "never
 /// happened" (see `setup_routes`'s own doc on pre-command checkpoint
 /// failure).
+///
+/// A record that became unreadable since the sweep read it is refused, not
+/// replaced. The failure `setup_routes` sees carries no path (it reaches a
+/// toast); the full error, path included, is logged here.
 fn checkpoint_installed(
     persisted: &mut state::RouteState,
-    state_dir: &Path,
+    record_file: &state::RouteFile,
     owner: Option<(u32, u32)>,
     ids: &[RouteId],
-) -> std::io::Result<()> {
+) -> Result<(), CheckpointFailure> {
+    checkpoint_installed_with(persisted, record_file.path(), ids, |state| {
+        state::write(record_file, state, owner)
+    })
+}
+
+/// [`checkpoint_installed`] over an injectable write.
+fn checkpoint_installed_with(
+    persisted: &mut state::RouteState,
+    record: &Path,
+    ids: &[RouteId],
+    write: impl FnOnce(&state::RouteState) -> Result<(), StoreError>,
+) -> Result<(), CheckpointFailure> {
     let prev = std::mem::replace(&mut persisted.installed, ids.to_vec());
-    state::save(state_dir, persisted, owner).inspect_err(|_| persisted.installed = prev)
+    match write(persisted) {
+        Ok(()) => Ok(()),
+        // The record on disk already lists `ids`: the checkpoint landed, only its
+        // durability is unconfirmed. Treating it as a failure would leave disk
+        // listing routes memory says were never installed, and a recovery from
+        // that record would delete routes Hole never installed.
+        Err(StoreError::PublishedNotFinalized(e)) => {
+            warn!(path = %record.display(), error = %e, "route record replaced, but not known durable");
+            Ok(())
+        }
+        Err(e) => {
+            persisted.installed = prev;
+            Err(checkpoint_failure(e))
+        }
+    }
+}
+
+/// The failure `setup_routes` sees for a checkpoint that did not land.
+fn checkpoint_failure(e: StoreError) -> CheckpointFailure {
+    match e {
+        StoreError::Io(e) => {
+            error!(error = %e, "route record could not be written");
+            CheckpointFailure::Io { kind: e.kind() }
+        }
+        StoreError::Unreadable { path, cause } => {
+            error!(path = %path.display(), %cause, "route record cannot be read; the checkpoint is refused");
+            CheckpointFailure::RecordUnreadable { path }
+        }
+        StoreError::ReadFailed { path, kind } => {
+            error!(path = %path.display(), ?kind, "route record cannot be read; the checkpoint is refused");
+            CheckpointFailure::RecordUnreadable { path }
+        }
+        StoreError::PublishedNotFinalized(_) => {
+            unreachable!("a published checkpoint is not a failure: see `checkpoint_installed`")
+        }
+        StoreError::Encode(what) => {
+            error!(what, "route record could not be encoded");
+            CheckpointFailure::Io {
+                kind: std::io::ErrorKind::Other,
+            }
+        }
+    }
 }
 
 /// Run a single command, feeding `stdin` if present and returning the full
@@ -1258,7 +1333,22 @@ where
     // from under each other: a SOCKS5-only bridge unconditionally issuing
     // `netsh delete route ... hole-tun` on startup would tear down the
     // routes of a concurrent TUN bridge mid-flight.
-    let route_state = state::load(state_dir);
+    let record_file = state::file(state_dir);
+    let route_state = match state::read(&record_file) {
+        state::Found::Records(record) => Some(record),
+        state::Found::Nothing => None,
+        state::Found::Unreadable { path, cause } => {
+            // Left exactly as it is, and no route command runs against it:
+            // what it names cannot be told from routes another VPN now holds.
+            // The cover steps below do not depend on it and still run.
+            error!(
+                path = %path.display(),
+                %cause,
+                "route record cannot be read; route recovery leaves it and deletes no route"
+            );
+            None
+        }
+    };
     if let Some(loaded) = route_state.clone() {
         let tun_name = loaded.tun_name.clone();
         let server_ip = loaded.server_ip;
@@ -1307,7 +1397,6 @@ where
         };
 
         let mut persisted = state::RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: tun_name.clone(),
             server_ip,
             interface_name: interface_name.clone(),
@@ -1325,7 +1414,7 @@ where
             let (primary, stale): (Vec<_>, Vec<_>) = groups.iter().cloned().partition(is_primary);
             persisted.installed = primary.into_iter().next().map(|g| g.installed).unwrap_or_default();
             persisted.stale = stale;
-            if let Err(e) = state::save(state_dir, &persisted, owner) {
+            if let Err(e) = state::write(&record_file, &persisted, owner) {
                 warn!(error = %e, "failed to checkpoint route-state during recovery — recorded routes may be stale if this process now crashes");
             }
         });
@@ -1342,11 +1431,18 @@ where
         // command, so a non-empty remainder is already recorded — the
         // next startup's recovery will retry exactly those ids.
         if still_installed.is_empty() && persisted.stale.is_empty() {
-            if let Err(e) = state::clear(state_dir) {
-                warn!(error = %e, "failed to clear route-state file during recovery");
+            match state::remove(&record_file) {
+                Ok(state::Cleared::Gone) => {}
+                Ok(state::Cleared::Kept) => {
+                    error!(
+                        path = %record_file.path().display(),
+                        "routes recovered, but the route record cannot be read now; left in place"
+                    );
+                }
+                Err(e) => warn!(error = %e, "failed to clear route-state file during recovery"),
             }
         } else {
-            if let Err(e) = state::save(state_dir, &persisted, owner) {
+            if let Err(e) = state::write(&record_file, &persisted, owner) {
                 warn!(error = %e, "failed to checkpoint route-state after recovery's stale-group sweep");
             }
             warn!(
@@ -1623,6 +1719,7 @@ pub trait Routing: Send + Sync {
 /// `state_dir` where `bridge-routes.json` lives for crash recovery.
 pub struct SystemRouting {
     state_dir: PathBuf,
+    record_file: Arc<state::RouteFile>,
     /// uid/gid to chown persisted state files to (an elevated user-scoped run
     /// hands the real user here); `None` leaves ownership as-is.
     owner: Option<(u32, u32)>,
@@ -1630,7 +1727,19 @@ pub struct SystemRouting {
 
 impl SystemRouting {
     pub fn new(state_dir: PathBuf, owner: Option<(u32, u32)>) -> Self {
-        Self { state_dir, owner }
+        Self {
+            record_file: Arc::new(state::file(&state_dir)),
+            state_dir,
+            owner,
+        }
+    }
+
+    /// Routes the install-time reads and checkpoint writes of the route record
+    /// through `fs`, so a test can fail one.
+    #[cfg(test)]
+    fn with_record_fs(mut self, fs: std::sync::Arc<dyn util::versioned_file::Fs>) -> Self {
+        self.record_file = Arc::new(state::RouteFile::with_fs(&self.state_dir, fs));
+        self
     }
 
     /// Best-effort delete of `confirmed` (the only ids ever safe to attempt —
@@ -1662,7 +1771,7 @@ impl SystemRouting {
         R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
     {
         persisted.installed = union_ids(confirmed, &extra_unconfirmed);
-        if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+        if let Err(e) = state::write(&self.record_file, &persisted, self.owner) {
             warn!(error = %e, "failed to checkpoint route-state before install rollback — recorded routes may be stale if this process now crashes");
         }
 
@@ -1677,7 +1786,7 @@ impl SystemRouting {
             runner,
             |ids| {
                 persisted.installed = union_ids(ids, &extra_unconfirmed);
-                if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+                if let Err(e) = state::write(&self.record_file, &persisted, self.owner) {
                     warn!(error = %e, "failed to checkpoint route-state during install rollback — recorded routes may be stale if this process now crashes");
                 }
             },
@@ -1689,12 +1798,21 @@ impl SystemRouting {
         // clearing while `stale` is non-empty would destroy the only record
         // of that separate leak.
         if final_remaining.is_empty() && persisted.stale.is_empty() {
-            if let Err(e) = state::clear(&self.state_dir) {
-                warn!(error = %e, "failed to clear route-state after rollback — a stale record will trigger a redundant idempotent teardown next start");
+            match state::remove(&self.record_file) {
+                Ok(state::Cleared::Gone) => {}
+                Ok(state::Cleared::Kept) => {
+                    error!(
+                        path = %self.record_file.path().display(),
+                        "install rolled back, but the route record cannot be read; left in place"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to clear route-state after rollback — a stale record will trigger a redundant idempotent teardown next start");
+                }
             }
         } else {
             persisted.installed = final_remaining.clone();
-            if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+            if let Err(e) = state::write(&self.record_file, &persisted, self.owner) {
                 warn!(error = %e, "failed to record the retained route-state after rollback — routes may leak untracked");
             }
             warn!(
@@ -1727,7 +1845,7 @@ impl Routing for SystemRouting {
     }
 
     fn default_gateway(&self, dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
-        clear_stale_server_bypass(&self.state_dir, self.owner, dest, exec_one::<BestEffortPhase>);
+        clear_stale_server_bypass(&self.record_file, self.owner, dest, exec_one::<BestEffortPhase>);
         gateway::upstream_route(dest).map_err(|e| RoutingError::Gateway(e.to_string()))
     }
 
@@ -1827,7 +1945,6 @@ impl SystemRouting {
         // `persisted.stale` instead of this install's own first checkpoint
         // racing it for the same on-disk slot.
         let mut persisted = state::RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
@@ -1843,12 +1960,12 @@ impl SystemRouting {
         // process start, not once per tunnel start — a long-lived bridge
         // process reconnecting must retry this itself. Whatever still can't
         // be confirmed gone lands in `persisted.stale`, never dropped.
-        sweep_leftover_before_install(&self.state_dir, self.owner, &mut persisted, teardown_runner);
+        sweep_leftover_before_install(&self.record_file, self.owner, &mut persisted, teardown_runner)?;
 
         let mut installed = Vec::new();
         #[allow(clippy::disallowed_methods)] // install_with IS SystemRouting::install's implementation
         let setup_result = setup_routes(tun_name, server_ip, gateway, &mut installed, setup_runner, |ids| {
-            checkpoint_installed(&mut persisted, &self.state_dir, self.owner, ids)
+            checkpoint_installed(&mut persisted, &self.record_file, self.owner, ids)
         });
         // Whatever the last checkpoint durably wrote (see
         // `checkpoint_installed`) but `installed` no longer names (popped
@@ -1873,7 +1990,7 @@ impl SystemRouting {
                 uncertain,
                 teardown_runner,
             );
-            return Err(RoutingError::RouteSetup(e.to_string()));
+            return Err(e.into());
         }
 
         // A route whose command ran but did not confirm going in (e.g.
@@ -1914,7 +2031,7 @@ impl SystemRouting {
             interface_name: interface_name.to_owned(),
             original_gateway: gateway.gateway_ip,
             route_form: route_form_of(gateway),
-            state_dir: self.state_dir.clone(),
+            record_file: Arc::clone(&self.record_file),
             owner: self.owner,
             installed,
             stale: persisted.stale,
@@ -1959,9 +2076,11 @@ pub struct SystemRoutes {
     original_gateway: IpAddr,
     /// The IPv4 bypass route's form — see [`state::RouteForm`].
     route_form: state::RouteForm,
-    state_dir: PathBuf,
-    /// Forwarded to every checkpoint `state::save` in `Drop` — same
-    /// uid/gid-chown contract as `SystemRouting.owner`.
+    /// The same file object `install` used, so teardown reaches the record the
+    /// way install did.
+    record_file: Arc<state::RouteFile>,
+    /// Forwarded to every checkpoint in `Drop` — same uid/gid-chown contract
+    /// as `SystemRouting.owner`.
     owner: Option<(u32, u32)>,
     /// The routes `install` got into the table — the only ones Drop may delete.
     installed: Vec<RouteId>,
@@ -1986,19 +2105,14 @@ impl RoutesInstalled for SystemRoutes {
     }
 }
 
-impl Drop for SystemRoutes {
-    fn drop(&mut self) {
-        // Unconditional entry log so a reader can confirm this Drop
-        // actually ran on Stop (teardown-skipped diagnosis).
-        info!(
-            tun = %self.tun_name,
-            server_ip = %self.server_ip,
-            iface = %self.interface_name,
-            installed = ?self.installed,
-            "SystemRoutes::drop entered — tearing down routes"
-        );
+impl SystemRoutes {
+    /// Deletes the routes this guard installed through `runner` and settles
+    /// the record, but not the adapter (see [`Drop`]).
+    fn teardown_with<R>(&mut self, runner: R)
+    where
+        R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
+    {
         let mut persisted = state::RouteState {
-            version: state::SCHEMA_VERSION,
             tun_name: self.tun_name.clone(),
             server_ip: self.server_ip,
             interface_name: self.interface_name.clone(),
@@ -2015,10 +2129,10 @@ impl Drop for SystemRoutes {
             Some(self.original_gateway),
             self.route_form,
             &self.installed,
-            exec_one::<BestEffortPhase>,
+            runner,
             |ids| {
                 persisted.installed = ids.to_vec();
-                if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+                if let Err(e) = state::write(&self.record_file, &persisted, self.owner) {
                     warn!(error = %e, "failed to checkpoint route-state during teardown — recorded routes may be stale if this process now crashes");
                 }
             },
@@ -2031,8 +2145,15 @@ impl Drop for SystemRoutes {
         // remainder is already recorded — the next start's `recover_routes`
         // will retry exactly those ids.
         if remaining.is_empty() && self.stale.is_empty() {
-            if let Err(e) = state::clear(&self.state_dir) {
-                warn!(error = %e, "state-file clear failed in SystemRoutes::drop");
+            match state::remove(&self.record_file) {
+                Ok(state::Cleared::Gone) => {}
+                Ok(state::Cleared::Kept) => {
+                    error!(
+                        path = %self.record_file.path().display(),
+                        "routes torn down, but the route record cannot be read; left in place"
+                    );
+                }
+                Err(e) => warn!(error = %e, "state-file clear failed in SystemRoutes::drop"),
             }
         } else {
             warn!(
@@ -2041,6 +2162,21 @@ impl Drop for SystemRoutes {
                 "keeping route-state for the next start's recovery — some teardown commands did not confirm their route is gone"
             );
         }
+    }
+}
+
+impl Drop for SystemRoutes {
+    fn drop(&mut self) {
+        // Unconditional entry log so a reader can confirm this Drop
+        // actually ran on Stop (teardown-skipped diagnosis).
+        info!(
+            tun = %self.tun_name,
+            server_ip = %self.server_ip,
+            iface = %self.interface_name,
+            installed = ?self.installed,
+            "SystemRoutes::drop entered — tearing down routes"
+        );
+        self.teardown_with(exec_one::<BestEffortPhase>);
         // Belt-and-suspenders post-teardown wintun adapter cleanup.
         // `bridge::Dispatcher::drop` synchronously drains the engine task
         // so wintun's own Drop runs; this is the safety net for paths that
@@ -2469,3 +2605,7 @@ fn platform_bypass_teardown_command(
 #[cfg(test)]
 #[path = "routing_tests.rs"]
 mod routing_tests;
+
+#[cfg(test)]
+#[path = "routing_unreadable_tests.rs"]
+mod routing_unreadable_tests;

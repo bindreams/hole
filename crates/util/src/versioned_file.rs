@@ -62,8 +62,10 @@ mod store;
 mod sys;
 
 pub use chain::{Chain, ChainError, Obsolete, Schema};
-pub use loaded::{CannotRead, Loaded, Raw};
+pub use loaded::{CannotRead, Loaded, Raw, WhyUnreadable};
 pub use role::{RemoveOver, Role, StoreOver};
+#[cfg(feature = "test-support")]
+pub use store::Fs;
 pub use store::{DefaultPlacement, Placement, Removal, StoreError, VersionedFile};
 
 #[cfg(test)]

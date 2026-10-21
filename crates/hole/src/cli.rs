@@ -403,7 +403,7 @@ fn resolved_owner(_service: bool) -> Option<()> {
     None
 }
 
-/// Extract `(uid, gid)` from a resolved [`RealUser`]. Named `to_ids` (not
+/// Extract `(uid, gid)` from a resolved [`hole_bridge::group::RealUser`]. Named `to_ids` (not
 /// `to_uid_gid`/a method) to avoid shadowing the local `owner_ids` binding at
 /// the call site.
 #[cfg(target_os = "macos")]

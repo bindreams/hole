@@ -17,17 +17,26 @@ Run with admin/root privileges:
 from __future__ import annotations
 
 import argparse
+import io
+import ipaddress
 import json
 import os
 import platform
+import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 import _lib
 
 # Keep in sync with `crates/tun-engine/src/routing/state.rs::STATE_FILE_NAME`.
+# Flat JSON object; this script reads only `server_ip` and ignores other keys,
+# so a newer release's file still works.
 STATE_FILE_NAME = "bridge-routes.json"
 # Keep in sync with `crates/bridge/src/dns_state.rs::STATE_FILE_NAME` /
 # `SUPERSEDED_FILE_NAME`. The bridge's own upgrade sweep (bindreams/hole#846)
@@ -39,24 +48,15 @@ DNS_STATE_FILE_NAME = "bridge-dns.json"
 DNS_STATE_SUPERSEDED_FILE_NAME = "bridge-dns.superseded.json"
 
 
-def load_dns_state_file() -> tuple[dict, Path] | None:
-    """Return the first valid parsed DNS state file found across candidate
-    state directories — checking the un-suffixed name before the superseded
-    one — plus the path it came from. Mirrors `load_state_file` but for
-    DNS."""
-    for name in (DNS_STATE_FILE_NAME, DNS_STATE_SUPERSEDED_FILE_NAME):
-        for d in candidate_state_dirs():
-            path = d / name
-            if not path.exists():
-                continue
-            try:
-                with path.open() as f:
-                    data = json.load(f)
-                print(f"  Found DNS state file at {path}")
-                return data, path
-            except (json.JSONDecodeError, OSError) as e:
-                print(f"  Skipping {path} (parse error: {e})")
-    return None
+def load_dns_state_file() -> tuple[tuple[dict, Path] | None, list[Path]]:
+    """Return the first readable DNS state file found across candidate state
+    directories — checking the un-suffixed name before the superseded one —
+    plus the path it came from, and the paths of those that exist but could
+    not be read. Mirrors `load_state_file` but for DNS."""
+    return load_first_record(
+        (d / name for name in (DNS_STATE_FILE_NAME, DNS_STATE_SUPERSEDED_FILE_NAME) for d in candidate_state_dirs()),
+        validate_dns_record,
+    )
 
 
 def _split_advertised(advertised: list[str]) -> tuple[list[str], list[str]]:
@@ -86,12 +86,11 @@ def live_dns_windows(alias: str, family: str) -> list[str] | None:
     `Get-DnsClientServerAddress`. `None` on any failure — a read failure is
     never treated as evidence of a match."""
     fam_flag = "IPv4" if family == "ipv4" else "IPv6"
-    result = run([
-        "powershell",
-        "-Command",
-        f'(Get-DnsClientServerAddress -InterfaceAlias "{alias}" -AddressFamily {fam_flag} '
-        f"-ErrorAction SilentlyContinue).ServerAddresses -join ','",
-    ])
+    result = powershell(
+        f"(Get-DnsClientServerAddress -InterfaceAlias ([WildcardPattern]::Escape($env:{ARG_ALIAS})) "
+        f"-AddressFamily {fam_flag} -ErrorAction SilentlyContinue).ServerAddresses -join ','",
+        {ARG_ALIAS: alias},
+    )
     if result.returncode != 0:
         return None
     text = result.stdout.strip()
@@ -112,18 +111,48 @@ def live_dns_macos(svc: str) -> list[str] | None:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def restore_dns_windows(state: dict, *, force: bool) -> bool:
-    """Returns True iff every recorded family was either restored or
-    skipped by explicit --force (i.e. nothing was left unconfirmed)."""
+@dataclass
+class DnsRestore:
+    """What a DNS restore pass left undone. The record may be deleted only if it
+    left nothing undone."""
+
+    skipped: bool = False  # a family was left alone: live DNS is not provably Hole's
+    failed: bool = False  # a restore command could not be run or did not succeed
+
+    @property
+    def complete(self) -> bool:
+        return not (self.skipped or self.failed)
+
+    def attempt(self, cmd: list[str]) -> bool:
+        """Run one restore command; record and return whether it succeeded."""
+        succeeded = run(cmd).returncode == 0
+        self.failed = self.failed or not succeeded
+        return succeeded
+
+    def unrestorable(self, what: str) -> None:
+        """Record an entry this script cannot restore, so the record is kept."""
+        print(f"  Cannot restore {what}; keeping the record.")
+        self.failed = True
+
+
+def _netsh_dns(family: str, verb: str, alias: str, *rest: str) -> list[str]:
+    return ["netsh", "interface", family, verb, "dnsservers", f"name={alias}", *rest]
+
+
+def restore_dns_windows(state: dict, *, force: bool) -> DnsRestore:
+    """Restore each recorded family, or skip it (`skipped`) when live DNS is not
+    provably Hole's, unless `force`. `failed` is set if a restore command fails."""
     print("Restoring prior DNS settings (Windows)...")
-    any_skipped = False
+    outcome = DnsRestore()
     advertised_v4, advertised_v6 = _split_advertised(state.get("advertised", []))
     for adapter in state.get("adapters", []):
         id_obj = adapter.get("id", {})
         if id_obj.get("kind") != "windows_alias":
+            outcome.unrestorable(f"an adapter of kind {id_obj.get('kind')!r} on Windows")
             continue
         alias = id_obj.get("value")
         if not alias:
+            outcome.unrestorable("an adapter with no alias")
             continue
         for family, field, advertised_family in (
             ("ipv4", "v4", advertised_v4),
@@ -137,72 +166,43 @@ def restore_dns_windows(state: dict, *, force: bool) -> bool:
                         f"advertised ({advertised_family}) — this setting may belong to someone else "
                         f"now. Re-run with --force-dns-restore to override."
                     )
-                    any_skipped = True
+                    outcome.skipped = True
                     continue
             prior = adapter.get(field, {})
             kind = prior.get("kind")
             if kind == "dhcp":
-                run([
-                    "netsh",
-                    "interface",
-                    family,
-                    "set",
-                    "dnsservers",
-                    f"name={alias}",
-                    "dhcp",
-                ])
+                outcome.attempt(_netsh_dns(family, "set", alias, "dhcp"))
             elif kind == "none":
-                run([
-                    "netsh",
-                    "interface",
-                    family,
-                    "set",
-                    "dnsservers",
-                    f"name={alias}",
-                    "static",
-                    "none",
-                ])
+                outcome.attempt(_netsh_dns(family, "set", alias, "static", "none"))
             elif kind == "static":
                 servers = prior.get("servers", [])
                 if not servers:
+                    # The bridge restores an empty static list as a blank NameServer, which is DHCP.
+                    outcome.attempt(_netsh_dns(family, "set", alias, "dhcp"))
                     continue
-                run([
-                    "netsh",
-                    "interface",
-                    family,
-                    "set",
-                    "dnsservers",
-                    f"name={alias}",
-                    "static",
-                    servers[0],
-                    "primary",
-                ])
+                # The `add`s extend the list the `set` starts, so they need it to have succeeded.
+                if not outcome.attempt(_netsh_dns(family, "set", alias, "static", servers[0], "primary")):
+                    continue
                 for idx, ip in enumerate(servers[1:], start=2):
-                    run([
-                        "netsh",
-                        "interface",
-                        family,
-                        "add",
-                        "dnsservers",
-                        f"name={alias}",
-                        ip,
-                        f"index={idx}",
-                    ])
-    return not any_skipped
+                    outcome.attempt(_netsh_dns(family, "add", alias, ip, f"index={idx}"))
+            else:
+                outcome.unrestorable(f"{alias} ({family}): prior setting of kind {kind!r}")
+    return outcome
 
 
-def restore_dns_macos(state: dict, *, force: bool) -> bool:
-    """Returns True iff nothing was left unconfirmed — see
-    `restore_dns_windows`'s doc."""
+def restore_dns_macos(state: dict, *, force: bool) -> DnsRestore:
+    """The macOS counterpart of `restore_dns_windows`."""
     print("Restoring prior DNS settings (macOS)...")
-    any_skipped = False
+    outcome = DnsRestore()
     advertised_v4, advertised_v6 = _split_advertised(state.get("advertised", []))
     for adapter in state.get("adapters", []):
         id_obj = adapter.get("id", {})
         if id_obj.get("kind") != "macos_service_name":
+            outcome.unrestorable(f"an adapter of kind {id_obj.get('kind')!r} on macOS")
             continue
         svc = id_obj.get("value")
         if not svc:
+            outcome.unrestorable("a network service with no name")
             continue
 
         if not force:
@@ -218,9 +218,14 @@ def restore_dns_macos(state: dict, *, force: bool) -> bool:
                     f"({advertised_combined}) — this setting may belong to someone else now. "
                     f"Re-run with --force-dns-restore to override."
                 )
-                any_skipped = True
+                outcome.skipped = True
                 continue
 
+        kinds = [adapter.get(field, {}).get("kind") for field in ("v4", "v6")]
+        unknown = [k for k in kinds if k not in ("dhcp", "none", "static")]
+        if unknown:
+            outcome.unrestorable(f"{svc}: prior setting of kind {unknown[0]!r}")
+            continue
         combined: list[str] = []
         saw_static = False
         for field in ("v4", "v6"):
@@ -229,10 +234,10 @@ def restore_dns_macos(state: dict, *, force: bool) -> bool:
                 saw_static = True
                 combined.extend(prior.get("servers", []))
         if saw_static and combined:
-            run(["networksetup", "-setdnsservers", svc, *combined])
+            outcome.attempt(["networksetup", "-setdnsservers", svc, *combined])
         else:
-            run(["networksetup", "-setdnsservers", svc, "Empty"])
-    return not any_skipped
+            outcome.attempt(["networksetup", "-setdnsservers", svc, "Empty"])
+    return outcome
 
 
 def clear_dns_state_file(path: Path) -> None:
@@ -246,9 +251,31 @@ def clear_dns_state_file(path: Path) -> None:
         print(f"  Failed to remove {path}: {e}")
 
 
-def run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
-    print(f"  $ {' '.join(cmd)}")
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+def run(cmd: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run `cmd` (never through a shell), with `env` added to the environment.
+    Never raises: a command that could not be started or that the OS refused
+    (too long, missing, ...) is reported and returned as a failed result, so the
+    steps after it still run."""
+    prefix = "".join(f"{k}={v} " for k, v in (env or {}).items())
+    print(f"  $ {prefix}{' '.join(cmd)}")
+    try:
+        return subprocess.run(
+            cmd, check=False, capture_output=True, text=True, errors="replace", env={**os.environ, **(env or {})}
+        )
+    except Exception as e:  # noqa: BLE001 - whatever stops the command from running is a failed command
+        print(f"  ! {cmd[0]} could not be run ({type(e).__name__}: {e})")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=str(e))
+
+
+# A record value reaches PowerShell as an environment variable the command reads
+# as `$env:NAME`, never spliced into the command text, so it cannot become code.
+ARG_ALIAS = "HOLE_RESET_ALIAS"
+ARG_IP = "HOLE_RESET_IP"
+
+
+def powershell(command: str, args: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run `command` in PowerShell. Pass record values in `args` (name -> value)."""
+    return run(["powershell", "-Command", command], env=args)
 
 
 def candidate_state_dirs() -> list[Path]:
@@ -268,21 +295,125 @@ def candidate_state_dirs() -> list[Path]:
     return dirs
 
 
-def load_state_file() -> dict | None:
-    """Return the first valid parsed state file found across candidate
-    directories, or None if none exists / all are corrupted."""
-    for d in candidate_state_dirs():
-        path = d / STATE_FILE_NAME
-        if not path.exists():
-            continue
+def load_state_file() -> tuple[tuple[dict, Path] | None, list[Path]]:
+    """Return the first readable route state file found across candidate
+    directories (None if there is none) plus its path, and the paths of those
+    that exist but could not be read. An unreadable file is never touched: it
+    may name a route this script cannot identify."""
+    return load_first_record((d / STATE_FILE_NAME for d in candidate_state_dirs()), validate_route_record)
+
+
+# Records ==============================================================================================================
+#
+# Every state record this script reads goes through `load_first_record`. The
+# files live in directories a user can write, so a record is trusted for
+# nothing: it is readable only if it parses AND has, in every field a reset
+# step uses, the type and shape the Rust writer produces.
+
+
+def _read_regular_file(path: Path) -> bytes:
+    """The bytes of `path`, which must be a regular file. A FIFO would block the
+    open and a device such as `/dev/zero` would never end, so the type is checked
+    on the open descriptor (`O_NONBLOCK` keeps the open itself from blocking)."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read()
+    finally:
+        os.close(fd)
+
+
+def load_first_record(
+    paths: Iterable[Path], validate: Callable[[object], None]
+) -> tuple[tuple[dict, Path] | None, list[Path]]:
+    """Read, decode, parse and `validate` each path in turn. Returns the first
+    readable record with its path, and the paths that exist but could not be
+    read, which are reported and left in place. A missing path is skipped
+    silently. Any exception while reading makes a record unreadable."""
+    unreadable: list[Path] = []
+    for path in paths:
         try:
-            with path.open() as f:
-                data = json.load(f)
-            print(f"  Found state file at {path}")
-            return data
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"  Skipping {path} (parse error: {e})")
-    return None
+            record = json.loads(_read_regular_file(path).decode("utf-8"))
+            validate(record)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except Exception as e:  # noqa: BLE001 - whatever the record does to us, it is unreadable
+            print(f"  Skipping {path} ({type(e).__name__}: {e})")
+            unreadable.append(path)
+            continue
+        print(f"  Found state file at {path}")
+        return (record, path), unreadable
+    return None, unreadable
+
+
+def _text(value: object, what: str) -> str:
+    """A string that can be passed as a process argument."""
+    if not isinstance(value, str):
+        raise TypeError(f"{what} is not a string")
+    if "\0" in value:
+        raise ValueError(f"{what} contains a NUL")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{what} is not valid Unicode") from None
+    return value
+
+
+def _ip_text(value: object, what: str) -> str:
+    """An IP address in the canonical text form the Rust writer emits (so no
+    scope id, whitespace or empty string)."""
+    text = _text(value, what)
+    if "%" in text:  # a scope id: Python parses it, Rust does not
+        raise ValueError(f"{what} carries a scope id")
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        raise ValueError(f"{what} is not an IP address") from None
+    canonical = {str(ip)}
+    # Rust prints an IPv4-mapped address dotted; Python before 3.13 prints it as hex.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        canonical.add(f"::ffff:{ip.ipv4_mapped}")
+    if text not in canonical:
+        raise ValueError(f"{what} is not in canonical form")
+    return text
+
+
+def _object(value: object, what: str) -> dict:
+    if not isinstance(value, dict):
+        raise TypeError(f"{what} is not a JSON object")
+    return value
+
+
+def _list(value: object, what: str) -> list:
+    if not isinstance(value, list):
+        raise TypeError(f"{what} is not a JSON array")
+    return value
+
+
+def validate_route_record(record: object) -> None:
+    """The reset steps use `server_ip`, as an address."""
+    _ip_text(_object(record, "record").get("server_ip"), "server_ip")
+
+
+def validate_dns_record(record: object) -> None:
+    """The restore steps use `advertised` (optional) and, per adapter, `id`
+    and the `v4`/`v6` priors."""
+    record = _object(record, "record")
+    for ip in _list(record.get("advertised", []), "advertised"):
+        _ip_text(ip, "advertised entry")
+    for adapter in _list(record.get("adapters"), "adapters"):
+        adapter = _object(adapter, "adapter")
+        id_obj = _object(adapter.get("id"), "adapter id")
+        _text(id_obj.get("kind"), "adapter id kind")
+        _text(id_obj.get("value"), "adapter id value")
+        for field in ("v4", "v6"):
+            prior = _object(adapter.get(field), f"adapter {field}")
+            kind = _text(prior.get("kind"), f"adapter {field} kind")
+            if kind == "static":
+                for ip in _list(prior.get("servers"), f"adapter {field} servers"):
+                    _ip_text(ip, f"adapter {field} server")
 
 
 def reset_macos(state: dict | None) -> None:
@@ -293,16 +424,16 @@ def reset_macos(state: dict | None) -> None:
     run(["route", "-n", "delete", "-inet6", "8000::/1"])
 
     if state is not None:
-        server_ip = state.get("server_ip", "")
+        server_ip = state["server_ip"]
         if ":" in server_ip:
             print(f"Removing IPv6 bypass route for {server_ip}...")
             run(["route", "-n", "delete", "-inet6", "-host", server_ip])
-        elif server_ip:
+        else:
             print(f"Removing IPv4 bypass route for {server_ip}...")
             run(["route", "-n", "delete", "-host", server_ip])
     else:
         print(
-            "  No state file found — cannot identify per-server bypass route. "
+            "  No readable state file — cannot identify per-server bypass route. "
             "If you still have connectivity issues, run 'netstat -rn' and "
             "remove any host routes pointing at a stale hole-tun interface."
         )
@@ -334,24 +465,17 @@ def reset_windows(state: dict | None) -> None:
         ])
 
     if state is not None:
-        server_ip = state.get("server_ip", "")
-        if ":" in server_ip:
-            print(f"Removing IPv6 bypass route for {server_ip}...")
-            run([
-                "powershell",
-                "-Command",
-                f'Remove-NetRoute -DestinationPrefix "{server_ip}/128" -Confirm:$false -ErrorAction SilentlyContinue',
-            ])
-        elif server_ip:
-            print(f"Removing IPv4 bypass route for {server_ip}...")
-            run([
-                "powershell",
-                "-Command",
-                f'Remove-NetRoute -DestinationPrefix "{server_ip}/32" -Confirm:$false -ErrorAction SilentlyContinue',
-            ])
+        server_ip = state["server_ip"]
+        family, prefix_len = ("IPv6", 128) if ":" in server_ip else ("IPv4", 32)
+        print(f"Removing {family} bypass route for {server_ip}...")
+        powershell(
+            f"Remove-NetRoute -DestinationPrefix ($env:{ARG_IP} + '/{prefix_len}') "
+            f"-Confirm:$false -ErrorAction SilentlyContinue",
+            {ARG_IP: server_ip},
+        )
     else:
         print(
-            "  No state file found — cannot identify per-server bypass route. "
+            "  No readable state file — cannot identify per-server bypass route. "
             "If you still have connectivity issues, run 'Get-NetRoute' and "
             "remove any host routes pointing at a stale hole-tun interface."
         )
@@ -404,7 +528,36 @@ def reset_windows(state: dict | None) -> None:
     print("  netsh int ip reset")
 
 
+class _ControlEscaping(io.TextIOBase):
+    """Writes text with control characters other than newline and tab escaped, so
+    a value read from a record cannot drive the terminal."""
+
+    def __init__(self, inner: TextIO) -> None:
+        self._inner = inner
+
+    def write(self, s: str) -> int:
+        self._inner.write("".join(_escape_control(c) for c in s))
+        return len(s)
+
+    def flush(self) -> None:
+        self._inner.flush()
+
+
+def _escape_control(c: str) -> str:
+    if c in "\n\t" or unicodedata.category(c) != "Cc":
+        return c
+    return f"\\x{ord(c):02x}"
+
+
 def main() -> None:
+    # An adapter name the console code page cannot encode must not crash the reset.
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is None:  # started with no such handle: `print` is a no-op, as before
+            continue
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(errors="backslashreplace")
+        setattr(sys, name, _ControlEscaping(stream))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--force-dns-restore",
@@ -424,22 +577,27 @@ def main() -> None:
     _lib.require_elevation()
 
     print("Looking for route-state file...")
-    state = load_state_file()
+    found, unreadable = load_state_file()
+    state = found[0] if found else None
+    for path in unreadable:
+        print(f"  The route record at {path} exists but could not be read; it was left in place.")
     print()
 
     print("Looking for DNS-state file...")
-    dns_state_and_path = load_dns_state_file()
+    dns_state_and_path, dns_unreadable = load_dns_state_file()
+    for path in dns_unreadable:
+        print(f"  The DNS record at {path} exists but could not be read; it was left in place.")
     print()
 
     system = platform.system()
-    dns_fully_confirmed = True
+    dns_restore = DnsRestore()
     if system == "Darwin":
         if dns_state_and_path is not None:
-            dns_fully_confirmed = restore_dns_macos(dns_state_and_path[0], force=args.force_dns_restore)
+            dns_restore = restore_dns_macos(dns_state_and_path[0], force=args.force_dns_restore)
         reset_macos(state)
     elif system == "Windows":
         if dns_state_and_path is not None:
-            dns_fully_confirmed = restore_dns_windows(dns_state_and_path[0], force=args.force_dns_restore)
+            dns_restore = restore_dns_windows(dns_state_and_path[0], force=args.force_dns_restore)
         reset_windows(state)
     else:
         print(f"Unsupported platform: {system}", file=sys.stderr)
@@ -447,14 +605,21 @@ def main() -> None:
 
     if dns_state_and_path is not None:
         _, dns_state_path = dns_state_and_path
-        if dns_fully_confirmed:
+        if dns_restore.complete:
             clear_dns_state_file(dns_state_path)
         else:
-            print(
-                "  Leaving the DNS state file in place — not every family was confirmed as "
-                "Hole's own prior DNS. Re-run with --force-dns-restore if you're sure it's "
-                "still correct, or remove the file by hand once you've verified your DNS."
-            )
+            print(f"  Leaving the DNS state file {dns_state_path} in place: DNS is not fully restored.")
+            if dns_restore.failed:
+                print(
+                    "  The DNS restore did not complete (see above). Fix the cause and re-run, or restore "
+                    "your DNS settings by hand and remove the file."
+                )
+            if dns_restore.skipped:
+                print(
+                    "  Not every family was confirmed as Hole's own prior DNS. Re-run with "
+                    "--force-dns-restore if you're sure it's still correct, or remove the file "
+                    "by hand once you've verified your DNS."
+                )
 
     print()
     print("Done. Test connectivity: curl -I https://example.com")

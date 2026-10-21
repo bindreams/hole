@@ -2,10 +2,10 @@
 //!
 //! Owns the real TUN device, the wall clock, the connection map, and the
 //! UDP flow table; the smoltcp layer lives in
-//! [`SocketStack`](super::socket_stack::SocketStack). Reads packets,
+//! [`SocketStack`]. Reads packets,
 //! dispatches TCP accepts + UDP flows to the caller-supplied
-//! [`Router`](super::Router), handles port-53 UDP via the optional
-//! [`DnsInterceptor`](super::DnsInterceptor).
+//! [`Router`], handles port-53 UDP via the optional
+//! [`DnsInterceptor`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
