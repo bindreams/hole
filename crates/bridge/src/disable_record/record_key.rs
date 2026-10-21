@@ -19,7 +19,7 @@ use crate::platform::os::SERVICE_NAME;
 
 /// The value's name. Its presence is the fact; the writer stores a DWORD 1 and
 /// the reader accepts any type.
-const VALUE: &str = "HoleDisabledByUninstall";
+const VALUE: &str = "HoleDisabledByHole";
 
 /// Where the record lives: a key, which the record's value is in.
 pub struct RecordKey {

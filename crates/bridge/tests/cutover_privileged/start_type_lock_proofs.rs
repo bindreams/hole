@@ -339,7 +339,7 @@ fn cutover_global_net_state_an_install_holds_the_start_type_lock_through_every_s
     assert!(held_for_another_thread(), "held after the read");
     os::ensure_stopped().expect("the retirement under the hold");
     assert!(held_for_another_thread(), "held after the retirement");
-    os::repair_interrupted_uninstall().expect("the repair under the hold");
+    os::repair_interrupted_change().expect("the repair under the hold");
     assert!(held_for_another_thread(), "held after the repair");
     os::ensure_failure_actions().expect("the failure-actions refresh under the hold");
     assert!(held_for_another_thread(), "held after the refresh");

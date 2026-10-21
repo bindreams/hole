@@ -192,7 +192,7 @@ impl CutoverOs for WindowsCutoverOs {
     }
 
     fn repair_start_type(&mut self) -> std::io::Result<RepairStep> {
-        crate::platform::os::repair_interrupted_uninstall()
+        crate::platform::os::repair_interrupted_change()
     }
 
     fn start_service_wait_running(&mut self) -> std::io::Result<()> {

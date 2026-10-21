@@ -750,7 +750,7 @@ fn open_error_is_absent(e: &windows_service::Error) -> bool {
 /// the caller does not start the service. With no service registered there is
 /// nothing to repair: the record lived in the service's key. Waits for the
 /// start-type lock, so it never repairs a retirement that is still running.
-pub fn repair_interrupted_uninstall() -> std::io::Result<RepairStep> {
+pub fn repair_interrupted_change() -> std::io::Result<RepairStep> {
     let Some(mut session) = RepairSession::open(REPAIR_ACCESS)? else {
         return Ok(RepairStep::Nothing);
     };

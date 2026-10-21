@@ -529,7 +529,7 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
             }
             Ok(())
         },
-        hole_bridge::platform::os::repair_interrupted_uninstall,
+        hole_bridge::platform::os::repair_interrupted_change,
         // On macOS, install() already bootstraps with RunAtLoad=true, so the bridge starts automatically.
         // On Windows, we need to explicitly start the service.
         || {

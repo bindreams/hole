@@ -333,7 +333,7 @@ pub fn hold_start_type() -> std::io::Result<StartTypeHold> {
 }
 
 /// launchd has no start type to disable: there is nothing to repair.
-pub fn repair_interrupted_uninstall() -> std::io::Result<crate::service_start::RepairStep> {
+pub fn repair_interrupted_change() -> std::io::Result<crate::service_start::RepairStep> {
     Ok(crate::service_start::RepairStep::Nothing)
 }
 

@@ -16,7 +16,7 @@ const WRITE_DAC: u32 = 0x0004_0000;
 
 /// The value's name, written out so that renaming it in the code is a decision
 /// a test notices: an installed release reads it by this name.
-const VALUE: &str = "HoleDisabledByUninstall";
+const VALUE: &str = "HoleDisabledByHole";
 
 /// A key of the test's own under HKCU, standing in for the service's key (HKLM
 /// is not writable here), removed when dropped.

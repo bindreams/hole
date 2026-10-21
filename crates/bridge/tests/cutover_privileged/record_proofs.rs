@@ -282,7 +282,7 @@ fn cutover_global_net_state_repair_resets_only_what_the_record_says_is_ours() {
             "the GUI's read of {start:?}, record {with_record}"
         );
 
-        let found = os::repair_interrupted_uninstall().expect("the repair");
+        let found = os::repair_interrupted_change().expect("the repair");
 
         assert_eq!(found, step, "{start:?}, record {with_record}");
         assert_eq!(must_start_type(), start_after, "{start:?}, record {with_record}");
@@ -305,7 +305,7 @@ fn cutover_global_net_state_the_record_dies_with_its_service() {
     drop(service);
 
     assert_eq!(record(), RecordState::Absent);
-    assert_eq!(os::repair_interrupted_uninstall().unwrap(), RepairStep::Nothing);
+    assert_eq!(os::repair_interrupted_change().unwrap(), RepairStep::Nothing);
     assert_eq!(gui_disabled_by(), None, "no service is not a disabled service");
 }
 
