@@ -16,6 +16,7 @@ use std::io;
 use tracing::{info, warn};
 
 use super::call_error::{io_error_is_a_refused_process_open, service_gone, ServiceGone};
+use super::scan::ScanFinding;
 use super::settle::{settle_stopped, SettleError, StopActor};
 use crate::disable_record::RecordState;
 use crate::service_start::StartType;
@@ -332,12 +333,9 @@ fn deleted<S: ServiceSession>(session: &mut S, hardening: Hardening) {
 
 /// What waiting out the processes of a service the SCM has no entry for needs.
 pub trait Survivors {
-    /// Hold every live process that carries the service's token, other than
-    /// the calling one.
-    fn hold_scanned(&mut self) -> io::Result<()>;
-    /// Whether any held process has not exited: a state read of each handle,
-    /// never a wait.
-    fn any_alive(&mut self) -> io::Result<bool>;
+    /// Scan for the live processes that carry the service's token, other than
+    /// the calling one, and hold them. Says what the scan itself found.
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding>;
     /// Wait until every held process has exited.
     fn await_exits(&mut self) -> io::Result<()>;
 }
@@ -346,13 +344,15 @@ pub trait Survivors {
 ///
 /// The SCM drops an entry once the service is not running, which is its state
 /// and not its process, so a process can outlive its entry, and only a scan by
-/// token sees it. Scan, hold, and while a held process is alive wait for it;
-/// scan again, because a process that exited can have started another. Every
-/// iteration ends in a process exit or in a scan that leaves nothing alive.
+/// token sees it. The wait ends on a scan of its own that finds nothing alive
+/// and loses no listed process ([`ScanFinding::Nothing`]): a process that
+/// exited, or vanished before its probe, can have started another after the
+/// listing, which the next scan finds. Every other iteration waits out the
+/// held processes (a process exit, or nothing to wait on) and scans again.
 pub fn wait_out_survivors<W: Survivors>(survivors: &mut W) -> Result<(), RetireError> {
     loop {
-        survivors.hold_scanned().map_err(RetireError::Hold)?;
-        if !survivors.any_alive().map_err(RetireError::Exit)? {
+        let finding = survivors.hold_scanned().map_err(RetireError::Hold)?;
+        if finding.ends_the_wait() {
             return Ok(());
         }
         survivors.await_exits().map_err(RetireError::Exit)?;

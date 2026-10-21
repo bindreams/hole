@@ -108,6 +108,52 @@ fn a_process_that_has_exited_is_dropped_not_held() {
     assert_eq!(*host.log.borrow(), vec!["open(3)", "close(3)", "open(5)", "close(5)"]);
 }
 
+/// A listed id that no process has any more at its probe, or whose process has
+/// exited by then, may have started a process after the listing: neither is
+/// something to wait for, and neither is a scan that found nothing.
+#[skuld::test]
+fn a_listed_process_gone_or_exited_by_its_probe_is_reported_vanished() {
+    let mut host = Host::new(
+        1,
+        vec![
+            (2, Process::Stranger),
+            (3, Process::Gone),
+            (4, Process::ServiceExited),
+            (5, Process::Undetermined(1117)),
+        ],
+    );
+    let result = scan(&mut host).unwrap();
+    assert!(result.alive.is_empty());
+    assert_eq!(result.vanished, vec![3, 4]);
+}
+
+/// Only a scan that probed every listed process and found none of the service's
+/// alive may end a wait.
+#[skuld::test]
+fn only_a_scan_that_found_nothing_and_lost_no_process_ends_the_wait() {
+    let finding = |processes: Vec<(u32, Process)>| scan(&mut Host::new(1, processes)).unwrap().finding();
+    assert_eq!(finding(vec![]), ScanFinding::Nothing);
+    assert_eq!(
+        finding(vec![(2, Process::Stranger), (5, Process::Undetermined(1117))]),
+        ScanFinding::Nothing
+    );
+    assert_eq!(finding(vec![(2, Process::Service)]), ScanFinding::Alive);
+    assert_eq!(finding(vec![(2, Process::Gone)]), ScanFinding::Vanished);
+    assert_eq!(finding(vec![(2, Process::ServiceExited)]), ScanFinding::Vanished);
+    // A live process takes precedence: it is waited on, and the next scan follows.
+    assert_eq!(
+        finding(vec![(2, Process::Service), (3, Process::Gone)]),
+        ScanFinding::Alive
+    );
+    for (finding, ends) in [
+        (ScanFinding::Nothing, true),
+        (ScanFinding::Alive, false),
+        (ScanFinding::Vanished, false),
+    ] {
+        assert_eq!(finding.ends_the_wait(), ends, "{finding:?}");
+    }
+}
+
 /// The calling process can carry the service's token (the cutover child
 /// inherits the bridge's): it must not wait on itself.
 #[skuld::test]
@@ -210,7 +256,9 @@ fn holding_the_scan_makes_what_it_found_show_in_the_next_look() {
 
     let mut host = Host::new(1, vec![(3, Process::Service), (5, Process::Undetermined(1117))]);
     let mut holds = ProcessHolds::default();
-    let undetermined = holds.hold_scanned(&mut host).unwrap();
+    let scanned = holds.hold_scanned(&mut host).unwrap();
+    assert_eq!(scanned.finding, ScanFinding::Alive);
+    let undetermined = scanned.undetermined;
     assert_eq!(
         undetermined,
         vec![Undetermined {

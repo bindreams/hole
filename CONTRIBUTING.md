@@ -1899,8 +1899,9 @@ state read before its act loses that race, so four rules close it:
   process) and `Look::settle_step` is the one decision. A Stop goes out only into
   RUNNING over a process that has not exited; START_PENDING, STOP_PENDING and a
   RUNNING that names an exited process are left by the SCM's own transition;
-  STOPPED is final only with no held process alive and a scan of the host finding
-  no process that carries the service's token. A wait for the SCM's reaction to
+  STOPPED is final only with no held process alive and a scan of the host that
+  itself finds no process carrying the service's token ("Only a scan ends the
+  wait", below). A wait for the SCM's reaction to
   our own Stop arms **before** the Stop (`arm_leaving`: every state but the one
   the service is in), so the Stop's effect is a state entry after the arm. A
   wait for the SCM's own transition arms, looks again, and sleeps only if that
@@ -1941,6 +1942,23 @@ state read before its act loses that race, so four rules close it:
   bar its own process: the cutover child carries the bridge's token, and the
   scan skips the calling process. The service *row* is not waited for; the SCM
   removes it once the handles close.
+- **Only a scan ends the wait.** The
+  host listing is a snapshot (Toolhelp), and a process in it can start a child
+  after the snapshot, then exit before it is probed or looked at. So the stop wait
+  and the removed-entry wait end only on a scan whose own alive list is empty and
+  that probed every listed id (`scan::ScanFinding::Nothing`). What an earlier
+  scan held and saw exit proves nothing, and an id the listing named that no
+  process had at its probe, or whose process had exited by then
+  (`ScanResult::vanished`), forces another scan: it may have started a process the
+  listing does not show, which the next listing, taken after its exit, does. The
+  listing must be complete: only `ERROR_NO_MORE_FILES` ends the Toolhelp
+  enumeration, any other failure is returned, and the System Idle Process (id 0,
+  which is listed and never opens, measured) is left out so it cannot read as
+  vanished on every pass. A process that has exited is not in a later listing
+  (measured, with its handle still held). Passes repeat without a count or a
+  timer; each one is a real scan, and each is separated from the last by the
+  exit of what it found alive. Any other process on the host that exits
+  between a listing and its probe also costs one more scan.
 - **No wait here has a bound.** Each is the exit of a process the SCM has been
   told to stop, or an SCM notification, and every iteration of the loop ends in
   one of those or in a state change a query read; nothing retries on a count or
@@ -2022,7 +2040,10 @@ and waited out on process handles like any other. What Microsoft documents as 10
   this call wrote is cleared and the settle loop runs.
 - An arm that is refused with 1072 makes the loop go on without arming
   (`Settle::without_arm`): it holds what the scan finds and waits on those
-  processes. With a held RUNNING process it never arms at all.
+  processes. With a held RUNNING process it never arms at all. A look that shows
+  the service's process gone (the one it named has exited, or an id no process
+  has in a state whose id is valid, or nothing named and every held process
+  exited) settles the wait once a scan finds nothing.
 - A `DeleteService` that answers 1072 is a success: someone else's delete got
   there first.
 - The one state with no event to wait on is a live or pending state with nothing
@@ -2032,8 +2053,9 @@ and waited out on process handles like any other. What Microsoft documents as 10
 
 **A gone entry** (1060 at open) is stopped as far as the SCM is concerned, so
 only the scan can see a process of it that lingers. `wait_out_survivors` scans,
-holds, waits while a held process is alive, and scans again until a scan finds
-nothing alive; no hit is `Ok(false)`, the common never-registered answer.
+holds, waits for the held processes, and scans again until a scan finds nothing
+alive and loses no listed process; no hit is `Ok(false)`, the common
+never-registered answer.
 
 What is measured and what is not. **Measured** in this project's Windows CI
 (privileged tests and probes, `cutover_global_net_state_*`): `OpenService` on a

@@ -22,6 +22,7 @@ use super::{apply_failure_actions, open_error_is_absent, scm_failure, FAILURE_AC
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::Look;
 use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, StartConfig, StartWrite, Survivors};
+use crate::cutover::scm_wait::scan::ScanFinding;
 use crate::cutover::scm_wait::settle::StopActor;
 use crate::cutover::scm_wait::Observed;
 use crate::disable_record::{RecordKey, RecordState};
@@ -90,12 +91,8 @@ impl Default for GoneSession {
 }
 
 impl Survivors for GoneSession {
-    fn hold_scanned(&mut self) -> io::Result<()> {
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
         self.processes.hold_scanned(&self.sid)
-    }
-
-    fn any_alive(&mut self) -> io::Result<bool> {
-        self.processes.any_alive()
     }
 
     fn await_exits(&mut self) -> io::Result<()> {
@@ -128,7 +125,7 @@ impl StopActor for RetireSession {
         self.stop.await_held_exits()
     }
 
-    fn hold_scanned(&mut self) -> io::Result<()> {
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
         self.stop.hold_scanned()
     }
 }

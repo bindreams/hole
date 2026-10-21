@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use hole_bridge::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
 use hole_bridge::cutover::scm_wait::hold::{Basis, ProbeFailure};
 use hole_bridge::cutover::scm_wait::ReportedPid;
-use hole_bridge::platform::os::{scan_service_processes, ServiceSid};
+use hole_bridge::platform::os::{enumeration_continues, scan_service_processes, ServiceSid};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, WAIT_OBJECT_0};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -134,6 +134,7 @@ fn measure(service: &str) -> String {
             let alive: Vec<u32> = found.alive.iter().map(|(pid, _)| *pid).collect();
             writeln!(report, "production scan, alive: {alive:?}").unwrap();
             writeln!(report, "production scan, undetermined: {:?}", found.undetermined).unwrap();
+            writeln!(report, "production scan, vanished: {:?}", found.vanished).unwrap();
         }
         Err(e) => writeln!(report, "production scan failed: {e}").unwrap(),
     }
@@ -183,13 +184,13 @@ fn processes() -> Vec<(u32, String)> {
     let mut found = Vec::new();
     // SAFETY: `snapshot` is the live handle just returned, and `entry` is a
     // `PROCESSENTRY32W` with its size set, as both calls require.
-    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    let mut more = enumeration_continues(unsafe { Process32FirstW(snapshot, &mut entry) }).expect("list the processes");
     while more {
         let name = &entry.szExeFile;
         let len = name.iter().position(|unit| *unit == 0).unwrap_or(name.len());
         found.push((entry.th32ProcessID, String::from_utf16_lossy(&name[..len])));
         // SAFETY: as above.
-        more = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+        more = enumeration_continues(unsafe { Process32NextW(snapshot, &mut entry) }).expect("list the processes");
     }
     // SAFETY: `snapshot` is the live handle returned above.
     let _ = unsafe { CloseHandle(snapshot) };

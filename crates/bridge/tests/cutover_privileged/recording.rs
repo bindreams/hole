@@ -6,6 +6,7 @@
 use hole_bridge::cutover::scm_wait::call_error::{service_gone, ServiceGone};
 use hole_bridge::cutover::scm_wait::hold::Look;
 use hole_bridge::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartConfig, StartWrite, Survivors};
+use hole_bridge::cutover::scm_wait::scan::ScanFinding;
 use hole_bridge::cutover::scm_wait::settle::StopActor;
 use hole_bridge::cutover::scm_wait::Observed;
 use hole_bridge::disable_record::RecordState;
@@ -147,7 +148,7 @@ impl<S: ServiceSession> StopActor for Recording<'_, S> {
         self.inner.await_held_exits()
     }
 
-    fn hold_scanned(&mut self) -> std::io::Result<()> {
+    fn hold_scanned(&mut self) -> std::io::Result<ScanFinding> {
         self.record(Event::HoldScanned);
         self.inner.hold_scanned()
     }
@@ -356,9 +357,8 @@ impl Trace {
 /// One act on the survivors of a removed service entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurvivorEvent {
-    HoldScanned,
-    /// The answer to the state read of every held process.
-    AnyAlive(bool),
+    /// A scan, with what it found.
+    HoldScanned(ScanFinding),
     AwaitExits,
 }
 
@@ -381,15 +381,10 @@ impl<'a, W> RecordingSurvivors<'a, W> {
 }
 
 impl<W: Survivors> Survivors for RecordingSurvivors<'_, W> {
-    fn hold_scanned(&mut self) -> std::io::Result<()> {
-        (self.hook)(&SurvivorEvent::HoldScanned);
-        self.inner.hold_scanned()
-    }
-
-    fn any_alive(&mut self) -> std::io::Result<bool> {
-        let alive = self.inner.any_alive()?;
-        (self.hook)(&SurvivorEvent::AnyAlive(alive));
-        Ok(alive)
+    fn hold_scanned(&mut self) -> std::io::Result<ScanFinding> {
+        let finding = self.inner.hold_scanned()?;
+        (self.hook)(&SurvivorEvent::HoldScanned(finding));
+        Ok(finding)
     }
 
     fn await_exits(&mut self) -> std::io::Result<()> {

@@ -151,6 +151,8 @@ struct Recording {
     await_callback_error: Option<io::Error>,
     await_exit_error: Option<io::Error>,
     scan_error: Option<io::Error>,
+    /// What each scan finds, in order. Nothing once it runs dry.
+    findings: VecDeque<ScanFinding>,
 }
 
 impl Recording {
@@ -183,6 +185,11 @@ impl Recording {
 
     fn scan_fails_with(mut self, error: io::Error) -> Self {
         self.scan_error = Some(error);
+        self
+    }
+
+    fn scans_find(mut self, findings: Vec<ScanFinding>) -> Self {
+        self.findings = findings.into();
         self
     }
 
@@ -221,9 +228,11 @@ impl StopActor for Recording {
         self.await_exit_error.take().map_or(Ok(()), Err)
     }
 
-    fn hold_scanned(&mut self) -> io::Result<()> {
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
         self.log.push("hold_scanned".into());
-        self.scan_error.take().map_or(Ok(()), Err)
+        self.scan_error
+            .take()
+            .map_or(Ok(self.findings.pop_front().unwrap_or(ScanFinding::Nothing)), Err)
     }
 }
 
@@ -527,6 +536,58 @@ fn a_marked_running_service_over_an_exited_process_is_settled_when_the_scan_find
     );
 }
 
+/// Marked, RUNNING over an id no process has: nothing was ever held, but the
+/// look itself shows the service's process gone, and a scan that finds nothing
+/// says nothing else carries the token.
+#[skuld::test]
+fn a_marked_running_service_over_an_id_no_process_has_is_settled_when_the_scan_finds_nothing() {
+    let mut actor = Recording::new(vec![running_over_an_exited_process(), running_over_an_exited_process()])
+        .arm_fails_with(vec![Some(marked())]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(actor.count("control_stop"), 0);
+    assert_eq!(
+        actor.log(),
+        ["observe", "arm_leaving(Running)", "hold_scanned", "observe"]
+    );
+}
+
+/// Marked, and the scan lost a listed process: the look shows nothing alive,
+/// but only a scan that finds nothing settles, so the scan is made again.
+#[skuld::test]
+fn a_marked_service_is_scanned_again_after_a_scan_that_lost_a_process() {
+    let gone = look_after_holds_exited(Observed::StopPending, ProcessFate::Exited);
+    let mut actor = Recording::new(vec![pending(Observed::StopPending), gone, gone])
+        .arm_fails_with(vec![Some(marked())])
+        .scans_find(vec![ScanFinding::Vanished, ScanFinding::Nothing]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(
+        actor.log(),
+        [
+            "observe",
+            "arm_leaving(StopPending)",
+            "hold_scanned",
+            "observe",
+            "hold_scanned",
+            "observe"
+        ]
+    );
+}
+
+/// STOPPED with nothing held alive is final only on a scan that found nothing:
+/// one that lost a listed process, or found one that has exited since, is made
+/// again, and the wait does not end on the look after it.
+#[skuld::test]
+fn a_stopped_service_is_scanned_again_until_a_scan_finds_nothing() {
+    let mut actor = Recording::new(vec![stopped(), stopped(), stopped(), stopped()]).scans_find(vec![
+        ScanFinding::Vanished,
+        ScanFinding::Alive,
+        ScanFinding::Nothing,
+    ]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(actor.count("hold_scanned"), 3);
+    assert_eq!(actor.log().last(), Some(&"observe"));
+}
+
 /// A live state with no process to wait on and no arm: the only event left is
 /// the SCM's, which cannot be asked for. The refusal that says why is the result.
 #[skuld::test]
@@ -596,7 +657,7 @@ fn a_query_that_fails_ends_the_wait() {
         fn await_held_exits(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn hold_scanned(&mut self) -> io::Result<()> {
+        fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
             unreachable!()
         }
     }
@@ -645,8 +706,8 @@ fn each_failing_act_is_its_own_error_variant() {
         fn await_held_exits(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn hold_scanned(&mut self) -> io::Result<()> {
-            Ok(())
+        fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
+            Ok(ScanFinding::Nothing)
         }
     }
     let error = settle_stopped(&mut FailsOnTheSecondLook(0)).unwrap_err();
@@ -666,4 +727,91 @@ fn a_settle_error_gives_back_the_error_it_carries() {
     ] {
         assert_eq!(error.into_io().raw_os_error(), Some(5));
     }
+}
+
+// The loop on a model host ============================================================================================
+
+use crate::cutover::scm_wait::world_tests::{Act, StoppedService, When, World};
+
+/// The stop wait over a STOPPED service whose processes the model host runs.
+struct ModelStop(StoppedService);
+
+impl StopActor for ModelStop {
+    fn observe(&mut self) -> io::Result<Look> {
+        self.0.look()
+    }
+
+    fn arm_leaving(&mut self, _: Observed) -> io::Result<()> {
+        unreachable!("a STOPPED service is not armed on")
+    }
+
+    fn control_stop(&mut self) -> io::Result<()> {
+        unreachable!("a STOPPED service takes no Stop")
+    }
+
+    fn await_callback(&mut self) -> io::Result<()> {
+        unreachable!("a STOPPED service is not armed on")
+    }
+
+    fn await_held_exits(&mut self) -> io::Result<()> {
+        self.0.await_exits();
+        Ok(())
+    }
+
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
+        let mut host = self.0.world.host();
+        self.0.holds.hold_scanned(&mut host).map(|scanned| scanned.finding)
+    }
+}
+
+fn settle_on(world: &World) {
+    settle_stopped(&mut ModelStop(StoppedService::new(world))).unwrap();
+    assert_eq!(
+        world.alive(),
+        Vec::<u32>::new(),
+        "the wait returned with a process of the service alive"
+    );
+}
+
+/// A process the scan holds starts a child after the snapshot and exits before
+/// the look: the look finds nothing alive among the holds, but the child runs.
+#[skuld::test]
+fn a_child_started_after_the_snapshot_by_a_process_that_then_exits_is_waited_out() {
+    let world = World::new(
+        &[10],
+        vec![
+            (When::AfterOpen(10), Act::Spawn(11)),
+            (When::AfterOpen(10), Act::Exit(10)),
+        ],
+    );
+    settle_on(&world);
+}
+
+/// A process in the snapshot starts a child and vanishes before it is probed:
+/// the child is not in the snapshot and nothing was held.
+#[skuld::test]
+fn a_child_started_by_a_process_that_vanished_before_its_probe_is_waited_out() {
+    let world = World::new(
+        &[10],
+        vec![
+            (When::AfterSnapshot(1), Act::Spawn(11)),
+            (When::AfterSnapshot(1), Act::Vanish(10)),
+        ],
+    );
+    settle_on(&world);
+}
+
+/// The same, again and again: each child starts one and exits.
+#[skuld::test]
+fn a_chain_of_children_each_exiting_before_the_next_look_is_waited_out() {
+    let world = World::new(
+        &[10],
+        vec![
+            (When::AfterOpen(10), Act::Spawn(11)),
+            (When::AfterOpen(10), Act::Exit(10)),
+            (When::AfterOpen(11), Act::Spawn(12)),
+            (When::AfterOpen(11), Act::Vanish(11)),
+        ],
+    );
+    settle_on(&world);
 }

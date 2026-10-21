@@ -11,7 +11,7 @@ use std::io;
 use tracing::warn;
 
 use super::call_error::{scm_call_error, ScmCall, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
-use super::scan::{scan, ProcessEnumerator, ScanResult, Undetermined};
+use super::scan::{scan, ProcessEnumerator, ScanFinding, ScanResult, Undetermined};
 use super::{Observed, ReportedPid};
 
 /// One look at a service: its state and the process id it names (0: none).
@@ -423,18 +423,28 @@ impl<P> ProcessHolds<P> {
     }
 
     /// Hold every live process `enumerator` finds carrying the service's
-    /// token, so the next [`look`](Self::look) shows it alive. Returns the
-    /// processes the scan could not decide.
-    pub fn hold_scanned<E: ProcessEnumerator<Process = P>>(
-        &mut self,
-        enumerator: &mut E,
-    ) -> io::Result<Vec<Undetermined>> {
-        let ScanResult { alive, undetermined } = scan(enumerator)?;
+    /// token, so the next [`look`](Self::look) shows it alive. Says what the
+    /// scan itself found ([`ScanFinding`]), which the holds cannot: a process
+    /// that exited between its probe and the next look is no longer held alive.
+    pub fn hold_scanned<E: ProcessEnumerator<Process = P>>(&mut self, enumerator: &mut E) -> io::Result<Scanned> {
+        let result = scan(enumerator)?;
+        let finding = result.finding();
+        let ScanResult {
+            alive, undetermined, ..
+        } = result;
         for (pid, process) in alive {
             self.adopt(pid, process);
         }
-        Ok(undetermined)
+        Ok(Scanned { finding, undetermined })
     }
+}
+
+/// What [`ProcessHolds::hold_scanned`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Scanned {
+    pub finding: ScanFinding,
+    /// The processes the scan could not decide.
+    pub undetermined: Vec<Undetermined>,
 }
 
 #[cfg(test)]

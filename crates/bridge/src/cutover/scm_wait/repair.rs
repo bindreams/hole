@@ -23,20 +23,17 @@ pub enum RepairError {
     Reset(io::Error),
 }
 
-/// The step a repair would take, reading both facts and writing neither.
-pub fn observe<S: StartConfig>(session: &mut S) -> Result<RepairStep, RepairError> {
-    let start = session.start_type().map_err(RepairError::StartType)?;
+/// The step a repair would take, reading both facts and writing neither. The
+/// only failure is the start type's read, so the error is the read's own.
+pub fn observe<S: StartConfig>(session: &mut S) -> io::Result<RepairStep> {
+    let start = session.start_type()?;
     Ok(RepairStep::of(session.record_state(), start))
 }
 
 /// Who disabled the service, for a reader that must never fail (the GUI's
 /// status). A start type that could not be read says nothing is disabled.
-pub fn for_display(observed: Result<RepairStep, RepairError>) -> Option<DisabledBy> {
-    match observed {
-        Ok(step) => step.disabled_by(),
-        Err(RepairError::StartType(_)) => None,
-        Err(RepairError::Reset(_)) => None,
-    }
+pub fn for_display(observed: io::Result<RepairStep>) -> Option<DisabledBy> {
+    observed.ok().and_then(RepairStep::disabled_by)
 }
 
 /// Takes the step [`observe`] finds and returns it.
@@ -47,7 +44,7 @@ pub fn for_display(observed: Result<RepairStep, RepairError>) -> Option<Disabled
 /// the error and leaves the record; a failed clear is a warning, because the
 /// next retirement, cutover or install sweeps a stale record.
 pub fn repair<S: StartConfig>(session: &mut S) -> Result<RepairStep, RepairError> {
-    let step = observe(session)?;
+    let step = observe(session).map_err(RepairError::StartType)?;
     match step {
         RepairStep::Nothing => {}
         RepairStep::LeaveDisabled => {}

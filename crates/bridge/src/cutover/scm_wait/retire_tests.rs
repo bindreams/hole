@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use super::*;
 use crate::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Look, ProcessFate};
+use crate::cutover::scm_wait::scan::ScanFinding;
 use crate::cutover::scm_wait::Observed;
 use crate::disable_record::RecordState;
 
@@ -131,8 +132,9 @@ impl StopActor for FakeSession<'_> {
     fn await_held_exits(&mut self) -> io::Result<()> {
         self.call("await_held_exits")
     }
-    fn hold_scanned(&mut self) -> io::Result<()> {
-        self.call("hold_scanned")
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
+        self.call("hold_scanned")?;
+        Ok(ScanFinding::Nothing)
     }
 }
 
@@ -867,43 +869,34 @@ fn a_failed_step_reads_with_its_call_and_its_code() {
 
 // A process that outlives its removed entry ===========================================================================
 
-/// What the survivors wait does, in order, with scripted answers. A script that
-/// runs dry panics, so a loop that would spin fails instead of hanging.
+/// What the survivors wait does, in order, with scripted answers. A script
+/// that runs dry panics, so a loop that would spin fails instead of hanging.
 struct FakeSurvivors<'a> {
     log: &'a Log,
-    /// The answer of each `any_alive`, in order.
-    alive: VecDeque<bool>,
+    /// What each scan finds, in order.
+    findings: VecDeque<ScanFinding>,
     scan_fails: bool,
     await_fails: bool,
-    alive_fails: bool,
 }
 
 impl<'a> FakeSurvivors<'a> {
-    fn new(log: &'a Log, alive: Vec<bool>) -> Self {
+    fn new(log: &'a Log, findings: Vec<ScanFinding>) -> Self {
         Self {
             log,
-            alive: alive.into(),
+            findings: findings.into(),
             scan_fails: false,
             await_fails: false,
-            alive_fails: false,
         }
     }
 }
 
 impl Survivors for FakeSurvivors<'_> {
-    fn hold_scanned(&mut self) -> io::Result<()> {
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
         self.log.borrow_mut().push("hold_scanned".into());
         if self.scan_fails {
             return Err(io::Error::other("scan"));
         }
-        Ok(())
-    }
-    fn any_alive(&mut self) -> io::Result<bool> {
-        self.log.borrow_mut().push("any_alive".into());
-        if self.alive_fails {
-            return Err(io::Error::other("alive"));
-        }
-        Ok(self.alive.pop_front().expect("the alive script ran dry"))
+        Ok(self.findings.pop_front().expect("the scan script ran dry"))
     }
     fn await_exits(&mut self) -> io::Result<()> {
         self.log.borrow_mut().push("await_exits".into());
@@ -917,32 +910,39 @@ impl Survivors for FakeSurvivors<'_> {
 #[skuld::test]
 fn an_absent_service_with_no_process_is_not_retired() {
     let log = Log::default();
-    let mut survivors = FakeSurvivors::new(&log, vec![false]);
+    let mut survivors = FakeSurvivors::new(&log, vec![ScanFinding::Nothing]);
     wait_out_survivors(&mut survivors).unwrap();
-    assert_eq!(logged(&log), ["hold_scanned", "any_alive"]);
+    assert_eq!(logged(&log), ["hold_scanned"]);
 }
 
-/// The wait ends only on a scan that leaves nothing alive: a process that
-/// exits can have started another, which the next scan finds.
+/// The wait ends only on a scan that finds nothing: a process that exits
+/// can have started another, which the next scan finds.
 #[skuld::test]
 fn a_process_that_outlives_its_entry_is_waited_on_until_a_scan_finds_none() {
     let log = Log::default();
     // The first scan holds the process, the second a descendant it started, the third nothing.
-    let mut survivors = FakeSurvivors::new(&log, vec![true, true, false]);
+    let mut survivors = FakeSurvivors::new(&log, vec![ScanFinding::Alive, ScanFinding::Alive, ScanFinding::Nothing]);
     wait_out_survivors(&mut survivors).unwrap();
     assert_eq!(
         logged(&log),
         [
             "hold_scanned",
-            "any_alive",
             "await_exits",
             "hold_scanned",
-            "any_alive",
             "await_exits",
-            "hold_scanned",
-            "any_alive",
+            "hold_scanned"
         ]
     );
+}
+
+/// A scan that lost a listed process to its probe is not a scan that found
+/// nothing: it is made again.
+#[skuld::test]
+fn a_scan_that_lost_a_listed_process_is_made_again() {
+    let log = Log::default();
+    let mut survivors = FakeSurvivors::new(&log, vec![ScanFinding::Vanished, ScanFinding::Nothing]);
+    wait_out_survivors(&mut survivors).unwrap();
+    assert_eq!(logged(&log), ["hold_scanned", "await_exits", "hold_scanned"]);
 }
 
 #[skuld::test]
@@ -953,14 +953,9 @@ fn a_scan_failure_is_a_hold_error_and_a_wait_failure_an_exit_error() {
     let error = wait_out_survivors(&mut survivors).expect_err("the scan failed");
     assert!(matches!(error, RetireError::Hold(_)), "{error}");
 
-    let mut survivors = FakeSurvivors::new(&log, vec![true]);
+    let mut survivors = FakeSurvivors::new(&log, vec![ScanFinding::Alive]);
     survivors.await_fails = true;
     let error = wait_out_survivors(&mut survivors).expect_err("the wait failed");
-    assert!(matches!(error, RetireError::Exit(_)), "{error}");
-
-    let mut survivors = FakeSurvivors::new(&log, vec![]);
-    survivors.alive_fails = true;
-    let error = wait_out_survivors(&mut survivors).expect_err("the state read failed");
     assert!(matches!(error, RetireError::Exit(_)), "{error}");
 }
 
@@ -972,17 +967,14 @@ fn an_absent_opening_goes_to_the_survivors_and_never_to_retire() {
         Opening::<FakeSession<'_>>::Absent,
         || {
             *built.borrow_mut() += 1;
-            FakeSurvivors::new(&log, vec![true, false])
+            FakeSurvivors::new(&log, vec![ScanFinding::Alive, ScanFinding::Nothing])
         },
         Disposition::Deregister,
     )
     .unwrap();
     assert!(!opened, "nothing was retired");
     assert_eq!(*built.borrow(), 1);
-    assert_eq!(
-        logged(&log),
-        ["hold_scanned", "any_alive", "await_exits", "hold_scanned", "any_alive"]
-    );
+    assert_eq!(logged(&log), ["hold_scanned", "await_exits", "hold_scanned"]);
 }
 
 #[skuld::test]
@@ -1111,8 +1103,9 @@ impl StopActor for Model {
     fn await_held_exits(&mut self) -> io::Result<()> {
         self.step(None, |_| {})
     }
-    fn hold_scanned(&mut self) -> io::Result<()> {
-        self.step(None, |_| {})
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
+        self.step(None, |_| {})?;
+        Ok(ScanFinding::Nothing)
     }
 }
 
@@ -1224,4 +1217,56 @@ fn a_completed_retirement_leaves_no_record() {
             }
         }
     }
+}
+
+// The survivors wait on a model host ==================================================================================
+
+use crate::cutover::scm_wait::world_tests::{Act, StoppedService, When, World};
+
+/// The removed-service wait over the processes the model host runs.
+struct ModelSurvivors(StoppedService);
+
+impl Survivors for ModelSurvivors {
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
+        let mut host = self.0.world.host();
+        self.0.holds.hold_scanned(&mut host).map(|scanned| scanned.finding)
+    }
+
+    fn await_exits(&mut self) -> io::Result<()> {
+        self.0.await_exits();
+        Ok(())
+    }
+}
+
+fn wait_out_on(world: &World) {
+    wait_out_survivors(&mut ModelSurvivors(StoppedService::new(world))).unwrap();
+    assert_eq!(
+        world.alive(),
+        Vec::<u32>::new(),
+        "the wait returned with a process of the service alive"
+    );
+}
+
+#[skuld::test]
+fn survivors_started_after_the_snapshot_by_a_process_that_then_exits_are_waited_out() {
+    let world = World::new(
+        &[10],
+        vec![
+            (When::AfterOpen(10), Act::Spawn(11)),
+            (When::AfterOpen(10), Act::Exit(10)),
+        ],
+    );
+    wait_out_on(&world);
+}
+
+#[skuld::test]
+fn survivors_started_by_a_process_that_vanished_before_its_probe_are_waited_out() {
+    let world = World::new(
+        &[10],
+        vec![
+            (When::AfterSnapshot(1), Act::Spawn(11)),
+            (When::AfterSnapshot(1), Act::Vanish(10)),
+        ],
+    );
+    wait_out_on(&world);
 }

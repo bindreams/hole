@@ -11,6 +11,9 @@ pub mod retire;
 pub mod scan;
 pub mod settle;
 
+#[cfg(test)]
+mod world_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WantState {
     Stopped,

@@ -2098,9 +2098,9 @@ fn deregister_recorded(hook: recording::Hook<'_>) -> recording::Trace {
 }
 
 /// Retires a service parked in START_PENDING by `flag`, and checks it ends up
-/// deregistered. The first look must be the parked START_PENDING (the case a
-/// blind Stop used to be sent into), and the Stop must have come only after a
-/// later RUNNING, with the start type already disabled.
+/// deregistered. The first look must be the parked START_PENDING, and the Stop
+/// must have come only after a later RUNNING, with the start type already
+/// disabled.
 #[cfg(target_os = "windows")]
 fn retire_a_parked_service(flag: &str) {
     use hole_bridge::cutover::scm_wait::Observed;
@@ -2447,7 +2447,7 @@ impl hole_bridge::cutover::scm_wait::settle::StopActor for WatchedStop<'_> {
         self.inner.await_held_exits()
     }
 
-    fn hold_scanned(&mut self) -> std::io::Result<()> {
+    fn hold_scanned(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::scan::ScanFinding> {
         self.inner.hold_scanned()
     }
 }
@@ -2866,6 +2866,7 @@ fn cutover_global_net_state_uninstall_of_a_marked_and_already_stopped_service_su
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_waits_out_a_process_whose_entry_is_already_gone() {
     use hole_bridge::cutover::scm_wait::retire::{retire_over, Disposition, RetireError};
+    use hole_bridge::cutover::scm_wait::scan::ScanFinding;
     use hole_bridge::platform::os::{GoneSession, RetireSession, SERVICE_NAME};
     use recording::SurvivorEvent;
 
@@ -2947,16 +2948,18 @@ fn cutover_global_net_state_uninstall_waits_out_a_process_whose_entry_is_already
         matches!(result, Ok(false)),
         "the entry is absent, so nothing was retired: {result:?}"
     );
+    // Any process on the host that exits between a scan's listing and its
+    // probe makes that scan `Vanished` and one more scan follow; those passes
+    // are not the helper's.
+    seen.retain(|event| *event != SurvivorEvent::HoldScanned(ScanFinding::Vanished));
     assert_eq!(
         seen,
         [
-            SurvivorEvent::HoldScanned,
-            SurvivorEvent::AnyAlive(true),
+            SurvivorEvent::HoldScanned(ScanFinding::Alive),
             SurvivorEvent::AwaitExits,
-            SurvivorEvent::HoldScanned,
-            SurvivorEvent::AnyAlive(false),
+            SurvivorEvent::HoldScanned(ScanFinding::Nothing),
         ],
-        "scan, wait on the process, and scan again until nothing is left"
+        "scan, wait on the process, and scan again until a scan finds nothing"
     );
     left_behind::assert_none(&pid_log);
     hole_bridge::platform::os::ensure_stopped().expect("nothing is left to stop");

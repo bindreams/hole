@@ -21,6 +21,7 @@ use super::service_sid::ServiceSid;
 use super::{scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessSource, Reading};
+use crate::cutover::scm_wait::scan::ScanFinding;
 use crate::cutover::scm_wait::settle::StopActor;
 use crate::cutover::scm_wait::{observed_from_state, Observed, SystemScmActor};
 
@@ -100,7 +101,7 @@ impl StopActor for StopSession {
     /// Holds every live process that carries the service's token, other than
     /// this one: the update cutover's child runs under the bridge's token and
     /// is never waited on.
-    fn hold_scanned(&mut self) -> io::Result<()> {
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
         self.processes.hold_scanned(&self.sid)
     }
 }
@@ -165,7 +166,3 @@ impl ServiceProbe<'_> {
         Ok((status.dwCurrentState.0, status.dwProcessId))
     }
 }
-
-#[cfg(test)]
-#[path = "stop_session_tests.rs"]
-mod stop_session_tests;

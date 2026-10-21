@@ -24,13 +24,14 @@ use tracing::{info, warn};
 
 use super::call_error::service_gone;
 use super::hold::{Look, ProcessFate};
+use super::scan::ScanFinding;
 use super::Observed;
 
 /// What the stop wait does on a look at the service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettleStep {
-    /// The SCM says STOPPED and nothing held is alive: ask the scan whether
-    /// anything else carries the service's token, and settle only if not.
+    /// The SCM says STOPPED and nothing held is alive: scan for processes that
+    /// carry the service's token, and settle only on a scan that finds nothing.
     Quiescent,
     /// RUNNING over a process that takes a Stop.
     SendStop,
@@ -68,6 +69,19 @@ impl Look {
                     SettleStep::Quiescent
                 }
             }
+        }
+    }
+}
+
+impl Look {
+    /// Whether the look shows that the process the service ran is gone, though
+    /// the SCM's state still says otherwise: the one it named has exited, or
+    /// it named none and every process shown before has.
+    fn shows_its_processes_gone(self) -> bool {
+        match self.fate {
+            ProcessFate::Exited => true,
+            ProcessFate::Alive => false,
+            ProcessFate::Unheld => self.ever_held,
         }
     }
 }
@@ -134,9 +148,10 @@ pub trait StopActor {
     fn await_callback(&mut self) -> io::Result<()>;
     /// Wait until every held process has exited.
     fn await_held_exits(&mut self) -> io::Result<()>;
-    /// Hold every live process that carries the service's token, other than
-    /// the calling one. Does nothing where there is no service token.
-    fn hold_scanned(&mut self) -> io::Result<()>;
+    /// Scan for the live processes that carry the service's token, other than
+    /// the calling one, and hold them. Says what the scan itself found: only
+    /// [`ScanFinding::Nothing`] lets the wait end.
+    fn hold_scanned(&mut self) -> io::Result<ScanFinding>;
 }
 
 /// Why the stop wait failed, by the act that failed, so a caller's policy per
@@ -179,8 +194,10 @@ impl SettleError {
     }
 }
 
-/// Stop the service and return once the SCM says STOPPED, nothing held is
-/// alive, and a scan finds no process carrying the service's token.
+/// Stop the service and return once the SCM says STOPPED and a scan of its
+/// own finds no process carrying the service's token alive and loses no listed
+/// process ([`ScanFinding::Nothing`]). What an earlier scan held and saw exit
+/// is not that: the exited process may have started a child after the listing.
 ///
 /// Every iteration ends in a real event (a process exit, an SCM notification)
 /// or in a state change a query read; nothing is retried on a count or a
@@ -199,9 +216,9 @@ pub fn settle_stopped<A: StopActor>(actor: &mut A) -> Result<(), SettleError> {
         let step = look.settle_step();
         let next = match step {
             SettleStep::Quiescent => {
-                settle.hold_scanned()?;
+                let finding = settle.hold_scanned()?;
                 look = settle.observe()?;
-                if look.settle_step().ends_the_wait() {
+                if finding.ends_the_wait() && look.settle_step().ends_the_wait() {
                     info!("stop wait: the service is stopped and no process of it is left");
                     return Ok(());
                 }
@@ -243,7 +260,7 @@ impl<A: StopActor> Settle<'_, A> {
         self.actor.observe().map_err(SettleError::Observe)
     }
 
-    fn hold_scanned(&mut self) -> Result<(), SettleError> {
+    fn hold_scanned(&mut self) -> Result<ScanFinding, SettleError> {
         self.actor.hold_scanned().map_err(SettleError::Scan)
     }
 
@@ -320,11 +337,12 @@ impl<A: StopActor> Settle<'_, A> {
 
     /// What the loop does where it would have armed and cannot: hold what the
     /// scan finds and wait on that. With nothing held alive and the SCM's
-    /// state still lagging, the processes that were held have exited and the
-    /// scan finds no other: settled. If none was ever held, the state is left
-    /// with no event to wait on.
+    /// state still lagging, a scan that finds nothing settles the wait if the
+    /// look shows the service's processes gone ([`Look::shows_its_processes_gone`]).
+    /// A scan that finds something, or loses a listed process, scans again.
+    /// With no process ever shown, the state is left with no event to wait on.
     fn without_arm(&mut self) -> Result<Next, SettleError> {
-        self.hold_scanned()?;
+        let finding = self.hold_scanned()?;
         let look = self.observe()?;
         if look.held_alive {
             self.await_held_exits()?;
@@ -333,10 +351,13 @@ impl<A: StopActor> Settle<'_, A> {
         if look.settle_step().ends_the_wait() {
             return Ok(Next::Look(look));
         }
-        if look.ever_held {
+        if !finding.ends_the_wait() {
+            return Ok(Next::Look(look));
+        }
+        if look.shows_its_processes_gone() {
             info!(
                 ?look,
-                "stop wait: every process held has exited and none else carries the token"
+                "stop wait: every process of the service has exited and none else carries the token"
             );
             return Ok(Next::Settled);
         }

@@ -35,7 +35,7 @@ use repair_session::{RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
 pub mod registration;
 #[path = "windows/service_processes.rs"]
 mod service_processes;
-pub use service_processes::scan_service_processes;
+pub use service_processes::{enumeration_continues, scan_service_processes};
 #[path = "windows/service_sid.rs"]
 mod service_sid;
 pub use service_sid::{ServiceSid, SidRepair, SidRepairOutcome};
@@ -752,7 +752,7 @@ pub fn disabled_by() -> std::io::Result<Option<DisabledBy>> {
     let Some(mut session) = RepairSession::open(READ_ACCESS)? else {
         return Ok(None);
     };
-    let step = repair::observe(&mut session).map_err(std::io::Error::other)?;
+    let step = repair::observe(&mut session).map_err(|e| std::io::Error::other(repair::RepairError::StartType(e)))?;
     Ok(step.disabled_by())
 }
 
@@ -770,7 +770,7 @@ pub fn disabled_state() -> Option<DisabledBy> {
     };
     let observed = repair::observe(&mut session);
     if let Err(e) = &observed {
-        warn!(error = %e, "could not read whether the service is disabled");
+        warn!(error = %e, "could not read the service's start type, so it is taken as not disabled");
     }
     repair::for_display(observed)
 }

@@ -22,7 +22,7 @@ use windows::Win32::System::Threading::{
 
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessHolds, ProcessSource};
-use crate::cutover::scm_wait::scan::{scan, ProcessEnumerator, ScanResult};
+use crate::cutover::scm_wait::scan::{scan, ProcessEnumerator, ScanFinding, ScanResult};
 
 use super::service_sid::ServiceSid;
 
@@ -87,6 +87,26 @@ pub(super) fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
     }
 }
 
+/// `ERROR_NO_MORE_FILES`: the end of a Toolhelp enumeration.
+const ERROR_NO_MORE_FILES: u32 = 18;
+
+/// What a `Process32FirstW` / `Process32NextW` result says about the
+/// enumeration: another entry (`true`), or its end (`false`). Only
+/// `ERROR_NO_MORE_FILES` is the end; any other failure is returned, because a
+/// list cut short would read as a host with no more processes.
+pub fn enumeration_continues(step: windows::core::Result<()>) -> io::Result<bool> {
+    match step {
+        Ok(()) => Ok(true),
+        Err(e) => match win32_code_of_hresult(e.code().0) {
+            ERROR_NO_MORE_FILES => Ok(false),
+            code => Err(io::Error::from_raw_os_error(code as i32)),
+        },
+    }
+}
+
+/// The System Idle Process's id.
+const IDLE_PROCESS: u32 = 0;
+
 /// Every process on the host, for [`scan_service_processes`].
 struct HostProcesses<'a> {
     service: &'a ServiceSid,
@@ -95,6 +115,9 @@ struct HostProcesses<'a> {
 impl ProcessEnumerator for HostProcesses<'_> {
     type Process = OwnedHandle;
 
+    /// Every id the Toolhelp snapshot lists but 0: the System Idle Process is
+    /// listed and never opens (`ERROR_INVALID_PARAMETER`), so the scan would
+    /// find it vanished on every pass.
     fn pids(&mut self) -> io::Result<Vec<u32>> {
         // SAFETY: plain FFI call.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
@@ -109,11 +132,13 @@ impl ProcessEnumerator for HostProcesses<'_> {
         let mut pids = Vec::new();
         // SAFETY: `handle` is the live snapshot just returned, and `entry` is
         // a `PROCESSENTRY32W` with its size set, as both calls require.
-        let mut more = unsafe { Process32FirstW(handle, &mut entry) }.is_ok();
+        let mut more = enumeration_continues(unsafe { Process32FirstW(handle, &mut entry) })?;
         while more {
-            pids.push(entry.th32ProcessID);
+            if entry.th32ProcessID != IDLE_PROCESS {
+                pids.push(entry.th32ProcessID);
+            }
             // SAFETY: as above.
-            more = unsafe { Process32NextW(handle, &mut entry) }.is_ok();
+            more = enumeration_continues(unsafe { Process32NextW(handle, &mut entry) })?;
         }
         Ok(pids)
     }
@@ -137,7 +162,9 @@ impl ProcessEnumerator for HostProcesses<'_> {
 /// such process is left (its id is never valid once STOPPED); this does.
 ///
 /// A process that cannot be probed never fails the scan: see
-/// [`Basis::verdict`] for `Basis::Scanned`.
+/// [`Basis::verdict`] for `Basis::Scanned`. A listed process gone by its probe
+/// is in `vanished`: only [`ScanResult::finding`] says whether the scan found
+/// nothing.
 pub fn scan_service_processes(service: &ServiceSid) -> io::Result<ScanResult<OwnedHandle>> {
     scan(&mut HostProcesses { service })
 }
@@ -156,22 +183,18 @@ impl ServiceProcesses {
     }
 
     /// Holds every live process on the host that carries `service`'s token, so
-    /// the next [`look`](Self::look) shows it alive. A process the scan cannot
-    /// tell is warned about by the scan and never fails it.
-    pub(super) fn hold_scanned(&mut self, service: &ServiceSid) -> io::Result<()> {
+    /// the next [`look`](Self::look) shows it alive, and says what the scan
+    /// found. A process the scan cannot tell is warned about by the scan and
+    /// never fails it.
+    pub(super) fn hold_scanned(&mut self, service: &ServiceSid) -> io::Result<ScanFinding> {
         self.holds
             .hold_scanned(&mut HostProcesses { service })
-            .map(|_undetermined| ())
+            .map(|scanned| scanned.finding)
     }
 
     /// How many processes are held, exited or not.
     pub(super) fn held(&self) -> usize {
         self.holds.processes().count()
-    }
-
-    /// Whether any held process has not exited: a state read of each handle.
-    pub(super) fn any_alive(&self) -> io::Result<bool> {
-        self.holds.any_alive(has_exited)
     }
 
     /// Blocks until every held process has exited. An external event with no
