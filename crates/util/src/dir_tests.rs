@@ -590,3 +590,15 @@ fn link_and_rename_work_for_a_name_of_every_length() {
         dir.unlink(&name(&target)).unwrap();
     }
 }
+
+#[skuld::test]
+fn unlink_refuses_a_directory_and_leaves_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+
+    let err = dir.unlink(&name("sub")).unwrap_err();
+
+    assert!(err.kind() != io::ErrorKind::NotFound, "{err:?}");
+    assert!(tmp.path().join("sub").is_dir());
+}
