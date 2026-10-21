@@ -2020,7 +2020,9 @@ state read before its act loses that race, so four rules close it:
   process is gone). That is also what a service process started before the SID
   type was set looks like, so on such a host the exit of the process is not
   awaited, and the stop and the SCM's own notifications are all that is, until
-  the start after the one that ran the startup repair above.
+  the start after the one that ran the startup repair above. This gap is accepted (owner 2026-10-21): it is
+  the one-time window after an in-app update from a release without the SID type,
+  and it closes at that host's next service start.
 
 A held process is also the ground truth for whether the status is current: the
 SCM's status can lag a process's exit by its own latency, so a process that has
@@ -2340,7 +2342,10 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   (`Install`, `Repair`, `Enable`), each with its own title, body, button, declined
   and unattended text. `Repair` runs `bridge install`, `Enable` runs `bridge enable`; an unattended startup (`Prompts::Forbidden`) fails passively with the
   prompt's text. `hole bridge status` prints `installed (disabled)` and exits 3
-  (running 0, stopped 1, not installed 2, being changed 4: see the lock above). The GUI's read is unprivileged and
+  (running 0, stopped 1, not installed 2, being changed 4: see the lock above). A reinstall deletes the
+  service and registers it again, and its change mark lives in the service's key, so between the delete
+  and the registration the read says not installed rather than being changed (accepted, owner
+  2026-10-21: it lasts seconds, and an install started then waits on the lock). The GUI's read is unprivileged and
   never fails (`disabled_state`: a start type it cannot read is none, a record it
   cannot read counts as present, as on every path). That read works as
   installed because nothing sets a security descriptor on the service or on its
