@@ -283,8 +283,9 @@ impl Standing {
 struct Walk {
     steps: VecDeque<Step>,
     trail: Trail<Sid>,
-    /// Links already followed in this walk; one met twice is a loop.
-    followed: HashSet<FileId>,
+    /// Links whose target the walk is in the middle of: meeting one again is a loop. A link met again after its
+    /// own target was walked is not.
+    resolving: HashSet<FileId>,
     /// From the root to the directory the walk stands in, which is the last.
     stack: Vec<Standing>,
 }
@@ -340,10 +341,12 @@ fn follow(walk: &mut Walk, link: &File) -> io::Result<()> {
     walk.trail
         .follow(&dir_owner, &owner_of(link)?)
         .map_err(Refusal::into_io_error)?;
-    if !walk.followed.insert(file_id(link)?) {
+    let id = file_id(link)?;
+    if !walk.resolving.insert(id) {
         return Err(Refusal::Symlink.into_io_error());
     }
     let mut expansion = link::steps_of_reparse_data(&reparse_data(link)?).map_err(Refusal::into_io_error)?;
+    expansion.push_back(Step::Done(id));
     expansion.append(&mut walk.steps);
     walk.steps = expansion;
     Ok(())
@@ -437,14 +440,18 @@ pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS
     let mut walk = Walk {
         steps: names.into_iter().map(Step::Name).collect(),
         trail: Trail::new(),
-        followed: HashSet::new(),
+        resolving: HashSet::new(),
         stack: Vec::new(),
     };
     let first = open_root(&root, rights_for(walk.steps.is_empty()), walk.steps.is_empty())?;
     walk.stack.push(first);
     while let Some(step) = walk.steps.pop_front() {
-        let last = walk.steps.is_empty();
+        // Only the end of a link's target remains.
+        let last = walk.steps.iter().all(|step| matches!(step, Step::Done(_)));
         match step {
+            Step::Done(id) => {
+                walk.resolving.remove(&id);
+            }
             Step::Root(root) => walk.stack = vec![open_root(&root, rights_for(last), last)?],
             Step::Parent => {
                 if walk.stack.len() < 2 {

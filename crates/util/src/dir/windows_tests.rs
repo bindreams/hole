@@ -174,6 +174,39 @@ fn a_relative_symlink_that_ends_on_a_parent_opens_that_folder_for_use() {
 }
 
 #[skuld::test]
+fn a_relative_symlink_that_ends_on_a_parent_gives_the_rights_asked_for_the_final_directory() {
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    let tmp = tempfile::tempdir().unwrap();
+    user_dir(&tmp.path().join("a").join("b"));
+    let link = tmp.path().join("a").join("b").join("up");
+    std::os::windows::fs::symlink_dir(r"..", &link)
+        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    own(&link);
+
+    let dir = Dir::open_for_acl(&link, false).unwrap();
+
+    // A directory flush needs the right to add files; reading the ACL needs `READ_CONTROL`.
+    dir.sync().unwrap();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the handle is open with `READ_CONTROL`; the out-pointer is a live local. The descriptor is
+    // LocalAlloc'd and leaked: it is a test.
+    let read = unsafe {
+        GetSecurityInfo(
+            HANDLE(dir.file().as_raw_handle()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    assert_eq!(read.0, 0);
+}
+
+#[skuld::test]
 fn a_users_junction_to_a_folder_the_system_owns_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let scratch = SystemScratch::new();
@@ -226,6 +259,20 @@ fn a_users_symlink_to_a_missing_folder_makes_the_folder_in_the_users_tree() {
     Dir::open(&link, true, None).unwrap();
 
     assert!(target.is_dir());
+}
+
+#[skuld::test]
+fn a_link_met_again_after_its_own_resolution_is_not_a_loop() {
+    // `link` leads to `real`, where `again` leads back through `link`.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real.join("sub"));
+    plant_link(&real, &tmp.path().join("link"));
+    plant_link(&tmp.path().join("link").join("sub"), &real.join("again"));
+
+    let dir = Dir::open(&tmp.path().join("link").join("again"), false, None).unwrap();
+
+    assert_eq!(super::file_id(dir.file()).unwrap(), file_id(&real.join("sub")));
 }
 
 #[skuld::test]

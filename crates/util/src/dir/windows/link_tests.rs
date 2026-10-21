@@ -174,9 +174,16 @@ fn a_symlink_buffer_with_the_relative_flag_is_a_relative_walk() {
 #[skuld::test]
 fn any_other_reparse_tag_is_refused() {
     // IO_REPARSE_TAG_CLOUD, IO_REPARSE_TAG_APPEXECLINK, IO_REPARSE_TAG_LX_SYMLINK.
+    // Laid out as each of the two followed kinds, so that only the tag can be the reason.
     for tag in [0x9000_001A, 0x8000_001B, 0xA000_001D, 0] {
-        let buffer = reparse(tag, Some(0), r"\??\D:\x", "");
-        assert_eq!(steps_of_reparse_data(&buffer), Err(Refusal::Symlink), "{tag:#x}");
+        for flags in [None, Some(0)] {
+            let buffer = reparse(tag, flags, r"\??\D:\x", "");
+            assert_eq!(
+                steps_of_reparse_data(&buffer),
+                Err(Refusal::Symlink),
+                "{tag:#x} {flags:?}"
+            );
+        }
     }
 }
 
