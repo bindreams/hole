@@ -478,6 +478,74 @@ fn write_state_file_refuses_a_link_to_a_folder_the_system_owns_and_writes_nothin
     );
 }
 
+// read_state_file =====================================================================================================
+
+#[skuld::test]
+fn read_state_file_returns_the_bytes_of_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("bridge-x.json"), b"{\"a\":1}").unwrap();
+
+    assert_eq!(
+        read_state_file(tmp.path(), &name("bridge-x.json")).unwrap(),
+        b"{\"a\":1}"
+    );
+}
+
+#[skuld::test]
+fn read_state_file_answers_not_found_for_a_missing_file_and_for_a_missing_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    assert_eq!(
+        kind(read_state_file(tmp.path(), &name("absent.json"))),
+        Some(io::ErrorKind::NotFound)
+    );
+    assert_eq!(
+        kind(read_state_file(&tmp.path().join("no-such-dir"), &name("x.json"))),
+        Some(io::ErrorKind::NotFound)
+    );
+}
+
+#[skuld::test]
+fn read_state_file_does_not_read_through_a_symlink_at_the_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    // A file that exists and is readable: what a link to it must not be read as.
+    let target = tmp.path().join("theirs.json");
+    std::fs::write(&target, b"{\"theirs\":true}").unwrap();
+    plant_file_symlink(&target, &state.join("bridge-x.json"));
+
+    let result = read_state_file(&state, &name("bridge-x.json"));
+
+    assert!(result.is_err(), "read through a symlink: {result:?}");
+}
+
+#[skuld::test]
+fn read_state_file_does_not_read_through_a_link_in_the_directory_path_that_the_rule_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The user's link to a folder the system owns.
+    let state = tmp.path().join("state");
+    plant_link(SystemScratch::new().root(), &state);
+
+    let err = read_state_file(&state, &name("bridge-x.json")).unwrap_err();
+
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink));
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn read_state_file_refuses_a_fifo_at_the_name_and_does_not_block() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo = std::ffi::CString::new(tmp.path().join("bridge-x.json").as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let err = read_state_file(tmp.path(), &name("bridge-x.json")).unwrap_err();
+
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular));
+}
+
 // read ================================================================================================================
 
 #[skuld::test]

@@ -453,6 +453,14 @@ pub fn write_state_file(state_dir: &Path, name: &OsStr, bytes: &[u8], owner: Opt
     dir.write_atomic(name, bytes, owner, |_| Ok(()))
 }
 
+/// The whole file `name` in the state directory `state_dir`, the counterpart of [`write_state_file`] for a reader
+/// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`Dir::open`], and
+/// the name is read by [`Dir::read`]: a link at the name, or a FIFO a user planted there, is an error, never the
+/// file it leads to and never a wait.
+pub fn read_state_file(state_dir: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
+    Dir::open(state_dir, false, None)?.read(name)
+}
+
 /// `name` must be one ordinary file name: no separator, and not empty, `.` or `..`.
 fn single_component(name: &OsStr) -> io::Result<()> {
     let mut components = Path::new(name).components();
