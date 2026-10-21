@@ -81,24 +81,32 @@ impl Stamp {
         Ok(Self::of_listed_process(self.pid)?.is_some_and(|listed| listed.created == self.created))
     }
 
-    /// The stamp of the live process `pid`, if the process list has it. The
-    /// list needs no access to the process, so this works for any process.
-    pub fn of_listed_process(pid: u32) -> io::Result<Option<Self>> {
+    /// Every live process in the list (one with a thread left; an exited one
+    /// that a handle keeps is not), with the creation time it was listed with.
+    /// One read, so each id and its time belong to one snapshot.
+    pub fn listed_processes() -> io::Result<Vec<Self>> {
         let list = process_list()?;
+        let mut stamps = Vec::new();
         let mut offset = 0usize;
         loop {
             let entry = list.entry_at(offset)?;
-            if entry.pid == pid && entry.threads > 0 {
-                return Ok(Some(Self {
-                    pid,
+            if entry.threads > 0 {
+                stamps.push(Self {
+                    pid: entry.pid,
                     created: entry.created,
-                }));
+                });
             }
             if entry.next == 0 {
-                return Ok(None);
+                return Ok(stamps);
             }
             offset += entry.next;
         }
+    }
+
+    /// The stamp of the live process `pid`, if the process list has it. The
+    /// list needs no access to the process, so this works for any process.
+    pub fn of_listed_process(pid: u32) -> io::Result<Option<Self>> {
+        Ok(Self::listed_processes()?.into_iter().find(|stamp| stamp.pid == pid))
     }
 }
 

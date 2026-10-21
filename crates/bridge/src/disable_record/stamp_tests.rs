@@ -82,6 +82,19 @@ fn the_creation_time_a_stamp_carries_is_the_one_the_process_times_call_gives() {
     assert_eq!(listed.created, creation_time_of(child.pid()));
 }
 
+/// The scan keys a lost process by this listing's id and creation time, so
+/// each entry's time must be its own process's.
+#[skuld::test]
+fn the_whole_listing_gives_each_process_its_own_creation_time() {
+    let child = EchoChild::spawn();
+    let listing = Stamp::listed_processes().expect("snapshot");
+    for pid in [std::process::id(), child.pid()] {
+        let listed = listing.iter().find(|stamp| stamp.pid == pid).expect("listed");
+        assert_eq!(listed.created, creation_time_of(pid), "{pid}");
+    }
+    assert!(listing.iter().any(|stamp| stamp.pid == 4), "the System process");
+}
+
 #[skuld::test]
 fn the_stamping_process_is_running() {
     assert!(Stamp::current().is_running().expect("probe"));

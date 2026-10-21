@@ -13,10 +13,10 @@ use std::fmt::Write as _;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 
-use hole_bridge::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
+use hole_bridge::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use hole_bridge::cutover::scm_wait::hold::{Basis, ProbeFailure};
 use hole_bridge::cutover::scm_wait::ReportedPid;
-use hole_bridge::platform::os::{enumeration_continues, scan_service_processes, ServiceSid};
+use hole_bridge::platform::os::{scan_service_processes, ServiceSid};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, WAIT_OBJECT_0};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -171,6 +171,23 @@ fn exited(process: &OwnedHandle) -> bool {
     // SAFETY: `process` is a live handle this function only reads the state of.
     let waited = unsafe { WaitForSingleObject(HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(process)), 0) };
     waited == WAIT_OBJECT_0
+}
+
+/// `ERROR_NO_MORE_FILES`: the end of a Toolhelp enumeration.
+const ERROR_NO_MORE_FILES: u32 = 18;
+
+/// What a `Process32FirstW` / `Process32NextW` result says about the
+/// enumeration: another entry (`true`), or its end (`false`). Only
+/// `ERROR_NO_MORE_FILES` is the end; any other failure is returned, because a
+/// list cut short would read as a host with no more processes.
+fn enumeration_continues(step: windows::core::Result<()>) -> std::io::Result<bool> {
+    match step {
+        Ok(()) => Ok(true),
+        Err(e) => match win32_code_of_hresult(e.code().0) {
+            ERROR_NO_MORE_FILES => Ok(false),
+            code => Err(std::io::Error::from_raw_os_error(code as i32)),
+        },
+    }
 }
 
 /// Every process the snapshot lists, as (id, image name).

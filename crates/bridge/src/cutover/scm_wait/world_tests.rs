@@ -9,7 +9,7 @@ use std::io;
 use std::rc::Rc;
 
 use super::hold::{Basis, Opened, ProcessHolds, ProcessSource, Reading};
-use super::scan::ProcessEnumerator;
+use super::scan::{ListedProcess, ProcessEnumerator};
 use super::Observed;
 
 /// The moment an [`Act`] happens.
@@ -125,7 +125,7 @@ pub struct Host(World);
 impl ProcessEnumerator for Host {
     type Process = Handle;
 
-    fn pids(&mut self) -> io::Result<Vec<u32>> {
+    fn list(&mut self) -> io::Result<Vec<ListedProcess>> {
         let mut state = (self.0).0.borrow_mut();
         state.snapshots += 1;
         assert!(state.snapshots < 1000, "the wait scans for ever");
@@ -136,6 +136,7 @@ impl ProcessEnumerator for Host {
             .filter(|(_, alive)| **alive)
             .map(|(pid, _)| *pid)
             .chain(state.never_open.iter().copied())
+            .map(|pid| ListedProcess { pid, created: 0 })
             .collect();
         let now = When::AfterSnapshot(state.snapshots);
         state.run(now);

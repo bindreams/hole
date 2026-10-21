@@ -11,16 +11,26 @@
 //! the listing does not show, and the next scan, listed after its exit, does
 //! ([`ScanFinding`]).
 //!
-//! That rescan has to end. A listed id that is gone or exited by its probe is
-//! vanished only if the next listing no longer names it; named again and still
-//! unprobeable, it is not the service's, as a denied probe is not, and no
-//! reason for another pass.
+//! That rescan has to end. A listed process that is gone or exited by its probe
+//! is vanished only if the next listing no longer names it; named again and
+//! still unprobeable, it is not the service's, as a denied probe is not, and no
+//! reason for another pass. "It" is the process, not its id: the OS hands an id
+//! to a new process, which the listing tells by its creation time.
 
 use std::io;
 
 use tracing::warn;
 
 use super::hold::Opened;
+
+/// A process as a listing names it: the id the OS reuses, and the creation time
+/// that tells a new holder of the id from the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListedProcess {
+    pub pid: u32,
+    /// The creation `FILETIME`, 100 ns ticks since 1601.
+    pub created: u64,
+}
 
 /// A process the scan could not decide ([`Verdict::Undetermined`](super::hold::Verdict)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,13 +46,13 @@ pub struct ScanResult<P> {
     pub alive: Vec<(u32, P)>,
     /// The processes the probe failed on in a way no table row decides.
     pub undetermined: Vec<Undetermined>,
-    /// The ids the listing named that no process had any more at the probe, or
-    /// whose process had exited by then, and that the previous scan did not
+    /// The processes the listing named that no process had any more at the
+    /// probe, or that had exited by then, and that the previous scan did not
     /// already find so. Each may have started a process after the listing.
-    pub vanished: Vec<u32>,
-    /// Every id that was gone or exited by its probe, those the previous scan
-    /// already found included: what the next scan is given.
-    pub unprobeable: Vec<u32>,
+    pub vanished: Vec<ListedProcess>,
+    /// Every process that was gone or exited by its probe, those the previous
+    /// scan already found included: what the next scan is given.
+    pub unprobeable: Vec<ListedProcess>,
 }
 
 /// What a scan leaves to do, from what it found.
@@ -70,12 +80,12 @@ impl ScanFinding {
 }
 
 impl<P> ScanResult<P> {
-    /// Records `pid`, listed and gone or exited by its probe: vanished unless
-    /// the previous scan found it so too.
-    fn gone_at_probe(&mut self, pid: u32, vanished_before: &[u32]) {
-        self.unprobeable.push(pid);
-        if !vanished_before.contains(&pid) {
-            self.vanished.push(pid);
+    /// Records `process`, listed and gone or exited by its probe: vanished
+    /// unless the previous scan found it so too.
+    fn gone_at_probe(&mut self, process: ListedProcess, vanished_before: &[ListedProcess]) {
+        self.unprobeable.push(process);
+        if !vanished_before.contains(&process) {
+            self.vanished.push(process);
         }
     }
 
@@ -97,10 +107,11 @@ impl<P> ScanResult<P> {
 pub trait ProcessEnumerator {
     /// An open process; closes when dropped.
     type Process;
-    /// Every process id on the host now, every one: a listing that stops early
+    /// Every process on the host now, every one: a listing that stops early
     /// is an error, never a short list. No id in it may be one that never
-    /// opens, or the scan would report it vanished forever.
-    fn pids(&mut self) -> io::Result<Vec<u32>>;
+    /// opens, or the scan would report it vanished forever. The creation time
+    /// is the listing's own, taken with the id.
+    fn list(&mut self) -> io::Result<Vec<ListedProcess>>;
     /// The id of the calling process, which a scan never waits on.
     fn this_process(&self) -> u32;
     /// Open process `pid` and read its token for the service SID, resolving a
@@ -117,9 +128,12 @@ pub trait ProcessEnumerator {
 /// fatal: an unrelated process must not fail an uninstall. A listed id that is
 /// gone, or a process of the service that has exited, by its probe is
 /// reported in `vanished`, unless `vanished_before` (what the previous scan
-/// reported) already has it: listed again and still unprobeable, it is not the
-/// service's.
-pub fn scan<E: ProcessEnumerator>(host: &mut E, vanished_before: &[u32]) -> io::Result<ScanResult<E::Process>> {
+/// reported) already has that process: listed again and still unprobeable, it
+/// is not the service's.
+pub fn scan<E: ProcessEnumerator>(
+    host: &mut E,
+    vanished_before: &[ListedProcess],
+) -> io::Result<ScanResult<E::Process>> {
     let this = host.this_process();
     let mut result = ScanResult {
         alive: Vec::new(),
@@ -127,16 +141,17 @@ pub fn scan<E: ProcessEnumerator>(host: &mut E, vanished_before: &[u32]) -> io::
         vanished: Vec::new(),
         unprobeable: Vec::new(),
     };
-    for pid in host.pids()? {
+    for listed in host.list()? {
+        let pid = listed.pid;
         if pid == this {
             continue;
         }
         match host.open(pid)? {
-            Opened::NoSuchProcess => result.gone_at_probe(pid, vanished_before),
+            Opened::NoSuchProcess => result.gone_at_probe(listed, vanished_before),
             Opened::NotTheService => {}
             Opened::Service(process) => {
                 if host.has_exited(&process)? {
-                    result.gone_at_probe(pid, vanished_before);
+                    result.gone_at_probe(listed, vanished_before);
                 } else {
                     result.alive.push((pid, process));
                 }

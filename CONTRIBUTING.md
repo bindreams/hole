@@ -1946,19 +1946,23 @@ state read before its act loses that race, so four rules close it:
   scan skips the calling process. The service *row* is not waited for; the SCM
   removes it once the handles close.
 - **Only a scan ends the wait.** The
-  host listing is a snapshot (Toolhelp), and a process in it can start a child
-  after the snapshot, then exit before it is probed or looked at. So the stop wait
-  and the removed-entry wait end only on a scan whose own alive list is empty and
-  that probed every listed id (`scan::ScanFinding::Nothing`). What an earlier
-  scan held and saw exit proves nothing, and an id the listing named that no
-  process had at its probe, or whose process had exited by then
+  host listing is a snapshot (the system process list, `NtQuerySystemInformation`,
+  which also gives each process's creation time), and a process in it can start a
+  child after the snapshot, then exit before it is probed or looked at. So the stop
+  wait and the removed-entry wait end only on a scan whose own alive list is empty
+  and that probed every listed process (`scan::ScanFinding::Nothing`). What an
+  earlier scan held and saw exit proves nothing, and a process the listing named
+  that no process had at its probe, or that had exited by then
   (`ScanResult::vanished`), forces another scan: it may have started a process the
   listing does not show, which the next listing, taken after its exit, does. The
-  listing must be complete: only `ERROR_NO_MORE_FILES` ends the Toolhelp
-  enumeration, any other failure is returned, and the System Idle Process (id 0,
-  which is listed and never opens, measured) is left out so it cannot read as
-  vanished on every pass. A process that has exited is not in a later listing
-  (measured, with its handle still held). Passes repeat without a count or a
+  listing must be complete: a failed read is returned, never a short list, and the
+  System Idle Process (id 0, which is listed and never opens, measured) is left out
+  so it cannot read as vanished on every pass. A process that has exited is not in
+  a later listing (measured, with its handle still held; the list's zero-thread
+  entries are dropped too). The exemption that ends the rescan of a process that never
+  opens keys it by id AND creation time (`scan::ListedProcess`), because the OS
+  hands an id to a new process, and that process can have started a child after
+  the listing and exited before its probe. Passes repeat without a count or a
   timer; each one is a real scan, and each is separated from the last by the
   exit of what it found alive. Any other process on the host that exits
   between a listing and its probe also costs one more scan.

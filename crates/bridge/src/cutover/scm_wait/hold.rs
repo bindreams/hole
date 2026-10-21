@@ -11,7 +11,7 @@ use std::io;
 use tracing::warn;
 
 use super::call_error::{scm_call_error, ScmCall, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
-use super::scan::{scan, ProcessEnumerator, ScanFinding, ScanResult, Undetermined};
+use super::scan::{scan, ListedProcess, ProcessEnumerator, ScanFinding, ScanResult, Undetermined};
 use super::{Observed, ReportedPid};
 
 /// One look at a service: its state and the process id it names (0: none).
@@ -272,9 +272,9 @@ pub trait ProcessSource {
 /// The processes held so far, each with the id it was opened under.
 pub struct ProcessHolds<P> {
     held: Vec<(u32, P)>,
-    /// The ids the last scan found gone or exited at their probe, which the
-    /// next scan does not call vanished again ([`scan`]).
-    vanished: Vec<u32>,
+    /// The processes the last scan found gone or exited at their probe, which
+    /// the next scan does not call vanished again ([`scan`]).
+    vanished: Vec<ListedProcess>,
 }
 
 impl<P> Default for ProcessHolds<P> {

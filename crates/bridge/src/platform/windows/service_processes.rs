@@ -12,9 +12,6 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE,
@@ -22,7 +19,8 @@ use windows::Win32::System::Threading::{
 
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessHolds, ProcessSource};
-use crate::cutover::scm_wait::scan::{scan, ProcessEnumerator, ScanFinding, ScanResult};
+use crate::cutover::scm_wait::scan::{scan, ListedProcess, ProcessEnumerator, ScanFinding, ScanResult};
+use crate::disable_record::Stamp;
 
 use super::service_sid::ServiceSid;
 
@@ -87,23 +85,6 @@ pub(super) fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
     }
 }
 
-/// `ERROR_NO_MORE_FILES`: the end of a Toolhelp enumeration.
-const ERROR_NO_MORE_FILES: u32 = 18;
-
-/// What a `Process32FirstW` / `Process32NextW` result says about the
-/// enumeration: another entry (`true`), or its end (`false`). Only
-/// `ERROR_NO_MORE_FILES` is the end; any other failure is returned, because a
-/// list cut short would read as a host with no more processes.
-pub fn enumeration_continues(step: windows::core::Result<()>) -> io::Result<bool> {
-    match step {
-        Ok(()) => Ok(true),
-        Err(e) => match win32_code_of_hresult(e.code().0) {
-            ERROR_NO_MORE_FILES => Ok(false),
-            code => Err(io::Error::from_raw_os_error(code as i32)),
-        },
-    }
-}
-
 /// The System Idle Process's id.
 const IDLE_PROCESS: u32 = 0;
 
@@ -115,32 +96,19 @@ struct HostProcesses<'a> {
 impl ProcessEnumerator for HostProcesses<'_> {
     type Process = OwnedHandle;
 
-    /// Every id the Toolhelp snapshot lists but 0: the System Idle Process is
-    /// listed and never opens (`ERROR_INVALID_PARAMETER`), so the scan would
-    /// find it vanished on every pass.
-    fn pids(&mut self) -> io::Result<Vec<u32>> {
-        // SAFETY: plain FFI call.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
-            .map_err(|e| io::Error::from_raw_os_error(win32_code_of_hresult(e.code().0) as i32))?;
-        // SAFETY: `CreateToolhelp32Snapshot` returned a new handle this value now owns.
-        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.0) };
-        let handle = HANDLE(snapshot.as_raw_handle());
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        let mut pids = Vec::new();
-        // SAFETY: `handle` is the live snapshot just returned, and `entry` is
-        // a `PROCESSENTRY32W` with its size set, as both calls require.
-        let mut more = enumeration_continues(unsafe { Process32FirstW(handle, &mut entry) })?;
-        while more {
-            if entry.th32ProcessID != IDLE_PROCESS {
-                pids.push(entry.th32ProcessID);
-            }
-            // SAFETY: as above.
-            more = enumeration_continues(unsafe { Process32NextW(handle, &mut entry) })?;
-        }
-        Ok(pids)
+    /// Every process the system process list names but the System Idle
+    /// Process, which is listed and never opens (`ERROR_INVALID_PARAMETER`), so
+    /// the scan would find it vanished on every pass. The creation time is the
+    /// list's, taken in the same read as the id.
+    fn list(&mut self) -> io::Result<Vec<ListedProcess>> {
+        Ok(Stamp::listed_processes()?
+            .into_iter()
+            .filter(|stamp| stamp.pid != IDLE_PROCESS)
+            .map(|stamp| ListedProcess {
+                pid: stamp.pid,
+                created: stamp.created,
+            })
+            .collect())
     }
 
     fn this_process(&self) -> u32 {

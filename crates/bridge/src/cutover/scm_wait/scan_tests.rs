@@ -33,6 +33,8 @@ struct Host {
     log: Log,
     this: u32,
     processes: BTreeMap<u32, Process>,
+    /// The creation time the listing gives an id; 0 unless set.
+    created: BTreeMap<u32, u64>,
 }
 
 impl Host {
@@ -41,15 +43,40 @@ impl Host {
             log: Log::default(),
             this,
             processes: processes.into_iter().collect(),
+            created: BTreeMap::new(),
         }
     }
+
+    /// The process the listing names `pid` as.
+    fn listed(&self, pid: u32) -> ListedProcess {
+        ListedProcess {
+            pid,
+            created: self.created.get(&pid).copied().unwrap_or(0),
+        }
+    }
+
+    /// The OS hands `pid` to a new process, which is `what` and was created at
+    /// `created`.
+    fn reuse(&mut self, pid: u32, created: u64, what: Process) {
+        self.processes.insert(pid, what);
+        self.created.insert(pid, created);
+    }
+}
+
+/// A process listed with creation time 0, the fake host's default.
+fn listed(pid: u32) -> ListedProcess {
+    ListedProcess { pid, created: 0 }
+}
+
+fn listed_all(pids: &[u32]) -> Vec<ListedProcess> {
+    pids.iter().copied().map(listed).collect()
 }
 
 impl ProcessEnumerator for Host {
     type Process = Handle;
 
-    fn pids(&mut self) -> io::Result<Vec<u32>> {
-        Ok(self.processes.keys().copied().collect())
+    fn list(&mut self) -> io::Result<Vec<ListedProcess>> {
+        Ok(self.processes.keys().map(|pid| self.listed(*pid)).collect())
     }
 
     fn this_process(&self) -> u32 {
@@ -124,7 +151,7 @@ fn a_listed_process_gone_or_exited_by_its_probe_is_reported_vanished() {
     );
     let result = scan(&mut host, &[]).unwrap();
     assert!(result.alive.is_empty());
-    assert_eq!(result.vanished, vec![3, 4]);
+    assert_eq!(result.vanished, listed_all(&[3, 4]));
 }
 
 /// An id the listing names and no probe ever opens (a listing that names more
@@ -136,7 +163,7 @@ fn an_id_listed_again_that_still_does_not_open_is_not_vanished_a_second_time() {
     for never_opens in [Process::Gone, Process::ServiceExited] {
         let mut host = Host::new(1, vec![(7, never_opens), (3, Process::Stranger)]);
         let first = scan(&mut host, &[]).unwrap();
-        assert_eq!(first.vanished, vec![7]);
+        assert_eq!(first.vanished, listed_all(&[7]));
         assert_eq!(first.finding(), ScanFinding::Vanished);
 
         let second = scan(&mut host, &first.vanished).unwrap();
@@ -151,10 +178,41 @@ fn an_id_listed_again_that_still_does_not_open_is_not_vanished_a_second_time() {
 #[skuld::test]
 fn what_vanished_before_exempts_only_an_id_that_still_does_not_open() {
     let mut host = Host::new(1, vec![(3, Process::Service), (4, Process::Gone)]);
-    let result = scan(&mut host, &[3, 4, 9]).unwrap();
+    let result = scan(&mut host, &listed_all(&[3, 4, 9])).unwrap();
     assert_eq!(alive_pids(&result), vec![3]);
     assert!(result.vanished.is_empty(), "4 stays exempt, 9 is not listed");
-    assert_eq!(result.unprobeable, vec![4], "and 4 is carried to the next scan");
+    assert_eq!(
+        result.unprobeable,
+        listed_all(&[4]),
+        "and 4 is carried to the next scan"
+    );
+}
+
+/// The exemption is for the process, not the id: the OS hands an id to a new
+/// process, which the listing tells by its creation time, and that process can
+/// have started a child after the listing and exited before its probe.
+#[skuld::test]
+fn an_id_given_to_a_new_process_that_does_not_open_is_vanished_again() {
+    let mut host = Host::new(1, vec![(7, Process::Gone)]);
+    host.created.insert(7, 100);
+    let first = scan(&mut host, &[]).unwrap();
+    assert_eq!(first.vanished, vec![ListedProcess { pid: 7, created: 100 }]);
+
+    host.reuse(7, 200, Process::ServiceExited);
+    let second = scan(&mut host, &first.unprobeable).unwrap();
+    assert_eq!(
+        second.vanished,
+        vec![ListedProcess { pid: 7, created: 200 }],
+        "a different process under the same id is not the one the last scan lost"
+    );
+    assert_eq!(second.finding(), ScanFinding::Vanished);
+
+    let third = scan(&mut host, &second.unprobeable).unwrap();
+    assert_eq!(
+        third.finding(),
+        ScanFinding::Nothing,
+        "listed again as itself, it is exempt"
+    );
 }
 
 /// An exempt id stays exempt while it is listed, however many scans, and a
@@ -267,7 +325,7 @@ fn a_failure_that_is_not_a_verdict_ends_the_scan() {
     struct Fails;
     impl ProcessEnumerator for Fails {
         type Process = Handle;
-        fn pids(&mut self) -> io::Result<Vec<u32>> {
+        fn list(&mut self) -> io::Result<Vec<ListedProcess>> {
             Err(io::Error::other("cannot list"))
         }
         fn this_process(&self) -> u32 {

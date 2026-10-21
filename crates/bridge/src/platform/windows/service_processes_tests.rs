@@ -4,8 +4,8 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE};
 
 use super::{
-    enumeration_continues, has_exited, open_process, opened_from_token_read, scan_service_processes, HostProcesses,
-    ServiceProcesses, ServiceSid,
+    has_exited, open_process, opened_from_token_read, scan_service_processes, HostProcesses, ServiceProcesses,
+    ServiceSid,
 };
 use crate::cutover::scm_wait::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::{Basis, Opened};
@@ -151,34 +151,16 @@ fn service_processes_count_what_they_hold() {
     assert_eq!(processes.held(), 1);
 }
 
-fn enumeration_error(code: u32) -> windows::core::Result<()> {
-    Err(windows::core::Error::from_hresult(windows::core::HRESULT(
-        (0x8007_0000 | code) as i32,
-    )))
-}
-
-/// Only the end-of-list code ends an enumeration; every other failure is
-/// returned, since a list cut short would read as a host with no more
-/// processes (and a scan that found nothing).
-#[skuld::test]
-fn only_no_more_files_ends_an_enumeration() {
-    assert!(enumeration_continues(Ok(())).unwrap());
-    assert!(!enumeration_continues(enumeration_error(18)).unwrap());
-    for code in [5, 24, 87, 1450] {
-        let error = enumeration_continues(enumeration_error(code)).expect_err("a failure is not an end");
-        assert_eq!(error.raw_os_error(), Some(code as i32), "{code}");
-    }
-}
-
 /// The listing is the host's real processes, and omits the System Idle Process
 /// (id 0), which is listed and never opens.
 #[skuld::test]
 fn the_listing_has_this_process_and_not_the_idle_process() {
-    let pids = HostProcesses {
+    let listed = HostProcesses {
         service: &ServiceSid::everyone(),
     }
-    .pids()
+    .list()
     .expect("list");
+    let pids: Vec<u32> = listed.iter().map(|process| process.pid).collect();
     assert!(pids.contains(&std::process::id()), "{pids:?}");
     assert!(!pids.contains(&0), "the idle process is listed");
 }
