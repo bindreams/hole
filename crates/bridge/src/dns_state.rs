@@ -218,8 +218,8 @@ pub fn supersede(state_dir: &Path) -> std::io::Result<()> {
         };
         std::fs::rename(&from, &archive)?;
         tracing::warn!(
-            kept = %to.display(),
-            archived = %archive.display(),
+            kept = SUPERSEDED_FILE_NAME,
+            archived = ?archive.file_name().unwrap_or_default(),
             "dns_state: bridge-dns.superseded.json already existed; archived the newer file \n             instead of overwriting it. The archive is forensic only — nothing reads it back."
         );
         return Ok(());
