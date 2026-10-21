@@ -411,6 +411,13 @@ fn to_ids(u: &hole_bridge::group::RealUser) -> (u32, u32) {
     (u.uid, u.gid)
 }
 
+/// `state_dir` as an absolute path, so a service whose cwd is `C:\Windows\System32` or `/` does not read it relative
+/// to that. Links are not resolved: the walk of `util::dir` judges every one in the path, and a path resolved here
+/// would have none left for it to refuse.
+fn absolute_state_dir(state_dir: std::path::PathBuf) -> std::path::PathBuf {
+    std::path::absolute(&state_dir).unwrap_or(state_dir)
+}
+
 /// Per-user log directory under the resolved user's home, derived from `home`
 /// (never `$HOME`/`dirs`, which under osascript-admin still point at the
 /// invoking user but are easy to get wrong for an elevated process).
@@ -680,19 +687,9 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 return 2;
             }
 
-            // Canonicalize state_dir to an absolute path. If canonicalize
-            // fails (e.g. directory doesn't exist yet), fall back to
-            // joining against cwd so the service mode doesn't surprise the
-            // user with a cwd-relative path (service cwd is `C:\Windows\System32`
-            // on Windows or `/` on macOS).
             #[cfg(target_os = "macos")]
             let state_dir = state_dir.or_else(|| owner.as_ref().map(|u| user_state_dir(&u.home)));
-            let state_dir = state_dir.unwrap_or_else(hole_common::paths::default_state_dir);
-            let state_dir = state_dir.canonicalize().unwrap_or_else(|_| {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(&state_dir))
-                    .unwrap_or(state_dir)
-            });
+            let state_dir = absolute_state_dir(state_dir.unwrap_or_else(hole_common::paths::default_state_dir));
 
             let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
 
