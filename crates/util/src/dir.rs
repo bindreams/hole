@@ -185,6 +185,16 @@ impl Dir {
         Self::open_as(path, create, owner, platform::caller())
     }
 
+    /// [`Self::open`] for a directory that is only read from ([`Self::read`], [`Self::kind_of`]): the walk is the
+    /// same, but Windows is not asked for the right to add to the final directory, so a folder whose ACL allows
+    /// reading alone is still read. Writing through it fails there and not on unix: use [`Self::open`] to write.
+    pub fn open_read(path: &Path) -> io::Result<Dir> {
+        #[cfg(windows)]
+        return platform::open_dir_read(path).map(|file| Dir { file });
+        #[cfg(unix)]
+        return Self::open(path, false, None);
+    }
+
     /// [`Self::open`] as `caller`; the seam lets a test claim to be another user.
     #[doc(hidden)]
     pub fn open_as(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<Dir> {
@@ -457,11 +467,11 @@ pub fn write_state_file(state_dir: &Path, name: &OsStr, bytes: &[u8], owner: Opt
 }
 
 /// The whole file `name` in the state directory `state_dir`, the counterpart of [`write_state_file`] for a reader
-/// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`Dir::open`], and
+/// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`Dir::open_read`], and
 /// the name is read by [`Dir::read`]: a link at the name, or a FIFO a user planted there, is an error, never the
 /// file it leads to and never a wait.
 pub fn read_state_file(state_dir: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
-    Dir::open(state_dir, false, None)?.read(name)
+    Dir::open_read(state_dir)?.read(name)
 }
 
 /// `name` must be one ordinary file name: no separator, and not empty, `.` or `..`.

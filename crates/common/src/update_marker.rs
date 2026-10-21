@@ -147,7 +147,7 @@ fn readable_by_the_gui(_staged: &std::fs::File) -> io::Result<()> {
 /// or SYSTEM in a log directory a user may own, where a link or a FIFO planted at
 /// the name must be neither followed nor waited for.
 pub fn read(log_dir: &Path) -> Marker {
-    let dir = match Dir::open(log_dir, false, None) {
+    let dir = match Dir::open_read(log_dir) {
         Ok(dir) => dir,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Marker::Absent,
         Err(e) => {
@@ -198,7 +198,7 @@ fn unopened(dir: &Dir, read_error: &io::Error) -> Marker {
             tracing::error!(
                 ?kind,
                 read_error = %read_error,
-                "the update marker name holds something that is not a regular file;                  it claims no cutover"
+                "the update marker name holds something that is not a regular file; it claims no cutover"
             );
             Marker::Indeterminate
         }

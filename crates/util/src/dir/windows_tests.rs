@@ -1,5 +1,5 @@
 use super::*;
-use crate::dir::testing::{own, plant_link, user_dir, SystemScratch};
+use crate::dir::testing::{own, plant_link, user_dir, AddDenied, SystemScratch};
 use crate::dir::Dir;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
@@ -227,6 +227,30 @@ fn a_relative_symlink_that_ends_on_a_parent_gives_the_rights_asked_for_the_final
         )
     };
     assert_eq!(read.0, 0);
+}
+
+#[skuld::test]
+fn a_folder_that_can_only_be_read_is_read_from() {
+    // A machine that tightened the ACL of `%ProgramData%\hole\logs` still lets the GUI read the update marker there.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("state.json"), b"{}").unwrap();
+    let _denied = AddDenied::to(tmp.path());
+
+    let read = crate::dir::read_state_file(tmp.path(), "state.json".as_ref());
+
+    assert_eq!(read.unwrap(), b"{}");
+}
+
+#[skuld::test]
+fn a_folder_opened_for_use_asks_to_add_to_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _denied = AddDenied::to(tmp.path());
+
+    let err = Dir::open(tmp.path(), false, None)
+        .err()
+        .expect("opening for use must need the add rights");
+
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 }
 
 #[skuld::test]

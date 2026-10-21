@@ -461,6 +461,17 @@ fn a_symlink_at_the_marker_claims_no_cutover() {
     assert!(!is_present(&state));
 }
 
+// The GUI reads the marker as the user, in a folder it may only be able to read from.
+#[cfg(windows)]
+#[skuld::test]
+fn a_marker_in_a_folder_nobody_may_add_to_is_still_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), &info(4242), None).unwrap();
+    let _denied = util::dir::testing::AddDenied::to(tmp.path());
+
+    assert_eq!(present(tmp.path()), info(4242));
+}
+
 #[cfg(unix)]
 #[skuld::test]
 fn a_fifo_at_the_marker_claims_no_cutover_and_is_not_waited_for() {
