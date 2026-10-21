@@ -442,7 +442,10 @@ const BY_PATH_ALLOWED: &[(&str, &str)] = &[
     ("crates/bridge/src/bin/test_plugin.rs", "a test binary"),
     ("crates/bridge/src/bin/test_service.rs", "a test binary"),
     ("crates/bridge/src/test_support/dist_harness.rs", "test support: reads the log of a process the test started"),
-    ("crates/bridge/src/ipc.rs", "reads the `installer-user-sid` file in the system's `ProgramData` folder"),
+    (
+        "crates/bridge/src/ipc.rs",
+        "reads the `installer-user-sid` file in the `hole` folder of `%ProgramData%`, where a standard user can add names on some hosts (routed to the follow-up branch azhukova/1118-2)",
+    ),
     ("crates/tun-engine/src/test_utils/escape.rs", "test support"),
     ("crates/tun-engine/src/test_utils/pktmon.rs", "test support: reads a capture the test made"),
     ("crates/util/src/dir/testing.rs", "test fixtures"),
