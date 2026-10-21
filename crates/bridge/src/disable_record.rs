@@ -84,7 +84,7 @@ impl Changer {
     }
 }
 
-/// What a status read saw of the change mark ([`ChangeKey`] on Windows): the
+/// What a status read saw of the change mark (`ChangeKey` on Windows): the
 /// value exactly as read, and whether the process it names, if any, runs. Two
 /// reads that see equal marks saw no change begin or end between them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

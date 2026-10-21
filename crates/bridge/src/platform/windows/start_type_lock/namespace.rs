@@ -10,8 +10,9 @@
 //! lock. Microsoft is explicit that "a process can open an existing namespace
 //! even if it is not within the boundary unless the creator restricted
 //! access", so the namespace carries a DACL of its own. The open itself is not
-//! checked against it (measured); making or opening an object in the
-//! namespace is.
+//! checked against it (measured); making an object in the namespace is
+//! (measured), and opening the existing mutex is refused by the mutex's own
+//! DACL.
 //!
 //! Each process makes or opens the namespace once and keeps the handle for as
 //! long as it lives. The namespace outlives the handle that made it for as
