@@ -106,7 +106,10 @@ impl ChangeKey {
     fn raw(&self) -> Result<Option<String>, windows::core::Error> {
         let answer = self.open(KEY_QUERY_VALUE.0).and_then(|key| key.get_value(VALUE));
         match answer {
-            Ok(value) => Ok(Some(String::try_from(value).unwrap_or_default())),
+            Ok(value) => Ok(Some(String::try_from(value).unwrap_or_else(|error| {
+                warn!(%error, "the service's change mark is not a string; counting it as empty");
+                String::new()
+            }))),
             Err(error) if missing(&error) => Ok(None),
             Err(error) => Err(error),
         }

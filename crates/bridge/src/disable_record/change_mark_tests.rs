@@ -87,6 +87,28 @@ fn a_value_that_is_not_a_mark_names_no_holder() {
     assert_eq!(key.get_string(VALUE).expect("replaced"), "1");
 }
 
+/// A value of the wrong type is read as an empty mark, and says so, as every
+/// other failed read of the mark does.
+#[skuld::test]
+fn a_value_of_the_wrong_type_is_read_as_empty_and_warned_about() {
+    use garter::test_utils::WaitableWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+
+    let (scratch, key) = ScratchChangeKey::created("wrong-type");
+    key.set_u32(VALUE, 7).expect("write");
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .finish();
+    let mark = {
+        let _guard = set_default_in_current_thread(subscriber);
+        scratch.mark().read()
+    };
+    assert_eq!(mark, ChangeMark::new(Some(String::new()), None));
+    assert!(writer.snapshot().contains("WARN"), "{:?}", writer.snapshot());
+}
+
 /// No key is no service: nothing to mark, and a key made here would outlive it.
 #[skuld::test]
 fn a_mark_with_no_key_is_neither_written_nor_an_error() {

@@ -146,7 +146,8 @@ pub enum Verdict {
     /// A process the retirement cannot let go of cannot be probed: the
     /// retirement fails.
     Fatal,
-    /// Nothing can be said; reported, and neither fatal nor dropped.
+    /// Nothing can be said. The scan warns of it and goes on: the process is
+    /// not waited on, and the scan does not fail.
     Undetermined,
 }
 
@@ -458,7 +459,8 @@ impl<P> ProcessHolds<P> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Scanned {
     pub finding: ScanFinding,
-    /// The processes the scan could not decide.
+    /// The processes the scan could not decide, each already warned of by the
+    /// scan. No wait reads this list.
     pub undetermined: Vec<Undetermined>,
 }
 
