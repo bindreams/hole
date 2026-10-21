@@ -662,9 +662,8 @@ re-derive them.
      is a link whose target is another user's.
 
    Without the second tightening a link a user plants in a folder the system owns (`/tmp`) leads anywhere:
-   `safe_transition` lets any step away from a system-owned folder pass and never sees who owns the link. The
-   cautionary case is that check, and CVE-2026-16552 (NVD status: Rejected, as out of its component's threat
-   model). The rule is one decision in one place (`dir/trail.rs`, `Owner::may_enter` and `Trail`), decided on
+   `safe_transition` lets any step away from a system-owned folder pass and never sees who owns the link; that
+   check is the cautionary case. The rule is one decision in one place (`dir/trail.rs`, `Owner::may_enter` and `Trail`), decided on
    each link, never at a call site.
 
 1. **Never follow the final name.** A file operation opens its name with `O_NOFOLLOW` / `FILE_OPEN_REPARSE_POINT`
