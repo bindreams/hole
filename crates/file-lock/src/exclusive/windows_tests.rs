@@ -4,7 +4,6 @@ fn file() -> Facts {
     Facts {
         disk_file: true,
         attributes: 0,
-        links: 1,
     }
 }
 
@@ -13,11 +12,6 @@ fn file() -> Facts {
 #[skuld::test]
 fn a_single_link_disk_file_passes() {
     assert_eq!(vet(file()), Ok(()));
-}
-
-#[skuld::test]
-fn a_file_with_more_than_one_link_is_refused() {
-    assert_eq!(vet(Facts { links: 2, ..file() }), Err(Refusal::ExtraLinks { links: 2 }));
 }
 
 #[skuld::test]

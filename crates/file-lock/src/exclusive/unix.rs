@@ -14,7 +14,6 @@ use util::dir::{Dir, FileId, OpenFile};
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Facts {
     pub regular: bool,
-    pub links: u64,
     pub uid: u32,
 }
 
@@ -45,10 +44,6 @@ pub(super) fn vet(facts: Facts, euid: u32, owner: Option<(u32, u32)>) -> Result<
         Some((uid, _)) if facts.uid != uid => return Err(Refusal::ForeignOwner { uid: facts.uid }),
         _ => {}
     }
-    // A file unlinked since the open has no links; the name check retries it.
-    if facts.links > 1 {
-        return Err(Refusal::ExtraLinks { links: facts.links });
-    }
     Ok(Verdict::Keep)
 }
 
@@ -65,7 +60,6 @@ fn facts_of(file: &File) -> io::Result<Facts> {
     let meta = file.metadata()?;
     Ok(Facts {
         regular: meta.file_type().is_file(),
-        links: meta.nlink(),
         uid: meta.uid(),
     })
 }

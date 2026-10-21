@@ -604,8 +604,7 @@ user swapped in.
   their parent's handle, never by `create_dir_all` on a path.
 
 A symlink (on Windows any reparse point), directory, socket or other non-regular
-file at the name, a kept file with a second name, a file owned by a third
-party, or a directory in the path that `Dir` refuses, is **refused**: an
+file at the name, a file owned by a third party, or a directory in the path that `Dir` refuses, is **refused**: an
 `InvalidData` error holding a `file_lock::Refused`.
 
 State-file writers use the same handle. `bridge-target.json`,

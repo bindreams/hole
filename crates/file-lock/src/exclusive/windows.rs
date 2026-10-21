@@ -21,7 +21,6 @@ use util::dir::{Dir, OpenFile};
 pub(super) struct Facts {
     pub disk_file: bool,
     pub attributes: u32,
-    pub links: u32,
 }
 
 /// Decides whether an opened file may be used as the lock file.
@@ -31,11 +30,6 @@ pub(super) fn vet(facts: Facts) -> Result<(), Refusal> {
     }
     if !facts.disk_file || facts.attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
         return Err(Refusal::NotRegular);
-    }
-    if facts.links != 1 {
-        return Err(Refusal::ExtraLinks {
-            links: u64::from(facts.links),
-        });
     }
     Ok(())
 }
@@ -49,7 +43,6 @@ fn facts_of(file: &File) -> io::Result<Facts> {
         return Ok(Facts {
             disk_file: false,
             attributes: 0,
-            links: 1,
         });
     }
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
@@ -58,7 +51,6 @@ fn facts_of(file: &File) -> io::Result<Facts> {
     Ok(Facts {
         disk_file: true,
         attributes: info.dwFileAttributes,
-        links: info.nNumberOfLinks,
     })
 }
 

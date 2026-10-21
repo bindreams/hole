@@ -43,8 +43,8 @@
 //!
 //! So whatever an attacker does to the name or its links, before or after the
 //! open, no file but one this call created or the `owner` owns is
-//! re-permissioned or chowned. A kept file with a second name is also refused,
-//! but that check does not protect: the count can change after it is read.
+//! re-permissioned or chowned. A second name for the kept file is not refused:
+//! the count can change after it is read, so a check on it would not protect.
 //!
 //! The directory part of `path` is opened once, as a [`Dir`] (missing components
 //! created, no symlink another user could have planted followed, and with an
@@ -98,8 +98,6 @@ fn on_token_drop() {}
 enum Refusal {
     /// Not a regular file: a FIFO, device, socket or directory.
     NotRegular,
-    /// More than one name: a hard link planted next to some other file.
-    ExtraLinks { links: u64 },
     /// A symbolic link where the lock file should be. On Windows any reparse
     /// point (a junction is a directory symlink) counts.
     Symlink,
@@ -126,7 +124,6 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Refusal::NotRegular => f.write_str("the lock file is not a regular file"),
-            Refusal::ExtraLinks { links } => write!(f, "the lock file has {links} links, not 1"),
             Refusal::Symlink => f.write_str("the lock file is a symbolic link"),
             #[cfg(unix)]
             Refusal::ForeignOwner { uid } => write!(f, "the lock file is owned by uid {uid}"),
@@ -238,8 +235,7 @@ impl Exclusive {
     /// protocol.
     ///
     /// Missing directories above the file are created. A symlink, directory,
-    /// socket or other non-regular file at the path, a file with a second name,
-    /// one owned by a third party, or a directory in the path that is a symlink
+    /// socket or other non-regular file at the path, one owned by a third party, or a directory in the path that is a symlink
     /// or (with an `owner`) owned by a third party, is refused with an
     /// `InvalidData` error holding a [`Refused`]; a refused file is never
     /// re-permissioned and nothing is created outside the directory the path
