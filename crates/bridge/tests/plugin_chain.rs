@@ -317,7 +317,9 @@ async fn a_plugin_that_exits_after_ready_ends_the_chain_task() {
     )
     .await
     .expect("the stub plugin becomes ready before it exits");
-    let mut held = accept_live_attempt(&listener).await;
+    // A plain accept: the plugin exits right after its marker, and on Windows the exit can
+    // reset the stream before the marker is read.
+    let (mut held, _) = listener.accept().await.expect("the plugin dials back");
 
     assert!(peer_is_gone(&mut held).await, "the plugin exits after it is ready");
     while chain.is_alive() {
