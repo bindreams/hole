@@ -659,6 +659,58 @@ async fn a_test_body_that_failed_before_its_plugin_tried_to_bind_is_run_again() 
     );
 }
 
+/// A bind that fails for a reason that is not a port race fails the same way on every port, so it is the body's own
+/// failure: the helper rethrows it instead of running the body again.
+#[skuld::test]
+async fn a_test_body_whose_plugin_failed_to_bind_for_another_reason_is_not_run_again() {
+    let picks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = picks.clone();
+    let outcome = tokio::spawn(async move {
+        let pick = || {
+            // A rerun helper that wrongly reruns would pick again: end it here instead of looping.
+            let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(n, 0, "the helper ran the body again");
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+        };
+        rerun_with(pick, |attempt| async move {
+            let (verdict_key, verdict_path) = attempt.plugin_env();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let runner = ChainRunner::new()
+                .add(Box::new(
+                    BinaryPlugin::new(mock_plugin_path(), None)
+                        .env("MOCK_PLUGIN_NO_SITREP", "1")
+                        .env("MOCK_PLUGIN_BIND_ERROR", "invalid_input")
+                        .env(verdict_key, verdict_path),
+                ))
+                .on_ready(ready_tx)
+                .drain_timeout(Duration::from_secs(3));
+            let env = PluginEnv {
+                local_host: attempt.addr.ip(),
+                local_port: attempt.addr.port(),
+                remote_host: "127.0.0.1".to_string(),
+                remote_port: 9,
+                plugin_options: None,
+            };
+            let _chain_task = attempt.spawn_chain(runner, env);
+            expect_ready(ready_rx)
+                .await
+                .expect("a plugin whose bind failed does not ready");
+        })
+        .await;
+    })
+    .await;
+
+    let failure = outcome
+        .expect_err("the body's failure must reach the test")
+        .into_panic();
+    let message = failure.downcast_ref::<String>().expect("an `expect` message");
+    assert!(message.contains("does not ready"), "{message}");
+    assert_eq!(picks.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 /// A plugin that emits `fatal` then exits surfaces a typed
 /// `StartError::Fatal` on the readiness channel, AND the chain `run()`
 /// future returns `Err`. The plugin exits before serving, so no client
