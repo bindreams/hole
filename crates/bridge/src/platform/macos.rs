@@ -282,11 +282,10 @@ fn ensure_stopped_verdict(registration: Registration) -> std::io::Result<()> {
 
 /// Stop, unload, and remove the bridge.
 ///
-/// The stop is FATAL here, not the best-effort it used to be. `is_installed()`
-/// is a `PLIST_PATH` existence check, so deleting the plist over a still-loaded
-/// job makes every later `uninstall` skip its teardown — nothing would ever
-/// stop the bridge again, and the cover release refuses against it forever
-/// (bindreams/hole#1003).
+/// The stop is FATAL here, not best-effort. `is_installed()` is a `PLIST_PATH`
+/// existence check, so deleting the plist over a still-loaded job makes every
+/// later `uninstall` skip its teardown — nothing would ever stop the bridge
+/// again, and the cover release refuses against it forever.
 pub fn uninstall() -> std::io::Result<()> {
     ensure_stopped()?;
 

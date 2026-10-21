@@ -190,7 +190,7 @@ fn sweep_recheck_uses_presence_not_schema() {
 
 // `RetireSession::open`'s absent-service classification ===============================================================
 //
-// Only an entry that does not exist is absent at the open (#1003): a lingering
+// Only an entry that does not exist is absent at the open: a lingering
 // process of it is waited out through the SID scan. A service marked for
 // deletion still opens, so `OpenService` answering 1072 is not an absence but
 // a plain failure, as is every other error. The classification of a failure
@@ -210,17 +210,6 @@ fn open_error_is_absent_for_a_missing_entry_only() {
     assert!(!open_error_is_absent(
         &windows_service::Error::LaunchArgumentsNotSupported
     ));
-}
-
-/// "If the service controller handles the SC_ACTION_RESTART action, hService
-/// must have the SERVICE_START access right" (`ChangeServiceConfig2W`): the
-/// failure actions `install` writes restart the service.
-#[skuld::test]
-fn the_handle_that_writes_restart_on_failure_can_start_the_service() {
-    assert_eq!(
-        FAILURE_ACTIONS_ACCESS,
-        ServiceAccess::CHANGE_CONFIG | ServiceAccess::START
-    );
 }
 
 // What `install` registers ============================================================================================

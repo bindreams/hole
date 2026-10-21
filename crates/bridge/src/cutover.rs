@@ -211,7 +211,7 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<Cle
 /// next bridge start to sweep a transient cover stranded by an earlier crash,
 /// and on Windows the filters are `FWPM_FILTER_FLAG_PERSISTENT` — the Base
 /// Filtering Engine re-adds them every boot, and the uninstaller is about to
-/// delete the only binary that could remove them (bindreams/hole#1003).
+/// delete the only binary that could remove them.
 ///
 /// The desync hazard is answered structurally, not by ordering: like [`unlock`]
 /// this REFUSES against a live bridge instance, so there is never an
@@ -269,7 +269,7 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// host: the exit code is 0 either way (see [`release_covers`] for why an
 /// unproven key must not fail an uninstall), so this message IS the
 /// qualification. Without it the `Ok` is silent again and the installer reads
-/// it as proof (bindreams/hole#1003).
+/// it as proof.
 ///
 /// It deliberately does NOT assert that a cover is present. An unproven key is
 /// equally consistent with never having been installed — which is what it will
