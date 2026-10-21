@@ -1241,12 +1241,9 @@ fn check_health_does_not_mark_healthy_task_as_crashed() {
 
 // A plugin chain's exit is a session death (a plugin dying mid-session) ===============================================
 
-/// A chain task the test ends on demand. Ending it is the plugin dying; a
-/// chain task finishes when any plugin in it exits. Returns the chain, the
-/// release trigger, and a receiver that fires from inside the task just
-/// before it returns: the task runs to completion on this current-thread
-/// runtime before the awaiting test is polled again, so `is_finished()` is
-/// already true on resume (no clock involved).
+/// A chain whose task the test ends on demand (a plugin dying). `done` fires
+/// from inside the task just before it returns; on this current-thread runtime
+/// `is_finished()` is then already true.
 fn controllable_chain() -> (
     crate::proxy::plugin::PluginChain,
     oneshot::Sender<()>,

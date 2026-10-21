@@ -57,11 +57,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Fault-injection knob: `connect-back=<addr>` dials `<addr>` and holds the
-    // stream until this process dies, so the test's end of it reads EOF exactly
-    // when the plugin is gone (and proves the plugin got this far).
+    // Fault-injection knob: `connect-back=<addr>` dials `<addr>`, sends the local
+    // port this attempt was told to bind (2 bytes, big-endian: a test tells a live
+    // attempt's stream from a dead one's), and holds the stream until this process
+    // dies, so the test's end of it reads EOF exactly when the plugin is gone.
     let _held = match opts.split(';').find_map(|s| s.strip_prefix("connect-back=")) {
-        Some(addr) => Some(tokio::net::TcpStream::connect(addr).await?),
+        Some(addr) => {
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &local_port.to_be_bytes()).await?;
+            Some(stream)
+        }
         None => None,
     };
 
@@ -94,6 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen: local_addr,
         transports: Transports::TCP,
     });
+
+    // Fault-injection knob: `exit-after-ready` exits as soon as `ready` is out
+    // — models a plugin dying mid-session.
+    if opts.split(';').any(|s| s == "exit-after-ready") {
+        std::process::exit(0);
+    }
 
     loop {
         let _ = listener.accept().await?;

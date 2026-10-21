@@ -109,22 +109,49 @@ async fn a_bind_conflict_is_retried_on_a_fresh_port() {
     drop(chain);
 }
 
-/// Whether the far end of `stream` is gone: EOF on a clean close, an error on a
-/// reset (a killed process on Windows resets rather than closes).
+/// Waits until the far end of `stream` is gone: EOF on a clean close, an error
+/// on a reset (a killed process on Windows resets rather than closes). Whatever
+/// the peer sent first is discarded.
 async fn peer_is_gone(stream: &mut tokio::net::TcpStream) -> bool {
     use tokio::io::AsyncReadExt;
-    let mut buf = [0u8; 1];
-    matches!(stream.read(&mut buf).await, Ok(0) | Err(_))
+    let mut buf = [0u8; 16];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return true,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// The stream of the attempt that listens on `port`. An attempt that lost a bind
+/// race dialed back too (with its own port), so the first stream accepted is not
+/// necessarily the chain's plugin.
+async fn accept_attempt_on(listener: &tokio::net::TcpListener, port: u16) -> tokio::net::TcpStream {
+    use tokio::io::AsyncReadExt;
+    loop {
+        let (mut stream, _) = listener.accept().await.expect("a plugin dials back");
+        let mut announced = [0u8; 2];
+        if stream.read_exact(&mut announced).await.is_ok() && u16::from_be_bytes(announced) == port {
+            return stream;
+        }
+    }
 }
 
 /// The chain lives as long as the session, not as long as the start that made
-/// it. Cancelling the start token after the chain is ready (the user's Cancel
-/// landing in the window before the start request is answered) must leave the
+/// it. Cancelling the start token after the chain is ready must leave the
 /// plugin running; ending the session (dropping the chain) must still stop it.
+/// The first attempt loses a bind race, so the stream held is picked by port
+/// and cannot be the dead attempt's.
 #[skuld::test]
 async fn a_cancel_of_the_start_after_the_chain_is_ready_leaves_the_chain_running() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sentinel = dir.path().join("bind-once");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let opts = format!("host=example.com;connect-back={}", listener.local_addr().expect("addr"));
+    let opts = format!(
+        "host=example.com;fail-bind-once={};connect-back={}",
+        sentinel.display(),
+        listener.local_addr().expect("addr")
+    );
 
     let start = CancellationToken::new();
     let chain = start_plugin_chain(
@@ -141,15 +168,11 @@ async fn a_cancel_of_the_start_after_the_chain_is_ready_leaves_the_chain_running
     )
     .await
     .expect("the stub plugin becomes ready");
-    let (mut held, _) = listener
-        .accept()
-        .await
-        .expect("the plugin dials back before it is ready");
+    assert!(sentinel.exists(), "the first attempt must have lost its bind race");
+    let mut held = accept_attempt_on(&listener, chain.local_addr().port()).await;
 
     start.cancel();
 
-    // Cancellation of a parent token marks its children synchronously, so this
-    // is a state read, not a wait: no timing is involved.
     assert!(
         !chain.is_cancelled(),
         "cancelling the start token must not cancel a ready chain"
@@ -203,6 +226,83 @@ async fn a_cancel_during_the_start_stops_the_plugin_it_spawned() {
     assert!(
         peer_is_gone(&mut held).await,
         "a cancel during the start must stop the plugin"
+    );
+}
+
+/// A start future dropped before it returns (the task around it aborted) must
+/// not orphan the plugin it spawned.
+#[skuld::test]
+async fn dropping_the_start_future_stops_the_plugin_it_spawned() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let opts = format!(
+        "host=example.com;never-ready;connect-back={}",
+        listener.local_addr().expect("addr")
+    );
+
+    let start = CancellationToken::new();
+    let plugin_path = test_plugin_path();
+    let mut starting = Box::pin(start_plugin_chain(
+        "v2ray-plugin",
+        plugin_path.to_str().expect("utf-8 path"),
+        Some(&opts),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &start,
+        None,
+    ));
+    // The plugin has dialed back, so it is running and cannot be ready yet.
+    let mut held = tokio::select! {
+        biased;
+        _ = &mut starting => panic!("a plugin that never readies cannot finish its start"),
+        accepted = listener.accept() => accepted.expect("the plugin dials back").0,
+    };
+
+    drop(starting);
+
+    assert!(
+        peer_is_gone(&mut held).await,
+        "dropping the start future must stop the plugin"
+    );
+}
+
+/// A plugin that exits after it is ready ends the chain's task: the property
+/// `check_health` reads through `is_alive`. Waits on the real condition, the
+/// task having finished, after the plugin's end of the connection has closed.
+#[skuld::test]
+async fn a_plugin_that_exits_after_ready_ends_the_chain_task() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let opts = format!(
+        "host=example.com;exit-after-ready;connect-back={}",
+        listener.local_addr().expect("addr")
+    );
+
+    let start = CancellationToken::new();
+    let chain = start_plugin_chain(
+        "v2ray-plugin",
+        test_plugin_path().to_str().expect("utf-8 path"),
+        Some(&opts),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &start,
+        None,
+    )
+    .await
+    .expect("the stub plugin becomes ready before it exits");
+    let mut held = accept_attempt_on(&listener, chain.local_addr().port()).await;
+
+    assert!(peer_is_gone(&mut held).await, "the plugin exits after it is ready");
+    while chain.is_alive() {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !chain.is_cancelled(),
+        "the chain ended because the plugin died, not because it was told to shut down"
     );
 }
 

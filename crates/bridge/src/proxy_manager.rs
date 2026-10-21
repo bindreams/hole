@@ -501,9 +501,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
-    /// Test seam: install `chain` as the live session's plugin chain, so a
-    /// test can drive `check_health` against a chain whose task it controls.
-    /// Panics when no session is running.
+    /// Test seam: install `chain` as the live session's plugin chain. Panics
+    /// when no session is running.
     #[cfg(test)]
     pub fn set_plugin_chain_for_test(&mut self, chain: crate::proxy::plugin::PluginChain) {
         self.posture
@@ -829,9 +828,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// 3. **Cancel right after `start_inner` returns `Ok(started)`.**
     ///    Commit to `self` happens after `start_inner` yields, so the
     ///    late cancel cannot race the commit. The started session is left
-    ///    running, plugin chain included (the chain's shutdown scope is not
-    ///    this token's); the client sees `Ok(())`. A caller that wanted to
-    ///    cancel that late can follow up with an explicit stop.
+    ///    running, plugin chain included; the client sees `Ok(())`. A caller
+    ///    that wanted to cancel that late can follow up with an explicit stop.
     pub async fn start_cancellable(
         &mut self,
         config: &ProxyConfig,
@@ -2207,11 +2205,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// Sync health check: detects a proxy task or plugin chain that exited on
     /// its own (e.g. shadowsocks panic, upstream connection failure, or a
     /// plugin process dying mid-session). Both report the same
-    /// [`DEATH_REASON`]; the log line says which one died. Performs no
-    /// teardown itself — it only records the failure and reports it as a
-    /// [`SessionEvent::GaveUp`] for the caller to feed into
-    /// [`Self::stop_with`], so the give-up path and the cover decision it
-    /// drives share the one teardown implementation instead of a hand-copy.
+    /// [`DEATH_REASON`]. Performs no teardown itself — it only records the
+    /// failure and reports it as a [`SessionEvent::GaveUp`] for the caller to
+    /// feed into [`Self::stop_with`], so the give-up path and the cover
+    /// decision it drives share the one teardown implementation instead of a
+    /// hand-copy.
     ///
     /// **Error-discard note**: this function cannot await the dead
     /// handle, so the underlying task's `io::Result` is discarded.
