@@ -286,8 +286,12 @@ fn a_lock_path_that_is_a_second_name_for_another_file_never_changes_that_file() 
     };
 
     match observable_owner() {
-        // Not root: no owner is expected, so the extra name is refused.
-        None => assert_refused(&path, None),
+        // Not root: no owner is expected, so the file is locked where it is and not modified.
+        None => {
+            let _guard = Exclusive::try_acquire(&path, None)
+                .unwrap()
+                .expect("a file with a second name is a lock file like any other");
+        }
         // Root: the victim is owned by this process but not by the expected owner, so the
         // name is replaced by a fresh file and the victim is untouched.
         Some(owner) => {

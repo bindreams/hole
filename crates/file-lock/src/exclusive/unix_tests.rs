@@ -7,11 +7,7 @@ const OWNER: u32 = 2001;
 const STRANGER: u32 = 3002;
 
 fn file(uid: u32) -> Facts {
-    Facts {
-        regular: true,
-        links: 1,
-        uid,
-    }
+    Facts { regular: true, uid }
 }
 
 // vet =================================================================================================================
@@ -33,18 +29,6 @@ fn a_file_owned_by_the_process_instead_of_the_expected_owner_is_replaced() {
 }
 
 #[skuld::test]
-fn a_file_replaced_for_its_owner_is_replaced_whatever_its_link_count() {
-    for links in [0, 1, 2, 7] {
-        let facts = Facts { links, ..file(ME) };
-        assert_eq!(
-            vet(facts, ME, Some((OWNER, OWNER))),
-            Ok(Verdict::Replace),
-            "{links} links"
-        );
-    }
-}
-
-#[skuld::test]
 fn a_file_with_another_owner_is_refused_when_an_owner_is_expected() {
     assert_eq!(
         vet(file(STRANGER), ME, Some((OWNER, OWNER))),
@@ -55,24 +39,6 @@ fn a_file_with_another_owner_is_refused_when_an_owner_is_expected() {
 #[skuld::test]
 fn ownership_is_not_checked_when_no_owner_is_expected() {
     assert_eq!(vet(file(STRANGER), ME, None), Ok(Verdict::Keep));
-}
-
-#[skuld::test]
-fn a_kept_file_with_more_than_one_link_is_refused() {
-    for (uid, owner) in [(OWNER, Some((OWNER, OWNER))), (ME, None), (STRANGER, None)] {
-        let facts = Facts { links: 2, ..file(uid) };
-        assert_eq!(
-            vet(facts, ME, owner),
-            Err(Refusal::ExtraLinks { links: 2 }),
-            "uid {uid}"
-        );
-    }
-}
-
-#[skuld::test]
-fn a_file_unlinked_since_the_open_is_not_refused_for_its_links() {
-    let facts = Facts { links: 0, ..file(ME) };
-    assert_eq!(vet(facts, ME, None), Ok(Verdict::Keep));
 }
 
 #[skuld::test]
@@ -210,8 +176,6 @@ fn a_file_swapped_in_after_the_open_is_the_one_locked() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("target.json.lock");
     std::fs::write(&path, b"first").unwrap();
-    // A second name keeps the first file at one link once the lock name is swapped.
-    std::fs::hard_link(&path, tmp.path().join("kept")).unwrap();
     let mine = real_uid();
     let mut swapped = false;
 
