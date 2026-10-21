@@ -29,6 +29,7 @@ include_paths:
   - crates/dump-macros/**
   - crates/handle-holders/**
   - crates/file-lock/**
+  - crates/util/**
   - xtask/**
   - xtask-lib/**
   - msi-installer/**
