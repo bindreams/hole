@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 license = "GPL-3.0-or-later"
-description = "Cross-process exclusive file lock (flock / LockFileEx) and no-follow directory handle, hardened for a directory another principal can write."
+description = "Cross-process exclusive file lock (flock / LockFileEx), hardened for a directory another principal can write."
 
 [lints]
 workspace = true
@@ -14,28 +14,16 @@ harness = false
 
 [dependencies]
 tracing = "0.1"
+util = { path = "../util" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# `LockFileEx` (`Win32_Storage_FileSystem`) and the `OVERLAPPED` it takes (`Win32_System_IO`); `Dir` opens
-# and renames relative to a directory handle with `NtCreateFile` / `NtSetInformationFile`
-# (`Wdk_Storage_FileSystem`, whose `OBJECT_ATTRIBUTES` needs `Wdk_Foundation` and `Win32_Security`).
-windows = { version = "0.62", features = [
-  "Wdk_Foundation",
-  "Wdk_Storage_FileSystem",
-  "Win32_Foundation",
-  "Win32_Security",
-  "Win32_Storage_FileSystem",
-  "Win32_System_IO",
-] }
+# `LockFileEx` (`Win32_Storage_FileSystem`) and the `OVERLAPPED` it takes (`Win32_System_IO`).
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
 tempfile = "3"
-
-[target.'cfg(windows)'.dev-dependencies]
-# The ACL read-back in `dir/windows_tests.rs`.
-windows = { version = "0.62", features = ["Win32_Security_Authorization"] }

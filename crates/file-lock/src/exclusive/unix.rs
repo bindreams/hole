@@ -8,7 +8,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use super::{split, Refusal, Refused};
-use crate::dir::{Dir, FileId, OpenFile};
+use util::dir::{Dir, FileId, OpenFile};
 
 /// What `fstat` says about the opened lock file; the only input to [`vet`].
 #[derive(Clone, Copy, Debug)]

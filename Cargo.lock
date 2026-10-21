@@ -2160,6 +2160,7 @@ dependencies = [
  "skuld",
  "tempfile",
  "tracing",
+ "util",
  "windows 0.62.2",
 ]
 
@@ -8562,7 +8563,6 @@ dependencies = [
  "bytes",
  "core-foundation 0.9.4",
  "default-net",
- "file-lock",
  "garter",
  "hole-test-observability",
  "libc",

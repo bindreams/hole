@@ -232,7 +232,7 @@ before editing; the sections linked below are the authoritative source.
   already own (it replaces a leftover, refuses a symlink or other non-regular
   file), because the state directory may belong to the interactive user. For the
   same reason the directory is opened once without following a user-planted
-  symlink (`file_lock::Dir`), and the lock and the state-file writers listed in
+  symlink (`util::dir::Dir`), and the lock and the state-file writers listed in
   the section below go through that handle, never back through the path. →
   [CONTRIBUTING.md#file-lock](CONTRIBUTING.md#file-lock)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay

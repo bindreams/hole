@@ -67,7 +67,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::dir::{self, Dir, EntryKind};
+use util::dir::{self, Dir, EntryKind};
 
 #[cfg(unix)]
 mod unix;

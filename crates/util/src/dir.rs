@@ -51,7 +51,7 @@ mod windows;
 #[cfg(windows)]
 use windows as platform;
 
-pub(crate) use platform::Caller;
+pub use platform::Caller;
 
 /// Why a path was not opened as a directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +136,8 @@ impl Dir {
     }
 
     /// [`Self::open`] as `caller`; the seam lets a test claim to be another user.
-    pub(crate) fn open_as(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<Dir> {
+    #[doc(hidden)]
+    pub fn open_as(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<Dir> {
         platform::open_dir(path, create, owner, caller).map(|file| Dir { file })
     }
 

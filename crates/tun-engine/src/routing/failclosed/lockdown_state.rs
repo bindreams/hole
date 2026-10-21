@@ -32,7 +32,7 @@ fn state_file(state_dir: &Path) -> PathBuf {
 /// before persist). Creates `state_dir`.
 pub fn save(state_dir: &Path, state: &LockdownState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    file_lock::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
+    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
 }
 
 /// What `bridge-lockdown.json` says about the standing kill switch. A closed

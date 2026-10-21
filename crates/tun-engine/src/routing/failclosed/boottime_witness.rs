@@ -166,7 +166,7 @@ fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> std::io::Re
     };
     let json =
         serde_json::to_vec_pretty(&state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    file_lock::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
+    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
 }
 
 /// Record that a twin is outstanding on this host.

@@ -12,7 +12,7 @@ use std::path::{Component, Path};
 use super::{EntryKind, OpenFile, Refusal};
 
 /// Who is opening: this process's effective uid.
-pub(crate) type Caller = u32;
+pub type Caller = u32;
 
 /// The running process as a [`Caller`].
 pub(super) fn caller() -> Caller {

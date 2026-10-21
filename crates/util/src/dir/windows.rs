@@ -34,7 +34,7 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use super::{EntryKind, OpenFile, Refusal};
 
 /// Nothing on Windows depends on who is opening.
-pub(crate) struct Caller;
+pub struct Caller;
 
 /// The running process as a [`Caller`].
 pub(super) fn caller() -> Caller {
