@@ -519,16 +519,35 @@ pub(super) fn open_dir(path: &Path, create: bool, _owner: Option<(u32, u32)>, _c
 
 /// [`open_dir`] with `extra` rights on the final directory.
 pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS) -> io::Result<File> {
-    let rights_for = |last| match last {
-        true => Rights {
+    walk_to(
+        path,
+        create,
+        Rights {
             wanted: access(&[dir_rights(true), extra]),
             // An ACL the caller asked to read and rewrite is not optional.
             owner_optional: extra.0 == 0,
         },
-        false => Rights {
-            wanted: dir_rights(false),
-            owner_optional: true,
-        },
+    )
+}
+
+/// The final directory opened to look names up in, which asks no right to add to it: a folder whose ACL a machine
+/// tightened is still one a reader can read from.
+pub(super) fn open_dir_read(path: &Path) -> io::Result<File> {
+    walk_to(path, false, lookup_rights())
+}
+
+fn lookup_rights() -> Rights {
+    Rights {
+        wanted: dir_rights(false),
+        owner_optional: true,
+    }
+}
+
+/// Walks `path`; `last` is what its final directory is opened with.
+fn walk_to(path: &Path, create: bool, last: Rights) -> io::Result<File> {
+    let rights_for = |is_last| match is_last {
+        true => last,
+        false => lookup_rights(),
     };
     let (root, names) = split(path)?;
     let mut walk = Walk {

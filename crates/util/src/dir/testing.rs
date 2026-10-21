@@ -32,6 +32,29 @@ pub fn plant_link(target: &Path, link: &Path) {
     own(link);
 }
 
+/// A folder nobody may add a file or a subfolder to, until the guard drops: the state of a `ProgramData` folder whose
+/// ACL a machine tightened, which a reader can still read from. Windows only; on unix an open directory carries no
+/// such right.
+#[cfg(windows)]
+#[must_use = "the folder is writable again when this drops"]
+pub struct AddDenied(PathBuf);
+
+#[cfg(windows)]
+impl AddDenied {
+    /// `*S-1-1-0` is Everyone; `WD` adds a file, `AD` a subfolder.
+    pub fn to(dir: &Path) -> AddDenied {
+        platform::icacls(dir, &["/deny", "*S-1-1-0:(WD,AD)"]);
+        AddDenied(dir.to_path_buf())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AddDenied {
+    fn drop(&mut self) {
+        platform::icacls(&self.0, &["/remove:d", "*S-1-1-0"]);
+    }
+}
+
 /// What a user can plant at the name a privileged reader reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlantedName {
@@ -191,6 +214,15 @@ mod platform {
             .expect("enable the restore privilege (a token without it cannot give a file to another owner)");
         super::super::windows::set_owner(&file, &USERS)
             .unwrap_or_else(|err| panic!("give {path:?} to the Users group: {err}"));
+    }
+
+    pub(super) fn icacls(dir: &Path, args: &[&str]) {
+        let changed = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(changed.status.success(), "icacls {args:?}: {changed:?}");
     }
 
     pub(super) fn file_link(target: &Path, link: &Path) {
