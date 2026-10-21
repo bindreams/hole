@@ -401,9 +401,9 @@ const LOCK_FILE_NAME: &str = "bridge-target.json.lock";
 /// The bridge's one leaf lock. Held only across [`apply`]'s
 /// load-apply-save critical section — microseconds of pure file I/O, never
 /// for a session's lifetime — over the shared [`file_lock::Exclusive`]
-/// core (see its module doc for the open discipline: `O_NOFOLLOW` +
-/// `mode(0o600)` at open + `fchown` on the fd, all security-relevant on the
-/// user-writable elevation-mode state directory).
+/// core (see its module doc for the open discipline: `O_NOFOLLOW`, a vet of
+/// the opened file, then `mode(0o600)` + `fchown` on the fd, all
+/// security-relevant on the user-writable elevation-mode state directory).
 ///
 /// **Leaf-lock contract (1): nothing may be acquired while this is held, and
 /// the critical section stays pure file I/O** — no `Routing`/OS/network/

@@ -464,7 +464,7 @@ fn apply_round_trips_through_load_and_save() {
 #[skuld::test]
 fn a_second_apply_call_sees_the_first_ones_write_not_a_value_captured_before_acquiring() {
     // Genuine two-thread race, real rendezvous (channels, no sleep/poll) —
-    // same shape as `tun_engine::exclusive`'s
+    // same shape as `file_lock::Exclusive`'s
     // `acquire_blocks_until_the_holder_releases`. Thread A holds `apply`'s
     // lock open (via a closure that blocks on a channel) while thread B's
     // `apply` call is issued; B must block until A's whole load-apply-save
