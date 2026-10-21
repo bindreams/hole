@@ -428,6 +428,131 @@ fn no_reader_waits_on_a_fifo_planted_at_its_name() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+// What a reader says about a file it cannot parse ---------------------------------------------------------------------
+//
+// A user can put a file they cannot read at a state name: a system file moved into their folder keeps its owner and
+// its one link. The parse failure the reader logs goes to `bridge.log`, which the elevated bridge hands to the user,
+// so it carries a category and a position and never a fragment of the file.
+
+const ECHOED_SECRET: &str = "hunter2-SECRET";
+
+/// The warnings `read` logs when `file` in a fresh folder holds a `version` that is a string where a number belongs:
+/// `serde_json`'s own message for that quotes the string.
+fn warnings_for_a_file_that_quotes_a_secret(file: &str, read: fn(&Path)) -> String {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(file), format!(r#"{{"version":"{ECHOED_SECRET}"}}"#)).unwrap();
+    let writer = crate::test_support::log_capture::VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        read(tmp.path());
+    }
+    writer.snapshot_string()
+}
+
+/// A reader that logs a parse failure: its name, the file it reads, and a call of it.
+type ParseFailureReader = (&'static str, &'static str, fn(&Path));
+
+fn parse_failure_readers() -> [ParseFailureReader; 2] {
+    use crate::{dns_state, plugin_state};
+    [
+        ("dns_state::load", dns_state::STATE_FILE_NAME, |dir| {
+            let _ = dns_state::load(dir);
+        }),
+        ("plugin_state::load", plugin_state::STATE_FILE_NAME, |dir| {
+            let _ = plugin_state::load(dir);
+        }),
+    ]
+}
+
+#[skuld::test]
+fn no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse() {
+    let mut failures = Vec::new();
+    for (name, file, read) in parse_failure_readers() {
+        let logs = warnings_for_a_file_that_quotes_a_secret(file, read);
+        if logs.contains(ECHOED_SECRET) {
+            failures.push(format!("{name} logged the file's content: {logs}"));
+        } else if !logs.contains("line 1") {
+            failures.push(format!("{name}: the warning lost its position: {logs}"));
+        }
+    }
+
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// What parses a `serde_json` document into a type.
+const PARSES_JSON: &[&str] = &[
+    "serde_json::from_slice",
+    "serde_json::from_str",
+    "serde_json::from_value",
+    "serde_json::from_reader",
+];
+
+/// When `text` reads a state file: its parses of JSON, if there are more than the `ParseFailure`s it makes. A parse's
+/// own error quotes the file back; a `ParseFailure` made where the parse happens cannot.
+fn parses_without_a_parse_failure(text: &str) -> Vec<&str> {
+    let code = || text.lines().filter(|line| !line.trim_start().starts_with("//"));
+    if !code().any(|line| line.contains("read_state_file(")) {
+        return Vec::new();
+    }
+    let parses: Vec<&str> = code()
+        .filter(|line| PARSES_JSON.iter().any(|parse| line.contains(parse)))
+        .collect();
+    let converted = code().filter(|line| line.contains("ParseFailure::from(")).count();
+    if parses.len() > converted {
+        return parses;
+    }
+    Vec::new()
+}
+
+#[skuld::test]
+fn no_state_reader_keeps_the_raw_parse_error() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let mut hits = Vec::new();
+    for (relative, path) in privileged_sources(&root) {
+        for line in parses_without_a_parse_failure(&std::fs::read_to_string(&path).unwrap()) {
+            hits.push(format!("{relative}: {}", line.trim()));
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "a state reader parses more JSON than it makes `ParseFailure`s: its `serde_json::Error` quotes the file, so convert it with `ParseFailure::from(&e)` at the parse site: {hits:#?}"
+    );
+}
+
+#[skuld::test]
+fn the_parse_error_scan_counts_parses_against_conversions() {
+    let reads = "let b = util::dir::read_state_file(dir, name)?;
+";
+    let parse = "match serde_json::from_slice::<State>(&b) {
+";
+    let convert = "let e = util::parse_error::ParseFailure::from(&e);
+";
+
+    assert_eq!(
+        parses_without_a_parse_failure(&format!("{reads}{parse}")),
+        [parse.trim_end()]
+    );
+    assert!(parses_without_a_parse_failure(&format!("{reads}{parse}{convert}")).is_empty());
+    assert_eq!(
+        parses_without_a_parse_failure(&format!("{reads}{parse}{parse}{convert}")).len(),
+        2
+    );
+    assert!(parses_without_a_parse_failure(&format!("// {reads}{parse}")).is_empty());
+    assert!(
+        parses_without_a_parse_failure(parse).is_empty(),
+        "a file that reads no state file is not scanned"
+    );
+}
+
 // No privileged read goes by path -------------------------------------------------------------------------------------
 
 /// What opens a file by a path: the reads the privileged state code must make through `util::dir` instead.

@@ -101,6 +101,8 @@ fn read_state(state_dir: &Path) -> Result<LockdownState, Intent> {
             Err(Intent::Unreadable)
         }
         Err(e) => {
+            // The error quotes the file, which the user may have put there: keep its position, not its text.
+            let e = util::parse_error::ParseFailure::from(&e);
             tracing::warn!(error = %e, file = STATE_FILE_NAME, "lockdown-state parse failed");
             Err(Intent::Unreadable)
         }

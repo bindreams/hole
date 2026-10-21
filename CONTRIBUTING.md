@@ -710,7 +710,10 @@ re-derive them.
    `read_state_file` also refuses a file the folder's owner cannot vouch for (`Refusal::ForeignFile`, decided by
    `trail::may_read` on both platforms): the file must be owned by the folder's own user, or by the system (root,
    SYSTEM, Administrators) with exactly one link. A user can hard-link any file the system can read at a state name
-   (macOS has no `protected_hardlinks`), and the planted name has two links. This holds only for the state files,
+   (macOS has no `protected_hardlinks`), and the planted name has two links. The rule stops that and nothing else
+   about ownership: a file the system owns that the user moved into the folder keeps its owner and its one link
+   (a rename moves the inode), so it is read. What the user could learn from it is limited by the readers, below.
+   This holds only for the state files,
    which are published by rename and so have one name; `ReadDir::read`, which `VersionedFile::load` and the update
    marker use, does not have it yet, because `VersionedFile::store` and the marker's claim make a second name for a
    live file themselves. The rule reaches them in the follow-up branch `azhukova/1118-2`.
@@ -732,14 +735,17 @@ report the file the name leads to. A hard link is the file's own inode, so only 
 file (`no_reader_reads_a_hard_link_the_system_would_not_have_made` and its `tun-engine` twin: a test cannot make a
 file the system owns without being the system, so the planted name is refused when the runner is root or an elevated
 token and read when it is a user). What a reader takes from a folder the user owns is parsed as that state's schema
-and never echoed.
-Four source scans close the class: `no_privileged_dir_code_changes_an_owner_or_a_mode_by_name` (nothing in
+and never echoed: every reader turns its `serde_json::Error` into a `util::parse_error::ParseFailure` (category and
+position) where the parse happens, since the error's own text quotes the file, and the log goes to `bridge.log`, which
+the user can read (`no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse`, here and in `state_symlink_tests.rs`).
+Five source scans close the class: `no_privileged_dir_code_changes_an_owner_or_a_mode_by_name` (nothing in
 `util::dir` or in a file that opens a `Dir` calls `fchownat`, `fchmodat`, `chown`, `chmod`, `set_permissions` or a
 Windows by-path ACL call), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates, `hole` among them, open no
 file by path, except the files listed in `BY_PATH_ALLOWED`, each with its reason),
 `no_privileged_code_resolves_a_link_before_the_walk` (the same crates call neither `canonicalize` nor `realpath`,
-except the lines listed in `RESOLVING_ALLOWED`, each with its reason) and `no_state_module_logs_a_path` (the
-state modules log the file's name). A test of
+except the lines listed in `RESOLVING_ALLOWED`, each with its reason), `no_state_module_logs_a_path` (the
+state modules log the file's name) and `no_state_reader_keeps_the_raw_parse_error` (a file that reads a state file
+parses no more JSON than it makes `ParseFailure`s). A test of
 a walk plants links with `util::dir::testing` (`plant_link`, `user_dir`, `SystemScratch`), which hand what they
 make to an unprivileged owner whoever runs the test: a link to a folder the system owns must be refused, a link
 to a folder its own owner owns must be followed, and the same through each writer.

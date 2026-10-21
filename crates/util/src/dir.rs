@@ -467,8 +467,9 @@ pub fn write_state_file(state_dir: &Path, name: &OsStr, bytes: &[u8], owner: Opt
 /// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`ReadDir::open`]: a
 /// link at the name, or a FIFO a user planted there, is an error, never the file it leads to and never a wait. So is a
 /// file the folder's owner cannot vouch for ([`Refusal::ForeignFile`]): one owned by the folder's own user is read, and
-/// so is one the system owns that has no second name, but a hard link planted at the name to any other file is not.
-/// The files this reads are published by rename, so none has a second name of its own making.
+/// so is one the system owns that has no second name, but a second name a user added to any other file is not. The
+/// files this reads are published by rename, so none has a second name of its own making. A file the system owns that
+/// the user moved to the name is read: the caller parses it as its schema and logs a `ParseFailure`, never the text.
 pub fn read_state_file(state_dir: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
     ReadDir::open(state_dir)?.read_vouched(name)
 }
