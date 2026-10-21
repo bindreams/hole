@@ -23,7 +23,7 @@ use util::dir::{Dir, Staged};
 pub const MARKER_FILE: &str = "update-in-progress.json";
 
 /// Schema version. Bump on a breaking shape change; `read` answers
-/// [`Marker::Unreadable`] for an unknown version, but `clear` is remove-by-path
+/// [`Marker::Unreadable`] for an unknown version, but `clear` is remove-by-name
 /// and ignores the schema entirely.
 pub const MARKER_VERSION: u32 = 3;
 
