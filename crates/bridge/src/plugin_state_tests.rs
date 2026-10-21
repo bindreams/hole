@@ -1,4 +1,5 @@
 use super::*;
+use util::dir::testing::{plant_link, SystemScratch};
 
 use cosca::identity::{Platform, ProcessId, ProcessIdRecord, RECORD_VERSION};
 
@@ -236,22 +237,13 @@ fn an_unreadable_append_writes_nothing_and_reports_the_error() {
 }
 
 #[skuld::test]
-fn save_refuses_a_symlinked_state_directory_and_writes_nothing_outside() {
+fn save_refuses_a_link_to_a_folder_the_system_owns_and_writes_nothing_there() {
     let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    let scratch = SystemScratch::new();
     let link = tmp.path().join("state");
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-        #[cfg(target_os = "macos")]
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            std::os::unix::fs::lchown(&link, Some(65534), Some(65534)).unwrap();
-        }
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&outside, &link).unwrap();
+    plant_link(scratch.root(), &link);
+    let written = scratch.root().join(STATE_FILE_NAME);
+    let before = written.exists();
 
     assert!(save(
         &link,
@@ -263,5 +255,9 @@ fn save_refuses_a_symlinked_state_directory_and_writes_nothing_outside() {
     )
     .is_err());
 
-    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    assert_eq!(
+        written.exists(),
+        before,
+        "a state file was written in the system's folder"
+    );
 }

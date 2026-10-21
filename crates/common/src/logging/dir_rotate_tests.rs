@@ -2,6 +2,7 @@ use super::DirRotate;
 use skuld::temp_dir;
 use std::io::Write;
 use std::path::Path;
+use util::dir::testing::plant_link;
 use util::dir::Dir;
 
 fn writer(dir: &Path, limit: usize) -> DirRotate {
@@ -24,20 +25,6 @@ fn names(dir: &Path) -> Vec<String> {
         .collect();
     found.sort();
     found
-}
-
-/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant.
-fn plant_symlink(target: &Path, link: &Path) {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link).unwrap();
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
-        }
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(target, link).unwrap();
 }
 
 #[skuld::test]
@@ -94,7 +81,7 @@ fn a_symlink_at_the_log_name_is_not_written_through(#[fixture(temp_dir)] dir: &P
     std::fs::create_dir(&outside).unwrap();
     let state = dir.join("logs");
     std::fs::create_dir(&state).unwrap();
-    plant_symlink(&outside, &state.join("bridge.log"));
+    plant_link(&outside, &state.join("bridge.log"));
 
     // A line that cannot be written is dropped, as it is when the file cannot be opened at all.
     let mut w = writer(&state, 1024);
@@ -116,7 +103,7 @@ fn a_rotation_after_the_directory_is_swapped_stays_in_the_opened_directory(#[fix
     w.write_all(&stream(60)).unwrap();
 
     std::fs::rename(&state, dir.join("moved")).unwrap();
-    plant_symlink(&outside, &state);
+    plant_link(&outside, &state);
     w.write_all(&stream(60)).unwrap();
     w.flush().unwrap();
     drop(w);

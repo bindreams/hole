@@ -219,8 +219,8 @@ impl<S: VersionedState> VersionedFile<S> {
     }
 
     /// Reads the file. Never rewrites it. A directory that is not there is an
-    /// absent file; one that cannot be opened (a symlink in its path that a user
-    /// could have planted, see [`Dir`]) is a read that failed.
+    /// absent file; one that cannot be opened (a link in its path that [`Dir`]
+    /// does not follow) is a read that failed.
     pub fn load(&self) -> Loaded<S> {
         match Dir::open(&self.dir, false, None) {
             Ok(dir) => self.load_in(&dir),

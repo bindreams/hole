@@ -95,7 +95,7 @@ rand = { version = "0.10", optional = true }
 
 [dev-dependencies]
 skuld = { workspace = true }
-# `test-support`: lets route-record tests fail a read.
+# `test-support`: lets route-record tests fail a read, and gives the state-directory tests their links.
 util = { path = "../util", features = ["test-support"] }
 hole-test-observability = { path = "../test-observability" }
 # Recovery-path redaction tests capture tracing output through a

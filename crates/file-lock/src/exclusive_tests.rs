@@ -2,6 +2,7 @@ use super::*;
 use std::io;
 use std::path::Path;
 use std::sync::mpsc;
+use util::dir::testing::{plant_link, user_dir, SystemScratch};
 
 // try_acquire =========================================================================================================
 
@@ -448,21 +449,7 @@ fn an_existing_file_is_not_re_permissioned_when_no_owner_is_expected() {
 // user's profile is theirs to replace. Nothing may be created or changed outside the directory the
 // path names, and the refusal names the lock path.
 
-/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant. Run as
-/// root, the link is given away so that it is no longer root's own.
-fn plant_dir_symlink(target: &Path, link: &Path) {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link).unwrap();
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
-        }
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(target, link).unwrap();
-}
-
+#[cfg(unix)]
 fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
     let mut found: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
@@ -473,37 +460,53 @@ fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
 }
 
 #[skuld::test]
-fn a_lock_directory_that_is_a_symlink_is_refused_and_nothing_is_made_outside() {
+fn a_lock_directory_that_is_a_link_to_a_folder_the_system_owns_is_refused_and_nothing_is_made_there() {
     let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    let scratch = SystemScratch::new();
     let state = tmp.path().join("state");
-    plant_dir_symlink(&outside, &state);
+    plant_link(scratch.root(), &state);
+    let lock = format!("{}.lock", scratch.name().to_string_lossy());
 
-    assert_refused(&state.join("target.json.lock"), observable_owner());
+    assert_refused(&state.join(&lock), observable_owner());
 
-    assert!(entries(&outside).is_empty(), "a lock file was made through the symlink");
+    assert!(
+        !scratch.root().join(&lock).exists(),
+        "a lock file was made in the system's folder"
+    );
 }
 
 #[skuld::test]
-fn a_symlink_among_the_parents_of_the_lock_directory_is_refused_and_nothing_is_made_outside() {
+fn a_link_among_the_parents_of_the_lock_directory_leads_nowhere_in_the_systems_folder() {
     let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    let scratch = SystemScratch::new();
     let hole = tmp.path().join("hole");
-    plant_dir_symlink(&outside, &hole);
+    plant_link(scratch.root(), &hole);
 
-    // The state directory exists below the link, and a deeper one does not.
-    std::fs::create_dir(outside.join("state")).unwrap();
     for path in [
-        hole.join("state").join("target.json.lock"),
-        hole.join("missing").join("target.json.lock"),
+        hole.join(scratch.name()).join("target.json.lock"),
+        hole.join(scratch.name()).join("state").join("target.json.lock"),
     ] {
         assert_refused(&path, observable_owner());
     }
 
-    assert_eq!(entries(&outside), vec![std::ffi::OsString::from("state")]);
-    assert!(entries(&outside.join("state")).is_empty());
+    assert!(!scratch.path().exists(), "a folder was made in the system's folder");
+}
+
+#[skuld::test]
+fn a_lock_directory_reached_through_a_users_link_to_the_users_folder_is_locked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    let state = tmp.path().join("state");
+    plant_link(&real, &state);
+    // As root the lock is given to nobody, whose folder this is; as anyone else the owner is no one.
+    let owner = observable_owner().map(|_| (65534, 65534));
+
+    let _guard = Exclusive::try_acquire(&state.join("target.json.lock"), owner)
+        .unwrap()
+        .expect("a link to the user's own folder is followed");
+
+    assert!(real.join("target.json.lock").is_file());
 }
 
 #[skuld::test]

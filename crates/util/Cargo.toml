@@ -42,7 +42,9 @@ libc = "0.2"
 # replace (with its `MoveFileExW` fallback) and no-clobber rename. `dir` opens and
 # renames relative to a directory handle with `NtCreateFile` / `NtSetInformationFile`
 # (`Wdk_Storage_FileSystem`, whose `OBJECT_ATTRIBUTES` needs `Wdk_Foundation` and `Win32_Security`).
-windows = { version = "0.62", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemInformation"] }
+# `Win32_Security_Authorization`: `GetSecurityInfo`, the owner of a folder or link; `Win32_System_Ioctl`:
+# `FSCTL_GET_REPARSE_POINT`; `Win32_System_Threading`: the process token the test fixtures adjust.
+windows = { version = "0.62", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
@@ -61,6 +63,3 @@ tokio = { version = "1", features = ["test-util"] }
 # does not build.
 trybuild = { workspace = true }
 
-[target.'cfg(windows)'.dev-dependencies]
-# The ACL read-back in `dir/windows_tests.rs`.
-windows = { version = "0.62", features = ["Win32_Security_Authorization"] }

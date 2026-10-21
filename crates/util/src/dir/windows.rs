@@ -4,7 +4,7 @@
 //! version has it). A component is opened with `FILE_OPEN_REPARSE_POINT`, which opens a symlink or
 //! junction as itself, and the handle's attributes then say whether it is one.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -23,9 +23,11 @@ use windows::Wdk::Storage::FileSystem::{
     NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows::Win32::Foundation::{
-    RtlNtStatusToDosError, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, HANDLE, NTSTATUS,
-    OBJECT_ATTRIBUTE_FLAGS, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    LocalFree, RtlNtStatusToDosError, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    ERROR_SUCCESS, HANDLE, HLOCAL, NTSTATUS, OBJECT_ATTRIBUTE_FLAGS, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
 };
+use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+use windows::Win32::Security::{GetLengthSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
 use windows::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, GetFileType, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ACCESS_RIGHTS, FILE_ADD_FILE,
     FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
@@ -33,9 +35,14 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, READ_CONTROL,
     SYNCHRONIZE, WRITE_DAC,
 };
-use windows::Win32::System::IO::IO_STATUS_BLOCK;
+use windows::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+use windows::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 
+use super::trail::{Folder, Owner, Trail};
 use super::{EntryKind, OpenFile, Refusal};
+
+mod link;
+use link::{Sid, Step};
 
 /// Nothing on Windows depends on who is opening.
 pub struct Caller;
@@ -148,6 +155,40 @@ fn kind_from(handle: &File) -> io::Result<EntryKind> {
     })
 }
 
+// Owners --------------------------------------------------------------------------------------------------------------
+
+/// Who owns what `file` is open on, which must be open with `READ_CONTROL`.
+pub(super) fn owner_of(file: &File) -> io::Result<Owner<Sid>> {
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the handle is open with `READ_CONTROL`; the out-pointers are live locals.
+    let status = unsafe {
+        GetSecurityInfo(
+            HANDLE(file.as_raw_handle()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status.0 as i32));
+    }
+    let bytes = (!owner.0.is_null()).then(|| {
+        // SAFETY: `owner` points into `descriptor`, a valid SID, until it is freed below.
+        unsafe { std::slice::from_raw_parts(owner.0.cast::<u8>(), GetLengthSid(owner) as usize) }.to_vec()
+    });
+    // SAFETY: `descriptor` was allocated by `GetSecurityInfo` for the caller to free, and nothing
+    // points into it any more.
+    unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    bytes
+        .map(|bytes| link::classify(&bytes))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "the file has no owner"))
+}
+
 // Path resolution -----------------------------------------------------------------------------------------------------
 
 /// The NT path of the root directory a Windows path starts at, and the names below it.
@@ -183,13 +224,13 @@ fn split(path: &Path) -> io::Result<(Vec<u16>, VecDeque<OsString>)> {
     Ok((root, names))
 }
 
-/// Rights to open a directory with: read its attributes (to see a reparse point); a final one also
-/// adds files and subdirectories. Listing is not asked for: a directory a user can traverse but not
-/// list is still on the path to a file they can reach.
+/// Rights to open a directory with: read its attributes (to see a reparse point) and its owner (to
+/// judge a link); a final one also adds files and subdirectories. Listing is not asked for: a
+/// directory a user can traverse but not list is still on the path to a file they can reach.
 fn dir_rights(last: bool) -> FILE_ACCESS_RIGHTS {
     match last {
-        true => access(&[FILE_READ_ATTRIBUTES, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY]),
-        false => access(&[FILE_READ_ATTRIBUTES]),
+        true => access(&[FILE_READ_ATTRIBUTES, READ_CONTROL, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY]),
+        false => access(&[FILE_READ_ATTRIBUTES, READ_CONTROL]),
     }
 }
 
@@ -211,33 +252,170 @@ fn classify(dir: &File, name: &[u16]) -> io::Result<Option<EntryKind>> {
     }
 }
 
-/// Opens the directory `name` in `dir`; a missing one is created when `create`.
-fn descend(dir: &File, name: &OsStr, create: bool, rights: FILE_ACCESS_RIGHTS) -> io::Result<File> {
+/// How a directory was reached, to open it again.
+enum Entry {
+    /// An NT root such as `\??\C:\`.
+    Root(Vec<u16>),
+    /// A name in the directory above it.
+    Name(Vec<u16>),
+}
+
+/// A directory the walk stands in.
+struct Standing {
+    file: File,
+    made: bool,
+    entry: Entry,
+    /// Opened with the rights a final directory needs. A directory the walk came back to through `..` was not.
+    complete: bool,
+}
+
+impl Standing {
+    /// The directory as the rule judges it.
+    fn folder(&self) -> io::Result<Folder<Sid>> {
+        match self.made {
+            true => Ok(Folder::Made),
+            false => owner_of(&self.file).map(Folder::Existing),
+        }
+    }
+}
+
+/// What the walk has left to do, what it has followed, and the directories it is inside of.
+struct Walk {
+    steps: VecDeque<Step>,
+    trail: Trail<Sid>,
+    /// Links already followed in this walk; one met twice is a loop.
+    followed: HashSet<FileId>,
+    /// From the root to the directory the walk stands in, which is the last.
+    stack: Vec<Standing>,
+}
+
+impl Walk {
+    fn here(&self) -> &Standing {
+        self.stack.last().expect("a walk always stands in a directory")
+    }
+}
+
+/// The NT root `root` as a directory.
+fn open_root(root: &[u16], rights: FILE_ACCESS_RIGHTS, complete: bool) -> io::Result<Standing> {
+    let file = nt_open(None, root, rights, SHARE_ALL, FILE_OPEN, options(OPEN_AS_ITSELF))?;
+    if kind_from(&file)? != EntryKind::Directory {
+        return Err(Refusal::NotDirectory.into_io_error());
+    }
+    Ok(Standing {
+        file,
+        made: false,
+        entry: Entry::Root(root.to_vec()),
+        complete,
+    })
+}
+
+/// The reparse data of the link `link` is open on, as `FSCTL_GET_REPARSE_POINT` returns it.
+fn reparse_data(link: &File) -> io::Result<Vec<u8>> {
+    /// `MAXIMUM_REPARSE_DATA_BUFFER_SIZE`.
+    const MAXIMUM: usize = 16 * 1024;
+    let mut buffer = vec![0u8; MAXIMUM];
+    let mut returned = 0u32;
+    // SAFETY: the handle is open and synchronous; `buffer` is valid for the length passed and `returned`
+    // is a live local.
+    unsafe {
+        DeviceIoControl(
+            HANDLE(link.as_raw_handle()),
+            FSCTL_GET_REPARSE_POINT,
+            None,
+            0,
+            Some(buffer.as_mut_ptr().cast()),
+            MAXIMUM as u32,
+            Some(&mut returned),
+            None,
+        )
+    }?;
+    buffer.truncate(returned as usize);
+    Ok(buffer)
+}
+
+/// Follows the link `link` (open as itself, with `READ_CONTROL`), which sits in the directory the walk
+/// stands in: judges it, and puts what it points at in front of the walk's steps.
+fn follow(walk: &mut Walk, link: &File) -> io::Result<()> {
+    let dir_owner = owner_of(&walk.here().file)?;
+    walk.trail
+        .follow(&dir_owner, &owner_of(link)?)
+        .map_err(Refusal::into_io_error)?;
+    if !walk.followed.insert(file_id(link)?) {
+        return Err(Refusal::Symlink.into_io_error());
+    }
+    let mut expansion = link::steps_of_reparse_data(&reparse_data(link)?).map_err(Refusal::into_io_error)?;
+    expansion.append(&mut walk.steps);
+    walk.steps = expansion;
+    Ok(())
+}
+
+/// Opens the directory `name` in the directory the walk stands in (a missing one is created when `create`), or
+/// makes progress towards it: `Ok(Some(next))` is the directory; `Ok(None)` is a followed link whose target was
+/// put in front of the walk's steps.
+fn descend(
+    walk: &mut Walk,
+    name: &OsStr,
+    create: bool,
+    rights: FILE_ACCESS_RIGHTS,
+    last: bool,
+) -> io::Result<Option<Standing>> {
     let name = wide(name)?;
     loop {
-        let open_err = match nt_open(Some(dir), &name, rights, SHARE_ALL, FILE_OPEN, options(OPEN_AS_ITSELF)) {
-            Ok(handle) => match kind_from(&handle)? {
-                EntryKind::Directory => return Ok(handle),
-                EntryKind::Symlink => return Err(Refusal::Symlink.into_io_error()),
-                _ => return Err(Refusal::NotDirectory.into_io_error()),
-            },
+        let cur = &walk.here().file;
+        let open_err = match nt_open(Some(cur), &name, rights, SHARE_ALL, FILE_OPEN, options(OPEN_AS_ITSELF)) {
+            Ok(handle) => {
+                return match kind_from(&handle)? {
+                    EntryKind::Directory => Ok(Some(Standing {
+                        file: handle,
+                        made: false,
+                        entry: Entry::Name(name),
+                        complete: last,
+                    })),
+                    EntryKind::Symlink => follow(walk, &handle).map(|()| None),
+                    _ => Err(Refusal::NotDirectory.into_io_error()),
+                };
+            }
             Err(err) => err,
         };
-        match classify(dir, &name) {
-            Ok(None) if create => match nt_open(
-                Some(dir),
-                &name,
-                rights,
-                SHARE_ALL,
-                FILE_CREATE,
-                options(&[FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT]),
-            ) {
-                Ok(handle) => return Ok(handle),
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(err),
-            },
+        // The rights for use may be what was refused; what the entry is decides.
+        match classify(cur, &name) {
+            Ok(None) if create => {
+                walk.trail
+                    .create_in(&walk.here().folder()?)
+                    .map_err(Refusal::into_io_error)?;
+                match nt_open(
+                    Some(&walk.here().file),
+                    &name,
+                    rights,
+                    SHARE_ALL,
+                    FILE_CREATE,
+                    options(&[FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT]),
+                ) {
+                    Ok(handle) => {
+                        return Ok(Some(Standing {
+                            file: handle,
+                            made: true,
+                            entry: Entry::Name(name),
+                            complete: last,
+                        }));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => return Err(err),
+                }
+            }
             Ok(None) => return Err(open_err),
-            Ok(Some(EntryKind::Symlink)) => return Err(Refusal::Symlink.into_io_error()),
+            Ok(Some(EntryKind::Symlink)) => {
+                let link = nt_open(
+                    Some(cur),
+                    &name,
+                    access(&[FILE_READ_ATTRIBUTES, READ_CONTROL]),
+                    SHARE_ALL,
+                    FILE_OPEN,
+                    options(OPEN_AS_ITSELF),
+                )?;
+                follow(walk, &link)?;
+                return Ok(None);
+            }
             Ok(Some(EntryKind::Directory)) => return Err(open_err),
             Ok(Some(EntryKind::File | EntryKind::Other)) => return Err(Refusal::NotDirectory.into_io_error()),
             Err(_) => return Err(open_err),
@@ -255,22 +433,64 @@ pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS
         true => access(&[dir_rights(true), extra]),
         false => dir_rights(false),
     };
-    let (root, mut names) = split(path)?;
-    let mut current = nt_open(
-        None,
-        &root,
-        rights_for(names.is_empty()),
-        SHARE_ALL,
-        FILE_OPEN,
-        options(OPEN_AS_ITSELF),
-    )?;
-    if kind_from(&current)? != EntryKind::Directory {
-        return Err(Refusal::NotDirectory.into_io_error());
+    let (root, names) = split(path)?;
+    let mut walk = Walk {
+        steps: names.into_iter().map(Step::Name).collect(),
+        trail: Trail::new(),
+        followed: HashSet::new(),
+        stack: Vec::new(),
+    };
+    let first = open_root(&root, rights_for(walk.steps.is_empty()), walk.steps.is_empty())?;
+    walk.stack.push(first);
+    while let Some(step) = walk.steps.pop_front() {
+        let last = walk.steps.is_empty();
+        match step {
+            Step::Root(root) => walk.stack = vec![open_root(&root, rights_for(last), last)?],
+            Step::Parent => {
+                if walk.stack.len() < 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a link leads above its root",
+                    ));
+                }
+                walk.stack.pop();
+            }
+            Step::Name(name) => {
+                if let Some(next) = descend(&mut walk, &name, create, rights_for(last), last)? {
+                    walk.stack.push(next);
+                }
+            }
+        }
     }
-    while let Some(name) = names.pop_front() {
-        current = descend(&current, &name, create, rights_for(names.is_empty()))?;
+
+    walk.trail
+        .end_at(&walk.here().folder()?)
+        .map_err(Refusal::into_io_error)?;
+    let end = walk.stack.pop().expect("a walk always stands in a directory");
+    match end.complete {
+        true => Ok(end.file),
+        false => reopen_complete(&walk, end, rights_for(true)),
     }
-    Ok(current)
+}
+
+/// `end`, which the walk came back to through `..` and so holds for lookup only, opened again with `rights`: from
+/// the directory above it by the name it was entered by, and checked to be the same directory.
+fn reopen_complete(walk: &Walk, end: Standing, rights: FILE_ACCESS_RIGHTS) -> io::Result<File> {
+    let again = match &end.entry {
+        Entry::Root(root) => nt_open(None, root, rights, SHARE_ALL, FILE_OPEN, options(OPEN_AS_ITSELF))?,
+        Entry::Name(name) => nt_open(
+            Some(&walk.here().file),
+            name,
+            rights,
+            SHARE_ALL,
+            FILE_OPEN,
+            options(OPEN_AS_ITSELF),
+        )?,
+    };
+    if file_id(&again)? != file_id(&end.file)? || kind_from(&again)? != EntryKind::Directory {
+        return Err(Refusal::Symlink.into_io_error());
+    }
+    Ok(again)
 }
 
 // Operations relative to a directory ----------------------------------------------------------------------------------
