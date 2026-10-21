@@ -18,7 +18,7 @@ use std::io;
 
 use tracing::warn;
 
-use super::retire::{clear_record, StartConfig, StartRead, StartWrite};
+use super::retire::{clear_record, RecordWrite, StartConfig, StartRead, StartWrite};
 use crate::disable_record::{DisabledState, RecordState};
 use crate::service_start::RepairStep;
 
@@ -58,11 +58,16 @@ pub fn display<S: StartRead>(session: &mut S) -> DisabledState {
 }
 
 /// Stamps the record with this process before a repair or an enable changes
-/// the start type. A failure costs the reader only its wording (it would read
-/// the earlier stamp's process), so it is a warning.
-fn stamp<S: StartConfig>(session: &mut S) {
-    if let Err(error) = session.write_record() {
-        warn!(%error, "could not stamp the record with this process; a status read may call this change interrupted");
+/// the start type, and says whether it was written. A failure costs the reader
+/// only its wording (it would read the earlier stamp's process), so it is a
+/// warning.
+fn stamp<S: StartConfig>(session: &mut S) -> bool {
+    match session.write_record() {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "could not stamp the record with this process; a status read may call this change interrupted");
+            false
+        }
     }
 }
 
@@ -80,7 +85,7 @@ pub fn repair<S: StartConfig>(session: &mut S) -> Result<RepairStep, RepairError
         RepairStep::LeaveDisabled => {}
         RepairStep::ClearRecordOnly => clear_record(session),
         RepairStep::ResetThenClear => {
-            stamp(session);
+            let _ = stamp(session);
             session.set_start_type(StartWrite::Auto).map_err(RepairError::Reset)?;
             clear_record(session);
         }
@@ -90,9 +95,19 @@ pub fn repair<S: StartConfig>(session: &mut S) -> Result<RepairStep, RepairError
 
 /// Sets the start type to automatic whatever it is and the record says, then
 /// clears the record. The administrator asked for it.
+///
+/// A failed write removes a record this call made: over an administrator's
+/// Disable (no record) it would otherwise leave an interrupted Hole change,
+/// which the repair and the cutover undo. A record that was there stays.
 pub fn enable<S: StartConfig>(session: &mut S) -> Result<(), RepairError> {
-    stamp(session);
-    session.set_start_type(StartWrite::Auto).map_err(RepairError::Reset)?;
+    let write = RecordWrite::over(session.record_state());
+    let stamped = stamp(session);
+    if let Err(error) = session.set_start_type(StartWrite::Auto) {
+        if stamped && write.clears_on_failure() {
+            clear_record(session);
+        }
+        return Err(RepairError::Reset(error));
+    }
     clear_record(session);
     Ok(())
 }

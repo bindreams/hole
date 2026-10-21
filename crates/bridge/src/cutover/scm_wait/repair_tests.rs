@@ -237,7 +237,7 @@ fn enabling_writes_automatic_whatever_the_record_says_and_then_clears_it() {
             enable(&mut config).unwrap();
             assert_eq!(
                 config.calls(),
-                ["write_record", "set_start_type(Auto)", "clear_record"],
+                ["record_state", "write_record", "set_start_type(Auto)", "clear_record"],
                 "{record:?} over {start:?}"
             );
             assert_eq!((config.start, config.record), (StartType::Auto, RecordState::Absent));
@@ -249,15 +249,50 @@ fn enabling_writes_automatic_whatever_the_record_says_and_then_clears_it() {
 fn a_failed_enable_write_is_the_error_and_leaves_the_record() {
     let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled).failing("set_start_type");
     assert!(matches!(enable(&mut config), Err(RepairError::Reset(_))));
-    assert_eq!(config.calls(), ["write_record", "set_start_type(Auto)"]);
+    assert_eq!(config.calls(), ["record_state", "write_record", "set_start_type(Auto)"]);
     assert_eq!(config.record, RecordState::Present);
+}
+
+/// An administrator's Disable has no record. The stamp `enable` makes would
+/// turn it into an interrupted Hole change if the write failed and the stamp
+/// stayed, and the elevated paths undo those; so a record this call made is
+/// its own to remove.
+#[skuld::test]
+fn a_failed_enable_write_removes_the_record_it_made_and_leaves_the_disable_an_administrators() {
+    let mut config = FakeConfig::new(RecordState::Absent, StartType::Disabled).failing("set_start_type");
+    assert!(matches!(enable(&mut config), Err(RepairError::Reset(_))));
+    assert_eq!(
+        config.calls(),
+        ["record_state", "write_record", "set_start_type(Auto)", "clear_record"]
+    );
+    assert_eq!(
+        (config.start, config.record),
+        (StartType::Disabled, RecordState::Absent)
+    );
+    assert_eq!(
+        display(&mut config),
+        DisabledState::By(DisabledBy::Elsewhere),
+        "the GUI still offers Enable, not Repair"
+    );
+}
+
+#[skuld::test]
+fn a_failed_enable_write_that_could_not_stamp_has_no_record_of_its_own_to_remove() {
+    let mut config = FakeConfig::new(RecordState::Absent, StartType::Disabled)
+        .failing("write_record")
+        .failing("set_start_type");
+    assert!(matches!(enable(&mut config), Err(RepairError::Reset(_))));
+    assert_eq!(config.calls(), ["record_state", "write_record", "set_start_type(Auto)"]);
 }
 
 #[skuld::test]
 fn an_enable_that_cannot_stamp_the_record_goes_on() {
     let mut config = FakeConfig::new(RecordState::Absent, StartType::Disabled).failing("write_record");
     enable(&mut config).unwrap();
-    assert_eq!(config.calls(), ["write_record", "set_start_type(Auto)", "clear_record"]);
+    assert_eq!(
+        config.calls(),
+        ["record_state", "write_record", "set_start_type(Auto)", "clear_record"]
+    );
     assert_eq!((config.start, config.record), (StartType::Auto, RecordState::Absent));
 }
 

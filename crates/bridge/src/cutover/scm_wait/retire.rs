@@ -114,9 +114,9 @@ impl Hardening {
     }
 }
 
-/// What [`harden`] does to the record.
+/// What a change to the start type does to the record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecordWrite {
+pub(super) enum RecordWrite {
     /// Nothing: the Disable is an administrator's.
     None,
     /// The record is not there: make it.
@@ -126,6 +126,15 @@ enum RecordWrite {
 }
 
 impl RecordWrite {
+    /// What a change that stamps whatever record it finds does: make it when
+    /// absent, stamp it again when present.
+    pub(super) fn over(record: RecordState) -> RecordWrite {
+        match record {
+            RecordState::Absent => RecordWrite::Make,
+            RecordState::Present => RecordWrite::Restamp,
+        }
+    }
+
     /// Whether the call writes the record.
     fn writes(self) -> bool {
         match self {
@@ -137,7 +146,7 @@ impl RecordWrite {
 
     /// Whether a failure after the write clears the record: only a record
     /// this call made is its own to remove; one that was there stays.
-    fn clears_on_failure(self) -> bool {
+    pub(super) fn clears_on_failure(self) -> bool {
         match self {
             RecordWrite::None => false,
             RecordWrite::Make => true,
