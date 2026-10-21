@@ -253,6 +253,8 @@ pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<F
     let (flags, mode) = match how {
         OpenFile::CreateNew { mode } => (libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, mode),
         OpenFile::Existing => (libc::O_RDWR, 0),
+        OpenFile::Read => (libc::O_RDONLY, 0),
+        OpenFile::Append { mode } => (libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT, mode),
     };
     open_fd(dir.as_raw_fd(), &cstr(name)?, flags | libc::O_NOFOLLOW, mode).map(File::from)
 }
@@ -290,9 +292,79 @@ pub(super) fn unlink(dir: &File, name: &OsStr) -> io::Result<()> {
 
 /// `from` to `to`, both in `dir`, replacing `to`. `_temp` is the open file at `from`: Windows renames by its handle.
 pub(super) fn rename(dir: &File, _temp: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    rename_by_name(dir, from, to)
+}
+
+/// `from` to `to`, both in `dir`, replacing `to`.
+pub(super) fn rename_by_name(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
     let (from, to) = (cstr(from)?, cstr(to)?);
     // SAFETY: both names are valid NUL-terminated strings and `dir` an open directory.
     check(unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) }).map(|_| ())
+}
+
+/// `from` to `to`, both in `dir`, in one step that fails with `AlreadyExists` instead of replacing `to`.
+/// `Unsupported` when the kernel or the filesystem has no such rename.
+#[cfg(target_os = "linux")]
+pub(super) fn rename_noreplace(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let (from, to) = (cstr(from)?, cstr(to)?);
+    // SAFETY: both names are valid NUL-terminated strings and `dir` an open directory, all for the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            dir.as_raw_fd(),
+            from.as_ptr(),
+            dir.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        // `EPERM` is not among these: it is a refusal of this rename (a sticky directory, a security
+        // module), and the caller's hard-link fallback is allowed where it was not.
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP) => Err(io::ErrorKind::Unsupported.into()),
+        _ => Err(err),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn rename_noreplace(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let (from, to) = (cstr(from)?, cstr(to)?);
+    // SAFETY: both names are valid NUL-terminated strings and `dir` an open directory, all for the call.
+    let rc = unsafe {
+        libc::renameatx_np(
+            dir.as_raw_fd(),
+            from.as_ptr(),
+            dir.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        // The volume does not support `RENAME_EXCL`.
+        Some(libc::ENOTSUP | libc::EINVAL) => Err(io::ErrorKind::Unsupported.into()),
+        _ => Err(err),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn rename_noreplace(_dir: &File, _from: &OsStr, _to: &OsStr) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// A second name `new` for `existing`, both in `dir`. `linkat` without `AT_SYMLINK_FOLLOW` links a symlink as
+/// itself.
+pub(super) fn link(dir: &File, existing: &OsStr, new: &OsStr) -> io::Result<()> {
+    let (existing, new) = (cstr(existing)?, cstr(new)?);
+    // SAFETY: both names are valid NUL-terminated strings and `dir` an open directory.
+    check(unsafe { libc::linkat(dir.as_raw_fd(), existing.as_ptr(), dir.as_raw_fd(), new.as_ptr(), 0) }).map(|_| ())
 }
 
 /// `fchown`; a failure is logged and swallowed (see [`super::Dir::secure`]).

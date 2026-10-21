@@ -350,3 +350,208 @@ fn write_state_file_refuses_a_symlinked_state_directory_and_writes_nothing_outsi
     assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink));
     assert!(names(&outside).is_empty());
 }
+
+// read ================================================================================================================
+
+#[skuld::test]
+fn read_returns_the_bytes_of_the_file_and_not_found_for_a_missing_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("state.json"), b"{\"a\":1}").unwrap();
+
+    assert_eq!(dir.read(&name("state.json")).unwrap(), b"{\"a\":1}");
+    assert_eq!(kind(dir.read(&name("absent"))), Some(io::ErrorKind::NotFound));
+}
+
+#[skuld::test]
+fn read_does_not_follow_a_symlink_at_the_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let target = tmp.path().join("target-dir");
+    std::fs::create_dir(&target).unwrap();
+    plant_symlink(&target, &tmp.path().join("link"));
+
+    assert!(dir.read(&name("link")).is_err());
+}
+
+#[skuld::test]
+fn a_file_open_for_reading_does_not_block_a_replace_of_it() {
+    // A reader that shares delete, as `std::fs::read` does: the store of a versioned file replaces the
+    // file under it.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    dir.write_atomic(&name("state.json"), b"one", None, |_| Ok(())).unwrap();
+    let reader = dir.open_file(&name("state.json"), OpenFile::Read).unwrap();
+
+    dir.write_atomic(&name("state.json"), b"two", None, |_| Ok(())).unwrap();
+
+    assert_eq!(dir.read(&name("state.json")).unwrap(), b"two");
+    drop(reader);
+}
+
+// open_file: Append ---------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn append_creates_the_file_and_then_adds_to_the_end_without_truncating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    let mut first = dir.open_file(&name("log"), OpenFile::Append { mode: 0o644 }).unwrap();
+    first.write_all(b"one\n").unwrap();
+    drop(first);
+    let mut second = dir.open_file(&name("log"), OpenFile::Append { mode: 0o644 }).unwrap();
+    second.write_all(b"two\n").unwrap();
+
+    assert_eq!(std::fs::read(tmp.path().join("log")).unwrap(), b"one\ntwo\n");
+}
+
+#[skuld::test]
+fn append_does_not_follow_a_symlink_at_the_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let target = tmp.path().join("target-dir");
+    std::fs::create_dir(&target).unwrap();
+    plant_symlink(&target, &tmp.path().join("log"));
+
+    assert!(dir.open_file(&name("log"), OpenFile::Append { mode: 0o644 }).is_err());
+    assert!(names(&target).is_empty());
+}
+
+#[skuld::test]
+fn an_appended_file_can_be_renamed_by_anyone_who_shares_delete() {
+    // The log writer keeps its file open while a reader or a scanner looks at it.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let mut open = dir.open_file(&name("log"), OpenFile::Append { mode: 0o644 }).unwrap();
+    open.write_all(b"x").unwrap();
+
+    std::fs::rename(tmp.path().join("log"), tmp.path().join("log.1")).unwrap();
+
+    assert_eq!(std::fs::read(tmp.path().join("log.1")).unwrap(), b"x");
+}
+
+// link / rename / rename_noreplace / sync =============================================================================
+
+#[skuld::test]
+fn link_gives_the_file_a_second_name_and_never_replaces_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("a"), b"a").unwrap();
+    std::fs::write(tmp.path().join("taken"), b"theirs").unwrap();
+
+    dir.link(&name("a"), &name("b")).unwrap();
+    let refused = dir.link(&name("a"), &name("taken"));
+
+    assert_eq!(dir.id_of(&name("a")).unwrap(), dir.id_of(&name("b")).unwrap());
+    assert_eq!(kind(refused), Some(io::ErrorKind::AlreadyExists));
+    assert_eq!(std::fs::read(tmp.path().join("taken")).unwrap(), b"theirs");
+    assert_eq!(
+        kind(dir.link(&name("absent"), &name("c"))),
+        Some(io::ErrorKind::NotFound)
+    );
+}
+
+#[skuld::test]
+fn rename_moves_a_file_over_the_name_it_is_given_and_by_name_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("active"), b"new").unwrap();
+    std::fs::write(tmp.path().join("old"), b"old").unwrap();
+
+    dir.rename(&name("active"), &name("old")).unwrap();
+
+    assert_eq!(names(tmp.path()), vec![name("old")]);
+    assert_eq!(std::fs::read(tmp.path().join("old")).unwrap(), b"new");
+    assert_eq!(
+        kind(dir.rename(&name("absent"), &name("x"))),
+        Some(io::ErrorKind::NotFound)
+    );
+}
+
+#[skuld::test]
+fn rename_noreplace_moves_to_a_free_name_and_never_replaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("from"), b"from").unwrap();
+    std::fs::write(tmp.path().join("taken"), b"theirs").unwrap();
+
+    dir.rename_noreplace(&name("from"), &name("free")).unwrap();
+    std::fs::write(tmp.path().join("from"), b"from").unwrap();
+    let refused = dir.rename_noreplace(&name("from"), &name("taken"));
+
+    assert_eq!(std::fs::read(tmp.path().join("free")).unwrap(), b"from");
+    assert_eq!(kind(refused), Some(io::ErrorKind::AlreadyExists));
+    assert_eq!(std::fs::read(tmp.path().join("from")).unwrap(), b"from");
+    assert_eq!(std::fs::read(tmp.path().join("taken")).unwrap(), b"theirs");
+    assert_eq!(
+        kind(dir.rename_noreplace(&name("absent"), &name("y"))),
+        Some(io::ErrorKind::NotFound)
+    );
+}
+
+#[skuld::test]
+fn sync_flushes_a_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    // A volume with no directory flush answers an error the caller reads; the temp dir is on one that has it.
+    dir.sync().unwrap();
+}
+
+// stage ===============================================================================================================
+
+#[skuld::test]
+fn a_staged_file_is_invisible_under_its_name_until_published() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    dir.write_atomic(&name("state.json"), b"old", None, |_| Ok(())).unwrap();
+
+    let staged = dir.stage(&name("state.json"), b"new", None, |_| Ok(())).unwrap();
+    assert_eq!(std::fs::read(tmp.path().join("state.json")).unwrap(), b"old");
+
+    staged.publish().unwrap();
+    assert_eq!(std::fs::read(tmp.path().join("state.json")).unwrap(), b"new");
+    assert_eq!(names(tmp.path()), vec![name("state.json")]);
+}
+
+#[skuld::test]
+fn a_staged_file_that_is_dropped_leaves_nothing_and_the_old_file_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    dir.write_atomic(&name("state.json"), b"old", None, |_| Ok(())).unwrap();
+
+    drop(dir.stage(&name("state.json"), b"new", None, |_| Ok(())).unwrap());
+
+    assert_eq!(names(tmp.path()), vec![name("state.json")]);
+    assert_eq!(std::fs::read(tmp.path().join("state.json")).unwrap(), b"old");
+}
+
+#[skuld::test]
+fn claiming_publishes_a_free_name_and_loses_to_a_taken_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    dir.stage(&name("marker"), b"first", None, |_| Ok(()))
+        .unwrap()
+        .claim()
+        .unwrap();
+    let lost = dir.stage(&name("marker"), b"second", None, |_| Ok(())).unwrap().claim();
+
+    assert_eq!(kind(lost), Some(io::ErrorKind::AlreadyExists));
+    assert_eq!(std::fs::read(tmp.path().join("marker")).unwrap(), b"first");
+    assert_eq!(names(tmp.path()), vec![name("marker")], "no temp left behind");
+}
+
+#[skuld::test]
+fn a_failed_protect_leaves_no_staged_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    let err = dir
+        .stage(&name("state.json"), b"x", None, |_| Err(io::Error::other("no")))
+        .err()
+        .unwrap();
+
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+    assert!(names(tmp.path()).is_empty());
+}
