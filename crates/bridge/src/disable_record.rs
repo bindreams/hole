@@ -9,9 +9,9 @@
 //! elevated paths undo it; absent, nothing here changes a Disabled service.
 //!
 //! On Windows the record is a value in the service's own registry key
-//! ([`RecordKey`]), so it dies with the service and an unprivileged reader can
-//! see it. A record that cannot be read counts as present, and the record
-//! never blocks an uninstall, an install, a cutover or a connect.
+//! (`RecordKey`), so it dies with the service and an unprivileged reader can
+//! see it. A record that cannot be read counts as present. A failed write fails
+//! the retirement before the start type changes.
 //!
 //! Neither write nor clear takes a lock. Two overlapping retirements can clear
 //! a record the other still needs; the service then reads as an

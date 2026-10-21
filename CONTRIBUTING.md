@@ -2098,19 +2098,20 @@ presence is the fact: any value of that name, of any type, is the record.
 **Record and start type together decide, one exhaustive match each**
 (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
 
-| Record  | Start type   | Cutover child, before its start        | `bridge install`                               | Retirement's restore                  | GUI                                                             |
-| ------- | ------------ | -------------------------------------- | ---------------------------------------------- | ------------------------------------- | --------------------------------------------------------------- |
-| present | Disabled     | set Automatic, clear the record, start | registers Automatic, clears the record, starts | Automatic, clear the record           | "an interrupted uninstall left Hole's service disabled": Repair |
-| present | not Disabled | clear the record (stale), start        | clear the record, start                        | restore as observed, clear the record | nothing                                                         |
-| absent  | Disabled     | untouched, not started (below)         | registers Disabled again, not started, exits 0 | stays Disabled                        | "the Hole service is disabled on this computer": Enable         |
-| absent  | not Disabled | nothing, start                         | start                                          | as observed                           | nothing                                                         |
+| Record  | Start type   | Cutover child, before its start        | `bridge install`                                                  | Retirement's restore                  | GUI                                                             |
+| ------- | ------------ | -------------------------------------- | ----------------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------------- |
+| present | Disabled     | set Automatic, clear the record, start | re-registers Automatic (the record dies with the old key), starts | Automatic, clear the record           | "an interrupted uninstall left Hole's service disabled": Repair |
+| present | not Disabled | clear the record (stale), start        | re-registers (the record dies with the old key), start            | restore as observed, clear the record | nothing                                                         |
+| absent  | Disabled     | untouched, not started (below)         | registers Disabled again, not started, exits 0                    | stays Disabled                        | "the Hole service is disabled on this computer": Enable         |
+| absent  | not Disabled | nothing, start                         | start                                                             | as observed                           | nothing                                                         |
 
 - **The kill-point invariant.** At no point of a retirement is a service it
   disabled left Disabled without its record: the record is written first, a
   failed record write changes nothing, a failed start-type write clears only the
   record this call wrote, a restore whose start-type write failed leaves the
   record, and a stale record (present over a service that is not Disabled) is
-  swept by the restore, the delete, the cutover child and `bridge install`; a
+  swept by the restore, the delete and the cutover child, and dies with the old
+  key when `bridge install` re-registers the service; a
   retirement that finds the service marked for deletion sweeps none, and
   keeps a stale record. The
   class is pinned by `at_no_point_is_a_service_we_disabled_left_without_a_record`
