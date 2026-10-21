@@ -12,6 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::port::{os_probe_with, pick_with};
 use crate::tap_tests::{addr, err, scripted};
+use crate::test_utils::WaitableWriter;
+use crate::tracing_test::set_default_in_current_thread;
 
 #[skuld::test]
 async fn the_inner_port_pick_never_returns_a_taken_port() {
@@ -134,6 +136,107 @@ async fn shutdown_ends_the_inner_port_pick() {
 
     assert_eq!(picked, None);
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+fn debug_subscriber() -> (impl tracing::Subscriber + Send + Sync, WaitableWriter) {
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    (subscriber, writer)
+}
+
+/// A probe that keeps returning a port the caller cannot use is as stuck as one that keeps failing, and the log says so
+/// once, naming the plugin and the port, while each miss is logged at debug.
+#[skuld::test]
+async fn a_probe_that_keeps_returning_a_taken_port_is_warned_about_once() {
+    tokio::time::pause();
+    let (subscriber, writer) = debug_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut script: Vec<_> = (0..4).map(|_| Ok(addr(5000))).collect();
+    script.push(Ok(addr(5001)));
+
+    pick_with(
+        "stuck-plugin",
+        addr(5000).ip(),
+        &[5000],
+        scripted(script, &calls),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let log = writer.snapshot();
+    let warns: Vec<_> = log.lines().filter(|line| line.contains("WARN")).collect();
+    assert_eq!(warns.len(), 1, "{log}");
+    assert!(
+        warns[0].contains("stuck-plugin") && warns[0].contains("5000"),
+        "{}",
+        warns[0]
+    );
+    let debugs = log
+        .lines()
+        .filter(|line| line.contains("DEBUG") && line.contains("stuck-plugin") && line.contains("5000"))
+        .count();
+    assert_eq!(debugs, 4, "one debug line per taken port returned: {log}");
+}
+
+/// The same bind race twice in a row is warned about once, not on every retry after it.
+#[skuld::test]
+async fn a_probe_that_keeps_failing_the_same_way_is_warned_about_once() {
+    tokio::time::pause();
+    let (subscriber, writer) = debug_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut script: Vec<_> = (0..4).map(|_| err(io::ErrorKind::AddrInUse)).collect();
+    script.push(Ok(addr(5001)));
+
+    pick_with(
+        "stuck-plugin",
+        addr(5000).ip(),
+        &[5000],
+        scripted(script, &calls),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let log = writer.snapshot();
+    let warns: Vec<_> = log.lines().filter(|line| line.contains("WARN")).collect();
+    assert_eq!(warns.len(), 1, "{log}");
+    assert!(warns[0].contains("stuck-plugin"), "{}", warns[0]);
+}
+
+/// A taken port and a bind race are different misses: neither repeats the other.
+#[skuld::test]
+async fn a_taken_port_between_bind_races_is_not_a_repeat() {
+    tokio::time::pause();
+    let (subscriber, writer) = debug_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let script = vec![
+        err(io::ErrorKind::AddrInUse),
+        Ok(addr(5000)),
+        err(io::ErrorKind::AddrInUse),
+        Ok(addr(5000)),
+        Ok(addr(5001)),
+    ];
+
+    pick_with(
+        "p",
+        addr(5000).ip(),
+        &[5000],
+        scripted(script, &calls),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let log = writer.snapshot();
+    assert!(!log.contains("WARN"), "{log}");
 }
 
 /// A port another process takes between the probe's drop and its rebind fails the rebind, so the pick starts over
