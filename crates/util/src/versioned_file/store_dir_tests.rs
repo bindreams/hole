@@ -5,7 +5,7 @@ use std::path::Path;
 
 use super::{DefaultPlacement, Loaded, Removal, VersionedFile};
 use crate::dir::Refusal;
-use crate::versioned_file::fixtures::{dir, DecisionFile, OsRecordFile};
+use crate::versioned_file::fixtures::{dir, DecisionFile};
 
 fn decision(value: &str) -> DecisionFile {
     DecisionFile {
@@ -112,6 +112,7 @@ fn a_directory_swapped_for_a_symlink_after_the_open_is_not_followed() {
     use std::io;
 
     use crate::dir::Dir;
+    use crate::versioned_file::fixtures::OsRecordFile;
 
     struct Swaps<'a> {
         root: &'a Path,

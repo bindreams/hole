@@ -246,19 +246,19 @@ fn only_the_unsupported_answers_select_the_legacy_replace() {
 #[skuld::test]
 fn the_legacy_replace_runs_only_after_an_unsupported_answer() {
     let legacy_calls = std::cell::Cell::new(0);
-    let mut legacy = || {
+    let legacy = || {
         legacy_calls.set(legacy_calls.get() + 1);
         Ok(())
     };
 
-    posix_or_legacy(|| Ok(()), &mut legacy).unwrap();
+    posix_or_legacy(|| Ok(()), legacy).unwrap();
     assert_eq!(legacy_calls.get(), 0, "a rename that worked needs no fallback");
 
-    let refused = posix_or_legacy(|| Err(os(5)), &mut legacy).unwrap_err();
+    let refused = posix_or_legacy(|| Err(os(5)), legacy).unwrap_err();
     assert_eq!(refused.raw_os_error(), Some(5));
     assert_eq!(legacy_calls.get(), 0, "any other error is returned as it is");
 
-    posix_or_legacy(|| Err(os(87)), &mut legacy).unwrap();
+    posix_or_legacy(|| Err(os(87)), legacy).unwrap();
     assert_eq!(legacy_calls.get(), 1);
 }
 
