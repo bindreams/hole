@@ -287,3 +287,107 @@ fn service_log_dir_matches_log_collector_constants() {
     #[cfg(target_os = "macos")]
     assert_eq!(d, std::path::PathBuf::from("/var/log/hole"));
 }
+
+// The log directory is the user's to swap =============================================================================
+
+/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant.
+fn plant_symlink(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
+        }
+    }
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(target, link).unwrap();
+}
+
+/// `root/outside` holding a marker of another cutover, and `root/logs` as a symlink to it.
+fn symlinked_log_dir(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let outside = root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    write(&outside, &info(5), None).unwrap();
+    let logs = root.join("logs");
+    plant_symlink(&outside, &logs);
+    (outside, logs)
+}
+
+fn listing(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[skuld::test]
+fn writing_through_a_symlinked_log_dir_is_refused_and_writes_nothing_outside() {
+    let root = tempfile::tempdir().unwrap();
+    let (outside, logs) = symlinked_log_dir(root.path());
+
+    assert!(write(&logs, &info(1), None).is_err());
+    assert!(write_new(&logs, &info(2), None).is_err());
+
+    assert_eq!(listing(&outside), [MARKER_FILE]);
+    assert_eq!(present(&outside).driver.pid, 5);
+}
+
+#[skuld::test]
+fn clearing_through_a_symlinked_log_dir_removes_nothing_outside() {
+    let root = tempfile::tempdir().unwrap();
+    let (outside, logs) = symlinked_log_dir(root.path());
+
+    assert!(clear(&logs).is_err());
+    assert!(stamp_driver(&logs, &info(1).driver).is_err());
+
+    assert_eq!(present(&outside).driver.pid, 5);
+}
+
+#[skuld::test]
+fn writing_below_a_symlinked_parent_creates_nothing_outside() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let link = root.path().join("hole");
+    plant_symlink(&outside, &link);
+
+    assert!(write(&link.join("logs"), &info(1), None).is_err());
+
+    assert!(listing(&outside).is_empty());
+}
+
+#[skuld::test]
+fn write_creates_the_log_dir_when_it_is_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let logs = root.path().join("hole").join("logs");
+
+    write(&logs, &info(1), None).unwrap();
+
+    assert_eq!(present(&logs).driver.pid, 1);
+    assert_eq!(listing(&logs), [MARKER_FILE], "no temp left behind");
+}
+
+#[skuld::test]
+fn clear_of_a_log_dir_that_is_not_there_is_ok_and_makes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("not-there");
+
+    clear(&missing).unwrap();
+
+    assert!(!missing.exists());
+}
+
+#[skuld::test]
+fn clear_does_not_remove_a_directory_at_the_marker_path() {
+    // `read` calls it indeterminate and says no sweep can retract a claim it never made; removing the directory
+    // would be a different act.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(MARKER_FILE)).unwrap();
+
+    assert!(clear(dir.path()).is_err());
+
+    assert!(dir.path().join(MARKER_FILE).is_dir());
+}

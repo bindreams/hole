@@ -352,18 +352,24 @@ pub(super) fn file_id(file: &File) -> io::Result<FileId> {
 
 pub(super) fn unlink(dir: &File, name: &OsStr) -> io::Result<()> {
     let handle = open_for_delete(dir, name)?;
+    // `unlinkat` without `AT_REMOVEDIR` does not remove a directory, and this must not either (a symlink to one is
+    // a link and goes, as `DeleteFile` has it).
+    if kind_from(&handle)? == EntryKind::Directory {
+        return Err(io::ErrorKind::IsADirectory.into());
+    }
     // With POSIX semantics the name goes at once, even while a reader that shares delete has the file open; a
     // volume without them (the three codes `posix_rename_unsupported` reads) gets the delete that waits for the
     // last handle.
     posix_or_legacy(|| set_disposition(&handle, true), || set_disposition(&handle, false))
 }
 
-/// The entry `name` as itself, open for `DELETE`, which unlinking and renaming it need.
+/// The entry `name` as itself, open for `DELETE`, which unlinking and renaming it need (and for its attributes, to
+/// tell what it is).
 fn open_for_delete(dir: &File, name: &OsStr) -> io::Result<File> {
     nt_open(
         Some(dir),
         &wide(name)?,
-        access(&[DELETE]),
+        access(&[DELETE, FILE_READ_ATTRIBUTES]),
         SHARE_ALL,
         FILE_OPEN,
         options(OPEN_AS_ITSELF),
