@@ -308,6 +308,211 @@ fn every_writer_runs_twice_below_a_link_the_user_owns() {
     }
 }
 
+// What a planted name does to a reader --------------------------------------------------------------------------------
+//
+// The readers of the same names run privileged too, and open them as `O_RDONLY`: a FIFO planted at the name makes a
+// read by path wait for a writer, and a link is read as whatever it points at. Each row writes a valid file, then
+// plants the name and reads again: the reader must not report the valid file the name leads to. A hard link is the
+// file's own inode, so a reader cannot tell it from the file and reads what the user put in a folder they own;
+// what is read is parsed as that state's schema and never echoed.
+
+struct Reading {
+    name: &'static str,
+    file: &'static str,
+    write_valid: fn(&Path),
+    /// Whether the reader reported what `write_valid` wrote.
+    reads_it: fn(&Path) -> bool,
+}
+
+fn readings() -> Vec<Reading> {
+    use crate::{dns_state, plugin_state};
+    use hole_common::config::StartupBehavior;
+    vec![
+        Reading {
+            name: "dns_state::load",
+            file: dns_state::STATE_FILE_NAME,
+            write_valid: |dir| {
+                let state = dns_state::DnsState {
+                    version: dns_state::SCHEMA_VERSION,
+                    advertised: Vec::new(),
+                    adapters: Vec::new(),
+                };
+                util::dir::write_state_file(
+                    dir,
+                    OsStr::new(dns_state::STATE_FILE_NAME),
+                    &serde_json::to_vec(&state).unwrap(),
+                    None,
+                )
+                .unwrap();
+            },
+            reads_it: |dir| dns_state::load(dir).is_some(),
+        },
+        Reading {
+            name: "plugin_state::load",
+            file: plugin_state::STATE_FILE_NAME,
+            write_valid: |dir| {
+                let state = plugin_state::PluginState {
+                    version: plugin_state::SCHEMA_VERSION,
+                    plugins: Vec::new(),
+                };
+                plugin_state::save(dir, &state, None).unwrap();
+            },
+            reads_it: |dir| matches!(plugin_state::load(dir), plugin_state::Loaded::State(_)),
+        },
+        Reading {
+            name: "target::load",
+            file: target::STATE_FILE_NAME,
+            // `Off` is what an absent file reads as too, but a planted name is not absent: it reads `Unreadable`.
+            write_valid: |dir| target::save(dir, &Target::Off, None).unwrap(),
+            reads_it: |dir| matches!(target::load(dir), Target::Off),
+        },
+        Reading {
+            name: "target::load_startup_preference",
+            file: target::STARTUP_PREFERENCE_FILE_NAME,
+            write_valid: |dir| {
+                let preference = target::StartupPreference {
+                    on_startup: StartupBehavior::AlwaysConnect,
+                    candidate: None,
+                };
+                target::save_startup_preference(dir, &preference, None).unwrap();
+            },
+            reads_it: |dir| target::load_startup_preference(dir).on_startup == StartupBehavior::AlwaysConnect,
+        },
+        Reading {
+            name: "update_marker::read",
+            file: MARKER_FILE,
+            write_valid: |dir| update_marker::write(dir, &marker_info(), None).unwrap(),
+            reads_it: |dir| matches!(update_marker::read(dir), update_marker::Marker::Present(_)),
+        },
+    ]
+}
+
+/// Plants `kind` at every reader's name; the failures, one line per reader.
+fn readers_that_read_a_planted_name(kind: util::dir::testing::PlantedName) -> Vec<String> {
+    let mut failures = Vec::new();
+    for reading in readings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader = util::dir::testing::Reader {
+            file: reading.file,
+            write_valid: &reading.write_valid,
+            reads_it: &reading.reads_it,
+        };
+        if let Err(why) = util::dir::testing::planted_name_is_not_read(tmp.path(), kind, &reader) {
+            failures.push(format!("{}: {why}", reading.name));
+        }
+    }
+    failures
+}
+
+#[skuld::test]
+fn no_reader_reads_through_a_symlink_planted_at_its_name() {
+    let failures = readers_that_read_a_planted_name(util::dir::testing::PlantedName::SymlinkToFile);
+
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn no_reader_waits_on_a_fifo_planted_at_its_name() {
+    let failures = readers_that_read_a_planted_name(util::dir::testing::PlantedName::Fifo);
+
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// No privileged read goes by path -------------------------------------------------------------------------------------
+
+/// What opens a file by a path: the reads the privileged state code must make through `util::dir` instead.
+const READS_BY_PATH: &[&str] = &["fs::read(", "fs::read_to_string(", "File::open(", "OpenOptions::new("];
+
+/// The crates whose code runs privileged on state or log directories.
+const PRIVILEGED_CRATES: &[&str] = &["bridge", "tun-engine", "util", "file-lock", "common", "tombstone"];
+
+/// Production sources that open a file by path, each with why it may. A path is a source file from the workspace
+/// root; the reason says who runs it and where the path points.
+const BY_PATH_ALLOWED: &[(&str, &str)] = &[
+    ("crates/bridge/src/bin/test_plugin.rs", "a test binary"),
+    ("crates/bridge/src/bin/test_service.rs", "a test binary"),
+    ("crates/bridge/src/test_support/dist_harness.rs", "test support: reads the log of a process the test started"),
+    ("crates/bridge/src/ipc.rs", "reads the `installer-user-sid` file in the system's `ProgramData` folder"),
+    ("crates/tun-engine/src/test_utils/escape.rs", "test support"),
+    ("crates/tun-engine/src/test_utils/pktmon.rs", "test support: reads a capture the test made"),
+    ("crates/util/src/dir/testing.rs", "test fixtures"),
+    ("crates/common/src/config.rs", "the GUI's own user config: syncs the folder of the file the user's GUI wrote"),
+    ("crates/common/src/config_store.rs", "the GUI's own user config, read and written as the user"),
+    ("crates/common/src/logging/logging_test_helpers.rs", "test helpers"),
+    ("crates/common/src/verify.rs", "hashes an installer the GUI downloaded, as the user"),
+    (
+        "crates/tombstone/src/crash.rs",
+        "the crash-marker sweep reads by path in the log directory (reported, not fixed here: it needs `util` as a          dependency of `tombstone`)",
+    ),
+];
+
+fn production_sources(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if path.is_dir() {
+            if !matches!(file_name.as_str(), "tests" | "target") {
+                production_sources(&path, found);
+            }
+        } else if file_name.ends_with(".rs") && !file_name.ends_with("_tests.rs") {
+            found.push(path);
+        }
+    }
+}
+
+/// The by-path reads on the code lines of `text`.
+fn by_path_reads(text: &str) -> Vec<&'static str> {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(|line| READS_BY_PATH.iter().copied().filter(move |read| line.contains(read)))
+        .collect()
+}
+
+#[skuld::test]
+fn no_privileged_state_code_reads_a_file_by_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let mut hits = Vec::new();
+    for krate in PRIVILEGED_CRATES {
+        let mut sources = Vec::new();
+        production_sources(&root.join("crates").join(krate).join("src"), &mut sources);
+        for path in sources {
+            let relative = path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+            if BY_PATH_ALLOWED.iter().any(|(allowed, _)| *allowed == relative) {
+                continue;
+            }
+            for read in by_path_reads(&std::fs::read_to_string(&path).unwrap()) {
+                hits.push(format!("{relative}: {read}"));
+            }
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "a privileged read opens a file by path: use `util::dir::read_state_file` (or a `Dir`), or add the file to          BY_PATH_ALLOWED with the reason: {hits:#?}"
+    );
+}
+
+#[skuld::test]
+fn every_by_path_allowance_still_reads_by_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    for (path, reason) in BY_PATH_ALLOWED {
+        let text = std::fs::read_to_string(root.join(path)).unwrap_or_else(|err| panic!("{path} ({reason}): {err}"));
+        assert!(
+            !by_path_reads(&text).is_empty(),
+            "{path} no longer reads by path: remove its allowance ({reason})"
+        );
+    }
+}
+
+#[skuld::test]
+fn the_by_path_scan_tells_a_read_from_a_comment() {
+    assert_eq!(by_path_reads("let bytes = std::fs::read(&path)?;"), ["fs::read("]);
+    assert_eq!(by_path_reads("let f = std::fs::File::open(p)?;"), ["File::open("]);
+    assert!(by_path_reads("    // `std::fs::read(path)` is what this replaces").is_empty());
+    assert!(by_path_reads("util::dir::read_state_file(dir, name)").is_empty());
+}
+
 // The list is complete ------------------------------------------------------------------------------------------------
 
 fn sources_in(dir: &Path, found: &mut Vec<PathBuf>) {

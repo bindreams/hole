@@ -126,12 +126,11 @@ impl From<PersistedTarget> for Target {
 /// `read_state`/[`Intent`](tun_engine::routing::failclosed::lockdown_state::Intent) split so a version mismatch and a missing file are
 /// classified rather than collapsed together in the log.
 fn read_target(state_dir: &Path) -> Target {
-    let path = state_dir.join(STATE_FILE_NAME);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Target::Off,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "target-state read failed; treating as no authority to connect");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "target-state read failed; treating as no authority to connect");
             return Target::Unreadable;
         }
     };
@@ -158,7 +157,7 @@ fn read_target(state_dir: &Path) -> Target {
             let e = hole_common::config::ParseFailure::from(&e);
             tracing::warn!(
                 error = %e,
-                path = %path.display(),
+                file = STATE_FILE_NAME,
                 "target-state parse failed; treating as no authority to connect"
             );
             Target::Unreadable
@@ -558,7 +557,7 @@ const STARTUP_PREFERENCE_SCHEMA_VERSION: u32 = 1;
 /// [`TargetExclusive`]/[`apply`] because multiple writers race it),
 /// this is written by exactly one path (`handle_start`, on every connect) and
 /// read by exactly one (boot reconciliation), so it needs no shared lock.
-const STARTUP_PREFERENCE_FILE_NAME: &str = "bridge-startup.json";
+pub(crate) const STARTUP_PREFERENCE_FILE_NAME: &str = "bridge-startup.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -607,12 +606,11 @@ pub struct StartupPreference {
 /// conservative lean as an absent target: no authority to always-connect
 /// without an explicit push.
 pub(crate) fn load_startup_preference(state_dir: &Path) -> StartupPreference {
-    let path = state_dir.join(STARTUP_PREFERENCE_FILE_NAME);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STARTUP_PREFERENCE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StartupPreference::default(),
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "startup-preference read failed; using defaults");
+            tracing::warn!(error = %e, file = STARTUP_PREFERENCE_FILE_NAME, "startup-preference read failed; using defaults");
             return StartupPreference::default();
         }
     };
@@ -636,7 +634,7 @@ pub(crate) fn load_startup_preference(state_dir: &Path) -> StartupPreference {
             let e = hole_common::config::ParseFailure::from(&e);
             tracing::warn!(
                 error = %e,
-                path = %path.display(),
+                file = STARTUP_PREFERENCE_FILE_NAME,
                 "startup-preference parse failed; using defaults"
             );
             StartupPreference::default()

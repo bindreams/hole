@@ -82,12 +82,11 @@ impl Intent {
 /// [`load`] and [`load_intent`] share a single reader (and a single set of
 /// `warn!` lines) instead of drifting apart.
 fn read_state(state_dir: &Path) -> Result<LockdownState, Intent> {
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Intent::Unset),
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "lockdown-state read failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "lockdown-state read failed");
             return Err(Intent::Unreadable);
         }
     };
@@ -102,7 +101,7 @@ fn read_state(state_dir: &Path) -> Result<LockdownState, Intent> {
             Err(Intent::Unreadable)
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "lockdown-state parse failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "lockdown-state parse failed");
             Err(Intent::Unreadable)
         }
     }

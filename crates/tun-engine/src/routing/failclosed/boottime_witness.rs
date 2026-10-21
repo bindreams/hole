@@ -130,12 +130,11 @@ fn state_file(state_dir: &Path) -> PathBuf {
 /// [`ArmingWitness`], whose whole point is that "no file" and "a file I could
 /// not read" are different findings.
 pub fn load(state_dir: &Path) -> ArmingWitness {
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ArmingWitness::Unset,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "boot-time witness read failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "boot-time witness read failed");
             return ArmingWitness::Unreadable;
         }
     };
@@ -151,7 +150,7 @@ pub fn load(state_dir: &Path) -> ArmingWitness {
             ArmingWitness::Unreadable
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "boot-time witness parse failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "boot-time witness parse failed");
             ArmingWitness::Unreadable
         }
     }

@@ -101,8 +101,7 @@ pub(crate) fn append_loaded(
 /// is detected; a failed read is reported to the caller instead, because the
 /// caller is the one that knows the consequence.
 pub fn load(state_dir: &Path) -> Loaded {
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Absent,
         Err(e) => return Loaded::Unreadable(e),
@@ -118,7 +117,7 @@ pub fn load(state_dir: &Path) -> Loaded {
             Loaded::Unusable
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "plugin-state parse failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "plugin-state parse failed");
             Loaded::Unusable
         }
     }

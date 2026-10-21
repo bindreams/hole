@@ -42,13 +42,6 @@ pub enum PlantedName {
     Fifo,
 }
 
-/// Every [`PlantedName`] the platform has.
-#[cfg(unix)]
-pub const PLANTED_NAMES: &[PlantedName] = &[PlantedName::SymlinkToFile, PlantedName::Fifo];
-/// Every [`PlantedName`] the platform has.
-#[cfg(windows)]
-pub const PLANTED_NAMES: &[PlantedName] = &[PlantedName::SymlinkToFile];
-
 /// One privileged reader of the file `file` in a state directory, for [`planted_name_is_not_read`].
 pub struct Reader<'a> {
     /// The file the reader reads.

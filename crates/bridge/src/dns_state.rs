@@ -130,12 +130,11 @@ fn superseded_file(state_dir: &Path) -> PathBuf {
 /// corrupted JSON, unknown fields, version mismatch — and logs at `warn`
 /// level. Crash recovery is best-effort and should never fail the caller.
 pub fn load(state_dir: &Path) -> Option<DnsState> {
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "dns-state read failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "dns-state read failed");
             return None;
         }
     };
@@ -150,7 +149,7 @@ pub fn load(state_dir: &Path) -> Option<DnsState> {
             None
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "dns-state parse failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "dns-state parse failed");
             None
         }
     }

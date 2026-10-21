@@ -60,12 +60,11 @@ pub fn save(state_dir: &Path, state: &FailClosedState, owner: Option<(u32, u32)>
 /// read/parse/version failure is `Unusable` (keeps the existing `warn!` lines).
 pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
     use super::StateFile;
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "failclosed-state read failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "failclosed-state read failed");
             // No bytes, so nothing to salvage a token from.
             return StateFile::Unusable { pf_token: None };
         }
@@ -81,7 +80,7 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
             StateFile::unusable(&bytes)
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "failclosed-state parse failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "failclosed-state parse failed");
             StateFile::unusable(&bytes)
         }
     }
