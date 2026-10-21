@@ -239,7 +239,7 @@ pub(crate) fn save(state_dir: &Path, target: &Target, owner: Option<(u32, u32)>)
 /// [`save_startup_preference`].
 ///
 /// The state directory may belong to the interactive user, so it is opened
-/// once without following a symlink (`file_lock::Dir`: created if missing,
+/// once without following a symlink (`util::dir::Dir`: created if missing,
 /// handed to `owner`, 0700 on unix / the state DACL on Windows) and the file is
 /// written through that handle. The temp file's owner and mode are set on its
 /// own handle before the rename, and nothing touches the final name afterwards:
@@ -261,14 +261,14 @@ fn write_state_file(state_dir: &Path, name: &str, json: Vec<u8>, owner: Option<(
 }
 
 #[cfg(not(windows))]
-fn open_state_dir(state_dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<file_lock::Dir> {
-    file_lock::Dir::open(state_dir, true, owner)
+fn open_state_dir(state_dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<util::dir::Dir> {
+    util::dir::Dir::open(state_dir, true, owner)
 }
 
 /// Opened with the right to rewrite its ACL, which [`protect_dir`] does.
 #[cfg(windows)]
-fn open_state_dir(state_dir: &Path, _owner: Option<(u32, u32)>) -> std::io::Result<file_lock::Dir> {
-    file_lock::Dir::open_for_acl(state_dir, true)
+fn open_state_dir(state_dir: &Path, _owner: Option<(u32, u32)>) -> std::io::Result<util::dir::Dir> {
+    util::dir::Dir::open_for_acl(state_dir, true)
 }
 
 /// The SID of the user this process runs as, as an SDDL string.
@@ -362,7 +362,7 @@ fn state_sddl() -> String {
 /// `BUILTIN\Users` read ACE. Without it this call changes nothing that
 /// matters.
 #[cfg(windows)]
-fn protect_dir(dir: &file_lock::Dir) -> std::io::Result<()> {
+fn protect_dir(dir: &util::dir::Dir) -> std::io::Result<()> {
     // `OICI` on every ACE: object- and container-inherit. Without it a
     // PROTECTED directory DACL leaves children inheriting NOTHING, so state
     // files written later by other modules (`bridge-routes.json`,
@@ -372,10 +372,10 @@ fn protect_dir(dir: &file_lock::Dir) -> std::io::Result<()> {
     crate::ipc::set_dacl_from_sddl_on_handle(dir.file(), &sddl, true)
 }
 
-/// The mode is the unix half of [`file_lock::Dir::secure`] and
-/// [`file_lock::Dir::write_atomic`]; there is no ACL to set.
+/// The mode is the unix half of [`util::dir::Dir::secure`] and
+/// [`util::dir::Dir::write_atomic`]; there is no ACL to set.
 #[cfg(not(windows))]
-fn protect_dir(_dir: &file_lock::Dir) -> std::io::Result<()> {
+fn protect_dir(_dir: &util::dir::Dir) -> std::io::Result<()> {
     Ok(())
 }
 

@@ -1,5 +1,8 @@
 //! Small cross-platform utilities shared across the workspace.
 //!
+//! - [`dir`] — a directory opened without following a symlink, and file
+//!   operations by name inside it, for a privileged writer in a directory
+//!   another principal can write.
 //! - [`ownership`] — generic `chown(2)` primitive (macOS; a no-op elsewhere).
 //! - [`parse_error`] — content-safe classification of a `serde_json` parse
 //!   failure, so an error that quotes its input never reaches a log.
@@ -23,6 +26,7 @@
 //! crates without license friction. Nothing here is Hole- or
 //! shadowsocks-specific.
 
+pub mod dir;
 pub mod ownership;
 pub mod parse_error;
 pub mod port_alloc;

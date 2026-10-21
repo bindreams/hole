@@ -1,10 +1,8 @@
-//! Cross-process exclusive file lock ([`Exclusive`]) and a directory opened without following a
-//! symlink ([`Dir`]), for files in a directory another principal can write.
+//! Cross-process exclusive file lock ([`Exclusive`]) for a file in a directory another principal can
+//! write. The directory is opened with [`util::dir::Dir`].
 
-pub mod dir;
 mod exclusive;
 
-pub use dir::Dir;
 pub use exclusive::{Exclusive, Refused};
 
 // Install the workspace test subscriber + panic hook.

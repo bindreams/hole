@@ -14,7 +14,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::IO::OVERLAPPED;
 
 use super::{split, Refusal, Refused};
-use crate::dir::{Dir, OpenFile};
+use util::dir::{Dir, OpenFile};
 
 /// What the open handle says about the lock file; the only input to [`vet`].
 #[derive(Clone, Copy, Debug)]
