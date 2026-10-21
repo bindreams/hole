@@ -857,7 +857,7 @@ fn is_legacy_daily_suffix(candidate: &str, stem: &str) -> bool {
         && b[9].is_ascii_digit()
 }
 
-mod dir_rotate;
+pub mod dir_rotate;
 
 /// Arming the redaction registry from a server entry.
 pub mod redact_arm;

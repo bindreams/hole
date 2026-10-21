@@ -106,19 +106,11 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
 
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
-    use windows::Win32::Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION, PSID, SE_PRIVILEGE_ENABLED,
-        SE_RESTORE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-    };
     use windows::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_OWNER,
     };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::super::trail::Owner;
 
@@ -136,42 +128,11 @@ mod platform {
         if matches!(super::super::windows::owner_of(&file).unwrap(), Owner::User(_)) {
             return;
         }
-        // An elevated token's files belong to Administrators; giving one away takes the restore privilege,
-        // which an elevated token has and keeps disabled.
-        enable_restore_privilege();
-        // SAFETY: the handle is open with `WRITE_OWNER` and `USERS` is a valid SID that outlives the call.
-        let status = unsafe {
-            SetSecurityInfo(
-                HANDLE(file.as_raw_handle()),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                Some(PSID(USERS.as_ptr().cast_mut().cast())),
-                None,
-                None,
-                None,
-            )
-        };
-        assert_eq!(status.0, 0, "give {path:?} to the Users group: error {}", status.0);
-    }
-
-    fn enable_restore_privilege() {
-        let mut token = HANDLE::default();
-        // SAFETY: the pseudo handle of this process is always valid; `token` is a live local.
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
-            .expect("open this process's token to enable the restore privilege");
-        let mut privileges = TOKEN_PRIVILEGES {
-            PrivilegeCount: 1,
-            ..Default::default()
-        };
-        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        // SAFETY: the privilege name is a static wide string and the LUID a field of a live local.
-        unsafe { LookupPrivilegeValueW(None, SE_RESTORE_NAME, &mut privileges.Privileges[0].Luid) }
-            .expect("look up the restore privilege");
-        // SAFETY: `token` is open with `TOKEN_ADJUST_PRIVILEGES` and `privileges` is live for the call.
-        let adjusted = unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) };
-        // SAFETY: `token` is open and owned here.
-        unsafe { CloseHandle(token) }.ok();
-        adjusted.expect("enable the restore privilege (a token without it cannot give a file to another owner)");
+        // An elevated token's files belong to Administrators; giving one away takes the restore privilege.
+        super::super::windows::enable_restore_privilege()
+            .expect("enable the restore privilege (a token without it cannot give a file to another owner)");
+        super::super::windows::set_owner(&file, &USERS)
+            .unwrap_or_else(|err| panic!("give {path:?} to the Users group: {err}"));
     }
 
     pub(super) fn link(target: &Path, link: &Path) {

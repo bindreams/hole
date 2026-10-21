@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
 
-use util::dir::{Dir, OpenFile};
+use util::dir::Dir;
 
 /// `<name>` (current) and `<name>.1` (the previous one): the active file is renamed over `<name>.1` once it
 /// reaches `limit` bytes, and a write that straddles the limit is split exactly there.
@@ -26,7 +26,8 @@ pub struct DirRotate {
 }
 
 impl DirRotate {
-    /// `owner` is given the active file each time it is created, so the user can read it without elevating.
+    /// `owner` is given the active file each time it is created, so the user can read it without elevating, and is
+    /// the only owner an existing active file may have.
     pub fn new(dir: Dir, name: &std::ffi::OsStr, limit: usize, owner: Option<(u32, u32)>) -> Self {
         assert!(limit > 0, "a log file that holds no bytes cannot be rotated");
         let mut rotated = name.to_os_string();
@@ -44,13 +45,10 @@ impl DirRotate {
         this
     }
 
-    /// Opens (creating if missing) the active file, never through a symlink, and counts what it already holds.
+    /// Opens the active file (see [`Dir::append_own_file`]: a file at the name that is not the owner's is replaced,
+    /// never written to), and counts what it already holds. A new file is given to `owner`.
     fn open_active(&mut self) {
-        self.file = self
-            .dir
-            .open_file(&self.name, OpenFile::Append { mode: 0o644 })
-            .ok()
-            .inspect(|file| util::dir::give_file(file, self.owner));
+        self.file = self.dir.append_own_file(&self.name, 0o644, self.owner).ok();
         self.count = self
             .file
             .as_ref()

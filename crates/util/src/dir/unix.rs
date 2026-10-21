@@ -1,6 +1,6 @@
 //! Unix half of [`super::Dir`]: `openat`, `mkdirat`, `fstatat`, `unlinkat`, `renameat`, `fchown`, `fchmod`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -9,7 +9,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path};
 
-use super::trail::{Folder, Owner, Trail};
+use super::trail::{Owner, Trail};
 use super::{EntryKind, OpenFile, Refusal};
 
 /// Who is opening: this process's effective uid.
@@ -154,9 +154,14 @@ enum Step {
     Root,
     Parent,
     Name(OsString),
-    /// The steps of this link's target are all taken: the link is no longer being resolved.
-    Done(FileId),
 }
+
+/// How many links one walk follows: the kernel's own bound on a path, `MAXSYMLINKS` (Linux
+/// `include/linux/namei.h`: 40; macOS and the BSDs `sys/param.h`: 32).
+#[cfg(target_os = "linux")]
+const MAX_LINKS: usize = 40;
+#[cfg(not(target_os = "linux"))]
+const MAX_LINKS: usize = 32;
 
 fn steps_of(path: &Path) -> VecDeque<Step> {
     path.components()
@@ -169,23 +174,15 @@ fn steps_of(path: &Path) -> VecDeque<Step> {
         .collect()
 }
 
-/// The folder the walk stands in, and whether it made it.
+/// The folder the walk stands in.
 struct Standing {
     fd: OwnedFd,
-    made: bool,
 }
 
 impl Standing {
-    fn existing(fd: OwnedFd) -> Self {
-        Standing { fd, made: false }
-    }
-
-    /// The folder as the rule judges it.
-    fn folder(&self) -> io::Result<Folder<u32>> {
-        match self.made {
-            true => Ok(Folder::Made),
-            false => Ok(Folder::Existing(fstat(self.fd.as_raw_fd())?.owner())),
-        }
+    /// The folder's owner as the rule judges it.
+    fn owner(&self) -> io::Result<Owner<u32>> {
+        Ok(fstat(self.fd.as_raw_fd())?.owner())
     }
 }
 
@@ -193,19 +190,23 @@ impl Standing {
 struct Walk {
     steps: VecDeque<Step>,
     trail: Trail<u32>,
-    /// Links whose target the walk is in the middle of: meeting one again is a loop. A link met again after its
-    /// own target was walked (macOS's `/var` in a path under `/var`, and again in a link's target) is not.
-    resolving: HashSet<FileId>,
+}
+
+/// Hands the folder `name` in `dir`, which the walk just made, to `uid` (the group is left as it is). By name, never
+/// following a link: whatever the name is by now is what is given, and a link is only ever the user's own.
+fn give_made_folder(dir: RawFd, name: &CString, uid: u32) -> io::Result<()> {
+    // SAFETY: `name` is a valid NUL-terminated string and `dir` an open directory, both for the call; a group of
+    // `-1` leaves the group alone.
+    check(unsafe { libc::fchownat(dir, name.as_ptr(), uid, libc::gid_t::MAX, libc::AT_SYMLINK_NOFOLLOW) }).map(|_| ())
 }
 
 /// Opens the directory `name` in `cur`, or makes progress towards it: `Ok(Some(next))` is the directory;
 /// `Ok(None)` is a followed symlink whose target was put in front of the walk's steps.
 fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::Result<Option<Standing>> {
     let cname = cstr(name)?;
-    let mut made = false;
     loop {
         let open_err = match open_dir_at(cur.fd.as_raw_fd(), &cname) {
-            Ok(fd) => return Ok(Some(Standing { fd, made })),
+            Ok(fd) => return Ok(Some(Standing { fd })),
             Err(err) => err,
         };
         // The errno of a failed no-follow open differs per platform and per kind of entry, so
@@ -213,10 +214,16 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
         let entry = match fstatat_nofollow(cur.fd.as_raw_fd(), &cname) {
             Ok(entry) => entry,
             Err(err) if err.kind() == io::ErrorKind::NotFound && create => {
-                walk.trail.create_in(&cur.folder()?).map_err(Refusal::into_io_error)?;
+                walk.trail.create_in(&cur.owner()?).map_err(Refusal::into_io_error)?;
                 // SAFETY: `cname` is a valid NUL-terminated string and `cur` an open directory.
                 match check(unsafe { libc::mkdirat(cur.fd.as_raw_fd(), cname.as_ptr(), 0o777) }) {
-                    Ok(_) => made = true,
+                    Ok(_) => {
+                        // The folder is the maker's on disk. Below a user's link it must be the user's, or the next
+                        // walk through the link refuses what this one made.
+                        if let Some(&uid) = walk.trail.led_by() {
+                            give_made_folder(cur.fd.as_raw_fd(), &cname, uid)?;
+                        }
+                    }
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(err) => return Err(err),
                 }
@@ -231,13 +238,8 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
                 walk.trail
                     .follow(&parent.owner(), &entry.owner())
                     .map_err(Refusal::into_io_error)?;
-                let id = (entry.dev, entry.ino);
-                if !walk.resolving.insert(id) {
-                    return Err(Refusal::Symlink.into_io_error());
-                }
                 let target = readlink_at(cur.fd.as_raw_fd(), &cname)?;
                 let mut expansion = steps_of(Path::new(&target));
-                expansion.push_back(Step::Done(id));
                 expansion.append(&mut walk.steps);
                 walk.steps = expansion;
                 Ok(None)
@@ -251,22 +253,22 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
 pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<File> {
     let mut walk = Walk {
         steps: steps_of(path),
-        trail: Trail::new(),
-        resolving: HashSet::new(),
+        trail: Trail::new(MAX_LINKS),
     };
     let rooted = matches!(walk.steps.front(), Some(Step::Root));
-    let mut cur = Standing::existing(open_start(if rooted { "/" } else { "." })?);
+    let mut cur = Standing {
+        fd: open_start(if rooted { "/" } else { "." })?,
+    };
     if rooted {
         walk.steps.pop_front();
     }
     while let Some(step) = walk.steps.pop_front() {
         match step {
-            Step::Root => cur = Standing::existing(open_start("/")?),
-            Step::Done(id) => {
-                walk.resolving.remove(&id);
-            }
+            Step::Root => cur = Standing { fd: open_start("/")? },
             Step::Parent => {
-                cur = Standing::existing(open_dir_at(cur.fd.as_raw_fd(), &CString::new("..").expect("no NUL"))?);
+                cur = Standing {
+                    fd: open_dir_at(cur.fd.as_raw_fd(), &CString::new("..").expect("no NUL"))?,
+                };
             }
             Step::Name(name) => {
                 if let Some(next) = descend(&cur, &name, create, &mut walk)? {
@@ -276,7 +278,7 @@ pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, cal
         }
     }
 
-    walk.trail.end_at(&cur.folder()?).map_err(Refusal::into_io_error)?;
+    walk.trail.end_at(&cur.owner()?).map_err(Refusal::into_io_error)?;
     if let Some((uid, _)) = owner {
         let found = fstat(cur.fd.as_raw_fd())?.uid;
         if found != uid && found != caller {
@@ -289,13 +291,44 @@ pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, cal
 // Operations relative to a directory ----------------------------------------------------------------------------------
 
 pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<File> {
+    // `O_NONBLOCK` keeps the open of a FIFO planted at the name from waiting for a peer that never comes; it does
+    // nothing to a regular file.
     let (flags, mode) = match how {
         OpenFile::CreateNew { mode } => (libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, mode),
         OpenFile::Existing => (libc::O_RDWR, 0),
-        OpenFile::Read => (libc::O_RDONLY, 0),
-        OpenFile::Append { mode } => (libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT, mode),
+        OpenFile::Read => (libc::O_RDONLY | libc::O_NONBLOCK, 0),
+        OpenFile::Append => (libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK, 0),
+        OpenFile::CreateAppend { mode } => (libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_EXCL, mode),
     };
-    open_fd(dir.as_raw_fd(), &cstr(name)?, flags | libc::O_NOFOLLOW, mode).map(File::from)
+    let file = File::from(open_fd(dir.as_raw_fd(), &cstr(name)?, flags | libc::O_NOFOLLOW, mode)?);
+    if matches!(how, OpenFile::Read) && !file.metadata()?.is_file() {
+        return Err(Refusal::NotRegular.into_io_error());
+    }
+    Ok(file)
+}
+
+/// What `fstat` says about a file opened to append to; the only input to [`trusted_appender`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Facts {
+    pub regular: bool,
+    pub uid: u32,
+}
+
+/// Whether a file found at a log's name is one a privileged writer may append to: a regular file that `owner`
+/// owns. With no `owner`, no ownership is expected and any regular file will do.
+pub(super) fn trusted_appender(facts: Facts, owner: Option<(u32, u32)>) -> bool {
+    facts.regular && owner.is_none_or(|(uid, _)| facts.uid == uid)
+}
+
+pub(super) fn is_own_file(file: &File, owner: Option<(u32, u32)>) -> io::Result<bool> {
+    let meta = file.metadata()?;
+    Ok(trusted_appender(
+        Facts {
+            regular: meta.is_file(),
+            uid: meta.uid(),
+        },
+        owner,
+    ))
 }
 
 /// A new file for [`super::Dir::write_atomic`].

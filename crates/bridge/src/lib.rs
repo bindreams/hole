@@ -33,6 +33,10 @@ pub mod target;
 #[cfg(test)]
 mod test_support;
 
+// The writers that go through `util::dir::Dir`, held to one table of properties.
+#[cfg(test)]
+mod dir_writers_tests;
+
 // The cross-implementation interop suite (ex-ray ↔ stock v2ray-plugin) was
 // relocated to the `plugin-e2e` crate (#435) so it runs on a plugin-owned,
 // Linux-inclusive matrix instead of Hole's Win+mac bridge CI.

@@ -504,3 +504,33 @@ fn the_real_open_refuses_a_directory_of_a_third_party_only_when_the_caller_can_m
         false => assert!(opened.is_ok()),
     }
 }
+
+// trusted_appender ====================================================================================================
+
+fn facts(regular: bool, uid: u32) -> Facts {
+    Facts { regular, uid }
+}
+
+#[skuld::test]
+fn a_regular_file_of_the_expected_owner_is_trusted() {
+    assert!(trusted_appender(facts(true, 1000), Some((1000, 1000))));
+}
+
+#[skuld::test]
+fn a_regular_file_of_anyone_else_is_not_trusted_whoever_made_it() {
+    // Root's own file is the one a user hard-linked, or one root left before it gave the file away.
+    assert!(!trusted_appender(facts(true, ROOT), Some((1000, 1000))));
+    assert!(!trusted_appender(facts(true, 1001), Some((1000, 1000))));
+}
+
+#[skuld::test]
+fn with_no_expected_owner_any_regular_file_is_trusted() {
+    assert!(trusted_appender(facts(true, ROOT), None));
+    assert!(trusted_appender(facts(true, 1001), None));
+}
+
+#[skuld::test]
+fn a_file_that_is_not_regular_is_never_trusted() {
+    assert!(!trusted_appender(facts(false, 1000), Some((1000, 1000))));
+    assert!(!trusted_appender(facts(false, 1000), None));
+}
