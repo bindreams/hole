@@ -144,6 +144,13 @@ impl DistHarness {
         if !hole_exe.is_file() {
             return Err(HarnessError(format!("hole binary missing from dist dir: {hole_exe:?}")));
         }
+        // A truncated binary spawns as an empty script on macOS and exits 0, which surfaces as
+        // "bridge exited before binding socket" with no hint of the cause.
+        if std::fs::metadata(&hole_exe)?.len() == 0 {
+            return Err(HarnessError(format!(
+                "hole binary in dist dir is empty (truncated by a concurrent stager or build?): {hole_exe:?}"
+            )));
+        }
 
         let state_dir = new_tempdir()?;
         let log_dir = new_tempdir()?;
@@ -170,12 +177,11 @@ impl DistHarness {
             // equal specificity to our `add_directive` and the winner is
             // tracing-subscriber version-dependent.
             //
-            // Single directive — `hole_common::logging::init` ultimately
-            // calls `add_directive(parse(_))` which only accepts one. The
-            // global default in common is already "info", so
-            // `shadowsocks_service` continues to emit its
-            // "TCP listening on ..." INFO line that we rely on.
-            .env("HOLE_BRIDGE_LOG", "hole_bridge=debug")
+            // `shadowsocks_service=debug` puts ss-local's per-connection lines
+            // (CONNECT target, tunnel established, relay errors) in `bridge.log`,
+            // which the panic hook dumps. Not `trace`: it renders the config,
+            // password included.
+            .env("HOLE_BRIDGE_LOG", "hole_bridge=debug,shadowsocks_service=debug")
             .env("HOLE_BRIDGE_SELF_TEST", "1");
 
         // Use the diagnostic wrapper so any `ACCESS_DENIED` / `ETXTBSY`
@@ -244,6 +250,29 @@ impl DistHarness {
             client: Some(client),
             _panic_dump_guard: Some(panic_dump_guard),
         })
+    }
+
+    /// The bridge's cumulative tunnel byte counters, `(bytes_in, bytes_out)`.
+    pub(crate) async fn tunnel_totals(&mut self) -> (u64, u64) {
+        let resp = self.send(BridgeRequest::Metrics).await.expect("send Metrics");
+        let BridgeResponse::Metrics {
+            bytes_in, bytes_out, ..
+        } = resp
+        else {
+            panic!("expected Metrics response, got {resp:?}");
+        };
+        (bytes_in, bytes_out)
+    }
+
+    /// Assert both tunnel counters grew since `before` (a [`Self::tunnel_totals`]
+    /// snapshot). They move only for bytes that crossed the shadowsocks server, which
+    /// tells a host-local target apart from a bypass.
+    pub(crate) async fn assert_tunnel_traffic_since(&mut self, before: (u64, u64)) {
+        let after = self.tunnel_totals().await;
+        assert!(
+            after.0 > before.0 && after.1 > before.1,
+            "roundtrip did not cross the ss server: tunnel (in, out) bytes {before:?} -> {after:?}"
+        );
     }
 
     /// Send a `BridgeRequest` over IPC and await the response.

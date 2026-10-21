@@ -48,7 +48,7 @@ use crate::test_support::net_discovery::{
 use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
-use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
+use crate::test_support::socks5_client::{http_get_request, socks5_request};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
 use plugin_e2e::ssserver::random_password_for;
@@ -75,13 +75,14 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
     }
 }
 
-/// Assert that a SOCKS5 GET to `target` through `proxy_port` returns the
-/// `HttpTarget` sentinel body.
+/// Assert that a SOCKS5 GET to `http` through `proxy_port` returns the
+/// `HttpTarget` sentinel body and that the bytes crossed the ss server.
 ///
 /// Sends a `Status` health check before polling the port so that a dead
 /// proxy task produces a clear assertion ("proxy reports not running")
 /// instead of a blind 10-second timeout on `wait_for_port`.
-async fn assert_socks5_roundtrip(harness: &mut DistHarness, proxy_port: u16, target_addr: SocketAddr) {
+async fn assert_socks5_roundtrip(harness: &mut DistHarness, proxy_port: u16, http: &HttpTarget) {
+    let target_addr = http.addr;
     eprintln!("[test] pid={} polling 127.0.0.1:{proxy_port}", std::process::id());
     // Health check: if the proxy task exited between Start and now,
     // the bridge's check_health() will notice and report running=false.
@@ -101,17 +102,13 @@ async fn assert_socks5_roundtrip(harness: &mut DistHarness, proxy_port: u16, tar
     // listener may not have reached `accept()` yet. Poll until it does.
     wait_for_port(proxy_addr, Duration::from_secs(10)).await;
 
+    let totals_before = harness.tunnel_totals().await;
+    let accepted_before = http.mark();
     let request = http_get_request(&target_addr, "/");
-    let response = socks5_request(proxy_addr, target_addr, &request, 8192)
-        .await
-        .expect("SOCKS5 request through bridge");
+    let result = socks5_request(proxy_addr, target_addr, &request, 8192).await;
 
-    let body = http_response_body(&response).expect("HTTP response has header terminator");
-    assert_eq!(
-        body,
-        crate::test_support::http_target::SENTINEL_BODY,
-        "expected sentinel body, got {response:?}"
-    );
+    http.assert_sentinel_roundtrip(accepted_before, "SOCKS5 request through bridge", result);
+    harness.assert_tunnel_traffic_since(totals_before).await;
 }
 
 /// Full template: start a bridge subprocess, send Start with the given
@@ -144,7 +141,7 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
         .expect("send Start");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
-    assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
+    assert_socks5_roundtrip(&mut harness, local_port, http).await;
 
     let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
@@ -158,7 +155,7 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
 fn e2e_none_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
@@ -172,7 +169,7 @@ fn e2e_none_socks_only_roundtrip(
 fn e2e_metrics_report_tunnel_traffic(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(async {
         let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -202,7 +199,7 @@ fn e2e_metrics_report_tunnel_traffic(
             .expect("send Start");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
-        assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, local_port, http).await;
 
         let resp = harness.send(BridgeRequest::Metrics).await.expect("send Metrics");
         let BridgeResponse::Metrics {
@@ -254,7 +251,7 @@ fn e2e_metrics_report_tunnel_traffic(
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
@@ -327,7 +324,7 @@ fn e2e_galoshes_chain_reports_udp_available(
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws_tls)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
@@ -340,7 +337,7 @@ fn e2e_ws_tls_socks_only_roundtrip(
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_quic)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
@@ -578,13 +575,9 @@ mod tun {
 
         // Direct TCP to `http.addr`, the host's own primary non-loopback
         // IPv4. Delivered locally by the host stack, not through the tunnel.
+        let accepted_before = http.mark();
         let response = direct_http_get(http.addr).await;
-        let body = http_response_body(&response).expect("HTTP response has header terminator");
-        assert_eq!(
-            body,
-            crate::test_support::http_target::SENTINEL_BODY,
-            "expected sentinel body, got {response:?}"
-        );
+        http.assert_sentinel_response(accepted_before, &response);
 
         let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
@@ -734,7 +727,7 @@ fn lifecycle_stop_when_idle_is_noop(#[fixture(dist_dir)] dist: &Path) {
 fn lifecycle_reload_changes_local_port(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(async {
         let port1 = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -762,7 +755,7 @@ fn lifecycle_reload_changes_local_port(
             })
             .await
             .unwrap();
-        assert_socks5_roundtrip(&mut harness, port1, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, port1, http).await;
 
         let port2 = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         assert_ne!(port1, port2, "ephemeral allocator should give a fresh port");
@@ -772,7 +765,7 @@ fn lifecycle_reload_changes_local_port(
         };
         let resp = harness.send(BridgeRequest::Reload { config: config2 }).await.unwrap();
         assert!(matches!(resp, BridgeResponse::Ack), "reload should Ack, got {resp:?}");
-        assert_socks5_roundtrip(&mut harness, port2, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, port2, http).await;
 
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
@@ -835,11 +828,12 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC], serial = PORT_ALLOC)]
 fn cipher_chacha20_ietf_poly1305_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(async {
         let method = CipherKind::CHACHA20_POLY1305;
         let password = random_password_for(method);
+        route_ss_server_logs();
         let (ss_addr, _ss_handle) = plugin_e2e::ssserver::start_real_ss_server(method, &password).await;
 
         let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -877,7 +871,7 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
             })
             .await
             .unwrap();
-        assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, local_port, http).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
@@ -891,11 +885,12 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC], serial = PORT_ALLOC)]
 fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
-    #[fixture(http_target_ipv4)] http: &HttpTarget,
+    #[fixture(http_target_loopback)] http: &HttpTarget,
 ) {
     rt().block_on(async {
         let method = CipherKind::AEAD2022_BLAKE3_AES_256_GCM;
         let password = random_password_for(method);
+        route_ss_server_logs();
         let (ss_addr, _ss_handle) = plugin_e2e::ssserver::start_real_ss_server(method, &password).await;
 
         let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -933,7 +928,7 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
             })
             .await
             .unwrap();
-        assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, local_port, http).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
