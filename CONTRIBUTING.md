@@ -523,10 +523,9 @@ consumer is known, reserve the union over the possible consumers:
 `plugin_e2e::ports::reserve_ss_local` is generic over which client plugin will
 run, and that set includes galoshes, so it always reserves TCP+UDP —
 over-reserving UDP for a TCP-only plugin costs a retry, under-reserving it for
-galoshes costs a race. The chain picks each intermediate port with
-`garter::port::pick_with`, uncapped, one hop at a time just before that hop
-starts, and verifies TCP only: every in-repo hop that is not the public one
-binds TCP alone. A hop that loses that port to another process reports a typed
+galoshes costs a race. `garter::ChainRunner` picks each intermediate port
+itself, uncapped, one hop at a time just before that hop starts, and verifies
+TCP only: every in-repo hop that is not the public one binds TCP alone. A hop that loses that port to another process reports a typed
 `BindConflict` and is run again alone on a fresh pick, uncapped; a hop that does
 not speak sitrep (`ReadinessMode::Probe`) cannot, so its lost port is a failed
 start and is not restarted ([garter README](crates/garter/README.md)).
