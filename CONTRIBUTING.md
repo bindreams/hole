@@ -2161,11 +2161,58 @@ presence is the fact: any value of that name, of any type, is the record.
   running service when the uninstall fails. A write needs the key and fails
   without it (nothing else has changed yet, and a key made there would outlive
   the service); a clear with no key or no value is success.
-- **Disclosed residual.** There is no lock between retirements. Two uninstalls
-  that overlap (a CLI run during an MSI action) can have one clear the record
-  while the other still has the service disabled, and a kill then leaves a
-  Disabled service that reads as an administrator's. The GUI offers Enable for
-  it, so it is recoverable.
+- **One lock, from the first read to the last write.** Every path that reads
+  the start type and the record and then writes either holds the machine-wide
+  mutex `Global\HoleBridgeStartTypeLock`
+  ([`StartTypeLock`](crates/bridge/src/platform/windows/start_type_lock.rs)):
+  a retirement (`uninstall`, `ensure_stopped`: the `RetireSession`), the repair
+  and the elevated `disabled_by` read (the `RepairSession`), `enable`,
+  `ensure_failure_actions`, and the update cutover, which holds it from before
+  its stop to after its start. The session owns the guard (its last field), so
+  no start-type read exists without it, and a waiter blocks with no bound,
+  because a retirement waits for the service to stop. Without it overlapping
+  retirements left the service Disabled with no record, and a repair or an
+  `enable` run during a live uninstall reset the start type and cleared the
+  record under it. The DACL grants SYSTEM and Administrators everything and any
+  signed-in user (Authenticated Users) `SYNCHRONIZE` only; whoever creates the
+  object first sets it, so the unprivileged GUI can be first. A mutex dies with
+  its holder, so **held means a change is live, and free over a record means an
+  interrupted one**, with no stored marker to go stale; a holder that ends
+  without releasing hands the lock on abandoned, which counts as taken. The
+  thread that holds it may take it again (the cutover's repair step does).
+  Proofs: the lock's own tests (a second thread waits and gets it once the
+  holder lets go, abandonment, re-entry), `opening_a_retirement_waits_for_the_start_type_lock`
+  and `opening_for_a_repair_or_an_enable_waits_for_the_start_type_lock` (each
+  opener waits on a holder), and, in CI, `..._the_start_type_lock_dacl_grants_a_user_the_wait_and_nothing_more`,
+  `..._a_token_without_administrators_waits_on_the_start_type_lock`,
+  `..._a_retirement_holds_the_start_type_lock_until_it_ends` and
+  `..._the_cutover_hold_hardens_the_service_and_restores_it`.
+- **The update cutover hardens the service like a retirement.** Its stop is
+  not final on its own: the SCM can restart a service that fails or exits
+  non-zero after the settle's last look, and the old image would run, or race
+  the move-in. So the cutover takes the lock, writes the record, sets the start
+  type Disabled and turns restart-on-failure off (`retire::harden`, the
+  retirement's own), then stops and swaps; it puts the failure actions, the
+  start type and the record back (`retire::restore_hardened`) before the repair
+  step and the start, on every path out of the swap, and lets go of the lock
+  after the start (`run_cutover`, `ServiceHold`). A cutover killed between the
+  hardening and the restore leaves what a killed retirement leaves: a Disabled
+  service with its record, which the next cutover, `bridge install` or the GUI's
+  Repair resets. A service an administrator disabled is hardened without a
+  record and put back Disabled, so the cutover still leaves it stopped.
+- **The GUI never waits for it.** Its status read tries the lock
+  (`RepairSession::open_unless_in_change`): held, a retirement, repair or enable
+  is changing the start type and the record, so neither answer is one yet. The
+  read is `DisabledState::InChange`, the status is
+  `BridgeInstallStatus::ChangeInProgress`, and the connect gate offers neither
+  Repair nor Enable: it fails the connect with "the Hole service is being
+  changed by an uninstall, a repair or an update that is in progress. Try again
+  when it finishes." (`InstallGate::ChangeInProgress`, also when unattended);
+  `hole bridge status` prints `installed (being changed)` and exits 4. Free, the
+  read is made under the lock and the record decides as in the table. A status
+  read colliding with another user's status read reads as in progress for that
+  instant. A lock that cannot be opened reads as not disabled, as an unreadable
+  start type does.
 - **An administrator's Disable survives every Hole path that is not an explicit
   enable.** The retirement's restore, the in-app update's cutover, `hole bridge install` and the GUI's status read leave it. A reinstall deletes and recreates
   the service, so `bridge install` reads who disabled it first, registers the new
@@ -2176,7 +2223,7 @@ presence is the fact: any value of that name, of any type, is the record.
   service is success; `Unsupported` on macOS, whose service has no start type)
   and the GUI's Enable action, which runs it, override it.
 - **The in-app update over an administrator's Disable succeeds.** The cutover
-  child (`run_cutover`: stop, swap, repair, start) swaps the new files in, does
+  child (`run_cutover`: hold, stop, swap, restore, repair, start) swaps the new files in, does
   not start the service, and returns `CutoverOutcome::LeftDisabled`, which is
   success: the update did install, and the service is off because an
   administrator turned it off. `run_detached` logs the reason at info and, unlike
@@ -2202,7 +2249,7 @@ presence is the fact: any value of that name, of any type, is the record.
   (`Install`, `Repair`, `Enable`), each with its own title, body, button, declined
   and unattended text. `Repair` runs `bridge install`, `Enable` runs `bridge enable`; an unattended startup (`Prompts::Forbidden`) fails passively with the
   prompt's text. `hole bridge status` prints `installed (disabled)` and exits 3
-  (running 0, stopped 1, not installed 2). The GUI's read is unprivileged and
+  (running 0, stopped 1, not installed 2, being changed 4: see the lock above). The GUI's read is unprivileged and
   never fails (`disabled_state`: a start type it cannot read is none, a record it
   cannot read counts as present, as on every path). That read works as
   installed because nothing sets a security descriptor on the service or on its

@@ -17,7 +17,7 @@ use std::path::Path;
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 use hole_bridge::cutover::os::CutoverOs;
 use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
-use hole_bridge::disable_record::{DisabledBy, RecordKey, RecordState};
+use hole_bridge::disable_record::{DisabledBy, DisabledState, RecordKey, RecordState};
 use hole_bridge::platform::os::{self, SERVICE_NAME};
 use hole_bridge::service_start::RepairStep;
 use windows::core::{PCWSTR, PWSTR};
@@ -93,6 +93,16 @@ fn set_start_type(to: ServiceStartType) {
     .expect("ChangeServiceConfigW: set the start type");
 }
 
+/// The GUI's status read as the whose-disable answer. Nothing else holds the
+/// start-type lock in these tests, so a change in progress is a failure.
+fn gui_disabled_by() -> Option<DisabledBy> {
+    match os::disabled_state() {
+        DisabledState::By(by) => Some(by),
+        DisabledState::NotDisabled => None,
+        DisabledState::InChange => panic!("the GUI's read found the start-type lock held"),
+    }
+}
+
 fn record() -> RecordState {
     RecordKey::service().state()
 }
@@ -128,7 +138,7 @@ fn assert_a_disabled_service_has_its_record(at: &recording::Event) {
         return;
     };
     let record = record();
-    let by = os::disabled_state();
+    let by = gui_disabled_by();
     match start {
         ServiceStartType::Disabled => {
             assert_eq!(
@@ -166,7 +176,7 @@ fn retire_checking_the_invariant_at_every_act(disposition: Disposition) {
         }
     }
     assert_eq!(record(), RecordState::Absent, "the retirement cleared its record");
-    assert_eq!(os::disabled_state(), None);
+    assert_eq!(gui_disabled_by(), None);
 }
 
 /// Proves: the record is written before the start type is disabled and cleared
@@ -209,7 +219,7 @@ fn cutover_global_net_state_an_administrators_disable_survives_ensure_stopped() 
         RecordState::Absent,
         "no record was made for a disable that is not ours"
     );
-    assert_eq!(os::disabled_state(), Some(DisabledBy::Elsewhere));
+    assert_eq!(gui_disabled_by(), Some(DisabledBy::Elsewhere));
     assert_eq!(
         os::disabled_by().expect("the elevated read"),
         Some(DisabledBy::Elsewhere)
@@ -267,7 +277,7 @@ fn cutover_global_net_state_repair_resets_only_what_the_record_says_is_ours() {
             write_record();
         }
         assert_eq!(
-            os::disabled_state(),
+            gui_disabled_by(),
             by,
             "the GUI's read of {start:?}, record {with_record}"
         );
@@ -296,7 +306,7 @@ fn cutover_global_net_state_the_record_dies_with_its_service() {
 
     assert_eq!(record(), RecordState::Absent);
     assert_eq!(os::repair_interrupted_uninstall().unwrap(), RepairStep::Nothing);
-    assert_eq!(os::disabled_state(), None, "no service is not a disabled service");
+    assert_eq!(gui_disabled_by(), None, "no service is not a disabled service");
 }
 
 // What a service marked for deletion answers ==========================================================================
@@ -374,7 +384,7 @@ const USER_GROUPS: [&str; 4] = ["S-1-5-4", "S-1-5-11", "S-1-5-32-545", "S-1-1-0"
 
 /// The access `acl` grants the SID `sid`, which `GetEffectiveRightsFromAclW`
 /// computes from the ACEs that name the SID itself (not its members' groups).
-fn rights_of(acl: *const windows::Win32::Security::ACL, sid: &str) -> u32 {
+pub(super) fn rights_of(acl: *const windows::Win32::Security::ACL, sid: &str) -> u32 {
     let wide: Vec<u16> = sid.encode_utf16().chain(std::iter::once(0)).collect();
     let mut psid = PSID::default();
     // SAFETY: `wide` is NUL-terminated and outlives the call; the SID is freed below.
@@ -398,7 +408,7 @@ fn rights_of(acl: *const windows::Win32::Security::ACL, sid: &str) -> u32 {
 
 /// What the groups of a standard user grant between them on `acl`, with each
 /// group's own share printed.
-fn user_rights(what: &str, acl: *const windows::Win32::Security::ACL) -> u32 {
+pub(super) fn user_rights(what: &str, acl: *const windows::Win32::Security::ACL) -> u32 {
     let mut union = 0;
     for group in USER_GROUPS {
         let rights = rights_of(acl, group);

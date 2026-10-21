@@ -1282,4 +1282,5 @@ fn bridge_status_prints_disabled_with_its_own_exit_code() {
     for by in [DisabledBy::InterruptedUninstall, DisabledBy::Elsewhere] {
         assert_eq!(status_report(Disabled(by)), ("installed (disabled)", 3), "{by:?}");
     }
+    assert_eq!(status_report(ChangeInProgress), ("installed (being changed)", 4));
 }

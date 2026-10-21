@@ -10,6 +10,10 @@
 //! after the start type is written back or the service is deleted, so a
 //! retirement cut short at any call leaves a Disabled service we disabled with
 //! its record.
+//!
+//! The session the real retirement runs on holds the machine-wide start-type
+//! lock from before its first read to after its last write, so no repair,
+//! enable or other retirement interleaves with it.
 
 use std::io;
 
@@ -187,7 +191,7 @@ impl From<SettleError> for RetireError {
 }
 
 /// What [`harden`] found.
-enum Hardened {
+pub(crate) enum Hardened {
     /// The start type is disabled, which [`restore`] undoes.
     Disabled(Hardening),
     /// The service is already marked for deletion by someone else's delete:
@@ -216,7 +220,7 @@ fn answered_as_marked(error: &io::Error) -> bool {
 /// this call wrote cleared, unless the SCM answers that the service is marked
 /// for deletion ([`Hardened::Marked`]); a failed failure-actions write only
 /// narrows what is queued, and is warned about.
-fn harden<S: ServiceSession>(session: &mut S) -> Result<Hardened, RetireError> {
+pub(crate) fn harden<S: ServiceSession>(session: &mut S) -> Result<Hardened, RetireError> {
     let observed = match session.start_type() {
         Ok(observed) => observed,
         Err(error) if answered_as_marked(&error) => return Ok(marked(&error)),
@@ -243,6 +247,15 @@ fn harden<S: ServiceSession>(session: &mut S) -> Result<Hardened, RetireError> {
         warn!(%error, "could not turn restart-on-failure off; the disabled start type still stops a restart");
     }
     Ok(Hardened::Disabled(hardening))
+}
+
+/// [`restore`] what a [`harden`] changed; a service found marked for deletion
+/// was left as it was.
+pub(crate) fn restore_hardened<S: ServiceSession>(session: &mut S, hardened: &Hardened) {
+    match hardened {
+        Hardened::Disabled(hardening) => restore(session, *hardening),
+        Hardened::Marked => {}
+    }
 }
 
 /// Remove the record. A failure is a warning: the next retirement, cutover or

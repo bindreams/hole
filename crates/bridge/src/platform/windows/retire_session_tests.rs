@@ -1,7 +1,8 @@
 use windows_service::service::{ServiceActionType, ServiceFailureResetPeriod, ServiceStartType};
 
-use super::{no_restart_failure_actions, scm_start_type, start_type_from};
+use super::{no_restart_failure_actions, scm_start_type, start_type_from, RetireSession};
 use crate::cutover::scm_wait::retire::StartWrite;
+use crate::platform::os::StartTypeLock;
 use crate::service_start::StartType;
 
 #[skuld::test]
@@ -40,4 +41,12 @@ fn each_start_type_the_retirement_writes_is_the_scm_one_it_names() {
     ] {
         assert_eq!(scm_start_type(written).to_raw(), raw, "{written:?}");
     }
+}
+
+#[skuld::test]
+fn opening_a_retirement_waits_for_the_start_type_lock() {
+    let lock = StartTypeLock::scratch("retire-open");
+    let opened = lock.while_another_waits(|on_busy| RetireSession::open_noting(&lock, on_busy).is_ok());
+    assert!(opened);
+    assert!(!lock.is_held_for_another_thread(), "released with the session");
 }

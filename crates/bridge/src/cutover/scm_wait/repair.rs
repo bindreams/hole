@@ -7,6 +7,11 @@
 //! that never finished, and the elevated paths undo it; without, an
 //! administrator's, and nothing here changes it. Only [`enable`], which the
 //! administrator asks for, overrides that.
+//!
+//! The real session holds the machine-wide start-type lock for as long as it is
+//! open, so a repair or an enable never runs under a retirement that is still
+//! going, and the GUI's read, which does not wait for the lock, says when it is
+//! held.
 
 use std::io;
 

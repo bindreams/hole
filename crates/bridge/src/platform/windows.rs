@@ -16,7 +16,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use crate::cutover::scm_wait::call_error::{ScmCall, ServiceGone};
 use crate::cutover::scm_wait::repair;
 use crate::cutover::scm_wait::retire::{retire_over, Disposition};
-use crate::disable_record::DisabledBy;
+use crate::disable_record::{DisabledBy, DisabledState};
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
 use crate::service_start::{InstallStart, RepairStep};
 use crate::service_stop::{self, StopPhase, StopProgress};
@@ -28,9 +28,12 @@ pub use retire_session::{GoneSession, RetireSession};
 #[path = "windows/stop_session.rs"]
 mod stop_session;
 pub use stop_session::StopSession;
+#[path = "windows/start_type_lock.rs"]
+mod start_type_lock;
+pub use start_type_lock::{Held, StartTypeLock, MACHINE_WIDE_NAME};
 #[path = "windows/repair_session.rs"]
 mod repair_session;
-use repair_session::{RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
+use repair_session::{Reading, RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
 #[path = "windows/registration.rs"]
 pub mod registration;
 #[path = "windows/service_processes.rs"]
@@ -654,8 +657,10 @@ fn apply_failure_actions(service: &windows_service::service::Service) -> std::io
 /// Open the installed `HoleBridge` service and apply the restart-on-failure
 /// config. Idempotent (a re-apply re-writes the same config). Called by the
 /// cutover child so an install base predating this config is brought up to date
-/// as part of the update itself.
+/// as part of the update itself. Under the start-type lock: a retirement in
+/// progress has turned them off, and this would turn them back on under it.
 pub fn ensure_failure_actions() -> std::io::Result<()> {
+    let _held = StartTypeLock::machine_wide().acquire()?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
     let service = manager
@@ -673,7 +678,8 @@ pub fn ensure_failure_actions() -> std::io::Result<()> {
 /// uninstall retryable instead of terminal.
 ///
 /// The stop, the delete and the check after it are one SCM session
-/// ([`retire`](crate::cutover::scm_wait::retire::retire)), because the service
+/// ([`retire`](crate::cutover::scm_wait::retire::retire)) under the start-type
+/// lock ([`StartTypeLock`]), because the service
 /// carries restart-on-failure: a service the SCM is about to restart reads
 /// STOPPED, and separate probes and acts each decided on a state the SCM could
 /// change under them. A service already
@@ -726,7 +732,8 @@ fn open_error_is_absent(e: &windows_service::Error) -> bool {
 /// interrupted uninstall left is reset to automatic and the record cleared; a
 /// Disabled start type with no record is an administrator's and is left, and
 /// the caller does not start the service. With no service registered there is
-/// nothing to repair: the record lived in the service's key.
+/// nothing to repair: the record lived in the service's key. Waits for the
+/// start-type lock, so it never repairs a retirement that is still running.
 pub fn repair_interrupted_uninstall() -> std::io::Result<RepairStep> {
     let Some(mut session) = RepairSession::open(REPAIR_ACCESS)? else {
         return Ok(RepairStep::Nothing);
@@ -747,7 +754,8 @@ pub fn repair_interrupted_uninstall() -> std::io::Result<RepairStep> {
 
 /// Who disabled the service, if it is disabled, for an elevated caller: an
 /// unreadable start type is its error, because the caller acts on it.
-/// A record that cannot be read counts as present.
+/// A record that cannot be read counts as present. Waits for the start-type
+/// lock, so the answer is never a retirement's half-done state.
 pub fn disabled_by() -> std::io::Result<Option<DisabledBy>> {
     let Some(mut session) = RepairSession::open(READ_ACCESS)? else {
         return Ok(None);
@@ -757,27 +765,36 @@ pub fn disabled_by() -> std::io::Result<Option<DisabledBy>> {
 }
 
 /// [`disabled_by`] for a reader that must never fail (the GUI's status, which
-/// runs unprivileged). A service it cannot open or read is "not disabled", and
-/// the reason is logged, the convention of [`is_installed`].
-pub fn disabled_state() -> Option<DisabledBy> {
-    let mut session = match RepairSession::open(READ_ACCESS) {
-        Ok(Some(session)) => session,
-        Ok(None) => return None,
+/// runs unprivileged). It never waits for the start-type lock: held, a
+/// retirement, repair or enable is changing the start type and the record, and
+/// the answer is [`DisabledState::InChange`], neither of the two it would give.
+/// A service it cannot open or read is "not disabled", and the reason is
+/// logged, the convention of [`is_installed`].
+pub fn disabled_state() -> DisabledState {
+    disabled_state_under(&StartTypeLock::machine_wide())
+}
+
+fn disabled_state_under(lock: &StartTypeLock) -> DisabledState {
+    let mut session = match RepairSession::open_unless_in_change(lock, READ_ACCESS) {
+        Ok(Reading::Session(Some(session))) => session,
+        Ok(Reading::Session(None)) => return DisabledState::NotDisabled,
+        Ok(Reading::InChange) => return DisabledState::InChange,
         Err(e) => {
             warn!(error = %e, "could not open the service to read whether it is disabled");
-            return None;
+            return DisabledState::NotDisabled;
         }
     };
     let observed = repair::observe(&mut session);
     if let Err(e) = &observed {
         warn!(error = %e, "could not read the service's start type, so it is taken as not disabled");
     }
-    repair::for_display(observed)
+    DisabledState::of(repair::for_display(observed))
 }
 
 /// Sets the service's start type to automatic, clears the record, and starts
 /// it: the administrator's explicit request to undo a disable, whoever made
-/// it. A service already running is success.
+/// it. A service already running is success. Holds the start-type lock from
+/// the first write to the start.
 pub fn enable() -> std::io::Result<()> {
     let Some(mut session) = RepairSession::open(ENABLE_ACCESS)? else {
         return Err(std::io::Error::new(

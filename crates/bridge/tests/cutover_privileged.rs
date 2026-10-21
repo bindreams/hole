@@ -63,6 +63,9 @@ mod restart_probes;
 #[cfg(target_os = "windows")]
 #[path = "cutover_privileged/sid_probes.rs"]
 mod sid_probes;
+#[cfg(target_os = "windows")]
+#[path = "cutover_privileged/start_type_lock_proofs.rs"]
+mod start_type_lock_proofs;
 
 #[cfg(target_os = "windows")]
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;

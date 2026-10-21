@@ -13,9 +13,11 @@
 //! see it. A record that cannot be read counts as present. A failed write fails
 //! the retirement before the start type changes.
 //!
-//! Neither write nor clear takes a lock. Two overlapping retirements can clear
-//! a record the other still needs; the service then reads as an
-//! administrator's, which the GUI still offers to enable.
+//! Record and start type are read and written under the machine-wide start-type
+//! lock (Windows `StartTypeLock`), from a caller's first read to its last write,
+//! so a record is never read mid-change by anything that acts on it. The GUI's
+//! status read takes the lock without waiting and says when it is held
+//! ([`DisabledState::InChange`]).
 
 #[cfg(windows)]
 #[path = "disable_record/record_key.rs"]
@@ -37,6 +39,28 @@ pub enum DisabledBy {
     InterruptedUninstall,
     /// No record: an administrator, or a tool, other than Hole.
     Elsewhere,
+}
+
+/// What the GUI's status read finds about the service being disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisabledState {
+    /// The service is not disabled, or its start type could not be read.
+    NotDisabled,
+    /// The service is disabled, by the one the record names.
+    By(DisabledBy),
+    /// A retirement, repair or enable holds the start-type lock: the start
+    /// type and the record are being changed, and neither says anything yet.
+    InChange,
+}
+
+impl DisabledState {
+    /// The state for a read that held the lock.
+    pub fn of(disabled_by: Option<DisabledBy>) -> DisabledState {
+        match disabled_by {
+            Some(by) => DisabledState::By(by),
+            None => DisabledState::NotDisabled,
+        }
+    }
 }
 
 impl DisabledBy {

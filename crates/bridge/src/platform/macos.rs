@@ -335,8 +335,8 @@ pub fn disabled_by() -> std::io::Result<Option<crate::disable_record::DisabledBy
 }
 
 /// [`disabled_by`] for the GUI's status.
-pub fn disabled_state() -> Option<crate::disable_record::DisabledBy> {
-    None
+pub fn disabled_state() -> crate::disable_record::DisabledState {
+    crate::disable_record::DisabledState::NotDisabled
 }
 
 /// launchd has no disabled start type to undo, so `hole bridge enable` has no

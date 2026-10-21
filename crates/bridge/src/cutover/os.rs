@@ -12,6 +12,18 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// What a cutover holds on the service from before its stop to after its
+/// start: on Windows the start-type lock, with the service hardened against a
+/// restart. Dropping it lets go of the lock; the hardening stays until
+/// [`restore`](Self::restore).
+#[cfg(target_os = "windows")]
+pub trait ServiceHold {
+    /// Puts back what holding the service changed: restart-on-failure, the
+    /// start type, the record. A failure is a warning, because the repair
+    /// step that follows finds and undoes what it left.
+    fn restore(&mut self);
+}
+
 /// The OS steps a cutover performs. Each method may block. The cover is owned
 /// by the bridge process (standing guard); this trait deliberately exposes NO
 /// cover-mutating method, so a cutover structurally cannot engage or disengage
@@ -28,6 +40,11 @@ pub trait CutoverOs {
     /// old inode; the canonical path flips, which `same_file::Handle` identity
     /// and the GUI self-heal depend on).
     fn swap_images(&mut self) -> std::io::Result<()>;
+    /// Take the service for the cutover: the start-type lock, then the record,
+    /// a Disabled start type and restart-on-failure off, so that the stop is
+    /// final and nothing restarts the old image under the swap. WINDOWS ONLY.
+    #[cfg(target_os = "windows")]
+    fn hold_service(&mut self) -> std::io::Result<Box<dyn ServiceHold>>;
     /// Trigger the bridge to stop after the swap. On Windows the detached child
     /// runs `ControlService(STOP)` + `NotifyServiceStatusChange(STOPPED)` and
     /// waits for a real STOPPED. On macOS this `launchctl kill SIGTERM`s its own
@@ -72,9 +89,11 @@ impl CutoverOutcome {
 }
 
 /// Drive the cutover sequence. Ordering is OS-asymmetric:
-/// - Windows: stop -> swap (while no bridge runs) -> repair the start type ->
-///   start. Stopping first bounds the gap and lets the new bridge boot from the
-///   new image deterministically. The detached child outlives the stopped
+/// - Windows: hold and harden the service -> stop -> swap (while no bridge
+///   runs) -> put the hardening back -> repair the start type -> start. Stopping
+///   first bounds the gap and lets the new bridge boot from the new image
+///   deterministically; hardening first makes the stop final, so the SCM's
+///   restart-on-failure cannot start the old image under the swap. The detached child outlives the stopped
 ///   service. A service an administrator disabled is not started (the start
 ///   would fail): the update did install, so that is `LeftDisabled`, not an
 ///   error.
@@ -87,8 +106,14 @@ impl CutoverOutcome {
 pub fn run_cutover<O: CutoverOs>(os: &mut O) -> std::io::Result<CutoverOutcome> {
     #[cfg(target_os = "windows")]
     {
-        os.stop_service_wait_stopped()?;
-        os.swap_images()?;
+        // Held from before the stop to after the start, so no retirement, repair
+        // or enable interleaves; hardened, so the SCM restarts nothing under the
+        // swap. Put back before the repair step, which finds what a restore
+        // that failed left. Dropped last, on every path out.
+        let mut hold = os.hold_service()?;
+        let stopped_and_swapped = os.stop_service_wait_stopped().and_then(|()| os.swap_images());
+        hold.restore();
+        stopped_and_swapped?;
         let repaired = os.repair_start_type()?;
         if !repaired.starts_service() {
             return Ok(CutoverOutcome::LeftDisabled);

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use hole_bridge::disable_record::DisabledBy;
+use hole_bridge::disable_record::{DisabledBy, DisabledState};
 use hole_bridge::service_start::{InstallStart, RepairStep};
 
 // Status detection ====================================================================================================
@@ -18,6 +18,10 @@ pub enum BridgeInstallStatus {
     /// Service is registered with its start type disabled, so it cannot start;
     /// who disabled it decides what the GUI offers.
     Disabled(DisabledBy),
+    /// A retirement, repair or enable of the service is under way (Windows):
+    /// its start type and record are being changed, so neither says whether
+    /// the service is disabled yet.
+    ChangeInProgress,
     /// Service is not registered.
     NotInstalled,
 }
@@ -37,7 +41,7 @@ pub fn bridge_install_status() -> BridgeInstallStatus {
 pub fn bridge_install_status_with(
     installed: impl FnOnce() -> bool,
     running: impl FnOnce() -> bool,
-    disabled: impl FnOnce() -> Option<DisabledBy>,
+    disabled: impl FnOnce() -> DisabledState,
 ) -> BridgeInstallStatus {
     if !installed() {
         return BridgeInstallStatus::NotInstalled;
@@ -46,8 +50,9 @@ pub fn bridge_install_status_with(
         return BridgeInstallStatus::Running;
     }
     match disabled() {
-        Some(by) => BridgeInstallStatus::Disabled(by),
-        None => BridgeInstallStatus::Installed,
+        DisabledState::By(by) => BridgeInstallStatus::Disabled(by),
+        DisabledState::InChange => BridgeInstallStatus::ChangeInProgress,
+        DisabledState::NotDisabled => BridgeInstallStatus::Installed,
     }
 }
 
@@ -62,15 +67,33 @@ pub enum InstallPrompt {
     Enable,
 }
 
+/// What the connect does about the service's state before it goes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallGate {
+    /// Nothing is in the way.
+    Proceed,
+    /// Offer to do this first.
+    Prompt(InstallPrompt),
+    /// The service's start type is being changed; offer nothing and say so.
+    ChangeInProgress,
+}
+
+/// The connect's failure while the service's start type is being changed.
+pub const CHANGE_IN_PROGRESS_ERROR: &str =
+    "The Hole service is being changed by an uninstall, a repair or an update that is in progress. Try again when it finishes.";
+
 impl BridgeInstallStatus {
-    /// What to offer, if the status needs something done before a connect.
-    pub fn install_prompt(self) -> Option<InstallPrompt> {
+    /// What the connect does, from the status.
+    pub fn install_gate(self) -> InstallGate {
         match self {
-            BridgeInstallStatus::Running => None,
-            BridgeInstallStatus::Installed => None,
-            BridgeInstallStatus::Disabled(DisabledBy::InterruptedUninstall) => Some(InstallPrompt::Repair),
-            BridgeInstallStatus::Disabled(DisabledBy::Elsewhere) => Some(InstallPrompt::Enable),
-            BridgeInstallStatus::NotInstalled => Some(InstallPrompt::Install),
+            BridgeInstallStatus::Running => InstallGate::Proceed,
+            BridgeInstallStatus::Installed => InstallGate::Proceed,
+            BridgeInstallStatus::Disabled(DisabledBy::InterruptedUninstall) => {
+                InstallGate::Prompt(InstallPrompt::Repair)
+            }
+            BridgeInstallStatus::Disabled(DisabledBy::Elsewhere) => InstallGate::Prompt(InstallPrompt::Enable),
+            BridgeInstallStatus::ChangeInProgress => InstallGate::ChangeInProgress,
+            BridgeInstallStatus::NotInstalled => InstallGate::Prompt(InstallPrompt::Install),
         }
     }
 }

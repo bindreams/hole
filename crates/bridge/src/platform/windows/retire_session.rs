@@ -17,6 +17,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::service_processes::ServiceProcesses;
 use super::service_sid::ServiceSid;
+use super::start_type_lock::{log_wait, Held, StartTypeLock};
 use super::stop_session::StopSession;
 use super::{apply_failure_actions, open_error_is_absent, scm_failure, FAILURE_ACTIONS_ACCESS, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
@@ -39,6 +40,9 @@ pub struct RetireSession {
     stop: StopSession,
     /// Where the record that an uninstall disabled the service lives.
     record: RecordKey,
+    /// Held from before the first read to after the last write. Last, so it is
+    /// released after everything above is closed.
+    _held: Held,
 }
 
 /// The rights the session's handle is opened with: exactly those its calls
@@ -54,9 +58,20 @@ fn session_access() -> ServiceAccess {
 }
 
 impl RetireSession {
-    /// Opens the session, or says the SCM has no entry to open. A service
-    /// marked for deletion opens: its mark is met on a call through the handle.
+    /// Opens the session, or says the SCM has no entry to open, once the
+    /// start-type lock is held; the session keeps it until it is dropped. A
+    /// service marked for deletion opens: its mark is met on a call through
+    /// the handle.
     pub fn open() -> Result<Opening<Self>, Box<dyn std::error::Error>> {
+        Self::open_noting(&StartTypeLock::machine_wide(), log_wait)
+    }
+
+    /// [`open`](Self::open) over `lock`, calling `on_busy` if another holds it.
+    pub(super) fn open_noting(
+        lock: &StartTypeLock,
+        on_busy: impl FnOnce(),
+    ) -> Result<Opening<Self>, Box<dyn std::error::Error>> {
+        let held = lock.acquire_noting_wait(on_busy)?;
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
         let service = match manager.open_service(SERVICE_NAME, session_access()) {
@@ -70,6 +85,7 @@ impl RetireSession {
             service,
             stop,
             record: RecordKey::service(),
+            _held: held,
         }))
     }
 }

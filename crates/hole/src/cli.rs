@@ -370,6 +370,7 @@ pub(crate) fn status_report(status: crate::setup::BridgeInstallStatus) -> (&'sta
         crate::setup::BridgeInstallStatus::Installed => ("installed (stopped)", 1),
         crate::setup::BridgeInstallStatus::NotInstalled => ("not installed", 2),
         crate::setup::BridgeInstallStatus::Disabled(_) => ("installed (disabled)", 3),
+        crate::setup::BridgeInstallStatus::ChangeInProgress => ("installed (being changed)", 4),
     }
 }
 

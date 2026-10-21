@@ -1,6 +1,7 @@
 // System tray icon and menu.
 
 use crate::commands::build_proxy_config;
+use crate::setup::{InstallGate, CHANGE_IN_PROGRESS_ERROR};
 use crate::state::AppState;
 use hole::tray_icons;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, CoverPresence};
@@ -223,16 +224,17 @@ pub(crate) fn persist_intended_enabled(
 /// `status_fn` is lazy so the production status probe (a stat, and on macOS a
 /// `launchctl` subprocess) is skipped entirely when externally supervised.
 ///
-/// What the gate offers depends on the status: an install for a missing
-/// service, a repair or an enable for a disabled one.
-pub(crate) fn install_prompt_for(
+/// What the gate does depends on the status: an install for a missing
+/// service, a repair or an enable for a disabled one, a refusal that says so
+/// for one whose start type is being changed.
+pub(crate) fn install_gate_for(
     externally_supervised: bool,
     status_fn: impl FnOnce() -> crate::setup::BridgeInstallStatus,
-) -> Option<crate::setup::InstallPrompt> {
+) -> InstallGate {
     if externally_supervised {
-        return None;
+        return InstallGate::Proceed;
     }
-    status_fn().install_prompt()
+    status_fn().install_gate()
 }
 
 // Menu IDs ============================================================================================================
@@ -721,11 +723,12 @@ async fn set_proxy_enabled_inner(
     // An externally-supervised bridge (HOLE_BRIDGE_SOCKET, dev) skips this
     // entirely — it is already reachable on its own socket (#569).
     if enable {
-        if let Some(prompt) = install_prompt_for(
+        match install_gate_for(
             state.bridge_is_externally_supervised(),
             crate::setup::bridge_install_status,
         ) {
-            match prompts {
+            InstallGate::Proceed => {}
+            InstallGate::Prompt(prompt) => match prompts {
                 Prompts::Allowed => {
                     if !crate::setup::prompt_bridge_install(app.clone(), prompt).await {
                         return Err(prompt.declined_error().into());
@@ -733,7 +736,8 @@ async fn set_proxy_enabled_inner(
                 }
                 // Startup must not throw an admin install wizard at a login.
                 Prompts::Forbidden => return Err(prompt.unattended_error().into()),
-            }
+            },
+            InstallGate::ChangeInProgress => return Err(CHANGE_IN_PROGRESS_ERROR.into()),
         }
     }
 

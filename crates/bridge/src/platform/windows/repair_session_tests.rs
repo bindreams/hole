@@ -1,4 +1,5 @@
 use super::*;
+use crate::platform::os::StartTypeLock;
 
 fn winapi_error(code: u32) -> windows_service::Error {
     windows_service::Error::Winapi(io::Error::from_raw_os_error(code as i32))
@@ -29,4 +30,51 @@ fn an_unprivileged_read_asks_for_the_query_right_alone() {
     assert_eq!(READ_ACCESS, ServiceAccess::QUERY_CONFIG);
     assert!(REPAIR_ACCESS.contains(READ_ACCESS));
     assert!(ENABLE_ACCESS.contains(ServiceAccess::START | ServiceAccess::CHANGE_CONFIG));
+}
+
+#[skuld::test]
+fn opening_for_a_repair_or_an_enable_waits_for_the_start_type_lock() {
+    for access in [REPAIR_ACCESS, ENABLE_ACCESS, READ_ACCESS] {
+        let lock = StartTypeLock::scratch("repair-open");
+        let opened = lock.while_another_waits(|on_busy| RepairSession::open_noting(&lock, access, on_busy).is_ok());
+        assert!(opened, "{access:?}");
+        assert!(
+            !lock.is_held_for_another_thread(),
+            "released with the session: {access:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn the_status_read_does_not_wait_and_says_a_change_is_in_progress_while_the_lock_is_held() {
+    let lock = StartTypeLock::scratch("status-open");
+    let held = lock.acquire().expect("hold the lock");
+    let in_change = std::thread::scope(|s| {
+        s.spawn(|| {
+            matches!(
+                RepairSession::open_unless_in_change(&lock, READ_ACCESS),
+                Ok(Reading::InChange)
+            )
+        })
+        .join()
+        .expect("the reader's thread")
+    });
+    assert!(in_change);
+    drop(held);
+    let read = RepairSession::open_unless_in_change(&lock, READ_ACCESS);
+    assert!(matches!(read, Ok(Reading::Session(_))), "free: the record decides");
+    drop(read);
+    assert!(!lock.is_held_for_another_thread(), "released with the session");
+}
+
+#[skuld::test]
+fn a_repair_session_holds_the_start_type_lock_for_as_long_as_it_is_open() {
+    let lock = StartTypeLock::scratch("repair-held");
+    // A service every Windows has, opened for the read the GUI's status makes.
+    let session = RepairSession::open_named_holding(lock.acquire().expect("take the lock"), "EventLog", READ_ACCESS)
+        .expect("open the service")
+        .expect("the service exists");
+    assert!(lock.is_held_for_another_thread(), "held while the session is open");
+    drop(session);
+    assert!(!lock.is_held_for_another_thread(), "let go with the session");
 }

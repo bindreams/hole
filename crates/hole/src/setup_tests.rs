@@ -472,17 +472,18 @@ fn uninstall_keep_covers_tears_down_without_releasing() {
 
 // Bridge status and what the GUI offers ===============================================================================
 
-const DISABLED_BYS: [Option<DisabledBy>; 3] = [
-    None,
-    Some(DisabledBy::InterruptedUninstall),
-    Some(DisabledBy::Elsewhere),
+const DISABLED_STATES: [DisabledState; 4] = [
+    DisabledState::NotDisabled,
+    DisabledState::By(DisabledBy::InterruptedUninstall),
+    DisabledState::By(DisabledBy::Elsewhere),
+    DisabledState::InChange,
 ];
 
 #[skuld::test]
 fn status_precedence_is_not_installed_then_running_then_disabled_then_installed() {
     for installed in [false, true] {
         for running in [false, true] {
-            for disabled in DISABLED_BYS {
+            for disabled in DISABLED_STATES {
                 let status = bridge_install_status_with(|| installed, || running, || disabled);
                 // Written out from the rule, not from the code: a service that is not
                 // registered is not running or disabled; a running one works, whatever its
@@ -491,10 +492,12 @@ fn status_precedence_is_not_installed_then_running_then_disabled_then_installed(
                     BridgeInstallStatus::NotInstalled
                 } else if running {
                     BridgeInstallStatus::Running
-                } else if let Some(by) = disabled {
-                    BridgeInstallStatus::Disabled(by)
                 } else {
-                    BridgeInstallStatus::Installed
+                    match disabled {
+                        DisabledState::By(by) => BridgeInstallStatus::Disabled(by),
+                        DisabledState::InChange => BridgeInstallStatus::ChangeInProgress,
+                        DisabledState::NotDisabled => BridgeInstallStatus::Installed,
+                    }
                 };
                 assert_eq!(
                     status, expected,
@@ -517,7 +520,7 @@ fn status_probes_only_what_the_answer_before_leaves_open() {
         },
         || {
             disabled_read.set(true);
-            None
+            DisabledState::NotDisabled
         },
     );
     assert!(
@@ -530,26 +533,36 @@ fn status_probes_only_what_the_answer_before_leaves_open() {
         || true,
         || {
             disabled_read.set(true);
-            None
+            DisabledState::NotDisabled
         },
     );
     assert!(!disabled_read.get(), "a running service's start type is never read");
 }
 
 #[skuld::test]
-fn install_prompt_per_variant() {
+fn install_gate_per_variant() {
     use BridgeInstallStatus::*;
-    assert_eq!(NotInstalled.install_prompt(), Some(InstallPrompt::Install));
+    assert_eq!(NotInstalled.install_gate(), InstallGate::Prompt(InstallPrompt::Install));
     assert_eq!(
-        Disabled(DisabledBy::InterruptedUninstall).install_prompt(),
-        Some(InstallPrompt::Repair)
+        Disabled(DisabledBy::InterruptedUninstall).install_gate(),
+        InstallGate::Prompt(InstallPrompt::Repair)
     );
     assert_eq!(
-        Disabled(DisabledBy::Elsewhere).install_prompt(),
-        Some(InstallPrompt::Enable)
+        Disabled(DisabledBy::Elsewhere).install_gate(),
+        InstallGate::Prompt(InstallPrompt::Enable)
     );
-    assert_eq!(Installed.install_prompt(), None);
-    assert_eq!(Running.install_prompt(), None);
+    assert_eq!(Installed.install_gate(), InstallGate::Proceed);
+    assert_eq!(Running.install_gate(), InstallGate::Proceed);
+    // A change under way offers neither Repair nor Enable, and does not let a
+    // connect run into a service whose start type is mid-change.
+    assert_eq!(ChangeInProgress.install_gate(), InstallGate::ChangeInProgress);
+}
+
+#[skuld::test]
+fn the_error_for_a_change_in_progress_says_so_and_asks_nothing() {
+    let text = CHANGE_IN_PROGRESS_ERROR.to_lowercase();
+    assert!(text.contains("in progress"), "{text}");
+    assert!(!text.contains('?'), "no prompt: {text}");
 }
 
 #[skuld::test]

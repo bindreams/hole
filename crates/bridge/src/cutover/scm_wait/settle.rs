@@ -17,6 +17,10 @@
 //!   if that look still asks for the same wait.** A restart that completed
 //!   between the first look and the arm leaves a RUNNING instance in a state
 //!   the arm excludes; the second look finds it and the loop stops it instead.
+//!
+//! Neither rule makes STOPPED final: a restart the SCM queued can land after
+//! the last look. A caller that needs the stop final disables the start type
+//! and restart-on-failure first, as the retirement and the update cutover do.
 
 use std::io;
 
