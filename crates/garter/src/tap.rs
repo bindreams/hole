@@ -37,7 +37,9 @@
 //!    one. A typed failure the inner
 //!    reports (`BindConflict` when another process took the internal port,
 //!    `Fatal`) becomes the tap's own, so the caller sees the same retryable
-//!    or terminal class. Bounded at 30s, covering an inner that drops its
+//!    or terminal class. When the tap is an intermediate hop, the chain
+//!    restarts it on that `BindConflict` (whatever address it names, not only the
+//!    tap's own), and the re-run's step 1 picks a fresh inner port. Bounded at 30s, covering an inner that drops its
 //!    readiness sender but keeps running. Every failed start from here on (that
 //!    timeout, a listener outside the given address, a failure the inner reports
 //!    while running, the step-4 bind) cancels the inner's token, a child of

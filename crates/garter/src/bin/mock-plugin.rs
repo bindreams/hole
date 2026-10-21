@@ -54,7 +54,7 @@ fn ignore_cooperative_signal() {
     unsafe { SetConsoleCtrlHandler(Some(absorb), true) }.expect("install a console control handler");
 }
 
-/// Knob: MOCK_PLUGIN_BIND_VERDICT=<file> — report the outcome of the listener bind: create `<file>` when it failed,
+/// Knob: `MOCK_PLUGIN_BIND_VERDICT=<file>` — report the outcome of the listener bind: create `<file>` when it failed,
 /// `<file>.bound` when it succeeded. A test that picked the port itself reads it to tell a lost race from its own
 /// failure (tests/common/lost_port.rs).
 fn record_bind_verdict(bound: bool) {

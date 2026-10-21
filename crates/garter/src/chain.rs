@@ -28,7 +28,8 @@ pub(crate) const DEFAULT_DRAIN_TIMEOUT: Duration =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainReady {
     /// The address the data-source-facing plugin is accepting on
-    /// (position 0 in Client mode, position N-1 in Server mode).
+    /// (position 0 in Client mode, position N-1 in Server mode). It is the address the
+    /// plugin reported binding, so a public port of 0 comes back as the port the plugin got.
     pub listen: SocketAddr,
     /// End-to-end transports: the intersection across all hops. A
     /// transport is carried only if every plugin in the chain serves it.

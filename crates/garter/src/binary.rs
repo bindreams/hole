@@ -23,6 +23,11 @@ pub enum ReadinessMode {
     ExpectSitrep,
     /// Self-probe `local` with a TCP connect, retried with backoff until it accepts.
     /// The conservative default for arbitrary / legacy plugins.
+    ///
+    /// A plugin readied this way cannot report a lost port. If it fails to bind, it exits untyped and the chain
+    /// fails with `Fatal` ("exited before becoming ready"); a chain restarts only a typed `BindConflict`, so it does
+    /// not restart this hop on a fresh intermediate port. If another process listens on the port, the probe connects
+    /// to that process and reports ready for it. A public `local_port` of 0 cannot be probed at all.
     #[default]
     Probe,
     /// Infer the strategy from the plugin's own sitrep `hello`, with NO timeout.

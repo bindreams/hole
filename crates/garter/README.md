@@ -41,11 +41,50 @@ byte-level diagnostics.
   (data-source-side first); in Server mode garter inverts the address
   wiring — including which plugin position faces the public endpoint.
   Per-plugin readiness is declared by each link (see the sitrep
-  protocol below) and aggregated by the runner.
+  protocol below); the runner reports the chain ready once every link has.
 
 Use `Mode::from_plugin_options(env.plugin_options.as_deref())` to derive
 the mode automatically from the SIP003 `server` keyword in
 `SS_PLUGIN_OPTIONS`.
+
+### Start order, restart and failure
+
+The hops start one at a time, each only after the hop it forwards to has
+reported ready. Plugins are added data-source-side first in both modes; the
+mode decides which end starts first.
+
+| Mode     | Starts first (forwards to the destination) | Starts last (listens on the public address) |
+| -------- | ------------------------------------------ | ------------------------------------------- |
+| `Client` | the last plugin added                      | the first plugin added                      |
+| `Server` | the first plugin added                     | the last plugin added                       |
+
+Every hop but the last-started listens on a loopback port the chain picks for
+it just before it starts. The port is free when picked, and another process may
+take it before the hop binds it. A hop that reports that as a `bind_conflict`
+(`StartError::BindConflict`) is stopped and run again on its own, on a fresh
+port, as often as it takes: the hops already running are not touched, and only a
+shutdown ends the retries. A conflict on the public address is the caller's, so
+the chain reports it. This makes `ChainPlugin::run` re-runnable: a plugin is a
+description of a hop, and `run` may be called again after it returned.
+
+`ChainRunner::run` returns `Error::StartFailed { plugin, cause }` whenever a hop
+fails to start, whether it reported a failure or ended before it was ready
+(whatever it returned). The chain cancels every plugin first, with or without an
+`on_ready` callback, and the start failure outranks the plugins' own exit
+errors and the drain timeout. A shutdown before the chain is ready is not a
+start failure.
+
+A public `local_port` of `0` is passed through to the hop, which picks its own
+port. The chain reports it in `ChainReady::listen` when the hop says which port
+it bound (sitrep `ready` carries `listen`).
+
+A hop that does not speak sitrep (`ReadinessMode::Probe`) cannot report a lost
+intermediate port. It exits without a typed conflict, so the chain fails with a
+`Fatal` "exited before becoming ready" start failure and does not restart it,
+and if another process now listens on that port the probe reports ready for that
+process instead. Use `ExpectSitrep` for a hop that is not the public one. A
+`TapPlugin` reports its inner plugin's typed conflict as its own, so a tap whose
+inner speaks sitrep is restarted, and the re-run picks a fresh inner port.
 
 ## sitrep protocol
 
