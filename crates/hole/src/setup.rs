@@ -88,9 +88,7 @@ impl BridgeInstallStatus {
         match self {
             BridgeInstallStatus::Running => InstallGate::Proceed,
             BridgeInstallStatus::Installed => InstallGate::Proceed,
-            BridgeInstallStatus::Disabled(DisabledBy::InterruptedUninstall) => {
-                InstallGate::Prompt(InstallPrompt::Repair)
-            }
+            BridgeInstallStatus::Disabled(DisabledBy::InterruptedChange) => InstallGate::Prompt(InstallPrompt::Repair),
             BridgeInstallStatus::Disabled(DisabledBy::Elsewhere) => InstallGate::Prompt(InstallPrompt::Enable),
             BridgeInstallStatus::ChangeInProgress => InstallGate::ChangeInProgress,
             BridgeInstallStatus::NotInstalled => InstallGate::Prompt(InstallPrompt::Install),

@@ -146,7 +146,7 @@ fn assert_a_disabled_service_has_its_record(at: &recording::Event) {
                 RecordState::Present,
                 "the service was left Disabled by a retirement with no record, at {at:?}"
             );
-            assert_eq!(by, Some(DisabledBy::InterruptedUninstall), "at {at:?}");
+            assert_eq!(by, Some(DisabledBy::InterruptedChange), "at {at:?}");
         }
         _ => assert_eq!(by, None, "a service that is not disabled was attributed, at {at:?}"),
     }
@@ -246,7 +246,7 @@ fn cutover_global_net_state_repair_resets_only_what_the_record_says_is_ours() {
             true,
             RepairStep::ResetThenClear,
             ServiceStartType::AutoStart,
-            Some(DisabledBy::InterruptedUninstall),
+            Some(DisabledBy::InterruptedChange),
         ),
         (
             ServiceStartType::OnDemand,
@@ -342,9 +342,9 @@ fn describe_key_read() -> String {
 /// leaves, and what happens to the record in the service's key. The service
 /// here is Disabled, has a record and is marked for deletion while the test's
 /// handle keeps it. If `QueryServiceConfig` answers Disabled and the record
-/// still reads present, `disabled_state()` is `Some(InterruptedUninstall)` and
+/// still reads present, `disabled_state()` is `Some(InterruptedChange)` and
 /// the GUI's status for a service that is being removed is
-/// `Disabled(InterruptedUninstall)`; if the key is gone or the read refused,
+/// `Disabled(InterruptedChange)`; if the key is gone or the read refused,
 /// the record reads as the key says (absent for a missing key, present for a
 /// refusal).
 ///

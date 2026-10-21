@@ -215,7 +215,7 @@ fn a_gui_reading_names_who_disabled_the_service_from_what_it_found() {
     let by = |record, start| for_display(observe(&mut FakeConfig::new(record, start)));
     assert_eq!(
         by(RecordState::Present, StartType::Disabled),
-        Some(DisabledBy::InterruptedUninstall)
+        Some(DisabledBy::InterruptedChange)
     );
     assert_eq!(
         by(RecordState::Absent, StartType::Disabled),

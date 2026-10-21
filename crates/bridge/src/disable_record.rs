@@ -36,7 +36,7 @@ pub enum RecordState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisabledBy {
     /// The record is present: an uninstall or an update of ours was interrupted.
-    InterruptedUninstall,
+    InterruptedChange,
     /// No record: an administrator, or a tool, other than Hole.
     Elsewhere,
 }
@@ -66,7 +66,7 @@ impl DisabledState {
 impl DisabledBy {
     pub fn of(state: RecordState) -> DisabledBy {
         match state {
-            RecordState::Present => DisabledBy::InterruptedUninstall,
+            RecordState::Present => DisabledBy::InterruptedChange,
             RecordState::Absent => DisabledBy::Elsewhere,
         }
     }

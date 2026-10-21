@@ -374,7 +374,7 @@ fn install_gate_offers_what_the_production_service_needs() {
         InstallGate::Prompt(InstallPrompt::Install)
     );
     assert_eq!(
-        install_gate_for(false, || Disabled(DisabledBy::InterruptedUninstall)),
+        install_gate_for(false, || Disabled(DisabledBy::InterruptedChange)),
         InstallGate::Prompt(InstallPrompt::Repair)
     );
     assert_eq!(

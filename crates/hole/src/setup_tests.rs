@@ -474,7 +474,7 @@ fn uninstall_keep_covers_tears_down_without_releasing() {
 
 const DISABLED_STATES: [DisabledState; 4] = [
     DisabledState::NotDisabled,
-    DisabledState::By(DisabledBy::InterruptedUninstall),
+    DisabledState::By(DisabledBy::InterruptedChange),
     DisabledState::By(DisabledBy::Elsewhere),
     DisabledState::InChange,
 ];
@@ -544,7 +544,7 @@ fn install_gate_per_variant() {
     use BridgeInstallStatus::*;
     assert_eq!(NotInstalled.install_gate(), InstallGate::Prompt(InstallPrompt::Install));
     assert_eq!(
-        Disabled(DisabledBy::InterruptedUninstall).install_gate(),
+        Disabled(DisabledBy::InterruptedChange).install_gate(),
         InstallGate::Prompt(InstallPrompt::Repair)
     );
     assert_eq!(
@@ -788,7 +788,7 @@ fn a_service_an_administrator_disabled_is_registered_disabled_not_started_and_th
 #[skuld::test]
 fn a_service_an_interrupted_uninstall_disabled_is_registered_automatic_and_started() {
     let (result, steps) = install_probe(InstallScript {
-        disabled_by: Ok(Some(DisabledBy::InterruptedUninstall)),
+        disabled_by: Ok(Some(DisabledBy::InterruptedChange)),
         installed: true,
         ..InstallScript::default()
     });

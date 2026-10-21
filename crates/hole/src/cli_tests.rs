@@ -1279,7 +1279,7 @@ fn bridge_status_prints_disabled_with_its_own_exit_code() {
     assert_eq!(status_report(Running), ("installed (running)", 0));
     assert_eq!(status_report(Installed), ("installed (stopped)", 1));
     assert_eq!(status_report(NotInstalled), ("not installed", 2));
-    for by in [DisabledBy::InterruptedUninstall, DisabledBy::Elsewhere] {
+    for by in [DisabledBy::InterruptedChange, DisabledBy::Elsewhere] {
         assert_eq!(status_report(Disabled(by)), ("installed (disabled)", 3), "{by:?}");
     }
     assert_eq!(status_report(ChangeInProgress), ("installed (being changed)", 4));

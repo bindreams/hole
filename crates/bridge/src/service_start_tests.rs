@@ -46,7 +46,7 @@ fn a_disabled_service_is_attributed_by_its_record_and_no_other_is_attributed() {
         for start in STARTS {
             let by = RepairStep::of(record, start).disabled_by();
             let expected = match (start, record) {
-                (StartType::Disabled, RecordState::Present) => Some(DisabledBy::InterruptedUninstall),
+                (StartType::Disabled, RecordState::Present) => Some(DisabledBy::InterruptedChange),
                 (StartType::Disabled, RecordState::Absent) => Some(DisabledBy::Elsewhere),
                 _ => None,
             };
@@ -61,7 +61,7 @@ fn a_disabled_service_is_attributed_by_its_record_and_no_other_is_attributed() {
 fn a_reinstall_keeps_only_an_administrators_disable() {
     assert_eq!(InstallStart::for_disabled_by(None), InstallStart::Automatic);
     assert_eq!(
-        InstallStart::for_disabled_by(Some(DisabledBy::InterruptedUninstall)),
+        InstallStart::for_disabled_by(Some(DisabledBy::InterruptedChange)),
         InstallStart::Automatic
     );
     assert_eq!(

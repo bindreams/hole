@@ -60,7 +60,7 @@ impl RepairStep {
         match self {
             RepairStep::Nothing => None,
             RepairStep::ClearRecordOnly => None,
-            RepairStep::ResetThenClear => Some(DisabledBy::InterruptedUninstall),
+            RepairStep::ResetThenClear => Some(DisabledBy::InterruptedChange),
             RepairStep::LeaveDisabled => Some(DisabledBy::Elsewhere),
         }
     }
@@ -83,7 +83,7 @@ impl InstallStart {
     pub fn for_disabled_by(disabled_by: Option<DisabledBy>) -> InstallStart {
         match disabled_by {
             None => InstallStart::Automatic,
-            Some(DisabledBy::InterruptedUninstall) => InstallStart::Automatic,
+            Some(DisabledBy::InterruptedChange) => InstallStart::Automatic,
             Some(DisabledBy::Elsewhere) => InstallStart::LeaveDisabled,
         }
     }
