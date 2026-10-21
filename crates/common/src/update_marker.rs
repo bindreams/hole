@@ -16,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use util::dir::{Dir, Staged};
+use util::dir::{Dir, EntryKind, Staged};
 
 /// Fixed marker filename (single-occupancy: one cutover per machine). The GUI
 /// finds it by this constant, not by enumeration.
@@ -142,12 +142,26 @@ fn readable_by_the_gui(_staged: &std::fs::File) -> io::Result<()> {
 /// Read the marker, distinguishing "no cutover was claimed" from "a cutover was
 /// claimed by a driver this build cannot identify" from "whether one was claimed
 /// could not be established".
+///
+/// Through a [`Dir`], for the GUI and the bridge alike: the bridge reads it as root
+/// or SYSTEM in a log directory a user may own, where a link or a FIFO planted at
+/// the name must be neither followed nor waited for.
 pub fn read(log_dir: &Path) -> Marker {
-    let path = log_dir.join(MARKER_FILE);
-    let bytes = match std::fs::read(&path) {
+    let dir = match Dir::open(log_dir, false, None) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Marker::Absent,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "whether an update marker exists could not be determined: the log directory could not be opened"
+            );
+            return Marker::Indeterminate;
+        }
+    };
+    let bytes = match dir.read(MARKER_FILE.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Marker::Absent,
-        Err(e) => return unopened(&path, &e),
+        Err(e) => return unopened(&dir, &e),
     };
     let info: MarkerInfo = match serde_json::from_slice(&bytes) {
         Ok(info) => info,
@@ -167,34 +181,31 @@ pub fn read(log_dir: &Path) -> Marker {
     Marker::Present(info)
 }
 
-/// Classify a marker that could not be OPENED. Presence comes from an existence
-/// probe, never from the open's error: a failed open is not evidence a file is
-/// there. A claim requires a regular FILE — anything else at that path is not a
-/// marker and asserts nothing about a cutover. `symlink_metadata` does not follow
-/// the link, so a symlink is classified as the anomaly it is instead of being
-/// resolved to whatever it points at; the marker is only ever published by rename
-/// or hard link, so hole never creates one.
-fn unopened(path: &Path, open_error: &io::Error) -> Marker {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() => {
-            tracing::warn!(error = %open_error, "update marker exists but could not be read");
+/// Classify a marker that could not be READ. Presence comes from asking the directory what the name is, never from
+/// the read's error: a failed read is not evidence a file is there. A claim requires a regular FILE; anything else
+/// at the name (a link, a FIFO, a directory) is not a marker and asserts nothing about a cutover. The name is never
+/// followed, so a link is classified as the anomaly it is instead of being resolved to whatever it points at; the
+/// marker is only ever published by rename or hard link, so hole never creates one.
+fn unopened(dir: &Dir, read_error: &io::Error) -> Marker {
+    match dir.kind_of(MARKER_FILE.as_ref()) {
+        Ok(Some(EntryKind::File)) => {
+            tracing::warn!(error = %read_error, "update marker exists but could not be read");
             Marker::Unreadable
         }
         // `error!`, not `warn!`: unlike a failed probe this is not an environmental
-        // io failure, it is a path nothing in hole can produce.
-        Ok(meta) => {
+        // io failure, it is a name nothing in hole can produce.
+        Ok(Some(kind)) => {
             tracing::error!(
-                file_type = ?meta.file_type(),
-                open_error = %open_error,
-                "the update marker path holds something that is not a regular file; \
-                 it claims no cutover"
+                ?kind,
+                read_error = %read_error,
+                "the update marker name holds something that is not a regular file;                  it claims no cutover"
             );
             Marker::Indeterminate
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Marker::Absent,
+        Ok(None) => Marker::Absent,
         Err(e) => {
             tracing::warn!(
-                open_error = %open_error,
+                read_error = %read_error,
                 probe_error = %e,
                 "whether an update marker exists could not be determined"
             );

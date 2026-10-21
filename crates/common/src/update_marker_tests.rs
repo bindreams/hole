@@ -419,3 +419,57 @@ fn the_marker_goes_to_the_owner_by_either_publisher_when_the_os_allows() {
     write_new(dir.path(), &info(2), owner).unwrap();
     assert_eq!(owner_of_marker() == foreign, allowed, "write_new");
 }
+
+// A name the user planted ---------------------------------------------------------------------------------------------
+//
+// The bridge reads the marker as root or SYSTEM in a log directory the user may own.
+
+fn marker_reader() -> util::dir::testing::Reader<'static> {
+    util::dir::testing::Reader {
+        file: MARKER_FILE,
+        write_valid: &|dir| write(dir, &info(4242), None).unwrap(),
+        reads_it: &|dir| matches!(read(dir), Marker::Present(_)),
+    }
+}
+
+#[skuld::test]
+fn a_symlink_at_the_marker_is_not_read_through() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    util::dir::testing::planted_name_is_not_read(
+        tmp.path(),
+        util::dir::testing::PlantedName::SymlinkToFile,
+        &marker_reader(),
+    )
+    .unwrap();
+}
+
+#[skuld::test]
+fn a_symlink_at_the_marker_claims_no_cutover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    write(&real, &info(4242), None).unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(real.join(MARKER_FILE), state.join(MARKER_FILE)).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(real.join(MARKER_FILE), state.join(MARKER_FILE)).unwrap();
+
+    assert!(matches!(read(&state), Marker::Indeterminate), "{:?}", read(&state));
+    assert!(!is_present(&state));
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_fifo_at_the_marker_claims_no_cutover_and_is_not_waited_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    util::dir::testing::planted_name_is_not_read(tmp.path(), util::dir::testing::PlantedName::Fifo, &marker_reader())
+        .unwrap();
+
+    // The directory `planted_name_is_not_read` read holds the FIFO.
+    let state = tmp.path().join("state");
+    assert!(matches!(read(&state), Marker::Indeterminate), "{:?}", read(&state));
+    assert!(!is_present(&state));
+}

@@ -32,6 +32,60 @@ pub fn plant_link(target: &Path, link: &Path) {
     own(link);
 }
 
+/// What a user can plant at the name a privileged reader reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlantedName {
+    /// A symbolic link to a valid file elsewhere.
+    SymlinkToFile,
+    /// A FIFO nobody writes to: a read of it by name waits for a writer that never comes.
+    #[cfg(unix)]
+    Fifo,
+}
+
+/// Every [`PlantedName`] the platform has.
+#[cfg(unix)]
+pub const PLANTED_NAMES: &[PlantedName] = &[PlantedName::SymlinkToFile, PlantedName::Fifo];
+/// Every [`PlantedName`] the platform has.
+#[cfg(windows)]
+pub const PLANTED_NAMES: &[PlantedName] = &[PlantedName::SymlinkToFile];
+
+/// One privileged reader of the file `file` in a state directory, for [`planted_name_is_not_read`].
+pub struct Reader<'a> {
+    /// The file the reader reads.
+    pub file: &'a str,
+    /// Writes a valid file `file` into the directory it is given: one whose content the reader reports.
+    pub write_valid: &'a dyn Fn(&Path),
+    /// Reads the directory and says whether it reported the content `write_valid` wrote.
+    pub reads_it: &'a dyn Fn(&Path) -> bool,
+}
+
+/// Plants `kind` at the reader's file in a fresh state directory below `scratch` (an empty folder the test owns), then
+/// reads it. `Err` if the reader reported the valid file the name leads to (it read through a link), or if the
+/// control read of a real valid file did not report it. A reader that opens a FIFO by name waits here forever.
+pub fn planted_name_is_not_read(scratch: &Path, kind: PlantedName, reader: &Reader) -> Result<(), String> {
+    let real = scratch.join("real");
+    let state = scratch.join("state");
+    std::fs::create_dir(&real).map_err(|err| err.to_string())?;
+    std::fs::create_dir(&state).map_err(|err| err.to_string())?;
+    (reader.write_valid)(&real);
+    if !(reader.reads_it)(&real) {
+        return Err(format!("control: the reader did not report the valid {}", reader.file));
+    }
+    let at = state.join(reader.file);
+    match kind {
+        PlantedName::SymlinkToFile => platform::file_link(&real.join(reader.file), &at),
+        #[cfg(unix)]
+        PlantedName::Fifo => platform::fifo(&at),
+    }
+    if (reader.reads_it)(&state) {
+        return Err(format!(
+            "{kind:?} planted at {}: the reader read through it",
+            reader.file
+        ));
+    }
+    Ok(())
+}
+
 /// A name nothing in a folder the system owns has, removed again when dropped: the place to look for what a
 /// walk wrongly made in that folder.
 pub struct SystemScratch {
@@ -98,6 +152,17 @@ mod platform {
         std::os::unix::fs::symlink(target, link).unwrap();
     }
 
+    pub(super) fn file_link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    pub(super) fn fifo(at: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(at.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
     pub(super) fn system_scratch() -> PathBuf {
         PathBuf::from("/tmp")
     }
@@ -133,6 +198,10 @@ mod platform {
             .expect("enable the restore privilege (a token without it cannot give a file to another owner)");
         super::super::windows::set_owner(&file, &USERS)
             .unwrap_or_else(|err| panic!("give {path:?} to the Users group: {err}"));
+    }
+
+    pub(super) fn file_link(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
     }
 
     pub(super) fn link(target: &Path, link: &Path) {
