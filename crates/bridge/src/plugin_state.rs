@@ -117,7 +117,9 @@ pub fn load(state_dir: &Path) -> Loaded {
             Loaded::Unusable
         }
         Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), file = STATE_FILE_NAME, "plugin-state parse failed");
+            // The error quotes the file, which the user may have put there: keep its position, not its text.
+            let e = util::parse_error::ParseFailure::from(&e);
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "plugin-state parse failed");
             Loaded::Unusable
         }
     }

@@ -64,8 +64,8 @@ pub enum PlantedName {
     #[cfg(unix)]
     Fifo,
     /// A second name for a valid file elsewhere (a hard link). The file belongs to whoever runs the test, so this
-    /// name is refused when the runner is the system ([`runner_is_the_system`]: a user cannot make a file the system
-    /// owns with one name, and the planted one has two), and is the runner's own file, read, when it is a user.
+    /// name is refused when the runner is the system ([`runner_is_the_system`]: the file keeps its owner and the
+    /// planted name gives it a second link), and is the runner's own file, read, when it is a user.
     HardLink,
 }
 

@@ -204,7 +204,7 @@ fn a_file_the_system_owns_with_one_name_is_read_from_any_folder() {
 
 #[skuld::test]
 fn a_file_the_system_owns_with_a_second_name_is_never_read() {
-    // The second name is a hard link a user planted: the system never made a file with two.
+    // The second name is a hard link a user planted: the system's files in a state folder have one.
     assert!(!may_read(ROOT, 2, user(1)));
     assert!(!may_read(ROOT, 2, ROOT));
     assert!(!may_read(ROOT, 1000, user(1)));

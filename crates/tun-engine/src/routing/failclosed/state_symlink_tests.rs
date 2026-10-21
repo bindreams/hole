@@ -244,3 +244,81 @@ fn no_state_reader_waits_on_a_fifo_planted_at_its_name() {
 
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+// What a reader says about a file it cannot parse ---------------------------------------------------------------------
+//
+// A user can put a file they cannot read at a state name: a system file moved into their folder keeps its owner and
+// its one link. The parse failure the reader logs goes to `bridge.log`, which the elevated bridge hands to the user,
+// so it carries a category and a position and never a fragment of the file.
+
+const ECHOED_SECRET: &str = "hunter2-SECRET";
+
+/// The warnings `read` logs when `file` in a fresh folder holds a `version` that is a string where a number belongs:
+/// `serde_json`'s own message for that quotes the string.
+fn warnings_for_a_file_that_quotes_a_secret(file: &str, read: fn(&std::path::Path)) -> String {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(file), format!(r#"{{"version":"{ECHOED_SECRET}"}}"#)).unwrap();
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        read(tmp.path());
+    }
+    writer.snapshot()
+}
+
+/// A reader that logs a parse failure: its name, the file it reads, and a call of it.
+type ParseFailureReader = (&'static str, &'static str, fn(&std::path::Path));
+
+fn parse_failure_readers() -> Vec<ParseFailureReader> {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut readers: Vec<ParseFailureReader> = vec![
+        ("lockdown_state::load_intent", lockdown_state::STATE_FILE_NAME, |dir| {
+            let _ = lockdown_state::load_intent(dir);
+        }),
+        ("boottime_witness::load", boottime_witness::STATE_FILE_NAME, |dir| {
+            let _ = boottime_witness::load(dir);
+        }),
+    ];
+    #[cfg(target_os = "macos")]
+    {
+        use super::{failclosed_state, lockdown_pf_state};
+        readers.push((
+            "failclosed_state::load_presence",
+            failclosed_state::STATE_FILE_NAME,
+            |dir| {
+                let _ = failclosed_state::load_presence(dir);
+            },
+        ));
+        readers.push((
+            "lockdown_pf_state::load_presence",
+            lockdown_pf_state::STATE_FILE_NAME,
+            |dir| {
+                let _ = lockdown_pf_state::load_presence(dir);
+            },
+        ));
+    }
+    readers
+}
+
+#[skuld::test]
+fn no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse() {
+    let mut failures = Vec::new();
+    for (name, file, read) in parse_failure_readers() {
+        let logs = warnings_for_a_file_that_quotes_a_secret(file, read);
+        if logs.contains(ECHOED_SECRET) {
+            failures.push(format!("{name} logged the file's content: {logs}"));
+        } else if !logs.contains("line 1") {
+            failures.push(format!("{name}: the warning lost its position: {logs}"));
+        }
+    }
+
+    assert!(failures.is_empty(), "{failures:#?}");
+}

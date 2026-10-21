@@ -80,7 +80,9 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
             StateFile::unusable(&bytes)
         }
         Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), file = STATE_FILE_NAME, "failclosed-state parse failed");
+            // The error quotes the file, which the user may have put there: keep its position, not its text.
+            let e = util::parse_error::ParseFailure::from(&e);
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "failclosed-state parse failed");
             StateFile::unusable(&bytes)
         }
     }

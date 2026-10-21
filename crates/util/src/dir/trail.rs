@@ -45,9 +45,10 @@ impl<Id: PartialEq> Owner<Id> {
 
 /// Whether a file `file` owns, with `links` names, in a folder `dir` reads the owner of, may be read by a privileged
 /// reader: one the folder's own user owns (their own file, whatever links it has), or one the system owns that has no
-/// second name. A user cannot make a file the system owns with one name, and a hard link they plant at a name to
-/// another user's file or to one the system owns is neither. The folder's owner is read only when the file is a
-/// user's.
+/// second name. This refuses a second name a user adds, by a hard link, to a file they do not own: the file keeps its
+/// owner and gains a link. It does not refuse a file the system owns that the user moved into the folder, which keeps
+/// its owner and its one link; what a reader of such a file may log is the reader's own rule, not this one. The
+/// folder's owner is read only when the file is a user's.
 pub(super) fn may_read<Id: PartialEq>(
     file: &Owner<Id>,
     links: u64,
