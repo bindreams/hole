@@ -286,7 +286,9 @@ before editing; the sections linked below are the authoritative source.
   handle it leaked deleted the rule instead of policing it.
   [→](CONTRIBUTING.md#fail-closed-cover)
 - **Privileged code in a folder a user may own walks through handles** —
-  `util::dir::Dir`, never a path call. A link is followed only if the walk never
+  `util::dir::Dir` (or `ReadDir`, for code that only reads), never a path call.
+  The walk gets the path as given: never `canonicalize` it first, which follows
+  every link with no rule. A link is followed only if the walk never
   moves from a folder an unprivileged user owns into one somebody else owns (a
   system-owned link stays trusted, a user's link to their own folder is followed,
   a user's link into the system's or another account's is refused); the final name
