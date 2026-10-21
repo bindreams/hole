@@ -214,7 +214,7 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
         let entry = match fstatat_nofollow(cur.fd.as_raw_fd(), &cname) {
             Ok(entry) => entry,
             Err(err) if err.kind() == io::ErrorKind::NotFound && create => {
-                walk.trail.create_in(&cur.owner()?).map_err(Refusal::into_io_error)?;
+                walk.trail.create_in(|| cur.owner())?;
                 // SAFETY: `cname` is a valid NUL-terminated string and `cur` an open directory.
                 match check(unsafe { libc::mkdirat(cur.fd.as_raw_fd(), cname.as_ptr(), 0o777) }) {
                     Ok(_) => {
@@ -278,7 +278,7 @@ pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, cal
         }
     }
 
-    walk.trail.end_at(&cur.owner()?).map_err(Refusal::into_io_error)?;
+    walk.trail.end_at(|| cur.owner())?;
     if let Some((uid, _)) = owner {
         let found = fstat(cur.fd.as_raw_fd())?.uid;
         if found != uid && found != caller {

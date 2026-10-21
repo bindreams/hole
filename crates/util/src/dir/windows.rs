@@ -284,6 +284,28 @@ fn dir_rights(last: bool) -> FILE_ACCESS_RIGHTS {
     }
 }
 
+/// What a component of the walk is opened with.
+#[derive(Clone, Copy)]
+struct Rights {
+    wanted: FILE_ACCESS_RIGHTS,
+    /// `READ_CONTROL` is only for judging the folder's owner, which a walk that follows no link and creates nothing
+    /// never does: a folder the caller may traverse but not read the permissions of (an ordinary user in
+    /// `%SystemRoot%\Temp`) is still on its path.
+    owner_optional: bool,
+}
+
+/// `name` in `root` (an absolute NT path when `root` is `None`) as a directory, opened as itself with `rights`; and
+/// whether its owner can be read, which is not so when the open had to do without `READ_CONTROL`.
+fn open_walked(root: Option<&File>, name: &[u16], rights: Rights) -> io::Result<(File, bool)> {
+    let open = |wanted| nt_open(root, name, wanted, SHARE_ALL, FILE_OPEN, options(OPEN_AS_ITSELF));
+    match open(rights.wanted) {
+        Err(err) if rights.owner_optional && err.kind() == io::ErrorKind::PermissionDenied => {
+            open(FILE_ACCESS_RIGHTS(rights.wanted.0 & !READ_CONTROL.0)).map(|file| (file, false))
+        }
+        result => result.map(|file| (file, true)),
+    }
+}
+
 const OPEN_AS_ITSELF: &[NTCREATEFILE_CREATE_OPTIONS] = &[FILE_OPEN_REPARSE_POINT, FILE_OPEN_FOR_BACKUP_INTENT];
 
 /// What the entry `name` in `dir` is, whether or not it can be opened for use.
@@ -313,6 +335,8 @@ enum Entry {
 /// A directory the walk stands in.
 struct Standing {
     file: File,
+    /// Whether [`owner_of`] works on `file`.
+    owner_readable: bool,
     entry: Entry,
     /// Opened with the rights a final directory needs. A directory the walk came back to through `..` was not.
     complete: bool,
@@ -321,7 +345,13 @@ struct Standing {
 impl Standing {
     /// The directory's owner as the rule judges it.
     fn owner(&self) -> io::Result<Owner<Sid>> {
-        owner_of(&self.file)
+        match self.owner_readable {
+            true => owner_of(&self.file),
+            false => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the owner of a folder on the path cannot be read",
+            )),
+        }
     }
 }
 
@@ -340,13 +370,14 @@ impl Walk {
 }
 
 /// The NT root `root` as a directory.
-fn open_root(root: &[u16], rights: FILE_ACCESS_RIGHTS, complete: bool) -> io::Result<Standing> {
-    let file = nt_open(None, root, rights, SHARE_ALL, FILE_OPEN, options(OPEN_AS_ITSELF))?;
+fn open_root(root: &[u16], rights: Rights, complete: bool) -> io::Result<Standing> {
+    let (file, owner_readable) = open_walked(None, root, rights)?;
     if kind_from(&file)? != EntryKind::Directory {
         return Err(Refusal::NotDirectory.into_io_error());
     }
     Ok(Standing {
         file,
+        owner_readable,
         entry: Entry::Root(root.to_vec()),
         complete,
     })
@@ -379,7 +410,7 @@ fn reparse_data(link: &File) -> io::Result<Vec<u8>> {
 /// Follows the link `link` (open as itself, with `READ_CONTROL`), which sits in the directory the walk
 /// stands in: judges it, and puts what it points at in front of the walk's steps.
 fn follow(walk: &mut Walk, link: &File) -> io::Result<()> {
-    let dir_owner = owner_of(&walk.here().file)?;
+    let dir_owner = walk.here().owner()?;
     walk.trail
         .follow(&dir_owner, &owner_of(link)?)
         .map_err(Refusal::into_io_error)?;
@@ -392,21 +423,16 @@ fn follow(walk: &mut Walk, link: &File) -> io::Result<()> {
 /// Opens the directory `name` in the directory the walk stands in (a missing one is created when `create`), or
 /// makes progress towards it: `Ok(Some(next))` is the directory; `Ok(None)` is a followed link whose target was
 /// put in front of the walk's steps.
-fn descend(
-    walk: &mut Walk,
-    name: &OsStr,
-    create: bool,
-    rights: FILE_ACCESS_RIGHTS,
-    last: bool,
-) -> io::Result<Option<Standing>> {
+fn descend(walk: &mut Walk, name: &OsStr, create: bool, rights: Rights, last: bool) -> io::Result<Option<Standing>> {
     let name = wide(name)?;
     loop {
         let cur = &walk.here().file;
-        let open_err = match nt_open(Some(cur), &name, rights, SHARE_ALL, FILE_OPEN, options(OPEN_AS_ITSELF)) {
-            Ok(handle) => {
+        let open_err = match open_walked(Some(cur), &name, rights) {
+            Ok((handle, owner_readable)) => {
                 return match kind_from(&handle)? {
                     EntryKind::Directory => Ok(Some(Standing {
                         file: handle,
+                        owner_readable,
                         entry: Entry::Name(name),
                         complete: last,
                     })),
@@ -419,13 +445,11 @@ fn descend(
         // The rights for use may be what was refused; what the entry is decides.
         match classify(cur, &name) {
             Ok(None) if create => {
-                walk.trail
-                    .create_in(&walk.here().owner()?)
-                    .map_err(Refusal::into_io_error)?;
+                walk.trail.create_in(|| walk.here().owner())?;
                 match nt_open(
                     Some(&walk.here().file),
                     &name,
-                    rights,
+                    rights.wanted,
                     SHARE_ALL,
                     FILE_CREATE,
                     options(&[FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT]),
@@ -438,6 +462,7 @@ fn descend(
                         }
                         return Ok(Some(Standing {
                             file: handle,
+                            owner_readable: true,
                             entry: Entry::Name(name),
                             complete: last,
                         }));
@@ -495,8 +520,15 @@ pub(super) fn open_dir(path: &Path, create: bool, _owner: Option<(u32, u32)>, _c
 /// [`open_dir`] with `extra` rights on the final directory.
 pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS) -> io::Result<File> {
     let rights_for = |last| match last {
-        true => access(&[dir_rights(true), extra]),
-        false => dir_rights(false),
+        true => Rights {
+            wanted: access(&[dir_rights(true), extra]),
+            // An ACL the caller asked to read and rewrite is not optional.
+            owner_optional: extra.0 == 0,
+        },
+        false => Rights {
+            wanted: dir_rights(false),
+            owner_optional: true,
+        },
     };
     let (root, names) = split(path)?;
     let mut walk = Walk {
@@ -527,13 +559,11 @@ pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS
         }
     }
 
-    walk.trail
-        .end_at(&walk.here().owner()?)
-        .map_err(Refusal::into_io_error)?;
+    walk.trail.end_at(|| walk.here().owner())?;
     let end = walk.stack.pop().expect("a walk always stands in a directory");
     match end.complete {
         true => Ok(end.file),
-        false => reopen_complete(&walk, end, rights_for(true)),
+        false => reopen_complete(&walk, end, rights_for(true).wanted),
     }
 }
 

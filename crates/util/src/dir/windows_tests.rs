@@ -115,6 +115,29 @@ fn a_directory_symlink_the_system_owns_in_a_folder_the_system_owns_is_followed()
     assert_eq!(super::file_id(dir.file()).unwrap(), file_id(Path::new(real)));
 }
 
+/// Removes the folder when dropped.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[skuld::test]
+fn a_folder_the_caller_may_pass_through_but_not_read_the_acl_of_is_walked_through() {
+    // `%SystemRoot%\Temp` lets an ordinary user traverse it and add to it, but not read its permissions, so the
+    // by-path walk this replaced got through it (a `HOLE_LOG_DIR` there is a real setting of the GUI). A walk that
+    // asks every folder for `READ_CONTROL` fails there as an ordinary user and passes as an administrator.
+    let temp = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot names the Windows folder")).join("Temp");
+    let made = temp.join(format!("hole-dir-test-acl-{}", std::process::id()));
+    let _remove = RemoveOnDrop(made.clone());
+
+    Dir::open(&made.join("below"), true, None).unwrap();
+
+    assert!(made.join("below").is_dir());
+}
+
 #[skuld::test]
 fn a_users_junction_to_a_folder_the_same_user_owns_is_followed() {
     // A profile folder moved to another disk and linked back.

@@ -6,6 +6,20 @@ fn user(id: u32) -> Owner<u32> {
     Owner::User(id)
 }
 
+/// What `Trail::end_at` says of a walk ending in a folder `owner` owns.
+fn end_at(trail: &Trail<u32>, owner: Owner<u32>) -> Result<(), Refusal> {
+    trail
+        .end_at(|| Ok(owner))
+        .map_err(|err| *Refusal::from_error(&err).expect("a refusal"))
+}
+
+/// What `Trail::create_in` says of creating in a folder `owner` owns.
+fn create_in(trail: &Trail<u32>, owner: Owner<u32>) -> Result<(), Refusal> {
+    trail
+        .create_in(|| Ok(owner))
+        .map_err(|err| *Refusal::from_error(&err).expect("a refusal"))
+}
+
 /// More links than any test follows.
 const PLENTY: usize = 1000;
 
@@ -36,9 +50,9 @@ fn a_privileged_link_in_a_privileged_folder_is_followed_and_binds_nothing() {
 
     assert_eq!(trail.follow(&ROOT, &ROOT), Ok(()));
 
-    assert_eq!(trail.end_at(&ROOT), Ok(()));
-    assert_eq!(trail.end_at(&user(1)), Ok(()));
-    assert_eq!(trail.create_in(&ROOT), Ok(()));
+    assert_eq!(end_at(&trail, ROOT), Ok(()));
+    assert_eq!(end_at(&trail, user(1)), Ok(()));
+    assert_eq!(create_in(&trail, ROOT), Ok(()));
 }
 
 #[skuld::test]
@@ -78,7 +92,7 @@ fn a_refused_link_binds_nothing() {
     let mut trail = Trail::new(PLENTY);
     trail.follow(&user(1), &user(2)).unwrap_err();
 
-    assert_eq!(trail.end_at(&ROOT), Ok(()));
+    assert_eq!(end_at(&trail, ROOT), Ok(()));
 }
 
 // end_at and create_in ------------------------------------------------------------------------------------------------
@@ -88,9 +102,9 @@ fn a_walk_that_followed_a_users_link_ends_only_in_that_users_folder() {
     let mut trail = Trail::new(PLENTY);
     trail.follow(&ROOT, &user(1)).unwrap();
 
-    assert_eq!(trail.end_at(&user(1)), Ok(()));
-    assert_eq!(trail.end_at(&ROOT), Err(Refusal::Symlink));
-    assert_eq!(trail.end_at(&user(2)), Err(Refusal::Symlink));
+    assert_eq!(end_at(&trail, user(1)), Ok(()));
+    assert_eq!(end_at(&trail, ROOT), Err(Refusal::Symlink));
+    assert_eq!(end_at(&trail, user(2)), Err(Refusal::Symlink));
 }
 
 #[skuld::test]
@@ -98,9 +112,9 @@ fn a_walk_that_followed_a_users_link_creates_only_in_that_users_folder() {
     let mut trail = Trail::new(PLENTY);
     trail.follow(&ROOT, &user(1)).unwrap();
 
-    assert_eq!(trail.create_in(&user(1)), Ok(()));
-    assert_eq!(trail.create_in(&ROOT), Err(Refusal::Symlink));
-    assert_eq!(trail.create_in(&user(2)), Err(Refusal::Symlink));
+    assert_eq!(create_in(&trail, user(1)), Ok(()));
+    assert_eq!(create_in(&trail, ROOT), Err(Refusal::Symlink));
+    assert_eq!(create_in(&trail, user(2)), Err(Refusal::Symlink));
 }
 
 #[skuld::test]
@@ -108,8 +122,8 @@ fn a_walk_that_followed_no_users_link_ends_and_creates_anywhere() {
     let trail = Trail::<u32>::new(PLENTY);
 
     for folder in [ROOT, user(1)] {
-        assert_eq!(trail.end_at(&folder), Ok(()));
-        assert_eq!(trail.create_in(&folder), Ok(()));
+        assert_eq!(end_at(&trail, folder.clone()), Ok(()));
+        assert_eq!(create_in(&trail, folder), Ok(()));
     }
 }
 
@@ -150,4 +164,27 @@ fn the_first_users_link_names_the_user_the_walk_is_bound_to() {
     trail.follow(&ROOT, &user(7)).unwrap();
 
     assert_eq!(trail.led_by(), Some(&7));
+}
+
+// the owner is read only when it is judged ============================================================================
+
+#[skuld::test]
+fn a_walk_bound_to_no_one_never_reads_a_folders_owner() {
+    let trail = Trail::<u32>::new(PLENTY);
+    let unreadable = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
+
+    assert!(trail.end_at(unreadable).is_ok());
+    assert!(trail.create_in(unreadable).is_ok());
+}
+
+#[skuld::test]
+fn a_walk_bound_to_a_user_that_cannot_read_a_folders_owner_does_not_proceed() {
+    let mut trail = Trail::<u32>::new(PLENTY);
+    trail.follow(&ROOT, &user(1)).unwrap();
+    let unreadable = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
+
+    assert_eq!(
+        trail.end_at(unreadable).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
 }

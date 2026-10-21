@@ -19,6 +19,8 @@
 //!
 //! The final name of a file operation is not a step of the walk and is never followed.
 
+use std::io;
+
 use super::Refusal;
 
 /// Who owns a folder or a link, as far as the rule cares: the system, or one unprivileged principal.
@@ -83,21 +85,23 @@ impl<Id: Clone + PartialEq> Trail<Id> {
         Ok(())
     }
 
-    /// Admits creating a folder in `dir`.
-    pub(super) fn create_in(&self, dir: &Owner<Id>) -> Result<(), Refusal> {
+    /// Admits creating a folder in the folder whose owner `dir` reads.
+    pub(super) fn create_in(&self, dir: impl FnOnce() -> io::Result<Owner<Id>>) -> io::Result<()> {
         self.stays_with_the_link_owner(dir)
     }
 
-    /// Admits the walk's last folder being `dir`.
-    pub(super) fn end_at(&self, dir: &Owner<Id>) -> Result<(), Refusal> {
+    /// Admits the walk's last folder being the one whose owner `dir` reads.
+    pub(super) fn end_at(&self, dir: impl FnOnce() -> io::Result<Owner<Id>>) -> io::Result<()> {
         self.stays_with_the_link_owner(dir)
     }
 
-    fn stays_with_the_link_owner(&self, dir: &Owner<Id>) -> Result<(), Refusal> {
-        match (&self.led_by, dir) {
-            (None, _) => Ok(()),
-            (Some(led_by), Owner::User(owner)) if led_by == owner => Ok(()),
-            (Some(_), _) => Err(Refusal::Symlink),
+    /// A walk bound to no one has nothing to stay with and does not read the owner at all: a folder whose
+    /// permissions the caller cannot read is still on a path no link led to.
+    fn stays_with_the_link_owner(&self, dir: impl FnOnce() -> io::Result<Owner<Id>>) -> io::Result<()> {
+        let Some(led_by) = &self.led_by else { return Ok(()) };
+        match dir()? {
+            Owner::User(owner) if &owner == led_by => Ok(()),
+            _ => Err(Refusal::Symlink.into_io_error()),
         }
     }
 }
