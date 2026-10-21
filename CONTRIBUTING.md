@@ -2004,8 +2004,17 @@ state read before its act loses that race, so four rules close it:
   would hold the machine-wide lock for ever; the service is Disabled, so
   nothing starts another. A scan that finds the process the SCM named does not
   make it an orphan, and the SCM naming a process a scan found first makes it
-  the service's. While the service is not STOPPED, the wait is for the
-  process's own exit.
+  the service's only in a state whose id is documented valid
+  (`ReportedPid::is_a_claim_about_the_service`: RUNNING): an id read in
+  START_PENDING or STOP_PENDING may name any process. While the service is not
+  STOPPED, the wait covers only the processes the SCM named
+  (`ProcessHolds::awaited`): an orphan has no Stop on its way and may be a live
+  bridge's plugin still being torn down, so it is neither waited on nor
+  terminated until the SCM reports STOPPED or the entry is gone. A service
+  marked for deletion refuses every arm, so there the loop has no event but a
+  named process's exit; with only an orphan alive outside STOPPED it has none,
+  and the result is the SCM's refusal of the arm (as for any live state with
+  nothing to wait on), not a wait on the orphan.
 - **A process id the SCM names is a claim; the service SID in the token is the
   identity.** Microsoft documents that the id
   ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks))

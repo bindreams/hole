@@ -288,3 +288,41 @@ fn the_terminating_wait_waits_on_the_services_own_process_and_ends_only_the_orph
         .expect("the wait ends once both are gone");
     orphan.release_and_wait();
 }
+
+/// Outside STOPPED the wait is on the service's own process only: an orphan a
+/// scan found beside it has no Stop on its way and is not waited out. The wait
+/// returns once the service's process has exited, with the orphan still alive;
+/// the test ends the orphan afterwards.
+#[skuld::test]
+fn the_wait_on_their_own_covers_the_services_process_and_not_an_orphan() {
+    // The orphan is spawned first: a child inherits the control sockets of the
+    // children spawned before it, which would keep their EOF from arriving.
+    let mut orphan = EchoChild::spawn();
+    let mut service = EchoChild::spawn();
+    let mut processes = ServiceProcesses::default();
+    processes
+        .look(&mut NamesChild(service.pid()))
+        .expect("hold the named process");
+    processes.holds.adopt(orphan.pid(), open_for_waiting(orphan.pid()));
+    let orphan_alive = open_for_waiting(orphan.pid());
+
+    let (done, returned) = std::sync::mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        let waited = processes.await_exits(ExitWait::OnTheirOwn);
+        let orphan_up = !has_exited(&orphan_alive).expect("state read");
+        done.send(()).expect("the test is listening");
+        (waited, orphan_up)
+    });
+    let status = service.release_and_wait();
+    assert!(
+        status.success(),
+        "the service's own process was not ended by the wait: {status:?}"
+    );
+    returned
+        .recv()
+        .expect("the wait returns once the service's process has exited");
+    orphan.release_and_wait();
+    let (waited, orphan_up) = waiting.join().expect("the wait did not panic");
+    waited.expect("the wait ends");
+    assert!(orphan_up, "the orphan was waited out or ended");
+}

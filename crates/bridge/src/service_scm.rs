@@ -75,6 +75,17 @@ pub enum ReportedPid {
 }
 
 impl ReportedPid {
+    /// Whether an id the SCM names in this state is evidence that the process
+    /// under it is the service's own. Where the id may be invalid it can name any
+    /// process, so it is not.
+    pub fn is_a_claim_about_the_service(self) -> bool {
+        match self {
+            ReportedPid::Valid => true,
+            ReportedPid::MayBeInvalid => false,
+            ReportedPid::Never => false,
+        }
+    }
+
     /// Whether an id that no process has means the service's process has
     /// exited. Only where the id is valid is that a fact about the service;
     /// where it may be invalid it is a fact about the id.

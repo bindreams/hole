@@ -15,6 +15,7 @@ fn running() -> Look {
         observed: Observed::Running,
         fate: ProcessFate::Alive,
         held_alive: true,
+        named_alive: true,
         ever_held: true,
     }
 }
@@ -25,6 +26,7 @@ fn stopped() -> Look {
         observed: Observed::Stopped,
         fate: ProcessFate::Unheld,
         held_alive: false,
+        named_alive: false,
         ever_held: true,
     }
 }
@@ -276,6 +278,7 @@ fn each_failure_before_the_delete_restores_and_returns_its_own_variant() {
                         observed: Observed::StopPending,
                         fate: ProcessFate::Unheld,
                         held_alive: false,
+                        named_alive: false,
                         ever_held: false,
                     }],
                 )
@@ -740,6 +743,7 @@ fn a_mark_at_the_first_arm_is_waited_out_on_the_held_process() {
         observed: Observed::StartPending,
         fate: ProcessFate::Alive,
         held_alive: true,
+        named_alive: true,
         ever_held: true,
     };
     for disposition in [Disposition::StopOnly, Disposition::Deregister] {
@@ -778,6 +782,7 @@ fn a_marked_service_with_nothing_to_wait_on_fails_and_is_never_ok() {
         observed: Observed::Running,
         fate: ProcessFate::Unheld,
         held_alive: false,
+        named_alive: false,
         ever_held: false,
     };
     for disposition in [Disposition::StopOnly, Disposition::Deregister] {

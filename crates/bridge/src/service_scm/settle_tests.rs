@@ -10,6 +10,7 @@ fn look(observed: Observed, fate: ProcessFate, held_alive: bool) -> Look {
         observed,
         fate,
         held_alive,
+        named_alive: held_alive,
         // A live hold was held.
         ever_held: held_alive,
     }
@@ -21,6 +22,7 @@ fn look_after_holds_exited(observed: Observed, fate: ProcessFate) -> Look {
         observed,
         fate,
         held_alive: false,
+        named_alive: false,
         ever_held: true,
     }
 }
@@ -318,6 +320,116 @@ fn the_loop_terminates_what_outlives_stopped_and_waits_out_a_service_that_is_sti
     let mut actor = Recording::new(vec![held, held, stopped(), stopped()]).arm_fails_with(vec![Some(marked())]);
     settle_stopped(&mut actor).unwrap();
     assert_eq!(actor.exit_waits, [ExitWait::OnTheirOwn]);
+}
+
+/// A look over a process only a scan found, with nothing the SCM named alive.
+fn only_an_orphan_alive(observed: Observed) -> Look {
+    Look {
+        observed,
+        fate: ProcessFate::Unheld,
+        held_alive: true,
+        named_alive: false,
+        ever_held: true,
+    }
+}
+
+/// The wait a look asks for has something to wait on only among the processes
+/// that wait covers: outside STOPPED the ones the SCM named (it told them to
+/// stop), at STOPPED every held one.
+#[skuld::test]
+fn a_look_has_a_process_to_await_only_among_the_ones_its_wait_covers() {
+    for (observed, named_alive, held_alive, want) in [
+        (Observed::Running, true, true, true),
+        (Observed::Running, false, true, false),
+        (Observed::Running, false, false, false),
+        (Observed::StartPending, true, true, true),
+        (Observed::StartPending, false, true, false),
+        (Observed::StopPending, true, true, true),
+        (Observed::StopPending, false, true, false),
+        (Observed::Stopped, false, true, true),
+        (Observed::Stopped, true, true, true),
+        (Observed::Stopped, false, false, false),
+    ] {
+        let look = Look {
+            observed,
+            fate: ProcessFate::Unheld,
+            held_alive,
+            named_alive,
+            ever_held: true,
+        };
+        assert_eq!(
+            look.has_a_process_to_await(),
+            want,
+            "{observed:?} named_alive={named_alive} held_alive={held_alive}"
+        );
+    }
+}
+
+/// A marked service's STOP_PENDING with only an orphan alive has no event to
+/// wait on: the SCM cannot be asked, the orphan is not waited out (it has no
+/// Stop on its way, and nothing here may end it before STOPPED) and the service's
+/// own process is gone. The refusal is the result, as for any live state with
+/// nothing to wait on, and the retirement does not scan in a loop.
+#[skuld::test]
+fn a_marked_service_stopping_over_only_an_orphan_is_the_refusal_not_a_wait_on_the_orphan() {
+    for pending in [Observed::StopPending, Observed::StartPending] {
+        let mut actor = Recording::new(vec![
+            pending_over(pending),
+            only_an_orphan_alive(pending),
+            stopped(),
+            stopped(),
+        ])
+        .arm_fails_with(vec![Some(marked())])
+        .scans_find(vec![ScanFinding::Alive, ScanFinding::Nothing]);
+        let error = settle_stopped(&mut actor).unwrap_err();
+        assert!(
+            matches!(&error, SettleError::Arm(e) if service_gone(e).is_some()),
+            "{pending:?}: {error:?}"
+        );
+        assert_eq!(actor.count("await_held_exits"), 0, "{pending:?}");
+        assert_eq!(actor.count("hold_scanned"), 1, "{pending:?}");
+    }
+}
+
+fn pending_over(observed: Observed) -> Look {
+    look(observed, ProcessFate::Unheld, false)
+}
+
+/// Marked, the service's process and an orphan are both alive in STOP_PENDING:
+/// the wait outside STOPPED is the graceful one, and the orphan is dealt with
+/// only once the SCM reports STOPPED, which completes the retirement.
+#[skuld::test]
+fn a_marked_service_with_an_orphan_is_waited_out_gracefully_then_the_orphan_is_ended_at_stopped() {
+    let both = look(Observed::StopPending, ProcessFate::Alive, true);
+    let mut actor = Recording::new(vec![
+        pending_over(Observed::StopPending),
+        both,
+        stopped_over_a_live_hold(),
+        stopped(),
+        stopped(),
+    ])
+    .arm_fails_with(vec![Some(marked())]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(
+        actor.exit_waits,
+        [ExitWait::OnTheirOwn, ExitWait::TerminateOrphansThenWait]
+    );
+}
+
+/// The same with an arm: an orphan alive outside STOPPED is not waited on at all,
+/// the SCM's transition is the event, and at STOPPED the orphan is ended.
+#[skuld::test]
+fn an_armed_stop_pending_over_an_orphan_waits_for_the_scm_then_ends_the_orphan_at_stopped() {
+    let mut actor = Recording::new(vec![
+        only_an_orphan_alive(Observed::StopPending),
+        only_an_orphan_alive(Observed::StopPending),
+        stopped_over_a_live_hold(),
+        stopped(),
+        stopped(),
+    ]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(actor.exit_waits, [ExitWait::TerminateOrphansThenWait]);
+    assert_eq!(actor.count("await_callback"), 1);
 }
 
 /// A held process takes the Stop and is waited on by its handle: a handle keeps

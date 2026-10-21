@@ -282,16 +282,16 @@ impl ServiceProcesses {
         Ok(())
     }
 
-    /// Blocks until every held process has exited. An external event with no
-    /// bound of its own to choose: the exit of the service's own process, which
-    /// the SCM has told to stop, or of an orphan
+    /// Blocks until the processes `wait` covers have exited
+    /// ([`ProcessHolds::awaited`]), after ending the orphans if it says so. An
+    /// external event with no bound of its own to choose: the exit of the
+    /// service's own process, which the SCM has told to stop, or of an orphan
     /// [`terminate_live`](Self::terminate_live) just ended.
     pub(super) fn await_exits(&self, wait: ExitWait) -> io::Result<()> {
-        match wait {
-            ExitWait::OnTheirOwn => {}
-            ExitWait::TerminateOrphansThenWait => self.terminate_live()?,
+        if wait.terminates_orphans() {
+            self.terminate_live()?;
         }
-        for process in self.holds.processes() {
+        for process in self.holds.awaited(wait) {
             let handle = HANDLE(process.as_raw_handle());
             // SAFETY: `handle` is the live handle `process` owns.
             let waited = unsafe { WaitForSingleObject(handle, INFINITE) };
