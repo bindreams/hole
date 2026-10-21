@@ -275,7 +275,7 @@ fn split(path: &Path) -> io::Result<(Vec<u16>, VecDeque<OsString>)> {
 }
 
 /// Rights to open a directory with: read its attributes (to see a reparse point) and its owner (to
-/// judge a link); a final one also adds files and subdirectories. Listing is not asked for: a
+/// judge a link, where [`Rights::owner_optional`] allows doing without); a final one also adds files and subdirectories. Listing is not asked for: a
 /// directory a user can traverse but not list is still on the path to a file they can reach.
 fn dir_rights(last: bool) -> FILE_ACCESS_RIGHTS {
     match last {
