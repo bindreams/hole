@@ -852,7 +852,8 @@ mod child_and_lock {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
-    use super::super::run_while_holding;
+    use super::super::{run_in, run_while_holding};
+    use crate::cutover::os::CutoverOutcome;
     use crate::platform::os::StartTypeLock;
 
     fn write_marker(dir: &std::path::Path) {
@@ -882,7 +883,7 @@ mod child_and_lock {
                     marker_dir.path(),
                     || {
                         ran.store(true, Ordering::SeqCst);
-                        Ok(())
+                        Ok(CutoverOutcome::Started)
                     },
                 )
             });
@@ -921,7 +922,7 @@ mod child_and_lock {
                         inside_tx.send(()).expect("tell the holder");
                         go_rx.recv().expect("the holder says go");
                         cutover_done.store(true, Ordering::SeqCst);
-                        Ok(())
+                        Ok(CutoverOutcome::Started)
                     },
                 )
             });
@@ -952,9 +953,82 @@ mod child_and_lock {
         let outcome = run_while_holding(
             || lock.try_acquire(),
             marker_dir.path(),
-            || Err::<(), _>(io::Error::other("the swap failed")),
+            || Err::<CutoverOutcome, _>(io::Error::other("the swap failed")),
         );
         assert_eq!(outcome.expect_err("failed").to_string(), "the swap failed");
         assert!(!lock.is_held_for_another_thread());
+    }
+
+    /// Whatever ends the child's run settles its marker, in the one wrapper:
+    /// only a cutover that started a new bridge leaves it, for that bridge's
+    /// sweep.
+    #[skuld::test]
+    fn the_marker_is_settled_by_how_the_whole_run_ended() {
+        let marker_after = |run: io::Result<CutoverOutcome>| {
+            let lock = StartTypeLock::scratch("marker-settled");
+            let dir = tempfile::tempdir().unwrap();
+            write_marker(dir.path());
+            let _ = run_while_holding(|| lock.try_acquire(), dir.path(), || run);
+            hole_common::update_marker::is_present(dir.path())
+        };
+        assert!(
+            marker_after(Ok(CutoverOutcome::Started)),
+            "Started: the new bridge sweeps it"
+        );
+        assert!(
+            !marker_after(Ok(CutoverOutcome::LeftDisabled)),
+            "LeftDisabled: no bridge will bind"
+        );
+        assert!(
+            !marker_after(Err(io::Error::other("a step failed"))),
+            "a failed run: the old bridge keeps serving"
+        );
+    }
+
+    /// A failure to take the lock at all is a failed run too.
+    #[skuld::test]
+    fn a_lock_that_cannot_be_tried_clears_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marker(dir.path());
+        let ran = AtomicBool::new(false);
+        let outcome = run_while_holding(
+            || Err::<Option<()>, _>(io::Error::other("no lock")),
+            dir.path(),
+            || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(CutoverOutcome::Started)
+            },
+        );
+        assert_eq!(outcome.expect_err("failed").to_string(), "no lock");
+        assert!(!ran.load(Ordering::SeqCst));
+        assert!(!hole_common::update_marker::is_present(dir.path()));
+    }
+
+    /// The staged payload is checked against every bundled name only here, in
+    /// the child (the bridge's extract step checks `hole.exe` alone), so a
+    /// payload missing one must not strand the marker.
+    #[skuld::test]
+    fn a_payload_missing_a_bundled_file_leaves_no_marker() {
+        let lock = StartTypeLock::scratch("payload-missing-a-file");
+        let marker_dir = tempfile::tempdir().unwrap();
+        write_marker(marker_dir.path());
+        let names = xtask_lib::bindir::bindir_dest_names(xtask_lib::bindir::Os::Windows);
+        let (missing, present) = names.split_last().expect("a bundled set");
+        let payload = tempfile::tempdir().unwrap();
+        for name in present {
+            std::fs::write(payload.path().join(name), b"stub").unwrap();
+        }
+        let install_dir = tempfile::tempdir().unwrap();
+        let outcome = run_while_holding(
+            || lock.try_acquire(),
+            marker_dir.path(),
+            || run_in(install_dir.path(), payload.path(), "9.9.9"),
+        );
+        let error = outcome.expect_err("the payload lacks a bundled file");
+        assert!(error.to_string().contains(missing.as_str()), "{error}");
+        assert!(
+            !hole_common::update_marker::is_present(marker_dir.path()),
+            "the old bridge keeps serving, so the claim must not stay"
+        );
     }
 }

@@ -2224,10 +2224,13 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   for the holder that waits for it. The only one that takes the lock is the
   cutover child (`bridge cutover`, spawned by the service): it tries the lock
   once, before anything else (`run_while_holding`), and if a change holds it
-  the update is abandoned and its marker cleared, as for any graceful failure
-  (the holder may leave the old bridge running, so no new bridge would bind to
-  sweep it); if it took the lock first it holds it for the
-  whole cutover and the other change waits for it. The service process
+  the update is abandoned; if it took the lock first it holds it for the
+  whole cutover and the other change waits for it. The same wrapper settles
+  the update marker by how the whole run ended: it stays only for a cutover
+  that started a new bridge to sweep it, and every other ending (an abandoned
+  update, a lock that cannot be tried, any error out of the run such as a
+  staged payload missing a bundled file, a service left disabled) clears it,
+  because the old bridge may keep serving and no new one would bind. The service process
   (`bridge run`) and the plugins it starts never take the lock.
   Proofs: the lock's own tests (a second thread waits and gets it once the
   holder lets go, abandonment, re-entry, a caller outside the boundary, two

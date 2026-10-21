@@ -792,9 +792,9 @@ pub fn disabled_by() -> std::io::Result<Option<DisabledBy>> {
 
 /// [`disabled_by`] for a reader that must never fail (the GUI's status, which
 /// runs unprivileged). It never touches the start-type lock: a record whose
-/// writer is still running means a retirement, repair or enable is changing the
-/// start type, and the answer is [`DisabledState::InChange`], neither of the
-/// two it would give. A service it cannot open or read is "not disabled", and
+/// writer is still running, or a change mark whose holder is, means a
+/// retirement, repair, enable or install is changing the start type, and the
+/// answer is [`DisabledState::InChange`], neither of the two it would give. A service it cannot open or read is "not disabled", and
 /// the reason is logged, the convention of [`is_installed`].
 pub fn disabled_state() -> DisabledState {
     let mut session = match StatusSession::open() {

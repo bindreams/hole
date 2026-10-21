@@ -56,11 +56,13 @@ pub fn service_state_dir() -> PathBuf {
 /// The child carries the service's SID, so a retirement or install that holds
 /// the start-type lock waits for the child to exit (it scans for the service's
 /// processes). The child therefore never waits for the lock: it tries it once,
-/// and if a change holds it the update is abandoned and its marker cleared, as
-/// for any graceful failure: the holder may leave the old bridge running, and
-/// then no new bridge would bind to sweep the marker. A child that took it first
-/// holds it for the whole cutover, and the other change waits for the child. No other process that carries the service's SID
-/// takes the lock: the service itself and the plugins it starts never do.
+/// and if a change holds it the update is abandoned. A child that took it first
+/// holds it for the whole cutover, and the other change waits for the child. No
+/// other process that carries the service's SID takes the lock: the service
+/// itself and the plugins it starts never do.
+///
+/// The update marker is settled by how the whole run ended (see
+/// [`run_while_holding`]).
 #[cfg(target_os = "windows")]
 pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()> {
     run_while_holding(
@@ -68,36 +70,48 @@ pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()>
         &hole_common::update_marker::service_log_dir(),
         || run_held(payload, target_version),
     )
+    .map(|_| ())
 }
 
-/// Runs `run` while holding the start-type lock `try_hold` takes, or, when
-/// another change holds it, does not run it, clears the update marker in
-/// `log_dir` (the update did nothing, and the holder may leave the old bridge
-/// running) and fails with `WouldBlock`. The lock belongs to this thread, so
-/// every step of `run` takes it again on this thread without waiting.
+/// Runs `run` while holding the start-type lock `try_hold` takes, and settles
+/// the update marker in `log_dir` by how the whole run ended: it stays only for
+/// a cutover that started a new bridge to sweep it, and any other ending
+/// (a failed `try_hold`, a lock another change holds, an error out of `run`, a
+/// service left disabled) clears it, since the old bridge may keep serving and
+/// no new one would bind. A lock another change holds is not waited for: `run`
+/// does not run and this fails with `WouldBlock`. The lock belongs to this
+/// thread, so every step of `run` takes it again on this thread without waiting.
 #[cfg(target_os = "windows")]
-fn run_while_holding<H, T>(
+fn run_while_holding<H>(
     try_hold: impl FnOnce() -> std::io::Result<Option<H>>,
     log_dir: &Path,
-    run: impl FnOnce() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    let Some(_held) = try_hold()? else {
-        clear_marker(log_dir);
-        tracing::warn!(
-            "cutover: an uninstall, install, repair or enable holds the service's start type, so this update is abandoned"
-        );
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "a change to the service holds its start type, so the update was abandoned",
-        ));
+    run: impl FnOnce() -> std::io::Result<crate::cutover::os::CutoverOutcome>,
+) -> std::io::Result<crate::cutover::os::CutoverOutcome> {
+    let _held = match try_hold() {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            clear_marker(log_dir);
+            tracing::warn!(
+                "cutover: an uninstall, install, repair or enable holds the service's start type, so this update is abandoned"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "a change to the service holds its start type, so the update was abandoned",
+            ));
+        }
+        Err(e) => {
+            clear_marker(log_dir);
+            return Err(e);
+        }
     };
-    run()
+    let result = run();
+    settle_marker(&result, log_dir);
+    result
 }
 
 #[cfg(target_os = "windows")]
-fn run_held(payload: &Path, target_version: &str) -> std::io::Result<()> {
-    use crate::cutover::os::windows::WindowsCutoverOs;
-    use crate::cutover::os::{run_cutover, CutoverOutcome};
+fn run_held(payload: &Path, target_version: &str) -> std::io::Result<crate::cutover::os::CutoverOutcome> {
+    use crate::cutover::os::CutoverOutcome;
 
     // Bring an install base predating the restart-on-failure SCM config up to date
     // as part of the update itself. Best-effort: a failure here must not abort the
@@ -110,20 +124,33 @@ fn run_held(payload: &Path, target_version: &str) -> std::io::Result<()> {
         .parent()
         .ok_or_else(|| std::io::Error::other("current_exe has no parent dir"))?
         .to_path_buf();
-    let names = xtask_lib::bindir::bindir_dest_names(xtask_lib::bindir::Os::Windows);
-    let images = plan_windows_images(&install_dir, payload, &names)?;
-    let mut os = WindowsCutoverOs {
-        images,
-        target_version: target_version.to_string(),
-    };
-    let result = run_cutover(&mut os);
-    settle_marker(&result, &hole_common::update_marker::service_log_dir());
-    if let Ok(CutoverOutcome::LeftDisabled) = result {
+    let outcome = run_in(&install_dir, payload, target_version)?;
+    if outcome == CutoverOutcome::LeftDisabled {
         tracing::info!(
             "cutover: the new files are installed, but the Hole service is disabled on this computer, so it was not started; enable it to run the new version"
         );
     }
-    result.map(|_| ())
+    Ok(outcome)
+}
+
+/// Plans the swap of every bundled binary from `payload` into `install_dir`,
+/// then runs it.
+#[cfg(target_os = "windows")]
+fn run_in(
+    install_dir: &Path,
+    payload: &Path,
+    target_version: &str,
+) -> std::io::Result<crate::cutover::os::CutoverOutcome> {
+    use crate::cutover::os::run_cutover;
+    use crate::cutover::os::windows::WindowsCutoverOs;
+
+    let names = xtask_lib::bindir::bindir_dest_names(xtask_lib::bindir::Os::Windows);
+    let images = plan_windows_images(install_dir, payload, &names)?;
+    let mut os = WindowsCutoverOs {
+        images,
+        target_version: target_version.to_string(),
+    };
+    run_cutover(&mut os)
 }
 
 /// Clear the marker unless a new bridge will bind and sweep it. A graceful
