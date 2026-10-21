@@ -52,8 +52,45 @@ pub fn service_state_dir() -> PathBuf {
 ///
 /// `payload` is the staging dir holding the extracted binaries; `target_version`
 /// names the `.old-<ver>` rename-away path.
+///
+/// The child carries the service's SID, so a retirement or install that holds
+/// the start-type lock waits for the child to exit (it scans for the service's
+/// processes). The child therefore never waits for the lock: it tries it once,
+/// and if a change holds it the update is abandoned, the update marker is left
+/// as it is, and the next start reconciles as it does after a crashed child. A
+/// child that took it first holds it for the whole cutover, and the other
+/// change waits for the child. No other process that carries the service's SID
+/// takes the lock: the service itself and the plugins it starts never do.
 #[cfg(target_os = "windows")]
 pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()> {
+    run_while_holding(crate::platform::os::try_hold_start_type, || {
+        run_held(payload, target_version)
+    })
+}
+
+/// Runs `run` while holding the start-type lock `try_hold` takes, or, when
+/// another change holds it, does not run it and fails with `WouldBlock`. The
+/// lock belongs to this thread, so every step of `run` takes it again on this
+/// thread without waiting.
+#[cfg(target_os = "windows")]
+fn run_while_holding<H, T>(
+    try_hold: impl FnOnce() -> std::io::Result<Option<H>>,
+    run: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let Some(_held) = try_hold()? else {
+        tracing::warn!(
+            "cutover: an uninstall, install, repair or enable holds the service's start type, so this update is abandoned"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "a change to the service holds its start type, so the update was abandoned",
+        ));
+    };
+    run()
+}
+
+#[cfg(target_os = "windows")]
+fn run_held(payload: &Path, target_version: &str) -> std::io::Result<()> {
     use crate::cutover::os::windows::WindowsCutoverOs;
     use crate::cutover::os::{run_cutover, CutoverOutcome};
 

@@ -683,6 +683,13 @@ pub fn hold_start_type() -> std::io::Result<Held> {
     hold_start_type_noting(&StartTypeLock::machine_wide(), start_type_lock::log_wait)
 }
 
+/// [`hold_start_type`] for the process that must never wait: the cutover child
+/// carries the service's SID, and a change holding the lock waits for it.
+/// `None`: another thread holds the lock.
+pub fn try_hold_start_type() -> std::io::Result<Option<Held>> {
+    StartTypeLock::machine_wide().try_acquire()
+}
+
 /// [`hold_start_type`] over `lock`, calling `on_busy` if another holds it.
 fn hold_start_type_noting(lock: &StartTypeLock, on_busy: impl FnOnce()) -> std::io::Result<Held> {
     lock.acquire_noting_wait(on_busy)

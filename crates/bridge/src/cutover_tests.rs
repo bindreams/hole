@@ -840,3 +840,100 @@ fn an_unproven_release_names_every_key_not_just_the_first() {
         "every unproven key must be named: {report}"
     );
 }
+
+// The cutover child and the start-type lock ===========================================================================
+
+/// The child carries the service's SID, so a retirement or install that holds
+/// the lock waits for it to exit while it waits for the lock. Whoever holds the
+/// lock first wins, and the other side must finish either way.
+#[cfg(target_os = "windows")]
+mod child_and_lock {
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    use super::super::run_while_holding;
+    use crate::platform::os::StartTypeLock;
+
+    /// Holder first: the holder waits for the child's exit (the join) while the
+    /// child tries the lock. A child that waited for it would wait for ever;
+    /// this one abandons the update, runs nothing, and the holder's wait ends.
+    #[skuld::test]
+    fn a_child_that_finds_the_lock_held_abandons_the_update_and_the_holder_waiting_for_it_finishes() {
+        let lock = StartTypeLock::scratch("child-after-holder");
+        let held = lock.acquire().expect("the holder takes the lock");
+        let ran = AtomicBool::new(false);
+        let outcome = std::thread::scope(|s| {
+            let child = s.spawn(|| {
+                run_while_holding(
+                    || lock.try_acquire(),
+                    || {
+                        ran.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+            });
+            // The holder waits for the child to exit.
+            child.join().expect("the child's thread")
+        });
+        let error = outcome.expect_err("the update is abandoned");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert!(!ran.load(Ordering::SeqCst), "nothing of the cutover ran");
+        assert!(lock.is_held_for_another_thread(), "the holder still holds it");
+        drop(held);
+    }
+
+    /// Child first: the child holds the lock for the whole cutover, and a
+    /// holder that arrives waits for the lock, getting it only after the
+    /// cutover has finished.
+    #[skuld::test]
+    fn a_holder_that_arrives_during_a_cutover_waits_for_it_and_then_finishes() {
+        let lock = StartTypeLock::scratch("holder-after-child");
+        let cutover_done = AtomicBool::new(false);
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            let child = s.spawn(|| {
+                let go_rx = go_rx;
+                run_while_holding(
+                    || lock.try_acquire(),
+                    || {
+                        inside_tx.send(()).expect("tell the holder");
+                        go_rx.recv().expect("the holder says go");
+                        cutover_done.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+            });
+            inside_rx.recv().expect("the child ended before its cutover");
+            let holder = s.spawn(|| {
+                let held = lock
+                    .acquire_noting_wait(move || waiting_tx.send(()).expect("tell the test"))
+                    .expect("the holder takes the lock");
+                let after_the_cutover = cutover_done.load(Ordering::SeqCst);
+                drop(held);
+                after_the_cutover
+            });
+            waiting_rx.recv().expect("the holder never had to wait");
+            go_tx.send(()).expect("the child is waiting for go");
+            child.join().expect("the child's thread").expect("the cutover ran");
+            assert!(
+                holder.join().expect("the holder's thread"),
+                "the holder got the lock before the cutover finished"
+            );
+        });
+    }
+
+    /// The lock is let go when the cutover ends, whether it succeeded or not.
+    #[skuld::test]
+    fn the_lock_is_free_again_after_a_cutover_that_failed() {
+        let lock = StartTypeLock::scratch("child-fails");
+        let outcome = run_while_holding(
+            || lock.try_acquire(),
+            || Err::<(), _>(io::Error::other("the swap failed")),
+        );
+        assert_eq!(outcome.expect_err("failed").to_string(), "the swap failed");
+        assert!(!lock.is_held_for_another_thread());
+    }
+}
