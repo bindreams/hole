@@ -192,12 +192,35 @@ struct Walk {
     trail: Trail<u32>,
 }
 
-/// Hands the folder `name` in `dir`, which the walk just made, to `uid` (the group is left as it is). By name, never
-/// following a link: whatever the name is by now is what is given, and a link is only ever the user's own.
-fn give_made_folder(dir: RawFd, name: &CString, uid: u32) -> io::Result<()> {
-    // SAFETY: `name` is a valid NUL-terminated string and `dir` an open directory, both for the call; a group of
-    // `-1` leaves the group alone.
-    check(unsafe { libc::fchownat(dir, name.as_ptr(), uid, libc::gid_t::MAX, libc::AT_SYMLINK_NOFOLLOW) }).map(|_| ())
+/// Hands the folder `name` in `dir`, which the walk just made as the process of uid `maker`, to `uid` (the group is
+/// left as it is). The name is opened once, and it is that handle that is judged and handed over: the user who owns
+/// `dir` can swap the name between the `mkdirat` and here, and a swapped-in directory is theirs, a hard link is not a
+/// directory, and a link is never followed. Only a directory `maker` owns is the one the walk made.
+fn give_made_folder(dir: RawFd, name: &CString, maker: u32, uid: u32) -> io::Result<()> {
+    if uid == maker {
+        return Ok(());
+    }
+    let made = match open_fd(
+        dir,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => {
+            return Err(match fstatat_nofollow(dir, name).map(|entry| entry.kind()) {
+                Ok(EntryKind::Symlink) => Refusal::Symlink.into_io_error(),
+                Ok(EntryKind::File | EntryKind::Other) => Refusal::NotDirectory.into_io_error(),
+                Ok(EntryKind::Directory) | Err(_) => err,
+            });
+        }
+    };
+    let found = fstat(made.as_raw_fd())?.uid;
+    if found != maker {
+        return Err(Refusal::ForeignOwner { uid: found }.into_io_error());
+    }
+    // SAFETY: the descriptor is open for the call; a group of `-1` leaves the group alone.
+    check(unsafe { libc::fchown(made.as_raw_fd(), uid, libc::gid_t::MAX) }).map(|_| ())
 }
 
 /// Opens the directory `name` in `cur`, or makes progress towards it: `Ok(Some(next))` is the directory;
@@ -221,7 +244,7 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
                         // The folder is the maker's on disk. Below a user's link it must be the user's, or the next
                         // walk through the link refuses what this one made.
                         if let Some(&uid) = walk.trail.led_by() {
-                            give_made_folder(cur.fd.as_raw_fd(), &cname, uid)?;
+                            give_made_folder(cur.fd.as_raw_fd(), &cname, caller(), uid)?;
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}

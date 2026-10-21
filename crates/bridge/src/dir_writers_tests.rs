@@ -370,3 +370,105 @@ fn the_scan_tells_code_from_a_comment() {
     assert!(!opens_a_dir("    // goes through `Dir::open` first"));
     assert!(!opens_a_dir("/// see [`Dir::open_as`]"));
 }
+
+// No privileged step changes an owner or a mode by name ---------------------------------------------------------------
+//
+// `chown(path)` and `chmod(path)` resolve the name again, so a name the user swaps (a hard link to a file of
+// root's, a directory of their own) is what changes. A privileged step changes a file through the handle it holds.
+
+/// What names its target: the by-path calls of unix and Windows that change an owner, a mode or an ACL.
+const BY_NAME: &[&str] = &[
+    "fchownat",
+    "fchmodat",
+    "libc::chown",
+    "libc::lchown",
+    "libc::chmod",
+    "libc::lchmod",
+    "fs::chown",
+    "fs::lchown",
+    "fs::set_permissions",
+    "SetNamedSecurityInfo",
+    "SetFileSecurity",
+    "SetFileAttributes",
+];
+
+/// The by-name calls on the code lines of `text`.
+fn by_name_calls(text: &str) -> Vec<&'static str> {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(|line| BY_NAME.iter().copied().filter(move |call| line.contains(call)))
+        .collect()
+}
+
+/// The files that must not call one: the sources of `util::dir` and every source file that opens a `Dir`. Not
+/// `util::dir::testing`, which is compiled for tests and changes only the fixtures a test made.
+fn privileged_dir_sources(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for krate in std::fs::read_dir(root.join("crates")).unwrap() {
+        let src = krate.unwrap().path().join("src");
+        if src.is_dir() {
+            sources_in(&src, &mut found);
+        }
+    }
+    found.retain(|path| opens_a_dir(&std::fs::read_to_string(path).unwrap()));
+    let util_dir = root.join("crates").join("util").join("src").join("dir");
+    found.push(root.join("crates").join("util").join("src").join("dir.rs"));
+    for entry in std::fs::read_dir(util_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if path.is_file() && name.ends_with(".rs") && !name.ends_with("_tests.rs") && name != "testing.rs" {
+            found.push(path);
+        }
+    }
+    let windows = root.join("crates").join("util").join("src").join("dir").join("windows");
+    for entry in std::fs::read_dir(windows).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.ends_with(".rs") && !name.ends_with("_tests.rs") {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+#[skuld::test]
+fn no_privileged_dir_code_changes_an_owner_or_a_mode_by_name() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let sources = privileged_dir_sources(&root);
+    assert!(
+        sources.iter().any(|path| path.ends_with("dir/unix.rs")) && sources.iter().any(|path| path.ends_with("dir.rs")),
+        "the scan must cover util::dir itself: {sources:?}"
+    );
+
+    let mut hits = Vec::new();
+    for path in &sources {
+        for call in by_name_calls(&std::fs::read_to_string(path).unwrap()) {
+            hits.push(format!("{}: {call}", path.strip_prefix(&root).unwrap().display()));
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "a privileged step changes an owner or a mode by name; do it through the handle (`fchown`, `fchmod`, \
+         `SetSecurityInfo`) after checking what it is: {hits:#?}"
+    );
+}
+
+#[skuld::test]
+fn the_by_name_scan_tells_a_name_from_a_handle() {
+    assert_eq!(by_name_calls("libc::fchownat(dir, name, uid, gid, 0)"), ["fchownat"]);
+    assert_eq!(
+        by_name_calls("std::fs::set_permissions(path, perms)"),
+        ["fs::set_permissions"]
+    );
+    assert_eq!(
+        by_name_calls("SetNamedSecurityInfoW(&path, ..)"),
+        ["SetNamedSecurityInfo"]
+    );
+    assert!(by_name_calls("libc::fchown(fd, uid, gid)").is_empty());
+    assert!(by_name_calls("file.set_permissions(perms)").is_empty());
+    assert!(by_name_calls("SetSecurityInfo(handle, ..)").is_empty());
+    assert!(by_name_calls("    // fchownat is the by-name call").is_empty());
+}
