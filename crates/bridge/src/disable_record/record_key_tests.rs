@@ -10,6 +10,7 @@ use windows::Win32::System::Registry::{RegSetKeySecurity, HKEY};
 use windows_registry::{Type, CURRENT_USER};
 
 use super::*;
+use crate::test_support::reap_child::EchoChild;
 
 /// `WRITE_DAC`, the right to replace a key's DACL.
 const WRITE_DAC: u32 = 0x0004_0000;
@@ -95,11 +96,79 @@ fn a_written_record_reads_present_and_a_cleared_one_absent() {
 
     record.write().expect("write");
     assert_eq!(record.state(), RecordState::Present);
-    assert_eq!(key.get_u32(VALUE).expect("the value, by its name"), 1);
+    assert_eq!(
+        key.get_string(VALUE).expect("the value, by its name"),
+        Stamp::current().encode(),
+        "the writer's identity"
+    );
 
     record.clear().expect("clear");
     assert_eq!(record.state(), RecordState::Absent);
     assert!(key.get_type(VALUE).is_err(), "the value is gone");
+}
+
+#[skuld::test]
+fn a_record_names_its_writer_and_the_writer_is_running() {
+    let (scratch, _key) = Scratch::created("changer-running");
+    let record = scratch.record();
+    assert_eq!(record.changer(), None, "no record, no changer");
+
+    record.write().expect("write");
+    assert_eq!(record.changer(), Some(Changer::Running), "this process wrote it");
+
+    record.clear().expect("clear");
+    assert_eq!(record.changer(), None);
+}
+
+#[skuld::test]
+fn a_record_whose_writer_exited_names_no_running_changer() {
+    let (scratch, key) = Scratch::created("changer-exited");
+    let mut writer = EchoChild::spawn();
+    let stamp = Stamp::of_listed_process(writer.pid()).unwrap().expect("listed");
+    key.set_string(VALUE, stamp.encode()).expect("the writer's record");
+    assert_eq!(scratch.record().changer(), Some(Changer::Running), "while it runs");
+
+    writer.release_and_wait();
+    assert_eq!(scratch.record().changer(), Some(Changer::NotRunning));
+    assert_eq!(
+        scratch.record().state(),
+        RecordState::Present,
+        "the record is still the fact"
+    );
+}
+
+#[skuld::test]
+fn a_record_whose_pid_now_names_another_process_names_no_running_changer() {
+    let (scratch, key) = Scratch::created("changer-reused");
+    let here = Stamp::current();
+    let reused = Stamp {
+        pid: here.pid,
+        created: here.created + 1,
+    };
+    key.set_string(VALUE, reused.encode())
+        .expect("a record of a reused pid");
+    assert_eq!(scratch.record().changer(), Some(Changer::NotRunning));
+}
+
+/// A value that is not a stamp is a record (present) whose writer cannot be
+/// shown to run, so it never holds a user in "in progress".
+#[skuld::test]
+fn a_value_that_is_not_a_stamp_is_present_with_no_running_changer() {
+    for (ty, bytes) in [
+        (Type::U32, 1u32.to_le_bytes().to_vec()),
+        (Type::Bytes, vec![]),
+        (Type::Other(11), vec![9]),
+    ] {
+        let (scratch, key) = Scratch::created("not-a-stamp");
+        key.set_bytes(VALUE, ty, &bytes).expect("a value of this type");
+        assert_eq!(scratch.record().state(), RecordState::Present, "{ty:?}");
+        assert_eq!(scratch.record().changer(), Some(Changer::NotRunning), "{ty:?}");
+    }
+    for text in ["", "garbage", "1", "1:2:3", "-1:5"] {
+        let (scratch, key) = Scratch::created("not-a-stamp-text");
+        key.set_string(VALUE, text).expect("a string");
+        assert_eq!(scratch.record().changer(), Some(Changer::NotRunning), "{text:?}");
+    }
 }
 
 #[skuld::test]
@@ -135,6 +204,11 @@ fn a_key_that_cannot_be_read_reads_present() {
     scratch.set_dacl("D:P(D;;0x1;;;WD)(A;;KA;;;WD)");
 
     assert_eq!(scratch.record().state(), RecordState::Present);
+    assert_eq!(
+        scratch.record().changer(),
+        Some(Changer::NotRunning),
+        "cannot be shown to run"
+    );
 }
 
 #[skuld::test]

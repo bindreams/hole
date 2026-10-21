@@ -17,7 +17,7 @@ use std::path::Path;
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 use hole_bridge::cutover::os::CutoverOs;
 use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
-use hole_bridge::disable_record::{DisabledBy, DisabledState, RecordKey, RecordState};
+use hole_bridge::disable_record::{DisabledBy, DisabledState, RecordKey, RecordState, Stamp};
 use hole_bridge::platform::os::{self, SERVICE_NAME};
 use hole_bridge::service_start::RepairStep;
 use windows::core::{PCWSTR, PWSTR};
@@ -34,6 +34,7 @@ use windows::Win32::System::Services::{
 use windows_service::service::{ServiceAccess, ServiceStartType};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use super::start_type_lock_proofs::as_a_standard_user;
 use super::{left_behind, pid_log_args, recording, scm_deletion, scm_probe, ProvisionedService, GLOBAL_NET_STATE, TUN};
 
 fn helper() -> &'static Path {
@@ -93,14 +94,20 @@ fn set_start_type(to: ServiceStartType) {
     .expect("ChangeServiceConfigW: set the start type");
 }
 
-/// The GUI's status read as the whose-disable answer. Nothing else holds the
-/// start-type lock in these tests, so a change in progress is a failure.
+/// The GUI's status read as the whose-disable answer. No change of Hole's is
+/// running when it is made, so a change in progress is a failure.
 fn gui_disabled_by() -> Option<DisabledBy> {
     match os::disabled_state() {
         DisabledState::By(by) => Some(by),
         DisabledState::NotDisabled => None,
-        DisabledState::InChange => panic!("the GUI's read found the start-type lock held"),
+        DisabledState::InChange => panic!("the GUI's read found a change in progress"),
     }
+}
+
+/// A writer that is not running: pid 4 is the System process, and no process
+/// was created at tick 1.
+fn a_writer_that_is_gone() -> Stamp {
+    Stamp::decode("4:1").expect("a stamp")
 }
 
 fn record() -> RecordState {
@@ -111,9 +118,27 @@ fn clear_record() {
     RecordKey::service().clear().expect("clear the record");
 }
 
-/// Needs the service to exist: the record is a value in its key.
+/// The record an interrupted change leaves. Needs the service to exist: the
+/// record is a value in its key.
 fn write_record() {
-    RecordKey::service().write().expect("write the record");
+    RecordKey::service()
+        .write_as(&a_writer_that_is_gone())
+        .expect("write the record");
+}
+
+/// The GUI's status read as it would be if the process stamping the record
+/// were killed now: the record, if there is one, is stamped by a process that
+/// is gone for the read, and by this one again after it.
+fn gui_state_if_killed_now() -> DisabledState {
+    let stamped = record() == RecordState::Present;
+    if stamped {
+        write_record();
+    }
+    let state = os::disabled_state();
+    if stamped {
+        RecordKey::service().write().expect("stamp the record again");
+    }
+    state
 }
 
 /// Leaves no record behind, whatever the test did.
@@ -128,9 +153,10 @@ impl Drop for RecordCleanup {
 // At every act of a retirement ========================================================================================
 
 /// The invariant a kill at any act must find: a Disabled service has its
-/// record, and the GUI's read names an interrupted uninstall as the cause. A
-/// start type that is not Disabled is not attributed to anyone, whether or not
-/// a record is left over it.
+/// record, and the GUI's read names an interrupted uninstall as the cause once
+/// the process that stamped it is gone (and a change in progress while it
+/// runs). A start type that is not Disabled is not attributed to anyone,
+/// whether or not a record is left over it.
 fn assert_a_disabled_service_has_its_record(at: &recording::Event) {
     let Some(start) = start_type() else {
         // A service marked for deletion may refuse the read; the record is
@@ -138,7 +164,8 @@ fn assert_a_disabled_service_has_its_record(at: &recording::Event) {
         return;
     };
     let record = record();
-    let by = gui_disabled_by();
+    let running = os::disabled_state();
+    let killed = gui_state_if_killed_now();
     match start {
         ServiceStartType::Disabled => {
             assert_eq!(
@@ -146,9 +173,21 @@ fn assert_a_disabled_service_has_its_record(at: &recording::Event) {
                 RecordState::Present,
                 "the service was left Disabled by a retirement with no record, at {at:?}"
             );
-            assert_eq!(by, Some(DisabledBy::InterruptedChange), "at {at:?}");
+            assert_eq!(running, DisabledState::InChange, "while the retirement runs, at {at:?}");
+            assert_eq!(killed, DisabledState::By(DisabledBy::InterruptedChange), "at {at:?}");
         }
-        _ => assert_eq!(by, None, "a service that is not disabled was attributed, at {at:?}"),
+        _ => {
+            assert_eq!(
+                killed,
+                DisabledState::NotDisabled,
+                "a service that is not disabled was attributed, at {at:?}"
+            );
+            let expected = match record {
+                RecordState::Present => DisabledState::InChange,
+                RecordState::Absent => DisabledState::NotDisabled,
+            };
+            assert_eq!(running, expected, "at {at:?}");
+        }
     }
 }
 
@@ -288,6 +327,33 @@ fn cutover_global_net_state_repair_resets_only_what_the_record_says_is_ours() {
         assert_eq!(must_start_type(), start_after, "{start:?}, record {with_record}");
         assert_eq!(record(), RecordState::Absent, "{start:?}, record {with_record}");
     }
+}
+
+/// Proves: a standard user's status read (the GUI's token) sees the SYSTEM
+/// process that stamped the record run, and then be gone. `OpenProcess` is
+/// refused to that token for a SYSTEM process, so the read goes by the process
+/// list. Red under: a liveness read by opening the process, which reads every
+/// SYSTEM writer as gone (or, if refusals read as running, as running for ever).
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_a_standard_users_read_sees_a_system_writer_run_and_then_be_gone() {
+    let _record = RecordCleanup;
+    let _service = ProvisionedService::install(helper());
+    CutoverOs::start_service_wait_running(&mut os_actor()).expect("bring the service up");
+    let writer = Stamp::of_listed_process(scm_probe::service_process_id())
+        .expect("the process list")
+        .expect("the service process is listed");
+    set_start_type(ServiceStartType::Disabled);
+    RecordKey::service().write_as(&writer).expect("stamp the record");
+
+    let read = || as_a_standard_user(os::disabled_state);
+    assert_eq!(read(), DisabledState::InChange, "the SYSTEM writer runs");
+
+    CutoverOs::stop_service_wait_stopped(&mut os_actor()).expect("stop the service");
+    assert_eq!(
+        read(),
+        DisabledState::By(DisabledBy::InterruptedChange),
+        "the SYSTEM writer is gone"
+    );
 }
 
 /// Proves: the record is a value in the service's own key, so it goes with the

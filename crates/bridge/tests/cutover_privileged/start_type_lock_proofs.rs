@@ -2,10 +2,8 @@
 //! (`hole_bridge::platform::os::StartTypeLock`), on the real object and, where
 //! a test needs one, a real service:
 //!
-//! - the lock's DACL grants SYSTEM and Administrators everything and a standard
-//!   user's groups the wait and nothing else;
-//! - a token without Administrators can wait on the lock, and cannot open it
-//!   for more;
+//! - a token without Administrators can neither make, open nor wait on the
+//!   lock's namespace or the lock, whether the lock is held or free;
 //! - a retirement, and the update cutover's hold, are holders for every other
 //!   thread, and the GUI's status read says a change is in progress meanwhile;
 //! - an install's hold over the start type stays in force through every step it
@@ -16,27 +14,22 @@ use std::path::Path;
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 use hole_bridge::cutover::os::CutoverOs;
 use hole_bridge::disable_record::{DisabledState, RecordState};
-use hole_bridge::platform::os::{self, Opening, RetireSession, StartTypeLock, MACHINE_WIDE_NAME};
+use hole_bridge::platform::os::{self, Opening, RetireSession, StartTypeLock, BOUNDARY_NAME, REQUIRED_SID};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_ACCESS_DENIED, HANDLE, HLOCAL};
-use windows::Win32::Security::Authorization::{ConvertStringSidToSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, HANDLE, HLOCAL};
+use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::{
-    CreateRestrictedToken, DuplicateTokenEx, SecurityImpersonation, TokenImpersonation, DACL_SECURITY_INFORMATION,
-    DISABLE_MAX_PRIVILEGE, PSECURITY_DESCRIPTOR, PSID, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
-    TOKEN_QUERY,
+    CreateRestrictedToken, DuplicateTokenEx, SecurityImpersonation, TokenImpersonation, DISABLE_MAX_PRIVILEGE, PSID,
+    SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenMutexW, OpenProcessToken, SetThreadToken, MUTEX_ALL_ACCESS, SYNCHRONIZATION_ACCESS_RIGHTS,
+    AddSIDToBoundaryDescriptor, CreateBoundaryDescriptorW, CreatePrivateNamespaceW, DeleteBoundaryDescriptor,
+    GetCurrentProcess, OpenPrivateNamespaceW, OpenProcessToken, SetThreadToken,
 };
 use windows_service::service::{ServiceAccess, ServiceActionType, ServiceStartType};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use super::record_proofs::user_rights;
 use super::{ProvisionedService, GLOBAL_NET_STATE, TUN};
-
-/// `SYNCHRONIZE`: the right to wait on an object.
-const SYNCHRONIZE: u32 = 0x0010_0000;
-const READ_CONTROL: u32 = 0x0002_0000;
 
 fn helper() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_test_service"))
@@ -46,75 +39,10 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// The lock's mutex opened for `access` by the calling thread's token.
-fn open_lock_mutex(access: SYNCHRONIZATION_ACCESS_RIGHTS) -> windows::core::Result<HANDLE> {
-    let name = wide(MACHINE_WIDE_NAME);
-    // SAFETY: `name` is NUL-terminated and outlives the call.
-    unsafe { OpenMutexW(access, false, PCWSTR(name.as_ptr())) }
-}
-
-/// The rights the ACE-naming SID `sid` has on the lock's DACL.
-fn rights_on_the_lock(sid: &str) -> u32 {
-    let handle = open_lock_mutex(SYNCHRONIZATION_ACCESS_RIGHTS(READ_CONTROL)).expect("open the lock for READ_CONTROL");
-    let mut acl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `handle` is a live mutex handle with READ_CONTROL; the
-    // descriptor is freed below.
-    let status = unsafe {
-        GetSecurityInfo(
-            handle,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut acl),
-            None,
-            Some(&mut descriptor),
-        )
-    };
-    assert_eq!(status.0, 0, "GetSecurityInfo of the lock");
-    let rights = if sid == "standard user" {
-        user_rights("start-type lock", acl)
-    } else {
-        super::record_proofs::rights_of(acl, sid)
-    };
-    // SAFETY: both were returned by the calls above.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-        let _ = CloseHandle(handle);
-    }
-    rights
-}
-
-/// Proves: SYSTEM and Administrators are granted every right on the lock, and
-/// the groups of a standard user between them are granted `SYNCHRONIZE` and
-/// nothing else, so an unprivileged GUI can wait on it and cannot release,
-/// take over or change it. Red under: a DACL that grants Users more, or
-/// Administrators less.
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_the_start_type_lock_dacl_grants_a_user_the_wait_and_nothing_more() {
-    let _held = StartTypeLock::machine_wide()
-        .acquire()
-        .expect("take the lock, which creates it");
-    for privileged in ["S-1-5-18", "S-1-5-32-544"] {
-        let rights = rights_on_the_lock(privileged);
-        assert_eq!(
-            rights & MUTEX_ALL_ACCESS.0,
-            MUTEX_ALL_ACCESS.0,
-            "{privileged} is granted {rights:#010x}, not every mutex right"
-        );
-    }
-    let user = rights_on_the_lock("standard user");
-    assert_eq!(
-        user, SYNCHRONIZE,
-        "a standard user's groups are granted {user:#010x}, not SYNCHRONIZE alone"
-    );
-}
-
 /// Runs `f` on a new thread whose token is the current one with Administrators
 /// disabled and every privilege dropped: what the GUI's unprivileged token has
 /// of the lock's DACL's concern.
-fn as_a_standard_user<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+pub(super) fn as_a_standard_user<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|s| {
         s.spawn(|| {
             let mut process_token = HANDLE::default();
@@ -179,48 +107,88 @@ fn as_a_standard_user<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
-/// Proves: a token without Administrators waits on the lock the way the GUI's
-/// status read does (taking it when free, finding it held when not), and is
-/// refused any right beyond `SYNCHRONIZE`. Red under: a DACL that grants
-/// Authenticated Users more than the wait, or less.
+/// The Win32 error of making (`make`) or opening the lock's private namespace
+/// under `alias`, with the production boundary, as the calling thread's token.
+/// `None`: it was made or opened.
+fn namespace_refusal(alias: &str, make: bool) -> Option<u32> {
+    let boundary_name = wide(BOUNDARY_NAME);
+    let sid_text = wide(REQUIRED_SID);
+    let alias = wide(alias);
+    // SAFETY: NUL-terminated inputs outliving the calls; the SID and the
+    // boundary descriptor are released below.
+    unsafe {
+        let mut sid = PSID::default();
+        ConvertStringSidToSidW(PCWSTR(sid_text.as_ptr()), &mut sid).expect("parse the SID");
+        let mut boundary = CreateBoundaryDescriptorW(PCWSTR(boundary_name.as_ptr()), 0);
+        AddSIDToBoundaryDescriptor(&mut boundary, sid).expect("name the SID in the boundary");
+        let namespace = if make {
+            CreatePrivateNamespaceW(None, boundary.0, PCWSTR(alias.as_ptr()))
+        } else {
+            OpenPrivateNamespaceW(boundary.0, PCWSTR(alias.as_ptr()))
+        };
+        let refusal = (namespace.is_invalid() || namespace.0.is_null()).then(|| GetLastError().0);
+        DeleteBoundaryDescriptor(boundary);
+        let _ = LocalFree(Some(HLOCAL(sid.0)));
+        refusal
+    }
+}
+
+/// Proves: a token without Administrators (what the GUI runs as) can neither
+/// make the lock's namespace before any Hole process does, nor open it, nor
+/// take or wait on the lock, whether an administrator holds it or it is free,
+/// and an administrator's token takes it. Red under: a boundary without the
+/// Administrators SID, a DACL that admits another group, or a right to wait
+/// given to anyone but SYSTEM and Administrators.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_a_token_without_administrators_waits_on_the_start_type_lock() {
-    let held = StartTypeLock::machine_wide().acquire().expect("take the lock");
-    let (tried_tx, tried_rx) = std::sync::mpsc::channel();
-    let (released_tx, released_rx) = std::sync::mpsc::channel::<()>();
-    let (found_it_held, refusal, took_it_once_free) = std::thread::scope(|s| {
-        let user = s.spawn(move || {
-            as_a_standard_user(move || {
-                let found_it_held = StartTypeLock::machine_wide()
-                    .try_acquire()
-                    .expect("try while held")
-                    .is_none();
-                let refusal = open_lock_mutex(MUTEX_ALL_ACCESS)
-                    .err()
-                    .map(|e| e.code().0 as u32 & 0xFFFF);
-                tried_tx.send(()).expect("tell the holder");
-                released_rx.recv().expect("the holder lets go");
-                let took_it_once_free = StartTypeLock::machine_wide()
-                    .try_acquire()
-                    .expect("try when free")
-                    .is_some();
-                (found_it_held, refusal, took_it_once_free)
-            })
-        });
-        tried_rx.recv().expect("the standard user's thread ended before trying");
-        drop(held);
-        released_tx.send(()).expect("tell the standard user");
-        user.join().expect("the standard user's thread")
-    });
-    assert!(found_it_held, "the lock was held by an administrator thread");
+fn cutover_global_net_state_a_token_without_administrators_can_neither_make_open_nor_wait_on_the_start_type_lock() {
+    let held = StartTypeLock::machine_wide()
+        .acquire()
+        .expect("an administrator takes the lock");
     assert_eq!(
-        refusal,
-        Some(ERROR_ACCESS_DENIED.0),
-        "a token without Administrators opened the lock for every right"
+        namespace_refusal("hole-proof-control", false),
+        None,
+        "control: an administrator's token opens the namespace (this lane runs elevated)"
+    );
+    let while_held = as_a_standard_user(|| {
+        (
+            StartTypeLock::machine_wide()
+                .try_acquire()
+                .err()
+                .and_then(|e| e.raw_os_error()),
+            namespace_refusal("hole-proof-squat", true),
+            namespace_refusal("hole-proof-open", false),
+        )
+    });
+    drop(held);
+    let when_free = as_a_standard_user(|| {
+        (
+            StartTypeLock::machine_wide()
+                .acquire()
+                .err()
+                .and_then(|e| e.raw_os_error()),
+            namespace_refusal("hole-proof-squat-free", true),
+        )
+    });
+    let denied = Some(ERROR_ACCESS_DENIED.0);
+    assert_eq!(
+        while_held.0.map(|e| e as u32),
+        denied,
+        "a standard user's try on a held lock"
+    );
+    assert_eq!(while_held.1, denied, "a standard user's make of the namespace");
+    assert_eq!(while_held.2, denied, "a standard user's open of the namespace");
+    assert_eq!(
+        when_free.0.map(|e| e as u32),
+        denied,
+        "a standard user's take of a free lock"
+    );
+    assert_eq!(
+        when_free.1, denied,
+        "a standard user's make of the namespace, lock free"
     );
     assert!(
-        took_it_once_free,
-        "the lock is free once released, and a standard user takes it"
+        StartTypeLock::machine_wide().try_acquire().expect("try").is_some(),
+        "the lock is free and an administrator takes it"
     );
 }
 
@@ -250,7 +218,11 @@ fn cutover_global_net_state_a_retirement_holds_the_start_type_lock_until_it_ends
         panic!("the provisioned service is registered");
     };
     assert!(held_for_another_thread(), "the retirement holds it");
-    assert_eq!(gui_status_from_another_thread(), DisabledState::InChange);
+    assert_eq!(
+        gui_status_from_another_thread(),
+        DisabledState::NotDisabled,
+        "the GUI's read does not wait for the lock, and nothing is stamped yet"
+    );
 
     drop(session);
     assert!(!held_for_another_thread(), "released with the session");
@@ -300,7 +272,11 @@ fn cutover_global_net_state_the_cutover_hold_hardens_the_service_and_restores_it
     };
     let mut hold = os_actor.hold_service().expect("hold the service");
     assert!(held_for_another_thread(), "the hold has the lock");
-    assert_eq!(gui_status_from_another_thread(), DisabledState::InChange);
+    assert_eq!(
+        gui_status_from_another_thread(),
+        DisabledState::InChange,
+        "the record names the holding process, which is running"
+    );
     assert_eq!(start_type(), ServiceStartType::Disabled, "the stop is final");
     assert!(!restarts_on_failure(), "nothing restarts the old image under the swap");
     assert_eq!(
@@ -317,6 +293,7 @@ fn cutover_global_net_state_the_cutover_hold_hardens_the_service_and_restores_it
         RecordState::Absent
     );
     assert!(held_for_another_thread(), "still held until the cutover is done");
+    assert_eq!(gui_status_from_another_thread(), DisabledState::NotDisabled);
 
     drop(hold);
     assert!(!held_for_another_thread(), "released with the hold");
@@ -333,7 +310,7 @@ fn cutover_global_net_state_an_install_holds_the_start_type_lock_through_every_s
     let _service = ProvisionedService::install(helper());
     let hold = os::hold_start_type().expect("hold the start type");
     assert!(held_for_another_thread(), "the hold has the lock");
-    assert_eq!(gui_status_from_another_thread(), DisabledState::InChange);
+    gui_status_from_another_thread();
 
     os::disabled_by().expect("the elevated read under the hold");
     assert!(held_for_another_thread(), "held after the read");
@@ -343,7 +320,7 @@ fn cutover_global_net_state_an_install_holds_the_start_type_lock_through_every_s
     assert!(held_for_another_thread(), "held after the repair");
     os::ensure_failure_actions().expect("the failure-actions refresh under the hold");
     assert!(held_for_another_thread(), "held after the refresh");
-    assert_eq!(gui_status_from_another_thread(), DisabledState::InChange);
+    gui_status_from_another_thread();
 
     drop(hold);
     assert!(!held_for_another_thread(), "released with the hold");

@@ -261,24 +261,6 @@ fn the_registered_service_runs_the_bridge_as_local_system_whatever_its_start_typ
 }
 
 #[skuld::test]
-fn a_status_read_while_the_start_type_lock_is_held_says_a_change_is_in_progress() {
-    let lock = StartTypeLock::scratch("status");
-    let held = lock.acquire().expect("hold the lock");
-    let state = std::thread::scope(|s| {
-        s.spawn(|| disabled_state_under(&lock))
-            .join()
-            .expect("the reader's thread")
-    });
-    assert_eq!(state, DisabledState::InChange);
-    drop(held);
-    assert_ne!(
-        disabled_state_under(&lock),
-        DisabledState::InChange,
-        "free: the record decides"
-    );
-}
-
-#[skuld::test]
 fn a_change_that_spans_several_steps_waits_for_another_holder_before_its_first() {
     let lock = StartTypeLock::scratch("hold-waits");
     let held = lock.while_another_waits(|on_busy| hold_start_type_noting(&lock, on_busy).is_ok());

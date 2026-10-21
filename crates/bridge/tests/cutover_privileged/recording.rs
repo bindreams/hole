@@ -9,7 +9,7 @@ use hole_bridge::cutover::scm_wait::retire::{FailureActions, ServiceSession, Sta
 use hole_bridge::cutover::scm_wait::scan::ScanFinding;
 use hole_bridge::cutover::scm_wait::settle::StopActor;
 use hole_bridge::cutover::scm_wait::Observed;
-use hole_bridge::disable_record::RecordState;
+use hole_bridge::disable_record::{Changer, RecordState};
 use hole_bridge::platform::os::{Opening, RetireSession};
 use hole_bridge::service_start::StartType;
 
@@ -174,6 +174,15 @@ impl<S: ServiceSession> StartConfig for Recording<'_, S> {
         self.record(Event::ClearRecord);
         self.inner.clear_record()
     }
+
+    fn write_record(&mut self) -> std::io::Result<()> {
+        self.record(Event::WriteRecord);
+        self.inner.write_record()
+    }
+
+    fn record_changer(&mut self) -> Option<Changer> {
+        self.inner.record_changer()
+    }
 }
 
 impl<S: ServiceSession> ServiceSession for Recording<'_, S> {
@@ -181,11 +190,6 @@ impl<S: ServiceSession> ServiceSession for Recording<'_, S> {
         self.record(Event::SetFailureActions(actions));
         let result = self.inner.set_failure_actions(actions);
         self.note(Call::SetFailureActions, result)
-    }
-
-    fn write_record(&mut self) -> std::io::Result<()> {
-        self.record(Event::WriteRecord);
-        self.inner.write_record()
     }
 
     fn delete(&mut self) -> std::io::Result<()> {

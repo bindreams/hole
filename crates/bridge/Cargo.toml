@@ -158,6 +158,9 @@ windows = { version = "0.62", features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",
     "Win32_System_Threading",
+    # NtQuerySystemInformation's SYSTEM_PROCESS_INFORMATION, for the process
+    # list a record's stamp is checked against (`disable_record::stamp`).
+    "Win32_System_WindowsProgramming",
 ] }
 # Used by the ETW consumer in crates/bridge/src/diagnostics/etw.rs.
 ferrisetw = "1.2.0"

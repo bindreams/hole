@@ -26,7 +26,7 @@ use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, 
 use crate::cutover::scm_wait::scan::ScanFinding;
 use crate::cutover::scm_wait::settle::StopActor;
 use crate::cutover::scm_wait::Observed;
-use crate::disable_record::{RecordKey, RecordState};
+use crate::disable_record::{Changer, RecordKey, RecordState};
 use crate::service_start::StartType;
 
 /// One service handle, opened before anything is changed, carries the
@@ -162,6 +162,14 @@ impl StartConfig for RetireSession {
     fn clear_record(&mut self) -> io::Result<()> {
         self.record.clear()
     }
+
+    fn write_record(&mut self) -> io::Result<()> {
+        self.record.write()
+    }
+
+    fn record_changer(&mut self) -> Option<Changer> {
+        self.record.changer()
+    }
 }
 
 impl ServiceSession for RetireSession {
@@ -179,10 +187,6 @@ impl ServiceSession for RetireSession {
         self.service
             .delete()
             .map_err(|e| scm_failure(ScmCall::DeleteService, e))
-    }
-
-    fn write_record(&mut self) -> io::Result<()> {
-        self.record.write()
     }
 }
 

@@ -1,5 +1,5 @@
-//! The SCM handle behind the start-type repair, the enable, and the GUI's read
-//! of whether the service is disabled.
+//! The SCM handle behind the start-type repair, the enable and the elevated
+//! read of whether the service is disabled, all under the start-type lock.
 
 use std::io;
 
@@ -12,11 +12,11 @@ use super::start_type_lock::{log_wait, Held, StartTypeLock};
 use super::{open_error_is_absent, scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::ScmCall;
 use crate::cutover::scm_wait::retire::{StartConfig, StartWrite};
-use crate::disable_record::{RecordKey, RecordState};
+use crate::disable_record::{Changer, RecordKey, RecordState};
 use crate::service_start::StartType;
 
-/// The rights a read of the start type needs, and all an unprivileged caller
-/// (the GUI) is asked for.
+/// The rights a read of the start type needs, and all the GUI's status read
+/// ([`StatusSession`](super::status_session::StatusSession)) asks for.
 pub(super) const READ_ACCESS: ServiceAccess = ServiceAccess::QUERY_CONFIG;
 
 /// The rights a repair needs: the start type read and written.
@@ -34,14 +34,6 @@ pub(super) struct RepairSession {
     _held: Held,
 }
 
-/// What the GUI's status read finds when it opens the service.
-pub(super) enum Reading {
-    /// Another thread holds the start-type lock: a change is in progress.
-    InChange,
-    /// The service opened (`Some`) or the SCM has no entry (`None`).
-    Session(Option<RepairSession>),
-}
-
 impl RepairSession {
     /// Opens the service with `access`, or `None` when the SCM has no entry,
     /// once the start-type lock is held.
@@ -56,15 +48,6 @@ impl RepairSession {
         on_busy: impl FnOnce(),
     ) -> io::Result<Option<Self>> {
         Self::open_holding(lock.acquire_noting_wait(on_busy)?, access)
-    }
-
-    /// The GUI's open: without waiting for the start-type lock, which another
-    /// thread holds while it changes the start type and the record.
-    pub(super) fn open_unless_in_change(lock: &StartTypeLock, access: ServiceAccess) -> io::Result<Reading> {
-        match lock.try_acquire()? {
-            Some(held) => Self::open_holding(held, access).map(Reading::Session),
-            None => Ok(Reading::InChange),
-        }
     }
 
     /// Opens the service with `access` while `held`, which the session keeps
@@ -124,6 +107,14 @@ impl StartConfig for RepairSession {
 
     fn clear_record(&mut self) -> io::Result<()> {
         self.record.clear()
+    }
+
+    fn write_record(&mut self) -> io::Result<()> {
+        self.record.write()
+    }
+
+    fn record_changer(&mut self) -> Option<Changer> {
+        self.record.changer()
     }
 }
 

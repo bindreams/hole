@@ -10,13 +10,16 @@
 //!
 //! The real session holds the machine-wide start-type lock for as long as it is
 //! open, so a repair or an enable never runs under a retirement that is still
-//! going, and the GUI's read, which does not wait for the lock, says when it is
-//! held.
+//! going. Both stamp the record with their own identity before they change the
+//! start type, so the GUI's read, which never touches the lock, sees a change
+//! in progress while they work ([`display`]).
 
 use std::io;
 
-use super::retire::{clear_record, StartConfig, StartWrite};
-use crate::disable_record::DisabledBy;
+use tracing::warn;
+
+use super::retire::{clear_record, StartConfig, StartRead, StartWrite};
+use crate::disable_record::{DisabledState, RecordState};
 use crate::service_start::RepairStep;
 
 /// Why a repair failed, by the step that failed.
@@ -35,10 +38,32 @@ pub fn observe<S: StartConfig>(session: &mut S) -> io::Result<RepairStep> {
     Ok(RepairStep::of(session.record_state(), start))
 }
 
-/// Who disabled the service, for a reader that must never fail (the GUI's
-/// status). A start type that could not be read says nothing is disabled.
-pub fn for_display(observed: io::Result<RepairStep>) -> Option<DisabledBy> {
-    observed.ok().and_then(RepairStep::disabled_by)
+/// What the GUI's status shows of the service: a reader that must never fail.
+/// It reads the start type, then the record's changer, and writes nothing. A
+/// record whose writer is still running is a change in progress, whatever the
+/// start type says (or whether it could be read); otherwise a start type that
+/// could not be read says nothing is disabled.
+pub fn display<S: StartRead>(session: &mut S) -> DisabledState {
+    let start = session.read_start_type();
+    let changer = session.read_changer();
+    let record = match changer {
+        Some(_) => RecordState::Present,
+        None => RecordState::Absent,
+    };
+    if let Err(error) = &start {
+        warn!(%error, "could not read the service's start type, so it is taken as not disabled");
+    }
+    let disabled_by = start.ok().and_then(|start| RepairStep::of(record, start).disabled_by());
+    DisabledState::of(changer, disabled_by)
+}
+
+/// Stamps the record with this process before a repair or an enable changes
+/// the start type. A failure costs the reader only its wording (it would read
+/// the earlier stamp's process), so it is a warning.
+fn stamp<S: StartConfig>(session: &mut S) {
+    if let Err(error) = session.write_record() {
+        warn!(%error, "could not stamp the record with this process; a status read may call this change interrupted");
+    }
 }
 
 /// Takes the step [`observe`] finds and returns it.
@@ -55,6 +80,7 @@ pub fn repair<S: StartConfig>(session: &mut S) -> Result<RepairStep, RepairError
         RepairStep::LeaveDisabled => {}
         RepairStep::ClearRecordOnly => clear_record(session),
         RepairStep::ResetThenClear => {
+            stamp(session);
             session.set_start_type(StartWrite::Auto).map_err(RepairError::Reset)?;
             clear_record(session);
         }
@@ -65,6 +91,7 @@ pub fn repair<S: StartConfig>(session: &mut S) -> Result<RepairStep, RepairError
 /// Sets the start type to automatic whatever it is and the record says, then
 /// clears the record. The administrator asked for it.
 pub fn enable<S: StartConfig>(session: &mut S) -> Result<(), RepairError> {
+    stamp(session);
     session.set_start_type(StartWrite::Auto).map_err(RepairError::Reset)?;
     clear_record(session);
     Ok(())

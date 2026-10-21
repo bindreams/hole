@@ -46,28 +46,6 @@ fn opening_for_a_repair_or_an_enable_waits_for_the_start_type_lock() {
 }
 
 #[skuld::test]
-fn the_status_read_does_not_wait_and_says_a_change_is_in_progress_while_the_lock_is_held() {
-    let lock = StartTypeLock::scratch("status-open");
-    let held = lock.acquire().expect("hold the lock");
-    let in_change = std::thread::scope(|s| {
-        s.spawn(|| {
-            matches!(
-                RepairSession::open_unless_in_change(&lock, READ_ACCESS),
-                Ok(Reading::InChange)
-            )
-        })
-        .join()
-        .expect("the reader's thread")
-    });
-    assert!(in_change);
-    drop(held);
-    let read = RepairSession::open_unless_in_change(&lock, READ_ACCESS);
-    assert!(matches!(read, Ok(Reading::Session(_))), "free: the record decides");
-    drop(read);
-    assert!(!lock.is_held_for_another_thread(), "released with the session");
-}
-
-#[skuld::test]
 fn a_repair_session_holds_the_start_type_lock_for_as_long_as_it_is_open() {
     let lock = StartTypeLock::scratch("repair-held");
     // A service every Windows has, opened for the read the GUI's status makes.

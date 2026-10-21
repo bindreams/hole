@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use super::call_error::{io_error_is_a_refused_process_open, service_gone, ServiceGone};
 use super::scan::ScanFinding;
 use super::settle::{settle_stopped, SettleError, StopActor};
-use crate::disable_record::RecordState;
+use crate::disable_record::{Changer, RecordState};
 use crate::service_start::StartType;
 
 /// What a retirement leaves behind once the service is stopped.
@@ -91,23 +91,57 @@ impl Hardening {
     }
 
     /// What the hardening does about the record, from the start type and the
-    /// record found. A record already there is never written again; one over a
+    /// record found. A record already there is stamped again with this
+    /// retirement's identity, so a reader does not take the old stamp's dead
+    /// process for an interrupted change while this one runs; one over a
     /// service that is not Disabled is stale, kept until [`restore`] or the
     /// delete sweeps it.
     fn plan(observed: StartType, record: RecordState) -> Plan {
-        let (ours, writes_record) = match (observed, record) {
-            (StartType::Auto, RecordState::Absent) => (true, true),
-            (StartType::Auto, RecordState::Present) => (true, false),
-            (StartType::Demand, RecordState::Absent) => (true, true),
-            (StartType::Demand, RecordState::Present) => (true, false),
-            (StartType::Disabled, RecordState::Absent) => (false, false),
-            (StartType::Disabled, RecordState::Present) => (true, false),
-            (StartType::Other, RecordState::Absent) => (true, true),
-            (StartType::Other, RecordState::Present) => (true, false),
+        let (ours, record_write) = match (observed, record) {
+            (StartType::Auto, RecordState::Absent) => (true, RecordWrite::Make),
+            (StartType::Auto, RecordState::Present) => (true, RecordWrite::Restamp),
+            (StartType::Demand, RecordState::Absent) => (true, RecordWrite::Make),
+            (StartType::Demand, RecordState::Present) => (true, RecordWrite::Restamp),
+            (StartType::Disabled, RecordState::Absent) => (false, RecordWrite::None),
+            (StartType::Disabled, RecordState::Present) => (true, RecordWrite::Restamp),
+            (StartType::Other, RecordState::Absent) => (true, RecordWrite::Make),
+            (StartType::Other, RecordState::Present) => (true, RecordWrite::Restamp),
         };
         Plan {
             hardening: Hardening { observed, ours },
-            writes_record,
+            record_write,
+        }
+    }
+}
+
+/// What [`harden`] does to the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordWrite {
+    /// Nothing: the Disable is an administrator's.
+    None,
+    /// The record is not there: make it.
+    Make,
+    /// The record is there: stamp it again.
+    Restamp,
+}
+
+impl RecordWrite {
+    /// Whether the call writes the record.
+    fn writes(self) -> bool {
+        match self {
+            RecordWrite::None => false,
+            RecordWrite::Make => true,
+            RecordWrite::Restamp => true,
+        }
+    }
+
+    /// Whether a failure after the write clears the record: only a record
+    /// this call made is its own to remove; one that was there stays.
+    fn clears_on_failure(self) -> bool {
+        match self {
+            RecordWrite::None => false,
+            RecordWrite::Make => true,
+            RecordWrite::Restamp => false,
         }
     }
 }
@@ -115,8 +149,7 @@ impl Hardening {
 /// What [`harden`] is to do, decided once from what it found.
 struct Plan {
     hardening: Hardening,
-    /// Whether this call writes the record.
-    writes_record: bool,
+    record_write: RecordWrite,
 }
 
 /// A service's start type and the record that an uninstall disabled it: what a
@@ -130,6 +163,34 @@ pub trait StartConfig {
     fn record_state(&mut self) -> RecordState;
     /// Remove the record.
     fn clear_record(&mut self) -> io::Result<()>;
+    /// Write the record, stamped with the identity of the process changing the
+    /// service, replacing a stamp already there.
+    fn write_record(&mut self) -> io::Result<()>;
+    /// Whether the process that stamped the record is still running: `None`
+    /// when there is no record.
+    fn record_changer(&mut self) -> Option<Changer>;
+}
+
+/// What the GUI's status read needs of the service: the start type and the
+/// record's changer, and nothing it could write. A session that holds the
+/// start-type lock reads through this too ([`StartConfig`]); the GUI's own
+/// session does not hold it and implements nothing else.
+pub trait StartRead {
+    /// The start type now.
+    fn read_start_type(&mut self) -> io::Result<StartType>;
+    /// Whether the process that stamped the record is still running: `None`
+    /// when there is no record.
+    fn read_changer(&mut self) -> Option<Changer>;
+}
+
+impl<S: StartConfig> StartRead for S {
+    fn read_start_type(&mut self) -> io::Result<StartType> {
+        self.start_type()
+    }
+
+    fn read_changer(&mut self) -> Option<Changer> {
+        self.record_changer()
+    }
 }
 
 /// The SCM operations a retirement needs on top of the stop wait, all through
@@ -140,8 +201,6 @@ pub trait ServiceSession: StopActor + StartConfig {
     fn set_failure_actions(&mut self, actions: FailureActions) -> io::Result<()>;
     /// `DeleteService`: mark the service for deletion.
     fn delete(&mut self) -> io::Result<()>;
-    /// Write the record.
-    fn write_record(&mut self) -> io::Result<()>;
 }
 
 /// Why a retirement failed, by the step that failed.
@@ -206,7 +265,8 @@ fn answered_as_marked(error: &io::Error) -> bool {
     service_gone(error).is_some_and(ServiceGone::harden_goes_on_marked)
 }
 
-/// Write the record, disable the start type, then turn restart-on-failure off.
+/// Write the record (stamped with this process), disable the start type, then
+/// turn restart-on-failure off.
 ///
 /// A disabled start type is what makes STOPPED final: the SCM's own restart of
 /// a service it is about to restart starts it, and a disabled service cannot be
@@ -229,13 +289,13 @@ pub(crate) fn harden<S: ServiceSession>(session: &mut S) -> Result<Hardened, Ret
     let record = session.record_state();
     let Plan {
         hardening,
-        writes_record,
+        record_write,
     } = Hardening::plan(observed, record);
-    if writes_record {
+    if record_write.writes() {
         session.write_record().map_err(RetireError::Record)?;
     }
     if let Err(error) = session.set_start_type(StartWrite::Disabled) {
-        if writes_record {
+        if record_write.clears_on_failure() {
             clear_record(session);
         }
         if answered_as_marked(&error) {

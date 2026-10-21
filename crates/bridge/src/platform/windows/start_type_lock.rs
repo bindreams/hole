@@ -5,41 +5,49 @@
 //! interleave: overlapping retirements leave the service Disabled with no
 //! record, and a repair run during a live uninstall resets the start type and
 //! clears the record under it. So every such caller holds one machine-wide
-//! named mutex from its first read to its last write, and the GUI's read takes
-//! it without waiting ([`StartTypeLock::try_acquire`]): held means a change is
-//! in progress and the record's answer is not yet one, free means the record
-//! decides.
+//! mutex from its first read to its last write. The GUI never touches it: a
+//! writer stamps the record with its own identity, and the GUI reads whether
+//! that process is still running ([`crate::disable_record`]).
 //!
-//! A mutex dies with its holder: held is live, and free over a record is an
-//! interrupted change, with no stored marker to go stale. A holder that ends
-//! without releasing hands the lock on abandoned, which counts as taken.
+//! The mutex lives in a private namespace ([`namespace`]) whose boundary
+//! requires the Administrators SID and whose DACL admits SYSTEM and
+//! Administrators only: an unprivileged user can neither create, squat, open
+//! nor wait on it. A wait on a mutex takes it, so a right to wait is a right to
+//! hold the lock for ever; no one outside those two is given one.
 //!
-//! The DACL lets SYSTEM and Administrators take it and any signed-in user only
-//! wait on it (`SYNCHRONIZE`), which is all the GUI's read asks for. Whoever
-//! creates the object first sets it, so the unprivileged reader can be first
-//! without weakening it.
+//! A holder that ends without releasing hands the lock on abandoned, which
+//! counts as taken.
 
 use std::io;
 use std::marker::PhantomData;
 
 use tracing::info;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{CreateMutexExW, ReleaseMutex, WaitForSingleObject, INFINITE};
 
 use crate::cutover::scm_wait::call_error::win32_code_of_hresult;
 
-/// The mutex's name in the Global namespace, so a GUI in a user's session and
-/// a service-session process meet on one object.
-pub const MACHINE_WIDE_NAME: &str = r"Global\HoleBridgeStartTypeLock";
+#[path = "start_type_lock/namespace.rs"]
+mod namespace;
 
-/// SYSTEM and Administrators: everything. Authenticated Users: `SYNCHRONIZE`
-/// (0x00100000), the right to wait and nothing else.
-const DACL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;AU)";
+use namespace::{Descriptor, Site};
 
-/// `SYNCHRONIZE`: all a wait needs, and the one right every caller is granted.
+/// The boundary descriptor's name, and the alias the mutex is named under.
+pub const BOUNDARY_NAME: &str = "HoleBridgeStartTypeLock";
+
+/// The SID a caller's token must hold to make, open or wait on the lock:
+/// Administrators. SYSTEM's token holds it too, so the service's cutover child
+/// and an elevated administrator meet on the one lock.
+pub const REQUIRED_SID: &str = "BA";
+
+/// SYSTEM and Administrators: everything, on the namespace and the mutex.
+const DACL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
+
+/// The mutex's name inside the namespace.
+const MUTEX_LEAF: &str = "Lock";
+
+/// `SYNCHRONIZE`: all a wait needs.
 const SYNCHRONIZE: u32 = 0x0010_0000;
 
 /// An open handle to the mutex, closed when dropped.
@@ -72,24 +80,54 @@ impl Drop for Held {
 /// The machine-wide mutex that serializes everything reading or writing the
 /// start type and the record together.
 pub struct StartTypeLock {
-    /// NUL-terminated UTF-16.
-    name: Vec<u16>,
+    site: Site,
+    /// The mutex's full name, `<alias>\Lock`, NUL-terminated UTF-16.
+    mutex_name: Vec<u16>,
 }
 
 impl StartTypeLock {
     /// The one lock every Hole process on this computer shares.
     pub fn machine_wide() -> Self {
-        Self::at(MACHINE_WIDE_NAME)
+        Self::at(BOUNDARY_NAME, REQUIRED_SID, BOUNDARY_NAME, Some(DACL))
     }
 
-    /// A lock of the test's own: a name nothing else uses, in the session's
-    /// namespace, which needs no privilege.
+    /// A lock of the test's own: a boundary nothing else uses, which every
+    /// caller is inside (Everyone), so it needs no privilege.
     #[cfg(test)]
     pub(crate) fn scratch(test: &str) -> Self {
+        Self::scratch_within(test, "WD")
+    }
+
+    /// [`scratch`](Self::scratch) with a boundary requiring `sid`.
+    #[cfg(test)]
+    pub(crate) fn scratch_within(test: &str, sid: &str) -> Self {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        Self::at(&format!(r"Local\hole-test-{}-{n}-{test}", std::process::id()))
+        let name = format!("hole-test-{}-{n}-{test}", std::process::id());
+        Self::at(&name, sid, &name, None)
+    }
+
+    /// A test lock with this one's boundary name, requiring `sid` instead,
+    /// under an alias of its own: the squat of this lock's name by a caller
+    /// with another SID.
+    #[cfg(test)]
+    pub(crate) fn with_the_same_boundary_name_within(&self, sid: &str) -> Self {
+        let name = String::from_utf16_lossy(&self.site.boundary_name[..self.site.boundary_name.len() - 1]);
+        Self::at(&name, sid, &format!("{name}-{sid}"), None)
+    }
+
+    /// Makes this lock's namespace under an alias of its own and does not keep
+    /// the process's record of it, so the lock's own first use finds a
+    /// namespace some other process made.
+    #[cfg(test)]
+    pub(crate) fn make_the_namespace_under_another_alias(&self) {
+        let mut site = self.site.clone();
+        site.alias = wide(&format!(
+            "{}-elsewhere",
+            String::from_utf16_lossy(&self.site.alias[..self.site.alias.len() - 1])
+        ));
+        namespace::make_unrecorded(&site).expect("make the namespace");
     }
 
     /// Whether a thread other than this one finds the lock held.
@@ -119,9 +157,15 @@ impl StartTypeLock {
         })
     }
 
-    fn at(name: &str) -> Self {
+    fn at(boundary_name: &str, required_sid: &str, alias: &str, dacl: Option<&'static str>) -> Self {
         Self {
-            name: name.encode_utf16().chain(std::iter::once(0)).collect(),
+            site: Site {
+                boundary_name: wide(boundary_name),
+                required_sid: required_sid.to_string(),
+                alias: wide(alias),
+                dacl,
+            },
+            mutex_name: wide(&format!(r"{alias}\{MUTEX_LEAF}")),
         }
     }
 
@@ -150,34 +194,28 @@ impl StartTypeLock {
         Ok(wait(&mutex, 0)?.then(|| held(mutex)))
     }
 
-    /// Opens the mutex, creating it with the lock's DACL if no one has.
+    /// Opens the mutex in the namespace, making both with the lock's DACL if
+    /// no one has.
     fn open(&self) -> io::Result<Mutex> {
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        let sddl: Vec<u16> = DACL.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: `sddl` is NUL-terminated and outlives the call; the
-        // descriptor it allocates is freed below.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(sddl.as_ptr()),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                None,
+        namespace::ensure(&self.site)?;
+        let descriptor = self.site.dacl.map(Descriptor::from_sddl).transpose()?;
+        let attributes = descriptor.as_ref().map(Descriptor::attributes);
+        // SAFETY: `mutex_name` is NUL-terminated, and `attributes` and the
+        // descriptor it points at outlive the call. Not initially owned.
+        let created = unsafe {
+            CreateMutexExW(
+                attributes.as_ref().map(std::ptr::from_ref),
+                PCWSTR(self.mutex_name.as_ptr()),
+                0,
+                SYNCHRONIZE,
             )
-        }
-        .map_err(io_error)?;
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor.0,
-            bInheritHandle: false.into(),
         };
-        // SAFETY: `name` is NUL-terminated, and `attributes` and the descriptor
-        // it points at outlive the call. Not initially owned; `SYNCHRONIZE`
-        // is the access every caller is granted.
-        let created = unsafe { CreateMutexExW(Some(&attributes), PCWSTR(self.name.as_ptr()), 0, SYNCHRONIZE) };
-        // SAFETY: allocated by the conversion, which asks for `LocalFree`.
-        let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
         created.map(Mutex).map_err(io_error)
     }
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// What a caller that has to wait says before it does.

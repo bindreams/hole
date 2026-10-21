@@ -30,10 +30,13 @@ mod stop_session;
 pub use stop_session::StopSession;
 #[path = "windows/start_type_lock.rs"]
 mod start_type_lock;
-pub use start_type_lock::{Held, StartTypeLock, MACHINE_WIDE_NAME};
+pub use start_type_lock::{Held, StartTypeLock, BOUNDARY_NAME, REQUIRED_SID};
 #[path = "windows/repair_session.rs"]
 mod repair_session;
-use repair_session::{Reading, RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
+use repair_session::{RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
+#[path = "windows/status_session.rs"]
+mod status_session;
+use status_session::StatusSession;
 #[path = "windows/registration.rs"]
 pub mod registration;
 #[path = "windows/service_processes.rs"]
@@ -781,30 +784,21 @@ pub fn disabled_by() -> std::io::Result<Option<DisabledBy>> {
 }
 
 /// [`disabled_by`] for a reader that must never fail (the GUI's status, which
-/// runs unprivileged). It never waits for the start-type lock: held, a
-/// retirement, repair or enable is changing the start type and the record, and
-/// the answer is [`DisabledState::InChange`], neither of the two it would give.
-/// A service it cannot open or read is "not disabled", and the reason is
-/// logged, the convention of [`is_installed`].
+/// runs unprivileged). It never touches the start-type lock: a record whose
+/// writer is still running means a retirement, repair or enable is changing the
+/// start type, and the answer is [`DisabledState::InChange`], neither of the
+/// two it would give. A service it cannot open or read is "not disabled", and
+/// the reason is logged, the convention of [`is_installed`].
 pub fn disabled_state() -> DisabledState {
-    disabled_state_under(&StartTypeLock::machine_wide())
-}
-
-fn disabled_state_under(lock: &StartTypeLock) -> DisabledState {
-    let mut session = match RepairSession::open_unless_in_change(lock, READ_ACCESS) {
-        Ok(Reading::Session(Some(session))) => session,
-        Ok(Reading::Session(None)) => return DisabledState::NotDisabled,
-        Ok(Reading::InChange) => return DisabledState::InChange,
+    let mut session = match StatusSession::open() {
+        Ok(Some(session)) => session,
+        Ok(None) => return DisabledState::NotDisabled,
         Err(e) => {
             warn!(error = %e, "could not open the service to read whether it is disabled");
             return DisabledState::NotDisabled;
         }
     };
-    let observed = repair::observe(&mut session);
-    if let Err(e) = &observed {
-        warn!(error = %e, "could not read the service's start type, so it is taken as not disabled");
-    }
-    DisabledState::of(repair::for_display(observed))
+    repair::display(&mut session)
 }
 
 /// Sets the service's start type to automatic, clears the record, and starts

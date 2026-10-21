@@ -155,6 +155,17 @@ impl StartConfig for FakeSession<'_> {
         self.record = RecordState::Absent;
         Ok(())
     }
+    fn write_record(&mut self) -> io::Result<()> {
+        self.call("write_record")?;
+        self.record = RecordState::Present;
+        Ok(())
+    }
+    fn record_changer(&mut self) -> Option<Changer> {
+        match self.record {
+            RecordState::Absent => None,
+            RecordState::Present => Some(Changer::NotRunning),
+        }
+    }
 }
 
 impl ServiceSession for FakeSession<'_> {
@@ -163,11 +174,6 @@ impl ServiceSession for FakeSession<'_> {
     }
     fn delete(&mut self) -> io::Result<()> {
         self.call("delete")
-    }
-    fn write_record(&mut self) -> io::Result<()> {
-        self.call("write_record")?;
-        self.record = RecordState::Present;
-        Ok(())
     }
 }
 
@@ -518,7 +524,9 @@ fn a_disabled_service_without_a_record_is_not_ours_and_is_restored_disabled() {
 }
 
 /// A Disabled service with a record is ours: put back as Automatic, and the
-/// record, which already exists, is neither rewritten nor kept.
+/// record, which already exists, is stamped again with this retirement's
+/// identity (so a reader does not take the old, dead stamp for an interrupted
+/// change while this one runs) and cleared at the end.
 #[skuld::test]
 fn a_disabled_service_with_a_record_is_restored_automatic_and_the_record_cleared() {
     let log = Log::default();
@@ -527,7 +535,7 @@ fn a_disabled_service_with_a_record_is_restored_automatic_and_the_record_cleared
         .with_record(RecordState::Present);
     retire(&mut session, Disposition::StopOnly).unwrap();
     let logged = logged(&log);
-    assert!(!logged.contains(&"write_record".to_owned()), "{logged:?}");
+    assert!(logged.contains(&"write_record".to_owned()), "{logged:?}");
     assert_eq!(logged[logged.len() - RESTORE_AUTO.len()..], RESTORE_AUTO, "{logged:?}");
     assert_eq!(session.record, RecordState::Absent);
 }
@@ -546,14 +554,15 @@ fn a_service_found_on_demand_is_restored_to_on_demand_and_its_record_cleared() {
 }
 
 /// A record over a service that is not Disabled is stale: the retirement
-/// restores the start type as observed and sweeps it, without writing it again.
+/// stamps it with its own identity, restores the start type as observed and
+/// sweeps it.
 #[skuld::test]
 fn a_stale_record_over_a_service_that_is_not_disabled_is_swept() {
     let log = Log::default();
     let mut session = FakeSession::running_then_stopped(&log).with_record(RecordState::Present);
     retire(&mut session, Disposition::StopOnly).unwrap();
     let logged = logged(&log);
-    assert!(!logged.contains(&"write_record".to_owned()), "{logged:?}");
+    assert!(logged.contains(&"write_record".to_owned()), "{logged:?}");
     assert_eq!(logged[logged.len() - RESTORE_AUTO.len()..], RESTORE_AUTO, "{logged:?}");
     assert_eq!(session.record, RecordState::Absent);
 }
@@ -659,7 +668,8 @@ fn a_start_type_write_answered_as_marked_goes_on_to_the_stop_wait() {
 }
 
 /// A record written by an earlier, interrupted uninstall is not this call's to
-/// clear: nothing was written, so nothing is cleared.
+/// clear: this call only stamped it again, so it is kept, and a record this
+/// call made is cleared.
 #[skuld::test]
 fn a_marked_answer_clears_the_record_this_call_wrote_and_keeps_a_stale_one() {
     let log = Log::default();
@@ -668,7 +678,7 @@ fn a_marked_answer_clears_the_record_this_call_wrote_and_keeps_a_stale_one() {
         .failing_with("set_start_type(Disabled)", marked_at_the_start_type_write());
     retire(&mut session, Disposition::Deregister).unwrap();
     let logged = logged(&log);
-    assert!(!logged.contains(&"write_record".to_owned()), "{logged:?}");
+    assert!(logged.contains(&"write_record".to_owned()), "{logged:?}");
     assert!(!logged.contains(&"clear_record".to_owned()), "{logged:?}");
     assert_eq!(session.record, RecordState::Present);
 
@@ -1133,6 +1143,12 @@ impl StartConfig for Model {
     fn clear_record(&mut self) -> io::Result<()> {
         self.step(None, |model| model.record = false)
     }
+    fn write_record(&mut self) -> io::Result<()> {
+        self.step(None, |model| model.record = true)
+    }
+    fn record_changer(&mut self) -> Option<Changer> {
+        self.record.then_some(Changer::NotRunning)
+    }
 }
 
 impl ServiceSession for Model {
@@ -1141,9 +1157,6 @@ impl ServiceSession for Model {
     }
     fn delete(&mut self) -> io::Result<()> {
         self.step(Some(ScmCall::DeleteService), |model| model.marked = true)
-    }
-    fn write_record(&mut self) -> io::Result<()> {
-        self.step(None, |model| model.record = true)
     }
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::disable_record::{DisabledBy, RecordState};
+use crate::disable_record::{Changer, DisabledBy, DisabledState, RecordState};
 use crate::service_start::{RepairStep, StartType};
 
 const STARTS: [StartType; 4] = [
@@ -18,6 +18,8 @@ struct FakeConfig {
     record: RecordState,
     /// Calls that fail, by the name they are logged under.
     fail: Vec<&'static str>,
+    /// Whether the process that stamped the record is running.
+    changer: Changer,
 }
 
 impl FakeConfig {
@@ -27,7 +29,13 @@ impl FakeConfig {
             start,
             record,
             fail: vec![],
+            changer: Changer::NotRunning,
         }
+    }
+
+    fn stamped_by(mut self, changer: Changer) -> Self {
+        self.changer = changer;
+        self
     }
 
     fn failing(mut self, call: &'static str) -> Self {
@@ -75,6 +83,21 @@ impl StartConfig for FakeConfig {
         self.record = RecordState::Absent;
         Ok(())
     }
+
+    fn write_record(&mut self) -> io::Result<()> {
+        self.call("write_record".into())?;
+        self.record = RecordState::Present;
+        self.changer = Changer::Running;
+        Ok(())
+    }
+
+    fn record_changer(&mut self) -> Option<Changer> {
+        self.calls.push("record_changer".into());
+        match self.record {
+            RecordState::Absent => None,
+            RecordState::Present => Some(self.changer),
+        }
+    }
 }
 
 // Reading -------------------------------------------------------------------------------------------------------------
@@ -113,7 +136,33 @@ fn a_record_over_a_disabled_service_is_reset_to_automatic_and_then_cleared() {
     // Disabled service of ours without its record.
     assert_eq!(
         config.calls(),
-        ["start_type", "record_state", "set_start_type(Auto)", "clear_record"]
+        [
+            "start_type",
+            "record_state",
+            "write_record",
+            "set_start_type(Auto)",
+            "clear_record"
+        ]
+    );
+    assert_eq!((config.start, config.record), (StartType::Auto, RecordState::Absent));
+}
+
+/// The repair stamps the record before it changes the start type, so a reader
+/// sees a running changer, not the interrupted change's dead one, while it
+/// works. A stamp that cannot be written costs only that wording.
+#[skuld::test]
+fn a_repair_that_cannot_stamp_the_record_goes_on() {
+    let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled).failing("write_record");
+    assert_eq!(repair(&mut config).unwrap(), RepairStep::ResetThenClear);
+    assert_eq!(
+        config.calls(),
+        [
+            "start_type",
+            "record_state",
+            "write_record",
+            "set_start_type(Auto)",
+            "clear_record"
+        ]
     );
     assert_eq!((config.start, config.record), (StartType::Auto, RecordState::Absent));
 }
@@ -156,7 +205,10 @@ fn a_service_with_nothing_to_repair_is_not_written() {
 fn a_failed_reset_is_the_error_and_leaves_the_record() {
     let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled).failing("set_start_type");
     assert!(matches!(repair(&mut config), Err(RepairError::Reset(_))));
-    assert_eq!(config.calls(), ["start_type", "record_state", "set_start_type(Auto)"]);
+    assert_eq!(
+        config.calls(),
+        ["start_type", "record_state", "write_record", "set_start_type(Auto)"]
+    );
     assert_eq!(
         (config.start, config.record),
         (StartType::Disabled, RecordState::Present)
@@ -185,7 +237,7 @@ fn enabling_writes_automatic_whatever_the_record_says_and_then_clears_it() {
             enable(&mut config).unwrap();
             assert_eq!(
                 config.calls(),
-                ["set_start_type(Auto)", "clear_record"],
+                ["write_record", "set_start_type(Auto)", "clear_record"],
                 "{record:?} over {start:?}"
             );
             assert_eq!((config.start, config.record), (StartType::Auto, RecordState::Absent));
@@ -197,8 +249,16 @@ fn enabling_writes_automatic_whatever_the_record_says_and_then_clears_it() {
 fn a_failed_enable_write_is_the_error_and_leaves_the_record() {
     let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled).failing("set_start_type");
     assert!(matches!(enable(&mut config), Err(RepairError::Reset(_))));
-    assert_eq!(config.calls(), ["set_start_type(Auto)"]);
+    assert_eq!(config.calls(), ["write_record", "set_start_type(Auto)"]);
     assert_eq!(config.record, RecordState::Present);
+}
+
+#[skuld::test]
+fn an_enable_that_cannot_stamp_the_record_goes_on() {
+    let mut config = FakeConfig::new(RecordState::Absent, StartType::Disabled).failing("write_record");
+    enable(&mut config).unwrap();
+    assert_eq!(config.calls(), ["write_record", "set_start_type(Auto)", "clear_record"]);
+    assert_eq!((config.start, config.record), (StartType::Auto, RecordState::Absent));
 }
 
 #[skuld::test]
@@ -210,23 +270,56 @@ fn a_failed_clear_after_enabling_does_not_fail_the_enable() {
 
 // Displaying ----------------------------------------------------------------------------------------------------------
 
+/// What a GUI reading says: the start type, then the record's changer, and
+/// nothing is written.
 #[skuld::test]
-fn a_gui_reading_names_who_disabled_the_service_from_what_it_found() {
-    let by = |record, start| for_display(observe(&mut FakeConfig::new(record, start)));
-    assert_eq!(
-        by(RecordState::Present, StartType::Disabled),
-        Some(DisabledBy::InterruptedChange)
-    );
-    assert_eq!(
-        by(RecordState::Absent, StartType::Disabled),
-        Some(DisabledBy::Elsewhere)
-    );
-    assert_eq!(by(RecordState::Present, StartType::Auto), None);
-    assert_eq!(by(RecordState::Absent, StartType::Auto), None);
+fn a_gui_reading_reads_and_writes_nothing() {
+    for record in RECORDS {
+        for start in STARTS {
+            let mut config = FakeConfig::new(record, start);
+            display(&mut config);
+            assert_eq!(
+                config.calls(),
+                ["start_type", "record_changer"],
+                "{record:?} over {start:?}"
+            );
+        }
+    }
 }
 
 #[skuld::test]
-fn a_gui_reading_that_cannot_read_the_start_type_says_nothing() {
+fn a_gui_reading_names_who_disabled_the_service_from_what_it_found() {
+    let state = |record, start| display(&mut FakeConfig::new(record, start));
+    assert_eq!(
+        state(RecordState::Present, StartType::Disabled),
+        DisabledState::By(DisabledBy::InterruptedChange)
+    );
+    assert_eq!(
+        state(RecordState::Absent, StartType::Disabled),
+        DisabledState::By(DisabledBy::Elsewhere)
+    );
+    assert_eq!(state(RecordState::Present, StartType::Auto), DisabledState::NotDisabled);
+    assert_eq!(state(RecordState::Absent, StartType::Auto), DisabledState::NotDisabled);
+}
+
+/// A record stamped by a process that runs is a change in progress, over
+/// every start type: the retirement writes the record before it disables the
+/// service and clears it after it restores it.
+#[skuld::test]
+fn a_gui_reading_of_a_record_whose_writer_runs_is_a_change_in_progress() {
+    for start in STARTS {
+        let mut config = FakeConfig::new(RecordState::Present, start).stamped_by(Changer::Running);
+        assert_eq!(display(&mut config), DisabledState::InChange, "{start:?}");
+    }
+}
+
+#[skuld::test]
+fn a_gui_reading_that_cannot_read_the_start_type_says_nothing_of_a_disable_but_still_sees_a_running_changer() {
     let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled).failing("start_type");
-    assert_eq!(for_display(observe(&mut config)), None);
+    assert_eq!(display(&mut config), DisabledState::NotDisabled);
+
+    let mut config = FakeConfig::new(RecordState::Present, StartType::Disabled)
+        .failing("start_type")
+        .stamped_by(Changer::Running);
+    assert_eq!(display(&mut config), DisabledState::InChange);
 }
