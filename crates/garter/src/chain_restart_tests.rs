@@ -4,7 +4,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::chain::{ChainReady, ChainRunner};
 use crate::plugin::ChainPlugin;
-use crate::port::{free_loopback_port, Probe};
+use crate::port::{os_probe, Probe};
 use crate::sip003::PluginEnv;
 use crate::sitrep::{PluginReady, StartError, Transports};
 use crate::tap_tests::addr;
@@ -293,16 +293,20 @@ async fn a_hop_that_loses_its_intermediate_port_is_restarted_on_a_fresh_port() {
     );
 }
 
-/// The conflict is the OS's own: the port the first pick returned is held by someone else.
+/// The conflict is the OS's own: the port the first pick returned is held by someone else. The second pick comes from
+/// the chain's own OS probe, so another process taking it is one more retry, not a failure of the test.
 #[skuld::test]
 async fn a_real_os_conflict_is_retried() {
     tokio::time::pause();
     let rig = Rig::new();
     let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let held_addr = held.local_addr().unwrap();
-    let free = free_loopback_port();
-    let mut answers = vec![held_addr, free].into_iter();
-    let probe: Probe = Box::new(move || Ok(answers.next().expect("the probe was asked for a third port")));
+    let mut first = Some(held_addr);
+    let mut os = os_probe(Ipv4Addr::LOCALHOST.into());
+    let probe: Probe = Box::new(move || match first.take() {
+        Some(held) => Ok(held),
+        None => os(),
+    });
     let runner = ChainRunner::new()
         .add(rig.steady("A"))
         .add(rig.hop("B", |_| Attempt::RealBind))
@@ -310,12 +314,12 @@ async fn a_real_os_conflict_is_retried() {
 
     let (told, _) = launch(runner).finish().await;
 
-    told.expect("the chain readies on the second port");
-    assert_eq!(
-        rig.wiring("B").into_iter().map(|(local, _)| local).collect::<Vec<_>>(),
-        [held_addr, free]
-    );
-    assert_eq!(rig.wiring("A")[0].1, free);
+    told.expect("the chain readies on a port nobody holds");
+    let b = rig.wiring("B").into_iter().map(|(local, _)| local).collect::<Vec<_>>();
+    assert_eq!(b[0], held_addr, "B was first given the held port");
+    let last = *b.last().unwrap();
+    assert_ne!(last, held_addr, "B readied on another port");
+    assert_eq!(rig.wiring("A")[0].1, last, "A forwards to the port B finally got");
     drop(held);
 }
 
