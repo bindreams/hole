@@ -188,3 +188,47 @@ fn a_walk_bound_to_a_user_that_cannot_read_a_folders_owner_does_not_proceed() {
         io::ErrorKind::PermissionDenied
     );
 }
+
+// may_read ============================================================================================================
+
+/// What `may_read` says of a file, with `links` names, in a folder `dir` owns.
+fn may_read(file: Owner<u32>, links: u64, dir: Owner<u32>) -> bool {
+    super::may_read(&file, links, || Ok(dir)).unwrap()
+}
+
+#[skuld::test]
+fn a_file_the_system_owns_with_one_name_is_read_from_any_folder() {
+    assert!(may_read(ROOT, 1, ROOT));
+    assert!(may_read(ROOT, 1, user(1)));
+}
+
+#[skuld::test]
+fn a_file_the_system_owns_with_a_second_name_is_never_read() {
+    // The second name is a hard link a user planted: the system never made a file with two.
+    assert!(!may_read(ROOT, 2, user(1)));
+    assert!(!may_read(ROOT, 2, ROOT));
+    assert!(!may_read(ROOT, 1000, user(1)));
+}
+
+#[skuld::test]
+fn a_file_of_the_folders_user_is_read_whatever_names_it_has() {
+    assert!(may_read(user(1), 1, user(1)));
+    assert!(may_read(user(1), 2, user(1)));
+}
+
+#[skuld::test]
+fn a_file_of_a_user_the_folder_does_not_belong_to_is_never_read() {
+    assert!(!may_read(user(2), 1, user(1)));
+    assert!(!may_read(user(1), 1, ROOT));
+}
+
+#[skuld::test]
+fn the_folders_owner_is_not_read_for_a_file_the_system_owns() {
+    // A folder whose owner cannot be read (no `READ_CONTROL`) still holds the system's files.
+    assert!(super::may_read(&ROOT, 1, || Err(io::Error::other("unreadable"))).unwrap());
+}
+
+#[skuld::test]
+fn a_users_file_in_a_folder_whose_owner_cannot_be_read_is_an_error() {
+    assert!(super::may_read(&user(1), 1, || Err(io::Error::other("unreadable"))).is_err());
+}

@@ -707,6 +707,14 @@ re-derive them.
    still read. Code that also writes opens a `Dir` and takes a `ReadDir` view of it with `Dir::reader`
    (`VersionedFile::store` and `remove` read the current file that way; `load` opens a `ReadDir`).
 
+   `read_state_file` also refuses a file the folder's owner cannot vouch for (`Refusal::ForeignFile`, decided by
+   `trail::may_read` on both platforms): the file must be owned by the folder's own user, or by the system (root,
+   SYSTEM, Administrators) with exactly one link. A user can hard-link any file the system can read at a state name
+   (macOS has no `protected_hardlinks`), and the planted name has two links. This holds only for the state files,
+   which are published by rename and so have one name; `ReadDir::read`, which `VersionedFile::load` and the update
+   marker use, does not have it yet, because `VersionedFile::store` and the marker's claim make a second name for a
+   live file themselves. The rule reaches them in the follow-up branch `azhukova/1118-2`.
+
 1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a
    temp file, before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
 
@@ -720,8 +728,11 @@ with or without a user's link on the path, succeeds. A source file that opens a 
 fails `every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. The readers have the same kind
 of table (`no_reader_reads_through_a_symlink_planted_at_its_name`, `no_reader_waits_on_a_fifo_planted_at_its_name`,
 and `state_symlink_tests.rs` in `tun-engine`): each writes a valid file, plants the name, and the reader must not
-report the file the name leads to. A hard link is the file's own inode, so a reader cannot tell it from the file;
-what a reader takes from a folder the user owns is parsed as that state's schema and never echoed.
+report the file the name leads to. A hard link is the file's own inode, so only `read_state_file`'s ownership and link-count rule tells it from the
+file (`no_reader_reads_a_hard_link_the_system_would_not_have_made` and its `tun-engine` twin: a test cannot make a
+file the system owns without being the system, so the planted name is refused when the runner is root or an elevated
+token and read when it is a user). What a reader takes from a folder the user owns is parsed as that state's schema
+and never echoed.
 Four source scans close the class: `no_privileged_dir_code_changes_an_owner_or_a_mode_by_name` (nothing in
 `util::dir` or in a file that opens a `Dir` calls `fchownat`, `fchmodat`, `chown`, `chmod`, `set_permissions` or a
 Windows by-path ACL call), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates, `hole` among them, open no

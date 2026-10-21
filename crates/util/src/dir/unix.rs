@@ -21,6 +21,14 @@ pub(super) fn caller() -> Caller {
     unsafe { libc::geteuid() }
 }
 
+/// Root is the system; every other uid is a user.
+fn owner_of_uid(uid: u32) -> Owner<u32> {
+    match uid {
+        0 => Owner::Privileged,
+        uid => Owner::User(uid),
+    }
+}
+
 /// `(device, inode)`.
 pub(super) type FileId = (u64, u64);
 
@@ -34,12 +42,8 @@ pub(super) struct Meta {
 }
 
 impl Meta {
-    /// Root is the system; every other uid is a user.
     fn owner(&self) -> Owner<u32> {
-        match self.uid {
-            0 => Owner::Privileged,
-            uid => Owner::User(uid),
-        }
+        owner_of_uid(self.uid)
     }
 
     #[allow(clippy::useless_conversion)] // `mode_t` is `u16` on macOS, `u32` on Linux
@@ -328,6 +332,14 @@ pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<F
         return Err(Refusal::NotRegular.into_io_error());
     }
     Ok(file)
+}
+
+/// Whether the folder's owner can vouch for `file`, a file read from `dir`: see [`super::trail::may_read`].
+pub(super) fn is_vouched_for(dir: &File, file: &File) -> io::Result<bool> {
+    let meta = file.metadata()?;
+    super::trail::may_read(&owner_of_uid(meta.uid()), meta.nlink(), || {
+        Ok(owner_of_uid(fstat(dir.as_raw_fd())?.uid))
+    })
 }
 
 /// What `fstat` says about a file opened to append to; the only input to [`trusted_appender`].
