@@ -2114,12 +2114,14 @@ A retirement disables the start type so that STOPPED is final, then puts it
 back. A process killed in between leaves a Disabled service that looks exactly
 like one an administrator disabled, and the two want opposite treatment: the
 first is broken, the second is a choice. Two writes cannot be one, so a record,
-the DWORD value `HoleDisabledByHole` under the service's own key
+the string value `HoleDisabledByHole` under the service's own key
 (`HKLM\SYSTEM\CurrentControlSet\Services\HoleBridge`; see
 [`RecordKey`](crates/bridge/src/disable_record/record_key.rs)), is written
 **before** the Disabled write and cleared only **after** the start type is
 written back (`StopOnly`) or the service is deleted (`Deregister`). Its
-presence is the fact: any value of that name, of any type, is the record.
+presence is the fact: any value of that name, of any type, is the record. The
+value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
+(`Stamp`), which is what tells a change in progress from an interrupted one.
 **Record and start type together decide, one exhaustive match each**
 (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
 
@@ -2166,7 +2168,7 @@ presence is the fact: any value of that name, of any type, is the record.
   the service); a clear with no key or no value is success.
 - **One lock, from the first read to the last write.** Every path that reads
   the start type and the record and then writes either holds the machine-wide
-  mutex `Global\HoleBridgeStartTypeLock`
+  mutex `HoleBridgeStartTypeLock\Lock`
   ([`StartTypeLock`](crates/bridge/src/platform/windows/start_type_lock.rs)):
   a retirement (`uninstall`, `ensure_stopped`: the `RetireSession`), the repair
   and the elevated `disabled_by` read (the `RepairSession`), `enable`,
@@ -2189,20 +2191,48 @@ presence is the fact: any value of that name, of any type, is the record.
   because a retirement waits for the service to stop. Without it overlapping
   retirements left the service Disabled with no record, and a repair or an
   `enable` run during a live uninstall reset the start type and cleared the
-  record under it. The DACL grants SYSTEM and Administrators everything and any
-  signed-in user (Authenticated Users) `SYNCHRONIZE` only; whoever creates the
-  object first sets it, so the unprivileged GUI can be first. A mutex dies with
-  its holder, so **held means a change is live, and free over a record means an
-  interrupted one**, with no stored marker to go stale; a holder that ends
-  without releasing hands the lock on abandoned, which counts as taken. The
-  thread that holds it may take it again (the cutover's repair step and every
-  step of the install and uninstall do); another thread of the same process does not, so a
-  hold is taken on the thread that runs the steps it covers.
+  record under it.
+  **Who can take it.** A wait on a mutex takes it, so the right to wait is the
+  right to hold the lock for ever; no one but SYSTEM and Administrators has it.
+  The mutex lives in a *private namespace*
+  ([`namespace.rs`](crates/bridge/src/platform/windows/start_type_lock/namespace.rs);
+  Microsoft: [Object Namespaces](https://learn.microsoft.com/en-us/windows/win32/sync/object-namespaces))
+  whose boundary descriptor requires the Administrators SID, which "the caller
+  must be within ... for the create operation to succeed", and whose DACL names
+  SYSTEM and Administrators, because "a process can open an existing namespace
+  even if it is not within the boundary unless the creator restricted access".
+  "Each namespace is uniquely identified by its name and boundaries", so a
+  namespace made under the same name with another SID is another namespace and
+  cannot stand in for ours (measured). A standard user can therefore neither
+  create the namespace before any Hole process does (squat it), open it, nor
+  wait on the lock; SYSTEM's token holds Administrators, so the cutover child
+  and an elevated administrator meet on the one lock. Each process makes or
+  opens the namespace once and keeps the handle: the namespace lives while any
+  process holds one (measured), and the mutex is reachable by name only
+  through it. A holder that ends without releasing hands the lock on abandoned,
+  which counts as taken. The thread that holds it may take it again (the
+  cutover's repair step and every step of the install and uninstall do);
+  another thread of the same process does not, so a hold is taken on the thread
+  that runs the steps it covers.
+  **Who must not wait for it.** A process that carries the service's SID is
+  waited for by whoever holds the lock (the scan for the service's processes
+  waits on every one), so such a process that waited for the lock would wait
+  for the holder that waits for it. The only one that takes the lock is the
+  cutover child (`bridge cutover`, spawned by the service): it tries the lock
+  once, before anything else (`run_while_holding`), and if a change holds it
+  the update is abandoned, the marker is left as a crashed child leaves it and
+  the next start reconciles it; if it took the lock first it holds it for the
+  whole cutover and the other change waits for it. The service process
+  (`bridge run`) and the plugins it starts never take the lock.
   Proofs: the lock's own tests (a second thread waits and gets it once the
-  holder lets go, abandonment, re-entry), `opening_a_retirement_waits_for_the_start_type_lock`
-  and `opening_for_a_repair_or_an_enable_waits_for_the_start_type_lock` (each
-  opener waits on a holder), and, in CI, `..._the_start_type_lock_dacl_grants_a_user_the_wait_and_nothing_more`,
-  `..._a_token_without_administrators_waits_on_the_start_type_lock`,
+  holder lets go, abandonment, re-entry, a caller outside the boundary, two
+  threads on first use, a namespace another process made, a same-named boundary
+  of another SID), `opening_a_retirement_waits_for_the_start_type_lock` and
+  `opening_for_a_repair_or_an_enable_waits_for_the_start_type_lock` (each
+  opener waits on a holder), `a_child_that_finds_the_lock_held_abandons_the_update_and_the_holder_waiting_for_it_finishes`
+  and `a_holder_that_arrives_during_a_cutover_waits_for_it_and_then_finishes`
+  (both orders of the cutover child and a holder finish), and, in CI,
+  `..._a_token_without_administrators_can_neither_make_open_nor_wait_on_the_start_type_lock`,
   `..._a_retirement_holds_the_start_type_lock_until_it_ends`,
   `..._the_cutover_hold_hardens_the_service_and_restores_it` and
   `..._an_install_holds_the_start_type_lock_through_every_step`; the install's
@@ -2222,19 +2252,30 @@ presence is the fact: any value of that name, of any type, is the record.
   service with its record, which the next cutover, `bridge install` or the GUI's
   Repair resets. A service an administrator disabled is hardened without a
   record and put back Disabled, so the cutover still leaves it stopped.
-- **The GUI never waits for it.** Its status read tries the lock
-  (`RepairSession::open_unless_in_change`): held, a retirement, repair or enable
-  is changing the start type and the record, so neither answer is one yet. The
-  read is `DisabledState::InChange`, the status is
-  `BridgeInstallStatus::ChangeInProgress`, and the connect gate offers neither
-  Repair nor Enable: it fails the connect with "the Hole service is being
-  changed by an uninstall, a repair or an update that is in progress. Try again
-  when it finishes." (`InstallGate::ChangeInProgress`, also when unattended);
-  `hole bridge status` prints `installed (being changed)` and exits 4. Free, the
-  read is made under the lock and the record decides as in the table. A status
-  read colliding with another user's status read reads as in progress for that
-  instant. A lock that cannot be opened reads as not disabled, as an unreadable
-  start type does.
+- **The GUI never touches the lock.** An unprivileged user has no right to it.
+  Every writer that changes the start type stamps the record with its own
+  identity first (a retirement, including over a record that is already there;
+  the repair of an interrupted change; `enable`), and the status read asks
+  whether that process is still running
+  ([`display`](crates/bridge/src/cutover/scm_wait/repair.rs),
+  `Stamp::is_running`): running, the read is `DisabledState::InChange` over any
+  start type, the status is `BridgeInstallStatus::ChangeInProgress`, and the
+  connect gate offers neither Repair nor Enable: it fails the connect with "the
+  Hole service is being changed by an uninstall, a repair or an update that is
+  in progress. Try again when it finishes." (`InstallGate::ChangeInProgress`,
+  also when unattended); `hole bridge status` prints `installed (being changed)` and exits 4. Gone, or the pid now another process's (a different
+  creation time), the change was interrupted and the table above decides. A
+  record whose value is not a stamp, or whose process list cannot be read, has
+  no running changer, so a user is never left waiting on a change that ended.
+  Liveness comes from the system process list (`NtQuerySystemInformation`),
+  not `OpenProcess`: a standard user is refused every SYSTEM process (measured:
+  `ERROR_ACCESS_DENIED` for `services.exe`, `svchost.exe` and the System process,
+  even for `PROCESS_QUERY_LIMITED_INFORMATION`), and the cutover child and an
+  installer's custom actions are SYSTEM. The list holds the creation time in
+  bytes `winternl.h` calls opaque (`Reserved1`, offset 24); a test compares it
+  with `GetProcessTimes`. A lock that cannot be read costs nothing here, since
+  the GUI never takes it; a start type that cannot be read says nothing is
+  disabled, but a running changer is still seen.
 - **An administrator's Disable survives every Hole path that is not an explicit
   enable.** The retirement's restore, the in-app update's cutover, `hole bridge install` and the GUI's status read leave it. A reinstall deletes and recreates
   the service, so `bridge install` reads who disabled it first, registers the new
