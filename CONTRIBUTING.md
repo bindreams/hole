@@ -666,9 +666,24 @@ re-derive them.
    check is the cautionary case. The rule is one decision in one place (`dir/trail.rs`, `Owner::may_enter` and `Trail`), decided on
    each link, never at a call site.
 
+   Two more things belong to the walk. It follows at most as many links as the OS itself follows in one path
+   (`MAXSYMLINKS` 40 on Linux, 32 on macOS; 63 reparse points on Windows), which also ends a loop: a user plants
+   the links and each can name the next several times, so without the bound a chain of forty costs exponential
+   time in a process that runs as root. And a folder the walk makes below a user's link is given to that user at
+   once (unix `fchown`; Windows: the owner is set, which takes the restore privilege an elevated token holds),
+   because a folder the bridge made is the bridge's on disk and the next walk through the link would refuse it.
+   A folder made on a path with no user's link is left as its maker's.
+
 1. **Never follow the final name.** A file operation opens its name with `O_NOFOLLOW` / `FILE_OPEN_REPARSE_POINT`
    and creates with `O_EXCL`. A link there is renamed, linked or unlinked as itself and never read or written
-   through.
+   through. A FIFO there is not waited for (`O_NONBLOCK`), and reading anything that is not a regular file is
+   refused.
+
+1. **Write only to a file you made or the owner already owns.** A file kept at a name across runs (the log) is
+   opened with `Dir::append_own_file`: created with `O_EXCL`, or an existing file taken only if it is the expected
+   owner's (unix: its uid; Windows: no other name). Anything else at the name (another name of someone else's
+   file, a link, a FIFO) is unlinked and replaced, never written through, and an existing file's owner and mode are
+   left alone.
 
 1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a
    temp file, before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
@@ -676,7 +691,11 @@ re-derive them.
 1. **Never touch a path after a rename.** Once the temp file has its final name the writer does nothing to that
    name: a name swapped for a hard link or a symlink after the rename changes nothing.
 
-`the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps the state-file writers on the handle. A test of
+`the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps the state-file writers on the handle.
+`crates/bridge/src/dir_writers_tests.rs` holds every writer that opens a `Dir` to two properties: a hard link, a
+symlink or a FIFO planted at a name it writes to changes nothing it leads to, and a second run in the same layout,
+with or without a user's link on the path, succeeds. A source file that opens a `Dir` and has no row in its table
+fails `every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. A test of
 a walk plants links with `util::dir::testing` (`plant_link`, `user_dir`, `SystemScratch`), which hand what they
 make to an unprivileged owner whoever runs the test: a link to a folder the system owns must be refused, a link
 to a folder its own owner owns must be followed, and the same through each writer.
