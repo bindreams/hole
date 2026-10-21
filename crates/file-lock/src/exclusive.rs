@@ -86,12 +86,27 @@ enum Refusal {
     NotRegular,
     /// More than one name: a hard link planted next to some other file.
     ExtraLinks { links: u64 },
-    /// A reparse point (symlink, junction) where the lock file should be.
-    #[cfg(windows)]
-    ReparsePoint,
+    /// A symbolic link where the lock file should be. On Windows any reparse
+    /// point (a junction is a directory symlink) counts.
+    Symlink,
     /// Owned by neither the expected owner nor this process.
     #[cfg(unix)]
     ForeignOwner { uid: u32 },
+}
+
+impl Refusal {
+    /// What sits at `path` when opening it failed, if that is a reason to refuse it: the
+    /// OS reports a symlink, directory or socket by an errno that differs per platform.
+    fn of_unopenable(path: &Path) -> Option<Self> {
+        let kind = std::fs::symlink_metadata(path).ok()?.file_type();
+        if kind.is_symlink() {
+            Some(Refusal::Symlink)
+        } else if !kind.is_file() {
+            Some(Refusal::NotRegular)
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for Refusal {
@@ -99,8 +114,7 @@ impl fmt::Display for Refusal {
         match self {
             Refusal::NotRegular => f.write_str("the lock file is not a regular file"),
             Refusal::ExtraLinks { links } => write!(f, "the lock file has {links} links, not 1"),
-            #[cfg(windows)]
-            Refusal::ReparsePoint => f.write_str("the lock file is a symbolic link or other reparse point"),
+            Refusal::Symlink => f.write_str("the lock file is a symbolic link"),
             #[cfg(unix)]
             Refusal::ForeignOwner { uid } => write!(f, "the lock file is owned by uid {uid}"),
         }
@@ -133,6 +147,18 @@ impl Refused {
 
     fn into_io_error(self) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, self)
+    }
+
+    /// `err`, a failed open of `path`, as a refusal when what sits at `path` is one.
+    fn from_failed_open(path: &Path, err: io::Error) -> io::Error {
+        match Refusal::of_unopenable(path) {
+            Some(why) => Refused {
+                path: path.to_path_buf(),
+                why,
+            }
+            .into_io_error(),
+            None => err,
+        }
     }
 }
 

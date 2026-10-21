@@ -9,8 +9,8 @@ use std::path::Path;
 use windows::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, GetFileType, LockFileEx, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_TYPE_DISK, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_TYPE_DISK,
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
 };
 use windows::Win32::System::IO::OVERLAPPED;
 
@@ -27,7 +27,7 @@ pub(super) struct Facts {
 /// Decides whether an opened file may be used as the lock file.
 pub(super) fn vet(facts: Facts) -> Result<(), Refusal> {
     if facts.attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        return Err(Refusal::ReparsePoint);
+        return Err(Refusal::Symlink);
     }
     if !facts.disk_file || facts.attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
         return Err(Refusal::NotRegular);
@@ -85,8 +85,9 @@ pub(super) fn open_locked(
         .read(true)
         .write(true)
         .create(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)?;
+        .custom_flags((FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).0)
+        .open(path)
+        .map_err(|err| Refused::from_failed_open(path, err))?;
 
     vet(facts_of(&file)?).map_err(|why| {
         Refused {

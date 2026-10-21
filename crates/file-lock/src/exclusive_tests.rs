@@ -27,9 +27,7 @@ fn try_acquire_reports_contention_without_blocking_or_erroring() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("target.json.lock");
     let _first = Exclusive::try_acquire(&path, None).unwrap().unwrap();
-    // Same path, opened a second time within this one process — flock is
-    // scoped to the open file description, not the process, so this
-    // genuinely contends rather than trivially re-acquiring.
+    // flock is per open file description, so a second open in this process contends.
     let second = Exclusive::try_acquire(&path, None).unwrap();
     assert!(
         second.is_none(),
@@ -56,23 +54,6 @@ fn the_lock_file_is_owner_only() {
     let _guard = Exclusive::try_acquire(&path, None).unwrap().unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the lock file must be 0600 regardless of umask");
-}
-
-#[skuld::test]
-#[cfg(unix)]
-fn try_acquire_chowns_the_fd_to_the_given_owner() {
-    // A different-owner chown is observable only as root (see
-    // `observable_owner` and the hard-link test). Chowning to the caller's own
-    // ids is always permitted and still exercises the `Some(owner)` path.
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("target.json.lock");
-    // SAFETY: getuid/getgid take no arguments and cannot fail.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    let guard = Exclusive::try_acquire(&path, Some((uid, gid)));
-    assert!(
-        guard.is_ok(),
-        "chowning to the caller's own ids must succeed without privilege"
-    );
 }
 
 /// `Some(owner)` that no unprivileged process owns a file as, and the uid a process would need to be to own one.
@@ -160,36 +141,45 @@ fn both_entries_hand_the_owner_to_the_fchown() {
 
 #[skuld::test]
 fn acquire_blocks_until_the_holder_releases() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("target.json.lock");
+    let released = Arc::new(AtomicBool::new(false));
 
+    // Channels, not sleeps, order the threads.
     let (holding_tx, holding_rx) = mpsc::channel::<()>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let holder_path = path.clone();
+    let holder_released = Arc::clone(&released);
     let holder = std::thread::spawn(move || {
         let guard = Exclusive::try_acquire(&holder_path, None).unwrap().unwrap();
         holding_tx.send(()).unwrap();
-        // Real rendezvous, not a sleep: blocks until the main thread signals.
         release_rx.recv().unwrap();
+        holder_released.store(true, Ordering::SeqCst);
         drop(guard);
     });
-    // Blocks until the holder thread actually holds the lock — no poll.
     holding_rx.recv().unwrap();
 
-    let (acquired_tx, acquired_rx) = mpsc::channel::<()>();
+    let (acquired_tx, acquired_rx) = mpsc::channel::<bool>();
     let waiter_path = path.clone();
+    let waiter_released = Arc::clone(&released);
     let waiter = std::thread::spawn(move || {
-        // A genuine kernel-level block: this call does not return until the
-        // holder thread's guard drops and releases the flock/LockFileEx lock.
         let _guard = Exclusive::acquire(&waiter_path, None).unwrap();
-        acquired_tx.send(()).unwrap();
+        acquired_tx.send(waiter_released.load(Ordering::SeqCst)).unwrap();
     });
 
-    // Tell the holder to release, then wait for the waiter to observe it —
-    // both rendezvous points are real channel recvs, never a sleep/poll.
+    assert!(
+        Exclusive::try_acquire(&path, None).unwrap().is_none(),
+        "the lock must be held while the waiter waits"
+    );
     release_tx.send(()).unwrap();
-    acquired_rx.recv().unwrap();
 
+    assert!(
+        acquired_rx.recv().unwrap(),
+        "the waiter acquired before the holder released"
+    );
     holder.join().unwrap();
     waiter.join().unwrap();
 }
@@ -260,7 +250,7 @@ fn a_lock_path_that_is_a_symlink_is_refused_and_its_target_left_alone() {
     let path = tmp.path().join("target.json.lock");
     symlink(&victim, &path);
 
-    both_entries_fail(&path, None);
+    assert_refused(&path, None);
 
     assert_eq!(std::fs::read(&victim).unwrap(), b"not a lock file");
 }
@@ -272,22 +262,12 @@ fn a_lock_path_that_is_a_dangling_symlink_is_refused_and_its_target_not_created(
     let path = tmp.path().join("target.json.lock");
     symlink(&victim, &path);
 
-    both_entries_fail(&path, None);
+    assert_refused(&path, None);
 
     assert!(
         std::fs::symlink_metadata(&victim).is_err(),
         "a privileged open must not create the file a planted symlink points at"
     );
-}
-
-#[skuld::test]
-#[cfg(windows)]
-fn a_symlink_at_the_lock_path_is_a_typed_refusal_on_windows() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("target.json.lock");
-    symlink(&tmp.path().join("victim.json"), &path);
-
-    assert_refused(&path, None);
 }
 
 #[skuld::test]
@@ -323,6 +303,27 @@ fn a_lock_path_that_is_a_second_name_for_another_file_is_refused_and_the_file_le
         );
     }
     assert_eq!(std::fs::read(&victim).unwrap(), b"not a lock file");
+}
+
+#[skuld::test]
+fn a_lock_path_that_is_a_directory_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("target.json.lock");
+    std::fs::create_dir(&path).unwrap();
+
+    assert_refused(&path, None);
+
+    assert!(path.is_dir(), "a refused directory must be left in place");
+}
+
+#[skuld::test]
+#[cfg(unix)]
+fn a_lock_path_that_is_a_socket_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("s");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+    assert_refused(&path, None);
 }
 
 #[skuld::test]
