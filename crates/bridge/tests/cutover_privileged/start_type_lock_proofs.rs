@@ -31,7 +31,7 @@ use windows_service::service::{ServiceAccess, ServiceActionType, ServiceStartTyp
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::record_proofs::set_start_type;
-use super::{ProvisionedService, GLOBAL_NET_STATE, TUN};
+use super::{scm_deletion, ProvisionedService, GLOBAL_NET_STATE, TUN};
 
 fn helper() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_test_service"))
@@ -409,4 +409,34 @@ fn cutover_global_net_state_an_install_holds_the_start_type_lock_through_every_s
 
     drop(hold);
     assert!(!held_for_another_thread(), "released with the hold");
+}
+
+/// Proves: a reinstall under a hold (deregister, then register a new service
+/// whose key has no mark) reads as a change in progress once the new service
+/// exists, not as an installed service with nothing the matter, until the hold
+/// ends. Red under: an install that does not mark the key it just made.
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_a_reinstall_marks_the_key_it_makes_as_a_change_in_progress() {
+    use hole_bridge::platform::os::SERVICE_NAME;
+
+    ProvisionedService::require_no_leftover();
+    let _service = ProvisionedService;
+    os::install(helper()).expect("install the service");
+    let hold = os::hold_start_type().expect("hold the start type");
+
+    os::uninstall().expect("deregister under the hold");
+    scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the old service is deleted, and its key with it");
+    os::install(helper()).expect("register the new service under the hold");
+    assert_eq!(
+        gui_status_from_another_thread(),
+        DisabledState::InChange,
+        "the new key is marked: a read before the change ends sees a change, not an installed service"
+    );
+
+    drop(hold);
+    assert_eq!(
+        gui_status_from_another_thread(),
+        DisabledState::NotDisabled,
+        "the change ended with the hold"
+    );
 }

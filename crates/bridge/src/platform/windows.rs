@@ -561,9 +561,13 @@ pub fn install_as(binary_path: &Path, start: InstallStart) -> std::io::Result<()
 
     let service_info = service_info(binary_path, start, log_dir, state_dir);
 
+    // Re-entrant: the elevated install holds it already, and this hold then
+    // ends nothing. Held here too, a lone `install` marks and ends its change.
+    let held = hold_start_type()?;
     registration::install_service(&mut NewService {
         manager: &manager,
         info: &service_info,
+        held: &held,
     })?;
     info!("Windows service installed");
     Ok(())
@@ -601,6 +605,8 @@ fn service_info(binary_path: &Path, start: InstallStart, log_dir: PathBuf, state
 struct NewService<'a> {
     manager: &'a ServiceManager,
     info: &'a ServiceInfo,
+    /// The hold of the change this install is part of.
+    held: &'a Held,
 }
 
 impl registration::NewServiceSteps for NewService<'_> {
@@ -610,6 +616,13 @@ impl registration::NewServiceSteps for NewService<'_> {
         self.manager
             .create_service(self.info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
             .map_err(|e| scm_failure(ScmCall::CreateService, e))
+    }
+
+    /// The registration made a key with no change mark: it is marked before any
+    /// other step, so a status read between here and the end of the change sees
+    /// one in progress.
+    fn registered(&mut self) {
+        self.held.mark_again();
     }
 
     /// The description and the service SID type (what lets an uninstall tell the

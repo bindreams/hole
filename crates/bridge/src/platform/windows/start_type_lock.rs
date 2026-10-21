@@ -112,6 +112,19 @@ impl Held {
     }
 }
 
+impl Held {
+    /// Marks the change again, in a key made after this hold began: a reinstall
+    /// deletes the service's key, which took the mark with it, and registers a
+    /// new one. Until this, the new key reads as no change in progress. The hold
+    /// still ends the change when it is let go.
+    pub fn mark_again(&self) {
+        let Some(change) = &self.change else { return };
+        if let Err(error) = change.begin(&Stamp::current()) {
+            warn!(%error, "could not mark the new service as being changed; a status read may see the change half done");
+        }
+    }
+}
+
 impl Drop for Held {
     fn drop(&mut self) {
         let outermost = DEPTH.with(|depth| {

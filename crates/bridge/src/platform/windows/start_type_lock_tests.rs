@@ -6,6 +6,9 @@ use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use super::*;
 use crate::disable_record::{ChangeMark, Changer, ScratchChangeKey};
 
+/// The change mark's value name, written out so that renaming it is a decision.
+const MARK_VALUE: &str = "HoleChangeMark";
+
 #[skuld::test]
 fn a_free_lock_is_taken_and_is_then_taken_for_every_other_thread() {
     let lock = StartTypeLock::scratch("taken");
@@ -173,6 +176,36 @@ fn holding_the_lock_marks_a_change_in_progress_until_it_is_let_go() {
         Some(Changer::Running),
         "this process holds it"
     );
+    drop(held);
+    assert_eq!(holder_of_the_mark(&scratch), None, "let go");
+}
+
+/// A reinstall deletes the service's key, and the mark with it, and registers a
+/// new key with none: between the registration and the end of the change a
+/// reader would see no change, and no record. The change marks the new key
+/// again as soon as it exists, and still ends it when the hold is let go.
+#[skuld::test]
+fn a_key_made_during_a_change_is_marked_again_and_the_change_still_ends() {
+    let (scratch, key) = ScratchChangeKey::created("reinstall");
+    let lock = StartTypeLock::scratch_marking("reinstall", scratch.mark());
+    let held = lock.acquire().expect("acquire");
+    assert_eq!(holder_of_the_mark(&scratch), Some(Changer::Running));
+
+    key.remove_value(MARK_VALUE)
+        .expect("the old key's mark goes with the old key");
+    assert_eq!(
+        scratch.mark().read(),
+        ChangeMark::new(None, None),
+        "the new key has no mark"
+    );
+
+    held.mark_again();
+    assert_eq!(
+        holder_of_the_mark(&scratch),
+        Some(Changer::Running),
+        "the new key names the change"
+    );
+
     drop(held);
     assert_eq!(holder_of_the_mark(&scratch), None, "let go");
 }

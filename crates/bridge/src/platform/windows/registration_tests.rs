@@ -28,6 +28,9 @@ impl NewServiceSteps for RecordingInstall<'_> {
     fn create(&mut self) -> io::Result<()> {
         self.step("create")
     }
+    fn registered(&mut self) {
+        self.log.borrow_mut().push("registered");
+    }
     fn configure(&mut self, _service: &()) -> io::Result<()> {
         self.step("configure")
     }
@@ -37,10 +40,10 @@ impl NewServiceSteps for RecordingInstall<'_> {
 }
 
 #[skuld::test]
-fn a_new_service_is_created_then_configured_then_given_its_failure_actions() {
+fn a_new_service_is_created_then_marked_then_configured_then_given_its_failure_actions() {
     let log = Log::default();
     install_service(&mut RecordingInstall { log: &log, fail: &[] }).unwrap();
-    assert_eq!(*log.borrow(), ["create", "configure", "failure_actions"]);
+    assert_eq!(*log.borrow(), ["create", "registered", "configure", "failure_actions"]);
 }
 
 /// The description and the service SID type are what the uninstall tells the
@@ -54,7 +57,7 @@ fn a_service_that_cannot_be_configured_fails_the_install_before_its_failure_acti
     })
     .expect_err("the configuration failed");
     assert_eq!(error.to_string(), "configure");
-    assert_eq!(*log.borrow(), ["create", "configure"]);
+    assert_eq!(*log.borrow(), ["create", "registered", "configure"]);
 }
 
 /// A restart-on-failure that could not be written is not worth failing an MSI
@@ -67,7 +70,7 @@ fn failure_actions_that_cannot_be_written_do_not_fail_the_install() {
         fail: &["failure_actions"],
     })
     .unwrap();
-    assert_eq!(*log.borrow(), ["create", "configure", "failure_actions"]);
+    assert_eq!(*log.borrow(), ["create", "registered", "configure", "failure_actions"]);
 }
 
 #[skuld::test]

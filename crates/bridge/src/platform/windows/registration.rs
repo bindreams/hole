@@ -35,19 +35,22 @@ pub trait NewServiceSteps {
     type Service;
     /// Create the service.
     fn create(&mut self) -> io::Result<Self::Service>;
+    /// Called once the service exists, before anything else is done to it.
+    fn registered(&mut self);
     /// What the install cannot do without ([`configure_new_service`]).
     fn configure(&mut self, service: &Self::Service) -> io::Result<()>;
     /// Restart-on-failure.
     fn failure_actions(&mut self, service: &Self::Service) -> io::Result<()>;
 }
 
-/// Create a service and configure it. The configuration is required and its
+/// Create a service, say so ([`NewServiceSteps::registered`]), and configure it. The configuration is required and its
 /// failure fails the install. Auto-restart is hardening, applied on the
 /// just-created handle (no re-open, which can race SCM propagation right after
 /// the create); its failure is a warning, since failing the whole install (an
 /// MSI custom action) over it would be worse than shipping without it.
 pub fn install_service<S: NewServiceSteps>(steps: &mut S) -> io::Result<()> {
     let service = steps.create()?;
+    steps.registered();
     steps.configure(&service)?;
     if let Err(e) = steps.failure_actions(&service) {
         warn!(error = %e, "could not configure SCM restart-on-failure; service installed without auto-restart");
