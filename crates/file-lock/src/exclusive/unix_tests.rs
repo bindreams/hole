@@ -333,3 +333,20 @@ fn a_directory_swapped_for_a_symlink_after_the_open_is_not_followed() {
     );
     assert_eq!(file.metadata().unwrap().ino(), ino(&moved));
 }
+
+// A directory above the lock that the caller can search but not read --------------------------------------------------
+
+#[skuld::test]
+fn a_lock_below_a_directory_the_caller_can_only_search_is_acquired() {
+    let tmp = tempfile::tempdir().unwrap();
+    let guarded = tmp.path().join("a");
+    let lock_dir = guarded.join("state");
+    std::fs::create_dir_all(&lock_dir).unwrap();
+    std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o311)).unwrap();
+
+    let held = crate::Exclusive::try_acquire(&lock_dir.join("target.json.lock"), None);
+
+    // Restored first so the temp dir can be removed whatever the assertion says.
+    std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(held.unwrap().is_some());
+}
