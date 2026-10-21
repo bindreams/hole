@@ -35,7 +35,7 @@ pub enum RecordState {
 /// Who disabled the service, as far as the record can say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisabledBy {
-    /// The record is present: an uninstall of ours was interrupted.
+    /// The record is present: an uninstall or an update of ours was interrupted.
     InterruptedUninstall,
     /// No record: an administrator, or a tool, other than Hole.
     Elsewhere,

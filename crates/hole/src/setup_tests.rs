@@ -567,7 +567,7 @@ fn the_error_for_a_change_in_progress_says_so_and_asks_nothing() {
 
 #[skuld::test]
 fn each_prompt_text_carries_its_own_words() {
-    let repair = "an interrupted uninstall left hole's service disabled";
+    let repair = "an interrupted uninstall or update left hole's service disabled";
     let enable = "the hole service is disabled on this computer";
     for (prompt, own, other) in [
         (InstallPrompt::Repair, repair, enable),
@@ -641,6 +641,7 @@ type StepLog = std::cell::RefCell<Vec<String>>;
 
 /// The scripted outcome of each injected effect of `install_bridge_with`.
 struct InstallScript {
+    hold: std::io::Result<()>,
     disabled_by: std::io::Result<Option<DisabledBy>>,
     installed: bool,
     stop: Result<(), &'static str>,
@@ -654,6 +655,7 @@ impl Default for InstallScript {
     /// A first install: nothing registered, nothing to repair.
     fn default() -> Self {
         Self {
+            hold: Ok(()),
             disabled_by: Ok(None),
             installed: false,
             stop: Ok(()),
@@ -665,10 +667,25 @@ impl Default for InstallScript {
     }
 }
 
-fn install_probe(script: InstallScript) -> (Result<(), Box<dyn std::error::Error>>, Vec<String>) {
+/// Notes "release" when the install lets go of what `hold` returned.
+struct Release<'a>(&'a StepLog);
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().push("release".to_string());
+    }
+}
+
+/// `install_bridge_with` over `script`, and every step it ran, "hold" and
+/// "release" included.
+fn install_probe_raw(script: InstallScript) -> (Result<(), Box<dyn std::error::Error>>, Vec<String>) {
     let steps: StepLog = std::cell::RefCell::new(Vec::new());
     let note = |step: &str| steps.borrow_mut().push(step.to_string());
     let result = install_bridge_with(
+        || {
+            note("hold");
+            script.hold.map(|()| Release(&steps))
+        },
         || {
             note("disabled_by");
             script.disabled_by
@@ -699,6 +716,18 @@ fn install_probe(script: InstallScript) -> (Result<(), Box<dyn std::error::Error
         },
     );
     (result, steps.into_inner())
+}
+
+/// [`install_probe_raw`] with the hold and the release taken off the ends of
+/// the steps, after checking they are on them: the lock is taken before the
+/// first step and let go after the last, whichever way the install ends.
+fn install_probe(script: InstallScript) -> (Result<(), Box<dyn std::error::Error>>, Vec<String>) {
+    let (result, mut steps) = install_probe_raw(script);
+    assert_eq!(steps.first().map(String::as_str), Some("hold"), "{steps:?}");
+    assert_eq!(steps.last().map(String::as_str), Some("release"), "{steps:?}");
+    steps.pop();
+    steps.remove(0);
+    (result, steps)
 }
 
 #[skuld::test]
@@ -783,6 +812,44 @@ fn a_start_type_that_cannot_be_read_fails_the_install_before_the_service_changes
     // already run, so the message must not claim the install changed nothing.
     assert!(message.contains("the service was not changed"), "{message}");
     assert_eq!(steps, ["disabled_by"]);
+}
+
+#[skuld::test]
+fn the_install_holds_the_start_type_from_before_its_first_read_to_after_its_last_step() {
+    let (result, steps) = install_probe_raw(InstallScript {
+        installed: true,
+        ..InstallScript::default()
+    });
+    assert!(result.is_ok());
+    assert_eq!(
+        steps,
+        [
+            "hold",
+            "disabled_by",
+            "is_installed",
+            "stop",
+            "deregister",
+            "register(Automatic)",
+            "repair",
+            "start",
+            "release"
+        ]
+    );
+}
+
+#[skuld::test]
+fn an_install_that_cannot_take_the_start_type_changes_nothing_and_says_why() {
+    let (result, steps) = install_probe_raw(InstallScript {
+        hold: Err(std::io::Error::other("injected hold failure")),
+        installed: true,
+        ..InstallScript::default()
+    });
+    let message = result
+        .expect_err("a change without the lock could race a retirement")
+        .to_string();
+    assert!(message.contains("injected hold failure"), "{message}");
+    assert!(message.contains("the service was not changed"), "{message}");
+    assert_eq!(steps, ["hold"]);
 }
 
 /// A reinstall whose stop or deregistration fails goes on to register, which

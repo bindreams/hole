@@ -669,6 +669,22 @@ pub fn ensure_failure_actions() -> std::io::Result<()> {
     apply_failure_actions(&service)
 }
 
+/// Takes the start-type lock for a change that spans several of this module's
+/// calls (the elevated install: it reads the start type, retires, registers,
+/// repairs and starts). The calls each take the lock themselves; this thread
+/// already owns it, so they proceed, and no other thread's retirement, repair
+/// or enable runs between them. Hold it on the thread that runs the calls: a
+/// mutex belongs to its thread, and a call from another one would wait on this
+/// one for good.
+pub fn hold_start_type() -> std::io::Result<Held> {
+    hold_start_type_noting(&StartTypeLock::machine_wide(), start_type_lock::log_wait)
+}
+
+/// [`hold_start_type`] over `lock`, calling `on_busy` if another holds it.
+fn hold_start_type_noting(lock: &StartTypeLock, on_busy: impl FnOnce()) -> std::io::Result<Held> {
+    lock.acquire_noting_wait(on_busy)
+}
+
 /// Stop and uninstall the bridge Windows Service.
 ///
 /// The stop is FATAL here, not best-effort. `DeleteService` against a

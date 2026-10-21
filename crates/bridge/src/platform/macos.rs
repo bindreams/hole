@@ -324,6 +324,14 @@ pub fn is_installed() -> bool {
     Path::new(PLIST_PATH).exists()
 }
 
+/// What [`hold_start_type`] returns.
+pub struct StartTypeHold;
+
+/// launchd has no start type, so a change to it has nothing to hold.
+pub fn hold_start_type() -> std::io::Result<StartTypeHold> {
+    Ok(StartTypeHold)
+}
+
 /// launchd has no start type to disable: there is nothing to repair.
 pub fn repair_interrupted_uninstall() -> std::io::Result<crate::service_start::RepairStep> {
     Ok(crate::service_start::RepairStep::Nothing)

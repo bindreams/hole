@@ -53,7 +53,7 @@ pub trait CutoverOs {
     /// unreachable) and `KeepAlive` respawns the new binary.
     fn stop_service_wait_stopped(&mut self) -> std::io::Result<()>;
     /// Put the service's start type right for the start that follows, and say
-    /// what was found: an interrupted uninstall's Disabled start type is reset,
+    /// what was found: an interrupted uninstall's or update's Disabled start type is reset,
     /// an administrator's is not. WINDOWS ONLY, like the start.
     #[cfg(target_os = "windows")]
     fn repair_start_type(&mut self) -> std::io::Result<RepairStep>;

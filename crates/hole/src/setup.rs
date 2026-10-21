@@ -61,7 +61,7 @@ pub fn bridge_install_status_with(
 pub enum InstallPrompt {
     /// Register the service.
     Install,
-    /// Undo the disable an interrupted uninstall left.
+    /// Undo the disable an interrupted uninstall or update left.
     Repair,
     /// Enable a service an administrator disabled.
     Enable,
@@ -112,7 +112,7 @@ impl InstallPrompt {
     pub fn body(self) -> &'static str {
         match self {
             InstallPrompt::Install => "The Hole bridge is not installed. It is required for the transparent proxy to work.\n\nInstall it now? (requires administrator privileges)",
-            InstallPrompt::Repair => "An interrupted uninstall left Hole's service disabled, so the bridge cannot start.\n\nRepair it now? (requires administrator privileges)",
+            InstallPrompt::Repair => "An interrupted uninstall or update left Hole's service disabled, so the bridge cannot start.\n\nRepair it now? (requires administrator privileges)",
             InstallPrompt::Enable => "The Hole service is disabled on this computer, so the bridge cannot start.\n\nEnable and start it now? (requires administrator privileges)",
         }
     }
@@ -131,7 +131,7 @@ impl InstallPrompt {
         match self {
             InstallPrompt::Install => "The Hole bridge must be installed to connect.",
             InstallPrompt::Repair => {
-                "An interrupted uninstall left Hole's service disabled; it must be repaired to connect."
+                "An interrupted uninstall or update left Hole's service disabled; it must be repaired to connect."
             }
             InstallPrompt::Enable => "The Hole service is disabled on this computer; it must be enabled to connect.",
         }
@@ -150,7 +150,7 @@ impl InstallPrompt {
     pub fn unattended_error(self) -> &'static str {
         match self {
             InstallPrompt::Install => "The Hole bridge is not installed.",
-            InstallPrompt::Repair => "An interrupted uninstall left Hole's service disabled.",
+            InstallPrompt::Repair => "An interrupted uninstall or update left Hole's service disabled.",
             InstallPrompt::Enable => "The Hole service is disabled on this computer.",
         }
     }
@@ -510,6 +510,7 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
     hole_bridge::ipc::prepare_ipc_access()?;
 
     install_bridge_with(
+        hole_bridge::platform::os::hold_start_type,
         hole_bridge::platform::os::disabled_by,
         hole_bridge::platform::os::is_installed,
         || {
@@ -552,11 +553,20 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
 /// A start type the read cannot answer fails the install before anything
 /// changes: guessing "not disabled" would re-enable it.
 ///
+/// **The install holds the start-type lock from its first read to its last
+/// step.** `hold` is taken before `disabled_by` and kept until this returns, so
+/// no retirement, repair or enable runs between the read that decides the start
+/// type and the registration and repair that act on it. The steps take the lock
+/// themselves; the thread running them already owns it, so they proceed. A lock
+/// that cannot be taken fails the install before anything changes.
+///
 /// **The repair follows the registration.** A record an interrupted uninstall
 /// left is cleared by the stop's restore, or, if the stop fails, dies with the
 /// old service's key at the deregistration; the repair reads the new key and
 /// says whether the service may be started.
-fn install_bridge_with(
+#[allow(clippy::too_many_arguments)] // private seam: one injected closure per step, bundling them adds more noise than the warning.
+fn install_bridge_with<Hold>(
+    hold: impl FnOnce() -> std::io::Result<Hold>,
     disabled_by: impl FnOnce() -> std::io::Result<Option<DisabledBy>>,
     is_installed: impl FnOnce() -> bool,
     ensure_stopped: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
@@ -565,6 +575,10 @@ fn install_bridge_with(
     repair: impl FnOnce() -> std::io::Result<RepairStep>,
     start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _hold = hold().map_err(|e| {
+        format!("could not take the lock over the service's start type, so the service was not changed: {e}")
+    })?;
+
     let start_type = match disabled_by() {
         Ok(disabled_by) => InstallStart::for_disabled_by(disabled_by),
         Err(e) => {

@@ -2120,12 +2120,12 @@ presence is the fact: any value of that name, of any type, is the record.
 **Record and start type together decide, one exhaustive match each**
 (`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
 
-| Record  | Start type   | Cutover child, before its start        | `bridge install`                                                              | Retirement's restore                  | GUI                                                             |
-| ------- | ------------ | -------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------------- |
-| present | Disabled     | set Automatic, clear the record, start | the stop sets Automatic and clears the record, re-registers Automatic, starts | Automatic, clear the record           | "an interrupted uninstall left Hole's service disabled": Repair |
-| present | not Disabled | clear the record (stale), start        | the stop clears the record, re-registers, start                               | restore as observed, clear the record | nothing                                                         |
-| absent  | Disabled     | untouched, not started (below)         | registers Disabled again, not started, exits 0                                | stays Disabled                        | "the Hole service is disabled on this computer": Enable         |
-| absent  | not Disabled | nothing, start                         | start                                                                         | as observed                           | nothing                                                         |
+| Record  | Start type   | Cutover child, before its start        | `bridge install`                                                              | Retirement's restore                  | GUI                                                                       |
+| ------- | ------------ | -------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------- |
+| present | Disabled     | set Automatic, clear the record, start | the stop sets Automatic and clears the record, re-registers Automatic, starts | Automatic, clear the record           | "an interrupted uninstall or update left Hole's service disabled": Repair |
+| present | not Disabled | clear the record (stale), start        | the stop clears the record, re-registers, start                               | restore as observed, clear the record | nothing                                                                   |
+| absent  | Disabled     | untouched, not started (below)         | registers Disabled again, not started, exits 0                                | stays Disabled                        | "the Hole service is disabled on this computer": Enable                   |
+| absent  | not Disabled | nothing, start                         | start                                                                         | as observed                           | nothing                                                                   |
 
 - **The kill-point invariant.** At no point of a retirement is a service it
   disabled left Disabled without its record: the record is written first, a
@@ -2168,7 +2168,13 @@ presence is the fact: any value of that name, of any type, is the record.
   a retirement (`uninstall`, `ensure_stopped`: the `RetireSession`), the repair
   and the elevated `disabled_by` read (the `RepairSession`), `enable`,
   `ensure_failure_actions`, and the update cutover, which holds it from before
-  its stop to after its start. The session owns the guard (its last field), so
+  its stop to after its start, and the elevated `bridge install`, which holds
+  it (`hold_start_type`, taken in `setup::install_bridge_with` before the
+  `disabled_by` read) through the stop, the deregistration, the registration,
+  the repair and the start, so no retirement, repair or enable runs between the
+  read that decides the start type and the registration that acts on it; an
+  install waits for a running uninstall and fails, changing nothing, if it
+  cannot take the lock. The session owns the guard (its last field), so
   no start-type read exists without it, and a waiter blocks with no bound,
   because a retirement waits for the service to stop. Without it overlapping
   retirements left the service Disabled with no record, and a repair or an
@@ -2179,14 +2185,18 @@ presence is the fact: any value of that name, of any type, is the record.
   its holder, so **held means a change is live, and free over a record means an
   interrupted one**, with no stored marker to go stale; a holder that ends
   without releasing hands the lock on abandoned, which counts as taken. The
-  thread that holds it may take it again (the cutover's repair step does).
+  thread that holds it may take it again (the cutover's repair step and every
+  step of the install do); another thread of the same process does not, so a
+  hold is taken on the thread that runs the steps it covers.
   Proofs: the lock's own tests (a second thread waits and gets it once the
   holder lets go, abandonment, re-entry), `opening_a_retirement_waits_for_the_start_type_lock`
   and `opening_for_a_repair_or_an_enable_waits_for_the_start_type_lock` (each
   opener waits on a holder), and, in CI, `..._the_start_type_lock_dacl_grants_a_user_the_wait_and_nothing_more`,
   `..._a_token_without_administrators_waits_on_the_start_type_lock`,
-  `..._a_retirement_holds_the_start_type_lock_until_it_ends` and
-  `..._the_cutover_hold_hardens_the_service_and_restores_it`.
+  `..._a_retirement_holds_the_start_type_lock_until_it_ends`,
+  `..._the_cutover_hold_hardens_the_service_and_restores_it` and
+  `..._an_install_holds_the_start_type_lock_through_every_step`; the install's
+  order is `the_install_holds_the_start_type_from_before_its_first_read_to_after_its_last_step`.
 - **The update cutover hardens the service like a retirement.** Its stop is
   not final on its own: the SCM can restart a service that fails or exits
   non-zero after the settle's last look, and the old image would run, or race

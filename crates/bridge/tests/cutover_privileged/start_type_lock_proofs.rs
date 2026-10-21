@@ -7,7 +7,9 @@
 //! - a token without Administrators can wait on the lock, and cannot open it
 //!   for more;
 //! - a retirement, and the update cutover's hold, are holders for every other
-//!   thread, and the GUI's status read says a change is in progress meanwhile.
+//!   thread, and the GUI's status read says a change is in progress meanwhile;
+//! - an install's hold over the start type stays in force through every step it
+//!   runs on its thread, and none of them waits on it.
 
 use std::path::Path;
 
@@ -315,6 +317,33 @@ fn cutover_global_net_state_the_cutover_hold_hardens_the_service_and_restores_it
         RecordState::Absent
     );
     assert!(held_for_another_thread(), "still held until the cutover is done");
+
+    drop(hold);
+    assert!(!held_for_another_thread(), "released with the hold");
+}
+
+/// Proves: the steps an install runs between its first read and its last
+/// write (the elevated `disabled_by`, the retirement, the repair, the
+/// failure-actions refresh) take a lock their own thread already holds without
+/// waiting on it, and the lock stays held for every other thread through all
+/// of them and until the hold is dropped. Red under: a step that waits on the
+/// lock (this test would hang), or one that releases it for good.
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_an_install_holds_the_start_type_lock_through_every_step() {
+    let _service = ProvisionedService::install(helper());
+    let hold = os::hold_start_type().expect("hold the start type");
+    assert!(held_for_another_thread(), "the hold has the lock");
+    assert_eq!(gui_status_from_another_thread(), DisabledState::InChange);
+
+    os::disabled_by().expect("the elevated read under the hold");
+    assert!(held_for_another_thread(), "held after the read");
+    os::ensure_stopped().expect("the retirement under the hold");
+    assert!(held_for_another_thread(), "held after the retirement");
+    os::repair_interrupted_uninstall().expect("the repair under the hold");
+    assert!(held_for_another_thread(), "held after the repair");
+    os::ensure_failure_actions().expect("the failure-actions refresh under the hold");
+    assert!(held_for_another_thread(), "held after the refresh");
+    assert_eq!(gui_status_from_another_thread(), DisabledState::InChange);
 
     drop(hold);
     assert!(!held_for_another_thread(), "released with the hold");

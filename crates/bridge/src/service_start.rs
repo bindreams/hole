@@ -22,7 +22,7 @@ pub enum RepairStep {
     Nothing,
     /// A record over a service that is not Disabled: stale, swept.
     ClearRecordOnly,
-    /// A Disabled service with a record: an interrupted uninstall's.
+    /// A Disabled service with a record: an interrupted uninstall's or update's.
     ResetThenClear,
     /// A Disabled service with no record: an administrator's, which stays so.
     LeaveDisabled,

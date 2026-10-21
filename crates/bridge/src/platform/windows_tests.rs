@@ -277,3 +277,33 @@ fn a_status_read_while_the_start_type_lock_is_held_says_a_change_is_in_progress(
         "free: the record decides"
     );
 }
+
+#[skuld::test]
+fn a_change_that_spans_several_steps_waits_for_another_holder_before_its_first() {
+    let lock = StartTypeLock::scratch("hold-waits");
+    let held = lock.while_another_waits(|on_busy| hold_start_type_noting(&lock, on_busy).is_ok());
+    assert!(held);
+    assert!(!lock.is_held_for_another_thread(), "released with the hold");
+}
+
+#[skuld::test]
+fn every_step_of_a_change_opens_under_the_hold_of_its_own_thread_without_waiting() {
+    use repair_session::{ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
+
+    let lock = StartTypeLock::scratch("hold-steps");
+    let hold = hold_start_type_noting(&lock, || panic!("nothing held it")).expect("hold");
+    for access in [READ_ACCESS, REPAIR_ACCESS, ENABLE_ACCESS] {
+        let step = RepairSession::open_noting(&lock, access, || panic!("this thread holds it: {access:?}"))
+            .expect("open a repair or an enable");
+        drop(step);
+        assert!(
+            lock.is_held_for_another_thread(),
+            "still held after the step: {access:?}"
+        );
+    }
+    let step = RetireSession::open_noting(&lock, || panic!("this thread holds it")).expect("open a retirement");
+    drop(step);
+    assert!(lock.is_held_for_another_thread(), "still held after the retirement");
+    drop(hold);
+    assert!(!lock.is_held_for_another_thread(), "released with the hold");
+}
