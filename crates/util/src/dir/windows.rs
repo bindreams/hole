@@ -4,7 +4,7 @@
 //! version has it). A component is opened with `FILE_OPEN_REPARSE_POINT`, which opens a symlink or
 //! junction as itself, and the handle's attributes then say whether it is one.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -19,26 +19,30 @@ use windows::Wdk::Storage::FileSystem::{
     FILE_DISPOSITION_DELETE, FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_INFORMATION,
     FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_INFORMATION_EX_FLAGS, FILE_DISPOSITION_POSIX_SEMANTICS,
     FILE_INFORMATION_CLASS, FILE_LINK_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
-    FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
-    NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS,
+    FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_DISPOSITION,
+    NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows::Win32::Foundation::{
     LocalFree, RtlNtStatusToDosError, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
     ERROR_SUCCESS, HANDLE, HLOCAL, NTSTATUS, OBJECT_ATTRIBUTE_FLAGS, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
 };
-use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-use windows::Win32::Security::{GetLengthSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+use windows::Win32::Security::Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT};
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, GetLengthSid, LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+};
 use windows::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, GetFileType, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ACCESS_RIGHTS, FILE_ADD_FILE,
     FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, READ_CONTROL,
-    SYNCHRONIZE, WRITE_DAC,
+    SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 
-use super::trail::{Folder, Owner, Trail};
+use super::trail::{Owner, Trail};
 use super::{EntryKind, OpenFile, Refusal};
 
 mod link;
@@ -189,7 +193,53 @@ pub(super) fn owner_of(file: &File) -> io::Result<Owner<Sid>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "the file has no owner"))
 }
 
+/// Gives `file`, open with `WRITE_OWNER`, to the principal `sid`.
+pub(super) fn set_owner(file: &File, sid: &[u8]) -> io::Result<()> {
+    // SAFETY: the handle is open with `WRITE_OWNER` and `sid` is a SID that outlives the call.
+    let status = unsafe {
+        SetSecurityInfo(
+            HANDLE(file.as_raw_handle()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(PSID(sid.as_ptr().cast_mut().cast())),
+            None,
+            None,
+            None,
+        )
+    };
+    match status == ERROR_SUCCESS {
+        true => Ok(()),
+        false => Err(io::Error::from_raw_os_error(status.0 as i32)),
+    }
+}
+
+/// Enables the restore privilege on this process's token, which opening a file with `WRITE_OWNER` for backup and
+/// giving it to another principal take. An elevated token and SYSTEM hold it (an elevated one disabled); a token
+/// without it is not changed, and the open that needs it then fails.
+pub(super) fn enable_restore_privilege() -> io::Result<()> {
+    let mut token = HANDLE::default();
+    // SAFETY: the pseudo handle of this process is always valid; `token` is a live local.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }?;
+    let mut privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        ..Default::default()
+    };
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    // SAFETY: the privilege name is a static wide string and the LUID a field of a live local.
+    let looked_up = unsafe { LookupPrivilegeValueW(None, SE_RESTORE_NAME, &mut privileges.Privileges[0].Luid) };
+    let adjusted = looked_up.and_then(|()| {
+        // SAFETY: `token` is open with `TOKEN_ADJUST_PRIVILEGES` and `privileges` is live for the call.
+        unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) }
+    });
+    // SAFETY: `token` is open and owned here.
+    unsafe { windows::Win32::Foundation::CloseHandle(token) }.ok();
+    adjusted.map_err(io::Error::from)
+}
+
 // Path resolution -----------------------------------------------------------------------------------------------------
+
+/// How many links one walk follows: Windows' own bound on the reparse points of a path (63).
+const MAX_LINKS: usize = 63;
 
 /// The NT path of the root directory a Windows path starts at, and the names below it.
 fn split(path: &Path) -> io::Result<(Vec<u16>, VecDeque<OsString>)> {
@@ -263,19 +313,15 @@ enum Entry {
 /// A directory the walk stands in.
 struct Standing {
     file: File,
-    made: bool,
     entry: Entry,
     /// Opened with the rights a final directory needs. A directory the walk came back to through `..` was not.
     complete: bool,
 }
 
 impl Standing {
-    /// The directory as the rule judges it.
-    fn folder(&self) -> io::Result<Folder<Sid>> {
-        match self.made {
-            true => Ok(Folder::Made),
-            false => owner_of(&self.file).map(Folder::Existing),
-        }
+    /// The directory's owner as the rule judges it.
+    fn owner(&self) -> io::Result<Owner<Sid>> {
+        owner_of(&self.file)
     }
 }
 
@@ -283,9 +329,6 @@ impl Standing {
 struct Walk {
     steps: VecDeque<Step>,
     trail: Trail<Sid>,
-    /// Links whose target the walk is in the middle of: meeting one again is a loop. A link met again after its
-    /// own target was walked is not.
-    resolving: HashSet<FileId>,
     /// From the root to the directory the walk stands in, which is the last.
     stack: Vec<Standing>,
 }
@@ -304,7 +347,6 @@ fn open_root(root: &[u16], rights: FILE_ACCESS_RIGHTS, complete: bool) -> io::Re
     }
     Ok(Standing {
         file,
-        made: false,
         entry: Entry::Root(root.to_vec()),
         complete,
     })
@@ -341,12 +383,7 @@ fn follow(walk: &mut Walk, link: &File) -> io::Result<()> {
     walk.trail
         .follow(&dir_owner, &owner_of(link)?)
         .map_err(Refusal::into_io_error)?;
-    let id = file_id(link)?;
-    if !walk.resolving.insert(id) {
-        return Err(Refusal::Symlink.into_io_error());
-    }
     let mut expansion = link::steps_of_reparse_data(&reparse_data(link)?).map_err(Refusal::into_io_error)?;
-    expansion.push_back(Step::Done(id));
     expansion.append(&mut walk.steps);
     walk.steps = expansion;
     Ok(())
@@ -370,7 +407,6 @@ fn descend(
                 return match kind_from(&handle)? {
                     EntryKind::Directory => Ok(Some(Standing {
                         file: handle,
-                        made: false,
                         entry: Entry::Name(name),
                         complete: last,
                     })),
@@ -384,7 +420,7 @@ fn descend(
         match classify(cur, &name) {
             Ok(None) if create => {
                 walk.trail
-                    .create_in(&walk.here().folder()?)
+                    .create_in(&walk.here().owner()?)
                     .map_err(Refusal::into_io_error)?;
                 match nt_open(
                     Some(&walk.here().file),
@@ -395,9 +431,13 @@ fn descend(
                     options(&[FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT]),
                 ) {
                     Ok(handle) => {
+                        // The folder is its maker's on disk. Below a user's link it must be the user's, or the
+                        // next walk through the link refuses what this one made.
+                        if let Some(sid) = walk.trail.led_by() {
+                            give_made_folder(&walk.here().file, &name, &handle, sid)?;
+                        }
                         return Ok(Some(Standing {
                             file: handle,
-                            made: true,
                             entry: Entry::Name(name),
                             complete: last,
                         }));
@@ -426,6 +466,28 @@ fn descend(
     }
 }
 
+/// Gives the folder `name` in `parent`, which the walk just made and holds as `made`, to the principal `sid`, unless
+/// it is theirs already (a user's own token makes user-owned folders). The folder is opened again by name for the
+/// right to change its owner, and checked to be the same one.
+fn give_made_folder(parent: &File, name: &[u16], made: &File, sid: &[u8]) -> io::Result<()> {
+    if owner_of(made)? == Owner::User(sid.to_vec()) {
+        return Ok(());
+    }
+    enable_restore_privilege()?;
+    let again = nt_open(
+        Some(parent),
+        name,
+        access(&[WRITE_OWNER, READ_CONTROL, FILE_READ_ATTRIBUTES]),
+        SHARE_ALL,
+        FILE_OPEN,
+        options(OPEN_AS_ITSELF),
+    )?;
+    if file_id(&again)? != file_id(made)? {
+        return Err(Refusal::Symlink.into_io_error());
+    }
+    set_owner(&again, sid)
+}
+
 pub(super) fn open_dir(path: &Path, create: bool, _owner: Option<(u32, u32)>, _caller: Caller) -> io::Result<File> {
     open_dir_with(path, create, FILE_ACCESS_RIGHTS(0))
 }
@@ -439,19 +501,14 @@ pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS
     let (root, names) = split(path)?;
     let mut walk = Walk {
         steps: names.into_iter().map(Step::Name).collect(),
-        trail: Trail::new(),
-        resolving: HashSet::new(),
+        trail: Trail::new(MAX_LINKS),
         stack: Vec::new(),
     };
     let first = open_root(&root, rights_for(walk.steps.is_empty()), walk.steps.is_empty())?;
     walk.stack.push(first);
     while let Some(step) = walk.steps.pop_front() {
-        // Only the end of a link's target remains.
-        let last = walk.steps.iter().all(|step| matches!(step, Step::Done(_)));
+        let last = walk.steps.is_empty();
         match step {
-            Step::Done(id) => {
-                walk.resolving.remove(&id);
-            }
             Step::Root(root) => walk.stack = vec![open_root(&root, rights_for(last), last)?],
             Step::Parent => {
                 if walk.stack.len() < 2 {
@@ -471,7 +528,7 @@ pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS
     }
 
     walk.trail
-        .end_at(&walk.here().folder()?)
+        .end_at(&walk.here().owner()?)
         .map_err(Refusal::into_io_error)?;
     let end = walk.stack.pop().expect("a walk always stands in a directory");
     match end.complete {
@@ -512,17 +569,14 @@ fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::R
         FILE_OPEN_FOR_BACKUP_INTENT,
         FILE_OPEN_REPARSE_POINT,
     ];
+    // `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write lands at the end.
+    let append = FILE_APPEND_DATA.0 | FILE_READ_ATTRIBUTES.0;
     let (rights, share, disposition, flags) = match how {
         OpenFile::CreateNew { .. } => (rights, SHARE_NO_DELETE, FILE_CREATE, options(&own_file)),
         OpenFile::Existing => (rights, SHARE_NO_DELETE, FILE_OPEN, options(OPEN_AS_ITSELF)),
         OpenFile::Read => (FILE_GENERIC_READ.0, SHARE_ALL, FILE_OPEN, options(&own_file)),
-        // `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write lands at the end.
-        OpenFile::Append { .. } => (
-            FILE_APPEND_DATA.0 | FILE_READ_ATTRIBUTES.0,
-            SHARE_ALL,
-            FILE_OPEN_IF,
-            options(&own_file),
-        ),
+        OpenFile::Append => (append, SHARE_ALL, FILE_OPEN, options(&own_file)),
+        OpenFile::CreateAppend { .. } => (append, SHARE_ALL, FILE_CREATE, options(&own_file)),
     };
     let file = nt_open(
         Some(dir),
@@ -533,10 +587,16 @@ fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::R
         flags,
     )?;
     // Opened as itself, a symlink is the link and not what it points at: it is not a file to read or append to.
-    if matches!(how, OpenFile::Read | OpenFile::Append { .. }) && kind_from(&file)? == EntryKind::Symlink {
+    if matches!(how, OpenFile::Read | OpenFile::Append) && kind_from(&file)? == EntryKind::Symlink {
         return Err(Refusal::Symlink.into_io_error());
     }
     Ok(file)
+}
+
+/// Whether a file found at a log's name is one a privileged writer may append to: one with no other name, as the
+/// system makes it. Windows has no unix ids to compare, and a second name is what a hard link a user planted adds.
+pub(super) fn is_own_file(file: &File, _owner: Option<(u32, u32)>) -> io::Result<bool> {
+    Ok(info(file)?.nNumberOfLinks == 1)
 }
 
 /// A new file for [`super::Dir::write_atomic`]: opened for `DELETE`, which renaming it needs, and

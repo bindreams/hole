@@ -33,8 +33,13 @@
 //! TrustedInstaller) stay trusted, which keeps macOS's `/var`, `/tmp` and `/etc`
 //! (and with them `temp_dir()`) working; a user's link to a folder that user owns
 //! is followed (a profile moved to another disk); a user's link to a folder the
-//! system or another account owns is refused. A link the walk meets twice is a
-//! loop and is refused. The final name of a file operation is never followed.
+//! system or another account owns is refused. A walk follows at most as many links
+//! as the OS itself follows in one path (Linux 40, macOS 32, Windows 63), which
+//! also refuses a loop; a link met again after its target was walked counts again.
+//! A folder the walk makes below a user's link is given to that user (unix `fchown`;
+//! Windows: the owner is set, which needs the restore privilege an elevated token
+//! holds), so the next walk through the link finds it theirs. The final name of a
+//! file operation is never followed.
 //!
 //! Given an `owner` (unix ids), the final directory must be owned by it or by
 //! this process; any other owner is refused. Windows has no unix ids and does not
@@ -84,13 +89,15 @@ pub use platform::Caller;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// A link (Windows: reparse point) in the path that the ownership-transition rule does not let the walk follow,
-    /// a link that is not one the walk can read, or a link met twice.
+    /// a link that is not one the walk can read, or more links than the OS follows in a path.
     Symlink,
     /// A component that exists and is not a directory.
     NotDirectory,
     /// The final directory is owned by neither the expected owner nor this process.
     #[cfg(unix)]
     ForeignOwner { uid: u32 },
+    /// A file that is read where it is not a regular file (a FIFO, a device).
+    NotRegular,
 }
 
 impl Refusal {
@@ -111,6 +118,7 @@ impl fmt::Display for Refusal {
             Refusal::NotDirectory => f.write_str("a component of the path is not a directory"),
             #[cfg(unix)]
             Refusal::ForeignOwner { uid } => write!(f, "the directory is owned by uid {uid}"),
+            Refusal::NotRegular => f.write_str("the file is not a regular file"),
         }
     }
 }
@@ -125,13 +133,18 @@ pub enum OpenFile {
     CreateNew { mode: u32 },
     /// Open what is there, `NotFound` if nothing. A symlink (Windows: reparse point) is opened as itself, not followed.
     Existing,
-    /// Open what is there to read, `NotFound` if nothing. Never follows a symlink. Shares everything
-    /// with other handles, delete included, so a replace of the file does not wait for the reader.
+    /// Open what is there to read, `NotFound` if nothing. Never follows a symlink, and never blocks on a FIFO
+    /// (unix): anything that is not a regular file is [`Refusal::NotRegular`]. Shares everything with other
+    /// handles, delete included, so a replace of the file does not wait for the reader.
     Read,
-    /// Open to append, creating the file if missing (unix: with `mode`, before the umask; Windows
-    /// ignores `mode`). Never follows a symlink. Shares everything with other handles, delete
-    /// included, so a reader or a rename of the name does not wait for the writer.
-    Append { mode: u32 },
+    /// Open what is there to append to, `NotFound` if nothing: it does not create the file, so that the caller
+    /// knows whether it made it. Never follows a symlink. Shares everything with other handles, delete included,
+    /// so a reader or a rename of the name does not wait for the writer. A FIFO is opened without blocking (unix),
+    /// which fails while nothing reads it.
+    Append,
+    /// Create the file to append to; `AlreadyExists` if the name is taken, by anything. Never follows a symlink.
+    /// Unix: created with `mode` (before the umask). Windows ignores `mode`. Shares as [`Self::Append`].
+    CreateAppend { mode: u32 },
 }
 
 /// What a name in a [`Dir`] is, not following a symlink.
@@ -263,6 +276,52 @@ impl Dir {
         platform::seal(temp, owner)?;
         protect(temp)?;
         Ok(staged)
+    }
+
+    /// Opens `name` to append to, a file this call can trust: one it created (then given to `owner`), or an
+    /// existing one that is `owner`'s own (unix: owned by `owner`'s uid; no `owner`: any regular file; Windows: a
+    /// regular file with no other name, as the system makes one). Anything else at the name (another name of
+    /// someone else's file, a link, a FIFO) is unlinked and replaced by a fresh file: it is never written to, and
+    /// never changed. A directory at the name is an error. An existing file's mode and owner are left as they are.
+    /// For a log in a folder a user may own, where a name the user planted must not make a privileged writer
+    /// change a file it did not make.
+    pub fn append_own_file(&self, name: &OsStr, mode: u32, owner: Option<(u32, u32)>) -> io::Result<File> {
+        loop {
+            match self.open_file(name, OpenFile::CreateAppend { mode }) {
+                Ok(file) => {
+                    give_file(&file, owner);
+                    return Ok(file);
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+            match self.kind_of(name)? {
+                None => continue,
+                Some(EntryKind::Symlink | EntryKind::Other) => {
+                    self.unlink_if_there(name)?;
+                    continue;
+                }
+                Some(EntryKind::File | EntryKind::Directory) => {}
+            }
+            let file = match self.open_file(name, OpenFile::Append) {
+                Ok(file) => file,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if platform::is_own_file(&file, owner)? {
+                return Ok(file);
+            }
+            // Closed first: Windows does not delete a name while a handle without delete sharing is open.
+            drop(file);
+            self.unlink_if_there(name)?;
+        }
+    }
+
+    fn unlink_if_there(&self, name: &OsStr) -> io::Result<()> {
+        match self.unlink(name) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
     }
 
     /// Removes the name, whatever it is, but not what it points at. `NotFound` if there is none.

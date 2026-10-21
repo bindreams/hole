@@ -10,7 +10,6 @@ use std::os::windows::ffi::OsStringExt;
 
 use super::super::trail::Owner;
 use super::super::Refusal;
-use super::FileId;
 
 /// A SID, as the bytes `GetSecurityInfo` hands out.
 pub(super) type Sid = Vec<u8>;
@@ -22,8 +21,6 @@ pub(super) enum Step {
     Root(Vec<u16>),
     Parent,
     Name(OsString),
-    /// The steps of this link's target are all taken: the link is no longer being resolved.
-    Done(FileId),
 }
 
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;

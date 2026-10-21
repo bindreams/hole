@@ -13,7 +13,9 @@
 //! - A link an unprivileged user owns binds the walk to that user. The walk may pass through
 //!   anyone's folders (an absolute target starts at `/`), but it may create only in that user's
 //!   folders ([`Trail::create_in`]) and must end in one ([`Trail::end_at`]). A user's link into
-//!   their own relocated profile is followed; their link to `/etc` is not.
+//!   their own relocated profile is followed; their link to `/etc` is not. A folder a bound walk
+//!   makes is given to that user at once, so that the next walk through the link finds it theirs.
+//! - The walk follows at most the number of links the OS itself follows in one path ([`Trail::new`]).
 //!
 //! The final name of a file operation is not a step of the walk and is never followed.
 
@@ -39,55 +41,63 @@ impl<Id: PartialEq> Owner<Id> {
     }
 }
 
-/// A folder the walk stands in, for the checks on where it may create and end.
-pub(super) enum Folder<Id> {
-    /// One that was there already, with its owner.
-    Existing(Owner<Id>),
-    /// One this walk just made. The file system gives it to the process that made it, but it was
-    /// made inside a folder [`Trail::create_in`] admitted, so it is as trusted as that one.
-    Made,
-}
-
 /// What a walk has followed so far.
 pub(super) struct Trail<Id> {
     /// The unprivileged owner of a link the walk followed, if any.
     led_by: Option<Id>,
+    /// Links followed so far.
+    followed: usize,
+    /// How many links a walk may follow: the OS's own bound on a path.
+    limit: usize,
 }
 
 impl<Id: Clone + PartialEq> Trail<Id> {
-    pub(super) fn new() -> Self {
-        Trail { led_by: None }
+    /// A walk that may follow `limit` links. A user plants them and each may name the next several times, so
+    /// without a bound a short chain costs exponential time; the bound is the one the OS itself applies to a path.
+    pub(super) fn new(limit: usize) -> Self {
+        Trail {
+            led_by: None,
+            followed: 0,
+            limit,
+        }
+    }
+
+    /// The unprivileged owner the walk is bound to, once it followed one's link.
+    pub(super) fn led_by(&self) -> Option<&Id> {
+        self.led_by.as_ref()
     }
 
     /// Admits following `link`, which sits in the folder `dir`, or refuses it.
     pub(super) fn follow(&mut self, dir: &Owner<Id>, link: &Owner<Id>) -> Result<(), Refusal> {
-        if !dir.may_enter(link) {
+        if self.followed >= self.limit || !dir.may_enter(link) {
             return Err(Refusal::Symlink);
         }
-        let Owner::User(owner) = link else { return Ok(()) };
-        match &self.led_by {
-            None => self.led_by = Some(owner.clone()),
-            Some(led_by) if led_by == owner => {}
-            Some(_) => return Err(Refusal::Symlink),
+        if let Owner::User(owner) = link {
+            match &self.led_by {
+                None => self.led_by = Some(owner.clone()),
+                Some(led_by) if led_by == owner => {}
+                Some(_) => return Err(Refusal::Symlink),
+            }
         }
+        self.followed += 1;
         Ok(())
     }
 
     /// Admits creating a folder in `dir`.
-    pub(super) fn create_in(&self, dir: &Folder<Id>) -> Result<(), Refusal> {
+    pub(super) fn create_in(&self, dir: &Owner<Id>) -> Result<(), Refusal> {
         self.stays_with_the_link_owner(dir)
     }
 
     /// Admits the walk's last folder being `dir`.
-    pub(super) fn end_at(&self, dir: &Folder<Id>) -> Result<(), Refusal> {
+    pub(super) fn end_at(&self, dir: &Owner<Id>) -> Result<(), Refusal> {
         self.stays_with_the_link_owner(dir)
     }
 
-    fn stays_with_the_link_owner(&self, dir: &Folder<Id>) -> Result<(), Refusal> {
+    fn stays_with_the_link_owner(&self, dir: &Owner<Id>) -> Result<(), Refusal> {
         match (&self.led_by, dir) {
-            (None, _) | (Some(_), Folder::Made) => Ok(()),
-            (Some(led_by), Folder::Existing(Owner::User(owner))) if led_by == owner => Ok(()),
-            (Some(_), Folder::Existing(_)) => Err(Refusal::Symlink),
+            (None, _) => Ok(()),
+            (Some(led_by), Owner::User(owner)) if led_by == owner => Ok(()),
+            (Some(_), _) => Err(Refusal::Symlink),
         }
     }
 }
