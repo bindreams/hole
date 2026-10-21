@@ -1,9 +1,9 @@
 use super::*;
 use crate::dir::testing::{own, plant_link, user_dir, AddDenied, SystemScratch};
-use crate::dir::Dir;
+use crate::dir::{Dir, ReadDir};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+use windows::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_FLAG_BACKUP_SEMANTICS};
 
 fn refusal(result: io::Result<Dir>) -> Refusal {
     let err = result.err().expect("the path must be refused");
@@ -241,16 +241,57 @@ fn a_folder_that_can_only_be_read_is_read_from() {
     assert_eq!(read.unwrap(), b"{}");
 }
 
+/// The access rights `file` was granted when it was opened. Not what the ACL allows: an elevated token passes an ACL
+/// that denies it (backup and restore privileges), so what a handle holds is the one thing a test can read on any
+/// token.
+fn granted_access(file: &std::fs::File) -> u32 {
+    use windows::Wdk::Storage::FileSystem::{FileAccessInformation, NtQueryInformationFile, FILE_ACCESS_INFORMATION};
+    use windows::Win32::System::IO::IO_STATUS_BLOCK;
+    let mut access = FILE_ACCESS_INFORMATION::default();
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: the handle is open, and `access` is a live `FILE_ACCESS_INFORMATION` of the size passed.
+    let queried = unsafe {
+        NtQueryInformationFile(
+            HANDLE(file.as_raw_handle()),
+            &mut status,
+            (&mut access as *mut FILE_ACCESS_INFORMATION).cast(),
+            std::mem::size_of::<FILE_ACCESS_INFORMATION>() as u32,
+            FileAccessInformation,
+        )
+    };
+    assert_eq!(queried.0, 0, "NtQueryInformationFile(FileAccessInformation)");
+    access.AccessFlags
+}
+
+const ADD_RIGHTS: u32 = FILE_ADD_FILE.0 | FILE_ADD_SUBDIRECTORY.0;
+
 #[skuld::test]
-fn a_folder_opened_for_use_asks_to_add_to_it() {
+fn a_directory_opened_for_use_holds_the_add_rights() {
     let tmp = tempfile::tempdir().unwrap();
-    let _denied = AddDenied::to(tmp.path());
 
-    let err = Dir::open(tmp.path(), false, None)
-        .err()
-        .expect("opening for use must need the add rights");
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
 
-    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(granted_access(dir.file()) & ADD_RIGHTS, ADD_RIGHTS);
+}
+
+#[skuld::test]
+fn a_directory_opened_for_reading_holds_no_add_right() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let dir = ReadDir::open(tmp.path()).unwrap();
+
+    assert_eq!(granted_access(dir.file()) & ADD_RIGHTS, 0);
+}
+
+#[skuld::test]
+fn a_read_view_of_a_directory_opened_for_use_holds_the_rights_it_was_opened_with() {
+    // The view is for reading, but the handle behind it is a duplicate: what it may do is decided by the type.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    let view = dir.reader().unwrap();
+
+    assert_eq!(granted_access(view.file()), granted_access(dir.file()));
 }
 
 #[skuld::test]

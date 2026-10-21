@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::loaded::{CannotRead, Loaded};
 use super::{frame, Chain, ChainError, RemoveOver, StoreOver, VersionedState};
-use crate::dir::{Dir, Staged};
+use crate::dir::{Dir, ReadDir, Staged};
 use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
@@ -28,7 +28,7 @@ pub trait Fs: Send + Sync {
         dir.rename_noreplace(from, to)
     }
 
-    fn read(&self, dir: &Dir, name: &OsStr) -> io::Result<Vec<u8>> {
+    fn read(&self, dir: &ReadDir, name: &OsStr) -> io::Result<Vec<u8>> {
         dir.read(name)
     }
 
@@ -222,14 +222,22 @@ impl<S: VersionedState> VersionedFile<S> {
     /// absent file; one that cannot be opened (a link in its path that [`Dir`]
     /// does not follow) is a read that failed.
     pub fn load(&self) -> Loaded<S> {
-        match Dir::open(&self.dir, false, None) {
+        match ReadDir::open(&self.dir) {
             Ok(dir) => self.load_in(&dir),
             Err(err) => Loaded::from_read(Err(err)),
         }
     }
 
-    fn load_in(&self, dir: &Dir) -> Loaded<S> {
+    fn load_in(&self, dir: &ReadDir) -> Loaded<S> {
         Loaded::from_read(self.fs.read(dir, self.file_name()))
+    }
+
+    /// [`Self::load_in`] for the directory a writer already holds.
+    fn load_through(&self, dir: &Dir) -> Loaded<S> {
+        match dir.reader() {
+            Ok(reader) => self.load_in(&reader),
+            Err(err) => Loaded::from_read(Err(err)),
+        }
     }
 
     /// Writes `value`, framed with `S::VERSION`. In this order, so nothing is
@@ -293,7 +301,7 @@ impl<S: VersionedState> VersionedFile<S> {
 
         let staged = dir.stage(self.file_name(), &bytes, place.owner(), |tmp| place.prepare_tmp(tmp))?;
 
-        let back_up = store_over(&self.path, &self.load_in(&dir))?;
+        let back_up = store_over(&self.path, &self.load_through(&dir))?;
 
         if back_up {
             self.link_to_free_backup(&dir)?;
@@ -323,7 +331,7 @@ impl<S: VersionedState> VersionedFile<S> {
         let Some(dir) = self.open_existing()? else {
             return Ok(Removal::Absent);
         };
-        match remove_over(&self.load_in(&dir)) {
+        match remove_over(&self.load_through(&dir)) {
             RemoveOver::Keep => Ok(Removal::Kept),
             RemoveOver::MoveAside => Ok(match self.move_aside_in(&dir)? {
                 Some(backup) => Removal::MovedAside(backup),
