@@ -17,7 +17,7 @@ use std::path::Path;
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 use hole_bridge::cutover::os::CutoverOs;
 use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
-use hole_bridge::disable_record::{DisabledBy, DisabledState, RecordKey, RecordState, Stamp};
+use hole_bridge::disable_record::{ChangeKey, Changer, DisabledBy, DisabledState, RecordKey, RecordState, Stamp};
 use hole_bridge::platform::os::{self, SERVICE_NAME};
 use hole_bridge::service_start::RepairStep;
 use windows::core::{PCWSTR, PWSTR};
@@ -126,15 +126,26 @@ fn write_record() {
         .expect("write the record");
 }
 
-/// The GUI's status read as it would be if the process stamping the record
-/// were killed now: the record, if there is one, is stamped by a process that
-/// is gone for the read, and by this one again after it.
+/// The GUI's status read as it would be if the process changing the service
+/// were killed now: the record, if there is one, and the change mark, if a
+/// running holder set it, name a process that is gone for the read, and this
+/// one again after it.
 fn gui_state_if_killed_now() -> DisabledState {
+    let mark = ChangeKey::service();
+    let marked = mark.read().holder() == Some(Changer::Running);
     let stamped = record() == RecordState::Present;
     if stamped {
         write_record();
     }
+    if marked {
+        mark.begin(&a_writer_that_is_gone())
+            .expect("mark the change as a dead holder's");
+    }
     let state = os::disabled_state();
+    if marked {
+        mark.begin(&Stamp::current())
+            .expect("mark the change as this process's again");
+    }
     if stamped {
         RecordKey::service().write().expect("stamp the record again");
     }
@@ -154,9 +165,11 @@ impl Drop for RecordCleanup {
 
 /// The invariant a kill at any act must find: a Disabled service has its
 /// record, and the GUI's read names an interrupted uninstall as the cause once
-/// the process that stamped it is gone (and a change in progress while it
-/// runs). A start type that is not Disabled is not attributed to anyone,
-/// whether or not a record is left over it.
+/// the process that stamped it and the one that holds the lock are gone. While
+/// the retirement runs it holds the lock, so the change mark says a change is
+/// in progress at every act the service can be read at, whatever the start type
+/// or the record say. A start type that is not Disabled is not attributed to
+/// anyone, whether or not a record is left over it.
 fn assert_a_disabled_service_has_its_record(at: &recording::Event) {
     let Some(start) = start_type() else {
         // A service marked for deletion may refuse the read; the record is
@@ -166,6 +179,7 @@ fn assert_a_disabled_service_has_its_record(at: &recording::Event) {
     let record = record();
     let running = os::disabled_state();
     let killed = gui_state_if_killed_now();
+    assert_eq!(running, DisabledState::InChange, "while the retirement runs, at {at:?}");
     match start {
         ServiceStartType::Disabled => {
             assert_eq!(
@@ -173,7 +187,6 @@ fn assert_a_disabled_service_has_its_record(at: &recording::Event) {
                 RecordState::Present,
                 "the service was left Disabled by a retirement with no record, at {at:?}"
             );
-            assert_eq!(running, DisabledState::InChange, "while the retirement runs, at {at:?}");
             assert_eq!(killed, DisabledState::By(DisabledBy::InterruptedChange), "at {at:?}");
         }
         _ => {
@@ -182,11 +195,6 @@ fn assert_a_disabled_service_has_its_record(at: &recording::Event) {
                 DisabledState::NotDisabled,
                 "a service that is not disabled was attributed, at {at:?}"
             );
-            let expected = match record {
-                RecordState::Present => DisabledState::InChange,
-                RecordState::Absent => DisabledState::NotDisabled,
-            };
-            assert_eq!(running, expected, "at {at:?}");
         }
     }
 }
@@ -354,6 +362,57 @@ fn cutover_global_net_state_a_standard_users_read_sees_a_system_writer_run_and_t
         DisabledState::By(DisabledBy::InterruptedChange),
         "the SYSTEM writer is gone"
     );
+}
+
+/// Proves: a standard user's status read sees the change mark a SYSTEM holder
+/// set, and the record it stamped, under HKLM, and says a change is in progress
+/// while the holder runs; once the holder is gone the record's answer stands,
+/// and a mark with no record and a start type of Automatic stands for nothing.
+/// Red under: a mark the standard user cannot read, or one it reads by opening
+/// the holder (refused for a SYSTEM process).
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_a_standard_users_read_sees_a_system_holders_change_mark_and_then_the_record() {
+    let _record = RecordCleanup;
+    let _service = ProvisionedService::install(helper());
+    CutoverOs::start_service_wait_running(&mut os_actor()).expect("bring the service up");
+    let holder = Stamp::of_listed_process(scm_probe::service_process_id())
+        .expect("the process list")
+        .expect("the service process is listed");
+    set_start_type(ServiceStartType::Disabled);
+    RecordKey::service().write_as(&holder).expect("stamp the record");
+    ChangeKey::service().begin(&holder).expect("mark the change");
+
+    let read = || as_a_standard_user(os::disabled_state);
+    assert_eq!(read(), DisabledState::InChange, "the SYSTEM holder runs");
+
+    CutoverOs::stop_service_wait_stopped(&mut os_actor()).expect("stop the service");
+    assert_eq!(
+        read(),
+        DisabledState::By(DisabledBy::InterruptedChange),
+        "the SYSTEM holder is gone, and the record says whose disable this is"
+    );
+}
+
+/// Proves: a holder that stamped nothing (a hardening of an administrator's
+/// disable, `ensure_failure_actions`) is still a change in progress to a
+/// standard user while it runs, and nothing once it is gone. Red under: a
+/// status read that takes only the record for a change.
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_a_standard_users_read_sees_a_system_holder_that_stamped_no_record() {
+    let _record = RecordCleanup;
+    let _service = ProvisionedService::install(helper());
+    clear_record();
+    CutoverOs::start_service_wait_running(&mut os_actor()).expect("bring the service up");
+    let holder = Stamp::of_listed_process(scm_probe::service_process_id())
+        .expect("the process list")
+        .expect("the service process is listed");
+    ChangeKey::service().begin(&holder).expect("mark the change");
+
+    let read = || as_a_standard_user(os::disabled_state);
+    assert_eq!(read(), DisabledState::InChange, "the SYSTEM holder runs");
+
+    CutoverOs::stop_service_wait_stopped(&mut os_actor()).expect("stop the service");
+    assert_eq!(read(), DisabledState::NotDisabled, "the SYSTEM holder is gone");
 }
 
 /// Proves: the record is a value in the service's own key, so it goes with the
