@@ -425,8 +425,16 @@ fn no_reader_waits_on_a_fifo_planted_at_its_name() {
 /// What opens a file by a path: the reads the privileged state code must make through `util::dir` instead.
 const READS_BY_PATH: &[&str] = &["fs::read(", "fs::read_to_string(", "File::open(", "OpenOptions::new("];
 
-/// The crates whose code runs privileged on state or log directories.
-const PRIVILEGED_CRATES: &[&str] = &["bridge", "tun-engine", "util", "file-lock", "common", "tombstone"];
+/// The crates whose code runs privileged on state or log directories. `hole` is one: `hole bridge run` is the bridge.
+const PRIVILEGED_CRATES: &[&str] = &[
+    "bridge",
+    "tun-engine",
+    "util",
+    "file-lock",
+    "common",
+    "tombstone",
+    "hole",
+];
 
 /// Production sources that open a file by path, each with why it may. A path is a source file from the workspace
 /// root; the reason says who runs it and where the path points.
@@ -442,9 +450,14 @@ const BY_PATH_ALLOWED: &[(&str, &str)] = &[
     ("crates/common/src/config_store.rs", "the GUI's own user config, read and written as the user"),
     ("crates/common/src/logging/logging_test_helpers.rs", "test helpers"),
     ("crates/common/src/verify.rs", "hashes an installer the GUI downloaded, as the user"),
+    ("crates/hole/src/cli.rs", "`hole bridge log`, `hole proxy` and the log tail read files the user names, as the user"),
+    ("crates/hole/src/commands.rs", "the GUI imports a file the user picked, as the user"),
+    ("crates/hole/src/elevation.rs", "reads a request and a result file in the requester's own private temp folder"),
+    ("crates/hole/src/log_collector.rs", "the GUI zips its own user's logs, as the user"),
+    ("crates/hole/src/setup.rs", "reads the log of an elevated child from the requester's own private temp folder"),
     (
         "crates/tombstone/src/crash.rs",
-        "the crash-marker sweep reads by path in the log directory (reported, not fixed here: it needs `util` as a          dependency of `tombstone`)",
+        "the crash-marker sweep reads by path in the log directory (reported, not fixed here: it needs `util` as a dependency of `tombstone`)",
     ),
 ];
 
@@ -474,23 +487,18 @@ fn by_path_reads(text: &str) -> Vec<&'static str> {
 fn no_privileged_state_code_reads_a_file_by_path() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
     let mut hits = Vec::new();
-    for krate in PRIVILEGED_CRATES {
-        let mut sources = Vec::new();
-        production_sources(&root.join("crates").join(krate).join("src"), &mut sources);
-        for path in sources {
-            let relative = path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
-            if BY_PATH_ALLOWED.iter().any(|(allowed, _)| *allowed == relative) {
-                continue;
-            }
-            for read in by_path_reads(&std::fs::read_to_string(&path).unwrap()) {
-                hits.push(format!("{relative}: {read}"));
-            }
+    for (relative, path) in privileged_sources(&root) {
+        if BY_PATH_ALLOWED.iter().any(|(allowed, _)| *allowed == relative) {
+            continue;
+        }
+        for read in by_path_reads(&std::fs::read_to_string(&path).unwrap()) {
+            hits.push(format!("{relative}: {read}"));
         }
     }
 
     assert!(
         hits.is_empty(),
-        "a privileged read opens a file by path: use `util::dir::read_state_file` (or a `Dir`), or add the file to          BY_PATH_ALLOWED with the reason: {hits:#?}"
+        "a privileged read opens a file by path: use `util::dir::read_state_file` (or a `Dir`), or add the file to BY_PATH_ALLOWED with the reason: {hits:#?}"
     );
 }
 
@@ -512,6 +520,117 @@ fn the_by_path_scan_tells_a_read_from_a_comment() {
     assert_eq!(by_path_reads("let f = std::fs::File::open(p)?;"), ["File::open("]);
     assert!(by_path_reads("    // `std::fs::read(path)` is what this replaces").is_empty());
     assert!(by_path_reads("util::dir::read_state_file(dir, name)").is_empty());
+}
+
+// No privileged step resolves a link before the walk ------------------------------------------------------------------
+//
+// The walk of `util::dir` refuses a link the user planted in a folder's path. A path resolved first has no link left
+// to refuse: `canonicalize` follows every link with no rule, so the user's link to a folder of root's becomes the
+// folder's own name and the walk accepts it. A privileged step passes the path as it was given.
+
+/// What resolves the links of a path: `std::fs::canonicalize`, `Path::canonicalize`, `dunce::canonicalize`, libc's
+/// `realpath`.
+const RESOLVES_LINKS: &[&str] = &["canonicalize(", "realpath("];
+
+/// Production lines that resolve a path's links, each with why they may: the file, a fragment of the line and the
+/// reason. None names a state or log directory.
+const RESOLVING_ALLOWED: &[(&str, &str, &str)] = &[
+    (
+        "crates/bridge/src/cutover/extract.rs",
+        "canonicalize(dir)",
+        "a dedup key for the walk of an extracted payload: nothing is opened through it",
+    ),
+    (
+        "crates/bridge/src/proxy/config.rs",
+        "canonicalize(&exe)",
+        "the bridge's own executable, to find the plugin beside it",
+    ),
+    (
+        "crates/tun-engine/src/device/wintun.rs",
+        "canonicalize(&exe)",
+        "the process's own executable, to find `wintun.dll` beside it",
+    ),
+    (
+        "crates/hole/src/path_management.rs",
+        "canonicalize(&exe)",
+        "the process's own executable, for the `PATH` link",
+    ),
+    (
+        "crates/hole/src/setup.rs",
+        "canonicalize(&exe)",
+        "the process's own executable, to register as the bridge",
+    ),
+];
+
+/// The code lines of `text` that resolve a path's links.
+fn link_resolutions(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .filter(|line| RESOLVES_LINKS.iter().any(|call| line.contains(call)))
+        .collect()
+}
+
+fn privileged_sources(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    for krate in PRIVILEGED_CRATES {
+        let mut sources = Vec::new();
+        production_sources(&root.join("crates").join(krate).join("src"), &mut sources);
+        for path in sources {
+            let relative = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+            found.push((relative, path));
+        }
+    }
+    found
+}
+
+#[skuld::test]
+fn no_privileged_code_resolves_a_link_before_the_walk() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let mut hits = Vec::new();
+    for (relative, path) in privileged_sources(&root) {
+        for line in link_resolutions(&std::fs::read_to_string(&path).unwrap()) {
+            let allowed = RESOLVING_ALLOWED
+                .iter()
+                .any(|(file, fragment, _)| *file == relative && line.contains(fragment));
+            if !allowed {
+                hits.push(format!("{relative}: {line}"));
+            }
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "privileged code resolves the links of a path: pass the path as given (`std::path::absolute` if it must be absolute), or add the line to RESOLVING_ALLOWED with the reason: {hits:#?}"
+    );
+}
+
+#[skuld::test]
+fn every_link_resolution_allowance_still_applies() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    for (path, fragment, reason) in RESOLVING_ALLOWED {
+        let text = std::fs::read_to_string(root.join(path)).unwrap_or_else(|err| panic!("{path} ({reason}): {err}"));
+        assert!(
+            link_resolutions(&text).iter().any(|line| line.contains(fragment)),
+            "{path} no longer has `{fragment}`: remove its allowance ({reason})"
+        );
+    }
+}
+
+#[skuld::test]
+fn the_link_resolution_scan_tells_a_call_from_a_comment() {
+    assert_eq!(
+        link_resolutions("let dir = state_dir.canonicalize().unwrap_or(state_dir);"),
+        ["let dir = state_dir.canonicalize().unwrap_or(state_dir);"]
+    );
+    assert_eq!(
+        link_resolutions("std::fs::canonicalize(&exe)?"),
+        ["std::fs::canonicalize(&exe)?"]
+    );
+    assert_eq!(link_resolutions("libc::realpath(p, out)"), ["libc::realpath(p, out)"]);
+    assert!(link_resolutions("    // `canonicalize()` follows every link").is_empty());
+    assert!(link_resolutions("canonicalize_for_match(domain)").is_empty());
+    assert!(link_resolutions("std::path::absolute(path)?").is_empty());
 }
 
 // No state module logs a path -----------------------------------------------------------------------------------------
