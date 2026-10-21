@@ -109,7 +109,11 @@ fn a_process_that_exited_is_not_running() {
     assert!(stamp.is_running().expect("probe"), "running while the child is up");
 
     child.release_and_wait();
-    assert!(!stamp.is_running().expect("probe"), "gone once the child exited");
+    // An exited process can stay in the system list for a few reads after its
+    // exit is signalled (Windows has no edge for that), so re-read until it goes.
+    while stamp.is_running().expect("probe") {
+        std::thread::yield_now();
+    }
 }
 
 /// The id of a running process with another creation time is a reused id.

@@ -76,7 +76,8 @@ impl Stamp {
 
     /// Whether the stamped process is running: listed with this creation time
     /// and a thread left. A pid listed with another creation time is the OS's
-    /// reuse of it.
+    /// reuse of it. A process that just exited can still read as running for a
+    /// few reads (measured in CI); a status read repeats on every poll.
     pub fn is_running(&self) -> io::Result<bool> {
         Ok(Self::of_listed_process(self.pid)?.is_some_and(|listed| listed.created == self.created))
     }
