@@ -14,7 +14,11 @@
 //! component at a time relative to the handle it already holds.
 //!
 //! - Unix: `openat(O_DIRECTORY | O_NOFOLLOW)` per component, with `mkdirat` for a
-//!   missing one when asked. Needs Linux 2.6.16 or macOS 10.10. There is no
+//!   missing one when asked. Every component is opened for lookup only (Linux
+//!   `O_PATH`, macOS `O_SEARCH`), so a directory the caller can search but not
+//!   read (`0o311`) is on a usable path; the final directory is then reopened
+//!   readable through the handle in hand, for `fchown`, `fchmod` and `fsync`.
+//!   Needs Linux 2.6.39 (`O_PATH`) or macOS 10.10. There is no
 //!   whole-path no-follow flag in use (`openat2(RESOLVE_NO_SYMLINKS)` is Linux
 //!   5.6, `O_NOFOLLOW_ANY` macOS 10.15), so one code path serves every version.
 //! - Windows: `NtCreateFile` relative to the parent handle with

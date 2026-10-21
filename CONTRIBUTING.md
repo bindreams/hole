@@ -588,8 +588,13 @@ user swapped in.
   this process (the second covers a directory a previous run created and died
   before handing over); any other owner is refused. Windows has no unix ids and
   does not check.
+- **Search-only walk (unix).** Every component is opened for lookup only (Linux
+  `O_PATH`, macOS `O_SEARCH`), which asks for search permission and not read, so a
+  directory the caller can pass through but not list (`0o311`) is still on a usable
+  path; only the final directory is reopened readable, through the handle in hand,
+  for `fchown`, `fchmod` and `fsync`.
 - **OS floor.** `openat`, `mkdirat`, `fstatat`, `unlinkat`, `renameat` (Linux
-  2.6.16, macOS 10.10) and `NtCreateFile` / `NtSetInformationFile` with a root
+  2.6.39 for `O_PATH`, macOS 10.10) and `NtCreateFile` / `NtSetInformationFile` with a root
   directory (every NT version). Neither `openat2(RESOLVE_NO_SYMLINKS)` (Linux 5.6)
   nor `O_NOFOLLOW_ANY` (macOS 10.15) is used, so one code path serves every
   version and there is no fallback to path resolution. The Windows replace uses

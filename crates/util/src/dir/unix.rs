@@ -72,8 +72,31 @@ fn open_fd(dir: RawFd, name: &CString, flags: libc::c_int, mode: u32) -> io::Res
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Opens a directory for lookup only, which asks the caller for search permission and not for read: a
+/// directory a caller can pass through but not list (`0o311`) is on a usable path. A handle opened
+/// this way names children (`openat`, `fstatat`, `mkdirat`, `readlinkat`, `fstat`) and is not for
+/// `fchown`, `fchmod` or `fsync`. Other unix: an ordinary read open, which asks for read as well.
+#[cfg(target_os = "linux")]
+const SEARCH_ONLY: libc::c_int = libc::O_PATH;
+#[cfg(target_os = "macos")]
+const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
+
+/// The directory `name` in `dir`, for lookup only; see [`SEARCH_ONLY`].
 fn open_dir_at(dir: RawFd, name: &CString) -> io::Result<OwnedFd> {
-    open_fd(dir, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW, 0)
+    open_fd(dir, name, SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW, 0)
+}
+
+/// `dir` again, for use: readable, so that `fchown`, `fchmod` and `fsync` work on it. Through the
+/// handle in hand (`.`), so no path is resolved again.
+fn reopen_for_use(dir: RawFd) -> io::Result<OwnedFd> {
+    open_fd(
+        dir,
+        &CString::new(".").expect("no NUL"),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    )
 }
 
 #[allow(clippy::unnecessary_cast, clippy::useless_conversion)] // the stat fields differ in width per platform
@@ -118,7 +141,7 @@ fn open_start(path: &str) -> io::Result<OwnedFd> {
     open_fd(
         libc::AT_FDCWD,
         &CString::new(path).expect("no NUL"),
-        libc::O_RDONLY | libc::O_DIRECTORY,
+        SEARCH_ONLY | libc::O_DIRECTORY,
         0,
     )
 }
@@ -221,7 +244,7 @@ pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, cal
             return Err(Refusal::ForeignOwner { uid: found }.into_io_error());
         }
     }
-    Ok(File::from(cur))
+    Ok(File::from(reopen_for_use(cur.as_raw_fd())?))
 }
 
 // Operations relative to a directory ----------------------------------------------------------------------------------

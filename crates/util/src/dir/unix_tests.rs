@@ -1,6 +1,7 @@
 use super::*;
 use crate::dir::Dir;
 use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 
 const ROOT: u32 = 0;
 const USER: u32 = 1000;
@@ -287,4 +288,66 @@ fn a_symlink_swapped_in_after_the_rename_is_not_followed() {
         (after.mode(), after.uid(), after.gid()),
         (before.mode(), before.uid(), before.gid())
     );
+}
+
+// Search-only directories on the path ---------------------------------------------------------------------------------
+//
+// The path calls `Dir` replaces need only search permission on the directories above the file. As root
+// (which bypasses the check) these pass whatever the open flags are: the check only has teeth for anyone else.
+
+/// Restores a directory's mode so the temp dir can be removed even when an assertion fails.
+struct Restore(PathBuf, u32);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
+#[skuld::test]
+fn a_directory_the_caller_can_search_but_not_read_is_walked_through() {
+    for mode in [0o311, 0o111] {
+        let tmp = tempfile::tempdir().unwrap();
+        let leaf = tmp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let guarded = tmp.path().join("a");
+        let _restore = Restore(guarded.clone(), 0o755);
+        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        let dir = Dir::open(&leaf, false, None).unwrap_or_else(|err| panic!("mode {mode:o}: {err:?}"));
+        dir.write_atomic("state.json".as_ref(), b"x", None, |_| Ok(())).unwrap();
+
+        assert_eq!(std::fs::read(leaf.join("state.json")).unwrap(), b"x", "mode {mode:o}");
+    }
+}
+
+#[skuld::test]
+fn a_missing_directory_is_created_below_one_the_caller_can_search_but_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let guarded = tmp.path().join("a");
+    std::fs::create_dir(&guarded).unwrap();
+    let _restore = Restore(guarded.clone(), 0o755);
+    std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o311)).unwrap();
+
+    Dir::open(&guarded.join("new").join("deeper"), true, None).unwrap();
+
+    std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(guarded.join("new").join("deeper").is_dir());
+}
+
+#[skuld::test]
+fn a_symlink_below_a_directory_the_caller_can_only_search_is_still_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let guarded = tmp.path().join("a");
+    std::fs::create_dir_all(guarded.join("real")).unwrap();
+    std::os::unix::fs::symlink(guarded.join("real"), guarded.join("link")).unwrap();
+    let _restore = Restore(guarded.clone(), 0o755);
+    std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o311)).unwrap();
+
+    let opened = Dir::open(&guarded.join("link"), false, None);
+
+    match is_root() {
+        true => assert!(opened.is_ok(), "root owns the link in a root-only directory"),
+        false => assert_eq!(refusal(opened), Refusal::Symlink),
+    }
 }
