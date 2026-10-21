@@ -14,6 +14,7 @@ use skuld::temp_dir;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use util::dir::Dir;
 
 /// Exact type of [`crate::logging::init`]. A regression to a different arity
 /// (e.g. dropping `kind` or the trailing `owner`) fails the assertion below.
@@ -370,55 +371,6 @@ fn panic_hook_chains_previous() {
     std::panic::set_hook(prev_hook);
 }
 
-// Tests: size-based rotation ==========================================================================================
-
-#[skuld::test]
-fn file_rotate_appender_rotates_and_prunes(#[fixture(temp_dir)] dir: &Path) {
-    use file_rotate::{compression::Compression, suffix::AppendCount, ContentLimit, FileRotate};
-    use std::io::Write;
-
-    let log_path = dir.join("test.log");
-    let mut appender = FileRotate::new(
-        &log_path,
-        AppendCount::new(1),
-        ContentLimit::Bytes(1024),
-        Compression::None,
-        None,
-    );
-
-    // 30 chunks × 100 bytes = 3000 bytes total. With a 1024-byte rotation
-    // threshold and max_files=1, this must produce exactly `test.log` and
-    // `test.log.1` at the end; older rotations are pruned.
-    let payload = vec![b'x'; 100];
-    for i in 0..30 {
-        appender.write_all(&payload).expect("write payload");
-        if i % 10 == 9 {
-            appender.flush().expect("flush appender");
-        }
-    }
-    drop(appender); // release the Windows file handle before re-reading the directory
-
-    assert!(log_path.exists(), "active log file is missing");
-    assert!(dir.join("test.log.1").exists(), "rotated log file .1 is missing");
-    assert!(
-        !dir.join("test.log.2").exists(),
-        "rotated log file .2 exists — max_files=1 pruning did not run"
-    );
-
-    let entries: Vec<_> = std::fs::read_dir(dir)
-        .expect("read dir")
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("test.log"))
-        .collect();
-    assert_eq!(
-        entries.len(),
-        2,
-        "expected exactly 2 test.log* files, found {}: {:?}",
-        entries.len(),
-        entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
-    );
-}
-
 // Tests: legacy daily-log cleanup =====================================================================================
 
 #[skuld::test]
@@ -430,7 +382,7 @@ fn cleanup_legacy_daily_logs_removes_only_dated_siblings_of_stem(#[fixture(temp_
     std::fs::write(dir.join("bridge.log.2024-01-01"), b"").expect("seed bridge.log.2024-01-01");
     std::fs::write(dir.join("bridge.log.2024-02-15"), b"").expect("seed bridge.log.2024-02-15");
 
-    super::cleanup_legacy_daily_logs(dir, "bridge.log");
+    super::cleanup_legacy_daily_logs(dir, &Dir::open(dir, false, None).unwrap(), "bridge.log");
 
     assert!(dir.join("bridge.log").exists(), "bridge.log must survive");
     assert!(dir.join("bridge.log.1").exists(), "bridge.log.1 must survive");
@@ -451,7 +403,7 @@ fn cleanup_legacy_daily_logs_removes_only_dated_siblings_of_stem(#[fixture(temp_
     // Exercise the co-located streams case: a second call with a different
     // stem must clean up that stem's dated files without disturbing the
     // already-cleaned set.
-    super::cleanup_legacy_daily_logs(dir, "gui.log");
+    super::cleanup_legacy_daily_logs(dir, &Dir::open(dir, false, None).unwrap(), "gui.log");
 
     assert!(
         !dir.join("gui.log.2024-01-01").exists(),
@@ -460,6 +412,29 @@ fn cleanup_legacy_daily_logs_removes_only_dated_siblings_of_stem(#[fixture(temp_
     assert!(dir.join("bridge.log").exists(), "bridge.log still present");
     assert!(dir.join("bridge.log.1").exists(), "bridge.log.1 still present");
     assert!(dir.join("bridge.other.txt").exists(), "bridge.other.txt still present");
+}
+
+#[skuld::test]
+fn cleanup_legacy_daily_logs_removes_only_inside_the_opened_directory(#[fixture(temp_dir)] dir: &Path) {
+    // The listing path names another directory than the one opened (it was swapped): the names it offers are
+    // acted on inside the opened directory only.
+    let opened = dir.join("opened");
+    let listed = dir.join("listed");
+    std::fs::create_dir(&opened).expect("create opened");
+    std::fs::create_dir(&listed).expect("create listed");
+    std::fs::write(listed.join("bridge.log.2024-01-01"), b"").expect("seed listed");
+    std::fs::write(opened.join("bridge.log.2024-02-02"), b"").expect("seed opened");
+
+    super::cleanup_legacy_daily_logs(&listed, &Dir::open(&opened, false, None).unwrap(), "bridge.log");
+
+    assert!(
+        listed.join("bridge.log.2024-01-01").exists(),
+        "a file of the listed directory was removed"
+    );
+    assert!(
+        opened.join("bridge.log.2024-02-02").exists(),
+        "no name from the listing matched it, so it stays"
+    );
 }
 
 #[skuld::test]
@@ -489,10 +464,10 @@ fn is_legacy_daily_suffix_matches_exactly_one_shape() {
 }
 
 #[skuld::test]
-fn cleanup_legacy_daily_logs_tolerates_missing_directory(#[fixture(temp_dir)] dir: &Path) {
+fn cleanup_legacy_daily_logs_tolerates_a_listing_that_is_not_there(#[fixture(temp_dir)] dir: &Path) {
     let nonexistent = dir.join("does-not-exist");
     // Must not panic.
-    super::cleanup_legacy_daily_logs(&nonexistent, "bridge.log");
+    super::cleanup_legacy_daily_logs(&nonexistent, &Dir::open(dir, false, None).unwrap(), "bridge.log");
 }
 
 // Tests: log crate bridge =============================================================================================
@@ -783,5 +758,107 @@ fn the_console_tee_target_is_redacted(#[fixture(temp_dir)] dir: &Path) {
         result.tee_stdout.contains(REDACT_TOKEN),
         "stdout tee received nothing recognizable: {:?}",
         result.tee_stdout
+    );
+}
+
+// Tests: the log directory is the user's to swap ======================================================================
+
+/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant.
+fn plant_symlink(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
+        }
+    }
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(target, link).unwrap();
+}
+
+#[skuld::test]
+fn init_dual_through_a_symlinked_log_dir_writes_nothing_outside_and_says_so(#[fixture(temp_dir)] dir: &Path) {
+    let outside = dir.join("outside");
+    std::fs::create_dir(&outside).expect("create outside");
+    let log_dir = dir.join("logs");
+    plant_symlink(&outside, &log_dir);
+    let exe = std::env::current_exe().expect("current_exe");
+
+    let out = Command::new(&exe)
+        .env("HOLE_LOGGING_TEST_KIND", "redact_file")
+        .env("HOLE_LOGGING_TEST_LOG_DIR", &log_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn child");
+
+    assert!(
+        out.status.success(),
+        "the bridge keeps running without a log file: {out:?}"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&outside).expect("read outside").collect();
+    assert!(
+        entries.is_empty(),
+        "a log file was written through the link: {entries:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the log file is disabled"),
+        "no word that it is: {stderr}"
+    );
+    assert!(
+        !stderr.contains(dir.to_string_lossy().as_ref()),
+        "the message carries a path: {stderr}"
+    );
+}
+
+#[skuld::test]
+fn init_dual_creates_the_log_dir_and_the_file(#[fixture(temp_dir)] dir: &Path) {
+    let log_dir = dir.join("hole").join("logs");
+    let exe = std::env::current_exe().expect("current_exe");
+
+    let status = Command::new(&exe)
+        .env("HOLE_LOGGING_TEST_KIND", "redact_file")
+        .env("HOLE_LOGGING_TEST_LOG_DIR", &log_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn child");
+
+    assert!(status.success(), "child failed with status {status:?}");
+    assert!(log_dir.join("test.log").is_file());
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn init_dual_hands_the_log_dir_and_file_to_the_owner_when_the_os_allows(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    let foreign = dir.metadata().unwrap().uid() + 2;
+    let scratch = dir.join("scratch");
+    std::fs::write(&scratch, b"").unwrap();
+    let allowed = std::os::unix::fs::chown(&scratch, Some(foreign), None).is_ok();
+    let log_dir = dir.join("logs");
+    let exe = std::env::current_exe().expect("current_exe");
+
+    let status = Command::new(&exe)
+        .env("HOLE_LOGGING_TEST_KIND", "redact_file")
+        .env("HOLE_LOGGING_TEST_LOG_DIR", &log_dir)
+        .env("HOLE_LOGGING_TEST_OWNER", format!("{foreign}:{foreign}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn child");
+
+    assert!(status.success(), "child failed with status {status:?}");
+    assert_eq!(log_dir.metadata().unwrap().uid() == foreign, allowed, "the directory");
+    assert_eq!(
+        log_dir.join("test.log").metadata().unwrap().uid() == foreign,
+        allowed,
+        "the file"
     );
 }

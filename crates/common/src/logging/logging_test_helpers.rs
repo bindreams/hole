@@ -438,7 +438,12 @@ fn scenario_redact_file() {
     // The redirect would eat the libtest-mimic per-test result lines; we
     // need its diagnostics if the child fails.
     unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
-    let guard = super::init(log_dir, "test", "test.log", "info", None);
+    // `HOLE_LOGGING_TEST_OWNER=<uid>:<gid>`: the user the files are handed to, as the elevated bridge's `owner`.
+    let owner = std::env::var("HOLE_LOGGING_TEST_OWNER").ok().map(|v| {
+        let (uid, gid) = v.split_once(':').expect("uid:gid");
+        (uid.parse().expect("uid"), gid.parse().expect("gid"))
+    });
+    let guard = super::init(log_dir, "test", "test.log", "info", owner);
     util::redact::arm(REDACT_TOKEN, [REDACT_ADDR.to_string()]);
     // A third-party-shaped line: no Hole site authored it, nothing about it
     // is `ServerAddress`-typed, and it still must not reach the file.

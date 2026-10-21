@@ -391,3 +391,26 @@ fn clear_does_not_remove_a_directory_at_the_marker_path() {
 
     assert!(dir.path().join(MARKER_FILE).is_dir());
 }
+
+#[cfg(unix)]
+#[skuld::test]
+fn the_marker_goes_to_the_owner_by_either_publisher_when_the_os_allows() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let foreign = dir.path().metadata().unwrap().uid() + 2;
+    let scratch = dir.path().join("scratch");
+    std::fs::write(&scratch, b"").unwrap();
+    let allowed = std::os::unix::fs::chown(&scratch, Some(foreign), None).is_ok();
+    let owner = Some((foreign, foreign));
+    let owner_of_marker = || std::fs::metadata(dir.path().join(MARKER_FILE)).unwrap().uid();
+    // The directory is the owner's too, as the bridge makes it before writing; a root-owned one is refused.
+    std::os::unix::fs::chown(dir.path(), Some(foreign), None).ok();
+
+    write(dir.path(), &info(1), owner).unwrap();
+    assert_eq!(owner_of_marker() == foreign, allowed, "write");
+
+    clear(dir.path()).unwrap();
+    write_new(dir.path(), &info(2), owner).unwrap();
+    assert_eq!(owner_of_marker() == foreign, allowed, "write_new");
+}

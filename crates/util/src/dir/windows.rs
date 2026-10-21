@@ -521,6 +521,9 @@ fn set_name(dir: &File, file: &File, to: &[u16], class: FILE_INFORMATION_CLASS, 
     nt(status)
 }
 
+/// No unix ids; see [`secure_dir`].
+pub(super) fn give_file(_file: &File, _owner: Option<(u32, u32)>) {}
+
 /// No unix ids or modes: the access control of a Windows file is its ACL, set through [`super::Dir::file`].
 pub(super) fn secure_dir(_dir: &File, _owner: Option<(u32, u32)>, _mode: Option<u32>) -> io::Result<()> {
     Ok(())

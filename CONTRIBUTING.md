@@ -2507,7 +2507,11 @@ The **marker** (`update-in-progress.json` in the service log dir, world-readable
 0o644 cross-privilege) does triple duty: the GUI holds its last snapshot instead
 of flashing Disconnected while it is set, the bridge shutdown disarms the cover
 while it is set, and it is the PR3 banner source. It is cleared unconditionally
-(remove-by-path) on the next bridge's post-bind sweep.
+(remove-by-name, never parse-then-clear) on the next bridge's post-bind sweep.
+Every write and the clear go through the log directory's no-follow `Dir` handle
+(a temp file staged and sealed through its own handle, then renamed or, for the
+single-occupancy claim, hard-linked); reads stay by path, since the GUI reads the
+marker as the user.
 
 ### Config corruption recovery
 
@@ -3208,6 +3212,16 @@ Default dir is `dirs::state_dir()/hole/logs` (`gui.log`, `bridge.log`):
 `hole bridge log` defaults to the installed-service dir; override with `--log-dir`
 or `HOLE_LOG_DIR` to read a foreground/dev bridge's log.
 
+The log directory sits in the user's profile when the bridge runs elevated on
+their behalf, so `init_dual` opens it once as a
+[`util::dir::Dir`](crates/util/src/dir.rs) (no symlink followed, created if
+missing, handed to the user) and the log file is a
+[`DirRotate`](crates/common/src/logging/dir_rotate.rs) inside that handle: the
+open, the rotation rename, the legacy-file cleanup and the `chown` of each fresh
+active file are all by a single name in it. A log directory the walk refuses (a
+symlink a user could have planted) disables the file sink with one line on the
+real stderr, which carries no path; the bridge keeps running.
+
 ### WebView2 and Chromium logs
 
 Windows WebView2 writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
@@ -3257,7 +3271,7 @@ process-global registry of armed literals behind an `ArcSwap` (lock-free reads,
 so no logging call can block behind a concurrent arm) and an `aho-corasick`
 automaton (`LeftmostLongest`, ASCII-case-insensitive). `RedactingWriter` wraps
 four non-blocking writers in `init_dual`, and **exactly one of them is a log
-file**: the `UserOwnedRotate` appender. Wrapping that one closes the file leak;
+file**: the `DirRotate` appender. Wrapping that one closes the file leak;
 the other three (the stderr layer's writer and the two stdio-relay tees) are the
 developer's terminal and cannot reopen it either way.
 
