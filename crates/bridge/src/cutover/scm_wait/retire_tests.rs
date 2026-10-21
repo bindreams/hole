@@ -1024,7 +1024,7 @@ enum Fault {
 /// harness, so nothing after the call that carried it runs.
 struct Killed;
 
-/// A service and its record, as the SCM and the state directory hold them,
+/// A service and its record, as the SCM and the service's registry key hold them,
 /// checked after every call.
 struct Model {
     start: StartType,

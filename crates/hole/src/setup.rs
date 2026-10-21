@@ -530,8 +530,9 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
 /// changes: guessing "not disabled" would re-enable it.
 ///
 /// **The repair follows the registration.** A record an interrupted uninstall
-/// left dies with the old service's key at the deregistration; the repair reads
-/// the new key and says whether the service may be started.
+/// left is cleared by the stop's restore, or, if the stop fails, dies with the
+/// old service's key at the deregistration; the repair reads the new key and
+/// says whether the service may be started.
 fn install_bridge_with(
     disabled_by: impl FnOnce() -> std::io::Result<Option<DisabledBy>>,
     is_installed: impl FnOnce() -> bool,
