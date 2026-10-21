@@ -271,7 +271,7 @@ fn a_lock_path_that_is_a_dangling_symlink_is_refused_and_its_target_not_created(
 }
 
 #[skuld::test]
-fn a_lock_path_that_is_a_second_name_for_another_file_is_refused_and_the_file_left_alone() {
+fn a_lock_path_that_is_a_second_name_for_another_file_never_changes_that_file() {
     let tmp = tempfile::tempdir().unwrap();
     let victim = tmp.path().join("victim.json");
     std::fs::write(&victim, b"not a lock file").unwrap();
@@ -285,7 +285,20 @@ fn a_lock_path_that_is_a_second_name_for_another_file_is_refused_and_the_file_le
         std::fs::metadata(&victim).unwrap()
     };
 
-    assert_refused(&path, observable_owner());
+    match observable_owner() {
+        // Not root: no owner is expected, so the extra name is refused.
+        None => assert_refused(&path, None),
+        // Root: the victim is owned by this process but not by the expected owner, so the
+        // name is replaced by a fresh file and the victim is untouched.
+        Some(owner) => {
+            let _guard = Exclusive::try_acquire(&path, Some(owner)).unwrap().unwrap();
+            assert_ne!(
+                std::fs::read(&path).unwrap(),
+                b"not a lock file",
+                "the lock must not be the victim"
+            );
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -303,6 +316,39 @@ fn a_lock_path_that_is_a_second_name_for_another_file_is_refused_and_the_file_le
         );
     }
     assert_eq!(std::fs::read(&victim).unwrap(), b"not a lock file");
+}
+
+#[skuld::test]
+#[cfg(windows)]
+fn the_lock_name_cannot_be_removed_or_renamed_while_it_is_held() {
+    // ERROR_SHARING_VIOLATION: the handle does not share DELETE, so the name the vet
+    // looked at stays bound to the file for as long as the lock is held.
+    const SHARING_VIOLATION: i32 = 32;
+    let tmp = tempfile::tempdir().unwrap();
+    for (case, existing) in [("created", false), ("reopened", true)] {
+        let path = tmp.path().join(case);
+        if existing {
+            std::fs::write(&path, b"").unwrap();
+        }
+        let guard = Exclusive::try_acquire(&path, None).unwrap().unwrap();
+
+        let removed = std::fs::remove_file(&path).expect_err(case);
+        let renamed = std::fs::rename(&path, tmp.path().join("moved")).expect_err(case);
+
+        assert_eq!(
+            removed.raw_os_error(),
+            Some(SHARING_VIOLATION),
+            "{case}: remove: {removed}"
+        );
+        assert_eq!(
+            renamed.raw_os_error(),
+            Some(SHARING_VIOLATION),
+            "{case}: rename: {renamed}"
+        );
+        assert!(path.exists(), "{case}");
+        drop(guard);
+        std::fs::remove_file(&path).expect("a released lock file can be removed");
+    }
 }
 
 #[skuld::test]
@@ -348,7 +394,48 @@ fn a_lock_path_that_names_a_device_is_refused() {
 
 #[skuld::test]
 #[cfg(unix)]
-fn an_existing_wider_lock_file_of_our_own_is_tightened_not_refused() {
+fn a_lock_file_left_owned_by_this_process_does_not_lock_the_owner_out() {
+    use std::os::unix::fs::MetadataExt;
+    // As root, this file stands in for the one a bridge that died before its `fchown` left
+    // behind. Unprivileged, the expected owner is the caller itself and the file is kept.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("target.json.lock");
+    std::fs::write(&path, b"leftover").unwrap();
+    // SAFETY: getuid/getgid take no arguments and cannot fail.
+    let owner = observable_owner().unwrap_or_else(|| unsafe { (libc::getuid(), libc::getgid()) });
+
+    let guard = Exclusive::try_acquire(&path, Some(owner)).unwrap();
+
+    assert!(guard.is_some());
+    assert_eq!(std::fs::metadata(&path).unwrap().uid(), owner.0);
+    if observable_owner().is_some() {
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"",
+            "a root-owned leftover must be replaced"
+        );
+    }
+}
+
+#[skuld::test]
+#[cfg(unix)]
+fn an_existing_wider_lock_file_of_the_expected_owner_is_tightened_not_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("target.json.lock");
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    // SAFETY: getuid/getgid take no arguments and cannot fail.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+
+    let _guard = Exclusive::try_acquire(&path, Some((uid, gid))).unwrap().unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[skuld::test]
+#[cfg(unix)]
+fn an_existing_file_is_not_re_permissioned_when_no_owner_is_expected() {
+    // Without an owner there is no proof the file is ours to change, so it is only locked.
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("target.json.lock");
@@ -356,5 +443,5 @@ fn an_existing_wider_lock_file_of_our_own_is_tightened_not_refused() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
 
     let _guard = Exclusive::try_acquire(&path, None).unwrap().unwrap();
-    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o666);
 }

@@ -3,13 +3,10 @@
 //! is testable by opening the same path twice.
 //!
 //! `Exclusive` is the shared core: a bare acquired-lock token with no
-//! knowledge of what path means or who wraps it. Domain-specific callers
-//! (`crates/bridge/src/target.rs`'s `TargetExclusive`, and the sibling three
-//! newtypes #878 adds after this lands — `SocketExclusive`,
-//! `Arc<MachineExclusive>`, `StateExclusive`) wrap it with their own keyed
-//! path and their own `Send`-ness. `Exclusive` itself stays `Send` (a `File`
-//! is `Send`); a newtype opts out via its own `PhantomData<*const ()>` field
-//! when its contract needs it — see `TargetExclusive` for why.
+//! knowledge of what path means or who wraps it. Domain-specific callers (e.g.
+//! `TargetExclusive` in the bridge) wrap it with their own keyed path and
+//! `Send`-ness. `Exclusive` stays `Send`; a newtype opts out via
+//! `PhantomData<*const ()>` when its contract needs it.
 //!
 //! **Invariant: no token without holding the lock.** Constructing an
 //! `Exclusive` *is* acquiring it — there is no separate "acquired" state to
@@ -17,36 +14,47 @@
 //! acquisition cannot observe contention, only succeed or fail with an I/O
 //! error.
 //!
-//! **Open discipline (security-relevant).** The lock sits in a directory
-//! another principal may write (the elevation-mode state dir belongs to the
-//! interactive user), so whatever is at the lock name when it is opened is
-//! attacker-chosen. Every check and every change goes through the open
-//! descriptor/handle, never the path:
+//! # Open protocol
 //!
-//! - the open refuses a symlink (`O_NOFOLLOW` on unix, reparse-point rejection
-//!   on Windows);
-//! - the opened file must be a regular file with exactly one link, and (unix,
-//!   when an `owner` is given) owned by that owner or by the process itself.
-//!   A hard link planted at the lock name to some other file passes
-//!   `O_NOFOLLOW`; without this check the `fchmod`/`fchown` below would
-//!   re-permission that file. A file that fails is refused with a path-free
-//!   error ([`Refused`]), never repaired;
-//! - only a file that passed is `fchmod`ed to `0600` and `fchown`ed to
-//!   `owner`. Windows applies no security descriptor at all, by path or by
-//!   handle: the owner-only DACL comes from the install path.
+//! The lock sits in a directory another principal may write (the
+//! elevation-mode state dir belongs to the interactive user), so whatever is at
+//! the lock name is attacker-chosen, and the name can change between any two
+//! calls that take it. The protocol decides on what the attacker cannot change
+//! once the file is open, never on the name:
 //!
-//! The link-count window is closed: a hard link made to the lock file *after*
-//! the check can only name our own lock file, which is ours to permission.
+//! 1. Create the file with `O_CREAT|O_EXCL` (Windows: `CREATE_NEW`). That never
+//!    follows a symlink and never reuses a file, so a file it creates is ours.
+//! 2. If the name exists, reopen it without creating; a name that vanished goes
+//!    back to 1. A symlink (Windows: any reparse point), directory, socket or
+//!    other non-regular file is refused with a [`Refused`].
+//! 3. Unix, with an `owner`: the existing file's uid must be the owner's,
+//!    exactly. Only root can change a file's uid, so, unlike its link count, it
+//!    cannot change after the check. A file owned by this process instead is not
+//!    used: it is locked, its *name* is unlinked, and a fresh file is created.
+//!    That recovers the file a previous run created and died before its
+//!    `fchown` (refusing it would lock the owner out). It is also what happens
+//!    to an unrelated file this process owns that was hard-linked at the name:
+//!    the unlink touches only the name, never that file. A file owned by anyone
+//!    else is refused.
+//! 4. `fchmod` and `fchown` are applied only to a file this call created or the
+//!    `owner` already owns. With no `owner` an existing file is only locked.
+//! 5. Once locked, the name must still name the open file (device and inode);
+//!    if the previous holder unlinked it, start over.
 //!
-//! **Extensibility hook for #878's depth guard.** `#878` adds a
-//! complementary, debug-only thread-local depth guard on top of this core:
-//! set while a leaf token is alive, checked on every acquisition, to catch
-//! (in debug builds) an attempt to acquire a second lock while a leaf one
-//! is already held on the same thread. This module must not foreclose that
-//! guard, so [`on_acquire_entry`] and [`on_token_drop`] are called at the
-//! two points the guard needs — entry to every acquisition attempt, and
-//! release of a held token — and are deliberately no-ops here. Do not
-//! remove these calls when refactoring; they are the seam, not dead code.
+//! So whatever an attacker does to the name or its links, before or after the
+//! open, no file but one this call created or the `owner` owns is
+//! re-permissioned or chowned. A kept file with a second name is also refused,
+//! but that check does not protect: the count can change after it is read.
+//!
+//! The directory part of `path` is resolved by name.
+//!
+//! Windows applies no security descriptor (the owner-only DACL comes from the
+//! install path), so it has nothing to redirect. It opens without
+//! `FILE_SHARE_DELETE`, so while the lock is held the name can be neither
+//! removed nor renamed and the vetted file stays the one at the name.
+//!
+//! **Hooks.** `on_acquire_entry` and `on_token_drop` are deliberate no-op seams
+//! for a caller-side depth guard; keep the calls.
 
 use std::fmt;
 use std::fs::File;
@@ -66,20 +74,18 @@ use windows as platform;
 // Extensibility hooks =================================================================================================
 
 /// Called at the start of every acquisition attempt ([`Exclusive::try_acquire`]
-/// and [`Exclusive::acquire`]), before anything else. See the module doc's
-/// "Extensibility hook for #878's depth guard".
+/// and [`Exclusive::acquire`]), before anything else.
 #[inline]
 fn on_acquire_entry() {}
 
 /// Called when a held [`Exclusive`] token's lock is released (on `Drop`).
-/// See the module doc's "Extensibility hook for #878's depth guard".
 #[inline]
 fn on_token_drop() {}
 
 // Refusal =============================================================================================================
 
 /// Why an existing lock file was refused. The one place that decides how each
-/// reason reads; platform modules only choose which reason applies.
+/// reason reads.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     /// Not a regular file: a FIFO, device, socket or directory.
@@ -185,8 +191,7 @@ impl std::error::Error for Refused {}
 /// releases every `flock`/`LockFileEx` lock held through it — no explicit
 /// unlock call is needed or made).
 pub struct Exclusive {
-    // Never read directly — held only so its `Drop` (closing the fd/handle)
-    // releases the OS-level lock when this token drops.
+    // Never read: closing it on drop releases the lock.
     #[allow(dead_code)]
     file: File,
 }
@@ -196,15 +201,16 @@ impl Exclusive {
     ///
     /// `Ok(None)` means the lock is currently held by someone else (this
     /// process or another) — contention, not an error. `owner`, when
-    /// `Some((uid, gid))`, is applied via `fchown` on the opened file
-    /// descriptor once the lock is held (unix; Windows ignores it), and an
-    /// existing lock file must already be owned by `uid` or by this process;
-    /// `None` leaves ownership alone and does not check it (the root-owned
-    /// `--service` daemon case).
+    /// `Some((uid, gid))`, is applied via `fchown` once the lock is held (unix;
+    /// Windows ignores it), and an existing lock file is only used if `uid`
+    /// owns it; `None` expects no owner and leaves an existing file as it is
+    /// (the root-owned `--service` daemon case). See the module doc's open
+    /// protocol.
     ///
-    /// An existing lock file that is not a regular file with exactly one link
-    /// (or has another owner, above) is refused with an `InvalidData` error
-    /// holding a [`Refused`]; it is never re-permissioned.
+    /// A symlink, directory, socket or other non-regular file at the path, a
+    /// file with a second name, or one owned by a third party, is refused with
+    /// an `InvalidData` error holding a [`Refused`]; it is never
+    /// re-permissioned.
     pub fn try_acquire(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Option<Self>> {
         Self::try_acquire_as(path, owner, platform::caller())
     }
@@ -223,15 +229,11 @@ impl Exclusive {
         }
     }
 
-    /// Acquire the lock, blocking until it is available.
+    /// Acquire the lock, blocking until it is available. See [`Self::try_acquire`]
+    /// for `owner` and the refusals.
     ///
-    /// No `Held`/contention arm: a blocking acquisition cannot observe
-    /// contention, only eventually succeed or fail with an I/O error. Every
-    /// caller of this function must be a **leaf** with respect to whatever
-    /// invariant its own newtype documents (see `TargetExclusive` in
-    /// `crates/bridge/src/target.rs` for the one leaf-lock contract this
-    /// core currently ships with) — `Exclusive` itself does not and cannot
-    /// enforce that; it is a per-newtype contract, not a core one.
+    /// Callers must be a leaf with respect to the invariant their own wrapper
+    /// documents; `Exclusive` does not enforce it.
     pub fn acquire(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Self> {
         Self::acquire_as(path, owner, platform::caller())
     }
@@ -247,9 +249,6 @@ impl Exclusive {
 
 impl Drop for Exclusive {
     fn drop(&mut self) {
-        // The OS releases the flock/LockFileEx lock when the last handle to
-        // this open file description/handle closes, which happens when
-        // `self.file` drops right after this. No explicit unlock call.
         on_token_drop();
     }
 }
