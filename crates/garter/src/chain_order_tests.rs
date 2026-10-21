@@ -387,6 +387,48 @@ async fn a_probe_error_that_is_a_race_before_the_first_answer_is_retried() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
+/// An OS error that is not a port race, with a raw errno to carry: `EINVAL` / `WSAEINVAL`, both `InvalidInput`.
+fn not_a_race() -> io::Error {
+    let errno = if cfg!(windows) { 10022 } else { 22 };
+    let error = io::Error::from_raw_os_error(errno);
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    error
+}
+
+#[skuld::test]
+async fn a_probe_error_that_is_not_a_race_fails_the_start_and_starts_no_hop() {
+    tokio::time::pause();
+    let rig = Rig::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let errno = not_a_race().raw_os_error();
+    let runner = ChainRunner::new()
+        .add(rig.hop("A"))
+        .add(rig.hop("B"))
+        .with_probe(Box::new(scripted(vec![Err(not_a_race())], &calls)));
+
+    let (told, result) = run_until_ready(runner, Mode::Client).await;
+
+    match told {
+        Err(StartError::Fatal { detail, errno: got }) => {
+            assert!(detail.contains("picking a port for plugin 'B'"), "{detail}");
+            assert_eq!(got, errno);
+        }
+        other => panic!("the caller must be told a Fatal start failure, got {other:?}"),
+    }
+    match result {
+        Err(crate::Error::StartFailed {
+            plugin,
+            cause: StartError::Fatal { errno: got, .. },
+        }) => {
+            assert_eq!(plugin, "B");
+            assert_eq!(got, errno);
+        }
+        other => panic!("run must return the start failure, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "a refusal is not picked again");
+    assert!(rig.trace().is_empty(), "no hop started: {:?}", rig.trace());
+}
+
 #[skuld::test]
 async fn a_cancel_during_the_pick_ends_run() {
     tokio::time::pause();
