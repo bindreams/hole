@@ -1,5 +1,7 @@
 //! Reading and writing one versioned file.
 
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -7,32 +9,35 @@ use std::sync::Arc;
 
 use super::loaded::{CannotRead, Loaded};
 use super::{frame, Chain, ChainError, RemoveOver, StoreOver, VersionedState};
+use crate::dir::{Dir, Staged};
 use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
-/// without touching the rest. Every method defaults to the real call.
+/// without touching the rest. Every method defaults to the real call, through
+/// the directory handle the type holds: a name is always a single name inside
+/// it.
 ///
 /// Reachable outside this crate only with the `test-support` feature.
 pub trait Fs: Send + Sync {
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
-        std::fs::remove_file(path)
+    fn remove_file(&self, dir: &Dir, name: &OsStr) -> io::Result<()> {
+        dir.unlink(name)
     }
 
     /// `Unsupported` when the platform cannot rename without replacing.
-    fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
-        super::sys::rename_noreplace(from, to)
+    fn rename_noreplace(&self, dir: &Dir, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        dir.rename_noreplace(from, to)
     }
 
-    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+    fn read(&self, dir: &Dir, name: &OsStr) -> io::Result<Vec<u8>> {
+        dir.read(name)
     }
 
-    fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
-        std::fs::hard_link(original, link)
+    fn hard_link(&self, dir: &Dir, original: &OsStr, link: &OsStr) -> io::Result<()> {
+        dir.link(original, link)
     }
 
-    fn publish(&self, tmp: tempfile::NamedTempFile, dest: &Path) -> io::Result<()> {
-        super::sys::publish(tmp, dest)
+    fn publish(&self, staged: Staged<'_>) -> io::Result<()> {
+        staged.publish()
     }
 }
 
@@ -41,30 +46,34 @@ struct StdFs;
 impl Fs for StdFs {}
 
 /// What differs per file about where and how it is written, and is not the
-/// type's business: directory creation and mode, the file's mode and owner.
+/// type's business: the directory's owner, the file's owner and ACL.
+///
+/// The directory is opened once, without following a symlink, and every step
+/// goes through that handle ([`Dir`]): the state directory may belong to the
+/// user whose privileged writer this is, so no step is a path.
 pub trait Placement {
     fn owner(&self) -> Option<(u32, u32)> {
         None
     }
 
-    /// Before anything is written: the directory exists and is as it should be.
-    fn prepare_dir(&self, dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        crate::ownership::chown_if_some(dir, self.owner());
-        Ok(())
+    /// Before anything is written: the directory exists (the type created it)
+    /// and is as it should be. By default it is handed to [`owner`](Self::owner).
+    fn prepare_dir(&self, dir: &Dir) -> io::Result<()> {
+        dir.secure(self.owner(), None)
     }
 
-    /// The temp file is complete, synced and not yet published: set its mode,
-    /// owner and ACL here. On Windows do not set `FILE_ATTRIBUTE_READONLY`:
-    /// no later `store` could replace the file.
-    fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
-        crate::ownership::chown_if_some(tmp, self.owner());
+    /// The temp file is complete, synced and not yet published, and already
+    /// owned by [`owner`](Self::owner) with mode `0600` (unix): set the rest of
+    /// its mode and its ACL here, through its own handle. On Windows do not set
+    /// `FILE_ATTRIBUTE_READONLY`: no later `store` could replace the file.
+    fn prepare_tmp(&self, _tmp: &File) -> io::Result<()> {
         Ok(())
     }
 
     /// The new file is in place. Not for its mode, owner or ACL: use
-    /// [`prepare_tmp`](Placement::prepare_tmp).
-    fn after_publish(&self, _path: &Path) -> io::Result<()> {
+    /// [`prepare_tmp`](Placement::prepare_tmp). Nothing here may act on `name`
+    /// by anything but the handle: it is the user's to swap.
+    fn after_publish(&self, _dir: &Dir, _name: &OsStr) -> io::Result<()> {
         Ok(())
     }
 
@@ -75,49 +84,21 @@ pub trait Placement {
     /// guarantee. A volume with no directory flush (an SMB share or a 9P
     /// volume on Windows; a filesystem without directory fsync on unix) is
     /// `Ok`, and the durability there is whatever the volume gives.
-    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+    fn sync_dir(&self, dir: &Dir) -> io::Result<()> {
         sync_dir(dir)
     }
 }
 
-/// Flushes the directory. A filesystem that offers no directory fsync (see
-/// [`no_directory_flush`]) is not an error. Failing to open the directory
-/// still is.
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    sync_dir_with(dir, std::fs::File::sync_all)
+/// Flushes the directory. A filesystem that offers no directory flush (see
+/// [`no_directory_flush`]) is not an error.
+fn sync_dir(dir: &Dir) -> io::Result<()> {
+    sync_dir_with(dir, Dir::sync)
 }
 
 /// [`sync_dir`] over an injectable flush, so the tolerance is tested where it
 /// is wired.
-#[cfg(unix)]
-fn sync_dir_with(dir: &Path, flush: impl FnOnce(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
-    tolerate_missing_directory_flush(flush(&std::fs::File::open(dir)?))
-}
-
-/// Flushes the directory. A volume that offers no directory flush (see
-/// [`no_directory_flush`]) is not an error: the replace there is as durable as
-/// the volume makes it. Failing to open the directory still is.
-///
-/// `FlushFileBuffers` needs a handle with `GENERIC_WRITE`, and opening a
-/// directory needs `FILE_FLAG_BACKUP_SEMANTICS`.
-#[cfg(windows)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    sync_dir_with(dir, std::fs::File::sync_all)
-}
-
-/// [`sync_dir`] over an injectable flush, so the tolerance is tested where it
-/// is wired.
-#[cfg(windows)]
-fn sync_dir_with(dir: &Path, flush: impl FnOnce(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let handle = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(dir)?;
-    tolerate_missing_directory_flush(flush(&handle))
+fn sync_dir_with(dir: &Dir, flush: impl FnOnce(&Dir) -> io::Result<()>) -> io::Result<()> {
+    tolerate_missing_directory_flush(flush(dir))
 }
 
 fn tolerate_missing_directory_flush(result: io::Result<()>) -> io::Result<()> {
@@ -203,6 +184,7 @@ const fn assert_unversioned_as_valid<S: VersionedState>() {
 
 /// One state file, `S::FILE_NAME` in a directory.
 pub struct VersionedFile<S: VersionedState> {
+    dir: PathBuf,
     path: PathBuf,
     fs: Arc<dyn Fs>,
     _schema: PhantomData<fn() -> S>,
@@ -219,6 +201,7 @@ impl<S: VersionedState> VersionedFile<S> {
             dir
         };
         Self {
+            dir: dir.to_path_buf(),
             path: dir.join(S::FILE_NAME),
             fs: Arc::new(StdFs),
             _schema: PhantomData,
@@ -235,16 +218,25 @@ impl<S: VersionedState> VersionedFile<S> {
         &self.path
     }
 
-    /// Reads the file. Never rewrites it.
+    /// Reads the file. Never rewrites it. A directory that is not there is an
+    /// absent file; one that cannot be opened (a symlink in its path that a user
+    /// could have planted, see [`Dir`]) is a read that failed.
     pub fn load(&self) -> Loaded<S> {
-        Loaded::from_read(self.fs.read(&self.path))
+        match Dir::open(&self.dir, false, None) {
+            Ok(dir) => self.load_in(&dir),
+            Err(err) => Loaded::from_read(Err(err)),
+        }
+    }
+
+    fn load_in(&self, dir: &Dir) -> Loaded<S> {
+        Loaded::from_read(self.fs.read(dir, self.file_name()))
     }
 
     /// Writes `value`, framed with `S::VERSION`. In this order, so nothing is
     /// removed before its replacement is durable:
     ///
     /// 1. Write a same-directory temp file, sync it and have `place` set its
-    ///    mode, owner and ACL.
+    ///    mode, owner and ACL, all through the temp file's own handle.
     /// 2. Probe the current file. Absent, older or obsolete goes straight to
     ///    4. A newer or corrupt file, and one whose read failed with an I/O
     ///    error, is decided by `S::ROLE`: refused (nothing touched, the temp
@@ -271,9 +263,11 @@ impl<S: VersionedState> VersionedFile<S> {
     /// files that is the bridge's liveness lock
     /// (`crates/bridge/src/liveness.rs`: held by the running bridge and by
     /// the CLIs that write state, one holder per state directory) plus the
-    /// caller's own ordering within the process. The state directory must
-    /// not let another principal create files in it: the type acts by name
-    /// and does not defend against a name changed under it.
+    /// caller's own ordering within the process. The directory is opened once
+    /// without following a symlink and every step names a file inside that
+    /// handle, so a directory another principal can write is not a way to make
+    /// the type act on a file outside it; a name changed under the type inside
+    /// it is still the caller's exclusion to prevent.
     /// [`load`](Self::load) needs none of this and reads either file whole.
     ///
     /// On Windows the replace is a POSIX-semantics rename, which a reader that
@@ -294,28 +288,22 @@ impl<S: VersionedState> VersionedFile<S> {
     /// float that would do so is refused with [`StoreError::Encode`].
     pub fn store(&self, value: &S, place: &dyn Placement) -> Result<(), StoreError> {
         let bytes = encode(value)?;
-        let dir = self.dir();
-        place.prepare_dir(dir)?;
+        let dir = Dir::open(&self.dir, true, place.owner())?;
+        place.prepare_dir(&dir)?;
 
-        let mut tmp = tempfile::Builder::new()
-            .prefix(&format!(".{}.", S::FILE_NAME))
-            .suffix(".tmp")
-            .tempfile_in(dir)?;
-        io::Write::write_all(&mut tmp, &bytes)?;
-        tmp.as_file().sync_all()?;
-        place.prepare_tmp(tmp.path())?;
+        let staged = dir.stage(self.file_name(), &bytes, place.owner(), |tmp| place.prepare_tmp(tmp))?;
 
-        let back_up = store_over(&self.path, &self.load())?;
+        let back_up = store_over(&self.path, &self.load_in(&dir))?;
 
         if back_up {
-            self.link_to_free_backup()?;
+            self.link_to_free_backup(&dir)?;
         }
 
-        self.fs.publish(tmp, &self.path)?;
+        self.fs.publish(staged)?;
         // The directory is flushed even when `after_publish` failed: the rename
         // happened either way. The first failure is the one reported.
-        let finalized = place.after_publish(&self.path);
-        let flushed = place.sync_dir(dir);
+        let finalized = place.after_publish(&dir, self.file_name());
+        let flushed = place.sync_dir(&dir);
         finalized.and(flushed).map_err(StoreError::PublishedNotFinalized)
     }
 
@@ -332,13 +320,16 @@ impl<S: VersionedState> VersionedFile<S> {
     /// The directory is the caller's to write: where it cannot, `remove` of a
     /// file this role removes or moves aside fails with the OS error.
     pub fn remove(&self) -> io::Result<Removal> {
-        match remove_over(&self.load()) {
+        let Some(dir) = self.open_existing()? else {
+            return Ok(Removal::Absent);
+        };
+        match remove_over(&self.load_in(&dir)) {
             RemoveOver::Keep => Ok(Removal::Kept),
-            RemoveOver::MoveAside => Ok(match self.move_aside()? {
+            RemoveOver::MoveAside => Ok(match self.move_aside_in(&dir)? {
                 Some(backup) => Removal::MovedAside(backup),
                 None => Removal::Absent,
             }),
-            RemoveOver::Remove => match self.fs.remove_file(&self.path) {
+            RemoveOver::Remove => match self.fs.remove_file(&dir, self.file_name()) {
                 Ok(()) => Ok(Removal::Removed),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Removal::Absent),
                 Err(e) => Err(e),
@@ -358,47 +349,63 @@ impl<S: VersionedState> VersionedFile<S> {
     /// loses its file. The caller must ensure there is none; see
     /// [`store`](Self::store), "Exclusion".
     pub fn move_aside(&self) -> io::Result<Option<PathBuf>> {
+        let Some(dir) = self.open_existing()? else {
+            return Ok(None);
+        };
+        self.move_aside_in(&dir)
+    }
+
+    /// The directory, or `None` when it is not there (and then nothing is made).
+    fn open_existing(&self) -> io::Result<Option<Dir>> {
+        match Dir::open(&self.dir, false, None) {
+            Ok(dir) => Ok(Some(dir)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn move_aside_in(&self, dir: &Dir) -> io::Result<Option<PathBuf>> {
         let mut attempt = 1u64;
         loop {
-            let backup = self.backup_path(attempt);
-            match self.fs.rename_noreplace(&self.path, &backup) {
+            let backup = self.backup_name(attempt);
+            match self.fs.rename_noreplace(dir, self.file_name(), &backup) {
                 Ok(()) => {
                     self.log_backup("moved a state file aside", &backup);
-                    return Ok(Some(backup));
+                    return Ok(Some(self.dir.join(backup)));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(e) if e.kind() == io::ErrorKind::Unsupported => return self.move_aside_by_link(),
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => return self.move_aside_by_link(dir),
                 Err(e) => return Err(e),
             }
         }
     }
 
-    fn move_aside_by_link(&self) -> io::Result<Option<PathBuf>> {
-        let Some(backup) = self.link_to_free_backup()? else {
+    fn move_aside_by_link(&self, dir: &Dir) -> io::Result<Option<PathBuf>> {
+        let Some(backup) = self.link_to_free_backup(dir)? else {
             return Ok(None);
         };
-        match self.fs.remove_file(&self.path) {
+        match self.fs.remove_file(dir, self.file_name()) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        Ok(Some(backup))
+        Ok(Some(self.dir.join(backup)))
     }
 
-    fn dir(&self) -> &Path {
-        self.path.parent().expect("a state file is always inside a directory")
+    fn file_name(&self) -> &OsStr {
+        OsStr::new(S::FILE_NAME)
     }
 
     /// Hard-links the file to the first free backup name and logs it.
     /// `hard_link` fails atomically on an existing name, so two writers never
     /// take the same name and no backup is ever replaced. `None` when the file
     /// is not there.
-    fn link_to_free_backup(&self) -> io::Result<Option<PathBuf>> {
+    fn link_to_free_backup(&self, dir: &Dir) -> io::Result<Option<OsString>> {
         let mut attempt = 1u64;
         loop {
-            let backup = self.backup_path(attempt);
-            match self.fs.hard_link(&self.path, &backup) {
+            let backup = self.backup_name(attempt);
+            match self.fs.hard_link(dir, self.file_name(), &backup) {
                 Ok(()) => {
                     self.log_backup("backed up a state file", &backup);
                     return Ok(Some(backup));
@@ -410,16 +417,16 @@ impl<S: VersionedState> VersionedFile<S> {
         }
     }
 
-    fn log_backup(&self, what: &str, backup: &Path) {
-        tracing::warn!(file = S::FILE_NAME, backup = %file_name(backup), "{what}");
+    fn log_backup(&self, what: &str, backup: &OsStr) {
+        tracing::warn!(file = S::FILE_NAME, backup = %backup.to_string_lossy(), "{what}");
     }
 
-    fn backup_path(&self, attempt: u64) -> PathBuf {
-        let name = match attempt {
+    fn backup_name(&self, attempt: u64) -> OsString {
+        match attempt {
             1 => format!("{}.unreadable.bak", S::FILE_NAME),
             n => format!("{}.unreadable.{n}.bak", S::FILE_NAME),
-        };
-        self.dir().join(name)
+        }
+        .into()
     }
 }
 
@@ -477,10 +484,6 @@ fn remove_over<S: VersionedState>(loaded: &Loaded<S>) -> RemoveOver {
     }
 }
 
-fn file_name(path: &Path) -> std::borrow::Cow<'_, str> {
-    path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
-}
-
 /// The value as one flat JSON object with `"version"` first, proven to read
 /// back as `S` before it is returned: anything `load` would call corrupt
 /// (a float that serializes as `null`, a top-level enum whose tag lands beside
@@ -525,6 +528,10 @@ fn read_back<S: VersionedState>(bytes: &[u8]) -> Result<(), ParseFailure> {
 #[cfg(test)]
 #[path = "store_tests.rs"]
 mod store_tests;
+
+#[cfg(test)]
+#[path = "store_dir_tests.rs"]
+mod store_dir_tests;
 
 #[cfg(test)]
 #[path = "store_faults_tests.rs"]

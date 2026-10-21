@@ -599,7 +599,7 @@ user swapped in.
   nor `O_NOFOLLOW_ANY` (macOS 10.15) is used, so one code path serves every
   version and there is no fallback to path resolution. The Windows replace uses
   `FileRenameInformationEx` with POSIX semantics (Windows 10 1607, NTFS) and the
-  plain replace where the volume rejects it, as `versioned_file` does.
+  plain replace where the volume rejects it.
 - **Missing directories** above the file are created the same way, relative to
   their parent's handle, never by `create_dir_all` on a path.
 
@@ -616,6 +616,13 @@ State-file writers use the same handle. `bridge-target.json`,
 on its own handle before the rename and nothing touches the final name after it,
 so a name swapped for a hard link or symlink after the rename changes nothing.
 `the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps them on it.
+
+`bridge-routes.json` is a `util::versioned_file::VersionedFile`, which opens its
+directory as a `Dir` for each call (load, store, remove, move-aside) and does
+every step inside that handle: the read, the staged temp file (sealed through its
+own handle), the backup hard link, the no-clobber rename, the replace and the
+directory flush. A symlink at the file's own name is never read through: it is a
+file this release cannot read, and the file's role decides what happens to it.
 
 `Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
 lock sits in a user's profile, so neither its `Display` nor its `Debug` carries

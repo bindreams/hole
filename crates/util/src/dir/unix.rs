@@ -323,11 +323,17 @@ pub(super) fn rename_noreplace(dir: &File, from: &OsStr, to: &OsStr) -> io::Resu
     }
     let err = io::Error::last_os_error();
     match err.raw_os_error() {
-        // `EPERM` is not among these: it is a refusal of this rename (a sticky directory, a security
-        // module), and the caller's hard-link fallback is allowed where it was not.
-        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP) => Err(io::ErrorKind::Unsupported.into()),
+        Some(errno) if renameat2_unavailable(errno) => Err(io::ErrorKind::Unsupported.into()),
         _ => Err(err),
     }
+}
+
+/// The kernel or the filesystem does not offer `renameat2` with the flag. `EPERM` is not among these: it is a
+/// refusal of this rename (a sticky directory, a security module), and the caller's hard-link fallback is allowed
+/// where the rename was not and would leave its backup when the delete that follows is refused.
+#[cfg(target_os = "linux")]
+pub(super) fn renameat2_unavailable(errno: i32) -> bool {
+    matches!(errno, libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
 }
 
 #[cfg(target_os = "macos")]

@@ -355,10 +355,7 @@ pub(super) fn unlink(dir: &File, name: &OsStr) -> io::Result<()> {
     // With POSIX semantics the name goes at once, even while a reader that shares delete has the file open; a
     // volume without them (the three codes `posix_rename_unsupported` reads) gets the delete that waits for the
     // last handle.
-    match set_disposition(&handle, true) {
-        Err(err) if posix_rename_unsupported(&err) => set_disposition(&handle, false),
-        result => result,
-    }
+    posix_or_legacy(|| set_disposition(&handle, true), || set_disposition(&handle, false))
 }
 
 /// The entry `name` as itself, open for `DELETE`, which unlinking and renaming it need.
@@ -425,8 +422,16 @@ const NO_REPLACE: u32 = 0;
 /// handle has the target open.
 pub(super) fn rename(dir: &File, temp: &File, _from: &OsStr, to: &OsStr) -> io::Result<()> {
     let to = wide(to)?;
-    match set_name(dir, temp, &to, FileRenameInformationEx, REPLACE_POSIX) {
-        Err(err) if posix_rename_unsupported(&err) => set_name(dir, temp, &to, FileRenameInformation, REPLACE),
+    posix_or_legacy(
+        || set_name(dir, temp, &to, FileRenameInformationEx, REPLACE_POSIX),
+        || set_name(dir, temp, &to, FileRenameInformation, REPLACE),
+    )
+}
+
+/// `posix`, or `legacy` when `posix` answers that the volume does not support it. Any other error is returned.
+fn posix_or_legacy(posix: impl FnOnce() -> io::Result<()>, legacy: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    match posix() {
+        Err(err) if posix_rename_unsupported(&err) => legacy(),
         result => result,
     }
 }

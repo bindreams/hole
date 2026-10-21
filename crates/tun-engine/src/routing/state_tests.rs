@@ -179,7 +179,7 @@ fn only_an_unreadable_record_blocks_a_connect() {
 struct DeniedRead;
 
 impl util::versioned_file::Fs for DeniedRead {
-    fn read(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+    fn read(&self, _dir: &util::dir::Dir, _name: &std::ffi::OsStr) -> std::io::Result<Vec<u8>> {
         Err(std::io::ErrorKind::PermissionDenied.into())
     }
 }

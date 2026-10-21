@@ -5,8 +5,6 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use tempfile::NamedTempFile;
-
 use super::{DefaultPlacement, Fs, Removal, StoreError, VersionedFile};
 use crate::versioned_file::fixtures::{dir, names, put, unreadable_bytes, DecisionFile, NoteV3};
 use crate::versioned_file::CannotRead;
@@ -27,7 +25,7 @@ fn decision(value: &str) -> DecisionFile {
 struct FailsPublish;
 
 impl Fs for FailsPublish {
-    fn publish(&self, _tmp: NamedTempFile, _dest: &Path) -> io::Result<()> {
+    fn publish(&self, _staged: crate::dir::Staged<'_>) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }
@@ -36,7 +34,12 @@ impl Fs for FailsPublish {
 struct FailsLink;
 
 impl Fs for FailsLink {
-    fn hard_link(&self, _original: &Path, _link: &Path) -> io::Result<()> {
+    fn hard_link(
+        &self,
+        _dir: &crate::dir::Dir,
+        _original: &std::ffi::OsStr,
+        _link: &std::ffi::OsStr,
+    ) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }

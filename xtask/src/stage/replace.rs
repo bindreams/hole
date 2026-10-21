@@ -40,7 +40,7 @@ mod windows_impl {
     const FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x40;
 
     // What a filesystem without POSIX rename answers: `ERROR_INVALID_PARAMETER` is measured on a
-    // 9P volume (`hole_util::versioned_file::sys`); `std` reads all three as "POSIX semantics
+    // 9P volume (`util::dir`); `std` reads all three as "POSIX semantics
     // unsupported" for the POSIX-semantics delete.
     const ERROR_INVALID_FUNCTION: i32 = 1;
     const ERROR_NOT_SUPPORTED: i32 = 50;

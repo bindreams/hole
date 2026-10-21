@@ -5,7 +5,6 @@
 //! disk, so each test can compare what is left with what was there.
 
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 
 use garter::test_utils::WaitableWriter;
@@ -21,7 +20,7 @@ const ORIGINAL: &[u8] = b"bytes nobody could read: hunter2";
 struct DeniedRead;
 
 impl Fs for DeniedRead {
-    fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+    fn read(&self, _dir: &crate::dir::Dir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }
@@ -30,11 +29,16 @@ impl Fs for DeniedRead {
 struct DeniedReadAndLink;
 
 impl Fs for DeniedReadAndLink {
-    fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+    fn read(&self, _dir: &crate::dir::Dir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 
-    fn hard_link(&self, _original: &Path, _link: &Path) -> io::Result<()> {
+    fn hard_link(
+        &self,
+        _dir: &crate::dir::Dir,
+        _original: &std::ffi::OsStr,
+        _link: &std::ffi::OsStr,
+    ) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }
