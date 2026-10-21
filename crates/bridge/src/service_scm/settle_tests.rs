@@ -285,7 +285,7 @@ fn only_a_stopped_look_terminates_what_is_held() {
         (Observed::Running, ExitWait::OnTheirOwn),
         (Observed::StartPending, ExitWait::OnTheirOwn),
         (Observed::StopPending, ExitWait::OnTheirOwn),
-        (Observed::Stopped, ExitWait::TerminateThenWait),
+        (Observed::Stopped, ExitWait::TerminateOrphansThenWait),
     ] {
         for fate in [ProcessFate::Unheld, ProcessFate::Alive, ProcessFate::Exited] {
             assert_eq!(look(observed, fate, true).exit_wait(), want, "{observed:?} {fate:?}");
@@ -305,7 +305,7 @@ fn the_loop_terminates_what_outlives_stopped_and_waits_out_a_service_that_is_sti
     };
     assert_eq!(
         after_stopped(vec![stopped_over_a_live_hold(), stopped(), stopped()]),
-        [ExitWait::TerminateThenWait]
+        [ExitWait::TerminateOrphansThenWait]
     );
     assert_eq!(
         after_stopped(vec![running(), stopped(), stopped()]),

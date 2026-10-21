@@ -270,9 +270,41 @@ pub trait ProcessSource {
     fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool>;
 }
 
-/// The processes held so far, each with the id it was opened under.
+/// How a held process came to be held: what the SCM did, or could have done,
+/// about its exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// The SCM named it as the service's process ([`ProcessHolds::hold_current`]),
+    /// so the SCM's Stop is on its way to it and its exit is the service's own.
+    Named,
+    /// Only a scan found it carrying the service's token: a plugin a crashed
+    /// bridge left, a cutover child left suspended. The SCM never named it, so
+    /// no Stop is on its way to it.
+    Scanned,
+}
+
+impl Origin {
+    /// Whether the SCM's Stop reaches a process held this way. The one place
+    /// that says which held processes may be terminated.
+    fn is_stopped_by_the_scm(self) -> bool {
+        match self {
+            Origin::Named => true,
+            Origin::Scanned => false,
+        }
+    }
+}
+
+/// A held process with the id it was opened under. The handle keeps the id
+/// from being reused, so the id names this process for as long as it is held.
+struct Held<P> {
+    pid: u32,
+    process: P,
+    origin: Origin,
+}
+
+/// The processes held so far.
 pub struct ProcessHolds<P> {
-    held: Vec<(u32, P)>,
+    held: Vec<Held<P>>,
     /// The processes the last scan found gone or exited at their probe, which
     /// the next scan does not call vanished again ([`scan`]).
     vanished: Vec<ListedProcess>,
@@ -290,12 +322,21 @@ impl<P> Default for ProcessHolds<P> {
 impl<P> ProcessHolds<P> {
     /// The held processes.
     pub fn processes(&self) -> impl Iterator<Item = &P> {
-        self.held.iter().map(|(_, process)| process)
+        self.held.iter().map(|held| &held.process)
     }
 
     /// The held processes with the ids they were opened under.
     pub fn held(&self) -> impl Iterator<Item = (u32, &P)> {
-        self.held.iter().map(|(pid, process)| (*pid, process))
+        self.held.iter().map(|held| (held.pid, &held.process))
+    }
+
+    /// The held processes the SCM never told to stop, with their ids: the
+    /// service's own process is not one, however long it outlives STOPPED.
+    pub fn orphans(&self) -> impl Iterator<Item = (u32, &P)> {
+        self.held
+            .iter()
+            .filter(|held| !held.origin.is_stopped_by_the_scm())
+            .map(|held| (held.pid, &held.process))
     }
 
     /// Read the service and hold the process it names.
@@ -335,7 +376,9 @@ impl<P> ProcessHolds<P> {
                     named: Named::Nothing,
                 });
             };
-            if self.held.iter().any(|(held, _)| *held == pid) {
+            if let Some(held) = self.held.iter_mut().find(|held| held.pid == pid) {
+                // Found by a scan before the SCM named it: it is the service's.
+                held.origin = Origin::Named;
                 return Ok(Hold {
                     reading,
                     named: Named::Held,
@@ -363,7 +406,11 @@ impl<P> ProcessHolds<P> {
             }
             let named = match candidate {
                 Some(process) => {
-                    self.held.push((pid, process));
+                    self.held.push(Held {
+                        pid,
+                        process,
+                        origin: Origin::Named,
+                    });
                     Named::Held
                 }
                 None => {
@@ -399,12 +446,12 @@ impl<P> ProcessHolds<P> {
         let Hold { reading, named } = self.hold_current(source)?;
         let fate = named.fate(reading.observed, || {
             let pid = reading.process_to_hold().expect("a held process was named");
-            let (_, process) = self
+            let held = self
                 .held
                 .iter()
-                .find(|(held, _)| *held == pid)
+                .find(|held| held.pid == pid)
                 .expect("a process reported as held is held");
-            source.has_exited(process)
+            source.has_exited(&held.process)
         })?;
         let held_alive = self.any_alive(|process| source.has_exited(process))?;
         Ok(Look {
@@ -418,19 +465,24 @@ impl<P> ProcessHolds<P> {
     /// Whether any held process has not exited, by `has_exited` on each: a
     /// state read of the handle, never a wait.
     pub fn any_alive(&self, mut has_exited: impl FnMut(&P) -> io::Result<bool>) -> io::Result<bool> {
-        for (_, process) in &self.held {
-            if !has_exited(process)? {
+        for held in &self.held {
+            if !has_exited(&held.process)? {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    /// Hold `process`, the process `pid`, unless it is held already; the
-    /// redundant handle is dropped.
+    /// Hold `process`, the process `pid` a scan found, unless it is held
+    /// already; the redundant handle is dropped, and a process the SCM named
+    /// stays the service's.
     pub fn adopt(&mut self, pid: u32, process: P) {
-        if self.held.iter().all(|(held, _)| *held != pid) {
-            self.held.push((pid, process));
+        if self.held.iter().all(|held| held.pid != pid) {
+            self.held.push(Held {
+                pid,
+                process,
+                origin: Origin::Scanned,
+            });
         }
     }
 

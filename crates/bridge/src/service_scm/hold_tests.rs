@@ -914,6 +914,55 @@ fn ever_held_outlasts_the_exit_of_everything_held() {
     assert!(!got.held_alive);
 }
 
+// Which held processes the SCM was never told to stop =================================================================
+
+fn orphan_pids(holds: &ProcessHolds<Handle>) -> Vec<u32> {
+    holds.orphans().map(|(pid, _)| pid).collect()
+}
+
+/// The service's own process, named while the SCM still said RUNNING, is told
+/// to stop by the SCM and waited on whatever happens after; a process only a
+/// scan found is nobody's to stop.
+#[skuld::test]
+fn only_a_process_a_scan_found_is_an_orphan() {
+    let log = Log::default();
+    let mut source = Script::new(&log, steady(Observed::Running, 100));
+    let mut holds = ProcessHolds::default();
+    holds.look(&mut source).unwrap();
+    holds.adopt(300, process(&log, 300));
+    assert_eq!(held_pids(&holds), vec![100, 300]);
+    assert_eq!(orphan_pids(&holds), vec![300]);
+}
+
+/// The SCM naming a process a scan found first makes it the service's own.
+#[skuld::test]
+fn a_scanned_process_the_scm_names_later_is_not_an_orphan() {
+    let log = Log::default();
+    let mut source = Script::new(&log, steady(Observed::Running, 100));
+    let mut holds = ProcessHolds::default();
+    holds.adopt(100, process(&log, 100));
+    holds.adopt(300, process(&log, 300));
+    assert_eq!(orphan_pids(&holds), vec![100, 300]);
+    holds.look(&mut source).unwrap();
+    assert_eq!(
+        held_pids(&holds),
+        vec![100, 300],
+        "the named process is the one already held"
+    );
+    assert_eq!(orphan_pids(&holds), vec![300]);
+}
+
+/// A scan that finds the process the SCM named does not demote it.
+#[skuld::test]
+fn a_named_process_a_scan_finds_again_stays_the_services() {
+    let log = Log::default();
+    let mut source = Script::new(&log, steady(Observed::Running, 100));
+    let mut holds = ProcessHolds::default();
+    holds.look(&mut source).unwrap();
+    holds.adopt(100, process(&log, 100));
+    assert!(orphan_pids(&holds).is_empty());
+}
+
 // Whether anything held is still alive ================================================================================
 
 #[skuld::test]

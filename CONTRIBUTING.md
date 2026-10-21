@@ -1991,16 +1991,21 @@ state read before its act loses that race, so four rules close it:
   owner's ruling: no hang of that kind is on record, so no bound is built, and
   the trail a hang leaves is the `stop wait:` and `held = N` lines the wait logs
   (bridge.log for the service, `gui-cli.log` for the CLI) beside the SCM's own
-  checkpoints. A wait later seen to hang is fixed at its cause. The one
-  exception is a wait the SCM's Stop cannot reach: once the SCM reports STOPPED
-  (`ExitWait::TerminateThenWait`, chosen from the look alone), or the entry is
-  gone, every held process, proven the service's by its token, is terminated
-  (`TerminateProcess`, with `SeDebugPrivilege` enabled first, which an
-  elevated administrator holds disabled) and then waited on. A plugin left by a
-  crashed bridge, or a cutover child left suspended, is told nothing by the SCM
-  and would hold the machine-wide lock for ever; the service is Disabled, so
-  nothing starts another. A process that outlives its own STOPPED is terminated
-  too. While the service is not STOPPED, the wait is for the process's own exit.
+  checkpoints. A wait later seen to hang is fixed at its cause. That holds for
+  the service's own process, the one the SCM named and told to stop, even when
+  it outlives its STOPPED: it is waited on, with no bound. The one exception is
+  a process the SCM's Stop cannot reach, because the SCM never named it: once
+  the SCM reports STOPPED (`ExitWait::TerminateOrphansThenWait`, chosen from the
+  look alone), or the entry is gone, every held process that only a scan found
+  carrying the service's token, and not the process the SCM named, is terminated
+  (`TerminateProcess`, with `SeDebugPrivilege` enabled first, which an elevated
+  administrator holds disabled) and then waited on. A plugin left by a crashed
+  bridge, or a cutover child left suspended, is told nothing by the SCM and
+  would hold the machine-wide lock for ever; the service is Disabled, so
+  nothing starts another. A scan that finds the process the SCM named does not
+  make it an orphan, and the SCM naming a process a scan found first makes it
+  the service's. While the service is not STOPPED, the wait is for the
+  process's own exit.
 - **A process id the SCM names is a claim; the service SID in the token is the
   identity.** Microsoft documents that the id
   ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks))

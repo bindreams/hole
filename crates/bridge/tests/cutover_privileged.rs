@@ -2332,9 +2332,9 @@ enum StoppedBy {
     TheRetirement,
     /// The test, before the stop wait begins: the first look is already
     /// STOPPED, which names no process, so only the scan for the service's
-    /// token can find the one that is left. A process found only so, after
-    /// STOPPED, is terminated rather than waited out
-    /// (`ExitWait::TerminateThenWait`); the test's release then finds it gone.
+    /// token can find the one that is left. The SCM never named it to this
+    /// retirement, so it is an orphan: terminated rather than waited out
+    /// (`ExitWait::TerminateOrphansThenWait`); the test's release then finds it gone.
     TheTest,
 }
 

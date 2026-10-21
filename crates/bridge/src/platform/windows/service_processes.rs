@@ -261,12 +261,14 @@ impl ServiceProcesses {
         self.holds.processes().count()
     }
 
-    /// Terminates every held process that has not exited. Each is proven the
-    /// service's by its token, and the held handle keeps its id from being
-    /// reused, so the id names the same process at the second open.
+    /// Terminates every held orphan that has not exited: a process only a scan
+    /// found, which the SCM never told to stop. The service's own process is
+    /// not one. Each is proven the service's by its token, and the held handle
+    /// keeps its id from being reused, so the id names the same process at the
+    /// second open.
     fn terminate_live(&self) -> io::Result<()> {
         let mut debug_enabled = false;
-        for (pid, process) in self.holds.held() {
+        for (pid, process) in self.holds.orphans() {
             if has_exited(process)? {
                 continue;
             }
@@ -274,19 +276,20 @@ impl ServiceProcesses {
                 enable_debug_privilege();
                 debug_enabled = true;
             }
-            info!(pid, "terminating a process of the stopped service");
+            info!(pid, "terminating a process of the service the SCM never told to stop");
             terminate(pid, process)?;
         }
         Ok(())
     }
 
     /// Blocks until every held process has exited. An external event with no
-    /// bound of its own to choose: the exit of a process the SCM has been told
-    /// to stop, or one [`terminate_live`](Self::terminate_live) just ended.
+    /// bound of its own to choose: the exit of the service's own process, which
+    /// the SCM has told to stop, or of an orphan
+    /// [`terminate_live`](Self::terminate_live) just ended.
     pub(super) fn await_exits(&self, wait: ExitWait) -> io::Result<()> {
         match wait {
             ExitWait::OnTheirOwn => {}
-            ExitWait::TerminateThenWait => self.terminate_live()?,
+            ExitWait::TerminateOrphansThenWait => self.terminate_live()?,
         }
         for process in self.holds.processes() {
             let handle = HANDLE(process.as_raw_handle());

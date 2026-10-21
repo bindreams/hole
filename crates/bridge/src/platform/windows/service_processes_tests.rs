@@ -1,7 +1,10 @@
 use std::io;
-use std::os::windows::io::{FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
+};
 
 use super::{
     has_exited, open_process, opened_from_token_read, scan_service_processes, ExitWait, HostProcesses,
@@ -9,9 +12,9 @@ use super::{
 };
 use crate::disable_record::Stamp;
 use crate::service_scm::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
-use crate::service_scm::hold::{Basis, Opened};
+use crate::service_scm::hold::{Basis, Opened, ProcessSource, Reading};
 use crate::service_scm::scan::{ListedProcess, ProcessEnumerator};
-use crate::service_scm::ReportedPid;
+use crate::service_scm::{Observed, ReportedPid};
 use crate::test_support::reap_child::EchoChild;
 
 const VALID: Basis = Basis::Named(ReportedPid::Valid);
@@ -199,11 +202,11 @@ fn an_id_held_by_a_process_with_another_creation_time_is_no_process() {
     }
 }
 
-/// A held process the SCM never told to stop does not exit on its own: the
-/// terminating wait ends it, where a wait on its own exit would never return.
+/// A held process only a scan found does not exit on its own: the terminating
+/// wait ends it, where a wait on its own exit would never return.
 /// The child parks until its control socket closes, which this test keeps open.
 #[skuld::test]
-fn the_terminating_wait_ends_a_held_process_that_would_not_exit() {
+fn the_terminating_wait_ends_an_orphan_that_would_not_exit() {
     let child = EchoChild::spawn();
     // SAFETY: plain FFI call.
     let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, child.pid()) }.expect("open the child");
@@ -217,10 +220,71 @@ fn the_terminating_wait_ends_a_held_process_that_would_not_exit() {
     );
 
     processes
-        .await_exits(ExitWait::TerminateThenWait)
+        .await_exits(ExitWait::TerminateOrphansThenWait)
         .expect("terminate and wait");
     assert!(
         !processes.holds.any_alive(has_exited).expect("state read"),
         "a held process is still alive after the terminating wait"
     );
+}
+
+/// A source for which the SCM names `child` as the running service's process.
+struct NamesChild(u32);
+
+impl ProcessSource for NamesChild {
+    type Process = OwnedHandle;
+
+    fn read(&mut self) -> io::Result<Reading> {
+        Ok(Reading {
+            observed: Observed::Running,
+            pid: self.0,
+        })
+    }
+
+    fn open(&mut self, pid: u32, _: Basis) -> io::Result<Opened<OwnedHandle>> {
+        Ok(Opened::Service(open_for_waiting(pid)))
+    }
+
+    fn has_exited(&mut self, process: &OwnedHandle) -> io::Result<bool> {
+        has_exited(process)
+    }
+}
+
+fn open_for_waiting(pid: u32) -> OwnedHandle {
+    // SAFETY: plain FFI call.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.expect("open the child");
+    // SAFETY: `OpenProcess` returned a new handle this value now owns.
+    unsafe { OwnedHandle::from_raw_handle(handle.0) }
+}
+
+/// The service's own process, named by the SCM, outlives STOPPED: the terminating
+/// wait waits on it and ends only the orphan a scan found beside it. The service
+/// is held first and the orphan second, and the terminating wait walks them in
+/// that order, so the orphan's exit shows the walk is past the service's
+/// process. The service's process is then released: it exits by itself with
+/// status 0, and a terminate would have left another status.
+#[skuld::test]
+fn the_terminating_wait_waits_on_the_services_own_process_and_ends_only_the_orphan() {
+    let mut service = EchoChild::spawn();
+    let mut orphan = EchoChild::spawn();
+    let mut processes = ServiceProcesses::default();
+    processes
+        .look(&mut NamesChild(service.pid()))
+        .expect("hold the named process");
+    processes.holds.adopt(orphan.pid(), open_for_waiting(orphan.pid()));
+    assert_eq!(processes.held(), 2);
+    let orphan_exit = open_for_waiting(orphan.pid());
+
+    let waiting = std::thread::spawn(move || processes.await_exits(ExitWait::TerminateOrphansThenWait));
+    // SAFETY: `orphan_exit` is the live handle this test owns.
+    let waited = unsafe { WaitForSingleObject(HANDLE(orphan_exit.as_raw_handle()), INFINITE) };
+    assert_eq!(waited, WAIT_OBJECT_0, "the orphan is ended by the terminating wait");
+
+    let status = service.release_and_wait();
+    assert!(status.success(), "the service's own process was terminated: {status:?}");
+    waiting
+        .join()
+        .expect("the wait did not panic")
+        .expect("the wait ends once both are gone");
+    orphan.release_and_wait();
 }

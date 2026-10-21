@@ -142,13 +142,13 @@ pub enum ExitWait {
     /// The processes exit on their own: the SCM's Stop is on its way to them,
     /// or the service is still going down.
     OnTheirOwn,
-    /// The SCM reports STOPPED, so nothing of the service is owed a graceful
-    /// exit: whatever carries its SID is terminated, then waited on. A process
-    /// the SCM never told to stop (a plugin left by a crashed bridge, a
-    /// cutover child left suspended) would otherwise be waited on for ever
-    /// while the machine-wide lock is held. The service is Disabled, so
-    /// nothing starts another.
-    TerminateThenWait,
+    /// The SCM reports STOPPED. A held process the SCM never told to stop (a
+    /// plugin left by a crashed bridge, a cutover child left suspended) is
+    /// terminated, or it would be waited on for ever while the machine-wide
+    /// lock is held; the service is Disabled, so nothing starts another. The
+    /// service's own process, which the SCM did tell to stop, is waited on with
+    /// no bound, as before STOPPED. Then every held process is waited on.
+    TerminateOrphansThenWait,
 }
 
 impl Look {
@@ -159,7 +159,7 @@ impl Look {
             Observed::Running => ExitWait::OnTheirOwn,
             Observed::StartPending => ExitWait::OnTheirOwn,
             Observed::StopPending => ExitWait::OnTheirOwn,
-            Observed::Stopped => ExitWait::TerminateThenWait,
+            Observed::Stopped => ExitWait::TerminateOrphansThenWait,
         }
     }
 }

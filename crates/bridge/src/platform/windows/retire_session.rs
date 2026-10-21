@@ -129,7 +129,7 @@ impl Survivors for GoneSession {
             held = self.processes.held(),
             "waiting for the processes of a removed service entry to exit"
         );
-        self.processes.await_exits(ExitWait::TerminateThenWait)
+        self.processes.await_exits(ExitWait::TerminateOrphansThenWait)
     }
 }
 
