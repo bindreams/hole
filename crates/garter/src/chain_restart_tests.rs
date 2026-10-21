@@ -390,6 +390,9 @@ async fn a_conflict_reported_for_another_address_is_still_retried() {
 /// The production intermediate hop is a `TapPlugin` around the real plugin, and one `TapPlugin` value runs again after
 /// its inner reported a conflict. The inner's conflict must reach the chain as the tap's own, and the second run must
 /// start from scratch.
+///
+/// The tap binds a port the chain's OS probe picked, so another process taking it is one more restart of the tap, and
+/// the inner runs once more. The assertions hold whatever the number of those.
 #[skuld::test]
 async fn a_tap_hop_whose_inner_loses_its_port_is_restarted_and_runs_again() {
     let rig = Rig::new();
@@ -401,20 +404,28 @@ async fn a_tap_hop_whose_inner_loses_its_port_is_restarted_and_runs_again() {
     let told = launched.ready.await.expect("a verdict");
     let ready = told.expect("the chain readies once the tap's inner finds a port");
 
+    let trace = rig.trace();
     assert_eq!(
-        rig.trace(),
-        [
-            Event::Entered("B"),
-            Event::Conflicted("B"),
-            Event::Entered("B"),
-            Event::ReadySent("B"),
-            Event::Entered("A"),
-            Event::ReadySent("A"),
-        ],
-        "the inner ran twice, and A started only after the tap's second run readied"
+        trace[..2],
+        [Event::Entered("B"), Event::Conflicted("B")],
+        "the inner's conflict is the first thing that happens: {trace:?}"
+    );
+    let a_starts = trace.iter().position(|e| *e == Event::Entered("A")).expect("A started");
+    assert_eq!(
+        trace[a_starts..],
+        [Event::Entered("A"), Event::ReadySent("A")],
+        "nothing runs after A readies: {trace:?}"
+    );
+    assert_eq!(
+        trace[a_starts - 1],
+        Event::ReadySent("B"),
+        "A started only after the tap's last run readied: {trace:?}"
     );
     let inner = rig.wiring("B");
-    assert_eq!(inner.len(), 2, "the tap's inner ran once per run of the tap");
+    assert!(
+        inner.len() >= 2,
+        "the same tap value ran its inner again after the conflict: {inner:?}"
+    );
     assert!(
         inner.iter().all(|&(_, remote)| remote == addr(SS_REMOTE)),
         "the inner forwards to the destination on every run: {inner:?}"
@@ -429,7 +440,7 @@ async fn a_tap_hop_whose_inner_loses_its_port_is_restarted_and_runs_again() {
     assert_eq!(ready.listen, addr(SS_LOCAL), "A is the public hop");
     tokio::net::TcpStream::connect(tap_listens)
         .await
-        .expect("the tap's second run is listening where A forwards");
+        .expect("the tap's last run is listening where A forwards");
 
     launched.cancel.cancel();
     launched.handle.await.unwrap().expect("a stop is a clean end");
