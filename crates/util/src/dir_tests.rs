@@ -561,6 +561,26 @@ fn read_state_file_refuses_a_fifo_at_the_name_and_does_not_block() {
     assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular));
 }
 
+// A test cannot make a file the system owns without being the system, so each case below is stated for any runner: the
+// files a test makes belong to whoever runs it, and the system's are refused a second name.
+
+#[skuld::test]
+fn read_state_file_reads_a_second_name_for_a_file_unless_the_runner_is_the_system() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("victim"), b"theirs").unwrap();
+    std::fs::hard_link(tmp.path().join("victim"), tmp.path().join("bridge-x.json")).unwrap();
+
+    let read = read_state_file(tmp.path(), &name("bridge-x.json"));
+
+    match super::testing::runner_is_the_system() {
+        true => {
+            let err = read.expect_err("the system never made a file with two names");
+            assert_eq!(Refusal::from_error(&err), Some(&Refusal::ForeignFile), "{err:?}");
+        }
+        false => assert_eq!(read.unwrap(), b"theirs"),
+    }
+}
+
 // open_file: CreateAppend and Append ----------------------------------------------------------------------------------
 
 const LOG: &str = "log";

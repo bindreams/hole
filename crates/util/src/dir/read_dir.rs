@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use super::{platform, read_whole, single_component, EntryKind};
+use super::{platform, read_whole, read_whole_vouched, single_component, EntryKind};
 
 /// An open directory with no way to write in it: it has no method that adds, replaces, renames or removes a name, so
 /// code that only reads cannot do more, on any platform. Opened by [`ReadDir::open`] or taken from a [`super::Dir`]
@@ -32,7 +32,7 @@ impl ReadDir {
     }
 
     /// The handle, for a test to ask the OS what it was opened with.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(super) fn file(&self) -> &File {
         &self.file
     }
@@ -42,6 +42,13 @@ impl ReadDir {
     /// is not a regular file ([`super::Refusal::NotRegular`], and a FIFO is never waited for).
     pub fn read(&self, name: &OsStr) -> io::Result<Vec<u8>> {
         read_whole(&self.file, name)
+    }
+
+    /// [`ReadDir::read`] for a privileged reader of a file the system publishes by rename: refused with
+    /// [`super::Refusal::ForeignFile`] unless the folder's owner can vouch for the file (see
+    /// [`super::read_state_file`]). Not for a file that has a second name by design.
+    pub(super) fn read_vouched(&self, name: &OsStr) -> io::Result<Vec<u8>> {
+        read_whole_vouched(&self.file, name)
     }
 
     /// What `name` is right now, or `None` if there is nothing. A symlink is itself, not what it points at.

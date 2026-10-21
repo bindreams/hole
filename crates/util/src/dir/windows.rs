@@ -642,6 +642,13 @@ fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::R
     Ok(file)
 }
 
+/// Whether the folder's owner can vouch for `file`, a file read from `dir`: see [`super::trail::may_read`].
+pub(super) fn is_vouched_for(dir: &File, file: &File) -> io::Result<bool> {
+    super::trail::may_read(&owner_of(file)?, u64::from(info(file)?.nNumberOfLinks), || {
+        owner_of(dir)
+    })
+}
+
 /// Whether a file found at a log's name is one a privileged writer may append to: one with no other name, as the
 /// system makes it. Windows has no unix ids to compare, and a second name is what a hard link a user planted adds.
 pub(super) fn is_own_file(file: &File, _owner: Option<(u32, u32)>) -> io::Result<bool> {

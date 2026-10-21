@@ -104,6 +104,9 @@ pub enum Refusal {
     ForeignOwner { uid: u32 },
     /// A file that is read where it is not a regular file (a FIFO, a device).
     NotRegular,
+    /// A file that is read where the folder's owner cannot vouch for it: another user's, or a second name of a file
+    /// the system owns (a hard link a user planted).
+    ForeignFile,
 }
 
 impl Refusal {
@@ -125,6 +128,7 @@ impl fmt::Display for Refusal {
             #[cfg(unix)]
             Refusal::ForeignOwner { uid } => write!(f, "the directory is owned by uid {uid}"),
             Refusal::NotRegular => f.write_str("the file is not a regular file"),
+            Refusal::ForeignFile => f.write_str("the file is not one the folder's owner can vouch for"),
         }
     }
 }
@@ -460,19 +464,36 @@ pub fn write_state_file(state_dir: &Path, name: &OsStr, bytes: &[u8], owner: Opt
 }
 
 /// The whole file `name` in the state directory `state_dir`, the counterpart of [`write_state_file`] for a reader
-/// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`ReadDir::open`], and
-/// the name is read by [`ReadDir::read`]: a link at the name, or a FIFO a user planted there, is an error, never the
-/// file it leads to and never a wait.
+/// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`ReadDir::open`]: a
+/// link at the name, or a FIFO a user planted there, is an error, never the file it leads to and never a wait. So is a
+/// file the folder's owner cannot vouch for ([`Refusal::ForeignFile`]): one owned by the folder's own user is read, and
+/// so is one the system owns that has no second name, but a hard link planted at the name to any other file is not.
+/// The files this reads are published by rename, so none has a second name of its own making.
 pub fn read_state_file(state_dir: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
-    ReadDir::open(state_dir)?.read(name)
+    ReadDir::open(state_dir)?.read_vouched(name)
 }
 
 /// The whole file `name` in the directory `dir`, through a handle that shares delete, so a replace of the file does
 /// not wait for the read. A symlink at the name is an error, not followed.
 fn read_whole(dir: &File, name: &OsStr) -> io::Result<Vec<u8>> {
     single_component(name)?;
+    read_to_end(platform::open_file(dir, name, OpenFile::Read)?)
+}
+
+/// [`read_whole`] for a file the folder's owner must vouch for ([`trail::may_read`]): refused with
+/// [`Refusal::ForeignFile`] before a byte is read.
+fn read_whole_vouched(dir: &File, name: &OsStr) -> io::Result<Vec<u8>> {
+    single_component(name)?;
+    let file = platform::open_file(dir, name, OpenFile::Read)?;
+    if !platform::is_vouched_for(dir, &file)? {
+        return Err(Refusal::ForeignFile.into_io_error());
+    }
+    read_to_end(file)
+}
+
+fn read_to_end(mut file: File) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    platform::open_file(dir, name, OpenFile::Read)?.read_to_end(&mut bytes)?;
+    file.read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 

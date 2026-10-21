@@ -229,6 +229,14 @@ fn no_state_reader_reads_through_a_symlink_planted_at_its_name() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+#[skuld::test]
+fn no_state_reader_reads_a_hard_link_the_system_would_not_have_made() {
+    // Refused when the runner is the system (a planted second name of a file it owns), read when it is a user.
+    let failures = readers_that_read_a_planted_name(PlantedName::HardLink);
+
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 #[cfg(unix)]
 #[skuld::test]
 fn no_state_reader_waits_on_a_fifo_planted_at_its_name() {

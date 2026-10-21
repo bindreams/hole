@@ -63,6 +63,10 @@ pub enum PlantedName {
     /// A FIFO nobody writes to: a read of it by name waits for a writer that never comes.
     #[cfg(unix)]
     Fifo,
+    /// A second name for a valid file elsewhere (a hard link). The file belongs to whoever runs the test, so this
+    /// name is refused when the runner is the system ([`runner_is_the_system`]: a user cannot make a file the system
+    /// owns with one name, and the planted one has two), and is the runner's own file, read, when it is a user.
+    HardLink,
 }
 
 /// One privileged reader of the file `file` in a state directory, for [`planted_name_is_not_read`].
@@ -75,9 +79,16 @@ pub struct Reader<'a> {
     pub reads_it: &'a dyn Fn(&Path) -> bool,
 }
 
+/// Whether the files a test makes belong to the system (root, or an elevated token on Windows) and not to a user.
+pub fn runner_is_the_system() -> bool {
+    platform::runner_is_the_system()
+}
+
 /// Plants `kind` at the reader's file in a fresh state directory below `scratch` (an empty folder the test owns), then
 /// reads it. `Err` if the reader reported the valid file the name leads to (it read through a link), or if the
 /// control read of a real valid file did not report it. A reader that opens a FIFO by name waits here forever.
+/// [`PlantedName::HardLink`] is the exception: it is read when the runner is a user (see there), so for a user the
+/// reader must report it, and `Err` is the reader not doing so.
 pub fn planted_name_is_not_read(scratch: &Path, kind: PlantedName, reader: &Reader) -> Result<(), String> {
     let real = scratch.join("real");
     let state = scratch.join("state");
@@ -92,14 +103,20 @@ pub fn planted_name_is_not_read(scratch: &Path, kind: PlantedName, reader: &Read
         PlantedName::SymlinkToFile => platform::file_link(&real.join(reader.file), &at),
         #[cfg(unix)]
         PlantedName::Fifo => platform::fifo(&at),
+        PlantedName::HardLink => std::fs::hard_link(real.join(reader.file), &at).map_err(|err| err.to_string())?,
     }
-    if (reader.reads_it)(&state) {
-        return Err(format!(
+    let expected = !(matches!(kind, PlantedName::HardLink) && !runner_is_the_system());
+    match ((reader.reads_it)(&state), expected) {
+        (true, true) => Err(format!(
             "{kind:?} planted at {}: the reader read through it",
             reader.file
-        ));
+        )),
+        (false, false) => Err(format!(
+            "{kind:?} planted at {}: the reader did not read the runner's own file",
+            reader.file
+        )),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// A name nothing in a folder the system owns has, removed again when dropped: the place to look for what a
@@ -168,6 +185,11 @@ mod platform {
         std::os::unix::fs::symlink(target, link).unwrap();
     }
 
+    pub(super) fn runner_is_the_system() -> bool {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
     pub(super) fn file_link(target: &Path, link: &Path) {
         std::os::unix::fs::symlink(target, link).unwrap();
     }
@@ -214,6 +236,16 @@ mod platform {
             .expect("enable the restore privilege (a token without it cannot give a file to another owner)");
         super::super::windows::set_owner(&file, &USERS)
             .unwrap_or_else(|err| panic!("give {path:?} to the Users group: {err}"));
+    }
+
+    /// Whether the files this process makes belong to the system: an elevated token's belong to Administrators.
+    pub(super) fn runner_is_the_system() -> bool {
+        let path = std::env::temp_dir().join(format!("hole-dir-owner-probe-{}", std::process::id()));
+        let probe = std::fs::File::create(&path).expect("a file to read the owner of");
+        let system = matches!(super::super::windows::owner_of(&probe).unwrap(), Owner::Privileged);
+        drop(probe);
+        std::fs::remove_file(&path).expect("remove the probe");
+        system
     }
 
     pub(super) fn icacls(dir: &Path, args: &[&str]) {

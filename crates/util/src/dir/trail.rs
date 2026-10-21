@@ -43,6 +43,22 @@ impl<Id: PartialEq> Owner<Id> {
     }
 }
 
+/// Whether a file `file` owns, with `links` names, in a folder `dir` reads the owner of, may be read by a privileged
+/// reader: one the folder's own user owns (their own file, whatever links it has), or one the system owns that has no
+/// second name. A user cannot make a file the system owns with one name, and a hard link they plant at a name to
+/// another user's file or to one the system owns is neither. The folder's owner is read only when the file is a
+/// user's.
+pub(super) fn may_read<Id: PartialEq>(
+    file: &Owner<Id>,
+    links: u64,
+    dir: impl FnOnce() -> io::Result<Owner<Id>>,
+) -> io::Result<bool> {
+    match file {
+        Owner::Privileged => Ok(links == 1),
+        Owner::User(owner) => Ok(matches!(dir()?, Owner::User(dir_owner) if &dir_owner == owner)),
+    }
+}
+
 /// What a walk has followed so far.
 pub(super) struct Trail<Id> {
     /// The unprivileged owner of a link the walk followed, if any.
