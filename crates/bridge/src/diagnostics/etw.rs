@@ -26,7 +26,7 @@
 //!    a. Sweeps any stale `hole-bridge-etw-*` sessions left by a crashed
 //!    prior bridge instance ([`sweep_stale_sessions`] via the Win32
 //!    `QueryAllTracesW` + `ControlTraceW` APIs).
-//!    b. Builds three [`ferrisetw::Provider`]s with all keywords
+//!    b. Builds three `ferrisetw::Provider`s with all keywords
 //!    enabled. High-volume firehose events are filtered in userspace
 //!    via [`HIGH_VOLUME_TCPIP_EVENTS`] rather than at the kernel
 //!    level — events 1004, 1077, and the rest of the SendPath family
@@ -102,7 +102,7 @@
 //! the callback queue when the handle closes are lost. We work around
 //! this with the split-lifecycle API:
 //!
-//! - [`ferrisetw::UserTrace::start`] returns `(trace, handle)` without
+//! - `ferrisetw::UserTrace::start` returns `(trace, handle)` without
 //!   spawning a processing thread.
 //! - We spawn that thread ourselves and store its `JoinHandle` in
 //!   [`EtwGuard`].
@@ -544,7 +544,7 @@ fn start_consumer_named(
 /// `start_consumer_named`'s own thread-spawn failure arm — the `drop(trace)`
 /// ordering plus [`abandon_session_on_thread_spawn_failure`] below — at the
 /// real call site, rather than calling `abandon_session_on_thread_spawn_failure`
-/// directly (see [`thread_spawn_failure_stops_the_orphaned_session`]'s doc
+/// directly (see `thread_spawn_failure_stops_the_orphaned_session`'s doc
 /// comment for why that alone doesn't pin this call site).
 fn start_consumer_named_with_spawn(
     session_name: String,
@@ -679,7 +679,7 @@ fn start_consumer_named_with_spawn(
 }
 
 /// Last-observed value of each cumulative loss counter
-/// [`EVENT_TRACE_PROPERTIES`] reports, so a caller ticking
+/// `EVENT_TRACE_PROPERTIES` reports, so a caller ticking
 /// [`query_session_stats`] repeatedly can escalate only on a genuine
 /// change instead of re-warning forever once a counter goes nonzero.
 /// `buffers_written` is deliberately excluded — it's a throughput count,

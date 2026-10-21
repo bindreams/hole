@@ -583,6 +583,8 @@ fn production_build_yaml_parses() {
         // runnables. Removing any of these would silently strip a CI gate.
         "clippy-hole",
         "clippy-ex-galoshes",
+        "doc-hole",
+        "doc-ex-galoshes",
         "prek",
         "frontend-check",
     ] {

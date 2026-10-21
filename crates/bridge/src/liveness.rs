@@ -12,7 +12,7 @@
 //! the IPC socket bind, which fails first), or `unlock` observes the lock
 //! held and refuses outright, with no window where neither is true.
 //!
-//! Unlike [`crate::target::TargetExclusive`], this lock is not a leaf lock —
+//! Unlike `crate::target::TargetExclusive`, this lock is not a leaf lock —
 //! it is meant to be held for a whole process's lifetime, across other
 //! locks (`target::apply`'s own, taken and released inside that span) and
 //! across `.await` points, so it carries no `!Send` marker.

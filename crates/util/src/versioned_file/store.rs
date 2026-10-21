@@ -11,7 +11,9 @@ use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
 /// without touching the rest. Every method defaults to the real call.
-pub(crate) trait Fs: Send + Sync {
+///
+/// Reachable outside this crate only with the `test-support` feature.
+pub trait Fs: Send + Sync {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
@@ -223,8 +225,9 @@ impl<S: VersionedState> VersionedFile<S> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_fs(dir: &Path, fs: Arc<dyn Fs>) -> Self {
+    /// A file whose reads, links and publishes go through `fs`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_fs(dir: &Path, fs: Arc<dyn Fs>) -> Self {
         Self { fs, ..Self::new(dir) }
     }
 
