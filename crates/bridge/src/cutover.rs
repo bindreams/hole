@@ -11,14 +11,6 @@ pub mod extract;
 pub mod os;
 
 #[cfg(any(target_os = "windows", test))]
-mod registration;
-
-// The state machine and its policy are pure, so their tests run on any host;
-// only the `ScmActor` that drives the real SCM is Windows-only.
-#[cfg(any(target_os = "windows", test))]
-pub mod scm_wait;
-
-#[cfg(any(target_os = "windows", test))]
 mod windows_profiles;
 
 use std::path::{Path, PathBuf};

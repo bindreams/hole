@@ -5,7 +5,7 @@
 //! the service through it, so a service process that outlives STOPPED is
 //! waited out on both, by the scan for the service's token.
 //!
-//! [`settle_stopped`]: crate::cutover::scm_wait::settle::settle_stopped
+//! [`settle_stopped`]: crate::service_scm::settle::settle_stopped
 
 use std::io;
 use std::mem::MaybeUninit;
@@ -19,11 +19,11 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use super::service_processes::{has_exited, open_process, ServiceProcesses};
 use super::service_sid::ServiceSid;
 use super::{scm_failure, SERVICE_NAME};
-use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessSource, Reading};
-use crate::cutover::scm_wait::scan::ScanFinding;
-use crate::cutover::scm_wait::settle::{ExitWait, StopActor};
-use crate::cutover::scm_wait::{observed_from_state, Observed, SystemScmActor};
+use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
+use crate::service_scm::hold::{Basis, Look, Opened, ProcessSource, Reading};
+use crate::service_scm::scan::ScanFinding;
+use crate::service_scm::settle::{ExitWait, StopActor};
+use crate::service_scm::{observed_from_state, Observed, SystemScmActor};
 
 /// The rights the session's handle is opened with: exactly those its calls
 /// need.
@@ -106,7 +106,7 @@ impl StopActor for StopSession {
     }
 }
 
-/// The service as [`ProcessHolds`](crate::cutover::scm_wait::hold::ProcessHolds)
+/// The service as [`ProcessHolds`](crate::service_scm::hold::ProcessHolds)
 /// reads it: one query for the state and the process id, and an open by id
 /// that keeps a process only if its token carries the service SID.
 struct ServiceProbe<'a> {

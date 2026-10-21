@@ -4,7 +4,7 @@
 //! The GUI's status read never takes the lock, so it reads the start type and
 //! the record as separate reads, and a change that begins or ends between them
 //! would be read half done. The reader reads the mark before and after and
-//! goes again if it moved ([`crate::cutover::scm_wait::repair::display`]).
+//! goes again if it moved ([`crate::service_scm::repair::display`]).
 //!
 //! The value is `<n>` while no change runs and `<n>:<pid>:<created>` while a
 //! holder changes the service, `n` counting every transition and the rest

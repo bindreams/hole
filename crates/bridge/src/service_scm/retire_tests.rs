@@ -2,12 +2,12 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use super::*;
-use crate::cutover::scm_wait::call_error::{ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{Look, ProcessFate};
-use crate::cutover::scm_wait::scan::ScanFinding;
-use crate::cutover::scm_wait::settle::ExitWait;
-use crate::cutover::scm_wait::Observed;
 use crate::disable_record::RecordState;
+use crate::service_scm::call_error::{ScmCall, ScmCallError};
+use crate::service_scm::hold::{Look, ProcessFate};
+use crate::service_scm::scan::ScanFinding;
+use crate::service_scm::settle::ExitWait;
+use crate::service_scm::Observed;
 
 /// A look at a service whose process is held and alive.
 fn running() -> Look {
@@ -1252,7 +1252,7 @@ fn restoring_a_service_found_marked_for_deletion_changes_nothing() {
 
 // The survivors wait on a model host ==================================================================================
 
-use crate::cutover::scm_wait::world_tests::{Act, StoppedService, When, World};
+use crate::service_scm::world_tests::{Act, StoppedService, When, World};
 
 /// The removed-service wait over the processes the model host runs.
 struct ModelSurvivors(StoppedService);

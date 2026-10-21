@@ -14,7 +14,7 @@ use windows::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_HANDLE, SC_MANAGER_CONNECT,
 };
 
-use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
+use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 
 fn failed(call: ScmCall, e: windows::core::Error) -> io::Error {
     ScmCallError {

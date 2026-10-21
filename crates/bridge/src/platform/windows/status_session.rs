@@ -12,9 +12,9 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use super::repair_session::READ_ACCESS;
 use super::retire_session::read_start_type;
 use super::{open_error_is_absent, scm_failure, SERVICE_NAME};
-use crate::cutover::scm_wait::call_error::ScmCall;
-use crate::cutover::scm_wait::retire::StartRead;
 use crate::disable_record::{ChangeKey, ChangeMark, Changer, RecordKey};
+use crate::service_scm::call_error::ScmCall;
+use crate::service_scm::retire::StartRead;
 use crate::service_start::StartType;
 
 /// An open `HoleBridge` service and the key its record and change mark live in,

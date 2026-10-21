@@ -7,11 +7,11 @@ use super::{
     has_exited, open_process, opened_from_token_read, scan_service_processes, ExitWait, HostProcesses,
     ServiceProcesses, ServiceSid,
 };
-use crate::cutover::scm_wait::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{Basis, Opened};
-use crate::cutover::scm_wait::scan::{ListedProcess, ProcessEnumerator};
-use crate::cutover::scm_wait::ReportedPid;
 use crate::disable_record::Stamp;
+use crate::service_scm::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
+use crate::service_scm::hold::{Basis, Opened};
+use crate::service_scm::scan::{ListedProcess, ProcessEnumerator};
+use crate::service_scm::ReportedPid;
 use crate::test_support::reap_child::EchoChild;
 
 const VALID: Basis = Basis::Named(ReportedPid::Valid);

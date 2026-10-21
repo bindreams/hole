@@ -72,7 +72,7 @@ use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 #[cfg(target_os = "windows")]
 use hole_bridge::cutover::os::CutoverOs;
 #[cfg(target_os = "windows")]
-use hole_bridge::cutover::scm_wait::Observed;
+use hole_bridge::service_scm::Observed;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{ERROR_INVALID_SERVICE_CONTROL, ERROR_SERVICE_NOT_ACTIVE};
 
@@ -560,7 +560,7 @@ impl Script {
 }
 
 #[cfg(target_os = "windows")]
-impl hole_bridge::cutover::scm_wait::Hooks for Script {
+impl hole_bridge::service_scm::Hooks for Script {
     fn intercept_notify(&mut self, record: usize) -> Option<std::num::NonZeroU32> {
         let call = {
             let mut records = self.records.borrow_mut();
@@ -584,8 +584,8 @@ impl hole_bridge::cutover::scm_wait::Hooks for Script {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_dropping_an_actor_with_a_pending_notification_frees_no_notify_record() {
-    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{ScmActor, SystemScmActor, WantState};
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let _service = ProvisionedService::install(helper);
@@ -610,8 +610,8 @@ fn cutover_global_net_state_dropping_an_actor_with_a_pending_notification_frees_
 fn cutover_global_net_state_dropping_an_actor_after_its_callback_frees_the_notify_record() {
     use hole_bridge::cutover::os::windows::WindowsCutoverOs;
     use hole_bridge::cutover::os::CutoverOs;
-    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{Observed, ScmActor, SystemScmActor, WantState};
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let _service = ProvisionedService::install(helper);
@@ -649,8 +649,8 @@ fn cutover_global_net_state_dropping_an_actor_after_its_callback_frees_the_notif
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_re_arming_while_a_notification_is_pending_frees_no_notify_record() {
-    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{ScmActor, SystemScmActor, WantState};
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let _service = ProvisionedService::install(helper);
@@ -671,8 +671,8 @@ fn cutover_global_net_state_re_arming_while_a_notification_is_pending_frees_no_n
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_waiting_before_arming_errs_instead_of_hanging() {
-    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{ScmActor, SystemScmActor};
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let _service = ProvisionedService::install(helper);
@@ -690,8 +690,8 @@ fn cutover_global_net_state_waiting_before_arming_errs_instead_of_hanging() {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_waiting_after_a_failed_arm_errs_instead_of_hanging() {
-    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{ScmActor, SystemScmActor, WantState};
     use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
@@ -715,8 +715,8 @@ fn cutover_global_net_state_waiting_after_a_failed_arm_errs_instead_of_hanging()
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_waiting_after_an_arm_that_failed_over_a_good_one_errs_instead_of_hanging() {
-    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{ScmActor, SystemScmActor, WantState};
     use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
@@ -746,8 +746,8 @@ fn cutover_global_net_state_waiting_after_an_arm_that_failed_over_a_good_one_err
 fn cutover_global_net_state_a_lagging_client_arms_again_on_fresh_handles() {
     use hole_bridge::cutover::os::windows::WindowsCutoverOs;
     use hole_bridge::cutover::os::CutoverOs;
-    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{Observed, ScmActor, SystemScmActor, WantState};
     use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
@@ -785,8 +785,8 @@ fn cutover_global_net_state_a_lagging_client_arms_again_on_fresh_handles() {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_a_failed_open_for_a_retry_fails_that_arm_only() {
-    use hole_bridge::cutover::scm_wait::{ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{ScmActor, SystemScmActor, WantState};
     use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
@@ -870,8 +870,8 @@ struct Delivery {
 fn deliver_controls_after_first_stop(on_stop: OnStop) -> Delivery {
     use hole_bridge::cutover::os::windows::WindowsCutoverOs;
     use hole_bridge::cutover::os::CutoverOs;
-    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{Observed, ScmActor, SystemScmActor, WantState};
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Services::{
@@ -1388,8 +1388,8 @@ mod scm_probe {
 /// pass arms for every state and acts on the one it is told.
 #[cfg(target_os = "windows")]
 fn wait_until_running() {
-    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{Observed, ScmActor, SystemScmActor, WantState};
 
     let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service to wait for RUNNING");
     let mut told = None;
@@ -1407,8 +1407,8 @@ fn wait_until_running() {
 /// Returns once the throwaway service reports STOPPED, with no Stop sent.
 #[cfg(target_os = "windows")]
 fn wait_until_stopped() {
-    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{Observed, ScmActor, SystemScmActor, WantState};
 
     let mut actor = SystemScmActor::open(SERVICE_NAME).expect("open the service to wait for STOPPED");
     let mut told = None;
@@ -1449,8 +1449,8 @@ fn start_in_background() -> std::thread::JoinHandle<windows_service::Result<()>>
 /// RUNNING the release produces, and the line says so.
 #[cfg(target_os = "windows")]
 mod stop_probe {
-    use hole_bridge::cutover::scm_wait::{Observed, ScmActor, SystemScmActor, WantState};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::{Observed, ScmActor, SystemScmActor, WantState};
 
     use windows::core::HRESULT;
     use windows::Win32::Foundation::WIN32_ERROR;
@@ -2085,7 +2085,7 @@ fn cutover_global_net_state_stop_probe_open_process_synchronize_on_the_service_p
     };
     eprintln!(
         "SCM stop probe, OpenProcess(PROCESS_SYNCHRONIZE) on the LocalSystem service process (pid {pid}) from an elevated administrator: {outcome}\n  \
-         MEANS: Ok => the process hold (scm_wait/hold.rs, service_processes.rs) works for `hole bridge uninstall` run elevated, and \
+         MEANS: Ok => the process hold (service_scm/hold.rs, service_processes.rs) works for `hole bridge uninstall` run elevated, and \
          the zero-timeout wait is the exit check `ProcessFate` reads. Err 5 (ACCESS_DENIED) => every uninstall by an elevated \
          administrator fails with RetireError::Hold (\"the service's process could not be opened ...: OpenProcess failed\"), \
          where it worked before the hold existed, and the exit has to be awaited another way (an owner question). \
@@ -2125,7 +2125,7 @@ fn releasing(release: &named_event::NamedEvent) -> recording::Hook<'_> {
 /// test that waits for the deletion must not hold it.
 #[cfg(target_os = "windows")]
 fn deregister_recorded(hook: recording::Hook<'_>) -> recording::Trace {
-    use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
+    use hole_bridge::service_scm::retire::{retire, Disposition};
 
     let mut session = recording::open_retire_session(hook);
     retire(&mut session, Disposition::Deregister).expect("the retirement succeeds");
@@ -2138,8 +2138,8 @@ fn deregister_recorded(hook: recording::Hook<'_>) -> recording::Trace {
 /// disabled.
 #[cfg(target_os = "windows")]
 fn retire_a_parked_service(flag: &str) {
-    use hole_bridge::cutover::scm_wait::Observed;
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::Observed;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let parked = named_event::NamedEvent::create("RetireParked");
@@ -2194,8 +2194,8 @@ fn cutover_global_net_state_uninstall_waits_out_a_service_not_yet_attached() {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_lands_on_the_instance_the_scm_just_restarted() {
-    use hole_bridge::cutover::scm_wait::Observed;
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::Observed;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let dir = tempfile::tempdir().unwrap();
@@ -2248,8 +2248,8 @@ fn cutover_global_net_state_uninstall_lands_on_the_instance_the_scm_just_restart
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_deregisters_a_killed_service_with_a_restart_pending() {
-    use hole_bridge::cutover::scm_wait::Observed;
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::Observed;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let dir = tempfile::tempdir().unwrap();
@@ -2290,8 +2290,8 @@ fn cutover_global_net_state_uninstall_deregisters_a_killed_service_with_a_restar
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_stops_the_instance_the_scm_restarted_while_running() {
-    use hole_bridge::cutover::scm_wait::Observed;
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::Observed;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let dir = tempfile::tempdir().unwrap();
@@ -2350,8 +2350,8 @@ enum StoppedBy {
 /// next message is whatever the retirement does next.
 #[cfg(target_os = "windows")]
 fn uninstall_waits_out_a_process_that_outlives_stopped(stopped_by: StoppedBy) {
-    use hole_bridge::cutover::scm_wait::retire::{retire, Disposition, RetireError};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::retire::{retire, Disposition, RetireError};
 
     #[derive(Debug)]
     enum Message {
@@ -2462,12 +2462,12 @@ struct WatchedStop<'a> {
 }
 
 #[cfg(target_os = "windows")]
-impl hole_bridge::cutover::scm_wait::settle::StopActor for WatchedStop<'_> {
-    fn observe(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::hold::Look> {
+impl hole_bridge::service_scm::settle::StopActor for WatchedStop<'_> {
+    fn observe(&mut self) -> std::io::Result<hole_bridge::service_scm::hold::Look> {
         self.inner.observe()
     }
 
-    fn arm_leaving(&mut self, from: hole_bridge::cutover::scm_wait::Observed) -> std::io::Result<()> {
+    fn arm_leaving(&mut self, from: hole_bridge::service_scm::Observed) -> std::io::Result<()> {
         self.inner.arm_leaving(from)
     }
 
@@ -2479,12 +2479,12 @@ impl hole_bridge::cutover::scm_wait::settle::StopActor for WatchedStop<'_> {
         self.inner.await_callback()
     }
 
-    fn await_held_exits(&mut self, wait: hole_bridge::cutover::scm_wait::settle::ExitWait) -> std::io::Result<()> {
+    fn await_held_exits(&mut self, wait: hole_bridge::service_scm::settle::ExitWait) -> std::io::Result<()> {
         (self.on_await_held_exits)();
         self.inner.await_held_exits(wait)
     }
 
-    fn hold_scanned(&mut self) -> std::io::Result<hole_bridge::cutover::scm_wait::scan::ScanFinding> {
+    fn hold_scanned(&mut self) -> std::io::Result<hole_bridge::service_scm::scan::ScanFinding> {
         self.inner.hold_scanned()
     }
 }
@@ -2498,8 +2498,8 @@ impl hole_bridge::cutover::scm_wait::settle::StopActor for WatchedStop<'_> {
 /// alive, and only then does the test let the helper exit.
 #[cfg(target_os = "windows")]
 fn cutover_stop_waits_out_a_process_that_outlives_stopped(stopped_by: StoppedBy) {
-    use hole_bridge::cutover::scm_wait::settle::settle_stopped;
     use hole_bridge::platform::os::StopSession;
+    use hole_bridge::service_scm::settle::settle_stopped;
 
     #[derive(Debug)]
     enum Message {
@@ -2546,7 +2546,7 @@ fn cutover_stop_waits_out_a_process_that_outlives_stopped(stopped_by: StoppedBy)
                 let _ = reached.send(Message::Reached(left_behind::still_running(&thread_pid_log)));
             }),
         };
-        let result = settle_stopped(&mut session).map_err(hole_bridge::cutover::scm_wait::settle::SettleError::into_io);
+        let result = settle_stopped(&mut session).map_err(hole_bridge::service_scm::settle::SettleError::into_io);
         let _ = messages.send(Message::Returned(result));
     });
 
@@ -2630,8 +2630,8 @@ fn cutover_global_net_state_uninstall_terminates_a_service_process_nothing_stops
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_cutover_stop_terminates_a_service_process_nothing_stops() {
-    use hole_bridge::cutover::scm_wait::settle::settle_stopped;
     use hole_bridge::platform::os::StopSession;
+    use hole_bridge::service_scm::settle::settle_stopped;
 
     let dir = tempfile::tempdir().unwrap();
     let pid_log = dir.path().join("pids.log");
@@ -2842,8 +2842,8 @@ fn cutover_global_net_state_uninstall_stops_a_service_marked_before_it_was_opene
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_stops_a_service_marked_between_the_hardening_and_the_stop() {
-    use hole_bridge::cutover::scm_wait::retire::{FailureActions, StartWrite};
     use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::service_scm::retire::{FailureActions, StartWrite};
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
     let dir = tempfile::tempdir().unwrap();
@@ -2955,9 +2955,9 @@ fn cutover_global_net_state_uninstall_of_a_marked_and_already_stopped_service_su
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_waits_out_a_process_whose_entry_is_already_gone() {
-    use hole_bridge::cutover::scm_wait::retire::{retire_over, Disposition, RetireError};
-    use hole_bridge::cutover::scm_wait::scan::ScanFinding;
     use hole_bridge::platform::os::{RetireSession, SERVICE_NAME};
+    use hole_bridge::service_scm::retire::{retire_over, Disposition, RetireError};
+    use hole_bridge::service_scm::scan::ScanFinding;
     use recording::SurvivorEvent;
 
     #[derive(Debug)]

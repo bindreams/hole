@@ -1,4 +1,4 @@
-//! The real SCM session behind [`retire`](crate::cutover::scm_wait::retire):
+//! The real SCM session behind [`retire`](crate::service_scm::retire):
 //! one open `HoleBridge` service, used for the hardening writes, the stop wait,
 //! the delete, the state query and the wait for the service's process.
 
@@ -20,13 +20,13 @@ use super::service_sid::ServiceSid;
 use super::start_type_lock::{log_wait, Held, StartTypeLock};
 use super::stop_session::StopSession;
 use super::{apply_failure_actions, open_error_is_absent, scm_failure, FAILURE_ACTIONS_ACCESS, SERVICE_NAME};
-use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::Look;
-use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, StartConfig, StartWrite, Survivors};
-use crate::cutover::scm_wait::scan::ScanFinding;
-use crate::cutover::scm_wait::settle::{ExitWait, StopActor};
-use crate::cutover::scm_wait::Observed;
 use crate::disable_record::{Changer, RecordKey, RecordState};
+use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
+use crate::service_scm::hold::Look;
+use crate::service_scm::retire::{FailureActions, Opening, ServiceSession, StartConfig, StartWrite, Survivors};
+use crate::service_scm::scan::ScanFinding;
+use crate::service_scm::settle::{ExitWait, StopActor};
+use crate::service_scm::Observed;
 use crate::service_start::StartType;
 
 /// One service handle, opened before anything is changed, carries the

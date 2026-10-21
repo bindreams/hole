@@ -3,14 +3,14 @@
 //! outcome. The real session still does the work: the state a later look reads
 //! comes from the SCM.
 
-use hole_bridge::cutover::scm_wait::call_error::{service_gone, ServiceGone};
-use hole_bridge::cutover::scm_wait::hold::Look;
-use hole_bridge::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartConfig, StartWrite, Survivors};
-use hole_bridge::cutover::scm_wait::scan::ScanFinding;
-use hole_bridge::cutover::scm_wait::settle::StopActor;
-use hole_bridge::cutover::scm_wait::Observed;
 use hole_bridge::disable_record::{Changer, RecordState};
 use hole_bridge::platform::os::{Opening, RetireSession};
+use hole_bridge::service_scm::call_error::{service_gone, ServiceGone};
+use hole_bridge::service_scm::hold::Look;
+use hole_bridge::service_scm::retire::{FailureActions, ServiceSession, StartConfig, StartWrite, Survivors};
+use hole_bridge::service_scm::scan::ScanFinding;
+use hole_bridge::service_scm::settle::StopActor;
+use hole_bridge::service_scm::Observed;
 use hole_bridge::service_start::StartType;
 
 /// A call on the session the SCM can refuse.
@@ -143,7 +143,7 @@ impl<S: ServiceSession> StopActor for Recording<'_, S> {
         self.inner.await_callback()
     }
 
-    fn await_held_exits(&mut self, wait: hole_bridge::cutover::scm_wait::settle::ExitWait) -> std::io::Result<()> {
+    fn await_held_exits(&mut self, wait: hole_bridge::service_scm::settle::ExitWait) -> std::io::Result<()> {
         self.record(Event::AwaitHeldExits);
         self.inner.await_held_exits(wait)
     }

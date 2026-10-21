@@ -1911,7 +1911,7 @@ STOPPED, then START_PENDING, then RUNNING again within a second, and the SCM
 refuses `ControlService(STOP)` in every state but RUNNING. A stop decided from a
 state read before its act loses that race, so four rules close it:
 
-- **Every step is decided on a look.** `scm_wait::settle::settle_stopped` loops
+- **Every step is decided on a look.** `service_scm::settle::settle_stopped` loops
   over looks at the service (state, the process it names, the fate of that
   process) and `Look::settle_step` is the one decision. A Stop goes out only into
   RUNNING over a process that has not exited; START_PENDING, STOP_PENDING and a
@@ -1933,7 +1933,7 @@ state read before its act loses that race, so four rules close it:
   the `windows_service` ones whose own error displays only as "IO error in winapi
   call", is a typed `ScmCallError` naming the call and the Win32 code, and
   reaches `gui-cli.log` that way.
-- **One session.** `scm_wait::retire::retire` (both `ensure_stopped` and
+- **One session.** `service_scm::retire::retire` (both `ensure_stopped` and
   `uninstall` run it over `windows::RetireSession`) opens the service once,
   before anything changes, and runs **harden, settle, then restore or delete**.
   Harden writes the record that the disable is ours (see
@@ -2298,7 +2298,7 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   identity first (a retirement, including over a record that is already there;
   the repair of an interrupted change; `enable`), and the status read asks
   whether that process is still running
-  ([`display`](crates/bridge/src/cutover/scm_wait/repair.rs),
+  ([`display`](crates/bridge/src/service_scm/repair.rs),
   `Stamp::is_running`): running, the read is `DisabledState::InChange` over any
   start type, the status is `BridgeInstallStatus::ChangeInProgress`, and the
   connect gate offers neither Repair nor Enable: it fails the connect with "the
@@ -2742,7 +2742,7 @@ Disclosed residuals:
    during an uninstall has no in-band recovery.
 
 1. A stop that never returns is not covered at all. The Windows stop wait
-   (`scm_wait::settle::settle_stopped`) waits on a real SCM `STOPPED` callback with no
+   (`service_scm::settle::settle_stopped`) waits on a real SCM `STOPPED` callback with no
    bound, and `ProxyManager`'s
    teardown is itself unbounded (#556) — so against the known
    windows-installer uninstall hang the release never runs, and the user's end
@@ -2887,9 +2887,9 @@ swap first, then `launchctl kill SIGTERM` rides the graceful shutdown
 (`pm.stop()` → the marker-conditional disarm fires), and `KeepAlive=true`
 respawns the now-swapped binary.
 
-`scm_wait::SystemScmActor` **deliberately leaks** the notify record of a
+`service_scm::SystemScmActor` **deliberately leaks** the notify record of a
 `NotifyServiceStatusChangeW` call whose callback has not run (mechanics:
-`cutover::registration`): one 88-byte record (64-bit Windows; `size_of` of the
+`service_scm::registration`): one 88-byte record (64-bit Windows; `size_of` of the
 record, asserted at compile time) per call that did not settle, including each
 `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` return. Nothing caps how many such calls
 are made (the LAGGING retry has no cap), so nothing caps the leak. Do not "fix" the leak without a

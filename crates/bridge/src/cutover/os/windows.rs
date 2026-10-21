@@ -1,15 +1,15 @@
 //! Real Windows `CutoverOs`: rename-away-then-move-in swap (D1) + raw SCM
-//! stop/start driven by the `scm_wait` state machine. The detached-child
+//! stop/start driven by the `service_scm` state machine. The detached-child
 //! lifetime + breakaway probe live at the apply layer, which spawns THIS process
 //! as `hole bridge cutover`; this impl is the swap+restart body that child runs.
 
 use std::path::{Path, PathBuf};
 
 use crate::cutover::os::{CutoverOs, ServiceHold};
-use crate::cutover::scm_wait::retire::{self, Hardened, Opening};
-use crate::cutover::scm_wait::settle::{settle_stopped, SettleError};
-use crate::cutover::scm_wait::{start_via_notify, SystemScmActor};
 use crate::platform::os::{RetireSession, StopSession, SERVICE_NAME};
+use crate::service_scm::retire::{self, Hardened, Opening};
+use crate::service_scm::settle::{settle_stopped, SettleError};
+use crate::service_scm::{start_via_notify, SystemScmActor};
 use crate::service_start::RepairStep;
 
 /// One image to rename-away-then-move-in: the live binary at `installed` is

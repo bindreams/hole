@@ -13,17 +13,17 @@ use windows_service::service::{
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use crate::cutover::scm_wait::call_error::{ScmCall, ServiceGone};
-use crate::cutover::scm_wait::repair;
-use crate::cutover::scm_wait::retire::{retire_over, Disposition};
 use crate::disable_record::{DisabledBy, DisabledState};
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
+use crate::service_scm::call_error::{ScmCall, ServiceGone};
+use crate::service_scm::repair;
+use crate::service_scm::retire::{retire_over, Disposition};
 use crate::service_start::{InstallStart, RepairStep};
 use crate::service_stop::{self, StopPhase, StopProgress};
 
 #[path = "windows/retire_session.rs"]
 mod retire_session;
-pub use crate::cutover::scm_wait::retire::Opening;
+pub use crate::service_scm::retire::Opening;
 pub use retire_session::{GoneSession, RetireSession};
 #[path = "windows/stop_session.rs"]
 mod stop_session;
@@ -715,7 +715,7 @@ fn hold_start_type_noting(lock: &StartTypeLock, on_busy: impl FnOnce()) -> std::
 /// uninstall retryable instead of terminal.
 ///
 /// The stop, the delete and the check after it are one SCM session
-/// ([`retire`](crate::cutover::scm_wait::retire::retire)) under the start-type
+/// ([`retire`](crate::service_scm::retire::retire)) under the start-type
 /// lock ([`StartTypeLock`]), because the service
 /// carries restart-on-failure: a service the SCM is about to restart reads
 /// STOPPED, and separate probes and acts each decided on a state the SCM could

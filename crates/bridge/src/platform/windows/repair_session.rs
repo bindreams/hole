@@ -10,9 +10,9 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use super::retire_session::{read_start_type, write_start_type};
 use super::start_type_lock::{log_wait, Held, StartTypeLock};
 use super::{open_error_is_absent, scm_failure, SERVICE_NAME};
-use crate::cutover::scm_wait::call_error::ScmCall;
-use crate::cutover::scm_wait::retire::{StartConfig, StartWrite};
 use crate::disable_record::{Changer, RecordKey, RecordState};
+use crate::service_scm::call_error::ScmCall;
+use crate::service_scm::retire::{StartConfig, StartWrite};
 use crate::service_start::StartType;
 
 /// The rights a read of the start type needs, and all the GUI's status read

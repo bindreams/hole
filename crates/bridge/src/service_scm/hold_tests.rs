@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use super::*;
-use crate::cutover::scm_wait::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::ReportedPid;
+use crate::service_scm::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
+use crate::service_scm::ReportedPid;
 
 /// What the fake OS did, in order: `read`, `open(pid)`, `close(pid)`.
 type Log = Rc<RefCell<Vec<String>>>;

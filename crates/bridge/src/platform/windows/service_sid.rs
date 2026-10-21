@@ -28,7 +28,7 @@ use windows_service::service::{Service, ServiceAccess};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::{scm_failure, SERVICE_NAME};
-use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
+use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 
 fn failed(call: ScmCall, e: &windows::core::Error) -> io::Error {
     ScmCallError {

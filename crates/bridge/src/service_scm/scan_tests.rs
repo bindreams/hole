@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::*;
-use crate::cutover::scm_wait::hold::ProcessHolds;
+use crate::service_scm::hold::ProcessHolds;
 
 /// What the fake host did, in order: `open(pid)`, `close(pid)`.
 type Log = Rc<RefCell<Vec<String>>>;
@@ -378,8 +378,8 @@ fn a_failure_that_is_not_a_verdict_ends_the_scan() {
 /// settled STOPPED waits for it.
 #[skuld::test]
 fn holding_the_scan_makes_what_it_found_show_in_the_next_look() {
-    use crate::cutover::scm_wait::hold::{ProcessSource, Reading};
-    use crate::cutover::scm_wait::Observed;
+    use crate::service_scm::hold::{ProcessSource, Reading};
+    use crate::service_scm::Observed;
 
     struct Stopped;
     impl ProcessSource for Stopped {
@@ -390,7 +390,7 @@ fn holding_the_scan_makes_what_it_found_show_in_the_next_look() {
                 pid: 0,
             })
         }
-        fn open(&mut self, _: u32, _: crate::cutover::scm_wait::hold::Basis) -> io::Result<Opened<Handle>> {
+        fn open(&mut self, _: u32, _: crate::service_scm::hold::Basis) -> io::Result<Opened<Handle>> {
             unreachable!("STOPPED names no process")
         }
         fn has_exited(&mut self, _: &Handle) -> io::Result<bool> {

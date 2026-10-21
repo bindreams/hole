@@ -23,6 +23,10 @@ pub mod reconciler;
 pub mod route_recovery;
 pub mod server_test;
 pub mod service_ctrl;
+// The state machine and its policy are pure, so their tests run on any host;
+// only the `ScmActor` that drives the real SCM is Windows-only.
+#[cfg(any(target_os = "windows", test))]
+pub mod service_scm;
 pub mod service_start;
 pub mod service_stop;
 pub mod socket;

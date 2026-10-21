@@ -1,6 +1,6 @@
 //! The service start types and the decisions made over them, which the install
 //! path and the platform layer exchange on every target. The SCM code that reads
-//! and writes a start type is Windows-only (`cutover::scm_wait`); these types
+//! and writes a start type is Windows-only (`service_scm`); these types
 //! are pure so a build for any target can name them.
 
 use crate::disable_record::{DisabledBy, RecordState};

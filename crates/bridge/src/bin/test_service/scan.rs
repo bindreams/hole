@@ -13,10 +13,10 @@ use std::fmt::Write as _;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 
-use hole_bridge::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
-use hole_bridge::cutover::scm_wait::hold::{Basis, ProbeFailure};
-use hole_bridge::cutover::scm_wait::ReportedPid;
 use hole_bridge::platform::os::{scan_service_processes, ServiceSid};
+use hole_bridge::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
+use hole_bridge::service_scm::hold::{Basis, ProbeFailure};
+use hole_bridge::service_scm::ReportedPid;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, WAIT_OBJECT_0};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;

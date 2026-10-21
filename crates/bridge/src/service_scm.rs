@@ -6,6 +6,7 @@
 
 pub mod call_error;
 pub mod hold;
+mod registration;
 pub mod repair;
 pub mod retire;
 pub mod scan;
@@ -200,8 +201,8 @@ mod system {
     use windows::Win32::System::Threading::SleepEx;
 
     use super::call_error::{self, win32_code_of_hresult, ScmCall, ScmCallError};
+    use super::registration::{Arming, Registration, Settle};
     use super::{states_to_arm, Observed, WantState};
-    use crate::cutover::registration::{Arming, Registration, Settle};
 
     // `call_error` classifies the control answers by number so its tests run on
     // any host; the numbers must be the Win32 ones.
@@ -586,5 +587,5 @@ pub(crate) use system::observed_from_state;
 pub use system::{Hooks, NoHooks, SystemScmActor};
 
 #[cfg(test)]
-#[path = "scm_wait_tests.rs"]
-mod scm_wait_tests;
+#[path = "service_scm_tests.rs"]
+mod service_scm_tests;

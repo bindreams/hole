@@ -35,8 +35,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{CreateMutexExW, ReleaseMutex, WaitForSingleObject, INFINITE};
 
-use crate::cutover::scm_wait::call_error::win32_code_of_hresult;
 use crate::disable_record::{ChangeKey, Stamp};
+use crate::service_scm::call_error::win32_code_of_hresult;
 
 #[path = "start_type_lock/namespace.rs"]
 mod namespace;

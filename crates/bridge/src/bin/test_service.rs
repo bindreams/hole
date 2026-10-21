@@ -1,7 +1,7 @@
 //! Windows service helper for the privileged SCM tests
 //! (`tests/cutover_privileged.rs`). It is a GENUINE SCM service — it reports
 //! RUNNING on start and STOPPED when SCM sends STOP — but does nothing else (no
-//! IPC, no TUN), so the tests can drive the REAL `scm_wait`
+//! IPC, no TUN), so the tests can drive the REAL `service_scm`
 //! `NotifyServiceStatusChange` restart sequence against a real service without
 //! the full Hole bridge. The test self-provisions a `HoleBridge` service pointing
 //! here and tears it down, so this helper owns no install/uninstall logic.

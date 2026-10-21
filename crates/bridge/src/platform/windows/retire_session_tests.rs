@@ -1,8 +1,8 @@
 use windows_service::service::{ServiceActionType, ServiceFailureResetPeriod, ServiceStartType};
 
 use super::{no_restart_failure_actions, scm_start_type, start_type_from, RetireSession};
-use crate::cutover::scm_wait::retire::{Opening, StartWrite};
 use crate::platform::os::StartTypeLock;
+use crate::service_scm::retire::{Opening, StartWrite};
 use crate::service_start::StartType;
 
 #[skuld::test]

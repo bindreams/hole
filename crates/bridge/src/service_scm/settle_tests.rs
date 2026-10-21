@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use super::*;
-use crate::cutover::scm_wait::call_error::{service_gone, ScmCall, ScmCallError, ServiceGone};
+use crate::service_scm::call_error::{service_gone, ScmCall, ScmCallError, ServiceGone};
 
 // The look table ======================================================================================================
 
@@ -777,7 +777,7 @@ fn a_settle_error_gives_back_the_error_it_carries() {
 
 // The loop on a model host ============================================================================================
 
-use crate::cutover::scm_wait::world_tests::{Act, StoppedService, When, World};
+use crate::service_scm::world_tests::{Act, StoppedService, When, World};
 
 /// The stop wait over a STOPPED service whose processes the model host runs.
 struct ModelStop(StoppedService);

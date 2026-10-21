@@ -18,7 +18,7 @@ use windows::Win32::Foundation::{FILETIME, HANDLE, STATUS_INFO_LENGTH_MISMATCH};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetProcessTimes};
 use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION;
 
-use crate::cutover::scm_wait::call_error::win32_code_of_hresult;
+use crate::service_scm::call_error::win32_code_of_hresult;
 
 /// `SystemProcessInformation`.
 const SYSTEM_PROCESS_INFORMATION_CLASS: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(5);

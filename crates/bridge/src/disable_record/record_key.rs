@@ -13,10 +13,10 @@ use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::System::Registry::{KEY_QUERY_VALUE, KEY_SET_VALUE};
 use windows_registry::{Key, LOCAL_MACHINE};
 
-use crate::cutover::scm_wait::call_error::win32_code_of_hresult;
 use crate::disable_record::stamp::Stamp;
 use crate::disable_record::{Changer, RecordState};
 use crate::platform::os::SERVICE_NAME;
+use crate::service_scm::call_error::win32_code_of_hresult;
 
 /// The value's name. Its presence is the fact; the writer stores its
 /// [`Stamp`] as a string, and the reader accepts a value of any type, which

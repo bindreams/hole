@@ -16,7 +16,7 @@ use windows_service::service::Service;
 use super::scm_failure;
 use super::service_sid::{apply_service_sid, ensure_own_service_sid, SidRepairOutcome};
 use super::SERVICE_DESCRIPTION;
-use crate::cutover::scm_wait::call_error::ScmCall;
+use crate::service_scm::call_error::ScmCall;
 
 /// The configuration of a just-created service that `install` cannot do
 /// without, so its failure fails the install: the description, and the service

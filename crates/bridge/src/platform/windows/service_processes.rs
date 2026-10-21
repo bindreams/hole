@@ -22,11 +22,11 @@ use windows::Win32::System::Threading::{
     INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
-use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
-use crate::cutover::scm_wait::hold::{Basis, Look, Opened, ProcessHolds, ProcessSource};
-use crate::cutover::scm_wait::scan::{scan, ListedProcess, ProcessEnumerator, ScanFinding, ScanResult};
-use crate::cutover::scm_wait::settle::ExitWait;
 use crate::disable_record::{creation_time_of, Stamp};
+use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
+use crate::service_scm::hold::{Basis, Look, Opened, ProcessHolds, ProcessSource};
+use crate::service_scm::scan::{scan, ListedProcess, ProcessEnumerator, ScanFinding, ScanResult};
+use crate::service_scm::settle::ExitWait;
 
 use super::service_sid::ServiceSid;
 
