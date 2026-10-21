@@ -438,7 +438,7 @@ async fn probe_echo_roundtrip(attempt: Attempt) {
         plugin_options: None,
     };
 
-    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    let chain_task = attempt.spawn_chain(runner, env);
 
     let chain_ready = expect_ready(ready_rx)
         .await
@@ -512,7 +512,7 @@ async fn a_test_body_that_failed_after_binding_is_not_run_again() {
                     remote_port: 9,
                     plugin_options: None,
                 };
-                let chain_task = tokio::spawn(async move { runner.run(env).await });
+                let chain_task = attempt.spawn_chain(runner, env);
                 expect_ready(ready_rx).await.expect("chain ready");
                 chain_task.abort();
                 // Only the first run fails, so a helper that wrongly reran it would let the test pass.
@@ -531,6 +531,132 @@ async fn a_test_body_that_failed_after_binding_is_not_run_again() {
         Some("a failure of the test body itself")
     );
     assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A body that fails before it starts any plugin leaves no bind verdict: the helper reports the failure and does not wait
+/// for a plugin that is not there.
+#[skuld::test]
+async fn a_test_body_that_fails_before_starting_a_plugin_reports_its_failure() {
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = runs.clone();
+    let outcome = tokio::spawn(async move {
+        rerun_on_lost_port(move |_attempt| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { panic!("a failure before any plugin started") }
+        })
+        .await;
+    })
+    .await;
+
+    let failure = outcome
+        .expect_err("the body's failure must reach the test")
+        .into_panic();
+    assert_eq!(
+        failure.downcast_ref::<&str>().copied(),
+        Some("a failure before any plugin started")
+    );
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A plugin that never spawns leaves no bind verdict either: its chain ends, and the helper reports the body's failure.
+#[skuld::test]
+async fn a_test_body_whose_plugin_never_spawned_reports_its_failure() {
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = runs.clone();
+    let outcome = tokio::spawn(async move {
+        rerun_on_lost_port(move |attempt| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                let missing = mock_plugin_path().with_file_name("no-such-plugin");
+                let (verdict_key, verdict_path) = attempt.plugin_env();
+                let (ready_tx, ready_rx) = oneshot::channel();
+                let runner = ChainRunner::new()
+                    .add(Box::new(
+                        BinaryPlugin::new(missing, None).env(verdict_key, verdict_path),
+                    ))
+                    .on_ready(ready_tx)
+                    .drain_timeout(Duration::from_secs(3));
+                let env = PluginEnv {
+                    local_host: attempt.addr.ip(),
+                    local_port: attempt.addr.port(),
+                    remote_host: "127.0.0.1".to_string(),
+                    remote_port: 9,
+                    plugin_options: None,
+                };
+                let _chain_task = attempt.spawn_chain(runner, env);
+                expect_ready(ready_rx)
+                    .await
+                    .expect("a chain whose plugin never spawned readies");
+            }
+        })
+        .await;
+    })
+    .await;
+
+    let failure = outcome
+        .expect_err("the body's failure must reach the test")
+        .into_panic();
+    let message = failure.downcast_ref::<String>().expect("an `expect` message");
+    assert!(message.contains("readies"), "{message}");
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// The body fails while the plugin is held short of its bind, after a foreign listener answered the probe. The plugin
+/// then loses the bind, so the failure was the lost race and the helper runs the body again.
+#[skuld::test]
+async fn a_test_body_that_failed_before_its_plugin_tried_to_bind_is_run_again() {
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let held = holder.local_addr().unwrap();
+    std::thread::spawn(move || while holder.accept().is_ok() {});
+
+    let picks = std::sync::atomic::AtomicUsize::new(0);
+    let pick = || {
+        if picks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            held
+        } else {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+        }
+    };
+    rerun_with(pick, move |attempt| async move {
+        if attempt.addr != held {
+            return probe_echo_roundtrip(attempt).await;
+        }
+        let gate = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (verdict_key, verdict_path) = attempt.plugin_env();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = ChainRunner::new()
+            .add(Box::new(
+                BinaryPlugin::new(mock_plugin_path(), None)
+                    .env("MOCK_PLUGIN_NO_SITREP", "1")
+                    .env("MOCK_PLUGIN_BIND_GATE", gate.local_addr().unwrap().to_string())
+                    .env(verdict_key, verdict_path),
+            ))
+            .on_ready(ready_tx)
+            .drain_timeout(Duration::from_secs(3));
+        let env = PluginEnv {
+            local_host: attempt.addr.ip(),
+            local_port: attempt.addr.port(),
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 9,
+            plugin_options: None,
+        };
+        let _chain_task = attempt.spawn_chain(runner, env);
+        // The plugin is at the gate, so it has not tried to bind; the holder answers the probe.
+        let (_at_the_gate, _) = gate.accept().await.unwrap();
+        expect_ready(ready_rx).await.expect("the holder answers the probe");
+        // The gate opens as the panic unwinds, after the panic hook ran, so the helper reads the verdict at once.
+        panic!("a failure the instant the plugin may bind");
+    })
+    .await;
+
+    assert_eq!(
+        picks.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the held port fails the first attempt, the free one passes the second"
+    );
 }
 
 /// A plugin that emits `fatal` then exits surfaces a typed
@@ -809,7 +935,7 @@ async fn version_skew_falls_back_to_probe_attempt(attempt: Attempt) {
         plugin_options: None,
     };
 
-    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    let chain_task = attempt.spawn_chain(runner, env);
 
     let chain_ready = expect_ready(ready_rx)
         .await
@@ -890,7 +1016,7 @@ async fn auto_readies_silent_non_sitrep_plugin_via_probe_attempt(attempt: Attemp
         remote_port: echo_addr.port(),
         plugin_options: None,
     };
-    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    let chain_task = attempt.spawn_chain(runner, env);
 
     let chain_ready = expect_ready(ready_rx)
         .await
@@ -1002,7 +1128,7 @@ async fn auto_readies_sitrep_plugin_on_a_probed_port_attempt(attempt: Attempt) {
         remote_port: echo_addr.port(),
         plugin_options: None,
     };
-    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    let chain_task = attempt.spawn_chain(runner, env);
 
     let chain_ready = expect_ready(ready_rx).await.expect("Auto should ready a sitrep plugin");
     assert_eq!(chain_ready.listen, attempt.addr);
@@ -1393,7 +1519,7 @@ async fn log_sink_receives_probe_mode_stdout_lines_attempt(attempt: Attempt) {
         remote_port: 9,
         plugin_options: None,
     };
-    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    let chain_task = attempt.spawn_chain(runner, env);
     expect_ready(ready_rx).await.expect("chain ready");
 
     assert!(
@@ -1498,7 +1624,7 @@ async fn log_sink_receives_lines_drained_after_version_skew_fallback_attempt(att
         remote_port: echo_addr.port(),
         plugin_options: None,
     };
-    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    let chain_task = attempt.spawn_chain(runner, env);
     expect_ready(ready_rx)
         .await
         .expect("unknown-major should fall back to probe, not a start error");

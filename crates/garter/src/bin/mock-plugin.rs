@@ -70,6 +70,20 @@ fn record_bind_verdict(bound: bool) {
     std::fs::write(&file, b"").expect("write the bind verdict");
 }
 
+/// Knob: `MOCK_PLUGIN_BIND_GATE=<addr>` — before binding, connect to `<addr>` and wait for the peer to close the
+/// connection. A test holds the plugin short of its bind for as long as it needs (tests/chain_integration.rs).
+async fn wait_for_bind_gate() {
+    use tokio::io::AsyncReadExt;
+
+    let Some(addr) = std::env::var_os("MOCK_PLUGIN_BIND_GATE") else {
+        return;
+    };
+    let addr = addr.to_str().expect("MOCK_PLUGIN_BIND_GATE is valid utf-8");
+    let mut gate = TcpStream::connect(addr).await.expect("connect to the bind gate");
+    // End of stream or a reset: either way the peer is done holding the gate.
+    let _ = gate.read(&mut [0u8; 1]).await;
+}
+
 /// One readiness byte on stdout, flushed. The reader's `read_exact` of it is the
 /// happens-before edge for "this process is executing its own code" — which the
 /// Windows leg needs, because a child is not registered with any console at the
@@ -466,6 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!("mock-plugin: listening on {local_addr}, forwarding to {remote_addr}");
+    wait_for_bind_gate().await;
     let listener = match TcpListener::bind(local_addr).await {
         Ok(listener) => {
             record_bind_verdict(true);
