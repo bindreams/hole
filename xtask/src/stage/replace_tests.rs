@@ -1,4 +1,4 @@
-use super::windows_impl::{refuses_posix_rename, target_name, win32_error};
+use super::windows_impl::{refuses_posix_rename, replace_file, replace_with, target_name, win32_error};
 use std::io;
 use std::path::Path;
 use windows::core::{Error, HRESULT};
@@ -71,4 +71,66 @@ fn a_verbatim_path_is_left_as_it_is() {
         target_name(Path::new(r"\\?\C:\dir\hole")).unwrap(),
         wide(r"\\?\C:\dir\hole")
     );
+}
+
+fn os(code: i32) -> io::Error {
+    io::Error::from_raw_os_error(code)
+}
+
+#[skuld::test]
+fn an_unsupported_answer_runs_the_fallback_and_returns_its_result() {
+    for code in [1, 50, 87] {
+        let mut fallback_ran = false;
+        let result = replace_with(
+            Path::new("staged"),
+            Path::new("dest"),
+            |_, _| Err(os(code)),
+            |_, _| {
+                fallback_ran = true;
+                Err(os(2))
+            },
+        );
+        assert!(fallback_ran, "code {code}");
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(2), "code {code}");
+    }
+}
+
+#[skuld::test]
+fn any_other_answer_is_returned_without_the_fallback() {
+    for code in [5, 32, 2, 3] {
+        let result = replace_with(
+            Path::new("staged"),
+            Path::new("dest"),
+            |_, _| Err(os(code)),
+            |_, _| panic!("the fallback ran on code {code}"),
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+    }
+}
+
+#[skuld::test]
+fn a_successful_replace_does_not_run_the_fallback() {
+    replace_with(
+        Path::new("staged"),
+        Path::new("dest"),
+        |_, _| Ok(()),
+        |_, _| panic!("the fallback ran after a successful replace"),
+    )
+    .unwrap();
+}
+
+/// The real call's failure reaches `replace_file` as the Win32 code, which is what the fallback
+/// test keys on: a replace over a directory is `ERROR_ACCESS_DENIED` (5) on NTFS, not a refusal.
+#[skuld::test]
+fn a_failed_replace_reports_the_win32_code_not_the_hresult() {
+    let dir = tempfile::tempdir().unwrap();
+    let staged = dir.path().join("staged");
+    let dest = dir.path().join("dest");
+    std::fs::write(&staged, b"new").unwrap();
+    std::fs::create_dir(&dest).unwrap();
+
+    let err = replace_file(&staged, &dest).unwrap_err();
+
+    assert_eq!(err.raw_os_error(), Some(5), "{err:?}");
+    assert!(dest.is_dir() && staged.exists());
 }

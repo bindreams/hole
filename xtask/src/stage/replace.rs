@@ -3,12 +3,15 @@
 use std::io;
 use std::path::Path;
 
-/// Moves `staged` onto `dest`, replacing it whatever its attributes. A reader that already holds
-/// `dest` keeps its old content.
+/// Moves `staged` onto `dest`, replacing it even when it is read-only. A reader that opened
+/// `dest` with share-delete access (as `std` does) keeps its old content; a holder without it
+/// fails the replace with `ERROR_SHARING_VIOLATION`, and a running image with
+/// `ERROR_ACCESS_DENIED`.
 ///
 /// Unix `rename(2)` does this. Windows `std::fs::rename` fails with "Access is denied" over a
 /// read-only `dest` (its POSIX-semantics rename omits the flag that ignores the attribute), so
-/// Windows issues that rename itself.
+/// Windows issues that rename itself. On a filesystem that refuses POSIX rename it falls back to
+/// `std::fs::rename`, which cannot replace a read-only `dest` there.
 pub(super) fn replace_file(staged: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(windows)]
     return windows_impl::replace_file(staged, dest);
@@ -36,13 +39,27 @@ mod windows_impl {
     const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
     const FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x40;
 
+    // What a filesystem without POSIX rename answers: `ERROR_INVALID_PARAMETER` is measured on a
+    // 9P volume (`hole_util::versioned_file::sys`); `std` reads all three as "POSIX semantics
+    // unsupported" for the POSIX-semantics delete.
     const ERROR_INVALID_FUNCTION: i32 = 1;
     const ERROR_NOT_SUPPORTED: i32 = 50;
     const ERROR_INVALID_PARAMETER: i32 = 87;
 
     pub(super) fn replace_file(staged: &Path, dest: &Path) -> io::Result<()> {
-        match posix_rename(staged, dest) {
-            Err(e) if refuses_posix_rename(&e) => std::fs::rename(staged, dest),
+        replace_with(staged, dest, posix_rename, |staged, dest| std::fs::rename(staged, dest))
+    }
+
+    /// Replaces with `posix`, or with `fallback` when `posix` answers that the OS or filesystem
+    /// does not implement it. Any other error is returned.
+    pub(super) fn replace_with(
+        staged: &Path,
+        dest: &Path,
+        posix: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        fallback: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match posix(staged, dest) {
+            Err(e) if refuses_posix_rename(&e) => fallback(staged, dest),
             result => result,
         }
     }

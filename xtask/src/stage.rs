@@ -12,11 +12,11 @@
 //! can additionally find the destination `NotFound` or `PermissionDenied` while a
 //! replace is in flight; Unix `rename(2)` has no such window.
 //!
-//! A stage returns `Err` only when the OS refuses the replace, and the error is
-//! not retried. On Windows that is a destination that is a running image
-//! (`ERROR_ACCESS_DENIED`), open without share-delete access
-//! (`ERROR_SHARING_VIOLATION`) or delete-pending (`ERROR_ACCESS_DENIED`); a
-//! read-only destination is replaced.
+//! A stage returns `Err` when the source is missing, when the scratch directory or the copy
+//! cannot be made, or when the OS refuses the replace; the last is not retried. On Windows
+//! that is a destination that is a running image (`ERROR_ACCESS_DENIED`), open without
+//! share-delete access (`ERROR_SHARING_VIOLATION`) or delete-pending (`ERROR_ACCESS_DENIED`);
+//! a read-only destination is replaced.
 //!
 //! This logic was previously duplicated in
 //! `msi-installer/src/msi_installer/__init__.py:link_or_copy()` and (via
