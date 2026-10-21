@@ -286,3 +286,50 @@ fn the_caller_is_the_real_effective_uid() {
 
     assert_eq!(caller(), std::fs::metadata(&path).unwrap().uid());
 }
+
+// Directory swapped under the open ------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_directory_swapped_for_a_symlink_after_the_open_is_not_followed() {
+    // A leftover of ours is replaced: its name is unlinked and a new file created. Both go through the
+    // directory that was opened, so a path that now leads elsewhere is not consulted. A file of the same
+    // name outside is the victim of a path-based unlink.
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("target.json.lock"), b"victim").unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(state.join("target.json.lock"), b"leftover").unwrap();
+    let mine = real_uid();
+    let mut swapped = false;
+
+    let file = open_locked_with(
+        &state.join("target.json.lock"),
+        false,
+        Some((mine + 2, mine + 2)),
+        mine,
+        || {
+            if !std::mem::replace(&mut swapped, true) {
+                std::fs::rename(&state, tmp.path().join("state.moved")).unwrap();
+                std::os::unix::fs::symlink(&outside, &state).unwrap();
+            }
+        },
+    )
+    .unwrap()
+    .expect("acquired");
+
+    assert_eq!(
+        std::fs::read(outside.join("target.json.lock")).unwrap(),
+        b"victim",
+        "a file outside the opened directory was removed or replaced"
+    );
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+    let moved = tmp.path().join("state.moved").join("target.json.lock");
+    assert_eq!(
+        std::fs::read(&moved).unwrap(),
+        b"",
+        "the lock must be in the opened directory"
+    );
+    assert_eq!(file.metadata().unwrap().ino(), ino(&moved));
+}

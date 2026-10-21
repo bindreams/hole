@@ -1,0 +1,277 @@
+//! A directory opened without following a symlink, and file operations relative to it.
+//!
+//! A state directory can sit under the interactive user's profile while a
+//! privileged process writes to it, so every component of its path is the user's
+//! to replace. A path call (`create_dir_all`, `chown`, `rename`) re-resolves the
+//! whole path each time, so a component swapped for a symlink between two calls
+//! sends the next one anywhere. [`Dir`] resolves the path once, refusing a
+//! symlink at every component, and then every operation names a file by its
+//! single name *inside the handle*: there is no path left to swap.
+//!
+//! # Resolution
+//!
+//! [`Dir::open`] starts at the root (or the current directory) and opens one
+//! component at a time relative to the handle it already holds.
+//!
+//! - Unix: `openat(O_DIRECTORY | O_NOFOLLOW)` per component, with `mkdirat` for a
+//!   missing one when asked. Needs Linux 2.6.16 or macOS 10.10. There is no
+//!   whole-path no-follow flag in use (`openat2(RESOLVE_NO_SYMLINKS)` is Linux
+//!   5.6, `O_NOFOLLOW_ANY` macOS 10.15), so one code path serves every version.
+//! - Windows: `NtCreateFile` relative to the parent handle with
+//!   `FILE_OPEN_REPARSE_POINT`, then the handle's attributes refuse a reparse
+//!   point (symlink, junction, mount point). Present in every NT version.
+//!
+//! A symlink a non-root user could have planted is refused. On unix a symlink is
+//! followed when root owns it *and* the directory it sits in, and nobody else can
+//! write that directory: that is system configuration (macOS's `/var`, `/tmp` and
+//! `/etc`, and with them `temp_dir()`), and a user cannot plant one there. On
+//! Windows no reparse point is followed.
+//!
+//! Given an `owner` (unix ids), the final directory must be owned by it or by
+//! this process; any other owner is refused. Windows has no unix ids and does not
+//! check.
+//!
+//! The refusals are an `InvalidData` [`io::Error`] holding a [`Refusal`]; they
+//! carry no path.
+
+use std::ffi::OsStr;
+use std::fmt;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as platform;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as platform;
+
+pub(crate) use platform::Caller;
+
+/// Why a path was not opened as a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// A symlink (Windows: any reparse point) in the path that a non-root user could have planted.
+    Symlink,
+    /// A component that exists and is not a directory.
+    NotDirectory,
+    /// The final directory is owned by neither the expected owner nor this process.
+    #[cfg(unix)]
+    ForeignOwner { uid: u32 },
+}
+
+impl Refusal {
+    /// The refusal inside `err`, or `None` if `err` is not one.
+    pub fn from_error(err: &io::Error) -> Option<&Refusal> {
+        err.get_ref()?.downcast_ref()
+    }
+
+    fn into_io_error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, self)
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::Symlink => f.write_str("a directory in the path is a symbolic link"),
+            Refusal::NotDirectory => f.write_str("a component of the path is not a directory"),
+            #[cfg(unix)]
+            Refusal::ForeignOwner { uid } => write!(f, "the directory is owned by uid {uid}"),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// How [`Dir::open_file`] opens a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenFile {
+    /// Create the file; `AlreadyExists` if the name is taken, by anything. Never follows a symlink.
+    /// Unix: created with `mode` (before the umask). Windows ignores `mode`.
+    CreateNew { mode: u32 },
+    /// Open what is there, `NotFound` if nothing. A symlink (Windows: reparse point) is opened as itself, not followed.
+    Existing,
+}
+
+/// What a name in a [`Dir`] is, not following a symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A symlink (Windows: any reparse point).
+    Symlink,
+    Directory,
+    /// A regular file.
+    File,
+    /// A FIFO, socket or device.
+    Other,
+}
+
+/// Which file a name or an open handle denotes: equal when both are the same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId(platform::FileId);
+
+impl FileId {
+    /// The file `file` is open on.
+    pub fn of(file: &File) -> io::Result<FileId> {
+        platform::file_id(file).map(FileId)
+    }
+}
+
+/// An open directory. Every operation takes a single file name inside it.
+pub struct Dir {
+    file: File,
+}
+
+impl Dir {
+    /// Opens the directory at `path` without following a symlink a non-root user could have planted.
+    /// With `create`, a missing component is created relative to its parent's handle (unix: mode
+    /// `0o777` before the umask, as `create_dir_all`). `owner`: see the module doc.
+    pub fn open(path: &Path, create: bool, owner: Option<(u32, u32)>) -> io::Result<Dir> {
+        Self::open_as(path, create, owner, platform::caller())
+    }
+
+    /// [`Self::open`] as `caller`; the seam lets a test claim to be another user.
+    pub(crate) fn open_as(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<Dir> {
+        platform::open_dir(path, create, owner, caller).map(|file| Dir { file })
+    }
+
+    /// The directory's own handle, for an operation on the directory itself (an ACL on Windows).
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Opens or creates `name` in the directory; see [`OpenFile`].
+    pub fn open_file(&self, name: &OsStr, how: OpenFile) -> io::Result<File> {
+        single_component(name)?;
+        platform::open_file(&self.file, name, how)
+    }
+
+    /// The file `name` denotes right now, or `None`. A symlink is itself, not what it points at.
+    pub fn id_of(&self, name: &OsStr) -> io::Result<Option<FileId>> {
+        single_component(name)?;
+        platform::id_of(&self.file, name).map(|id| id.map(FileId))
+    }
+
+    /// What `name` is right now, or `None` if there is nothing.
+    pub fn kind_of(&self, name: &OsStr) -> io::Result<Option<EntryKind>> {
+        single_component(name)?;
+        platform::kind_of(&self.file, name)
+    }
+
+    /// Removes the name, whatever it is, but not what it points at. `NotFound` if there is none.
+    pub fn unlink(&self, name: &OsStr) -> io::Result<()> {
+        single_component(name)?;
+        platform::unlink(&self.file, name)
+    }
+
+    /// [`Self::open`] with the right to read and rewrite the final directory's ACL through [`Self::file`], which
+    /// opening for use does not ask for (and which fails where the caller lacks it).
+    #[cfg(windows)]
+    pub fn open_for_acl(path: &Path, create: bool) -> io::Result<Dir> {
+        platform::open_dir_with(path, create, platform::ACL_RIGHTS).map(|file| Dir { file })
+    }
+
+    /// Hands the directory itself to `owner` and, if given, sets its mode (unix; `0o700` for a state
+    /// directory). A failed `fchown` is logged and not returned: an unprivileged run cannot give a
+    /// file away and is no worse off for it. Windows has no unix ids or mode: set the ACL on
+    /// [`Self::file`].
+    pub fn secure(&self, owner: Option<(u32, u32)>, mode: Option<u32>) -> io::Result<()> {
+        platform::secure_dir(&self.file, owner, mode)
+    }
+
+    /// Writes `bytes` to `name` as a whole or not at all: a same-directory temp file is written,
+    /// synced, sealed to its owner (unix: `fchmod 0600`, `fchown(owner)`), passed to `protect` (the
+    /// place for a Windows ACL) and then renamed over `name`. Everything is done through the temp
+    /// file's handle before the rename, and the final name is never touched after it, so a
+    /// name swapped for a hard link or symlink after the rename changes nothing.
+    pub fn write_atomic(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        protect: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.write_atomic_with(name, bytes, owner, protect, || {})
+    }
+
+    /// [`Self::write_atomic`] with `after_rename` run right after the rename: the point where a
+    /// name changed by another principal would meet any step that still went by the final name.
+    pub(crate) fn write_atomic_with(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+        protect: impl FnOnce(&File) -> io::Result<()>,
+        after_rename: impl FnOnce(),
+    ) -> io::Result<()> {
+        single_component(name)?;
+        let (temp_name, mut temp) = self.create_temp(name)?;
+        let written = (|| {
+            temp.write_all(bytes)?;
+            temp.sync_all()?;
+            platform::seal(&temp, owner)?;
+            protect(&temp)?;
+            platform::rename(&self.file, &temp, &temp_name, name)?;
+            // Right after the rename, so that any step added below it runs on the swapped name.
+            after_rename();
+            Ok(())
+        })();
+        // Closed first: Windows does not let a name be deleted while a handle that does not share delete is open.
+        drop(temp);
+        if written.is_err() {
+            // The temp name may be gone already (a failed rename leaves it); either way it is not ours to keep.
+            let _ = platform::unlink(&self.file, &temp_name);
+        }
+        written
+    }
+
+    /// A new file named after `name` that nobody else holds, and its name.
+    fn create_temp(&self, name: &OsStr) -> io::Result<(std::ffi::OsString, File)> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let mut temp_name = std::ffi::OsString::from(".");
+            temp_name.push(name);
+            temp_name.push(format!(
+                ".{}.{}.tmp",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match platform::create_temp(&self.file, &temp_name) {
+                Ok(file) => return Ok((temp_name, file)),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+/// Writes `bytes` to the state file `name` in `state_dir` as a whole or not at all, for a privileged
+/// writer whose state directory the interactive user may own: the directory is opened without
+/// following a symlink and created if missing, handed to `owner`, and the file is written through
+/// [`Dir::write_atomic`] (owned by `owner`, mode `0600`, unix). Nothing goes by path after the open.
+pub fn write_state_file(state_dir: &Path, name: &OsStr, bytes: &[u8], owner: Option<(u32, u32)>) -> io::Result<()> {
+    let dir = Dir::open(state_dir, true, owner)?;
+    dir.secure(owner, None)?;
+    dir.write_atomic(name, bytes, owner, |_| Ok(()))
+}
+
+/// `name` must be one ordinary file name: no separator, and not empty, `.` or `..`.
+fn single_component(name: &OsStr) -> io::Result<()> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(only)), None) if only == name => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single file name",
+        )),
+    }
+}
+
+#[cfg(test)]
+#[path = "dir_tests.rs"]
+mod dir_tests;

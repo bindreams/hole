@@ -2142,6 +2142,7 @@ dependencies = [
  "libc",
  "skuld",
  "tempfile",
+ "tracing",
  "windows 0.62.2",
 ]
 

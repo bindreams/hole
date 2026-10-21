@@ -1,12 +1,14 @@
 //! Unix half of [`super::Exclusive`]: `flock`, `fstat` vetting, `fchmod`, `fchown`.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use super::{Refusal, Refused};
+use super::{split, Refusal, Refused};
+use crate::dir::{Dir, FileId, OpenFile};
 
 /// What `fstat` says about the opened lock file; the only input to [`vet`].
 #[derive(Clone, Copy, Debug)]
@@ -85,34 +87,22 @@ struct Opened {
 /// Creates the lock file with `O_EXCL`, which never follows a symlink and never
 /// reuses an existing file; if the name exists, opens that without `O_CREAT`.
 /// `Ok(None)` when the name vanished between the two.
-fn open_name(path: &Path) -> io::Result<Option<Opened>> {
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW);
-    match options.clone().create_new(true).open(path) {
+fn open_name(dir: &Dir, name: &OsStr, path: &Path) -> io::Result<Option<Opened>> {
+    match dir.open_file(name, OpenFile::CreateNew { mode: 0o600 }) {
         Ok(file) => return Ok(Some(Opened { file, created: true })),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(err) => return Err(Refused::from_failed_open(path, err)),
+        Err(err) => return Err(Refused::from_failed_open(dir, name, path, err)),
     }
-    match options.open(path) {
+    match dir.open_file(name, OpenFile::Existing) {
         Ok(file) => Ok(Some(Opened { file, created: false })),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Refused::from_failed_open(path, err)),
+        Err(err) => Err(Refused::from_failed_open(dir, name, path, err)),
     }
 }
 
-/// Whether `path` still names the file `file` is open on.
-fn names(path: &Path, file: &File) -> io::Result<bool> {
-    let named = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
-    let open = file.metadata()?;
-    Ok((named.dev(), named.ino()) == (open.dev(), open.ino()))
+/// Whether `name` in `dir` still names the file `file` is open on.
+fn names(dir: &Dir, name: &OsStr, file: &File) -> io::Result<bool> {
+    Ok(dir.id_of(name)? == Some(FileId::of(file)?))
 }
 
 /// `flock` exclusive, blocking or not per `block`; `Ok(false)` when not blocking and held elsewhere.
@@ -155,8 +145,11 @@ pub(super) fn open_locked_with(
     euid: Caller,
     mut after_open: impl FnMut(),
 ) -> io::Result<Option<File>> {
+    let (parent, name) = split(path)?;
+    // Everything below goes through this handle, never through `path` again.
+    let dir = Dir::open_as(parent, true, owner, euid).map_err(|err| Refused::from_dir_error(path, err))?;
     loop {
-        let Some(Opened { file, created }) = open_name(path)? else {
+        let Some(Opened { file, created }) = open_name(&dir, name, path)? else {
             continue;
         };
         after_open();
@@ -170,7 +163,7 @@ pub(super) fn open_locked_with(
         }
         // Whoever held the lock before may have unlinked or replaced the name; this
         // file is then an orphan, and the name is evaluated afresh.
-        if !names(path, &file)? {
+        if !names(&dir, name, &file)? {
             continue;
         }
 
@@ -180,7 +173,7 @@ pub(super) fn open_locked_with(
             false => vet(facts_of(&file)?, euid, owner).map_err(|why| refuse(path, why))?,
         };
         match verdict {
-            Verdict::Replace => match std::fs::remove_file(path) {
+            Verdict::Replace => match dir.unlink(name) {
                 Ok(()) => continue,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err),

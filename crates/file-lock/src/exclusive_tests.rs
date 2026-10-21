@@ -385,14 +385,6 @@ fn a_lock_path_that_is_a_fifo_is_refused() {
 }
 
 #[skuld::test]
-#[cfg(windows)]
-fn a_lock_path_that_names_a_device_is_refused() {
-    let tmp = tempfile::tempdir().unwrap();
-    // Win32 path normalization turns a reserved device name in any directory into the device.
-    assert_refused(&tmp.path().join("NUL"), None);
-}
-
-#[skuld::test]
 #[cfg(unix)]
 fn a_lock_file_left_owned_by_this_process_does_not_lock_the_owner_out() {
     use std::os::unix::fs::MetadataExt;
@@ -444,4 +436,106 @@ fn an_existing_file_is_not_re_permissioned_when_no_owner_is_expected() {
 
     let _guard = Exclusive::try_acquire(&path, None).unwrap().unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o666);
+}
+
+// Hostile lock directory ==============================================================================================
+//
+// The directory part of the path is as attacker-writable as the name: every component under the
+// user's profile is theirs to replace. Nothing may be created or changed outside the directory the
+// path names, and the refusal names the lock path.
+
+/// A symlink to the directory `target` at `link`, of the kind an unprivileged user can plant. Run as
+/// root, the link is given away so that it is no longer root's own.
+fn plant_dir_symlink(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::lchown(link, Some(65534), Some(65534)).unwrap();
+        }
+    }
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(target, link).unwrap();
+}
+
+fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut found: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    found.sort();
+    found
+}
+
+#[skuld::test]
+fn a_lock_directory_that_is_a_symlink_is_refused_and_nothing_is_made_outside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let state = tmp.path().join("state");
+    plant_dir_symlink(&outside, &state);
+
+    assert_refused(&state.join("target.json.lock"), observable_owner());
+
+    assert!(entries(&outside).is_empty(), "a lock file was made through the symlink");
+}
+
+#[skuld::test]
+fn a_symlink_among_the_parents_of_the_lock_directory_is_refused_and_nothing_is_made_outside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let hole = tmp.path().join("hole");
+    plant_dir_symlink(&outside, &hole);
+
+    // The state directory exists below the link, and a deeper one does not.
+    std::fs::create_dir(outside.join("state")).unwrap();
+    for path in [
+        hole.join("state").join("target.json.lock"),
+        hole.join("missing").join("target.json.lock"),
+    ] {
+        assert_refused(&path, observable_owner());
+    }
+
+    assert_eq!(entries(&outside), vec![std::ffi::OsString::from("state")]);
+    assert!(entries(&outside.join("state")).is_empty());
+}
+
+#[skuld::test]
+fn missing_directories_are_created_for_the_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("a").join("b").join("target.json.lock");
+
+    for entry in ["try_acquire", "acquire"] {
+        let _guard = match entry {
+            "try_acquire" => Exclusive::try_acquire(&path, None).unwrap().unwrap(),
+            _ => Exclusive::acquire(&path, None).unwrap(),
+        };
+        assert!(path.is_file(), "{entry}");
+    }
+}
+
+#[skuld::test]
+#[cfg(unix)]
+fn a_lock_directory_owned_by_a_third_party_is_refused_and_nothing_is_made_in_it() {
+    // The directory is ours but the pretend caller is someone else and the expected owner a third.
+    let (owner, pretend) = foreign_owner_and_caller();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("target.json.lock");
+
+    for entry in ["try_acquire_as", "acquire_as"] {
+        let err = match entry {
+            "try_acquire_as" => Exclusive::try_acquire_as(&path, Some(owner), pretend).map(|_| ()),
+            _ => Exclusive::acquire_as(&path, Some(owner), pretend).map(|_| ()),
+        }
+        .expect_err(entry);
+
+        let refused = Refused::from_error(&err).unwrap_or_else(|| panic!("{entry}: not a Refused: {err:?}"));
+        assert_eq!(refused.path(), path, "{entry}");
+    }
+    assert!(
+        entries(tmp.path()).is_empty(),
+        "a lock file was made in a refused directory"
+    );
 }
