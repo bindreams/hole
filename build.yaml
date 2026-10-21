@@ -374,10 +374,10 @@ targets:
     platforms: [linux/amd64, linux/arm64, windows/arm64]
     run:
       - bash:
-          command: cargo doc --lib --no-deps --document-private-items -p garter-bin -p galoshes -p plugin-e2e -p util -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p dump -p dump-macros -p tombstone -p hole-common -p hole-test-observability -p tun-engine-macros -p handle-holders --features garter/test-utils
+          command: cargo doc --lib --no-deps --document-private-items -p garter-bin -p galoshes -p plugin-e2e -p util -p file-lock -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p dump -p dump-macros -p tombstone -p hole-common -p hole-test-observability -p tun-engine-macros -p handle-holders --features garter/test-utils
           environment: { RUSTDOCFLAGS: "-D warnings -A rustdoc::private_intra_doc_links" }
       - bash:
-          command: cargo doc --bins --no-deps --document-private-items -p garter-bin -p galoshes -p plugin-e2e -p util -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p dump -p dump-macros -p tombstone -p hole-common -p hole-test-observability -p tun-engine-macros -p handle-holders --features garter/test-utils,tombstone/crash-child
+          command: cargo doc --bins --no-deps --document-private-items -p garter-bin -p galoshes -p plugin-e2e -p util -p file-lock -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p dump -p dump-macros -p tombstone -p hole-common -p hole-test-observability -p tun-engine-macros -p handle-holders --features garter/test-utils,tombstone/crash-child
           environment: { RUSTDOCFLAGS: "-D warnings -A rustdoc::private_intra_doc_links" }
       - bash:
           command: cargo doc --lib --no-deps -p garter --features garter/test-utils
