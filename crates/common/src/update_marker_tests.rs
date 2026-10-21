@@ -45,7 +45,7 @@ fn valid_reads_as_present() {
 
     clear(dir.path()).unwrap();
     assert!(matches!(read(dir.path()), Marker::Absent));
-    // clear is idempotent (remove-by-path, not parse-then-clear).
+    // clear is idempotent (remove-by-name, not parse-then-clear).
     clear(dir.path()).unwrap();
 }
 
@@ -152,7 +152,7 @@ fn an_unknown_version_marker_reads_as_unreadable() {
     });
     std::fs::write(dir.path().join(MARKER_FILE), serde_json::to_vec(&future).unwrap()).unwrap();
     assert!(matches!(read(dir.path()), Marker::Unreadable));
-    // But clear still removes it (remove-by-path), proving clear does NOT route
+    // But clear still removes it (remove-by-name), proving clear does NOT route
     // through read() — a schema bump must never strand the marker.
     clear(dir.path()).unwrap();
     assert!(!dir.path().join(MARKER_FILE).exists());
