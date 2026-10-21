@@ -6,10 +6,6 @@ use std::path::PathBuf;
 
 const ROOT: u32 = 0;
 
-fn is_root() -> bool {
-    caller() == ROOT
-}
-
 fn refusal(result: io::Result<Dir>) -> Refusal {
     let err = result.err().expect("the path must be refused");
     *Refusal::from_error(&err).unwrap_or_else(|| panic!("not a typed refusal: {err:?}"))
@@ -195,6 +191,36 @@ fn a_followed_absolute_link_resolves_from_the_root() {
     Dir::open(&tmp.path().join("link").join("made"), true, None).unwrap();
 
     assert!(real.join("made").is_dir());
+}
+
+#[skuld::test]
+fn a_link_met_again_after_its_own_resolution_is_not_a_loop() {
+    // `link` leads to `real`, where `again` leads back through `link`: the way macOS's `/var` shows up twice in a
+    // path under `/var/folders` whose user link points at another `/var/folders` path.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real.join("sub"));
+    plant(&real, &tmp.path().join("link"));
+    plant(&tmp.path().join("link").join("sub"), &real.join("again"));
+
+    let dir = Dir::open(&tmp.path().join("link").join("again"), false, None).unwrap();
+
+    assert_eq!(
+        FileIdOf::of(dir.file()),
+        FileIdOf::of(&std::fs::File::open(real.join("sub")).unwrap())
+    );
+}
+
+#[skuld::test]
+fn a_link_to_a_path_through_itself_is_a_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    user_dir(&tmp.path().join("real"));
+    plant(&tmp.path().join("link").join("deeper"), &tmp.path().join("link"));
+
+    assert_eq!(
+        refusal(Dir::open(&tmp.path().join("link"), true, None)),
+        Refusal::Symlink
+    );
 }
 
 #[skuld::test]

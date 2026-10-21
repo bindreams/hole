@@ -154,6 +154,8 @@ enum Step {
     Root,
     Parent,
     Name(OsString),
+    /// The steps of this link's target are all taken: the link is no longer being resolved.
+    Done(FileId),
 }
 
 fn steps_of(path: &Path) -> VecDeque<Step> {
@@ -191,8 +193,9 @@ impl Standing {
 struct Walk {
     steps: VecDeque<Step>,
     trail: Trail<u32>,
-    /// Links already followed in this walk; one met twice is a loop.
-    followed: HashSet<FileId>,
+    /// Links whose target the walk is in the middle of: meeting one again is a loop. A link met again after its
+    /// own target was walked (macOS's `/var` in a path under `/var`, and again in a link's target) is not.
+    resolving: HashSet<FileId>,
 }
 
 /// Opens the directory `name` in `cur`, or makes progress towards it: `Ok(Some(next))` is the directory;
@@ -228,11 +231,13 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
                 walk.trail
                     .follow(&parent.owner(), &entry.owner())
                     .map_err(Refusal::into_io_error)?;
-                if !walk.followed.insert((entry.dev, entry.ino)) {
+                let id = (entry.dev, entry.ino);
+                if !walk.resolving.insert(id) {
                     return Err(Refusal::Symlink.into_io_error());
                 }
                 let target = readlink_at(cur.fd.as_raw_fd(), &cname)?;
                 let mut expansion = steps_of(Path::new(&target));
+                expansion.push_back(Step::Done(id));
                 expansion.append(&mut walk.steps);
                 walk.steps = expansion;
                 Ok(None)
@@ -247,7 +252,7 @@ pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, cal
     let mut walk = Walk {
         steps: steps_of(path),
         trail: Trail::new(),
-        followed: HashSet::new(),
+        resolving: HashSet::new(),
     };
     let rooted = matches!(walk.steps.front(), Some(Step::Root));
     let mut cur = Standing::existing(open_start(if rooted { "/" } else { "." })?);
@@ -257,6 +262,9 @@ pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, cal
     while let Some(step) = walk.steps.pop_front() {
         match step {
             Step::Root => cur = Standing::existing(open_start("/")?),
+            Step::Done(id) => {
+                walk.resolving.remove(&id);
+            }
             Step::Parent => {
                 cur = Standing::existing(open_dir_at(cur.fd.as_raw_fd(), &CString::new("..").expect("no NUL"))?);
             }
