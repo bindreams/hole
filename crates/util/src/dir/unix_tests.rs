@@ -534,3 +534,85 @@ fn a_file_that_is_not_regular_is_never_trusted() {
     assert!(!trusted_appender(facts(false, 1000), Some((1000, 1000))));
     assert!(!trusted_appender(facts(false, 1000), None));
 }
+
+// Handing over a made folder ------------------------------------------------------------------------------------------
+//
+// The folder is made by name and handed over after, and the user who owns the parent can swap the name in between.
+// What the walk made is a directory its own process owns; anything else at the name is the user's doing.
+
+fn name(text: &str) -> CString {
+    CString::new(text).unwrap()
+}
+
+/// `give_made_folder` on `hole` in `parent` as a process of uid `maker`, giving to a uid that is neither it nor the
+/// runner's.
+fn give_as(maker: u32, parent: &Path) -> io::Result<()> {
+    let dir = Dir::open(parent, false, None).unwrap();
+    give_made_folder(dir.file().as_raw_fd(), &name("hole"), maker, mine() + 2)
+}
+
+#[skuld::test]
+fn a_hard_link_swapped_in_at_a_made_folders_name_is_refused_and_keeps_its_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, b"root's file\n").unwrap();
+    std::fs::hard_link(&victim, tmp.path().join("hole")).unwrap();
+    let before = std::fs::metadata(&victim).unwrap().uid();
+
+    let err = give_as(mine(), tmp.path()).expect_err("a file is not the folder the walk made");
+
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotDirectory), "{err:?}");
+    assert_eq!(std::fs::metadata(&victim).unwrap().uid(), before);
+}
+
+#[skuld::test]
+fn a_folder_of_someone_else_swapped_in_at_a_made_folders_name_is_refused_and_keeps_its_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("hole")).unwrap();
+    let before = std::fs::metadata(tmp.path().join("hole")).unwrap().uid();
+
+    // The folder is the runner's; the walk is a process of another uid, so it did not make it.
+    let err = give_as(mine() + 1, tmp.path()).expect_err("a folder the maker does not own is not one it made");
+
+    assert_eq!(
+        Refusal::from_error(&err),
+        Some(&Refusal::ForeignOwner { uid: before }),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::metadata(tmp.path().join("hole")).unwrap().uid(), before);
+}
+
+#[skuld::test]
+fn a_symlink_swapped_in_at_a_made_folders_name_is_refused_and_not_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, tmp.path().join("hole")).unwrap();
+    let before = std::fs::metadata(&target).unwrap().uid();
+
+    let err = give_as(mine(), tmp.path()).expect_err("a link is not the folder the walk made");
+
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink), "{err:?}");
+    assert_eq!(std::fs::metadata(&target).unwrap().uid(), before);
+}
+
+#[skuld::test]
+fn a_fifo_swapped_in_at_a_made_folders_name_is_refused_without_waiting_for_a_peer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo = name(tmp.path().join("hole").to_str().unwrap());
+    // SAFETY: `fifo` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let err = give_as(mine(), tmp.path()).expect_err("a FIFO is not the folder the walk made");
+
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotDirectory), "{err:?}");
+}
+
+#[skuld::test]
+fn a_made_folder_that_is_already_the_receivers_needs_no_hand_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("hole")).unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    give_made_folder(dir.file().as_raw_fd(), &name("hole"), mine(), mine()).unwrap();
+}
