@@ -624,6 +624,7 @@ fn install_bridge_with<Hold>(
 pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Error>> {
     uninstall_bridge_with(
         keep_covers,
+        hole_bridge::platform::os::hold_start_type,
         // Statement form, not `Ok(..?)`: the platforms return different error
         // types (macOS `io::Error`, Windows `Box<dyn Error>`), so on Windows
         // the `?` inside an `Ok` would convert nothing and trip
@@ -657,8 +658,17 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
     )
 }
 
-/// `uninstall_bridge`'s ordering, with the four effects injected so tests can
+/// `uninstall_bridge`'s ordering, with the five effects injected so tests can
 /// drive it without touching SCM/launchd or the host firewall.
+///
+/// **The uninstall holds the start-type lock for its whole run.** `hold` is
+/// taken before the stop and kept until this returns, so no repair or enable
+/// runs between the stop's restore and the delete, and the delete never
+/// discards a start type that one just set. The steps take the lock themselves;
+/// the thread running them already owns it, so they proceed. A lock that cannot
+/// be taken skips the stop and the deregistration, leaving the service as it
+/// is, and fails the uninstall; the release below does not touch the start type
+/// and still runs.
 ///
 /// **Stop, deregister, release — and the stop is gated on nothing.** Whether a
 /// bridge is running and whether a registration record still names it are
@@ -694,8 +704,9 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
 /// major-upgrade path (`RemoveExistingProducts`) must tear the old service down
 /// so its image can be replaced WITHOUT disarming the kill switch: the standing
 /// cover is what holds the update-cutover gap, and the new bridge re-adopts it.
-fn uninstall_bridge_with(
+fn uninstall_bridge_with<Hold>(
     keep_covers: bool,
+    hold: impl FnOnce() -> std::io::Result<Hold>,
     ensure_stopped: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
     is_installed: impl FnOnce() -> bool,
     deregister: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
@@ -703,18 +714,30 @@ fn uninstall_bridge_with(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut failures: Vec<String> = Vec::new();
 
-    let stopped = ensure_stopped();
-    if let Err(e) = &stopped {
-        failures.push(format!("could not stop the bridge: {e}"));
-    }
+    let held = match hold() {
+        Ok(held) => Some(held),
+        Err(e) => {
+            failures.push(format!(
+                "could not take the lock over the service's start type, so the service was not changed: {e}"
+            ));
+            None
+        }
+    };
 
-    if stopped.is_ok() {
-        if is_installed() {
-            if let Err(e) = deregister() {
-                failures.push(format!("could not deregister the bridge service: {e}"));
+    if held.is_some() {
+        let stopped = ensure_stopped();
+        if let Err(e) = &stopped {
+            failures.push(format!("could not stop the bridge: {e}"));
+        }
+
+        if stopped.is_ok() {
+            if is_installed() {
+                if let Err(e) = deregister() {
+                    failures.push(format!("could not deregister the bridge service: {e}"));
+                }
+            } else {
+                cli_log!(warn, "bridge is not installed");
             }
-        } else {
-            cli_log!(warn, "bridge is not installed");
         }
     }
 

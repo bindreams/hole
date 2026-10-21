@@ -311,13 +311,14 @@ fn build_elevation_script_output_compiles_and_roundtrips_via_osascript() {
 
 struct UninstallOutcome {
     result: Result<(), Box<dyn std::error::Error>>,
-    steps: Vec<&'static str>,
+    steps: Vec<String>,
 }
 
 /// The scripted outcome of each injected effect. `installed` is what
 /// `is_installed` reports; every other field is the `Result` its step returns.
 struct UninstallScript {
     keep_covers: bool,
+    hold: std::io::Result<()>,
     stopped: Result<(), Box<dyn std::error::Error>>,
     installed: bool,
     deregister: Result<(), Box<dyn std::error::Error>>,
@@ -330,6 +331,7 @@ impl Default for UninstallScript {
     fn default() -> Self {
         Self {
             keep_covers: false,
+            hold: Ok(()),
             stopped: Ok(()),
             installed: true,
             deregister: Ok(()),
@@ -338,21 +340,28 @@ impl Default for UninstallScript {
     }
 }
 
-fn uninstall_probe(script: UninstallScript) -> UninstallOutcome {
-    let steps = std::cell::RefCell::new(Vec::new());
+/// `uninstall_bridge_with` over `script`, and every step it ran, "hold" and
+/// "unhold" included.
+fn uninstall_probe_raw(script: UninstallScript) -> UninstallOutcome {
+    let steps: StepLog = std::cell::RefCell::new(Vec::new());
+    let note = |step: &str| steps.borrow_mut().push(step.to_string());
     let result = uninstall_bridge_with(
         script.keep_covers,
         || {
-            steps.borrow_mut().push("stop");
+            note("hold");
+            script.hold.map(|()| Unhold(&steps))
+        },
+        || {
+            note("stop");
             script.stopped
         },
         || script.installed,
         || {
-            steps.borrow_mut().push("deregister");
+            note("deregister");
             script.deregister
         },
         || {
-            steps.borrow_mut().push("release");
+            note("release");
             script.release
         },
     );
@@ -360,6 +369,18 @@ fn uninstall_probe(script: UninstallScript) -> UninstallOutcome {
         result,
         steps: steps.into_inner(),
     }
+}
+
+/// [`uninstall_probe_raw`] with the hold and the unhold taken off the ends of
+/// the steps, after checking they are on them: the lock is taken before the
+/// first step and let go after the last, whichever way the uninstall ends.
+fn uninstall_probe(script: UninstallScript) -> UninstallOutcome {
+    let mut out = uninstall_probe_raw(script);
+    assert_eq!(out.steps.first().map(String::as_str), Some("hold"), "{:?}", out.steps);
+    assert_eq!(out.steps.last().map(String::as_str), Some("unhold"), "{:?}", out.steps);
+    out.steps.pop();
+    out.steps.remove(0);
+    out
 }
 
 #[skuld::test]
@@ -468,6 +489,47 @@ fn uninstall_keep_covers_tears_down_without_releasing() {
         vec!["stop", "deregister"],
         "the MSI's major-upgrade path replaces the service image but must not disarm the kill switch"
     );
+}
+
+/// The stop and the deregistration are two retirements of the service; a repair
+/// or an enable that ran between them would act on a start type the second one
+/// then discards.
+#[skuld::test]
+fn the_uninstall_holds_the_start_type_from_before_its_first_step_to_after_its_last() {
+    let out = uninstall_probe_raw(UninstallScript::default());
+
+    assert!(out.result.is_ok());
+    assert_eq!(out.steps, ["hold", "stop", "deregister", "release", "unhold"]);
+}
+
+#[skuld::test]
+fn the_uninstall_lets_go_of_the_start_type_after_a_failed_step_too() {
+    let out = uninstall_probe_raw(UninstallScript {
+        stopped: Err("service is still STOP_PENDING".into()),
+        release: Err("a bridge instance is running".into()),
+        ..Default::default()
+    });
+
+    assert!(out.result.is_err());
+    assert_eq!(out.steps, ["hold", "stop", "release", "unhold"]);
+}
+
+/// Without the lock a repair could run between the stop and the delete, so the
+/// service is left alone. The release does not touch the start type and is the
+/// way out of a fail-closed host, so it still runs.
+#[skuld::test]
+fn an_uninstall_that_cannot_take_the_start_type_leaves_the_service_and_still_releases_the_covers() {
+    let out = uninstall_probe_raw(UninstallScript {
+        hold: Err(std::io::Error::other("injected hold failure")),
+        stopped: Err("must never be called".into()),
+        deregister: Err("must never be called".into()),
+        ..Default::default()
+    });
+
+    let report = out.result.expect_err("the service was not uninstalled").to_string();
+    assert!(report.contains("injected hold failure"), "{report}");
+    assert!(report.contains("the service was not changed"), "{report}");
+    assert_eq!(out.steps, ["hold", "release"]);
 }
 
 // Bridge status and what the GUI offers ===============================================================================
@@ -667,24 +729,24 @@ impl Default for InstallScript {
     }
 }
 
-/// Notes "release" when the install lets go of what `hold` returned.
-struct Release<'a>(&'a StepLog);
+/// Notes "unhold" when an install or uninstall lets go of what `hold` returned.
+struct Unhold<'a>(&'a StepLog);
 
-impl Drop for Release<'_> {
+impl Drop for Unhold<'_> {
     fn drop(&mut self) {
-        self.0.borrow_mut().push("release".to_string());
+        self.0.borrow_mut().push("unhold".to_string());
     }
 }
 
 /// `install_bridge_with` over `script`, and every step it ran, "hold" and
-/// "release" included.
+/// "unhold" included.
 fn install_probe_raw(script: InstallScript) -> (Result<(), Box<dyn std::error::Error>>, Vec<String>) {
     let steps: StepLog = std::cell::RefCell::new(Vec::new());
     let note = |step: &str| steps.borrow_mut().push(step.to_string());
     let result = install_bridge_with(
         || {
             note("hold");
-            script.hold.map(|()| Release(&steps))
+            script.hold.map(|()| Unhold(&steps))
         },
         || {
             note("disabled_by");
@@ -724,7 +786,7 @@ fn install_probe_raw(script: InstallScript) -> (Result<(), Box<dyn std::error::E
 fn install_probe(script: InstallScript) -> (Result<(), Box<dyn std::error::Error>>, Vec<String>) {
     let (result, mut steps) = install_probe_raw(script);
     assert_eq!(steps.first().map(String::as_str), Some("hold"), "{steps:?}");
-    assert_eq!(steps.last().map(String::as_str), Some("release"), "{steps:?}");
+    assert_eq!(steps.last().map(String::as_str), Some("unhold"), "{steps:?}");
     steps.pop();
     steps.remove(0);
     (result, steps)
@@ -832,7 +894,7 @@ fn the_install_holds_the_start_type_from_before_its_first_read_to_after_its_last
             "register(Automatic)",
             "repair",
             "start",
-            "release"
+            "unhold"
         ]
     );
 }
@@ -1022,6 +1084,20 @@ fn the_cover_release_is_wired_to_both_of_its_entry_points() {
         "`cutover::release_covers` is the only thing that can clear a persistent WFP filter before \
          the binary is deleted (#1003). A call site that vanished here is a silent no-op on a \
          fail-closed host; a new one is an unreviewed release path."
+    );
+}
+
+/// `install_bridge_with` and `uninstall_bridge_with` take their hold from the
+/// closure they are given, so every test of them stays green if the real lock
+/// is replaced by `|| Ok(())`. Pin who passes it.
+#[skuld::test]
+fn the_start_type_hold_is_wired_to_both_elevated_changes() {
+    let pattern = regex::Regex::new(r"\bhold_start_type\b").expect("regex must compile");
+
+    assert_eq!(
+        production_call_sites(&pattern),
+        expected_sites(&[("setup.rs", "install_bridge"), ("setup.rs", "uninstall_bridge"),]),
+        "a change that spans several start-type steps must hold the lock across them"
     );
 }
 

@@ -2174,7 +2174,14 @@ presence is the fact: any value of that name, of any type, is the record.
   the repair and the start, so no retirement, repair or enable runs between the
   read that decides the start type and the registration that acts on it; an
   install waits for a running uninstall and fails, changing nothing, if it
-  cannot take the lock. The session owns the guard (its last field), so
+  cannot take the lock. The elevated `bridge uninstall` holds it the same way
+  (`setup::uninstall_bridge_with`) through the stop and the deregistration, so
+  no repair or enable runs between the stop's restore and the delete; if it
+  cannot take the lock it leaves the service alone, fails, and still releases
+  the covers, which do not touch the start type. `bridge enable` and the cutover
+  each hold it in one session or hold already, and the cover release, the
+  `release-covers` action and the bridge service itself never read or write the
+  start type. The session owns the guard (its last field), so
   no start-type read exists without it, and a waiter blocks with no bound,
   because a retirement waits for the service to stop. Without it overlapping
   retirements left the service Disabled with no record, and a repair or an
@@ -2186,7 +2193,7 @@ presence is the fact: any value of that name, of any type, is the record.
   interrupted one**, with no stored marker to go stale; a holder that ends
   without releasing hands the lock on abandoned, which counts as taken. The
   thread that holds it may take it again (the cutover's repair step and every
-  step of the install do); another thread of the same process does not, so a
+  step of the install and uninstall do); another thread of the same process does not, so a
   hold is taken on the thread that runs the steps it covers.
   Proofs: the lock's own tests (a second thread waits and gets it once the
   holder lets go, abandonment, re-entry), `opening_a_retirement_waits_for_the_start_type_lock`
@@ -2196,7 +2203,9 @@ presence is the fact: any value of that name, of any type, is the record.
   `..._a_retirement_holds_the_start_type_lock_until_it_ends`,
   `..._the_cutover_hold_hardens_the_service_and_restores_it` and
   `..._an_install_holds_the_start_type_lock_through_every_step`; the install's
-  order is `the_install_holds_the_start_type_from_before_its_first_read_to_after_its_last_step`.
+  order is `the_install_holds_the_start_type_from_before_its_first_read_to_after_its_last_step`
+  and the uninstall's `the_uninstall_holds_the_start_type_from_before_its_first_step_to_after_its_last`;
+  `the_start_type_hold_is_wired_to_both_elevated_changes` pins who takes it.
 - **The update cutover hardens the service like a retirement.** Its stop is
   not final on its own: the SCM can restart a service that fails or exits
   non-zero after the settle's last look, and the old image would run, or race
