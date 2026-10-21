@@ -475,14 +475,9 @@ impl ReadyGate {
     /// Returns that failure whether or not a sender was registered.
     pub(crate) fn release(self) -> Option<HopFailure> {
         let delivered_since = || {
-            let Pending { plugin, decision } = self.unread?;
-            let mut decision = decision;
-            match decision.try_recv() {
-                Ok(Decision::Failed(cause)) => Some(HopFailure { plugin, cause }),
-                Ok(Decision::Ready { .. }) => None,
-                Ok(Decision::Dropped) => None,
-                Err(_) => None,
-            }
+            let Pending { plugin, mut decision } = self.unread?;
+            let cause = decision.try_recv().ok()?.failure()?.clone();
+            Some(HopFailure { plugin, cause })
         };
         let failure = self.failure.or_else(delivered_since);
         if let (Some(failure), Some(ready_tx)) = (&failure, self.ready_tx) {
@@ -508,19 +503,16 @@ pub(crate) enum Verdict {
 /// end without a decision after the cancel is the cancel's doing, so it is preempted rather than reported. A start failure
 /// cancels `shutdown`: the other plugins stop cooperatively.
 pub(crate) fn judge(decision: Result<Decision, oneshot::error::RecvError>, shutdown: &CancellationToken) -> Verdict {
-    match decision {
-        Ok(Decision::Failed(error)) => {
-            shutdown.cancel();
-            Verdict::Failed(error)
-        }
-        Ok(Decision::Ready { given, report }) => {
-            if shutdown.is_cancelled() {
-                return Verdict::Preempted;
-            }
-            Verdict::Ready { given, report }
-        }
-        Ok(Decision::Dropped) => ended_undecided(shutdown),
-        Err(_) => ended_undecided(shutdown),
+    // A hop task that returned without deciding is a readiness its plugin dropped.
+    let decision = decision.unwrap_or(Decision::Dropped);
+    if let Some(error) = decision.failure() {
+        shutdown.cancel();
+        return Verdict::Failed(error.clone());
+    }
+    match decision.ready() {
+        Some(_) if shutdown.is_cancelled() => Verdict::Preempted,
+        Some((given, report)) => Verdict::Ready { given, report },
+        None => ended_undecided(shutdown),
     }
 }
 

@@ -25,6 +25,25 @@ pub(crate) enum Decision {
 }
 
 impl Decision {
+    /// The start failure this decision carries. It stands whoever cancelled the chain afterwards, which is what
+    /// separates it from a [`Decision::Ready`] or a [`Decision::Dropped`] that the cancel overtook.
+    pub(crate) fn failure(&self) -> Option<&StartError> {
+        match self {
+            Decision::Ready { .. } => None,
+            Decision::Dropped => None,
+            Decision::Failed(error) => Some(error),
+        }
+    }
+
+    /// The `(given, report)` of a hop that is up.
+    pub(crate) fn ready(self) -> Option<(SocketAddr, PluginReady)> {
+        match self {
+            Decision::Ready { given, report } => Some((given, report)),
+            Decision::Dropped => None,
+            Decision::Failed(_) => None,
+        }
+    }
+
     /// The conflict that makes the hop run again instead of being reported, if this decision is one.
     ///
     /// Only an intermediate hop's bind conflict qualifies: its port was the chain's pick, so a fresh pick can win,
