@@ -19,6 +19,14 @@ fn plant_symlink(target: &Path, link: &Path) {
     std::os::windows::fs::symlink_dir(target, link).unwrap();
 }
 
+/// A symlink to the file `target` at `link`, of the kind an unprivileged user can plant.
+fn plant_file_symlink(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, link).unwrap();
+}
+
 fn names(dir: &Path) -> Vec<OsString> {
     let mut found: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
@@ -367,9 +375,9 @@ fn read_returns_the_bytes_of_the_file_and_not_found_for_a_missing_one() {
 fn read_does_not_follow_a_symlink_at_the_name() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = Dir::open(tmp.path(), false, None).unwrap();
-    let target = tmp.path().join("target-dir");
-    std::fs::create_dir(&target).unwrap();
-    plant_symlink(&target, &tmp.path().join("link"));
+    let target = tmp.path().join("secret");
+    std::fs::write(&target, b"theirs").unwrap();
+    plant_file_symlink(&target, &tmp.path().join("link"));
 
     assert!(dir.read(&name("link")).is_err());
 }
@@ -409,12 +417,12 @@ fn append_creates_the_file_and_then_adds_to_the_end_without_truncating() {
 fn append_does_not_follow_a_symlink_at_the_name() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = Dir::open(tmp.path(), false, None).unwrap();
-    let target = tmp.path().join("target-dir");
-    std::fs::create_dir(&target).unwrap();
-    plant_symlink(&target, &tmp.path().join("log"));
+    let target = tmp.path().join("secret");
+    std::fs::write(&target, b"theirs").unwrap();
+    plant_file_symlink(&target, &tmp.path().join("log"));
 
     assert!(dir.open_file(&name("log"), OpenFile::Append { mode: 0o644 }).is_err());
-    assert!(names(&target).is_empty());
+    assert_eq!(std::fs::read(&target).unwrap(), b"theirs");
 }
 
 #[skuld::test]
@@ -601,4 +609,20 @@ fn unlink_refuses_a_directory_and_leaves_it() {
 
     assert!(err.kind() != io::ErrorKind::NotFound, "{err:?}");
     assert!(tmp.path().join("sub").is_dir());
+}
+
+#[skuld::test]
+fn unlink_frees_the_name_at_once_even_while_a_reader_holds_the_file() {
+    // A reader that shares delete, as `std` opens: on Windows a delete that waits for the last handle leaves
+    // the name unusable, and a new file cannot take it.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("state.json"), b"old").unwrap();
+    let reader = std::fs::File::open(tmp.path().join("state.json")).unwrap();
+
+    dir.unlink(&name("state.json")).unwrap();
+    let recreated = dir.open_file(&name("state.json"), OpenFile::CreateNew { mode: 0o600 });
+
+    assert!(recreated.is_ok(), "the name is still taken: {:?}", recreated.err());
+    drop(reader);
 }

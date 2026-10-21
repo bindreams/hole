@@ -88,3 +88,27 @@ fn move_aside_of_a_dangling_symlink_state_path_moves_the_link() {
         "the backup is the link itself"
     );
 }
+
+#[skuld::test]
+fn store_over_a_symlink_state_path_backs_up_the_link_and_not_its_target() {
+    let dir = dir();
+    let away = crate::versioned_file::fixtures::dir();
+    let target = put(&away, "elsewhere.json", STATE);
+    let state = dir.path().join("decision.json");
+    make_symlink(&target, &state);
+
+    VersionedFile::<DecisionFile>::new(dir.path())
+        .store(
+            &DecisionFile { value: "new".into() },
+            &crate::versioned_file::DefaultPlacement::default(),
+        )
+        .unwrap();
+
+    let backup = dir.path().join("decision.json.unreadable.bak");
+    assert!(
+        std::fs::symlink_metadata(&backup).unwrap().is_symlink(),
+        "the backup is the link itself"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), STATE, "the target was not touched");
+    assert!(std::fs::read_to_string(&state).unwrap().contains("\"new\""));
+}
