@@ -630,6 +630,8 @@ type StepLog = std::cell::RefCell<Vec<String>>;
 struct InstallScript {
     disabled_by: std::io::Result<Option<DisabledBy>>,
     installed: bool,
+    stop: Result<(), &'static str>,
+    deregister: Result<(), &'static str>,
     repair: std::io::Result<RepairStep>,
     register: Result<(), &'static str>,
     start: Result<(), &'static str>,
@@ -641,6 +643,8 @@ impl Default for InstallScript {
         Self {
             disabled_by: Ok(None),
             installed: false,
+            stop: Ok(()),
+            deregister: Ok(()),
             repair: Ok(RepairStep::Nothing),
             register: Ok(()),
             start: Ok(()),
@@ -662,11 +666,11 @@ fn install_probe(script: InstallScript) -> (Result<(), Box<dyn std::error::Error
         },
         || {
             note("stop");
-            Ok(())
+            script.stop.map_err(Into::into)
         },
         || {
             note("deregister");
-            Ok(())
+            script.deregister.map_err(Into::into)
         },
         |start| {
             note(&format!("register({start:?})"));
@@ -766,6 +770,54 @@ fn a_start_type_that_cannot_be_read_fails_the_install_before_the_service_changes
     // already run, so the message must not claim the install changed nothing.
     assert!(message.contains("the service was not changed"), "{message}");
     assert_eq!(steps, ["disabled_by"]);
+}
+
+/// A reinstall whose stop or deregistration fails goes on to register, which
+/// then fails generically; the typed causes are in the log.
+#[skuld::test]
+fn a_failed_stop_or_deregistration_before_a_reinstall_is_logged_with_its_cause() {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+    let (result, steps) = install_probe(InstallScript {
+        installed: true,
+        stop: Err("stop refused: process 1234 is alive"),
+        deregister: Err("deregister refused: marked"),
+        register: Err("registration failed"),
+        ..InstallScript::default()
+    });
+    assert!(result.is_err());
+    assert_eq!(steps.last().map(String::as_str), Some("register(Automatic)"));
+    let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("WARN"), "{logged:?}");
+    assert!(logged.contains("stop refused: process 1234 is alive"), "{logged:?}");
+    assert!(logged.contains("deregister refused: marked"), "{logged:?}");
 }
 
 #[skuld::test]

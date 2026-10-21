@@ -554,8 +554,17 @@ fn install_bridge_with(
     // Idempotent: if already installed, stop and uninstall first
     if is_installed() {
         cli_log!(info, "bridge already installed, reinstalling...");
-        let _ = ensure_stopped();
-        let _ = deregister();
+        // Neither failure ends the reinstall: `register` follows and reports
+        // what is left. The cause is what `register`'s generic failure hides.
+        if let Err(e) = ensure_stopped() {
+            cli_log!(warn, "could not stop the installed bridge before reinstalling: {e}");
+        }
+        if let Err(e) = deregister() {
+            cli_log!(
+                warn,
+                "could not deregister the installed bridge before reinstalling: {e}"
+            );
+        }
     }
 
     register(start_type)?;
