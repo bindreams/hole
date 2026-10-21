@@ -8,10 +8,15 @@
 //! Every entry is built under a unique scratch directory beside the destination
 //! and renamed into place, so concurrent stagers never write through each
 //! other's (or the source's) inode. A reader of a file destination never sees a
-//! short or wrong file, every stage returns `Ok`, and the destination ends
-//! complete. On Windows a reader can additionally find the destination
-//! `NotFound` or `PermissionDenied` while a replace is in flight; Unix `rename(2)`
-//! has no such window.
+//! short or wrong file, and the destination ends complete. On Windows a reader
+//! can additionally find the destination `NotFound` or `PermissionDenied` while a
+//! replace is in flight; Unix `rename(2)` has no such window.
+//!
+//! A stage returns `Err` only when the OS refuses the replace, and the error is
+//! not retried. On Windows that is a destination that is a running image
+//! (`ERROR_ACCESS_DENIED`), open without share-delete access
+//! (`ERROR_SHARING_VIOLATION`) or delete-pending (`ERROR_ACCESS_DENIED`); a
+//! read-only destination is replaced.
 //!
 //! This logic was previously duplicated in
 //! `msi-installer/src/msi_installer/__init__.py:link_or_copy()` and (via
@@ -23,6 +28,8 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 
 use crate::bindir::{BindirFile, BindirSource};
+
+mod replace;
 
 /// Makes `staged` a hard link of `src`. An `Err` sends the entry down the copy fallback.
 pub(crate) type LinkFn<'a> = &'a (dyn Fn(&Path, &Path) -> io::Result<()> + Sync);
@@ -83,7 +90,7 @@ fn stage_file(src: &Path, dest: &Path, link: LinkFn<'_>) -> Result<()> {
 
     // `dest` only ever holds complete content. On Windows a replace briefly leaves the name
     // unopenable (`NotFound`/`PermissionDenied`) to a concurrent reader.
-    std::fs::rename(&staged, dest)
+    replace::replace_file(&staged, dest)
         .with_context(|| format!("failed to move {} over {}", staged.display(), dest.display()))
 }
 

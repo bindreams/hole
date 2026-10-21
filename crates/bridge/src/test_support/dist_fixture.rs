@@ -21,8 +21,9 @@
 //!
 //! ## Concurrency
 //!
-//! `xtask::run_stage` replaces each file by atomic rename; two layers also keep
-//! stagers from overlapping, so every test sees one complete staging pass:
+//! `xtask::run_stage` replaces each file's content by atomic rename (on Windows the
+//! name can briefly fail to open); two layers also keep stagers from overlapping,
+//! so every test sees one complete staging pass:
 //!
 //! 1. **Cross-process** — `serial = DIST_BIN` on the fixture. Skuld's
 //!    SQLite coordinator blocks concurrent tests in different nextest

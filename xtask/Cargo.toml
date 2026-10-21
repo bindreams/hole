@@ -83,6 +83,11 @@ typst-render = "=0.15.1"
 typst-utils = "=0.15.1"
 png = "0.18"
 
+# `stage` replaces a file by a POSIX-semantics rename that also ignores the read-only attribute,
+# which std's `rename` does not expose.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 # `check_vendoring_integrity_tests`'s real-`prek`-hook e2e fixtures: `std::env::temp_dir()`
 # can return an 8.3 short-name path component (e.g. `BINDRE~1`) on some Windows machines,

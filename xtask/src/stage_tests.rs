@@ -241,6 +241,66 @@ fn copy_fallback_replaces_existing_dest_file() {
     assert_eq!(fs::read(&dest).unwrap(), b"new content");
 }
 
+fn set_read_only(path: &Path) {
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+/// A read-only `dest` that is a different file than the staged entry must still be replaced,
+/// by link or by copy.
+fn assert_stage_replaces_a_read_only_dest(link: crate::stage::LinkFn<'_>) {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+
+    let src = src_dir.path().join("hole");
+    fs::write(&src, b"new content").unwrap();
+    let dest = dst_dir.path().join("hole");
+    fs::write(&dest, b"old content").unwrap();
+    set_read_only(&dest);
+
+    stage_with(dst_dir.path(), &[BindirFile::new(src, "hole")], link).unwrap();
+
+    assert_eq!(fs::read(&dest).unwrap(), b"new content");
+}
+
+#[skuld::test]
+fn stage_replaces_a_read_only_dest_by_hard_link() {
+    assert_stage_replaces_a_read_only_dest(&|src, staged| fs::hard_link(src, staged));
+}
+
+#[skuld::test]
+fn stage_replaces_a_read_only_dest_by_copy() {
+    assert_stage_replaces_a_read_only_dest(&link_unsupported);
+}
+
+/// A read-only `src` stages a read-only entry (a copy keeps the attribute, a link shares it);
+/// staging it again over its own earlier stage must work.
+fn assert_stage_of_a_read_only_src_can_be_repeated(link: crate::stage::LinkFn<'_>) {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+
+    let src = src_dir.path().join("hole");
+    fs::write(&src, b"read-only content").unwrap();
+    set_read_only(&src);
+    let files = [BindirFile::new(src, "hole")];
+
+    stage_with(dst_dir.path(), &files, link).unwrap();
+    stage_with(dst_dir.path(), &files, link).unwrap();
+
+    assert_eq!(fs::read(dst_dir.path().join("hole")).unwrap(), b"read-only content");
+}
+
+#[skuld::test]
+fn stage_of_a_read_only_src_by_hard_link_can_be_repeated() {
+    assert_stage_of_a_read_only_src_can_be_repeated(&|src, staged| fs::hard_link(src, staged));
+}
+
+#[skuld::test]
+fn stage_of_a_read_only_src_by_copy_can_be_repeated() {
+    assert_stage_of_a_read_only_src_can_be_repeated(&link_unsupported);
+}
+
 #[skuld::test]
 fn stage_leaves_only_the_staged_entries_in_out_dir() {
     let src_dir = tempfile::tempdir().unwrap();
@@ -269,8 +329,8 @@ const STAGERS: usize = 4;
 const STAGES_PER_STAGER: usize = 150;
 
 /// Whether a failed open of `dest` is the transient a Windows replace causes: the name is briefly
-/// unresolvable (`NotFound`) or deleted-pending (`PermissionDenied`). Unix `rename(2)` is atomic,
-/// so there no open may fail.
+/// unresolvable (`NotFound`) or its replaced file is gone (`PermissionDenied`, measured as
+/// `STATUS_FILE_DELETED`, `0xC0000123`). Unix `rename(2)` is atomic, so there no open may fail.
 fn is_open_error_of_a_replace_in_flight(e: &io::Error) -> bool {
     cfg!(windows) && matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
 }
@@ -297,10 +357,13 @@ fn assert_concurrent_file_staging_is_safe(link: crate::stage::LinkFn<'_>) {
 
     std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
-            // `done` is a real signal set after every stager has joined, not a deadline.
-            while !done.load(Ordering::Acquire) {
+            let mut complete_reads = 0_u64;
+            // `done` is a real signal set after every stager has joined, not a deadline. Read
+            // once more after it, so a reader scheduled late still reads.
+            loop {
+                let finished = done.load(Ordering::Acquire);
                 match fs::read(&dest) {
-                    Ok(bytes) if bytes == content => {}
+                    Ok(bytes) if bytes == content => complete_reads += 1,
                     Ok(bytes) => reader_violations.lock().unwrap().push(format!(
                         "dest read back {} bytes, expected {}",
                         bytes.len(),
@@ -309,6 +372,16 @@ fn assert_concurrent_file_staging_is_safe(link: crate::stage::LinkFn<'_>) {
                     Err(e) if is_open_error_of_a_replace_in_flight(&e) => {}
                     Err(e) => reader_violations.lock().unwrap().push(format!("dest unreadable: {e}")),
                 }
+                if finished {
+                    break;
+                }
+            }
+            // Tolerated open errors must not let a reader that never read pass.
+            if complete_reads == 0 {
+                reader_violations
+                    .lock()
+                    .unwrap()
+                    .push("the reader never completed a read".to_string());
             }
         });
 
