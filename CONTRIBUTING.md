@@ -648,6 +648,11 @@ re-derive them.
    already held (`openat` on unix, `NtCreateFile` relative to the parent handle on Windows). Every later step
    names a file by one name *inside that handle*.
 
+1. **Hand the walk the path as it was given.** A state or log directory is never resolved first (`canonicalize`,
+   `realpath`): resolving follows every link with no rule, so the user's link to a folder of root's is the folder's
+   own name by the time the walk judges it, and the walk accepts it. `std::path::absolute` makes a path absolute
+   without following anything.
+
 1. **The ownership-transition rule.** A link is followed only if the walk never moves from a folder an
    unprivileged user owns into one somebody else owns. This is systemd's `chase()` with `CHASE_SAFE`
    (`safe_transition`), tightened in two places:
@@ -695,7 +700,9 @@ re-derive them.
    same walk (`util::dir::read_state_file` for a state file). `std::fs::read` opens by path without `O_NONBLOCK`: a
    FIFO the user plants at the name hangs the bridge (at start, before it serves; at shutdown, before it tears
    down), a link to `/dev/zero` is read without end, and a link is read as any path the user names. A read by
-   path stays only where the reader is the unprivileged GUI.
+   path stays only where the reader is the unprivileged GUI. A read opens the directory with `Dir::open_read`
+   (`read_state_file` does): Windows is then not asked for the right to add to it, so a folder whose ACL a
+   machine tightened to read-only for the reader (the GUI reads the update marker as the user) is still read.
 
 1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a
    temp file, before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
@@ -712,10 +719,12 @@ of table (`no_reader_reads_through_a_symlink_planted_at_its_name`, `no_reader_wa
 and `state_symlink_tests.rs` in `tun-engine`): each writes a valid file, plants the name, and the reader must not
 report the file the name leads to. A hard link is the file's own inode, so a reader cannot tell it from the file;
 what a reader takes from a folder the user owns is parsed as that state's schema and never echoed.
-Three source scans close the class: `no_privileged_dir_code_changes_an_owner_or_a_mode_by_name` (nothing in
+Four source scans close the class: `no_privileged_dir_code_changes_an_owner_or_a_mode_by_name` (nothing in
 `util::dir` or in a file that opens a `Dir` calls `fchownat`, `fchmodat`, `chown`, `chmod`, `set_permissions` or a
-Windows by-path ACL call), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates open no file by
-path, except the files listed in `BY_PATH_ALLOWED`, each with its reason) and `no_state_module_logs_a_path` (the
+Windows by-path ACL call), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates, `hole` among them, open no
+file by path, except the files listed in `BY_PATH_ALLOWED`, each with its reason),
+`no_privileged_code_resolves_a_link_before_the_walk` (the same crates call neither `canonicalize` nor `realpath`,
+except the lines listed in `RESOLVING_ALLOWED`, each with its reason) and `no_state_module_logs_a_path` (the
 state modules log the file's name). A test of
 a walk plants links with `util::dir::testing` (`plant_link`, `user_dir`, `SystemScratch`), which hand what they
 make to an unprivileged owner whoever runs the test: a link to a folder the system owns must be refused, a link
