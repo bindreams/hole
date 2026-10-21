@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 
+// Each test binary compiles this module; not every one reruns a body.
+#[allow(dead_code)]
+pub mod lost_port;
+
 /// Path to the `mock-plugin` fixture — an ungated bin of this package
 /// (src/bin/mock-plugin.rs), so cargo builds it before these tests under
 /// every invocation, feature flags or not. The runtime env var wins —

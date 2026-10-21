@@ -14,6 +14,7 @@ use garter::{BinaryPlugin, ChainReady, ChainRunner, PluginEnv, StartError};
 use skuld::env;
 
 mod common;
+use common::lost_port::{rerun_on_lost_port, rerun_with, Attempt};
 use common::mock_plugin_path;
 
 /// The public port these tests ask for. A hop binds a port of its own choosing and the chain reports it in
@@ -388,6 +389,11 @@ async fn two_plugin_chain_server_mode_relays_data() {
 /// AND relays a payload through to the echo).
 #[skuld::test]
 async fn tier2_plugin_without_sitrep_still_readies_via_probe() {
+    rerun_on_lost_port(probe_echo_roundtrip).await;
+}
+
+/// The body of the tier-2 test: one silent plugin on `attempt.addr`, readied by the probe, echoing a payload.
+async fn probe_echo_roundtrip(attempt: Attempt) {
     let mock_path = mock_plugin_path();
 
     // Multi-accept echo. In `Probe` mode the self-probe TCP-connects to the
@@ -409,25 +415,24 @@ async fn tier2_plugin_without_sitrep_still_readies_via_probe() {
         }
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
-
     let (ready_tx, ready_rx) = oneshot::channel();
 
     // Single plugin, NO_SITREP so it emits nothing on stdout, default
     // `Probe` readiness (do NOT set ExpectSitrep) — readiness must come
     // from the self-probe.
+    let (verdict_key, verdict_path) = attempt.plugin_env();
     let runner = ChainRunner::new()
         .add(Box::new(
-            BinaryPlugin::new(&mock_path, None).env("MOCK_PLUGIN_NO_SITREP", "1"),
+            BinaryPlugin::new(&mock_path, None)
+                .env("MOCK_PLUGIN_NO_SITREP", "1")
+                .env(verdict_key, verdict_path),
         ))
         .on_ready(ready_tx)
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: attempt.addr.ip(),
+        local_port: attempt.addr.port(),
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         plugin_options: None,
@@ -451,6 +456,81 @@ async fn tier2_plugin_without_sitrep_still_readies_via_probe() {
     echo_task.abort();
     chain_task.abort();
     let _ = chain_task.await;
+}
+
+/// Another process holds the first attempt's port and answers the readiness probe, so the plugin loses its bind, the
+/// probe still reports the chain ready, and the round trip fails. The helper must run the body again on a free port.
+#[skuld::test]
+async fn a_test_body_that_lost_its_port_runs_again_on_a_new_one() {
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let held = holder.local_addr().unwrap();
+    // Answers the probe, then closes: the oracle for "this attempt was handed to the holder".
+    std::thread::spawn(move || while holder.accept().is_ok() {});
+
+    let picks = std::sync::atomic::AtomicUsize::new(0);
+    let pick = || {
+        if picks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            held
+        } else {
+            let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            free.local_addr().unwrap()
+        }
+    };
+    rerun_with(pick, probe_echo_roundtrip).await;
+
+    assert_eq!(
+        picks.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the held port fails the first attempt, the free one passes the second"
+    );
+}
+
+/// A failure after the plugin bound its port is not a lost race: the helper reports it and does not run the body again.
+#[skuld::test]
+async fn a_test_body_that_failed_after_binding_is_not_run_again() {
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = runs.clone();
+    let outcome = tokio::spawn(async move {
+        rerun_on_lost_port(move |attempt| {
+            let counted = counted.clone();
+            async move {
+                let run = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (verdict_key, verdict_path) = attempt.plugin_env();
+                let (ready_tx, ready_rx) = oneshot::channel();
+                let runner = ChainRunner::new()
+                    .add(Box::new(
+                        BinaryPlugin::new(mock_plugin_path(), None)
+                            .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                            .env(verdict_key, verdict_path),
+                    ))
+                    .on_ready(ready_tx)
+                    .drain_timeout(Duration::from_secs(3));
+                let env = PluginEnv {
+                    local_host: attempt.addr.ip(),
+                    local_port: attempt.addr.port(),
+                    remote_host: "127.0.0.1".to_string(),
+                    remote_port: 9,
+                    plugin_options: None,
+                };
+                let chain_task = tokio::spawn(async move { runner.run(env).await });
+                expect_ready(ready_rx).await.expect("chain ready");
+                chain_task.abort();
+                // Only the first run fails, so a helper that wrongly reran it would let the test pass.
+                assert!(run > 0, "a failure of the test body itself");
+            }
+        })
+        .await;
+    })
+    .await;
+
+    let failure = outcome
+        .expect_err("the body's own failure must reach the test")
+        .into_panic();
+    assert_eq!(
+        failure.downcast_ref::<&str>().copied(),
+        Some("a failure of the test body itself")
+    );
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 /// A plugin that emits `fatal` then exits surfaces a typed
@@ -685,6 +765,10 @@ async fn empty_transports_ready_surfaces_fatal() {
 /// `ready` was not honored.
 #[skuld::test]
 async fn version_skew_falls_back_to_probe() {
+    rerun_on_lost_port(version_skew_falls_back_to_probe_attempt).await;
+}
+
+async fn version_skew_falls_back_to_probe_attempt(attempt: Attempt) {
     let mock_path = mock_plugin_path();
 
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -703,15 +787,14 @@ async fn version_skew_falls_back_to_probe() {
         }
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
+    let (verdict_key, verdict_path) = attempt.plugin_env();
 
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let runner = ChainRunner::new()
         .add(Box::new(
             BinaryPlugin::new(&mock_path, None)
+                .env(verdict_key, verdict_path)
                 .readiness(garter::binary::ReadinessMode::ExpectSitrep)
                 .env("MOCK_PLUGIN_BAD_PROTOCOL", "1"),
         ))
@@ -719,8 +802,8 @@ async fn version_skew_falls_back_to_probe() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: attempt.addr.ip(),
+        local_port: attempt.addr.port(),
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         plugin_options: None,
@@ -766,6 +849,10 @@ async fn version_skew_falls_back_to_probe() {
 /// is the case that proves the probe is concurrent, not line-gated.)
 #[skuld::test]
 async fn auto_readies_silent_non_sitrep_plugin_via_probe() {
+    rerun_on_lost_port(auto_readies_silent_non_sitrep_plugin_via_probe_attempt).await;
+}
+
+async fn auto_readies_silent_non_sitrep_plugin_via_probe_attempt(attempt: Attempt) {
     let mock_path = mock_plugin_path();
 
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -784,22 +871,21 @@ async fn auto_readies_silent_non_sitrep_plugin_via_probe() {
         }
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
+    let (verdict_key, verdict_path) = attempt.plugin_env();
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
             BinaryPlugin::new(&mock_path, None)
+                .env(verdict_key, verdict_path)
                 .readiness(garter::binary::ReadinessMode::Auto)
                 .env("MOCK_PLUGIN_NO_SITREP", "1"),
         ))
         .on_ready(ready_tx)
         .drain_timeout(Duration::from_secs(3));
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: attempt.addr.ip(),
+        local_port: attempt.addr.port(),
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         plugin_options: None,
@@ -1220,20 +1306,23 @@ async fn collect_sunk_lines_until(
 /// of the stdout task, so see `wait_for_sunk_line` for why this is bounded.
 #[skuld::test]
 async fn log_sink_receives_probe_mode_stdout_lines() {
+    rerun_on_lost_port(log_sink_receives_probe_mode_stdout_lines_attempt).await;
+}
+
+async fn log_sink_receives_probe_mode_stdout_lines_attempt(attempt: Attempt) {
     let mock_path = mock_plugin_path();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let sink: garter::LogSink = Arc::new(move |line: &str| {
         let _ = tx.send(line.to_string());
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
+    let (verdict_key, verdict_path) = attempt.plugin_env();
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
             BinaryPlugin::new(&mock_path, None)
+                .env(verdict_key, verdict_path)
                 .readiness(garter::binary::ReadinessMode::Probe)
                 .log_sink(sink),
         ))
@@ -1241,8 +1330,8 @@ async fn log_sink_receives_probe_mode_stdout_lines() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: attempt.addr.ip(),
+        local_port: attempt.addr.port(),
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
@@ -1305,6 +1394,10 @@ async fn log_sink_receives_stderr_lines() {
 /// reader, so this is bounded for the same reason as the two tests above.
 #[skuld::test]
 async fn log_sink_receives_lines_drained_after_version_skew_fallback() {
+    rerun_on_lost_port(log_sink_receives_lines_drained_after_version_skew_fallback_attempt).await;
+}
+
+async fn log_sink_receives_lines_drained_after_version_skew_fallback_attempt(attempt: Attempt) {
     let mock_path = mock_plugin_path();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let sink: garter::LogSink = Arc::new(move |line: &str| {
@@ -1327,14 +1420,13 @@ async fn log_sink_receives_lines_drained_after_version_skew_fallback() {
         }
     });
 
-    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chain_local = chain_listener.local_addr().unwrap();
-    drop(chain_listener);
+    let (verdict_key, verdict_path) = attempt.plugin_env();
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let runner = ChainRunner::new()
         .add(Box::new(
             BinaryPlugin::new(&mock_path, None)
+                .env(verdict_key, verdict_path)
                 .readiness(garter::binary::ReadinessMode::ExpectSitrep)
                 .env("MOCK_PLUGIN_BAD_PROTOCOL", "1")
                 .log_sink(sink),
@@ -1343,8 +1435,8 @@ async fn log_sink_receives_lines_drained_after_version_skew_fallback() {
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
-        local_host: chain_local.ip(),
-        local_port: chain_local.port(),
+        local_host: attempt.addr.ip(),
+        local_port: attempt.addr.port(),
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         plugin_options: None,

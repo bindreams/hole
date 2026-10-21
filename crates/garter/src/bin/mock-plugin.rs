@@ -54,6 +54,22 @@ fn ignore_cooperative_signal() {
     unsafe { SetConsoleCtrlHandler(Some(absorb), true) }.expect("install a console control handler");
 }
 
+/// Knob: MOCK_PLUGIN_BIND_VERDICT=<file> — report the outcome of the listener bind: create `<file>` when it failed,
+/// `<file>.bound` when it succeeded. A test that picked the port itself reads it to tell a lost race from its own
+/// failure (tests/common/lost_port.rs).
+fn record_bind_verdict(bound: bool) {
+    let Some(path) = std::env::var_os("MOCK_PLUGIN_BIND_VERDICT") else {
+        return;
+    };
+    let mut file = std::path::PathBuf::from(path);
+    if bound {
+        let mut name = file.into_os_string();
+        name.push(".bound");
+        file = name.into();
+    }
+    std::fs::write(&file, b"").expect("write the bind verdict");
+}
+
 /// One readiness byte on stdout, flushed. The reader's `read_exact` of it is the
 /// happens-before edge for "this process is executing its own code" — which the
 /// Windows leg needs, because a child is not registered with any console at the
@@ -450,7 +466,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!("mock-plugin: listening on {local_addr}, forwarding to {remote_addr}");
-    let listener = TcpListener::bind(local_addr).await?;
+    let listener = match TcpListener::bind(local_addr).await {
+        Ok(listener) => {
+            record_bind_verdict(true);
+            listener
+        }
+        Err(e) => {
+            record_bind_verdict(false);
+            return Err(e.into());
+        }
+    };
 
     // sitrep ready: listener is bound & accepting. With
     // MOCK_PLUGIN_EMPTY_TRANSPORTS the transports set is empty (a protocol
