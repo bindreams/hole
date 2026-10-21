@@ -815,3 +815,10 @@ fn a_chain_of_children_each_exiting_before_the_next_look_is_waited_out() {
     );
     settle_on(&world);
 }
+
+/// A listed id that no probe ever opens does not keep the wait scanning.
+#[skuld::test]
+fn an_id_the_listing_names_and_no_probe_opens_does_not_hold_the_wait_for_ever() {
+    let world = World::new(&[10], vec![]).listing_an_id_that_never_opens(77);
+    settle_on(&world);
+}

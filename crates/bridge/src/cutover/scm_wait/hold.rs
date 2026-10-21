@@ -272,11 +272,17 @@ pub trait ProcessSource {
 /// The processes held so far, each with the id it was opened under.
 pub struct ProcessHolds<P> {
     held: Vec<(u32, P)>,
+    /// The ids the last scan found gone or exited at their probe, which the
+    /// next scan does not call vanished again ([`scan`]).
+    vanished: Vec<u32>,
 }
 
 impl<P> Default for ProcessHolds<P> {
     fn default() -> Self {
-        Self { held: Vec::new() }
+        Self {
+            held: Vec::new(),
+            vanished: Vec::new(),
+        }
     }
 }
 
@@ -427,11 +433,15 @@ impl<P> ProcessHolds<P> {
     /// scan itself found ([`ScanFinding`]), which the holds cannot: a process
     /// that exited between its probe and the next look is no longer held alive.
     pub fn hold_scanned<E: ProcessEnumerator<Process = P>>(&mut self, enumerator: &mut E) -> io::Result<Scanned> {
-        let result = scan(enumerator)?;
+        let result = scan(enumerator, &self.vanished)?;
         let finding = result.finding();
         let ScanResult {
-            alive, undetermined, ..
+            alive,
+            undetermined,
+            unprobeable,
+            ..
         } = result;
+        self.vanished = unprobeable;
         for (pid, process) in alive {
             self.adopt(pid, process);
         }

@@ -92,7 +92,7 @@ fn the_scan_holds_the_live_processes_that_carry_the_token() {
             (5, Process::Service),
         ],
     );
-    let result = scan(&mut host).unwrap();
+    let result = scan(&mut host, &[]).unwrap();
     assert_eq!(alive_pids(&result), vec![3, 5]);
     assert!(result.undetermined.is_empty());
 }
@@ -102,7 +102,7 @@ fn the_scan_holds_the_live_processes_that_carry_the_token() {
 #[skuld::test]
 fn a_process_that_has_exited_is_dropped_not_held() {
     let mut host = Host::new(1, vec![(3, Process::ServiceExited), (5, Process::Service)]);
-    let result = scan(&mut host).unwrap();
+    let result = scan(&mut host, &[]).unwrap();
     assert_eq!(alive_pids(&result), vec![5]);
     drop(result);
     assert_eq!(*host.log.borrow(), vec!["open(3)", "close(3)", "open(5)", "close(5)"]);
@@ -122,16 +122,69 @@ fn a_listed_process_gone_or_exited_by_its_probe_is_reported_vanished() {
             (5, Process::Undetermined(1117)),
         ],
     );
-    let result = scan(&mut host).unwrap();
+    let result = scan(&mut host, &[]).unwrap();
     assert!(result.alive.is_empty());
     assert_eq!(result.vanished, vec![3, 4]);
+}
+
+/// An id the listing names and no probe ever opens (a listing that names more
+/// than the host runs) is vanished once; listed and unopenable again on the
+/// next scan, it is not the service's and no reason for another pass. Without
+/// this the wait scans for ever.
+#[skuld::test]
+fn an_id_listed_again_that_still_does_not_open_is_not_vanished_a_second_time() {
+    for never_opens in [Process::Gone, Process::ServiceExited] {
+        let mut host = Host::new(1, vec![(7, never_opens), (3, Process::Stranger)]);
+        let first = scan(&mut host, &[]).unwrap();
+        assert_eq!(first.vanished, vec![7]);
+        assert_eq!(first.finding(), ScanFinding::Vanished);
+
+        let second = scan(&mut host, &first.vanished).unwrap();
+        assert!(second.vanished.is_empty());
+        assert_eq!(second.finding(), ScanFinding::Nothing);
+    }
+}
+
+/// The exemption is for the id as it was listed twice running: an id that was
+/// vanished and is not listed now carries nothing, and an id that opens as the
+/// service's is waited on whatever it did before.
+#[skuld::test]
+fn what_vanished_before_exempts_only_an_id_that_still_does_not_open() {
+    let mut host = Host::new(1, vec![(3, Process::Service), (4, Process::Gone)]);
+    let result = scan(&mut host, &[3, 4, 9]).unwrap();
+    assert_eq!(alive_pids(&result), vec![3]);
+    assert!(result.vanished.is_empty(), "4 stays exempt, 9 is not listed");
+    assert_eq!(result.unprobeable, vec![4], "and 4 is carried to the next scan");
+}
+
+/// An exempt id stays exempt while it is listed, however many scans, and a
+/// vanishing of another id in between does not lift it.
+#[skuld::test]
+fn an_exempt_id_stays_exempt_while_other_ids_vanish_around_it() {
+    let mut holds = ProcessHolds::default();
+    let mut host = Host::new(1, vec![(7, Process::Gone)]);
+    assert_eq!(holds.hold_scanned(&mut host).unwrap().finding, ScanFinding::Vanished);
+
+    host.processes.insert(8, Process::Gone);
+    assert_eq!(
+        holds.hold_scanned(&mut host).unwrap().finding,
+        ScanFinding::Vanished,
+        "8 is new"
+    );
+
+    host.processes.remove(&8);
+    assert_eq!(
+        holds.hold_scanned(&mut host).unwrap().finding,
+        ScanFinding::Nothing,
+        "7 is exempt still"
+    );
 }
 
 /// Only a scan that probed every listed process and found none of the service's
 /// alive may end a wait.
 #[skuld::test]
 fn only_a_scan_that_found_nothing_and_lost_no_process_ends_the_wait() {
-    let finding = |processes: Vec<(u32, Process)>| scan(&mut Host::new(1, processes)).unwrap().finding();
+    let finding = |processes: Vec<(u32, Process)>| scan(&mut Host::new(1, processes), &[]).unwrap().finding();
     assert_eq!(finding(vec![]), ScanFinding::Nothing);
     assert_eq!(
         finding(vec![(2, Process::Stranger), (5, Process::Undetermined(1117))]),
@@ -159,7 +212,7 @@ fn only_a_scan_that_found_nothing_and_lost_no_process_ends_the_wait() {
 #[skuld::test]
 fn the_calling_process_is_never_opened_or_held() {
     let mut host = Host::new(3, vec![(3, Process::Service), (5, Process::Service)]);
-    let result = scan(&mut host).unwrap();
+    let result = scan(&mut host, &[]).unwrap();
     assert_eq!(alive_pids(&result), vec![5]);
     assert!(!host.log.borrow().contains(&"open(3)".to_string()));
 }
@@ -176,7 +229,7 @@ fn an_undetermined_process_is_reported_with_its_pid_and_code_and_the_scan_goes_o
             (4, Process::Undetermined(6)),
         ],
     );
-    let result = scan(&mut host).unwrap();
+    let result = scan(&mut host, &[]).unwrap();
     assert_eq!(alive_pids(&result), vec![3]);
     assert_eq!(
         result.undetermined,
@@ -202,7 +255,7 @@ fn an_undetermined_process_is_logged_with_its_pid_and_code() {
         .finish();
     let _guard = set_default_in_current_thread(subscriber);
     let mut host = Host::new(1, vec![(2718, Process::Undetermined(1117))]);
-    scan(&mut host).unwrap();
+    scan(&mut host, &[]).unwrap();
     let logged = writer.snapshot();
     assert!(logged.contains("WARN"), "{logged:?}");
     assert!(logged.contains("2718"), "{logged:?}");
@@ -227,7 +280,7 @@ fn a_failure_that_is_not_a_verdict_ends_the_scan() {
             unreachable!()
         }
     }
-    assert_eq!(scan(&mut Fails).err().expect("fails").to_string(), "cannot list");
+    assert_eq!(scan(&mut Fails, &[]).err().expect("fails").to_string(), "cannot list");
 }
 
 /// What the scan finds joins the holds, so the next look shows it alive and a
@@ -268,4 +321,15 @@ fn holding_the_scan_makes_what_it_found_show_in_the_next_look() {
     );
     let look = holds.look(&mut Stopped).unwrap();
     assert!(look.held_alive && look.ever_held);
+}
+
+/// The holds remember what vanished at their last scan, so the exemption needs
+/// nothing of the caller.
+#[skuld::test]
+fn holds_scanning_twice_end_on_an_id_that_never_opens() {
+    let mut host = Host::new(1, vec![(7, Process::Gone)]);
+    let mut holds = ProcessHolds::default();
+    assert_eq!(holds.hold_scanned(&mut host).unwrap().finding, ScanFinding::Vanished);
+    assert_eq!(holds.hold_scanned(&mut host).unwrap().finding, ScanFinding::Nothing);
+    assert_eq!(holds.hold_scanned(&mut host).unwrap().finding, ScanFinding::Nothing);
 }

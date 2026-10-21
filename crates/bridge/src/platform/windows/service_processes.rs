@@ -164,9 +164,10 @@ impl ProcessEnumerator for HostProcesses<'_> {
 /// A process that cannot be probed never fails the scan: see
 /// [`Basis::verdict`] for `Basis::Scanned`. A listed process gone by its probe
 /// is in `vanished`: only [`ScanResult::finding`] says whether the scan found
-/// nothing.
+/// nothing. One scan, with no scan before it; a wait goes through
+/// [`ServiceProcesses::hold_scanned`], which remembers the last.
 pub fn scan_service_processes(service: &ServiceSid) -> io::Result<ScanResult<OwnedHandle>> {
-    scan(&mut HostProcesses { service })
+    scan(&mut HostProcesses { service }, &[])
 }
 
 /// Every process a retirement has seen its service run.

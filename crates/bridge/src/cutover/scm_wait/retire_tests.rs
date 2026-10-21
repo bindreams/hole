@@ -1283,3 +1283,10 @@ fn survivors_started_by_a_process_that_vanished_before_its_probe_are_waited_out(
     );
     wait_out_on(&world);
 }
+
+/// A listed id that no probe ever opens does not keep the wait scanning.
+#[skuld::test]
+fn an_id_the_listing_names_and_no_probe_opens_does_not_hold_the_survivors_wait_for_ever() {
+    let world = World::new(&[10], vec![]).listing_an_id_that_never_opens(77);
+    wait_out_on(&world);
+}

@@ -38,6 +38,8 @@ struct State {
     processes: BTreeMap<u32, bool>,
     script: Vec<(When, Act)>,
     snapshots: usize,
+    /// Ids every listing names and no probe opens.
+    never_open: Vec<u32>,
 }
 
 impl State {
@@ -79,8 +81,16 @@ impl World {
             processes: alive.iter().map(|pid| (*pid, true)).collect(),
             script,
             snapshots: 0,
+            never_open: Vec::new(),
         };
         World(Rc::new(RefCell::new(state)))
+    }
+
+    /// The same host whose listing also names `pid`, which no process has and
+    /// no probe opens.
+    pub fn listing_an_id_that_never_opens(self, pid: u32) -> Self {
+        self.0.borrow_mut().never_open.push(pid);
+        self
     }
 
     /// Every process of the service that has not exited.
@@ -125,6 +135,7 @@ impl ProcessEnumerator for Host {
             .iter()
             .filter(|(_, alive)| **alive)
             .map(|(pid, _)| *pid)
+            .chain(state.never_open.iter().copied())
             .collect();
         let now = When::AfterSnapshot(state.snapshots);
         state.run(now);
