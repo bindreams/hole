@@ -388,7 +388,18 @@ impl ChainPlugin for TapPlugin {
                 return Err(crate::Error::Chain(format!("tap[{plugin_name}]: bind {local}: {e}")));
             }
         };
-        let listen_addr = listener.local_addr().unwrap_or(local);
+        let listen_addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                stop_inner(&plugin_name, &inner_stop, inner_handle).await;
+                let detail = format!("tap[{plugin_name}]: read the address of the listener on {local}: {e}");
+                let _ = ready.send(Err(StartError::Fatal {
+                    detail: detail.clone(),
+                    errno: e.raw_os_error(),
+                }));
+                return Err(crate::Error::Chain(detail));
+            }
+        };
         tracing::info!(
             plugin = %plugin_name,
             %local,
