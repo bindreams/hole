@@ -16,6 +16,7 @@ use crate::plugin::ChainPlugin;
 use crate::port::{os_probe, Probe};
 use crate::sip003::PluginEnv;
 use crate::sitrep::{PluginReady, StartError, Transports};
+use crate::tap::TapPlugin;
 use crate::tap_tests::addr;
 
 const SS_LOCAL: u16 = 41000;
@@ -384,6 +385,54 @@ async fn a_conflict_reported_for_another_address_is_still_retried() {
 
     told.expect("the chain readies");
     assert_eq!(rig.wiring("B").len(), 2, "B was restarted");
+}
+
+/// The production intermediate hop is a `TapPlugin` around the real plugin, and one `TapPlugin` value runs again after
+/// its inner reported a conflict. The inner's conflict must reach the chain as the tap's own, and the second run must
+/// start from scratch.
+#[skuld::test]
+async fn a_tap_hop_whose_inner_loses_its_port_is_restarted_and_runs_again() {
+    let rig = Rig::new();
+    let runner = ChainRunner::new().add(rig.steady("A")).add(Box::new(TapPlugin::wrap(
+        rig.hop_that_starts_with("B", vec![Attempt::Conflict { addr: None }]),
+    )));
+
+    let launched = launch(runner);
+    let told = launched.ready.await.expect("a verdict");
+    let ready = told.expect("the chain readies once the tap's inner finds a port");
+
+    assert_eq!(
+        rig.trace(),
+        [
+            Event::Entered("B"),
+            Event::Conflicted("B"),
+            Event::Entered("B"),
+            Event::ReadySent("B"),
+            Event::Entered("A"),
+            Event::ReadySent("A"),
+        ],
+        "the inner ran twice, and A started only after the tap's second run readied"
+    );
+    let inner = rig.wiring("B");
+    assert_eq!(inner.len(), 2, "the tap's inner ran once per run of the tap");
+    assert!(
+        inner.iter().all(|&(_, remote)| remote == addr(SS_REMOTE)),
+        "the inner forwards to the destination on every run: {inner:?}"
+    );
+    let a = rig.wiring("A");
+    assert_eq!(a.len(), 1, "A ran once");
+    let tap_listens = a[0].1;
+    assert!(
+        inner.iter().all(|&(local, _)| local != tap_listens),
+        "A forwards to the tap's listener, not to its inner"
+    );
+    assert_eq!(ready.listen, addr(SS_LOCAL), "A is the public hop");
+    tokio::net::TcpStream::connect(tap_listens)
+        .await
+        .expect("the tap's second run is listening where A forwards");
+
+    launched.cancel.cancel();
+    launched.handle.await.unwrap().expect("a stop is a clean end");
 }
 
 #[skuld::test]
