@@ -214,7 +214,8 @@ impl ChainPlugin for Hop {
                     let _ = ready.send(Ok(report));
                     shutdown.cancelled().await;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // A fresh port can fail `PermissionDenied` on Windows; the product restarts on that too.
+                Err(e) if crate::port::is_port_race(&e) => {
                     self.rig.push(Event::Conflicted(self.name));
                     let errno = e.raw_os_error().expect("a bind failure carries an errno");
                     let _ = ready.send(Err(StartError::BindConflict { errno, addr: local }));
