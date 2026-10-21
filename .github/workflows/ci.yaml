@@ -948,6 +948,7 @@ jobs:
         timeout-minutes: 5
         with:
           node-version: lts/*
+          check-latest: true
 
       # Named explicitly, with --no-global: naming a config file makes the
       # validator treat it as *global* self-hosted config by default, which
