@@ -18,9 +18,9 @@
 //!
 //! The lock sits in a directory another principal may write (the
 //! elevation-mode state dir belongs to the interactive user), so whatever is at
-//! the lock name is attacker-chosen, and the name can change between any two
-//! calls that take it. The protocol decides on what the attacker cannot change
-//! once the file is open, never on the name:
+//! the lock name is attacker-chosen, and the name, like every directory above it,
+//! can change between any two calls that take it. The protocol decides on what
+//! the attacker cannot change once the file is open, never on the name:
 //!
 //! 1. Create the file with `O_CREAT|O_EXCL` (Windows: `CREATE_NEW`). That never
 //!    follows a symlink and never reuses a file, so a file it creates is ours.
@@ -46,7 +46,12 @@
 //! re-permissioned or chowned. A kept file with a second name is also refused,
 //! but that check does not protect: the count can change after it is read.
 //!
-//! The directory part of `path` is resolved by name.
+//! The directory part of `path` is opened once, as a [`Dir`] (missing components
+//! created, no symlink another user could have planted followed, and with an
+//! `owner` the directory must be owned by it or by this process), and every step
+//! on the lock file above goes through that handle: the open, the name check and
+//! the unlink of a leftover. A path swapped after the directory is open is never
+//! consulted.
 //!
 //! Windows applies no security descriptor (the owner-only DACL comes from the
 //! install path), so it has nothing to redirect. It opens without
@@ -56,10 +61,13 @@
 //! **Hooks.** `on_acquire_entry` and `on_token_drop` are deliberate no-op seams
 //! for a caller-side depth guard; keep the calls.
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use crate::dir::{self, Dir, EntryKind};
 
 #[cfg(unix)]
 mod unix;
@@ -98,19 +106,18 @@ enum Refusal {
     /// Owned by neither the expected owner nor this process.
     #[cfg(unix)]
     ForeignOwner { uid: u32 },
+    /// The directory the lock file is in was refused; see [`dir::Refusal`].
+    Directory(dir::Refusal),
 }
 
 impl Refusal {
-    /// What sits at `path` when opening it failed, if that is a reason to refuse it: the
+    /// What sits at `name` in `dir` when opening it failed, if that is a reason to refuse it: the
     /// OS reports a symlink, directory or socket by an errno that differs per platform.
-    fn of_unopenable(path: &Path) -> Option<Self> {
-        let kind = std::fs::symlink_metadata(path).ok()?.file_type();
-        if kind.is_symlink() {
-            Some(Refusal::Symlink)
-        } else if !kind.is_file() {
-            Some(Refusal::NotRegular)
-        } else {
-            None
+    fn of_unopenable(dir: &Dir, name: &OsStr) -> Option<Self> {
+        match dir.kind_of(name) {
+            Ok(Some(EntryKind::Symlink)) => Some(Refusal::Symlink),
+            Ok(Some(EntryKind::Directory | EntryKind::Other)) => Some(Refusal::NotRegular),
+            Ok(Some(EntryKind::File) | None) | Err(_) => None,
         }
     }
 }
@@ -123,6 +130,7 @@ impl fmt::Display for Refusal {
             Refusal::Symlink => f.write_str("the lock file is a symbolic link"),
             #[cfg(unix)]
             Refusal::ForeignOwner { uid } => write!(f, "the lock file is owned by uid {uid}"),
+            Refusal::Directory(why) => write!(f, "the lock file's directory was refused: {why}"),
         }
     }
 }
@@ -155,12 +163,25 @@ impl Refused {
         io::Error::new(io::ErrorKind::InvalidData, self)
     }
 
-    /// `err`, a failed open of `path`, as a refusal when what sits at `path` is one.
-    fn from_failed_open(path: &Path, err: io::Error) -> io::Error {
-        match Refusal::of_unopenable(path) {
+    /// `err`, a failed open of `name` in `dir` (the lock file `path`), as a refusal when what sits
+    /// there is one.
+    fn from_failed_open(dir: &Dir, name: &OsStr, path: &Path, err: io::Error) -> io::Error {
+        match Refusal::of_unopenable(dir, name) {
             Some(why) => Refused {
                 path: path.to_path_buf(),
                 why,
+            }
+            .into_io_error(),
+            None => err,
+        }
+    }
+
+    /// `err`, a failed open of the lock file's directory, as a refusal when it is one.
+    fn from_dir_error(path: &Path, err: io::Error) -> io::Error {
+        match dir::Refusal::from_error(&err) {
+            Some(&why) => Refused {
+                path: path.to_path_buf(),
+                why: Refusal::Directory(why),
             }
             .into_io_error(),
             None => err,
@@ -183,6 +204,15 @@ impl fmt::Debug for Refused {
 }
 
 impl std::error::Error for Refused {}
+
+/// The directory part and the file name of the lock path. A bare name is in the current directory.
+fn split(path: &Path) -> io::Result<(&Path, &OsStr)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a lock path must end in a file name"))?;
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+    Ok((parent.unwrap_or(Path::new(".")), name))
+}
 
 // Exclusive ===========================================================================================================
 
@@ -207,10 +237,13 @@ impl Exclusive {
     /// (the root-owned `--service` daemon case). See the module doc's open
     /// protocol.
     ///
-    /// A symlink, directory, socket or other non-regular file at the path, a
-    /// file with a second name, or one owned by a third party, is refused with
-    /// an `InvalidData` error holding a [`Refused`]; it is never
-    /// re-permissioned.
+    /// Missing directories above the file are created. A symlink, directory,
+    /// socket or other non-regular file at the path, a file with a second name,
+    /// one owned by a third party, or a directory in the path that is a symlink
+    /// or (with an `owner`) owned by a third party, is refused with an
+    /// `InvalidData` error holding a [`Refused`]; a refused file is never
+    /// re-permissioned and nothing is created outside the directory the path
+    /// names.
     pub fn try_acquire(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Option<Self>> {
         Self::try_acquire_as(path, owner, platform::caller())
     }

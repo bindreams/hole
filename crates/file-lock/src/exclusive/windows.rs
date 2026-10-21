@@ -1,20 +1,20 @@
 //! Windows half of [`super::Exclusive`]: `LockFileEx` and handle-based vetting.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
-use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
 use windows::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, GetFileType, LockFileEx, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TYPE_DISK, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_TYPE_DISK, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
 };
 use windows::Win32::System::IO::OVERLAPPED;
 
-use super::{Refusal, Refused};
+use super::{split, Refusal, Refused};
+use crate::dir::{Dir, OpenFile};
 
 /// What the open handle says about the lock file; the only input to [`vet`].
 #[derive(Clone, Copy, Debug)]
@@ -73,22 +73,16 @@ pub(super) fn caller() -> Caller {
 /// Opens the lock name without following a reparse point and shares everything but
 /// `DELETE`, so nobody can remove or rename the name while the handle is open.
 /// `Ok(None)` when the name vanished between the two opens.
-fn open_name(path: &Path) -> io::Result<Option<File>> {
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
-        .custom_flags((FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).0);
-    match options.clone().create_new(true).open(path) {
+fn open_name(dir: &Dir, name: &OsStr, path: &Path) -> io::Result<Option<File>> {
+    match dir.open_file(name, OpenFile::CreateNew { mode: 0o600 }) {
         Ok(file) => return Ok(Some(file)),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(err) => return Err(Refused::from_failed_open(path, err)),
+        Err(err) => return Err(Refused::from_failed_open(dir, name, path, err)),
     }
-    match options.open(path) {
+    match dir.open_file(name, OpenFile::Existing) {
         Ok(file) => Ok(Some(file)),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Refused::from_failed_open(path, err)),
+        Err(err) => Err(Refused::from_failed_open(dir, name, path, err)),
     }
 }
 
@@ -100,8 +94,10 @@ pub(super) fn open_locked(
     _owner: Option<(u32, u32)>,
     _caller: Caller,
 ) -> io::Result<Option<File>> {
+    let (parent, name) = split(path)?;
+    let dir = Dir::open(parent, true, None).map_err(|err| Refused::from_dir_error(path, err))?;
     let file = loop {
-        if let Some(file) = open_name(path)? {
+        if let Some(file) = open_name(&dir, name, path)? {
             break file;
         }
     };
