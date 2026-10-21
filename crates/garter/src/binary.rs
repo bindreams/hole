@@ -23,6 +23,11 @@ pub enum ReadinessMode {
     ExpectSitrep,
     /// Self-probe `local` with a TCP connect, retried with backoff until it accepts.
     /// The conservative default for arbitrary / legacy plugins.
+    ///
+    /// A plugin readied this way cannot report a lost port. If it fails to bind, it exits untyped and the chain
+    /// fails with `Fatal` ("exited before becoming ready"); a chain restarts only a typed `BindConflict`, so it does
+    /// not restart this hop on a fresh intermediate port. If another process listens on the port, the probe connects
+    /// to that process and reports ready for it. A public `local_port` of 0 cannot be probed at all.
     #[default]
     Probe,
     /// Infer the strategy from the plugin's own sitrep `hello`, with NO timeout.
@@ -211,7 +216,7 @@ impl ChainPlugin for BinaryPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         remote: SocketAddr,
         shutdown: CancellationToken,
@@ -366,7 +371,7 @@ impl ChainPlugin for BinaryPlugin {
         };
 
         // If the child binds but never readies and is then shut down, the readiness sender is dropped
-        // unsent and the aggregator synthesizes `Fatal{exited before ready}`.
+        // unsent and the chain synthesizes `Fatal{exited before ready}`.
         let supervised = supervise_plugin(
             &self.name,
             &mut child,
@@ -1007,7 +1012,7 @@ impl Supervised {
 ///
 /// The readiness sender (start-gate for `on_ready`) and the exit's `Err` (lifecycle error driving
 /// teardown) are two intentionally separate observers of one exit; a plugin that emits `fatal` then
-/// exits nonzero fires both, and neither must be suppressed. See `run_readiness_aggregator` in
+/// exits nonzero fires both, and neither must be suppressed. See `judge` in
 /// chain.rs for the full two-channel rationale. The start failure `failure` holds is delivered last,
 /// after the plugin's output has been drained (or given up on at its bound): whoever hears of it has
 /// been shown the plugin's last words. If this future is dropped or unwinds first, dropping `failure`

@@ -271,11 +271,81 @@ fn unspecified_for(target: SocketAddr) -> SocketAddr {
 pub(crate) fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     // Bind via std so the raw handle is available for the Windows ioctl before
     // the socket is registered with tokio's reactor.
-    let sock = std::net::UdpSocket::bind(addr)?;
+    configure_udp(std::net::UdpSocket::bind(addr)?)
+}
+
+/// [`bind_udp`] for a start-up listener, which keeps a lost bind apart from a failed setup.
+fn bind_udp_listener(what: &'static str, addr: SocketAddr) -> std::result::Result<UdpSocket, ListenError> {
+    let sock = std::net::UdpSocket::bind(addr).map_err(|source| ListenError::Bind { what, addr, source })?;
+    configure_udp(sock).map_err(|source| ListenError::Setup {
+        what: "configure the UDP listener",
+        source,
+    })
+}
+
+/// The part of [`bind_udp`] after the bind.
+fn configure_udp(sock: std::net::UdpSocket) -> std::io::Result<UdpSocket> {
     sock.set_nonblocking(true)?;
     #[cfg(windows)]
     disable_udp_connreset(&sock)?;
     UdpSocket::from_std(sock)
+}
+
+/// A start-up listener that did not come up. The variant is the policy: only a lost `bind` can be a
+/// [`garter::StartError::BindConflict`]; a socket that bound and then failed its setup is `Fatal` whatever the kind
+/// of its error, since no other port would help.
+#[derive(Debug)]
+pub(crate) enum ListenError {
+    Bind {
+        what: &'static str,
+        addr: SocketAddr,
+        source: std::io::Error,
+    },
+    Setup {
+        what: &'static str,
+        source: std::io::Error,
+    },
+}
+
+impl ListenError {
+    /// The typed start failure a hop reports for this.
+    pub(crate) fn start_error(&self) -> garter::StartError {
+        match self {
+            ListenError::Bind { addr, source, .. } => garter::StartError::from_bind_failure(source, *addr),
+            ListenError::Setup { what, source } => garter::StartError::Fatal {
+                detail: format!("{what}: {source}"),
+                errno: source.raw_os_error(),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ListenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListenError::Bind { what, addr, source } => write!(f, "{what} {addr}: {source}"),
+            ListenError::Setup { what, source } => write!(f, "{what}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for ListenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ListenError::Bind { source, .. } | ListenError::Setup { source, .. } => Some(source),
+        }
+    }
+}
+
+/// What a listener reports to its hop once up: the address it bound, or why it did not come up.
+type Bound<T> = std::result::Result<T, garter::StartError>;
+
+/// Reports `failure` on `bound_addr_tx` before the run returns it, so the hop's `ready` carries the typed cause.
+fn fail_start<T>(bound_addr_tx: Option<oneshot::Sender<Bound<T>>>, failure: ListenError) -> anyhow::Error {
+    if let Some(tx) = bound_addr_tx {
+        let _ = tx.send(Err(failure.start_error()));
+    }
+    anyhow::Error::new(failure)
 }
 
 #[cfg(windows)]
@@ -858,7 +928,7 @@ pub(crate) async fn run_client(
     remote: SocketAddr,
     udp_timeout: Duration,
     shutdown: CancellationToken,
-    bound_addr_tx: Option<oneshot::Sender<ClientBoundAddrs>>,
+    bound_addr_tx: Option<oneshot::Sender<Bound<ClientBoundAddrs>>>,
     // Test seam (mirrors `bound_addr_tx`): each reconnect decision `(failures,
     // productive)` after a session ends. Production passes `None`.
     reconnect_events: Option<mpsc::UnboundedSender<(u32, bool)>>,
@@ -869,15 +939,36 @@ pub(crate) async fn run_client(
     // churns. Binding per-reconnect would race the previous connection's
     // detached association tasks (which hold `Arc<UdpSocket>` clones) for the
     // port and could fail the rebind, terminating the client.
-    let tcp_listener = TcpListener::bind(local).await.context("bind local TCP")?;
-    let udp_socket = Arc::new(bind_udp(local).context("bind local UDP")?);
+    let tcp_listener = match TcpListener::bind(local).await {
+        Ok(listener) => listener,
+        Err(source) => {
+            let failure = ListenError::Bind {
+                what: "bind local TCP",
+                addr: local,
+                source,
+            };
+            return Err(fail_start(bound_addr_tx, failure));
+        }
+    };
+    let udp_socket = match bind_udp_listener("bind local UDP", local) {
+        Ok(socket) => Arc::new(socket),
+        Err(failure) => return Err(fail_start(bound_addr_tx, failure)),
+    };
+    let local_addr = |what: &'static str, addr: std::io::Result<SocketAddr>| {
+        addr.map_err(|source| ListenError::Setup { what, source })
+    };
+    let addrs = local_addr("read the local TCP address", tcp_listener.local_addr()).and_then(|tcp| {
+        let udp = local_addr("read the local UDP address", udp_socket.local_addr())?;
+        Ok(ClientBoundAddrs { tcp, udp })
+    });
+    let addrs = match addrs {
+        Ok(addrs) => addrs,
+        Err(failure) => return Err(fail_start(bound_addr_tx, failure)),
+    };
 
     // Readiness signal: both listeners are up, so the hop is serving.
     if let Some(tx) = bound_addr_tx {
-        let _ = tx.send(ClientBoundAddrs {
-            tcp: tcp_listener.local_addr().context("local tcp addr")?,
-            udp: udp_socket.local_addr().context("local udp addr")?,
-        });
+        let _ = tx.send(Ok(addrs));
     }
 
     let mut failures: u32 = 0;
@@ -946,7 +1037,7 @@ pub(crate) async fn run_server(
     local: SocketAddr,
     remote: SocketAddr,
     shutdown: CancellationToken,
-    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
+    bound_addr_tx: Option<oneshot::Sender<Bound<SocketAddr>>>,
 ) -> Result<()> {
     run_server_with_connections(config, local, remote, shutdown, bound_addr_tx, serve_underlying).await
 }
@@ -958,22 +1049,39 @@ pub(crate) async fn run_server_with_connections<S, F>(
     local: SocketAddr,
     remote: SocketAddr,
     shutdown: CancellationToken,
-    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
+    bound_addr_tx: Option<oneshot::Sender<Bound<SocketAddr>>>,
     serve: S,
 ) -> Result<()>
 where
     S: Fn(TcpStream, SocketAddr, yamux::Config, SocketAddr, CancellationToken) -> F,
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = TcpListener::bind(local)
-        .await
-        .with_context(|| format!("bind yamux server on {local}"))?;
+    let listener = match TcpListener::bind(local).await {
+        Ok(listener) => listener,
+        Err(source) => {
+            let failure = ListenError::Bind {
+                what: "bind yamux server on",
+                addr: local,
+                source,
+            };
+            return Err(fail_start(bound_addr_tx, failure));
+        }
+    };
+    let addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(source) => {
+            let failure = ListenError::Setup {
+                what: "read the local TCP address",
+                source,
+            };
+            return Err(fail_start(bound_addr_tx, failure));
+        }
+    };
     tracing::info!(local = %local, "yamux server listening");
 
     // Readiness signal: the listener is up, so the hop is serving.
     if let Some(tx) = bound_addr_tx {
-        let addr = listener.local_addr().context("local tcp addr")?;
-        let _ = tx.send(addr);
+        let _ = tx.send(Ok(addr));
     }
 
     // Every connection task is owned here, never detached: joining them is what
@@ -1234,9 +1342,10 @@ impl YamuxPlugin {
     }
 }
 
-/// Waits for the task that holds `ready`: `run` returning with that sender still held reads, to the chain, as a hop
-/// that is still starting rather than one that exited before ready. The task ends once `run_server`/`run_client`
-/// has sent its address or dropped its sender, and both have by now.
+/// Waits for the task that holds `ready`, so that `ready` holds the hop's result (its address, or its typed start
+/// failure) by the time `run` returns. A task `run` did not join could deliver a failure after the chain has read
+/// the exit as an untyped one. The task ends once `run_server`/`run_client` has sent its result or dropped its
+/// sender, and both have by now.
 async fn join_ready_holder(holder: tokio::task::JoinHandle<()>) {
     holder
         .await
@@ -1254,7 +1363,7 @@ impl garter::ChainPlugin for YamuxPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1263,13 +1372,16 @@ impl garter::ChainPlugin for YamuxPlugin {
         // Readiness comes from the bind point itself, over the same channel the
         // tests use: `run_server`/`run_client` send their bound address once
         // their listeners are up, and a YAMUX plugin serves both TCP and UDP
-        // there. A failed bind drops `ready` unsent, which the chain reports as an
-        // exit before ready once `run` has joined the task holding it. Startup is not
-        // gated on `shutdown` here — garter's readiness aggregator is `biased` on
-        // it and owns the "shutdown before ready" outcome for the whole chain.
+        // there. A listener that does not come up sends its typed `StartError`
+        // instead: a lost bind is a `BindConflict`, so the chain restarts an
+        // intermediate hop on a fresh port and the bridge retries a public one.
+        // `run` joins the task that forwards it, so `ready` holds it by the time
+        // `run` returns. Startup is not gated on `shutdown` here — garter's
+        // start sequence is `biased` on it and owns the "shutdown before ready"
+        // outcome for the whole chain.
         //
         // This is galoshes' INTERNAL hop-readiness signal: it feeds galoshes'
-        // OWN `ChainRunner` aggregator, which intersects it with the inner
+        // OWN `ChainRunner`, which intersects it with the inner
         // ex-ray hop and fires the chain-level `on_ready`. The PROCESS-level
         // sitrep the bridge reads is emitted separately in `main.rs` off that
         // `on_ready` outcome (see `galoshes::sitrep_out`). This signal knows
@@ -1277,25 +1389,25 @@ impl garter::ChainPlugin for YamuxPlugin {
         // contract.
         let transports = garter::Transports::TCP | garter::Transports::UDP;
         let result = if self.is_server {
-            let (bound_tx, bound_rx) = oneshot::channel();
+            let (bound_tx, bound_rx) = oneshot::channel::<Bound<SocketAddr>>();
             let holder = tokio::spawn(async move {
-                let Ok(listen) = bound_rx.await else { return };
-                let _ = ready.send(Ok(garter::PluginReady { listen, transports }));
+                let Ok(bound) = bound_rx.await else { return };
+                let _ = ready.send(bound.map(|listen| garter::PluginReady { listen, transports }));
             });
-            let result = run_server(self.config, local, remote, shutdown, Some(bound_tx)).await;
+            let result = run_server(self.config.clone(), local, remote, shutdown, Some(bound_tx)).await;
             join_ready_holder(holder).await;
             result
         } else {
-            let (bound_tx, bound_rx) = oneshot::channel::<ClientBoundAddrs>();
+            let (bound_tx, bound_rx) = oneshot::channel::<Bound<ClientBoundAddrs>>();
             let holder = tokio::spawn(async move {
-                let Ok(addrs) = bound_rx.await else { return };
-                let _ = ready.send(Ok(garter::PluginReady {
+                let Ok(bound) = bound_rx.await else { return };
+                let _ = ready.send(bound.map(|addrs| garter::PluginReady {
                     listen: addrs.tcp,
                     transports,
                 }));
             });
             let result = run_client(
-                self.config,
+                self.config.clone(),
                 local,
                 remote,
                 self.udp_timeout,

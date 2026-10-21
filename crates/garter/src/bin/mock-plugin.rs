@@ -1,7 +1,7 @@
 #![allow(clippy::disallowed_methods)] // test fixture: re-execs its own binary, not an OS tool
 use std::net::SocketAddr;
 
-use garter::sitrep::{SitrepEvent, Transports, SITREP_PROTOCOL};
+use garter::sitrep::{SitrepEvent, StartError, Transports, SITREP_PROTOCOL};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -52,6 +52,51 @@ fn ignore_cooperative_signal() {
 
     // SAFETY: `absorb` is a valid handler with the required ABI and no state of its own.
     unsafe { SetConsoleCtrlHandler(Some(absorb), true) }.expect("install a console control handler");
+}
+
+/// Knob: `MOCK_PLUGIN_BIND_VERDICT=<file>` — report the outcome of the listener bind: create `<file>` when a port race
+/// made it fail, `<file>.bound` when it succeeded. A bind that failed for any other reason writes nothing: it fails the
+/// same way on every port, so it is not a lost race. A test that picked the port itself reads the files to tell a lost
+/// race from its own failure (tests/common/lost_port.rs).
+fn record_bind_verdict(outcome: &io::Result<TcpListener>, addr: SocketAddr) {
+    let Some(path) = std::env::var_os("MOCK_PLUGIN_BIND_VERDICT") else {
+        return;
+    };
+    let mut file = std::path::PathBuf::from(path);
+    match outcome {
+        Ok(_) => {
+            let mut name = file.into_os_string();
+            name.push(".bound");
+            file = name.into();
+        }
+        Err(e) if matches!(StartError::from_bind_failure(e, addr), StartError::BindConflict { .. }) => {}
+        Err(_) => return,
+    }
+    std::fs::write(&file, b"").expect("write the bind verdict");
+}
+
+/// Knob: `MOCK_PLUGIN_BIND_GATE=<addr>` — before binding, connect to `<addr>` and wait for the peer to close the
+/// connection. A test holds the plugin short of its bind for as long as it needs (tests/chain_integration.rs).
+async fn wait_for_bind_gate() {
+    use tokio::io::AsyncReadExt;
+
+    let Some(addr) = std::env::var_os("MOCK_PLUGIN_BIND_GATE") else {
+        return;
+    };
+    let addr = addr.to_str().expect("MOCK_PLUGIN_BIND_GATE is valid utf-8");
+    let mut gate = TcpStream::connect(addr).await.expect("connect to the bind gate");
+    // End of stream or a reset: either way the peer is done holding the gate.
+    let _ = gate.read(&mut [0u8; 1]).await;
+}
+
+/// Knob: `MOCK_PLUGIN_BIND_ERROR=invalid_input` — fail the listener bind with an error of that kind instead of binding.
+/// A test cannot make the OS refuse a bind for a reason that is not a port race.
+async fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    match std::env::var("MOCK_PLUGIN_BIND_ERROR").as_deref() {
+        Err(_) => TcpListener::bind(addr).await,
+        Ok("invalid_input") => Err(io::ErrorKind::InvalidInput.into()),
+        Ok(other) => panic!("MOCK_PLUGIN_BIND_ERROR={other:?} is not a known kind"),
+    }
 }
 
 /// One readiness byte on stdout, flushed. The reader's `read_exact` of it is the
@@ -450,7 +495,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!("mock-plugin: listening on {local_addr}, forwarding to {remote_addr}");
-    let listener = TcpListener::bind(local_addr).await?;
+    wait_for_bind_gate().await;
+    let bound = bind_listener(local_addr).await;
+    record_bind_verdict(&bound, local_addr);
+    let listener = bound?;
 
     // sitrep ready: listener is bound & accepting. With
     // MOCK_PLUGIN_EMPTY_TRANSPORTS the transports set is empty (a protocol
@@ -466,7 +514,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     emit(
         &SitrepEvent::Ready {
-            listen: local_addr,
+            listen: listener.local_addr()?,
             transports: ready_transports,
         },
         sitrep_enabled,

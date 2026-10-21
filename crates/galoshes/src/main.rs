@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let ex_ray_plugin =
         BinaryPlugin::new(verified.exec_path(), Some(&ex_ray_options)).readiness(ReadinessMode::ExpectSitrep);
 
-    // Bridge-facing readiness: galoshes' OWN ChainRunner aggregates the
+    // Bridge-facing readiness: galoshes' OWN ChainRunner folds the
     // per-plugin readiness of [yamux, ex-ray] and fires this channel with
     // the chain-level outcome. We map that to a PROCESS-stdout sitrep event
     // (overriding the inner-chain transport intersection with galoshes'
@@ -118,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
     // `verified` must remain alive here -- its open handle prevents TOCTOU
     // attacks on the extracted binary. It is dropped after `run()` returns.
     let result = runner.run(env).await.map_err(|e| anyhow::anyhow!(e));
-    // The aggregator drops `ready_tx` once the chain ends (or on shutdown),
+    // The runner drops `ready_tx` once the chain ends (or on shutdown),
     // so the emitter task either already emitted or sees RecvError; await
     // it to completion rather than fire-and-forget.
     let _ = emitter.await;

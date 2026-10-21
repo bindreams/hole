@@ -1,3 +1,6 @@
+use std::io;
+use std::net::SocketAddr;
+
 use super::sitrep::*;
 
 #[skuld::test]
@@ -167,4 +170,58 @@ fn fatal_includes_errno_key_when_some() {
         serde_json::to_string(&ev).unwrap(),
         r#"{"event":"fatal","detail":"boom","errno":13}"#
     );
+}
+
+// from_bind_failure ---------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_bind_that_lost_its_port_is_a_conflict_with_the_real_errno() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = held.local_addr().expect("local addr");
+    let err = std::net::TcpListener::bind(addr).expect_err("the port is held");
+
+    match StartError::from_bind_failure(&err, addr) {
+        StartError::BindConflict { errno, addr: got } => {
+            assert_eq!(Some(errno), err.raw_os_error());
+            assert_eq!(got, addr);
+        }
+        other => panic!("expected BindConflict, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn every_port_race_kind_is_a_conflict_and_an_unknown_errno_is_zero() {
+    let addr: SocketAddr = "127.0.0.1:1984".parse().unwrap();
+    for kind in [
+        io::ErrorKind::AddrInUse,
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::AddrNotAvailable,
+    ] {
+        let err = io::Error::from(kind);
+        assert!(
+            matches!(
+                StartError::from_bind_failure(&err, addr),
+                StartError::BindConflict { errno: 0, addr: got } if got == addr
+            ),
+            "{kind:?} must be a BindConflict"
+        );
+    }
+}
+
+#[skuld::test]
+fn any_other_bind_error_is_fatal_and_keeps_its_errno() {
+    let addr: SocketAddr = "127.0.0.1:1984".parse().unwrap();
+    for err in [
+        io::Error::from(io::ErrorKind::InvalidInput),
+        io::Error::from(io::ErrorKind::NotFound),
+        io::Error::from_raw_os_error(22),
+    ] {
+        match StartError::from_bind_failure(&err, addr) {
+            StartError::Fatal { detail, errno } => {
+                assert_eq!(errno, err.raw_os_error(), "{err:?}");
+                assert!(detail.contains("1984"), "the detail names the address: {detail}");
+            }
+            other => panic!("{err:?} must be Fatal, got {other:?}"),
+        }
+    }
 }

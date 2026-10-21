@@ -53,12 +53,11 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::counting::CountingStream;
+use crate::once::Once;
 use crate::plugin::ChainPlugin;
+use crate::port::is_port_race;
 use crate::sitrep::{PluginReady, StartError};
-use crate::tap::{
-    allocate_inner_port_with, connect_target, is_port_race, reports_the_given_address, retry_connect_with, Connector,
-    TapPlugin,
-};
+use crate::tap::{connect_target, reports_the_given_address, retry_connect_with, Connector, TapPlugin};
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
@@ -112,7 +111,7 @@ impl ChainPlugin for StubPlugin {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -543,7 +542,7 @@ impl ChainPlugin for CountingStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -585,13 +584,13 @@ impl ChainPlugin for StolenPortStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        let _torn_down = SetOnDrop(self.torn_down);
+        let _torn_down = SetOnDrop(self.torn_down.clone());
         // A port this stub holds itself, so it cannot lose it to a third party.
         let other_process = std::net::TcpListener::bind(SocketAddr::new(local.ip(), 0)).expect("take a port");
         let taken = other_process.local_addr().unwrap();
@@ -618,14 +617,14 @@ impl ChainPlugin for FailingStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        if let Some(e) = self.report {
-            let _ = ready.send(Err(e));
+        if let Some(e) = &self.report {
+            let _ = ready.send(Err(e.clone()));
         }
         Err(crate::Error::Chain("stub failed".into()))
     }
@@ -643,7 +642,7 @@ impl ChainPlugin for ExitsHoldingReadyStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -667,7 +666,7 @@ impl ChainPlugin for ParkedStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -710,6 +709,49 @@ async fn a_public_bind_conflict_is_reported_and_the_inner_is_not_restarted() {
         "a public conflict never restarts an inner that bound"
     );
     drop(holder);
+}
+
+/// The public bind goes through the one bind classifier: a port race is the retryable `BindConflict` (errno 0 when the
+/// error has none), and any other failure is a `Fatal` that keeps the errno, because retrying it cannot succeed.
+#[skuld::test]
+async fn a_public_bind_failure_is_typed_by_the_bind_race_rule() {
+    let public: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+    for (error, conflict) in [
+        (io::Error::from(io::ErrorKind::AddrInUse), true),
+        (io::Error::from(io::ErrorKind::PermissionDenied), true),
+        (io::Error::from(io::ErrorKind::AddrNotAvailable), true),
+        (io::Error::from(io::ErrorKind::InvalidInput), false),
+        (io::Error::other("scripted bind failure"), false),
+        // 22 is no port-race errno on either family of OS: EINVAL, and an uncategorized Windows code.
+        (io::Error::from_raw_os_error(22), false),
+    ] {
+        let case = format!("{error:?}");
+        let errno = error.raw_os_error();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let tap = TapPlugin::wrap_with_bind_failure(Box::new(CountingStub { runs: runs.clone() }), error);
+
+        let (ready, result) = failed_start_of(tap, public, unused_remote()).await;
+
+        let reported = ready.expect("the start failure is reported, not dropped").unwrap_err();
+        match (conflict, &reported) {
+            (true, StartError::BindConflict { addr, errno: got }) => {
+                assert_eq!((*addr, *got), (public, errno.unwrap_or(0)), "{case}");
+            }
+            (false, StartError::Fatal { errno: got, detail }) => {
+                assert_eq!(*got, errno, "{case}");
+                assert!(
+                    detail.contains("4242"),
+                    "{case}: the detail names the address: {detail}"
+                );
+            }
+            _ => panic!(
+                "{case}: want {}, got {reported:?}",
+                if conflict { "BindConflict" } else { "Fatal" }
+            ),
+        }
+        assert!(result.is_err(), "{case}: run must fail, got {result:?}");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "{case}: the inner had started");
+    }
 }
 
 #[skuld::test]
@@ -756,7 +798,7 @@ impl ChainPlugin for StealOnceStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -868,7 +910,7 @@ pub(crate) fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-fn err(kind: io::ErrorKind) -> io::Result<SocketAddr> {
+pub(crate) fn err(kind: io::ErrorKind) -> io::Result<SocketAddr> {
     Err(io::Error::from(kind))
 }
 
@@ -883,129 +925,6 @@ pub(crate) fn scripted(
         calls.fetch_add(1, Ordering::SeqCst);
         script.next().expect("probe called past the end of its script")
     }
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_never_returns_a_taken_port() {
-    tokio::time::pause();
-    // Every taken port collides repeatedly, past any fixed attempt count.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut script: Vec<_> = (0..9).map(|i| Ok(addr(if i % 2 == 0 { 5000 } else { 6000 }))).collect();
-    script.push(Ok(addr(5001)));
-    let picked = allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000, 6000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(picked, Some(addr(5001)));
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_retries_a_bind_race_without_a_cap() {
-    tokio::time::pause();
-    let kinds = [io::ErrorKind::AddrInUse, io::ErrorKind::PermissionDenied];
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut script: Vec<_> = (0..60).map(|i| err(kinds[i % 2])).collect();
-    script.push(Ok(addr(5001)));
-    let picked = allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(picked, Some(addr(5001)));
-    assert_eq!(calls.load(Ordering::SeqCst), 61);
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_retries_addr_not_available() {
-    // A Windows excluded-port-range refusal, like `util::retry::is_bind_race`.
-    tokio::time::pause();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let script = vec![err(io::ErrorKind::AddrNotAvailable), Ok(addr(5001))];
-    let picked = allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(picked, Some(addr(5001)));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_returns_any_other_error_at_once() {
-    tokio::time::pause();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let script = vec![err(io::ErrorKind::AddrInUse), err(io::ErrorKind::Other)];
-    let e = allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(e.kind(), io::ErrorKind::Other);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-}
-
-#[skuld::test]
-async fn the_inner_port_pick_paces_its_retries() {
-    tokio::time::pause();
-    // The backoff starts at 5ms and is capped at 50ms: 60 retries take well over 2s
-    // of virtual time, where a loop that never waits takes none.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut script: Vec<_> = (0..60).map(|_| err(io::ErrorKind::AddrInUse)).collect();
-    script.push(Ok(addr(5001)));
-    let started = tokio::time::Instant::now();
-    allocate_inner_port_with(
-        "p",
-        addr(5000).ip(),
-        &[5000],
-        scripted(script, &calls),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    assert!(started.elapsed() > Duration::from_secs(2), "{:?}", started.elapsed());
-}
-
-#[skuld::test]
-async fn shutdown_ends_the_inner_port_pick() {
-    tokio::time::pause();
-    let shutdown = CancellationToken::new();
-    let calls = AtomicUsize::new(0);
-    // Races forever; the third attempt also fires shutdown.
-    let probe = || {
-        if calls.fetch_add(1, Ordering::SeqCst) == 2 {
-            shutdown.cancel();
-        }
-        err(io::ErrorKind::AddrInUse)
-    };
-    let picked = allocate_inner_port_with("p", addr(5000).ip(), &[5000], probe, &shutdown)
-        .await
-        .unwrap();
-
-    assert_eq!(picked, None);
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
 /// Stands in for a runaway test: a paused runtime that goes idle jumps the clock, so a wait that
@@ -1024,7 +943,7 @@ impl ChainPlugin for RecordingStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -1220,13 +1139,13 @@ impl ChainPlugin for SilentStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
         ready: oneshot::Sender<Ready>,
     ) -> crate::Result<()> {
-        let _torn_down = SetOnDrop(self.torn_down);
+        let _torn_down = SetOnDrop(self.torn_down.clone());
         let _held = (!self.drop_ready).then_some(ready);
         shutdown.cancelled().await;
         Ok(())
@@ -1309,7 +1228,7 @@ impl ChainPlugin for ForeignListenStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         _local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1349,7 +1268,7 @@ impl ChainPlugin for OtherPortStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1440,7 +1359,7 @@ impl ChainPlugin for ReportsAnotherIpStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1637,7 +1556,7 @@ async fn a_short_run_of_refusals_never_warns() {
 /// Reports ready on the address it was given without binding it, then exits with an
 /// error once `die` fires.
 struct ReadiedStub {
-    die: oneshot::Receiver<()>,
+    die: Once<oneshot::Receiver<()>>,
 }
 
 #[async_trait::async_trait]
@@ -1647,7 +1566,7 @@ impl ChainPlugin for ReadiedStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
@@ -1657,7 +1576,7 @@ impl ChainPlugin for ReadiedStub {
             listen: local,
             transports: crate::sitrep::Transports::TCP,
         }));
-        let _ = self.die.await;
+        let _ = self.die.take().await;
         Err(crate::Error::Chain("stub died".into()))
     }
 }
@@ -1679,7 +1598,7 @@ async fn the_inner_exiting_ends_a_forwarder_still_retrying_its_connect() {
         ))))
     });
     let tap = Box::new(TapPlugin::wrap_with_connector(
-        Box::new(ReadiedStub { die: die_rx }),
+        Box::new(ReadiedStub { die: Once::new(die_rx) }),
         always_refused,
     ));
     // Never cancelled: only the inner's exit may end the tap and its forwarder.
@@ -1761,8 +1680,8 @@ pub(crate) fn announce(
 struct LastLineStub {
     prelude: Prelude,
     /// Fires when the inner has been told to stop.
-    stopped: oneshot::Sender<()>,
-    gate: oneshot::Receiver<()>,
+    stopped: Once<oneshot::Sender<()>>,
+    gate: Once<oneshot::Receiver<()>>,
     relayed: Arc<AtomicBool>,
 }
 
@@ -1773,7 +1692,7 @@ impl ChainPlugin for LastLineStub {
     }
 
     async fn run(
-        self: Box<Self>,
+        &self,
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
@@ -1781,8 +1700,8 @@ impl ChainPlugin for LastLineStub {
     ) -> crate::Result<()> {
         let _held_ready = announce(self.prelude, local, ready);
         shutdown.cancelled().await;
-        let _ = self.stopped.send(());
-        let _ = self.gate.await;
+        let _ = self.stopped.take().send(());
+        let _ = self.gate.take().await;
         self.relayed.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1799,8 +1718,8 @@ async fn assert_failure_waits_for_the_inners_last_line(
     let relayed = Arc::new(AtomicBool::new(false));
     let inner = Box::new(LastLineStub {
         prelude,
-        stopped: stopped_tx,
-        gate: gate_rx,
+        stopped: Once::new(stopped_tx),
+        gate: Once::new(gate_rx),
         relayed: relayed.clone(),
     });
     let calls = Arc::new(AtomicUsize::new(0));
