@@ -5,13 +5,12 @@
 
 use hole_bridge::cutover::scm_wait::call_error::{service_gone, ServiceGone};
 use hole_bridge::cutover::scm_wait::hold::Look;
-use hole_bridge::cutover::scm_wait::retire::{
-    FailureActions, ServiceSession, StartConfig, StartType, StartWrite, Survivors,
-};
+use hole_bridge::cutover::scm_wait::retire::{FailureActions, ServiceSession, StartConfig, StartWrite, Survivors};
 use hole_bridge::cutover::scm_wait::settle::StopActor;
 use hole_bridge::cutover::scm_wait::Observed;
 use hole_bridge::disable_record::RecordState;
 use hole_bridge::platform::os::{Opening, RetireSession};
+use hole_bridge::service_start::StartType;
 
 /// A call on the session the SCM can refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

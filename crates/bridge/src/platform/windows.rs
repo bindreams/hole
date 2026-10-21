@@ -14,10 +14,11 @@ use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::cutover::scm_wait::call_error::{ScmCall, ServiceGone};
-use crate::cutover::scm_wait::repair::{self, InstallStart, RepairStep};
+use crate::cutover::scm_wait::repair;
 use crate::cutover::scm_wait::retire::{retire_over, Disposition};
 use crate::disable_record::DisabledBy;
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
+use crate::service_start::{InstallStart, RepairStep};
 use crate::service_stop::{self, StopPhase, StopProgress};
 
 #[path = "windows/retire_session.rs"]

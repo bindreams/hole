@@ -1,7 +1,8 @@
 use windows_service::service::{ServiceAccess, ServiceActionType, ServiceFailureResetPeriod, ServiceStartType};
 
 use super::{no_restart_failure_actions, scm_start_type, session_access, start_type_from};
-use crate::cutover::scm_wait::retire::{StartType, StartWrite};
+use crate::cutover::scm_wait::retire::StartWrite;
+use crate::service_start::StartType;
 
 #[skuld::test]
 fn the_disabled_restart_restarts_nothing_and_keeps_the_reset_period() {

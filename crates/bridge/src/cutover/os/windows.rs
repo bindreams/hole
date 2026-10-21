@@ -6,10 +6,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::cutover::os::CutoverOs;
-use crate::cutover::scm_wait::repair::RepairStep;
 use crate::cutover::scm_wait::settle::{settle_stopped, SettleError};
 use crate::cutover::scm_wait::{start_via_notify, SystemScmActor};
 use crate::platform::os::{StopSession, SERVICE_NAME};
+use crate::service_start::RepairStep;
 
 /// One image to rename-away-then-move-in: the live binary at `installed` is
 /// renamed aside, then the staged new bytes are moved onto `installed`.

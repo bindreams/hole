@@ -5,7 +5,7 @@
 //! contract.
 
 #[cfg(target_os = "windows")]
-use crate::cutover::scm_wait::repair::RepairStep;
+use crate::service_start::RepairStep;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

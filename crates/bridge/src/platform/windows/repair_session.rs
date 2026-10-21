@@ -10,8 +10,9 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use super::retire_session::{read_start_type, write_start_type};
 use super::{open_error_is_absent, scm_failure, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::ScmCall;
-use crate::cutover::scm_wait::retire::{StartConfig, StartType, StartWrite};
+use crate::cutover::scm_wait::retire::{StartConfig, StartWrite};
 use crate::disable_record::{RecordKey, RecordState};
+use crate::service_start::StartType;
 
 /// The rights a read of the start type needs, and all an unprivileged caller
 /// (the GUI) is asked for.

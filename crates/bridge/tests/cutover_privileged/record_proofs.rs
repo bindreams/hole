@@ -16,10 +16,10 @@ use std::path::Path;
 
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
 use hole_bridge::cutover::os::CutoverOs;
-use hole_bridge::cutover::scm_wait::repair::RepairStep;
 use hole_bridge::cutover::scm_wait::retire::{retire, Disposition};
 use hole_bridge::disable_record::{DisabledBy, RecordKey, RecordState};
 use hole_bridge::platform::os::{self, SERVICE_NAME};
+use hole_bridge::service_start::RepairStep;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
 use windows::Win32::Security::Authorization::{

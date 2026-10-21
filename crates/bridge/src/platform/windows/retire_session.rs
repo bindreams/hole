@@ -21,12 +21,11 @@ use super::stop_session::StopSession;
 use super::{apply_failure_actions, open_error_is_absent, scm_failure, FAILURE_ACTIONS_ACCESS, SERVICE_NAME};
 use crate::cutover::scm_wait::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::cutover::scm_wait::hold::Look;
-use crate::cutover::scm_wait::retire::{
-    FailureActions, Opening, ServiceSession, StartConfig, StartType, StartWrite, Survivors,
-};
+use crate::cutover::scm_wait::retire::{FailureActions, Opening, ServiceSession, StartConfig, StartWrite, Survivors};
 use crate::cutover::scm_wait::settle::StopActor;
 use crate::cutover::scm_wait::Observed;
 use crate::disable_record::{RecordKey, RecordState};
+use crate::service_start::StartType;
 
 /// One service handle, opened before anything is changed, carries the
 /// hardening writes and the delete; the delete only marks the service, so it

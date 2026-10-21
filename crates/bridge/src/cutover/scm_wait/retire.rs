@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use super::call_error::{io_error_is_a_refused_process_open, service_gone, ServiceGone};
 use super::settle::{settle_stopped, SettleError, StopActor};
 use crate::disable_record::RecordState;
+use crate::service_start::StartType;
 
 /// What a retirement leaves behind once the service is stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,16 +36,6 @@ pub enum Opening<S> {
     /// The SCM has no entry for the service: never registered, or removed. A
     /// process of it can still be running.
     Absent,
-}
-
-/// A service's start type as the SCM reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartType {
-    Auto,
-    Demand,
-    Disabled,
-    /// A boot or system start, which a service of its own process never has.
-    Other,
 }
 
 /// A start type the retirement writes.

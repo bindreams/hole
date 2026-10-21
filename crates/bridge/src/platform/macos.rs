@@ -326,8 +326,8 @@ pub fn is_installed() -> bool {
 }
 
 /// launchd has no start type to disable: there is nothing to repair.
-pub fn repair_interrupted_uninstall() -> std::io::Result<crate::cutover::scm_wait::repair::RepairStep> {
-    Ok(crate::cutover::scm_wait::repair::RepairStep::Nothing)
+pub fn repair_interrupted_uninstall() -> std::io::Result<crate::service_start::RepairStep> {
+    Ok(crate::service_start::RepairStep::Nothing)
 }
 
 /// launchd has no start type to disable, so the bridge is never disabled.
