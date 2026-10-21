@@ -382,6 +382,10 @@ fn chown_best_effort(file: &File, owner: Option<(u32, u32)>) {
     }
 }
 
+pub(super) fn give_file(file: &File, owner: Option<(u32, u32)>) {
+    chown_best_effort(file, owner);
+}
+
 pub(super) fn secure_dir(dir: &File, owner: Option<(u32, u32)>, mode: Option<u32>) -> io::Result<()> {
     chown_best_effort(dir, owner);
     match mode {

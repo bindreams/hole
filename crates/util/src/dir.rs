@@ -37,6 +37,19 @@
 //!
 //! The refusals are an `InvalidData` [`io::Error`] holding a [`Refusal`]; they
 //! carry no path.
+//!
+//! # Operations
+//!
+//! [`Dir::read`], [`Dir::open_file`], [`Dir::link`], [`Dir::rename`],
+//! [`Dir::rename_noreplace`] and [`Dir::unlink`] take single names, and none
+//! follows a symlink at the name: a link is renamed, linked or removed as
+//! itself, and reading or appending through one is an error. [`Dir::stage`]
+//! writes a complete temp file that [`Staged::publish`] renames over a name or
+//! [`Staged::claim`] links to a free one; [`Dir::write_atomic`] is the two in one.
+//! On Windows a file that is read or appended shares everything with other
+//! handles, delete included, and a replace or an unlink has POSIX semantics where
+//! the volume has them (Windows 10 1607, NTFS), so an open reader neither blocks
+//! it nor keeps the old name alive.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -352,6 +365,12 @@ impl Drop for Staged<'_> {
             let _ = platform::unlink(&self.dir.file, &self.temp_name);
         }
     }
+}
+
+/// Hands the open file to `owner` (unix `fchown`; Windows has no unix ids). A failure is logged and not returned: an
+/// unprivileged run cannot give a file away and is no worse off for it.
+pub fn give_file(file: &File, owner: Option<(u32, u32)>) {
+    platform::give_file(file, owner);
 }
 
 /// Writes `bytes` to the state file `name` in `state_dir` as a whole or not at all, for a privileged
