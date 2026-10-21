@@ -273,7 +273,9 @@ const SCM_BOUND_PREFIX: &str = "cutover_global_net_state_";
 
 /// The tests of [`SCM_BINARY`] in `membership` that the `terminate-after`
 /// override does not match (`"<binary id>: <name>"`), so a hang in one would
-/// run to the job wall instead of failing with the test's name.
+/// run to the job wall instead of failing with the test's name. `membership` is
+/// the label-matched set, so only a test that carries the `global_net_state`
+/// label is seen: an unlabelled test of the binary is not reported here.
 pub(crate) fn unbounded_scm_tests(membership: &BTreeMap<String, BTreeSet<String>>) -> Vec<String> {
     membership
         .iter()
@@ -337,10 +339,10 @@ pub(crate) fn verify_with(
     let unbounded = unbounded_scm_tests(&label_matched);
     ensure!(
         unbounded.is_empty(),
-        "job {job_id:?}: tests of {SCM_BINARY} that wait on the real SCM or the start-type lock are not matched          by the `terminate-after` override (it matches names starting {SCM_BOUND_PREFIX:?}), so a hang in one          would run to the job wall:
-  {}",
-        unbounded.join("
-  ")
+        "job {job_id:?}: tests of {SCM_BINARY} that wait on the real SCM or the start-type lock are not matched \
+         by the `terminate-after` override (it matches names starting {SCM_BOUND_PREFIX:?}), so a hang in one \
+         would run to the job wall:\n  {}",
+        unbounded.join("\n  ")
     );
     println!(
         "xtask: global_net_state label conformance OK for job {job_id:?} — the nextest.toml \
