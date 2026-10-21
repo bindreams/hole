@@ -2314,8 +2314,9 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   child (`run_cutover`: hold, stop, swap, restore, repair, start) swaps the new files in, does
   not start the service, and returns `CutoverOutcome::LeftDisabled`, which is
   success: the update did install, and the service is off because an
-  administrator turned it off. `run_detached` logs the reason at info and, unlike
-  after a started cutover, clears the update marker itself, because the marker is
+  administrator turned it off. `run_held` logs the reason at info and the wrapper
+  around the child's run (`run_while_holding`), unlike after a started cutover,
+  clears the update marker, because the marker is
   left for the next bridge's post-bind sweep and no bridge will bind
   (`CutoverOutcome::leaves_marker_for_new_bridge`, read by `settle_marker`; a
   failure clears it too). A marker left behind would show the GUI a failed update
