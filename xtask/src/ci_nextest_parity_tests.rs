@@ -355,15 +355,14 @@ jobs:
 }
 
 /// A forward that does not hand the child exactly the ambient value, set or
-/// unset, is an assignment: `"NAME=$NAME"` makes an unset variable empty, a
-/// single-quoted one passes the literal `$NAME`, an unquoted one splits.
+/// unset, is an assignment: `"NAME=$NAME"` makes an unset variable empty and a
+/// single-quoted one passes the literal `$NAME`.
 #[skuld::test]
 fn an_inexact_forward_is_an_assignment() {
     for word in [
         r#""CARGO_INCREMENTAL=$CARGO_INCREMENTAL""#,
         r#""CARGO_INCREMENTAL=${CARGO_INCREMENTAL}""#,
         r#"'CARGO_INCREMENTAL=$CARGO_INCREMENTAL'"#,
-        r#"CARGO_INCREMENTAL=$CARGO_INCREMENTAL"#,
     ] {
         let ci = format!(
             r#"
@@ -433,13 +432,23 @@ jobs:
     assert!(job.launches[0].1.forwarded.is_empty());
 }
 
-/// The shell decides a word is an assignment before expansion, and only for an
-/// unquoted `NAME=` before the command; the gate runs its first argument. So an
-/// assignment is one only where `env` or `sudo` reads it, or unquoted before
-/// any command.
+/// A prefix outside `[NAME=value ...] [gate] [sudo [ARG ...]] [env [ARG ...]]`, or a
+/// word in it that does not assign as written, is an error: the shell assigns
+/// only an unquoted `NAME=` word before the command, the gate runs its first
+/// argument, `sudo` drops what was assigned before it, and an unquoted `$` in
+/// an `env` argument splits.
 #[skuld::test]
-fn an_assignment_outside_its_position_is_an_error() {
+fn a_prefix_that_does_not_assign_as_written_is_an_error() {
     for prefix in [
+        r#"env ${CARGO_INCREMENTAL+"CARGO_INCREMENTAL=$CARGO_INCREMENTAL"} sudo"#,
+        "SKULD_LABELS=tun sudo",
+        &format!("SKULD_LABELS=tun {NO_COMPILE_GATE} sudo env"),
+        "sudo env PATH=$PATH",
+        "sudo env CARGO_INCREMENTAL=$CARGO_INCREMENTAL",
+        "sudo env PATH=/bin/*",
+        &format!(r#"sudo env ${{A+"A=$A"}} {NO_COMPILE_GATE}"#),
+        "sudo sudo",
+        "env sudo",
         r#"${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"}"#,
         r#"SKULD_LABELS=tun ${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"}"#,
         r#"${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"} sudo env"#,
@@ -460,8 +469,7 @@ jobs:
           {prefix} cargo nextest run -E 'package(a)'
 "#
         );
-        let err = test_job(&ci, "j", None).unwrap_err();
-        assert!(format!("{err:#}").contains("runs as a command"), "{prefix}: {err:#}");
+        assert!(test_job(&ci, "j", None).is_err(), "{prefix}");
     }
 }
 
@@ -474,6 +482,9 @@ fn an_assignment_in_its_position_is_a_launcher() {
         format!(r#"{NO_COMPILE_GATE} sudo env "SKULD_LABELS=tun" ${{A+"A=$A"}}"#),
         format!(r#"{NO_COMPILE_GATE} env SKULD_LABELS=tun ${{A+"A=$A"}}"#),
         r#"sudo ${A+"A=$A"}"#.to_string(),
+        r#"sudo SKULD_LABELS=tun env "PATH=$PATH""#.to_string(),
+        "sudo env PATH=/usr/bin:/bin 'HOME=$x'".to_string(),
+        format!("SKULD_LABELS=tun NEXTEST_PROFILE=tun {NO_COMPILE_GATE} env CARGO_LOG=cargo::core=trace"),
     ] {
         let ci = format!(
             r#"

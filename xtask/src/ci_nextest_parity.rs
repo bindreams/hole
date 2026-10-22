@@ -209,39 +209,60 @@ fn step_label(step: &CiStep, index: usize) -> String {
 
 /// One command split into its launcher prefix and the comparable remainder:
 /// whitespace collapsed to single spaces, launchers dropped.
+///
+/// The prefix must have the shape `[NAME=value ...] [gate] [sudo [ARG ...]] [env [ARG ...]]`,
+/// a shape in which every stripped assignment reaches the command as written: the shell
+/// assigns only an unquoted `NAME=` word before the command, the gate runs its first
+/// argument, `sudo` resets the environment it inherits, and `env`/`sudo` arguments are
+/// expanded words. Any other prefix is an error rather than a guess.
 fn split_launch(cmd: &str) -> Result<(Launch, String)> {
     let toks: Vec<&str> = cmd.split_whitespace().collect();
     let mut launch = Launch::default();
-    let mut position = Position::Shell;
+    let mut phase = Phase::Shell;
+    let mut shell_assigned = false;
     let mut start = 0;
     while let Some(tok) = toks.get(start) {
-        match classify(tok) {
-            Token::Gate => {
-                launch.gated = true;
-                position = Position::Argv;
+        let token = classify(tok);
+        let launcher = match token {
+            Token::Gate => Some(Phase::Gate),
+            Token::Sudo => Some(Phase::Sudo),
+            Token::Env => Some(Phase::Env),
+            Token::Command => break,
+            Token::Forward(_) | Token::Assign { .. } => None,
+        };
+        if let Some(next) = launcher {
+            if next <= phase {
+                bail!("command {cmd:?} has {tok:?} out of the launcher order [NAME=value ...] [gate] [sudo [ARG ...]] [env [ARG ...]]");
             }
+            phase = next;
+        }
+        match token {
+            Token::Gate => launch.gated = true,
             Token::Sudo => {
+                if shell_assigned {
+                    bail!("command {cmd:?} assigns before `sudo`, which resets the environment and drops it");
+                }
                 launch.privileged = true;
-                position = Position::Assignments;
             }
-            Token::Env => position = Position::Assignments,
+            Token::Env | Token::Command => {}
             Token::Forward(name) => {
-                if position != Position::Assignments {
+                if phase < Phase::Sudo {
                     bail!("command {cmd:?} forwards {name:?} outside the arguments of `env` or `sudo`, so it runs as a command");
                 }
                 if !FINGERPRINT_NEUTRAL_ENV.contains(&name) {
                     launch.forwarded.insert(name.to_string());
                 }
             }
-            Token::Assign { name, quoted } => {
-                let assigns = match position {
-                    Position::Shell => !quoted,
-                    Position::Argv => false,
-                    Position::Assignments => true,
+            Token::Assign { name, quoted, literal } => {
+                let one_word = match phase {
+                    Phase::Shell => !quoted,
+                    Phase::Gate => false,
+                    Phase::Sudo | Phase::Env => quoted || literal,
                 };
-                if !assigns {
-                    bail!("command {cmd:?} sets {name:?} where it is not an assignment, so it runs as a command");
+                if !one_word {
+                    bail!("command {cmd:?} sets {name:?} in a word that does not assign it as written");
                 }
+                shell_assigned |= phase == Phase::Shell;
                 if !FINGERPRINT_NEUTRAL_ENV.contains(&name) {
                     bail!(
                         "command {cmd:?} sets {name:?} inline, which is outside the fingerprint-neutral \
@@ -250,24 +271,23 @@ fn split_launch(cmd: &str) -> Result<(Launch, String)> {
                     );
                 }
             }
-            Token::Command => break,
         }
         start += 1;
     }
     Ok((launch, toks[start..].join(" ")))
 }
 
-/// Where a launcher-prefix word sits, which decides whether `NAME=value` in it
-/// assigns or names the command.
-#[derive(PartialEq, Eq)]
-enum Position {
-    /// Before any command word: the shell assigns an unquoted `NAME=` word, and
-    /// it does so before expansion.
+/// The launcher prefix's segments, in the only order they may appear.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Phase {
+    /// Before any command word: the shell assigns an unquoted `NAME=` word.
     Shell,
     /// The argv of the [`NO_COMPILE_GATE`] wrapper, which runs its first word.
-    Argv,
-    /// The arguments of `env` or `sudo`, which assign each `NAME=value` word.
-    Assignments,
+    Gate,
+    /// The arguments of `sudo`.
+    Sudo,
+    /// The arguments of `env`.
+    Env,
 }
 
 enum Token<'a> {
@@ -279,8 +299,9 @@ enum Token<'a> {
     Env,
     /// `${NAME+"NAME=$NAME"}`: the child gets the variable as the ambient environment has it.
     Forward(&'a str),
-    /// `NAME=value`, possibly quoted.
-    Assign { name: &'a str, quoted: bool },
+    /// `NAME=value`: `quoted` if the whole word is quoted, `literal` if its value
+    /// has nothing the shell would expand or split.
+    Assign { name: &'a str, quoted: bool, literal: bool },
     /// The command itself — everything from here on is compared.
     Command,
 }
@@ -300,9 +321,12 @@ fn classify(tok: &str) -> Token<'_> {
         return Token::Forward(name);
     }
     match stripped.split_once('=') {
-        Some((name, _)) if is_env_var_name(name) => Token::Assign {
+        Some((name, value)) if is_env_var_name(name) => Token::Assign {
             name,
             quoted: stripped.len() != tok.len(),
+            literal: value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c)),
         },
         _ => Token::Command,
     }
