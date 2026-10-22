@@ -45,6 +45,8 @@ const LOCK_NAME: &str = "writers.lock";
 const STATE_NAME: &str = "state.json";
 const LOG_NAME: &str = "bridge.log";
 const LOG_ROTATED_NAME: &str = "bridge.log.1";
+const CRASH_PID: u32 = 4242;
+const CRASH_MARKER_NAME: &str = "crash-bridge-4242.marker";
 
 fn marker_info() -> MarkerInfo {
     MarkerInfo {
@@ -135,6 +137,22 @@ fn writers() -> Vec<Writer> {
             sources: &["crates/common/src/update_marker.rs"],
             names: &[MARKER_FILE],
             run: |dir, _| update_marker::clear(dir),
+        },
+        Writer {
+            name: "the crash marker, written",
+            sources: &["crates/tombstone/src/crash.rs"],
+            names: &[CRASH_MARKER_NAME],
+            // The marker is the crash handler's, left root-owned on purpose: it takes no owner.
+            run: |dir, _| tombstone::crash::write_marker_for("bridge", CRASH_PID, dir),
+        },
+        Writer {
+            name: "the crash marker, swept",
+            sources: &["crates/tombstone/src/crash.rs"],
+            names: &[CRASH_MARKER_NAME],
+            run: |dir, _| {
+                tombstone::sweep(dir);
+                Ok(())
+            },
         },
         Writer {
             name: "the log, rotated",
@@ -742,10 +760,6 @@ const BY_PATH_ALLOWED: &[(&str, &str)] = &[
     ("crates/hole/src/elevation.rs", "reads a request and a result file in the requester's own private temp folder"),
     ("crates/hole/src/log_collector.rs", "the GUI zips its own user's logs, as the user"),
     ("crates/hole/src/setup.rs", "reads the log of an elevated child from the requester's own private temp folder"),
-    (
-        "crates/tombstone/src/crash.rs",
-        "the crash-marker sweep reads by path in the log directory (reported, not fixed here: it needs `util` as a dependency of `tombstone`)",
-    ),
 ];
 
 fn production_sources(dir: &Path, found: &mut Vec<PathBuf>) {

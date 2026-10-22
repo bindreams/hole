@@ -193,22 +193,22 @@ async fn sweep_reports_malformed_marker() {
 }
 
 // `write_marker_signal_safe` is best-effort and infallible: it writes what
-// it can and returns. What must hold is that a GOOD path really gets the
+// it can and returns. What must hold is that a GOOD name really gets the
 // marker, and that an unopenable one is survived rather than propagated —
 // the `fd < 0` branch, which on a crash path has no signal-safe way to
 // report anything anyway.
 #[cfg(target_os = "macos")]
 mod write_marker_signal_safe_tests {
     use crate::crash::{write_marker_signal_safe, HandlerState};
-    use std::os::unix::ffi::OsStrExt;
+    use std::ffi::OsStr;
+    use util::dir::Dir;
 
-    fn state_for(path: &std::path::Path) -> HandlerState {
-        let mut marker_path_c: Vec<u8> = path.as_os_str().as_bytes().to_vec();
-        marker_path_c.push(0);
-        HandlerState {
-            kind: "test",
-            marker_path_c,
-        }
+    fn state_in(dir: &std::path::Path, name: &str) -> HandlerState {
+        HandlerState::new(
+            "test",
+            Some(Dir::open(dir, false, None).expect("open")),
+            OsStr::new(name),
+        )
     }
 
     fn ctx() -> crash_handler::CrashContext {
@@ -221,19 +221,159 @@ mod write_marker_signal_safe_tests {
     }
 
     #[skuld::test]
-    fn writes_a_good_path_and_survives_an_unopenable_one() {
+    fn writes_a_good_name_and_survives_an_unopenable_one() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let good = dir.path().join("crash-test-1.marker");
-        // Under a nonexistent directory: `open(O_CREAT)` fails with ENOENT.
-        let bad = dir.path().join("does-not-exist").join("crash-test-2.marker");
 
-        write_marker_signal_safe(&state_for(&good), &ctx());
-        let text = std::fs::read_to_string(&good).expect("the good path was actually written");
+        write_marker_signal_safe(&state_in(dir.path(), "crash-test-1.marker"), &ctx());
+        let text = std::fs::read_to_string(dir.path().join("crash-test-1.marker"))
+            .expect("the good name was actually written");
         assert!(text.starts_with("tombstone-marker v1\n"), "got: {text}");
 
-        // The open-failure branch: returns normally, leaves nothing behind.
-        write_marker_signal_safe(&state_for(&bad), &ctx());
-        assert!(!bad.exists());
+        // The open-failure branch: a name that is not a plain file name in the directory (`openat` fails with
+        // ENOENT), and a state with no directory at all (`EBADF`). Both return normally and leave nothing behind.
+        write_marker_signal_safe(&state_in(dir.path(), "does-not-exist/crash-test-2.marker"), &ctx());
+        write_marker_signal_safe(
+            &HandlerState::new("test", None, OsStr::new("crash-test-3.marker")),
+            &ctx(),
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
+// The marker is created by name inside the log directory the handler holds, exclusively. What the user can do to
+// that directory or to the name is pinned here without a crash: `write_record_signal_safe` is the whole of the
+// handler's I/O, and `tests/crash_child.rs` runs it for real behind a native fault.
+mod write_record_signal_safe_tests {
+    use crate::crash::{free_marker_name, write_record_signal_safe, HandlerState, MarkerRecord};
+    use std::ffi::OsStr;
+    use std::path::Path;
+    use util::dir::Dir;
+
+    const NAME: &str = "crash-test-1.marker";
+
+    fn rec() -> MarkerRecord<'static> {
+        MarkerRecord {
+            kind: "test",
+            pid: 1,
+            tid: 2,
+            code: 3,
+            fault_addr: 4,
+            time: 5,
+        }
+    }
+
+    fn state_in(dir: &Path) -> HandlerState {
+        HandlerState::new(
+            "test",
+            Some(Dir::open(dir, false, None).expect("open")),
+            OsStr::new(NAME),
+        )
+    }
+
+    #[skuld::test]
+    fn writes_the_record_to_a_free_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        write_record_signal_safe(&state_in(dir.path()), &rec());
+
+        let text = std::fs::read_to_string(dir.path().join(NAME)).expect("the marker was written");
+        assert!(
+            text.starts_with("tombstone-marker v1\nkind=test\npid=1\n"),
+            "got: {text}"
+        );
+    }
+
+    #[skuld::test]
+    fn leaves_a_file_already_at_the_name_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(NAME), "keep, and longer than a marker's first line").unwrap();
+
+        write_record_signal_safe(&state_in(dir.path()), &rec());
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(NAME)).unwrap(),
+            "keep, and longer than a marker's first line"
+        );
+    }
+
+    #[skuld::test]
+    fn does_not_write_through_a_symlink_at_the_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        super::plant_file_symlink(&victim, &dir.path().join(NAME));
+
+        write_record_signal_safe(&state_in(dir.path()), &rec());
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(std::fs::symlink_metadata(dir.path().join(NAME)).unwrap().is_symlink());
+    }
+
+    // A create that opened the FIFO would wait for a reader that never comes; `O_EXCL` fails first.
+    #[cfg(unix)]
+    #[skuld::test]
+    fn returns_on_a_fifo_at_the_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = std::ffi::CString::new(dir.path().join(NAME).as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        write_record_signal_safe(&state_in(dir.path()), &rec());
+
+        use std::os::unix::fs::FileTypeExt;
+        assert!(std::fs::symlink_metadata(dir.path().join(NAME))
+            .unwrap()
+            .file_type()
+            .is_fifo());
+    }
+
+    #[skuld::test]
+    fn writes_into_the_directory_it_holds_when_the_path_is_swapped() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let logs = root.path().join("logs");
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        let state = state_in(&logs);
+
+        std::fs::rename(&logs, root.path().join("logs.moved")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &logs).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&victim, &logs).unwrap();
+        write_record_signal_safe(&state, &rec());
+
+        assert_eq!(
+            std::fs::read_dir(&victim).unwrap().count(),
+            0,
+            "wrote into the swapped-in directory"
+        );
+        assert!(root.path().join("logs.moved").join(NAME).exists());
+    }
+
+    #[skuld::test]
+    fn writes_nothing_and_returns_without_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        write_record_signal_safe(&HandlerState::new("test", None, OsStr::new(NAME)), &rec());
+
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    // `free_marker_name`: an unswept marker or dump of an earlier process with the same pid is that crash's record,
+    // so this process takes the next name rather than the taken one.
+    #[skuld::test]
+    fn the_marker_name_is_the_pid_s_when_free_and_the_next_free_one_otherwise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let held = Dir::open(dir.path(), false, None).expect("open");
+        let name = || free_marker_name(&held, "bridge", 42).unwrap();
+
+        assert_eq!(name(), "crash-bridge-42.marker");
+        std::fs::write(dir.path().join("crash-bridge-42.marker"), "").unwrap();
+        assert_eq!(name(), "crash-bridge-42-1.marker");
+        std::fs::write(dir.path().join("crash-bridge-42-1.dmp"), "").unwrap();
+        assert_eq!(name(), "crash-bridge-42-2.marker");
     }
 }
 
@@ -532,12 +672,16 @@ const HANDLER_FRONTIER: &[Frontier] = &[
     Frontier {
         name: "write_marker_signal_safe",
         header: "#[cfg(unix)]\nfn write_marker_signal_safe(",
+        allowed: &["extract_fault_fields", "unix_time", "write_record_signal_safe"],
+    },
+    Frontier {
+        name: "write_record_signal_safe",
+        header: "#[cfg(unix)]
+fn write_record_signal_safe(",
         allowed: &[
-            "extract_fault_fields",
-            "unix_time",
             "format_marker_into",
             "write_all_signal_safe",
-            "open",
+            "openat",
             "write",
             "close",
             "as_ptr",
@@ -597,7 +741,7 @@ const NOT_A_CALL: &[&str] = &["FnMut"];
 /// syscall (async-signal-safe by POSIX.1-2017 §2.4.3), a thread-local errno
 /// accessor, or an operation with nowhere to put an allocation:
 ///
-/// * `_exit`, `open`, `write`, `close`, `getpid`, `clock_gettime` — syscalls.
+/// * `_exit`, `openat`, `write`, `close`, `getpid`, `clock_gettime` — syscalls.
 ///   `write` is also the name of `write_all_signal_safe`'s syscall seam.
 /// * `__error` / `__errno_location` — pure thread-local accessors.
 /// * `zeroed` — `core::mem::zeroed`, a compiler intrinsic.
@@ -612,7 +756,7 @@ const NOT_A_CALL: &[&str] = &["FnMut"];
 #[cfg(target_os = "macos")]
 const SIGNAL_SAFE_PRIMITIVES: &[&str] = &[
     "_exit",
-    "open",
+    "openat",
     "write",
     "close",
     "getpid",
@@ -745,4 +889,62 @@ async fn sweep_reports_unreadable_marker() {
     assert!(snap.contains("crash"), "target=crash expected: {snap}");
     // sweep's remove_file can't delete a directory; best-effort means no
     // panic, which the test reaching this line proves.
+}
+
+// The log directory is the interactive user's while the bridge sweeps it as root, so a name in it is whatever the
+// user made it: a symlink to a file of root's, a FIFO. The sweep reads each marker by name inside the directory it
+// opened, never through a link and never waiting on a FIFO, and removes the name itself.
+
+/// A symlink to the file `target`, of the kind an unprivileged user can plant.
+fn plant_file_symlink(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, link).unwrap();
+}
+
+#[skuld::test]
+async fn sweep_does_not_read_through_a_symlink_at_a_marker_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A valid marker of another process under a name the sweep does not take: reading through the link would
+    // report its pid.
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, "tombstone-marker v1\nkind=victim\npid=31337\n").unwrap();
+    let link = dir.path().join("crash-bridge-5.marker");
+    plant_file_symlink(&victim, &link);
+
+    let (subscriber, writer) = make_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+
+    crate::sweep(dir.path());
+
+    // `sweep` logs on this thread before it returns, so the snapshot is complete: waiting for the breadcrumb instead
+    // would hang, not fail, on a sweep that reads through the link and says something else.
+    let snap = writer.snapshot();
+    assert!(snap.contains("marker unreadable"), "{snap}");
+    assert!(!snap.contains("31337"), "read through the link: {snap}");
+    assert!(victim.exists(), "what the link pointed at was removed");
+    assert!(std::fs::symlink_metadata(&link).is_err(), "the link itself is removed");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+async fn sweep_returns_on_a_fifo_at_a_marker_name_and_removes_it() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fifo = dir.path().join("crash-bridge-5.marker");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let real = write_marker(dir.path(), "bridge", 6);
+
+    let (subscriber, writer) = make_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+
+    // Returning at all is the assertion: a read that waits for a writer to the FIFO never does.
+    crate::sweep(dir.path());
+
+    assert!(writer.snapshot().contains("marker unreadable"), "{}", writer.snapshot());
+    assert!(std::fs::symlink_metadata(&fifo).is_err(), "the FIFO is removed");
+    assert!(!real.exists(), "the real marker next to it is still swept");
 }

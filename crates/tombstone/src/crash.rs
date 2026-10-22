@@ -34,9 +34,10 @@
 //! lock, so anything in the callback that allocates can block forever.
 //! `write_minidump_best_effort` allocates three times over: a `PathBuf` for
 //! the dump path, a `CString` inside `File::create`, and `MinidumpWriter`'s
-//! own buffers. The marker write allocates not at all — path pre-encoded at
-//! `attach`, stack scratch buffer, raw `open`/`write`/`close` — and runs
-//! first, which is why it is what survives.
+//! own buffers. The marker write allocates not at all — the log directory's
+//! handle and the marker's name pre-encoded at `attach`, stack scratch buffer,
+//! raw `openat`/`write`/`close` — and runs first, which is why it is what
+//! survives.
 //!
 //! ## The deadlock is observed, not predicted
 //!
@@ -83,40 +84,159 @@
 //! Neither is reopened by a change that merely makes the deadlock rarer: the
 //! ruling is about hanging at all.
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::OnceLock;
+
+use util::dir::{Dir, ReadDir};
+
+// # The log directory
+//
+// The log directory is the interactive user's while the elevated bridge writes a marker in it, reads it back and
+// removes it, so every component of its path and every name in it is the user's to replace: a symlink at the marker
+// name, a FIFO, the directory itself renamed and a link put at its path. The crate therefore opens it once,
+// through `util::dir::Dir`, which judges every link on the way, and from then on names a file only by its single
+// name *inside that handle*. `attach` holds the `Dir` for the life of the process; the handler creates the marker
+// and the dump relative to it. `sweep` opens its own, reads each marker through a `ReadDir` (a symlink is an
+// error, a FIFO is never waited for) and removes the name through `Dir::unlink`.
+//
+// What a name that is already taken becomes: the handler creates exclusively, so it never writes through, truncates
+// or replaces an entry it did not make. `attach` therefore picks a name that is free at that moment (`-1`, `-2`
+// ... after the pid when a marker or dump of an earlier process with the same pid is still unswept), and an entry
+// the user plants at that name afterwards costs this one crash its marker and costs the entry nothing.
 
 /// Holds the live crash handler for the process lifetime (it detaches on
 /// Drop). Second `attach` is a no-op (set returns Err once filled).
 static CRASH_HANDLER: OnceLock<crash_handler::CrashHandler> = OnceLock::new();
 
-/// Per-process handler state: the marker path is FULLY PRE-ENCODED at attach
-/// time (Windows: NUL-terminated `Vec<u16>` wide; Unix: NUL-terminated
-/// `Vec<u8>`) so `on_crash` opens the file with zero allocation — no
-/// `encode_wide`, no `as_bytes`, no `to_vec`. We also keep `kind` so
-/// on_crash can write it without re-deriving. Stored in a static so the
-/// &'static reference the CrashEvent impl needs outlives the handler.
-/// See bindreams/hole#438 (review S3 — signal-safe marker path).
+/// Per-process handler state: the log directory's handle and the marker's name, FULLY PRE-ENCODED at attach time
+/// (Windows: UTF-16 without a terminator, as `UNICODE_STRING` counts it; Unix: NUL-terminated bytes) so `on_crash`
+/// creates the file with zero allocation — no `encode_wide`, no `as_bytes`, no `to_vec`. We also keep `kind` so
+/// on_crash can write it without re-deriving. Stored in a static so the &'static reference the CrashEvent impl
+/// needs outlives the handler. See bindreams/hole#438 (review S3 — signal-safe marker path).
 static HANDLER_STATE: OnceLock<HandlerState> = OnceLock::new();
 
 struct HandlerState {
     kind: &'static str,
-    /// Marker path as a NUL-terminated UTF-16 wide string, pre-encoded at
-    /// attach time. Passed straight to `CreateFileW` in on_crash.
-    #[cfg(windows)]
-    marker_path_wide: Vec<u16>,
-    /// Marker path as NUL-terminated bytes, pre-encoded at attach time.
-    /// Passed straight to `open` in on_crash. Shared by macOS AND Linux —
-    /// the open/write syscall path is identical on every Unix.
+    /// The log directory, open for the life of the process: the raw handle below is a borrow of it. `None` when it
+    /// could not be opened, in which case a crash leaves no marker (and, on macOS, still ends the process).
+    _dir: Option<Dir>,
+    /// The directory's file descriptor, or -1 for none (`openat` then fails with `EBADF`, which the handler
+    /// swallows like every other failure).
     #[cfg(unix)]
-    marker_path_c: Vec<u8>,
+    dir_fd: i32,
+    /// The marker's name in the directory, NUL-terminated. Shared by macOS AND Linux — the openat/write syscall
+    /// path is identical on every Unix.
+    #[cfg(unix)]
+    marker_name_c: Vec<u8>,
+    /// The directory's handle, or null for none.
+    #[cfg(windows)]
+    dir_handle: windows::Win32::Foundation::HANDLE,
+    /// The marker's name in the directory, as `UNICODE_STRING` takes it.
+    #[cfg(windows)]
+    marker_name_wide: Vec<u16>,
+    /// The dump's name: the marker's with a `.dmp` extension.
+    #[cfg(all(feature = "crash-dumps", windows))]
+    dmp_name_wide: Vec<u16>,
 }
 
-// SAFETY: HandlerState holds only an &'static str and an owned, pre-encoded
-// byte/wide vector; it is read-only after attach() and never mutated, so
-// sharing across the crash thread is sound.
+// SAFETY: HandlerState holds an &'static str, the owned `Dir` and the raw handle that borrows it, and owned,
+// pre-encoded byte/wide vectors; it is read-only after attach() and never mutated, so sharing across the crash
+// thread is sound.
 unsafe impl Send for HandlerState {}
 unsafe impl Sync for HandlerState {}
+
+impl HandlerState {
+    /// The state for a marker named `marker_name` in `dir`.
+    fn new(kind: &'static str, dir: Option<Dir>, marker_name: &OsStr) -> HandlerState {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let mut marker_name_c = marker_name.as_bytes().to_vec();
+            marker_name_c.push(0);
+            HandlerState {
+                kind,
+                dir_fd: dir.as_ref().map_or(-1, |dir| dir.file().as_raw_fd()),
+                _dir: dir,
+                marker_name_c,
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use std::os::windows::io::AsRawHandle;
+            HandlerState {
+                kind,
+                dir_handle: windows::Win32::Foundation::HANDLE(
+                    dir.as_ref()
+                        .map_or(std::ptr::null_mut(), |dir| dir.file().as_raw_handle()),
+                ),
+                _dir: dir,
+                marker_name_wide: marker_name.encode_wide().collect(),
+                #[cfg(feature = "crash-dumps")]
+                dmp_name_wide: Path::new(marker_name)
+                    .with_extension("dmp")
+                    .as_os_str()
+                    .encode_wide()
+                    .collect(),
+            }
+        }
+    }
+
+    /// The state for the marker of process `pid` in `log_dir`, which is created if missing. The directory is
+    /// opened without following a link the ownership-transition rule does not allow (see `util::dir`).
+    fn open(kind: &'static str, pid: u32, log_dir: &Path) -> std::io::Result<HandlerState> {
+        let dir = Dir::open(log_dir, true, None)?;
+        let name = free_marker_name(&dir, kind, pid)?;
+        Ok(HandlerState::new(kind, Some(dir), &name))
+    }
+
+    /// [`Self::open`] for this process; a directory that cannot be opened gives a state that writes no marker.
+    fn open_or_none(kind: &'static str, log_dir: &Path) -> HandlerState {
+        HandlerState::open(kind, std::process::id(), log_dir).unwrap_or_else(|e| {
+            // The error carries no path: a refusal names what it refused, an OS error its code.
+            tracing::warn!(error = %e, "tombstone: the log directory was not opened, a crash will leave no marker");
+            HandlerState::new(kind, None, OsStr::new(""))
+        })
+    }
+}
+
+/// Writes the marker a crash of process `pid` would, through the handler's own write: for the tests of what a user
+/// can plant in the log directory (`crates/bridge/src/dir_writers_tests.rs`). An `Err` is a log directory that was
+/// not opened; a name that is taken is not an error, as in the handler.
+#[cfg(feature = "test-support")]
+pub fn write_marker_for(kind: &'static str, pid: u32, log_dir: &Path) -> std::io::Result<()> {
+    let state = HandlerState::open(kind, pid, log_dir)?;
+    let rec = MarkerRecord {
+        kind,
+        pid,
+        tid: 0,
+        code: 0,
+        fault_addr: 0,
+        time: 0,
+    };
+    write_record_signal_safe(&state, &rec);
+    Ok(())
+}
+
+/// `crash-<kind>-<pid>.marker`, or with `-1`, `-2` ... after the pid for the first name that neither a marker nor a
+/// dump already holds in `dir`: an unswept one of an earlier process with the same pid is that crash's record and
+/// is left for `sweep`.
+fn free_marker_name(dir: &Dir, kind: &str, pid: u32) -> std::io::Result<OsString> {
+    let mut attempt = 0u64;
+    loop {
+        let stem = match attempt {
+            0 => format!("crash-{kind}-{pid}"),
+            n => format!("crash-{kind}-{pid}-{n}"),
+        };
+        let marker = OsString::from(format!("{stem}.marker"));
+        if dir.kind_of(&marker)?.is_none() && dir.kind_of(OsStr::new(&format!("{stem}.dmp")))?.is_none() {
+            return Ok(marker);
+        }
+        attempt += 1;
+    }
+}
 
 /// Parsed crash-marker record. `kind` borrows from the source text when
 /// parsed; for the write path it is `&'static str` from `attach`.
@@ -209,7 +329,7 @@ pub(crate) fn format_marker_into(rec: &MarkerRecord, buf: &mut [u8]) -> usize {
 // === signal-safe marker write (per platform) =========================================================================
 
 /// Best-effort and infallible by design: every failure mode here (disk full,
-/// permission, TOCTOU on the pre-encoded path) costs a breadcrumb and
+/// permission, a name taken by the user) costs a breadcrumb and
 /// nothing else, and there is no signal-safe way to report one from a
 /// compromised context anyway.
 #[cfg(windows)]
@@ -252,35 +372,27 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
         fault_addr,
         time,
     };
-    let mut buf = [0u8; 256];
-    let n = format_marker_into(&rec, &mut buf);
+    write_record_signal_safe(state, &rec);
+}
 
-    // Open + write via CreateFileW/WriteFile using the marker path PRE-ENCODED
-    // at attach time (state.marker_path_wide). NO encode_wide / alloc here —
-    // this runs in a compromised context. See review S3.
+/// Creates the marker in the log directory and writes `rec` to it. Nothing is created if the name is taken, by
+/// anything (see "The log directory" above).
+#[cfg(windows)]
+fn write_record_signal_safe(state: &HandlerState, rec: &MarkerRecord) {
+    let mut buf = [0u8; 256];
+    let n = format_marker_into(rec, &mut buf);
+
+    // Create + write via NtCreateFile/WriteFile, relative to the directory handle and with the marker name
+    // PRE-ENCODED at attach time. NO encode_wide / alloc here — this runs in a compromised context. See review S3.
     unsafe {
-        use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
-        use windows::Win32::Storage::FileSystem::{
-            CreateFileW, WriteFile, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
-        };
-        let h = CreateFileW(
-            PCWSTR(state.marker_path_wide.as_ptr()),
-            GENERIC_WRITE.0,
-            FILE_SHARE_READ,
-            None,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            // htemplatefile is Option<HANDLE> in windows 0.62; pass None.
-            // See review M6.
-            None,
-        );
-        if let Ok(handle) = h {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Storage::FileSystem::WriteFile;
+        if let Some(handle) = create_new_in_dir(state, &state.marker_name_wide) {
             // `lpNumberOfBytesWritten` may be NULL only when `lpOverlapped`
             // is non-NULL; this handle is synchronous, so the out-param is
             // mandatory — and it is also what tells a full write from a
-            // short one. `CREATE_ALWAYS` means the marker file exists the
-            // moment the handle opens, so a partial transfer (a disk filling
+            // short one. The marker file exists the moment the handle
+            // opens, so a partial transfer (a disk filling
             // mid-write) would leave a TRUNCATED record that `parse_marker`
             // reports as fact. Resume until the buffer is out; a hard error
             // or a zero-byte transfer has nothing to resume from. Same loop
@@ -296,6 +408,62 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
             let _ = CloseHandle(handle);
         }
     }
+}
+
+/// A new file `name` in the log directory, open for writing, or `None`. `FILE_CREATE` fails if anything holds the
+/// name, a symlink included, and `FILE_OPEN_REPARSE_POINT` keeps the create from following one regardless, so what
+/// is already there is neither written through nor truncated. No allocation: the name is a counted string over
+/// `name`, and the attributes live on the stack.
+#[cfg(windows)]
+fn create_new_in_dir(state: &HandlerState, name: &[u16]) -> Option<windows::Win32::Foundation::HANDLE> {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Wdk::Storage::FileSystem::{
+        NtCreateFile, FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        NTCREATEFILE_CREATE_OPTIONS,
+    };
+    use windows::Win32::Foundation::{HANDLE, OBJECT_ATTRIBUTE_FLAGS, OBJ_CASE_INSENSITIVE, UNICODE_STRING};
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ};
+    use windows::Win32::System::IO::IO_STATUS_BLOCK;
+
+    if state.dir_handle.is_invalid() {
+        return None;
+    }
+    let bytes = u16::try_from(name.len() * 2).ok()?;
+    let unicode = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: windows::core::PWSTR(name.as_ptr().cast_mut()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: state.dir_handle,
+        ObjectName: &unicode,
+        Attributes: OBJECT_ATTRIBUTE_FLAGS(OBJ_CASE_INSENSITIVE.0),
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle = HANDLE::default();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: `attributes`, and the `unicode` and `name` it points to, outlive the call; the out-pointers are live
+    // locals; no extended attributes are passed (None, length 0).
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_WRITE,
+            &attributes,
+            &mut status_block,
+            None,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ,
+            FILE_CREATE,
+            NTCREATEFILE_CREATE_OPTIONS(
+                FILE_NON_DIRECTORY_FILE.0 | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0,
+            ),
+            None,
+            0,
+        )
+    };
+    (status.0 >= 0).then_some(handle)
 }
 
 #[cfg(windows)]
@@ -320,7 +488,7 @@ fn win_time() -> u64 {
 // tid } — bindreams/hole#438).
 
 /// Best-effort and infallible by design: every failure mode here (disk full,
-/// permission, TOCTOU on the pre-encoded path) costs a breadcrumb and
+/// permission, a name taken by the user) costs a breadcrumb and
 /// nothing else, and there is no signal-safe way to report one from a
 /// compromised context anyway.
 #[cfg(unix)]
@@ -336,16 +504,26 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
         fault_addr,
         time,
     };
-    let mut buf = [0u8; 256];
-    let n = format_marker_into(&rec, &mut buf);
+    write_record_signal_safe(state, &rec);
+}
 
-    // open(O_WRONLY|O_CREAT|O_TRUNC) + write + close — all async-signal-safe.
-    // Use the marker path PRE-ENCODED at attach time (state.marker_path_c,
-    // already NUL-terminated). NO as_bytes / to_vec / alloc here. See review S3.
+/// Creates the marker in the log directory and writes `rec` to it. Nothing is created if the name is taken, by
+/// anything (see "The log directory" above).
+#[cfg(unix)]
+fn write_record_signal_safe(state: &HandlerState, rec: &MarkerRecord) {
+    let mut buf = [0u8; 256];
+    let n = format_marker_into(rec, &mut buf);
+
+    // openat(O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW) + write + close — all async-signal-safe. The directory is the
+    // descriptor held since attach and the name the one PRE-ENCODED then (state.marker_name_c, already
+    // NUL-terminated). NO as_bytes / to_vec / alloc here. See review S3. `O_EXCL` fails on any entry at the name
+    // (a symlink included, which it never follows) and never opens a FIFO, so nothing already there is written
+    // through, truncated or waited for.
     unsafe {
-        let fd = libc::open(
-            state.marker_path_c.as_ptr() as *const libc::c_char,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+        let fd = libc::openat(
+            state.dir_fd,
+            state.marker_name_c.as_ptr() as *const libc::c_char,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
             0o644,
         );
         if fd >= 0 {
@@ -356,8 +534,8 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
 }
 
 /// Write all of `buf` through `write`, resuming after a short transfer and
-/// retrying an EINTR that moved nothing. `O_TRUNC` means a marker file
-/// exists the moment `open` succeeds, so a single unchecked `write` leaves a
+/// retrying an EINTR that moved nothing. The marker file exists the moment
+/// `openat` succeeds, so a single unchecked `write` leaves a
 /// TRUNCATED record on a short count — and `parse_marker` is deliberately
 /// tolerant of partial markers, so `sweep` would report the truncation as
 /// fact. On macOS this record is the only crash artifact there is.
@@ -470,27 +648,16 @@ fn unix_time() -> u64 {
 
 #[cfg(all(feature = "crash-dumps", windows))]
 fn write_minidump_best_effort(state: &HandlerState, ctx: &crash_handler::CrashContext) {
-    // Reconstruct the .dmp path from the pre-encoded marker path: same stem,
-    // ".dmp" extension. Allocation allowed here (dev-only, best-effort).
-    let Some(dmp_path) = dmp_path_from_marker(state) else {
+    // Created in the log directory like the marker, under its stem with a ".dmp" extension (pre-encoded at attach):
+    // an entry already at the name makes this create fail and costs the dump, never what is there.
+    use std::os::windows::io::FromRawHandle;
+    let Some(handle) = create_new_in_dir(state, &state.dmp_name_wide) else {
         return;
     };
-    let Ok(mut file) = std::fs::File::create(&dmp_path) else {
-        return;
-    };
+    // SAFETY: `create_new_in_dir` returned a handle that nothing else owns.
+    let mut file = unsafe { std::fs::File::from_raw_handle(handle.0) };
     // dump_crash_context is an associated fn; None = default minidump type.
     let _ = minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(ctx, None, &mut file);
-}
-
-#[cfg(all(feature = "crash-dumps", windows))]
-fn dmp_path_from_marker(state: &HandlerState) -> Option<std::path::PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    // Strip the trailing NUL before decoding.
-    let wide = &state.marker_path_wide[..state.marker_path_wide.len().saturating_sub(1)];
-    let os = std::ffi::OsString::from_wide(wide);
-    let mut p = std::path::PathBuf::from(os);
-    p.set_extension("dmp");
-    Some(p)
 }
 
 /// Parse a marker's text (heap-OK; called only by `sweep`). Returns `None`
@@ -539,7 +706,9 @@ fn parse_hex(s: &str) -> u64 {
 /// on failure logs a `tracing::warn!` and returns — never panics. `kind`
 /// labels the marker ("gui", "bridge", "gui-cli", "galoshes", "test").
 /// `log_dir` must be user-readable even for the elevated bridge (the marker
-/// inherits its perms).
+/// inherits its perms). It is created if missing and opened once, here, for the life of
+/// the process (see "The log directory" above); a directory that cannot be opened leaves the handler
+/// attached and writing no marker.
 pub fn attach(kind: &'static str, log_dir: &Path) {
     // Idempotent: a second attach (e.g. init_multi called twice in a
     // process) is a no-op once the handler is set.
@@ -547,45 +716,13 @@ pub fn attach(kind: &'static str, log_dir: &Path) {
         return;
     }
 
-    let pid = std::process::id();
-    let marker_path = log_dir.join(format!("crash-{kind}-{pid}.marker"));
-    // Best-effort: ensure the dir exists so on_crash's open() can succeed.
-    let _ = std::fs::create_dir_all(log_dir);
-
-    // Pre-encode the marker path NOW (allocation is fine on the happy path)
-    // so on_crash does ZERO allocation. See review S3.
-    #[cfg(windows)]
-    let state = {
-        use std::os::windows::ffi::OsStrExt;
-        let marker_path_wide: Vec<u16> = marker_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        HandlerState { kind, marker_path_wide }
-    };
-    #[cfg(unix)]
-    let state = {
-        use std::os::unix::ffi::OsStrExt;
-        let mut marker_path_c: Vec<u8> = marker_path.as_os_str().as_bytes().to_vec();
-        marker_path_c.push(0);
-        HandlerState { kind, marker_path_c }
-    };
     // Reuse an existing state if attach was previously called (e.g. a prior
     // attach whose CrashHandler::attach failed) so a retry can still install
     // the handler. OnceLock pins the first kind/log_dir, which is correct:
-    // attach is always called with the same process's kind + log_dir.
-    let state_ref: &'static HandlerState = match HANDLER_STATE.get() {
-        Some(existing) => existing,
-        None => {
-            let _ = HANDLER_STATE.set(state);
-            // Another thread could have won the race; either way get() is now Some.
-            match HANDLER_STATE.get() {
-                Some(s) => s,
-                None => unreachable!("HANDLER_STATE must be Some after a successful set()"),
-            }
-        }
-    };
+    // attach is always called with the same process's kind + log_dir. The
+    // directory is opened and the marker's name chosen NOW (allocation is fine
+    // on the happy path) so on_crash does ZERO allocation. See review S3.
+    let state_ref: &'static HandlerState = HANDLER_STATE.get_or_init(|| HandlerState::open_or_none(kind, log_dir));
 
     let event = Box::new(MarkerCrashEvent { state: state_ref });
     // SAFETY: crash-handler requires the closure/handler to be valid; our
@@ -713,33 +850,56 @@ unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
 /// `tracing::error!(target: "crash", …)` breadcrumb per marker, then delete
 /// the marker (leaving any sibling `.dmp`). Best-effort; tolerant of
 /// malformed/partial markers.
+///
+/// The directory is opened once, without following a link the ownership-transition rule does not allow, and every
+/// marker is read and removed by its name inside that handle (see "The log directory" above): a symlink at a
+/// marker name is reported unreadable and removed as itself, a FIFO is never waited for.
 pub fn sweep(log_dir: &Path) {
+    let dir = match Dir::open(log_dir, false, None) {
+        Ok(dir) => dir,
+        // Missing dir — nothing to report.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            // The error carries no path: a refusal names what it refused, an OS error its code.
+            tracing::warn!(error = %e, "tombstone: the log directory was not opened, its crash markers were not swept");
+            return;
+        }
+    };
+    // The listing is by path, but it only supplies names: each read and removal is by name inside `dir`, so a path
+    // swapped for another directory's listing can touch nothing outside `dir`, and only a name of the marker shape
+    // inside it.
     let Ok(entries) = std::fs::read_dir(log_dir) else {
-        // Missing/unreadable dir — nothing to report. Best-effort.
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_marker = path
-            .file_name()
-            .and_then(|n| n.to_str())
+    sweep_dir(&dir, entries.flatten().map(|entry| entry.file_name()));
+}
+
+/// [`sweep`] of the markers among `names`, all names in `dir`.
+fn sweep_dir(dir: &Dir, names: impl IntoIterator<Item = OsString>) {
+    let Ok(reader) = dir.reader() else {
+        return;
+    };
+    for name in names {
+        let is_marker = name
+            .to_str()
             .map(|n| n.starts_with("crash-") && n.ends_with(".marker"))
             .unwrap_or(false);
         if !is_marker {
             continue;
         }
-        report_one(&path);
+        report_one(&reader, &name);
         // Delete on report (dedup): a marker is reported exactly once by
         // whichever process sweeps first. Leave any sibling .dmp.
-        let _ = std::fs::remove_file(&path);
+        let _ = dir.unlink(&name);
     }
 }
 
-fn report_one(path: &Path) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+fn report_one(dir: &ReadDir, name: &OsStr) {
+    let marker = name.to_string_lossy();
+    let Some(text) = dir.read(name).ok().and_then(|bytes| String::from_utf8(bytes).ok()) else {
         tracing::error!(
             target: "crash",
-            marker = %path.display(),
+            marker = %marker,
             "native crash detected in previous run (marker unreadable)"
         );
         return;
@@ -747,14 +907,14 @@ fn report_one(path: &Path) {
     let Some(rec) = parse_marker(&text) else {
         tracing::error!(
             target: "crash",
-            marker = %path.display(),
+            marker = %marker,
             "native crash detected in previous run (marker malformed)"
         );
         return;
     };
     // A sibling .dmp (dev builds only) sits next to the marker.
-    let dmp = path.with_extension("dmp");
-    let dmp_path = dmp.exists().then(|| dmp.display().to_string());
+    let dmp = Path::new(name).with_extension("dmp");
+    let dmp_name = matches!(dir.kind_of(dmp.as_os_str()), Ok(Some(_))).then(|| dmp.display().to_string());
     tracing::error!(
         target: "crash",
         kind = rec.kind,
@@ -763,7 +923,7 @@ fn report_one(path: &Path) {
         code = format_args!("0x{:x}", rec.code),
         fault_addr = format_args!("0x{:x}", rec.fault_addr),
         time = rec.time,
-        dump = dmp_path.as_deref(),
+        dump = dmp_name.as_deref(),
         "native crash detected in previous run"
     );
 }
