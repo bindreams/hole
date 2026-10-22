@@ -22,9 +22,10 @@
 //! variables may be stripped or exported — anything else feeds cargo's
 //! fingerprint, and normalizing it away would hide the very rebuild being
 //! guarded against. Two launcher forms are exempt because they cannot change
-//! what cargo builds: the [`NO_COMPILE_GATE`] wrapper, and `NAME=$NAME`, which
-//! hands the child the value it already has. The latter is how a `sudo env`
-//! child gets back a variable `sudo` dropped.
+//! what cargo builds: the [`NO_COMPILE_GATE`] wrapper, and `NAME=$NAME` (or
+//! `${NAME+"NAME=$NAME"}`, which leaves an unset variable unset), which hands
+//! the child the value it already has. The latter is how a `sudo env` child
+//! gets back a variable `sudo` dropped.
 
 use std::collections::BTreeSet;
 
@@ -257,16 +258,13 @@ fn classify(tok: &str) -> Token<'_> {
     if stripped == "env" {
         return Token::Launcher;
     }
+    if let Some(key) = conditional_forward(stripped) {
+        return forward(key);
+    }
     match stripped.split_once('=') {
         Some((key, value)) if is_env_var_name(key) => {
             if value == format!("${key}") || value == format!("${{{key}}}") {
-                // Checked before the neutral list: a forward is a launcher whatever the name,
-                // but only a name outside that list is worth reporting as one.
-                if FINGERPRINT_NEUTRAL_ENV.contains(&key) {
-                    Token::Launcher
-                } else {
-                    Token::Forward(key)
-                }
+                forward(key)
             } else if FINGERPRINT_NEUTRAL_ENV.contains(&key) {
                 Token::Launcher
             } else {
@@ -275,6 +273,22 @@ fn classify(tok: &str) -> Token<'_> {
         }
         _ => Token::Command,
     }
+}
+
+/// A forward is a launcher whatever the name, but only a name outside
+/// [`FINGERPRINT_NEUTRAL_ENV`] is worth reporting as one.
+fn forward(key: &str) -> Token<'_> {
+    if FINGERPRINT_NEUTRAL_ENV.contains(&key) {
+        Token::Launcher
+    } else {
+        Token::Forward(key)
+    }
+}
+
+/// `NAME` of `${NAME+"NAME=$NAME"}`: a forward that leaves an unset variable unset.
+fn conditional_forward(tok: &str) -> Option<&str> {
+    let (key, word) = tok.strip_prefix("${")?.strip_suffix('}')?.split_once('+')?;
+    (is_env_var_name(key) && unquote(word) == format!("{key}=${key}")).then_some(key)
 }
 
 /// A POSIX environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.

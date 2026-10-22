@@ -369,6 +369,50 @@ jobs:
     assert!(job.launches[0].1.forwarded.contains("CARGO_INCREMENTAL"));
 }
 
+/// `${NAME+"NAME=$NAME"}` forwards a variable only when it is set, so an unset
+/// one stays unset rather than becoming empty.
+#[skuld::test]
+fn a_conditional_forward_is_recognized() {
+    let ci = r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env ${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"} cargo nextest run -E 'package(a)'
+"#;
+    let job = test_job(ci, "j", None).expect("analyze");
+    assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
+    assert!(job.launches[0].1.forwarded.contains("PKG_CONFIG_PATH"));
+}
+
+/// A conditional whose word is not the forward of its own name is part of the
+/// command, so the comparison sees it.
+#[skuld::test]
+fn a_mismatched_conditional_is_not_a_forward() {
+    for word in [r#"${A+"B=$B"}"#, r#"${A+"A=0"}"#, r#"${A-"A=$A"}"#] {
+        let ci = format!(
+            r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env {word} cargo nextest run -E 'package(a)'
+"#
+        );
+        let job = test_job(&ci, "j", None).expect("analyze");
+        assert_eq!(
+            job.runs[0].1,
+            format!("{word} cargo nextest run -E 'package(a)'"),
+            "{word}"
+        );
+        assert!(job.launches[0].1.forwarded.is_empty(), "{word}");
+    }
+}
+
 // ===== target_nextest_run ============================================================================================
 
 fn fixture_manifest() -> Manifest {
@@ -536,11 +580,12 @@ fn ci_test_hole_steps_match_the_hole_tests_target() {
 /// `sudo env` replaces the environment wholesale. `CARGO_INCREMENTAL` (set to 0
 /// by the toolchain action) is part of every workspace unit's profile, so a root
 /// step that drops it hashes each workspace crate differently and recompiles all
-/// of them (measured: 20 crates, as root). Variables dropped for the same reason
-/// belong in this list, each with its measurement.
+/// of them (measured: 20 crates, as root). `aws-lc-sys` tracks `PKG_CONFIG_PATH`
+/// (measured: darwin's root step rebuilt it on `EnvVarChanged`). Variables
+/// dropped for the same reason belong in this list, each with its measurement.
 #[skuld::test]
 fn a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint() {
-    const MUST_FORWARD: [&str; 1] = ["CARGO_INCREMENTAL"];
+    const MUST_FORWARD: [&str; 2] = ["CARGO_INCREMENTAL", "PKG_CONFIG_PATH"];
     let root = crate::repo_root().expect("repo root");
     let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
     let job = test_job(&ci_yaml, "ci", Some("hole-")).expect("analyze ci.yaml");

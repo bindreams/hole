@@ -886,8 +886,10 @@ jobs:
       # rebuilds instead of reusing the prebuilt binaries, and so must every
       # variable cargo hashes. `sudo env` replaces the whole environment: without
       # `CARGO_INCREMENTAL` (0, from the toolchain action; it is part of every
-      # workspace unit's profile) every workspace unit is recompiled as root, so it
-      # is forwarded (`a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint`).
+      # workspace unit's profile) every workspace unit is recompiled as root, and
+      # without `PKG_CONFIG_PATH` (tracked by aws-lc-sys) so is aws-lc-sys, so both
+      # are forwarded (`a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint`);
+      # `${VAR+…}` keeps an unset one unset rather than empty.
       # NEXTEST_PROFILE=tun (see the windows TUN step's comment above): this
       # step runs under `sudo`, so without a lane-specific profile it would
       # write a ROOT-owned `target/nextest/default/junit.xml` that no
@@ -904,6 +906,7 @@ jobs:
         run: >
           .github/scripts/fail-on-compile.sh
           sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" "CARGO_LOG=$CARGO_LOG"
+          ${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"}
           SKULD_LABELS=tun NEXTEST_PROFILE=tun
           cargo nextest run --no-default-features
           --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
