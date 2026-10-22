@@ -73,6 +73,8 @@ fn a_marker_held_open_against_readers_reads_as_unreadable() {
     // denying read, so the open fails while the file is plainly there. Windows-only
     // — the unix equivalent is a permission denial, which root defeats.
     use std::os::windows::fs::OpenOptionsExt;
+    let log = CapturedLog::new();
+    let _guard = log.install();
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), &info(7), None).unwrap();
     let _held = std::fs::OpenOptions::new()
@@ -81,12 +83,77 @@ fn a_marker_held_open_against_readers_reads_as_unreadable() {
         .share_mode(0)
         .open(dir.path().join(MARKER_FILE))
         .unwrap();
+    let got = read(dir.path());
     assert!(
-        matches!(read(dir.path()), Marker::Unreadable),
-        "a regular file that exists but cannot be opened is still a claim"
+        matches!(got, Marker::Unreadable),
+        "a regular file that exists but cannot be opened is still a claim; read answered {got:?}\nraw steps: {}\nlog:\n{}",
+        raw_steps(dir.path()),
+        log.contents()
     );
     assert!(is_present(dir.path()));
 }
+
+// Diagnostics for the held-open test ----------------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod held_diagnostics {
+    use super::*;
+
+    /// What each OS step under [`read`] answers for the marker, for a failed assertion to show which one it was.
+    pub(super) fn raw_steps(log_dir: &std::path::Path) -> String {
+        let dir = match ReadDir::open(log_dir) {
+            Ok(dir) => dir,
+            Err(e) => return format!("ReadDir::open: {e:?}"),
+        };
+        let read = dir.read(MARKER_FILE.as_ref()).map(|bytes| bytes.len());
+        format!("read: {read:?}; kind_of: {:?}", dir.kind_of(MARKER_FILE.as_ref()))
+    }
+
+    /// The module's tracing output for one test, so a failed assertion can name the branch that answered.
+    #[derive(Clone)]
+    pub(super) struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        pub(super) fn new() -> Self {
+            Self(Default::default())
+        }
+
+        pub(super) fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            garter::tracing_test::set_default_in_current_thread(subscriber)
+        }
+
+        pub(super) fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+}
+
+#[cfg(windows)]
+use held_diagnostics::{raw_steps, CapturedLog};
 
 #[skuld::test]
 fn a_directory_at_the_marker_path_reads_as_indeterminate() {
