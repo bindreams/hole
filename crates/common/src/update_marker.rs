@@ -166,6 +166,8 @@ pub fn read(log_dir: &Path) -> Marker {
     let info: MarkerInfo = match serde_json::from_slice(&bytes) {
         Ok(info) => info,
         Err(e) => {
+            // Shadowed so the raw error, which quotes the file, cannot be logged; see `ParseFailure`.
+            let e = util::parse_error::ParseFailure::from(&e);
             tracing::warn!(error = %e, "update marker could not be parsed");
             return Marker::Unreadable;
         }

@@ -744,8 +744,9 @@ Windows by-path ACL call), `no_privileged_state_code_reads_a_file_by_path` (the 
 file by path, except the files listed in `BY_PATH_ALLOWED`, each with its reason),
 `no_privileged_code_resolves_a_link_before_the_walk` (the same crates call neither `canonicalize` nor `realpath`,
 except the lines listed in `RESOLVING_ALLOWED`, each with its reason), `no_state_module_logs_a_path` (the
-state modules log the file's name) and `no_state_reader_keeps_the_raw_parse_error` (a file that reads a state file
-parses no more JSON than it makes `ParseFailure`s). A test of
+state modules log the file's name) and `no_privileged_json_parse_keeps_the_raw_error` (every non-test `serde_json` parse in `bridge`,
+`tun-engine`, `util` and `common`, spelled `serde_json::from_*`, `Deserializer::from_*` or a `from_*` imported by name,
+converts its error before the next parse or `fn`; the parses listed in `JSON_PARSE_ALLOWED` do not, each with its reason). A test of
 a walk plants links with `util::dir::testing` (`plant_link`, `user_dir`, `SystemScratch`), which hand what they
 make to an unprivileged owner whoever runs the test: a link to a folder the system owns must be refused, a link
 to a folder its own owner owns must be followed, and the same through each writer.

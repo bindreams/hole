@@ -439,10 +439,15 @@ const ECHOED_SECRET: &str = "hunter2-SECRET";
 /// The warnings `read` logs when `file` in a fresh folder holds a `version` that is a string where a number belongs:
 /// `serde_json`'s own message for that quotes the string.
 fn warnings_for_a_file_that_quotes_a_secret(file: &str, read: fn(&Path)) -> String {
+    warnings_for_a_file(file, &format!(r#"{{"version":"{ECHOED_SECRET}"}}"#), read)
+}
+
+/// The warnings `read` logs when `file` in a fresh folder holds `content`.
+fn warnings_for_a_file(file: &str, content: &str, read: fn(&Path)) -> String {
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join(file), format!(r#"{{"version":"{ECHOED_SECRET}"}}"#)).unwrap();
+    std::fs::write(tmp.path().join(file), content).unwrap();
     let writer = crate::test_support::log_capture::VecWriter::new();
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
@@ -460,9 +465,12 @@ fn warnings_for_a_file_that_quotes_a_secret(file: &str, read: fn(&Path)) -> Stri
 /// A reader that logs a parse failure: its name, the file it reads, and a call of it.
 type ParseFailureReader = (&'static str, &'static str, fn(&Path));
 
-fn parse_failure_readers() -> [ParseFailureReader; 2] {
+fn parse_failure_readers() -> [ParseFailureReader; 3] {
     use crate::{dns_state, plugin_state};
     [
+        ("update_marker::read", MARKER_FILE, |dir| {
+            let _ = update_marker::read(dir);
+        }),
         ("dns_state::load", dns_state::STATE_FILE_NAME, |dir| {
             let _ = dns_state::load(dir);
         }),
@@ -487,70 +495,213 @@ fn no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// What parses a `serde_json` document into a type.
-const PARSES_JSON: &[&str] = &[
-    "serde_json::from_slice",
-    "serde_json::from_str",
-    "serde_json::from_value",
-    "serde_json::from_reader",
-];
+#[skuld::test]
+fn the_update_marker_logs_no_fragment_of_a_marker_with_a_secret_field() {
+    // `deny_unknown_fields`: serde's message for an unknown field quotes the field's name.
+    let content = format!(r#"{{"version":3,"{ECHOED_SECRET}":1}}"#);
+    let logs = warnings_for_a_file(MARKER_FILE, &content, |dir| {
+        let _ = update_marker::read(dir);
+    });
 
-/// When `text` reads a state file: its parses of JSON, if there are more than the `ParseFailure`s it makes. A parse's
-/// own error quotes the file back; a `ParseFailure` made where the parse happens cannot.
-fn parses_without_a_parse_failure(text: &str) -> Vec<&str> {
-    let code = || text.lines().filter(|line| !line.trim_start().starts_with("//"));
-    if !code().any(|line| line.contains("read_state_file(")) {
-        return Vec::new();
-    }
-    let parses: Vec<&str> = code()
-        .filter(|line| PARSES_JSON.iter().any(|parse| line.contains(parse)))
-        .collect();
-    let converted = code().filter(|line| line.contains("ParseFailure::from(")).count();
-    if parses.len() > converted {
-        return parses;
-    }
-    Vec::new()
+    assert!(
+        !logs.contains(ECHOED_SECRET),
+        "the marker reader logged the file's content: {logs}"
+    );
+    assert!(logs.contains("line 1"), "the warning lost its position: {logs}");
 }
 
+/// The `serde_json` functions that parse a document into a type.
+const JSON_PARSERS: &[&str] = &["from_slice", "from_str", "from_value", "from_reader"];
+
+/// What makes a parse's error content-safe where it happens: a `ParseFailure`, or the two helpers it is built from.
+const CONVERSIONS: &[&str] = &["ParseFailure::from(", "parse_kind(", "describe_parse_error("];
+
+/// The privileged crates whose JSON parses the scan covers: the ones that read state a user's folder may hold.
+const JSON_PARSE_CRATES: &[&str] = &["bridge", "tun-engine", "util", "common"];
+
+/// One `serde_json` parse in a source and whether its error is converted before it can be logged.
+#[derive(Debug, PartialEq, Eq)]
+struct JsonParse<'a> {
+    line: &'a str,
+    converted: bool,
+}
+
+/// Whether `line` calls `name` bare: not as part of a longer name or a path (`extend_from_slice(` is not `from_slice(`).
+fn calls_by_name(line: &str, name: &str) -> bool {
+    line.match_indices(name).any(|(at, _)| {
+        let before = line[..at].chars().next_back();
+        let after = &line[at + name.len()..];
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':')
+            && (after.starts_with('(') || after.starts_with("::<"))
+    })
+}
+
+/// Every parse of JSON in `text`, whatever the spelling: `serde_json::from_*`, a `from_*` imported by name, and
+/// `Deserializer::from_*`. A parse's own error quotes the file back; a conversion within the parse's statement cannot.
+/// The conversion is looked for from the parse to the next parse or the next `fn`, so one conversion covers one parse.
+fn json_parses(text: &str) -> Vec<JsonParse<'_>> {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect();
+    let imported: Vec<&str> = JSON_PARSERS
+        .iter()
+        .copied()
+        .filter(|name| {
+            lines
+                .iter()
+                .any(|line| line.trim_start().starts_with("use serde_json::") && line.contains(name))
+        })
+        .collect();
+    let is_parse = |line: &str| {
+        !line.trim_start().starts_with("use ")
+            && (line.contains("serde_json::from_")
+                || line.contains("Deserializer::from_")
+                || imported.iter().any(|name| calls_by_name(line, name)))
+    };
+    let starts_a_fn = |line: &str| line.split_whitespace().any(|word| word == "fn");
+
+    let mut parses = Vec::new();
+    for (at, line) in lines.iter().enumerate().filter(|(_, line)| is_parse(line)) {
+        let following = lines[at + 1..]
+            .iter()
+            .take_while(|next| !is_parse(next) && !starts_a_fn(next))
+            .count();
+        let converted = lines[at..=at + following]
+            .iter()
+            .any(|line| CONVERSIONS.iter().any(|conversion| line.contains(conversion)));
+        parses.push(JsonParse { line, converted });
+    }
+    parses
+}
+
+/// Parses of JSON in the privileged crates whose error is not converted, each with why it may be. The text is a part
+/// of the parse's line; the reason says where the error goes.
+const JSON_PARSE_ALLOWED: &[(&str, &str, &str)] = &[
+    (
+        "crates/common/src/import.rs",
+        "serde_json::from_str(json)?",
+        "`?` into `ImportError`, whose `From<serde_json::Error>` keeps a category and a position",
+    ),
+    (
+        "crates/tun-engine/src/routing/failclosed.rs",
+        "serde_json::from_slice::<serde_json::Value>(bytes)",
+        "`.ok()` drops the error; only a salvaged `pf_token` leaves the function",
+    ),
+    (
+        "crates/bridge/src/test_support/dist_harness.rs",
+        "let status: StatusResponse = serde_json::from_slice(&body)?",
+        "test support: the harness parses the IPC replies of a bridge the test started",
+    ),
+    (
+        "crates/bridge/src/test_support/dist_harness.rs",
+        "BridgeResponse::StartFailed(serde_json::from_slice(&body)?)",
+        "test support: the harness parses the IPC replies of a bridge the test started",
+    ),
+    (
+        "crates/bridge/src/test_support/dist_harness.rs",
+        "let metrics: MetricsResponse = serde_json::from_slice(&body)?",
+        "test support: the harness parses the IPC replies of a bridge the test started",
+    ),
+    (
+        "crates/bridge/src/test_support/dist_harness.rs",
+        "let diag: DiagnosticsResponse = serde_json::from_slice(&body)?",
+        "test support: the harness parses the IPC replies of a bridge the test started",
+    ),
+    (
+        "crates/bridge/src/test_support/dist_harness.rs",
+        "let parsed: TestServerResponse = serde_json::from_slice(&body)?",
+        "test support: the harness parses the IPC replies of a bridge the test started",
+    ),
+    (
+        "crates/bridge/src/test_support/dist_harness.rs",
+        "let err: ErrorResponse = serde_json::from_slice(&body).unwrap_or(",
+        "test support: the harness parses the IPC replies of a bridge the test started",
+    ),
+];
+
 #[skuld::test]
-fn no_state_reader_keeps_the_raw_parse_error() {
+fn no_privileged_json_parse_keeps_the_raw_error() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
     let mut hits = Vec::new();
-    for (relative, path) in privileged_sources(&root) {
-        for line in parses_without_a_parse_failure(&std::fs::read_to_string(&path).unwrap()) {
-            hits.push(format!("{relative}: {}", line.trim()));
+    for (relative, path) in privileged_sources(&root).into_iter().filter(|(relative, _)| {
+        JSON_PARSE_CRATES
+            .iter()
+            .any(|krate| relative.starts_with(&format!("crates/{krate}/")))
+    }) {
+        let text = std::fs::read_to_string(&path).unwrap();
+        for parse in json_parses(&text).into_iter().filter(|parse| !parse.converted) {
+            let allowed = JSON_PARSE_ALLOWED
+                .iter()
+                .any(|(file, part, _)| *file == relative && parse.line.contains(part));
+            if !allowed {
+                hits.push(format!("{relative}: {}", parse.line.trim()));
+            }
         }
     }
 
     assert!(
         hits.is_empty(),
-        "a state reader parses more JSON than it makes `ParseFailure`s: its `serde_json::Error` quotes the file, so convert it with `ParseFailure::from(&e)` at the parse site: {hits:#?}"
+        "a privileged crate parses JSON and keeps the `serde_json::Error`, whose text quotes the file (and the file may be one a user placed): convert it with `ParseFailure::from(&e)` where the parse happens, or add the parse to JSON_PARSE_ALLOWED with the reason: {hits:#?}"
     );
 }
 
 #[skuld::test]
-fn the_parse_error_scan_counts_parses_against_conversions() {
-    let reads = "let b = util::dir::read_state_file(dir, name)?;
-";
-    let parse = "match serde_json::from_slice::<State>(&b) {
-";
-    let convert = "let e = util::parse_error::ParseFailure::from(&e);
-";
+fn every_json_parse_allowance_still_names_an_unconverted_parse() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    for (file, part, reason) in JSON_PARSE_ALLOWED {
+        let text = std::fs::read_to_string(root.join(file)).unwrap_or_else(|err| panic!("{file} ({reason}): {err}"));
+        assert!(
+            json_parses(&text)
+                .iter()
+                .any(|parse| !parse.converted && parse.line.contains(part)),
+            "{file} no longer has an unconverted parse `{part}`: remove its allowance ({reason})"
+        );
+    }
+}
 
+#[skuld::test]
+fn the_json_parse_scan_counts_each_parse_against_its_own_conversion() {
+    let parse = "    match serde_json::from_slice::<State>(&b) {";
+    let convert = "        Err(e) => { let e = util::parse_error::ParseFailure::from(&e); }";
+    let converted = |text: &str| -> Vec<bool> { json_parses(text).iter().map(|p| p.converted).collect() };
+
+    assert_eq!(converted(parse), [false]);
+    assert_eq!(converted(&format!("{parse}\n{convert}")), [true]);
+    // A conversion covers the parse it follows, not the next one.
+    assert_eq!(converted(&format!("{parse}\n{convert}\n{parse}")), [true, false]);
+    assert_eq!(converted(&format!("{parse}\n{parse}\n{convert}")), [false, true]);
+    // ... nor one in the next function.
+    assert_eq!(converted(&format!("{parse}\nfn other() {{\n{convert}")), [false]);
+    // A conversion on the parse's own line counts.
     assert_eq!(
-        parses_without_a_parse_failure(&format!("{reads}{parse}")),
-        [parse.trim_end()]
+        converted("serde_json::from_slice(b).map_err(|e| ParseFailure::from(&e))"),
+        [true]
     );
-    assert!(parses_without_a_parse_failure(&format!("{reads}{parse}{convert}")).is_empty());
+    assert!(converted(&format!("// {parse}")).is_empty());
+}
+
+#[skuld::test]
+fn the_json_parse_scan_sees_every_spelling_of_a_parse() {
+    let sites = |text: &str| json_parses(text).len();
+
+    assert_eq!(sites("let v = serde_json::from_str::<T>(s);"), 1);
+    assert_eq!(sites("let v = serde_json::from_value(v);"), 1);
+    assert_eq!(sites("let v = serde_json::from_reader(r);"), 1);
+    assert_eq!(sites("let mut de = serde_json::Deserializer::from_slice(b);"), 1);
     assert_eq!(
-        parses_without_a_parse_failure(&format!("{reads}{parse}{parse}{convert}")).len(),
-        2
+        sites("use serde_json::Deserializer;\nlet mut de = Deserializer::from_str(s);"),
+        1
     );
-    assert!(parses_without_a_parse_failure(&format!("// {reads}{parse}")).is_empty());
-    assert!(
-        parses_without_a_parse_failure(parse).is_empty(),
-        "a file that reads no state file is not scanned"
+    assert_eq!(sites("use serde_json::from_slice;\nlet v: T = from_slice(b)?;"), 1);
+    assert_eq!(
+        sites("use serde_json::{from_str, Value};\nlet v = from_str::<T>(s);"),
+        1
     );
+    // Not a parse: a name that is only part of another, an import the file never calls, a `from_*` that is not serde_json's.
+    assert_eq!(sites("use serde_json::from_slice;\nbuf.extend_from_slice(b);"), 0);
+    assert_eq!(sites("buf.extend_from_slice(b);\nlet a = u8::from_str(s);"), 0);
+    assert_eq!(sites("let v = from_slice(b);"), 0);
 }
 
 // No privileged read goes by path -------------------------------------------------------------------------------------
