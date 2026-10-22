@@ -302,7 +302,8 @@ jobs:
 
 /// Under `sudo` the child's environment is whatever `env` is told, so the
 /// ambient value of a variable is forwarded by naming it. The child then sees
-/// what the compile step saw, which is the property this module guards.
+/// what the compile step saw, set or unset, which is the property this module
+/// guards.
 #[skuld::test]
 fn a_forwarded_variable_is_a_launcher_not_a_change() {
     let ci = r#"
@@ -312,7 +313,7 @@ jobs:
       - id: hole-build
         run: cargo xtask build tests
       - name: root
-        run: sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" cargo nextest run -E 'package(a)'
+        run: sudo env "PATH=$PATH" "HOME=$HOME" ${CARGO_INCREMENTAL+"CARGO_INCREMENTAL=$CARGO_INCREMENTAL"} cargo nextest run -E 'package(a)'
 "#;
     let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
@@ -353,9 +354,70 @@ jobs:
     }
 }
 
-/// `${NAME}` is the same forward as `$NAME`.
+/// A forward that does not hand the child exactly the ambient value, set or
+/// unset, is an assignment: `"NAME=$NAME"` makes an unset variable empty and a
+/// single-quoted one passes the literal `$NAME`.
 #[skuld::test]
-fn a_braced_forward_is_recognized() {
+fn an_inexact_forward_is_an_assignment() {
+    for word in [
+        r#""CARGO_INCREMENTAL=$CARGO_INCREMENTAL""#,
+        r#""CARGO_INCREMENTAL=${CARGO_INCREMENTAL}""#,
+        r#"'CARGO_INCREMENTAL=$CARGO_INCREMENTAL'"#,
+    ] {
+        let ci = format!(
+            r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env {word} cargo nextest run -E 'package(a)'
+"#
+        );
+        let err = test_job(&ci, "j", None).unwrap_err();
+        assert!(format!("{err:#}").contains("fingerprint-neutral"), "{word}: {err:#}");
+    }
+}
+
+/// A conditional that is not the exact forward of its own name is part of the
+/// command, so the comparison sees it: a single-quoted word passes the literal
+/// `$A`, an unquoted one splits, a quoted token turns unset into `""`.
+#[skuld::test]
+fn an_inexact_conditional_is_not_a_forward() {
+    for word in [
+        r#"${A+"B=$B"}"#,
+        r#"${A+"A=0"}"#,
+        r#"${A-"A=$A"}"#,
+        r#"${A:+"A=$A"}"#,
+        r#"${A+'A=$A'}"#,
+        r#"${A+A=$A}"#,
+        r#""${A+"A=$A"}""#,
+    ] {
+        let ci = format!(
+            r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env {word} cargo nextest run -E 'package(a)'
+"#
+        );
+        let job = test_job(&ci, "j", None).expect("analyze");
+        assert_eq!(
+            job.runs[0].1,
+            format!("{word} cargo nextest run -E 'package(a)'"),
+            "{word}"
+        );
+        assert!(job.launches[0].1.forwarded.is_empty(), "{word}");
+    }
+}
+
+/// A forward of a neutral name is a launcher, but not one worth reporting.
+#[skuld::test]
+fn a_neutral_forward_is_a_launcher() {
     let ci = r#"
 jobs:
   j:
@@ -363,10 +425,96 @@ jobs:
       - id: hole-build
         run: cargo xtask build tests
       - name: root
-        run: sudo env "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" cargo nextest run -E 'package(a)'
+        run: sudo env ${PATH+"PATH=$PATH"} cargo nextest run -E 'package(a)'
 "#;
     let job = test_job(ci, "j", None).expect("analyze");
-    assert!(job.launches[0].1.forwarded.contains("CARGO_INCREMENTAL"));
+    assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
+    assert!(job.launches[0].1.forwarded.is_empty());
+}
+
+/// A prefix outside `[NAME=value ...] [gate] [sudo [ARG ...]] [env [ARG ...]]`, or a
+/// word in it that does not assign as written, is an error: the shell assigns
+/// only an unquoted `NAME=` word before the command, the gate runs its first
+/// argument, `sudo` drops what was assigned before it, and an unquoted `$` in
+/// an `env` argument splits.
+#[skuld::test]
+fn a_prefix_that_does_not_assign_as_written_is_an_error() {
+    for prefix in [
+        r#"env ${CARGO_INCREMENTAL+"CARGO_INCREMENTAL=$CARGO_INCREMENTAL"} sudo"#,
+        "SKULD_LABELS=tun sudo",
+        &format!("SKULD_LABELS=tun {NO_COMPILE_GATE} sudo env"),
+        "sudo env PATH=$PATH",
+        "sudo env CARGO_INCREMENTAL=$CARGO_INCREMENTAL",
+        "sudo env PATH=/bin/*",
+        &format!(r#"sudo env ${{A+"A=$A"}} {NO_COMPILE_GATE}"#),
+        "sudo sudo",
+        "env sudo",
+        r#"sudo env "HOME="$HOME"""#,
+        r#"sudo env 'HOME='$HOME''"#,
+        r#"sudo env "HOME=a"b""#,
+        r#""SKULD_LABELS=tun""x""#,
+        r#"sudo env "HOME=$@""#,
+        r#"sudo env "HOME=${arr[@]}""#,
+        r#"sudo env "HOME=$*""#,
+        r#"sudo env "HOME=$(pwd)""#,
+        r#"sudo env "HOME=${HOME""#,
+        "SKULD_LABELS='tun NEXTEST_PROFILE=tun'",
+        "SKULD_LABELS=$X",
+        "sudo env SKULD_LABELS='tun NEXTEST_PROFILE=tun'",
+        r#"sudo env "HOME=\""#,
+        r#"${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"}"#,
+        r#"SKULD_LABELS=tun ${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"}"#,
+        r#"${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"} sudo env"#,
+        r#"${PATH+"PATH=$PATH"} sudo env"#,
+        &format!(r#"{NO_COMPILE_GATE} ${{PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"}}"#),
+        &format!("{NO_COMPILE_GATE} SKULD_LABELS=tun"),
+        r#""SKULD_LABELS=tun""#,
+    ] {
+        let ci = format!(
+            r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: >-
+          {prefix} cargo nextest run -E 'package(a)'
+"#
+        );
+        assert!(test_job(&ci, "j", None).is_err(), "{prefix}");
+    }
+}
+
+/// The positions where an assignment does assign.
+#[skuld::test]
+fn an_assignment_in_its_position_is_a_launcher() {
+    for prefix in [
+        "SKULD_LABELS=tun".to_string(),
+        format!("SKULD_LABELS=tun {NO_COMPILE_GATE}"),
+        format!(r#"{NO_COMPILE_GATE} sudo env "SKULD_LABELS=tun" ${{A+"A=$A"}}"#),
+        format!(r#"{NO_COMPILE_GATE} env SKULD_LABELS=tun ${{A+"A=$A"}}"#),
+        r#"sudo ${A+"A=$A"}"#.to_string(),
+        r#"sudo SKULD_LABELS=tun env "PATH=$PATH""#.to_string(),
+        "sudo env PATH=/usr/bin:/bin 'HOME=$x'".to_string(),
+        r#"sudo env "PATH=$HOME/bin:${PATH}" "HOME=$HOME""#.to_string(),
+        format!("SKULD_LABELS=tun NEXTEST_PROFILE=tun {NO_COMPILE_GATE} env CARGO_LOG=cargo::core=trace"),
+    ] {
+        let ci = format!(
+            r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: >-
+          {prefix} cargo nextest run -E 'package(a)'
+"#
+        );
+        let job = test_job(&ci, "j", None).unwrap_or_else(|e| panic!("{prefix}: {e:#}"));
+        assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'", "{prefix}");
+    }
 }
 
 // ===== target_nextest_run ============================================================================================
@@ -536,11 +684,12 @@ fn ci_test_hole_steps_match_the_hole_tests_target() {
 /// `sudo env` replaces the environment wholesale. `CARGO_INCREMENTAL` (set to 0
 /// by the toolchain action) is part of every workspace unit's profile, so a root
 /// step that drops it hashes each workspace crate differently and recompiles all
-/// of them (measured: 20 crates, as root). Variables dropped for the same reason
-/// belong in this list, each with its measurement.
+/// of them (measured: 20 crates, as root). `aws-lc-sys` tracks `PKG_CONFIG_PATH`
+/// (measured: darwin's root step rebuilt it on `EnvVarChanged`). Variables
+/// dropped for the same reason belong in this list, each with its measurement.
 #[skuld::test]
 fn a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint() {
-    const MUST_FORWARD: [&str; 1] = ["CARGO_INCREMENTAL"];
+    const MUST_FORWARD: [&str; 2] = ["CARGO_INCREMENTAL", "PKG_CONFIG_PATH"];
     let root = crate::repo_root().expect("repo root");
     let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
     let job = test_job(&ci_yaml, "ci", Some("hole-")).expect("analyze ci.yaml");
@@ -551,7 +700,7 @@ fn a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint() {
         for var in MUST_FORWARD {
             assert!(
                 launch.forwarded.contains(var),
-                "privileged lane {label:?} does not forward {var}: add \"{var}=${var}\" after `sudo env`"
+                "privileged lane {label:?} does not forward {var}: add ${{{var}+\"{var}=${var}\"}} after `sudo env`"
             );
         }
     }
