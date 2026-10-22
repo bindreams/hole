@@ -884,11 +884,9 @@ jobs:
       #
       # `--features` must match `hole-build` and the non-TUN step above or cargo
       # rebuilds instead of reusing the prebuilt binaries, and so must every
-      # variable cargo hashes. `sudo env` replaces the whole environment: without
-      # `CARGO_INCREMENTAL` (0, from the toolchain action; it is part of every
-      # workspace unit's profile) every workspace unit is recompiled as root, and
-      # without `PKG_CONFIG_PATH` (tracked by aws-lc-sys) so is aws-lc-sys, so both
-      # are forwarded (`a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint`)
+      # variable cargo hashes. `sudo env` replaces the whole environment, so each
+      # such variable is forwarded
+      # (`a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint`)
       # as `${VAR+"VAR=$VAR"}`, which keeps an unset one unset rather than empty.
       # NEXTEST_PROFILE=tun (see the windows TUN step's comment above): this
       # step runs under `sudo`, so without a lane-specific profile it would

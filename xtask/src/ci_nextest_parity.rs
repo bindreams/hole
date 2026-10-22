@@ -212,25 +212,62 @@ fn step_label(step: &CiStep, index: usize) -> String {
 fn split_launch(cmd: &str) -> Result<(Launch, String)> {
     let toks: Vec<&str> = cmd.split_whitespace().collect();
     let mut launch = Launch::default();
+    let mut position = Position::Shell;
     let mut start = 0;
     while let Some(tok) = toks.get(start) {
         match classify(tok) {
-            Token::Gate => launch.gated = true,
-            Token::Sudo => launch.privileged = true,
-            Token::Launcher => {}
+            Token::Gate => {
+                launch.gated = true;
+                position = Position::Argv;
+            }
+            Token::Sudo => {
+                launch.privileged = true;
+                position = Position::Assignments;
+            }
+            Token::Env => position = Position::Assignments,
             Token::Forward(name) => {
-                launch.forwarded.insert(name.to_string());
+                if position != Position::Assignments {
+                    bail!("command {cmd:?} forwards {name:?} outside the arguments of `env` or `sudo`, so it runs as a command");
+                }
+                if !FINGERPRINT_NEUTRAL_ENV.contains(&name) {
+                    launch.forwarded.insert(name.to_string());
+                }
+            }
+            Token::Assign { name, quoted } => {
+                let assigns = match position {
+                    Position::Shell => !quoted,
+                    Position::Argv => false,
+                    Position::Assignments => true,
+                };
+                if !assigns {
+                    bail!("command {cmd:?} sets {name:?} where it is not an assignment, so it runs as a command");
+                }
+                if !FINGERPRINT_NEUTRAL_ENV.contains(&name) {
+                    bail!(
+                        "command {cmd:?} sets {name:?} inline, which is outside the fingerprint-neutral \
+                         set {FINGERPRINT_NEUTRAL_ENV:?} — stripping it would hide a cargo rebuild \
+                         (to forward the ambient value, pass ${{{name}+\"{name}=${name}\"}} to `env`)"
+                    );
+                }
             }
             Token::Command => break,
-            Token::ForeignEnv(name) => bail!(
-                "command {cmd:?} sets {name:?} inline, which is outside the fingerprint-neutral \
-                 set {FINGERPRINT_NEUTRAL_ENV:?} — stripping it would hide a cargo rebuild \
-                 (forward the ambient value with ${{{name}+\"{name}=${name}\"}})"
-            ),
         }
         start += 1;
     }
     Ok((launch, toks[start..].join(" ")))
+}
+
+/// Where a launcher-prefix word sits, which decides whether `NAME=value` in it
+/// assigns or names the command.
+#[derive(PartialEq, Eq)]
+enum Position {
+    /// Before any command word: the shell assigns an unquoted `NAME=` word, and
+    /// it does so before expansion.
+    Shell,
+    /// The argv of the [`NO_COMPILE_GATE`] wrapper, which runs its first word.
+    Argv,
+    /// The arguments of `env` or `sudo`, which assign each `NAME=value` word.
+    Assignments,
 }
 
 enum Token<'a> {
@@ -238,12 +275,12 @@ enum Token<'a> {
     Gate,
     /// `sudo`: the command runs with a replaced environment.
     Sudo,
-    /// Sets up the environment rather than naming the command.
-    Launcher,
+    /// `env`.
+    Env,
     /// `${NAME+"NAME=$NAME"}`: the child gets the variable as the ambient environment has it.
     Forward(&'a str),
-    /// An assignment of a variable cargo's fingerprint may depend on.
-    ForeignEnv(&'a str),
+    /// `NAME=value`, possibly quoted.
+    Assign { name: &'a str, quoted: bool },
     /// The command itself — everything from here on is compared.
     Command,
 }
@@ -257,30 +294,17 @@ fn classify(tok: &str) -> Token<'_> {
         return Token::Sudo;
     }
     if stripped == "env" {
-        return Token::Launcher;
+        return Token::Env;
     }
-    if let Some(key) = forwarded_name(tok) {
-        return forward(key);
+    if let Some(name) = forwarded_name(tok) {
+        return Token::Forward(name);
     }
     match stripped.split_once('=') {
-        Some((key, _)) if is_env_var_name(key) => {
-            if FINGERPRINT_NEUTRAL_ENV.contains(&key) {
-                Token::Launcher
-            } else {
-                Token::ForeignEnv(key)
-            }
-        }
+        Some((name, _)) if is_env_var_name(name) => Token::Assign {
+            name,
+            quoted: stripped.len() != tok.len(),
+        },
         _ => Token::Command,
-    }
-}
-
-/// A forward is a launcher whatever the name, but only a name outside
-/// [`FINGERPRINT_NEUTRAL_ENV`] is worth reporting as one.
-fn forward(key: &str) -> Token<'_> {
-    if FINGERPRINT_NEUTRAL_ENV.contains(&key) {
-        Token::Launcher
-    } else {
-        Token::Forward(key)
     }
 }
 

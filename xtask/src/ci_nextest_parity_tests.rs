@@ -416,6 +416,82 @@ jobs:
     }
 }
 
+/// A forward of a neutral name is a launcher, but not one worth reporting.
+#[skuld::test]
+fn a_neutral_forward_is_a_launcher() {
+    let ci = r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env ${PATH+"PATH=$PATH"} cargo nextest run -E 'package(a)'
+"#;
+    let job = test_job(ci, "j", None).expect("analyze");
+    assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
+    assert!(job.launches[0].1.forwarded.is_empty());
+}
+
+/// The shell decides a word is an assignment before expansion, and only for an
+/// unquoted `NAME=` before the command; the gate runs its first argument. So an
+/// assignment is one only where `env` or `sudo` reads it, or unquoted before
+/// any command.
+#[skuld::test]
+fn an_assignment_outside_its_position_is_an_error() {
+    for prefix in [
+        r#"${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"}"#,
+        r#"SKULD_LABELS=tun ${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"}"#,
+        r#"${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"} sudo env"#,
+        r#"${PATH+"PATH=$PATH"} sudo env"#,
+        &format!(r#"{NO_COMPILE_GATE} ${{PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"}}"#),
+        &format!("{NO_COMPILE_GATE} SKULD_LABELS=tun"),
+        r#""SKULD_LABELS=tun""#,
+    ] {
+        let ci = format!(
+            r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: >-
+          {prefix} cargo nextest run -E 'package(a)'
+"#
+        );
+        let err = test_job(&ci, "j", None).unwrap_err();
+        assert!(format!("{err:#}").contains("runs as a command"), "{prefix}: {err:#}");
+    }
+}
+
+/// The positions where an assignment does assign.
+#[skuld::test]
+fn an_assignment_in_its_position_is_a_launcher() {
+    for prefix in [
+        "SKULD_LABELS=tun".to_string(),
+        format!("SKULD_LABELS=tun {NO_COMPILE_GATE}"),
+        format!(r#"{NO_COMPILE_GATE} sudo env "SKULD_LABELS=tun" ${{A+"A=$A"}}"#),
+        format!(r#"{NO_COMPILE_GATE} env SKULD_LABELS=tun ${{A+"A=$A"}}"#),
+        r#"sudo ${A+"A=$A"}"#.to_string(),
+    ] {
+        let ci = format!(
+            r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: >-
+          {prefix} cargo nextest run -E 'package(a)'
+"#
+        );
+        let job = test_job(&ci, "j", None).unwrap_or_else(|e| panic!("{prefix}: {e:#}"));
+        assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'", "{prefix}");
+    }
+}
+
 // ===== target_nextest_run ============================================================================================
 
 fn fixture_manifest() -> Manifest {

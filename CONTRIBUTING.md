@@ -2612,9 +2612,9 @@ on a client path (the vendored tree is lint-excluded): re-verify on every re-mer
 - Go toolchain (for ex-ray; built by `cargo xtask deps`) — pinned by the
   `toolchain` directive in [crates/ex-ray/go.mod](crates/ex-ray/go.mod), which
   `go` enforces on a bare `go build` and CI feeds to `actions/setup-go`
-- Node.js 24.22.1 or newer 24.x, the first to distrust the compromised eMudhra
-  intermediates — a *range* (`engines.node` in [package.json](package.json)),
-  resolved at job time
+- Node.js 24 — a *range* (`engines.node` in [package.json](package.json)),
+  resolved at job time, whose floor is the first release that distrusts the
+  compromised eMudhra intermediates
 
 Rust and Go are exact pins, so a release of either cannot turn `main` red on its
 own. Bump them deliberately: clippy gains lints between releases, and
