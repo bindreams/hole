@@ -323,13 +323,25 @@ fn classify(tok: &str) -> Token<'_> {
     match stripped.split_once('=') {
         Some((name, value)) if is_env_var_name(name) => Token::Assign {
             name,
-            quoted: stripped.len() != tok.len(),
+            quoted: is_one_quoted_span(tok),
             literal: value
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c)),
         },
         _ => Token::Command,
     }
+}
+
+/// Whether `tok` is a single quoted span, which the shell neither splits nor
+/// globs: `'…'` with no `'` inside, or `"…"` with no `"` or `\` inside.
+fn is_one_quoted_span(tok: &str) -> bool {
+    if let Some(inner) = tok.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        return !inner.contains('\'');
+    }
+    if let Some(inner) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        return !inner.contains(['"', '\\']);
+    }
+    false
 }
 
 /// `NAME` of the raw token `${NAME+"NAME=$NAME"}`, the one form that hands the
