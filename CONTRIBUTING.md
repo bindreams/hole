@@ -2926,7 +2926,8 @@ and a rerun repeats the platform's whole job.
   `xtask/src/child_env.rs`); build scripts named `.git/packed-refs`
   or a packed branch ref in `rerun-if-changed`, and a missing path reruns the
   script on every invocation (`xtask-lib/src/git_rerun.rs`); and `sudo env`
-  dropped `CARGO_INCREMENTAL`, which is part of every workspace unit's profile.
+  dropped `CARGO_INCREMENTAL`, which is part of every workspace unit's profile,
+  and `PKG_CONFIG_PATH`, which aws-lc-sys's build script tracks.
   The strip is a prefix rule, so `hole-verify-run-env` records its environment
   with `env -0` (an external process sees names a shell builtin omits, such as
   `ProgramFiles(x86)`), runs under a real `cargo run`, and fails on any variable

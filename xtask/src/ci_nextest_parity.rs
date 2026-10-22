@@ -224,7 +224,8 @@ fn split_launch(cmd: &str) -> Result<(Launch, String)> {
             Token::Command => break,
             Token::ForeignEnv(name) => bail!(
                 "command {cmd:?} sets {name:?} inline, which is outside the fingerprint-neutral \
-                 set {FINGERPRINT_NEUTRAL_ENV:?} — stripping it would hide a cargo rebuild                  (forward the ambient value with ${{{name}+\"{name}=${name}\"}})"
+                 set {FINGERPRINT_NEUTRAL_ENV:?} — stripping it would hide a cargo rebuild \
+                 (forward the ambient value with ${{{name}+\"{name}=${name}\"}})"
             ),
         }
         start += 1;
