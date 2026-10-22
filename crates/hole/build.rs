@@ -26,7 +26,7 @@ fn main() {
         return;
     }
 
-    let repo_root = git_repo_root();
+    let repo_root = repo_root();
     let cache_icons_dir = repo_root.join(".cache").join("icons");
     std::fs::create_dir_all(&cache_icons_dir).expect("failed to create .cache/icons/");
 
@@ -173,15 +173,12 @@ fn ensure_external_bin_stubs(repo_root: &Path) {
 
 // Repo root ===========================================================================================================
 
-fn git_repo_root() -> PathBuf {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .expect("failed to run `git rev-parse --show-toplevel` — is git installed?");
-
-    assert!(output.status.success(), "git rev-parse --show-toplevel failed");
-
-    PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+/// `CARGO_MANIFEST_DIR` is `<repo>/crates/hole`. Not `git rev-parse
+/// --show-toplevel`: under a git hook `GIT_DIR` is set and git answers the
+/// current directory, which for a build script is the crate.
+fn repo_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    manifest_dir.parent().and_then(Path::parent).unwrap().to_path_buf()
 }
 
 // Version =============================================================================================================
