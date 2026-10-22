@@ -173,12 +173,14 @@ fn ensure_external_bin_stubs(repo_root: &Path) {
 
 // Repo root ===========================================================================================================
 
-/// `CARGO_MANIFEST_DIR` is `<repo>/crates/hole`. Not `git rev-parse
-/// --show-toplevel`: under a git hook `GIT_DIR` is set and git answers the
-/// current directory, which for a build script is the crate.
+/// Repo root from `CARGO_MANIFEST_DIR` (`<repo>/crates/hole`); `git rev-parse` is wrong under a git hook (`GIT_DIR` set).
 fn repo_root() -> PathBuf {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    manifest_dir.parent().and_then(Path::parent).unwrap().to_path_buf()
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("CARGO_MANIFEST_DIR is <repo>/crates/hole")
+        .to_path_buf()
 }
 
 // Version =============================================================================================================
