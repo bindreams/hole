@@ -72,9 +72,9 @@ fn a_marker_held_open_against_readers_reads_as_unreadable() {
     // The case the post-sweep refusal exists for: a holder keeps the marker open
     // denying read, so the open fails while the file is plainly there. Windows-only
     // — the unix equivalent is a permission denial, which root defeats.
+    // Pins the unprivileged reader: one holding backup rights reads through the
+    // holder and gets `Present`, which is also a claim.
     use std::os::windows::fs::OpenOptionsExt;
-    let log = CapturedLog::new();
-    let _guard = log.install();
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), &info(7), None).unwrap();
     let _held = std::fs::OpenOptions::new()
@@ -83,14 +83,90 @@ fn a_marker_held_open_against_readers_reads_as_unreadable() {
         .share_mode(0)
         .open(dir.path().join(MARKER_FILE))
         .unwrap();
-    let got = read(dir.path());
+    let (got, present, raw_steps, log) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let log = CapturedLog::new();
+                let _guard = log.install();
+                let _unprivileged = restricted_reader::Impersonation::begin();
+                let got = read(dir.path());
+                (got, is_present(dir.path()), raw_steps(dir.path()), log.contents())
+            })
+            .join()
+            .unwrap()
+    });
     assert!(
         matches!(got, Marker::Unreadable),
-        "a regular file that exists but cannot be opened is still a claim; read answered {got:?}\nraw steps: {}\nlog:\n{}",
-        raw_steps(dir.path()),
-        log.contents()
+        "a regular file that exists but cannot be opened is still a claim; read answered {got:?}
+raw steps: {raw_steps}
+log:
+{log}"
     );
-    assert!(is_present(dir.path()));
+    assert!(present);
+}
+
+// The unprivileged reader ---------------------------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod restricted_reader {
+    use windows::core::Owned;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{
+        CreateRestrictedToken, DuplicateTokenEx, SecurityImpersonation, TokenImpersonation, DISABLE_MAX_PRIVILEGE,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
+
+    /// The calling thread runs as a copy of the process token with every privilege removed, until dropped.
+    /// Thread-scoped: the process token, and every other thread, are untouched.
+    pub(super) struct Impersonation;
+
+    impl Impersonation {
+        /// Panics if the token cannot be built or applied: a test of the unprivileged reader has no meaning without it.
+        pub(super) fn begin() -> Self {
+            // SAFETY: every out-pointer names a live local; each handle is owned and closed on drop.
+            unsafe {
+                let mut process = HANDLE::default();
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
+                    &mut process,
+                )
+                .expect("OpenProcessToken");
+                let process = Owned::new(process);
+
+                let mut restricted = HANDLE::default();
+                CreateRestrictedToken(*process, DISABLE_MAX_PRIVILEGE, None, None, None, &mut restricted)
+                    .expect("CreateRestrictedToken");
+                let restricted = Owned::new(restricted);
+
+                let mut impersonation = HANDLE::default();
+                DuplicateTokenEx(
+                    *restricted,
+                    TOKEN_IMPERSONATE | TOKEN_QUERY,
+                    None,
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &mut impersonation,
+                )
+                .expect("DuplicateTokenEx");
+                let impersonation = Owned::new(impersonation);
+
+                // The thread keeps its own reference to the token; closing ours afterwards is fine.
+                SetThreadToken(None, Some(*impersonation)).expect("SetThreadToken");
+            }
+            Self
+        }
+    }
+
+    impl Drop for Impersonation {
+        fn drop(&mut self) {
+            // SAFETY: a null token stops this thread impersonating.
+            let reverted = unsafe { SetThreadToken(None, None) };
+            // A failed revert leaves the thread restricted; a panic in drop during unwinding aborts, so only report.
+            debug_assert!(reverted.is_ok(), "SetThreadToken(NULL) failed: {reverted:?}");
+        }
+    }
 }
 
 // Diagnostics for the held-open test ----------------------------------------------------------------------------------
