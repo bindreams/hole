@@ -255,7 +255,7 @@ fn split_launch(cmd: &str) -> Result<(Launch, String)> {
             }
             Token::Assign { name, quoted, literal } => {
                 let one_word = match phase {
-                    Phase::Shell => !quoted,
+                    Phase::Shell => literal,
                     Phase::Gate => false,
                     Phase::Sudo | Phase::Env => quoted || literal,
                 };
@@ -280,7 +280,8 @@ fn split_launch(cmd: &str) -> Result<(Launch, String)> {
 /// The launcher prefix's segments, in the only order they may appear.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Phase {
-    /// Before any command word: the shell assigns an unquoted `NAME=` word.
+    /// Before any command word: the shell assigns an unquoted `NAME=` word, so
+    /// only a literal one is taken as written.
     Shell,
     /// The argv of the [`NO_COMPILE_GATE`] wrapper, which runs its first word.
     Gate,
@@ -299,8 +300,8 @@ enum Token<'a> {
     Env,
     /// `${NAME+"NAME=$NAME"}`: the child gets the variable as the ambient environment has it.
     Forward(&'a str),
-    /// `NAME=value`: `quoted` if the whole word is quoted, `literal` if its value
-    /// has nothing the shell would expand or split.
+    /// `NAME=value`: `quoted` if the word is one quoted span, `literal` if it is
+    /// unquoted and has nothing the shell would expand or split.
     Assign { name: &'a str, quoted: bool, literal: bool },
     /// The command itself — everything from here on is compared.
     Command,
@@ -324,9 +325,10 @@ fn classify(tok: &str) -> Token<'_> {
         Some((name, value)) if is_env_var_name(name) => Token::Assign {
             name,
             quoted: is_one_quoted_span(tok),
-            literal: value
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c)),
+            literal: stripped.len() == tok.len()
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c)),
         },
         _ => Token::Command,
     }
