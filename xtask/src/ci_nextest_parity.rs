@@ -22,10 +22,10 @@
 //! variables may be stripped or exported — anything else feeds cargo's
 //! fingerprint, and normalizing it away would hide the very rebuild being
 //! guarded against. Two launcher forms are exempt because they cannot change
-//! what cargo builds: the [`NO_COMPILE_GATE`] wrapper, and `NAME=$NAME` (or
-//! `${NAME+"NAME=$NAME"}`, which leaves an unset variable unset), which hands
-//! the child the value it already has. The latter is how a `sudo env` child
-//! gets back a variable `sudo` dropped.
+//! what cargo builds: the [`NO_COMPILE_GATE`] wrapper, and the forward
+//! `${NAME+"NAME=$NAME"}`, which hands the child the variable as it already is,
+//! set or unset. The latter is how a `sudo env` child gets back a variable
+//! `sudo` dropped.
 
 use std::collections::BTreeSet;
 
@@ -108,7 +108,7 @@ pub struct Launch {
     pub gated: bool,
     /// Started through `sudo`.
     pub privileged: bool,
-    /// Variables handed on with `NAME=$NAME`, i.e. restored to the ambient value.
+    /// Variables handed on with `${NAME+"NAME=$NAME"}`, i.e. restored to the ambient state.
     pub forwarded: BTreeSet<String>,
 }
 
@@ -224,7 +224,7 @@ fn split_launch(cmd: &str) -> Result<(Launch, String)> {
             Token::Command => break,
             Token::ForeignEnv(name) => bail!(
                 "command {cmd:?} sets {name:?} inline, which is outside the fingerprint-neutral \
-                 set {FINGERPRINT_NEUTRAL_ENV:?} — stripping it would hide a cargo rebuild"
+                 set {FINGERPRINT_NEUTRAL_ENV:?} — stripping it would hide a cargo rebuild                  (forward the ambient value with ${{{name}+\"{name}=${name}\"}})"
             ),
         }
         start += 1;
@@ -239,7 +239,7 @@ enum Token<'a> {
     Sudo,
     /// Sets up the environment rather than naming the command.
     Launcher,
-    /// `NAME=$NAME`: the child gets the value the ambient environment has.
+    /// `${NAME+"NAME=$NAME"}`: the child gets the variable as the ambient environment has it.
     Forward(&'a str),
     /// An assignment of a variable cargo's fingerprint may depend on.
     ForeignEnv(&'a str),
@@ -258,14 +258,12 @@ fn classify(tok: &str) -> Token<'_> {
     if stripped == "env" {
         return Token::Launcher;
     }
-    if let Some(key) = conditional_forward(stripped) {
+    if let Some(key) = forwarded_name(tok) {
         return forward(key);
     }
     match stripped.split_once('=') {
-        Some((key, value)) if is_env_var_name(key) => {
-            if value == format!("${key}") || value == format!("${{{key}}}") {
-                forward(key)
-            } else if FINGERPRINT_NEUTRAL_ENV.contains(&key) {
+        Some((key, _)) if is_env_var_name(key) => {
+            if FINGERPRINT_NEUTRAL_ENV.contains(&key) {
                 Token::Launcher
             } else {
                 Token::ForeignEnv(key)
@@ -285,10 +283,11 @@ fn forward(key: &str) -> Token<'_> {
     }
 }
 
-/// `NAME` of `${NAME+"NAME=$NAME"}`: a forward that leaves an unset variable unset.
-fn conditional_forward(tok: &str) -> Option<&str> {
+/// `NAME` of the raw token `${NAME+"NAME=$NAME"}`, the one form that hands the
+/// child the variable unchanged: `"NAME=$NAME"` would set an unset one to empty.
+fn forwarded_name(tok: &str) -> Option<&str> {
     let (key, word) = tok.strip_prefix("${")?.strip_suffix('}')?.split_once('+')?;
-    (is_env_var_name(key) && unquote(word) == format!("{key}=${key}")).then_some(key)
+    (is_env_var_name(key) && word == format!("\"{key}=${key}\"")).then_some(key)
 }
 
 /// A POSIX environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.

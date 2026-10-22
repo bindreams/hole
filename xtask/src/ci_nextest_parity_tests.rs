@@ -302,7 +302,8 @@ jobs:
 
 /// Under `sudo` the child's environment is whatever `env` is told, so the
 /// ambient value of a variable is forwarded by naming it. The child then sees
-/// what the compile step saw, which is the property this module guards.
+/// what the compile step saw, set or unset, which is the property this module
+/// guards.
 #[skuld::test]
 fn a_forwarded_variable_is_a_launcher_not_a_change() {
     let ci = r#"
@@ -312,7 +313,7 @@ jobs:
       - id: hole-build
         run: cargo xtask build tests
       - name: root
-        run: sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" cargo nextest run -E 'package(a)'
+        run: sudo env "PATH=$PATH" "HOME=$HOME" ${CARGO_INCREMENTAL+"CARGO_INCREMENTAL=$CARGO_INCREMENTAL"} cargo nextest run -E 'package(a)'
 "#;
     let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
@@ -353,45 +354,47 @@ jobs:
     }
 }
 
-/// `${NAME}` is the same forward as `$NAME`.
+/// A forward that does not hand the child exactly the ambient value, set or
+/// unset, is an assignment: `"NAME=$NAME"` makes an unset variable empty, a
+/// single-quoted one passes the literal `$NAME`, an unquoted one splits.
 #[skuld::test]
-fn a_braced_forward_is_recognized() {
-    let ci = r#"
+fn an_inexact_forward_is_an_assignment() {
+    for word in [
+        r#""CARGO_INCREMENTAL=$CARGO_INCREMENTAL""#,
+        r#""CARGO_INCREMENTAL=${CARGO_INCREMENTAL}""#,
+        r#"'CARGO_INCREMENTAL=$CARGO_INCREMENTAL'"#,
+        r#"CARGO_INCREMENTAL=$CARGO_INCREMENTAL"#,
+    ] {
+        let ci = format!(
+            r#"
 jobs:
   j:
     steps:
       - id: hole-build
         run: cargo xtask build tests
       - name: root
-        run: sudo env "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" cargo nextest run -E 'package(a)'
-"#;
-    let job = test_job(ci, "j", None).expect("analyze");
-    assert!(job.launches[0].1.forwarded.contains("CARGO_INCREMENTAL"));
+        run: sudo env {word} cargo nextest run -E 'package(a)'
+"#
+        );
+        let err = test_job(&ci, "j", None).unwrap_err();
+        assert!(format!("{err:#}").contains("fingerprint-neutral"), "{word}: {err:#}");
+    }
 }
 
-/// `${NAME+"NAME=$NAME"}` forwards a variable only when it is set, so an unset
-/// one stays unset rather than becoming empty.
+/// A conditional that is not the exact forward of its own name is part of the
+/// command, so the comparison sees it: a single-quoted word passes the literal
+/// `$A`, an unquoted one splits, a quoted token turns unset into `""`.
 #[skuld::test]
-fn a_conditional_forward_is_recognized() {
-    let ci = r#"
-jobs:
-  j:
-    steps:
-      - id: hole-build
-        run: cargo xtask build tests
-      - name: root
-        run: sudo env ${PKG_CONFIG_PATH+"PKG_CONFIG_PATH=$PKG_CONFIG_PATH"} cargo nextest run -E 'package(a)'
-"#;
-    let job = test_job(ci, "j", None).expect("analyze");
-    assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
-    assert!(job.launches[0].1.forwarded.contains("PKG_CONFIG_PATH"));
-}
-
-/// A conditional whose word is not the forward of its own name is part of the
-/// command, so the comparison sees it.
-#[skuld::test]
-fn a_mismatched_conditional_is_not_a_forward() {
-    for word in [r#"${A+"B=$B"}"#, r#"${A+"A=0"}"#, r#"${A-"A=$A"}"#] {
+fn an_inexact_conditional_is_not_a_forward() {
+    for word in [
+        r#"${A+"B=$B"}"#,
+        r#"${A+"A=0"}"#,
+        r#"${A-"A=$A"}"#,
+        r#"${A:+"A=$A"}"#,
+        r#"${A+'A=$A'}"#,
+        r#"${A+A=$A}"#,
+        r#""${A+"A=$A"}""#,
+    ] {
         let ci = format!(
             r#"
 jobs:
@@ -596,7 +599,7 @@ fn a_privileged_lane_forwards_the_variables_that_feed_cargos_fingerprint() {
         for var in MUST_FORWARD {
             assert!(
                 launch.forwarded.contains(var),
-                "privileged lane {label:?} does not forward {var}: add \"{var}=${var}\" after `sudo env`"
+                "privileged lane {label:?} does not forward {var}: add ${{{var}+\"{var}=${var}\"}} after `sudo env`"
             );
         }
     }
