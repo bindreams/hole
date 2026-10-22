@@ -2662,6 +2662,20 @@ Rust's unwinding panic hook. The first-party Apache-2.0
 signal-safe work: write a fixed-format `crash-<kind>-<pid>.marker` via raw
 syscalls (no heap/locks/`format!`). All I/O errors are swallowed.
 
+The log directory is the interactive user's while the bridge writes in it as
+root, so [`attach`](crates/tombstone/src/crash.rs) opens it once through
+`util::dir::Dir` (see
+[Privileged code in folders a user may own](#privileged-code-in-folders-a-user-may-own))
+and holds it for the process lifetime. The handler creates the marker, and the
+Windows dev-only `.dmp`, by a name pre-encoded at `attach` and relative to that
+handle: `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` on unix,
+`NtCreateFile(FILE_CREATE)` on Windows. An entry already at the name is never
+written through, truncated or replaced; `attach` picks a name that is free then
+(`-1`, `-2` after the pid when an earlier process's marker or dump with the same
+pid is unswept), so a name planted afterwards costs that one crash its marker
+and the entry nothing. A directory that cannot be opened leaves the handler
+attached (on macOS it still ends the process) and writing no marker.
+
 On Windows and Linux it then returns `Handled(false)` so the OS default path
 (WER / core dump) still runs. **On macOS it never returns** — it `_exit(70)`s,
 for every fault class, every attach kind and every build, so a macOS crash
@@ -2680,7 +2694,11 @@ callback does.
 `tombstone::sweep(log_dir)` runs at the next start of the same kind, emits a
 `tracing::error!(target: "crash", …)`, and deletes the marker. Markers land in
 `log_dir` (not `state_dir`) so the elevated bridge's marker is readable by the
-unprivileged GUI.
+unprivileged GUI. The sweep opens `log_dir` through `Dir` and reads each marker
+through a `ReadDir` by its name inside that handle: a symlink at a marker name
+is reported unreadable and unlinked as itself, and a FIFO is never waited for.
+The listing of names is by path (names only; each read and removal is by name
+in the handle, as `cleanup_legacy_daily_logs` does).
 
 - **Platform coverage:** marker + sweep work on Windows, macOS, **and Linux**
   (galoshes ships a Linux release, so `tombstone` must compile and run there).

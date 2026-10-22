@@ -8207,6 +8207,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "util",
  "wait-timeout",
  "windows 0.62.2",
 ]
