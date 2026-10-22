@@ -453,6 +453,11 @@ fn a_prefix_that_does_not_assign_as_written_is_an_error() {
         r#"sudo env 'HOME='$HOME''"#,
         r#"sudo env "HOME=a"b""#,
         r#""SKULD_LABELS=tun""x""#,
+        r#"sudo env "HOME=$@""#,
+        r#"sudo env "HOME=${arr[@]}""#,
+        r#"sudo env "HOME=$*""#,
+        r#"sudo env "HOME=$(pwd)""#,
+        r#"sudo env "HOME=${HOME""#,
         "SKULD_LABELS='tun NEXTEST_PROFILE=tun'",
         "SKULD_LABELS=$X",
         "sudo env SKULD_LABELS='tun NEXTEST_PROFILE=tun'",
@@ -492,6 +497,7 @@ fn an_assignment_in_its_position_is_a_launcher() {
         r#"sudo ${A+"A=$A"}"#.to_string(),
         r#"sudo SKULD_LABELS=tun env "PATH=$PATH""#.to_string(),
         "sudo env PATH=/usr/bin:/bin 'HOME=$x'".to_string(),
+        r#"sudo env "PATH=$HOME/bin:${PATH}" "HOME=$HOME""#.to_string(),
         format!("SKULD_LABELS=tun NEXTEST_PROFILE=tun {NO_COMPILE_GATE} env CARGO_LOG=cargo::core=trace"),
     ] {
         let ci = format!(

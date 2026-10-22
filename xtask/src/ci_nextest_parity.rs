@@ -325,25 +325,52 @@ fn classify(tok: &str) -> Token<'_> {
         Some((name, value)) if is_env_var_name(name) => Token::Assign {
             name,
             quoted: is_one_quoted_span(tok),
-            literal: stripped.len() == tok.len()
-                && value
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c)),
+            literal: stripped.len() == tok.len() && value.chars().all(is_literal_char),
         },
         _ => Token::Command,
     }
 }
 
-/// Whether `tok` is a single quoted span, which the shell neither splits nor
-/// globs: `'…'` with no `'` inside, or `"…"` with no `"` or `\` inside.
+/// Whether `tok` is a single quoted span that expands to exactly one word:
+/// `'…'` with no `'` inside, or `"…"` made only of [`is_literal_char`]s,
+/// `$NAME` and `${NAME}` (not `$@`, `${a[@]}`, or a substitution).
 fn is_one_quoted_span(tok: &str) -> bool {
     if let Some(inner) = tok.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
         return !inner.contains('\'');
     }
-    if let Some(inner) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
-        return !inner.contains(['"', '\\']);
+    let Some(mut rest) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
+        return false;
+    };
+    while let Some(c) = rest.chars().next() {
+        if is_literal_char(c) {
+            rest = &rest[1..];
+            continue;
+        }
+        let Some(after) = rest.strip_prefix('$') else {
+            return false;
+        };
+        let (name, tail) = match after.strip_prefix('{') {
+            Some(braced) => match braced.split_once('}') {
+                Some(split) => split,
+                None => return false,
+            },
+            None => after.split_at(
+                after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len()),
+            ),
+        };
+        if !is_env_var_name(name) {
+            return false;
+        }
+        rest = tail;
     }
-    false
+    true
+}
+
+/// A character the shell takes literally in or out of quotes.
+fn is_literal_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c)
 }
 
 /// `NAME` of the raw token `${NAME+"NAME=$NAME"}`, the one form that hands the
