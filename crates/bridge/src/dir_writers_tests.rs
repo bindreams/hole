@@ -145,6 +145,7 @@ const LOCK_NAME: &str = "writers.lock";
 const STATE_NAME: &str = "state.json";
 const LOG_NAME: &str = "bridge.log";
 const LOG_ROTATED_NAME: &str = "bridge.log.1";
+const LOG_FALLBACK_NAME: &str = "bridge.log.1.fallback";
 const SOCKET_NAME: &str = "hole-bridge.sock";
 const CRASH_PID: u32 = 4242;
 const CRASH_MARKER_NAME: &str = "crash-bridge-4242.marker";
@@ -464,7 +465,7 @@ fn writers() -> Vec<Writer> {
                 "crates/common/src/logging.rs",
                 "crates/common/src/logging/dir_rotate.rs",
             ],
-            names: &[LOG_NAME, LOG_ROTATED_NAME],
+            names: &[LOG_NAME, LOG_ROTATED_NAME, LOG_FALLBACK_NAME],
             at_a_planted_name: AtAPlantedName::KeepsAFileItsOwnerOwns,
             runs_here: true,
             run: |dir, owner| {
@@ -1729,6 +1730,8 @@ const BY_NAME: &[&str] = &[
     "fs::symlink_dir",
     "File::create",
     "File::create_new",
+    "OpenOptions::new",
+    "File::options",
     "libc::unlink",
     "libc::rmdir",
     "libc::rename",
@@ -1812,6 +1815,18 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
         "libc::lchown",
         1,
         "no caller in production code: only tests/elevated_ownership_privileged.rs and its own tests call it",
+    ),
+    (
+        "crates/bridge/src/bin/test_plugin.rs",
+        "std::fs::OpenOptions::new",
+        1,
+        "a test binary: claims a sentinel file the test names",
+    ),
+    (
+        "crates/bridge/src/bin/test_service.rs",
+        "std::fs::OpenOptions::new",
+        1,
+        "a test binary: appends to a control log the test names",
     ),
     (
         "crates/bridge/src/cutover/extract.rs",
@@ -1917,6 +1932,12 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "crates/common/src/config_store.rs",
+        "fs::OpenOptions::new",
+        2,
+        "the GUI's own user config: the backup of a corrupt file, made as the user (only the GUI process uses `ConfigStore`)",
+    ),
+    (
+        "crates/common/src/config_store.rs",
         "fs::remove_file",
         2,
         "the GUI's own user config, written as the user",
@@ -1926,6 +1947,12 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
         "fs::rename",
         1,
         "the GUI's own user config, written as the user",
+    ),
+    (
+        "crates/common/src/logging/logging_test_helpers.rs",
+        "OpenOptions::new",
+        3,
+        "test helpers",
     ),
     (
         "crates/common/src/logging/logging_test_helpers.rs",
@@ -2040,6 +2067,12 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
         "std::os::windows::fs::symlink_file",
         1,
         "a test binary: built only by the test workflow (feature crash-child) to plant links under a crash",
+    ),
+    (
+        "crates/tun-engine/src/test_utils/escape.rs",
+        "std::fs::OpenOptions::new",
+        1,
+        "test support",
     ),
     (
         "crates/tun-engine/src/test_utils/escape.rs",
@@ -2215,6 +2248,65 @@ let f = ufs::lchown;"
 chown(fd);"
         ),
         0
+    );
+}
+
+#[skuld::test]
+fn the_by_name_scan_keeps_every_binding_of_a_name() {
+    let banned_first = "#[cfg(unix)]
+use std::fs::remove_file as rm;
+#[cfg(windows)]
+use crate::win::delete as rm;
+fn f(p: &Path) { rm(p); }";
+    let banned_last = "#[cfg(windows)]
+use crate::win::delete as rm;
+#[cfg(unix)]
+use std::fs::remove_file as rm;
+fn f(p: &Path) { rm(p); }";
+    assert_eq!(by_name_calls(banned_first), ["rm"]);
+    assert_eq!(by_name_calls(banned_last), ["rm"]);
+    // The same name from a `use` and from a `type`, and from two imports without an alias.
+    assert_eq!(
+        by_name_calls(
+            "use std::fs::remove_file as rm;
+type rm = other::Thing;
+fn f(p: &Path) { rm(p); }"
+        ),
+        ["rm"]
+    );
+    assert_eq!(
+        by_name_calls(
+            "use std::fs::rename;
+use crate::win::rename;
+fn f() { rename(a, b); }"
+        ),
+        ["rename"]
+    );
+    // Two bindings, neither of them banned.
+    assert!(by_name_calls(
+        "use a::rm;
+use b::rm;
+fn f(p: &Path) { rm(p); }"
+    )
+    .is_empty());
+}
+
+#[skuld::test]
+fn the_by_name_scan_sees_a_create_through_open_options() {
+    assert_eq!(
+        by_name_calls("let f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;"),
+        ["std::fs::OpenOptions::new"]
+    );
+    assert_eq!(
+        by_name_calls(
+            "use std::fs::OpenOptions;
+let f = OpenOptions::new().create(true).open(path)?;"
+        ),
+        ["OpenOptions::new"]
+    );
+    assert_eq!(
+        by_name_calls("let f = std::fs::File::options().create(true).write(true).open(path)?;"),
+        ["std::fs::File::options"]
     );
 }
 

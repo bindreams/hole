@@ -5,8 +5,12 @@
 //! The guards in the parent module are scans of source text, and a scan of substrings sees one spelling. This one
 //! sees what the `use` and `type` declarations of the file say a name stands for, comments and string literals aside.
 //!
+//! A name that several declarations bind (the arms of a `cfg` split) stands for every path they give it.
+//!
 //! What it does not see: a name bound by something other than those two (a macro that expands to a path, a `let`
-//! that copies a function under a new name and is then called by that name).
+//! that copies a function under a new name and is then called by that name); a path through a module of the same file
+//! that re-exports (`mod sys { pub use std::fs::remove_file; }` and then `sys::remove_file(p)`); and a call written
+//! with a qualified self (`<std::fs::File>::create(p)`, `<T as Trait>::f(p)`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -171,8 +175,9 @@ fn tokens(chars: &[char]) -> Vec<Token> {
 /// What the `use` and `type` declarations of a file make a name stand for.
 #[derive(Debug, Default)]
 struct Imports {
-    /// A name the file imported or aliased, and the path it stands for.
-    names: HashMap<String, Vec<String>>,
+    /// A name the file imported or aliased, and every path it stands for: a file splits an import by `cfg`
+    /// (`#[cfg(unix)] use a::f as g;` and `#[cfg(windows)] use b::f as g;`), and the scan reads every arm.
+    names: HashMap<String, Vec<Vec<String>>>,
     /// The prefixes of `use prefix::*`.
     globs: Vec<Vec<String>>,
 }
@@ -244,7 +249,14 @@ impl Imports {
             .collect();
         let plain = path.iter().all(|segment| segment.chars().all(is_ident));
         if !alias.is_empty() && !path.is_empty() && plain {
-            self.names.insert(alias, path);
+            self.bind(alias, path);
+        }
+    }
+
+    fn bind(&mut self, local: String, path: Vec<String>) {
+        let paths = self.names.entry(local).or_default();
+        if !paths.contains(&path) {
+            paths.push(path);
         }
     }
 
@@ -288,7 +300,7 @@ impl Imports {
                         *at += 2;
                     }
                     if let Some(local) = local.filter(|local| local != "_") {
-                        self.names.insert(local, path);
+                        self.bind(local, path);
                     }
                     return;
                 }
@@ -298,25 +310,32 @@ impl Imports {
         }
     }
 
-    /// Every path `written` can stand for: as written, with its first segment replaced by what the file imported or
-    /// aliased under that name (and that path's first segment again, for an alias of an alias), and below each glob
+    /// Every path `written` can stand for: as written, with its first segment replaced by each path the file imported
+    /// or aliased under that name (and that path's first segment again, for an alias of an alias), and below each glob
     /// import.
     fn resolve(&self, written: &[String]) -> Vec<Vec<String>> {
         let mut found = vec![written.to_vec()];
-        // Each name is replaced at most once, so a cycle of aliases ends.
-        let mut replaced = HashSet::new();
-        let mut current = written.to_vec();
-        while let Some(first) = current.first().filter(|first| replaced.insert((*first).clone())) {
-            let Some(path) = self.names.get(first) else {
-                break;
-            };
-            current = path.iter().chain(&current[1..]).cloned().collect();
-            found.push(current.clone());
-        }
+        self.expand(written, HashSet::new(), &mut found);
         for glob in &self.globs {
             found.push(glob.iter().chain(written).cloned().collect());
         }
         found
+    }
+
+    /// Adds to `found` each path `current` becomes by replacing its first segment. Each name is replaced at most once
+    /// along a chain, so a cycle of aliases ends.
+    fn expand(&self, current: &[String], mut replaced: HashSet<String>, found: &mut Vec<Vec<String>>) {
+        let Some(first) = current.first() else {
+            return;
+        };
+        if !replaced.insert(first.clone()) {
+            return;
+        }
+        for path in self.names.get(first).into_iter().flatten() {
+            let next: Vec<String> = path.iter().chain(&current[1..]).cloned().collect();
+            found.push(next.clone());
+            self.expand(&next, replaced.clone(), found);
+        }
     }
 }
 

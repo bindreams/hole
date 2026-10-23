@@ -752,13 +752,21 @@ Five source scans close the class. They read every use of a function through the
 (`dir_writers_tests/scan.rs`): a name imported, aliased, globbed or reached through a `type` alias is seen as the function it
 stands for, whether it is called or only named as a value (`.map(fs::read)`, `let f = fs::read;`, `(fs::read)(p)`). A `use`
 declaration itself, a definition, a macro, and a field or parameter that has the name are not uses; a method counts when it
-is called. What the scan does not see is a function bound by anything but `use` and `type` (a macro that expands to a
-path, a `let` that renames a function and is then called by the new name).
+is called. A name that several `use` or `type` declarations bind (the arms of a `cfg` split) stands for every path they
+give it. The scans are lexical tripwires over the explicit lists in `dir_writers_tests.rs`, not a proof about every
+spelling: the resolver does not see a function bound by anything but `use` and `type` (a macro that expands to a
+path, a `let` that renames a function and is then called by the new name), a path through a module of the same file that
+re-exports it (`mod sys { pub use std::fs::remove_file; }`, then `sys::remove_file(p)`), or a call with a qualified self
+(`<std::fs::File>::create(p)`). A call the lists do not name is not seen either: a new spelling of a by-path call needs a
+new row in the list.
 `no_privileged_code_acts_on_a_file_by_name`
-(no privileged crate calls `fchownat`, `fchmodat`, `chown`, `chmod`, `set_permissions`, a Windows by-path ACL call, or one
-that makes, removes, renames or links a name by path (`remove_file`, `remove_dir*`, `rename`, `create_dir*`, `write`,
-`copy`, `File::create`, `symlink`, `libc::unlink` and kin), except the sites listed in `BY_NAME_ALLOWED`, each with its
-count and reason: a folder no user can add names to, the acting user's own, a test's, or an "open owner question" that
+(no privileged crate calls any of the `BY_NAME` list: `fchownat`, `fchmodat`, `libc::{chown, lchown, chmod, lchmod}`,
+`fs::{chown, lchown, set_permissions}`, `SetNamedSecurityInfo*`, `SetFileSecurity*`, `SetFileAttributes*`,
+`fs::{remove_file, remove_dir, remove_dir_all, rename, create_dir, create_dir_all, write, copy, hard_link, soft_link, symlink, symlink_file, symlink_dir}`, `File::{create, create_new, options}`, `OpenOptions::new`,
+`libc::{unlink, rmdir, rename, mkdir, link, symlink}`, `DeleteFile*`, `MoveFile*`, `CreateDirectory*`,
+`RemoveDirectory*`, `CreateHardLink*`, `CreateSymbolicLink*`; `OpenOptions::new` is on it so that a create by path is
+judged here even in a file that `BY_PATH_ALLOWED` exempts for reads), except the sites listed in `BY_NAME_ALLOWED`, each
+with its count and reason: a folder no user can add names to, the acting user's own, a test's, or an "open owner question" that
 waits for a decision), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates, `hole` among them, open no
 file by path, except the files listed in `BY_PATH_ALLOWED`, each with its reason),
 `no_privileged_code_resolves_a_link_before_the_walk` (the same crates call neither `canonicalize` nor `realpath`,
