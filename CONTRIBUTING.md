@@ -748,6 +748,9 @@ token and read when it is a user). What a reader takes from a folder the user ow
 and never echoed: every reader turns its `serde_json::Error` into a `util::parse_error::ParseFailure` (category and
 position) where the parse happens, since the error's own text quotes the file, and the log goes to `bridge.log`, which
 the user can read (`no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse`, here and in `state_symlink_tests.rs`).
+The installer-SID reader (`take_installer_user_sid`) reads plain text and parses nothing as JSON; it logs a fixed
+warning for text that is not a SID and never the text (`text_that_is_not_a_sid_is_refused_and_never_logged`). Only text that passes
+`is_valid_sid_string` reaches the DACL builder, which logs no rejected text either.
 Five source scans close the class. They read every use of a function through the file's own `use` and `type` declarations
 (`dir_writers_tests/scan.rs`): a name imported, aliased, globbed or reached through a `type` alias is seen as the function it
 stands for, whether it is called or only named as a value (`.map(fs::read)`, `let f = fs::read;`, `(fs::read)(p)`). A `use`

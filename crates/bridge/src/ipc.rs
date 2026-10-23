@@ -1489,7 +1489,8 @@ pub(crate) fn read_installer_user_sid(dir: &Path) -> std::io::Result<String> {
 /// Reads and removes the installer's SID in `dir`; `None` when there is no usable one. The file is removed after a
 /// read, because the per-user SID is a temporary bridge that is no longer needed after the bridge restarts (group
 /// membership will be in the token after re-login). A file that could not be read (a name a user planted, or a read
-/// error) is left, and reported.
+/// error) is left, and reported. Text that is not a SID is removed and reported without the text: the folder is one a
+/// user can add names to, and `bridge.log` is one the user can read.
 #[cfg(target_os = "windows")]
 pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
     let sid = match read_installer_user_sid(dir) {
@@ -1503,7 +1504,11 @@ pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
     if let Err(e) = util::dir::remove_state_file(dir, INSTALLER_USER_SID_FILE.as_ref()) {
         warn!(error = %e, "could not remove the installer user SID file");
     }
-    (!sid.is_empty()).then_some(sid)
+    if !is_valid_sid_string(&sid) {
+        warn!("the installer user SID file does not hold a SID; ignoring it");
+        return None;
+    }
+    Some(sid)
 }
 
 /// Writes `sid` as the installer's SID in `dir`, making the folder if it is missing. The file is replaced as a whole,
@@ -1589,7 +1594,7 @@ pub fn build_sddl(extra_sids: &[&str]) -> String {
         if is_valid_sid_string(sid) {
             sddl.push_str(&format!("(A;;GA;;;{sid})"));
         } else {
-            warn!(sid = %sid, "ignoring malformed SID string in DACL");
+            warn!("ignoring malformed SID string in DACL");
         }
     }
 

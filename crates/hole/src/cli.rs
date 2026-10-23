@@ -904,7 +904,7 @@ fn file_was_rotated(path: &std::path::Path, current: &same_file::Handle) -> std:
 }
 
 /// Tail and follow a log file (like `tail -f`). Detects rename-rotation by
-/// `file-rotate` and reopens `path` so the stream keeps flowing after
+/// `DirRotate` and reopens `path` so the stream keeps flowing after
 /// rollover.
 fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
     use std::io::{BufRead, Seek, SeekFrom};
@@ -948,7 +948,7 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
                 match file_was_rotated(path, &handle) {
                     Ok(true) => {
                         // Drain any final bytes from the old (renamed) file
-                        // before swapping. file-rotate may have flushed a
+                        // before swapping. `DirRotate` may have flushed a
                         // line between our last Ok(0) and the rename.
                         loop {
                             line.clear();

@@ -2827,6 +2827,88 @@ fn the_installer_sid_folder_is_not_walked_through_a_users_link_to_a_system_folde
     assert_eq!(crate::ipc::take_installer_user_sid(&link), None);
 }
 
+/// Text a user could plant at the installer's SID name, with a piece of it on a second line.
+#[cfg(target_os = "windows")]
+const PLANTED_SID_TEXT: &str = "hunter2-SECRET
+second-line-SECRET";
+
+/// Everything `body` logs at any level, as text.
+#[cfg(target_os = "windows")]
+fn logs_of(body: impl FnOnce()) -> String {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let writer = crate::test_support::log_capture::VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        body();
+    }
+    writer.snapshot_string()
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn text_that_is_not_a_sid_is_refused_and_never_logged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("hole");
+    crate::ipc::write_installer_user_sid(&dir, PLANTED_SID_TEXT).unwrap();
+
+    let mut taken = Some(String::new());
+    let logs = logs_of(|| taken = crate::ipc::take_installer_user_sid(&dir));
+
+    assert_eq!(taken, None, "text that is not a SID was taken as one");
+    assert!(
+        logs.contains("installer user SID"),
+        "the refusal was not reported: {logs}"
+    );
+    assert!(!logs.contains("SECRET"), "the file's text reached the log: {logs}");
+    assert!(!logs.contains("hunter2"), "the file's text reached the log: {logs}");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn an_sddl_injection_in_the_installer_sid_file_is_refused_and_never_logged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("hole");
+    crate::ipc::write_installer_user_sid(&dir, "S-1-1-0)(A;;GA;;;hunter2").unwrap();
+
+    let mut taken = Some(String::new());
+    let logs = logs_of(|| taken = crate::ipc::take_installer_user_sid(&dir));
+
+    assert_eq!(taken, None);
+    assert!(!logs.contains("hunter2"), "the file's text reached the log: {logs}");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn an_empty_installer_sid_file_is_no_sid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("hole");
+    crate::ipc::write_installer_user_sid(
+        &dir, " 
+",
+    )
+    .unwrap();
+
+    assert_eq!(crate::ipc::take_installer_user_sid(&dir), None);
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_dacl_builder_logs_no_text_of_a_sid_it_rejects() {
+    let mut sddl = String::new();
+    let logs = logs_of(|| sddl = crate::ipc::build_sddl(&[PLANTED_SID_TEXT]));
+
+    assert!(!sddl.contains("SECRET"), "a rejected SID reached the SDDL: {sddl}");
+    assert!(logs.contains("malformed SID"), "the rejection was not reported: {logs}");
+    assert!(!logs.contains("SECRET"), "the rejected text reached the log: {logs}");
+    assert!(!logs.contains("hunter2"), "the rejected text reached the log: {logs}");
+}
+
 // bind() smoke tests — the production-path bind, which in cfg(test) uses
 // the unrestricted LocalListener::bind and skips apply_socket_permissions.
 
