@@ -2967,13 +2967,15 @@ and a rerun repeats the platform's whole job.
   network; a stale `go.sum` does not loop, since `go build` fails it at once),
   `cargo fetch` (a manifest cargo cannot parse), `uv sync` and `uv tool install`
   (a yanked pin or a source build that fails), `npm ci` and `npx`, `prek install-hooks`,
-  `GOTOOLCHAIN=goX.Y.Z go version` (a toolchain that does not exist), `go mod tidy` (in the vendor bump), `gh release download`, `git clone`, `curl -f`, `brew`, `cargo binstall`.
+  `GOTOOLCHAIN=goX.Y.Z go version` (a toolchain that does not exist), `go mod tidy` (in the vendor bump, whose `Finish` step has a 10-minute step bound so that the step fails and `Push` still runs, rather than the 30-minute job bound cancelling them), `gh release download`, `git clone`, `curl -f`, `brew`, `cargo binstall`.
   Three tools get a discriminator instead: `git ls-remote --exit-code` tells a
   tag upstream lacks (exit 2) from a lost network before `pull-subrepo`
   fetches; `cargo package --offline` runs a release's packaging and verify
   build from the fetched sources, so only `cargo publish --dry-run --no-verify`
   (which always asks the registry) is retried; and the publish workflows wait
-  for `api.github.com` to answer before asking `gh release view` once. The real
+  for `api.github.com` to answer (`gh api zen`, with the job's token: the
+  unauthenticated limit is 60 an hour per shared runner IP) before asking
+  `gh release view` once. The real
   `cargo publish` is not retried: a retry after an upload whose answer was lost
   would fail on the version that just landed.
   A `uses:` action that fetches cannot be wrapped: `setup-go` and the
