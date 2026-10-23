@@ -20,8 +20,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::child_env::{is_run_injected, launch_env_names};
 
-/// Variables `cargo run` (cargo 1.98.0, the pinned toolchain, via the rustup proxy) adds that the
-/// strip must keep. None is package environment: each is toolchain state that
+/// Variables `cargo run` (cargo 1.98.0, the pinned toolchain, via the rustup proxy or a wrapper around
+/// it) adds that the strip must keep. None is package environment: each is toolchain state that
 /// does not depend on which package is run, and a child that runs cargo or
 /// loads the toolchain's libraries needs it. Each is `(name, why it stays)`.
 pub const KEPT_TOOLCHAIN: &[(&str, &str)] = &[
@@ -51,7 +51,7 @@ pub const KEPT_TOOLCHAIN: &[(&str, &str)] = &[
     ),
     (
         "RUSTUP_OVERRIDE_UNIX_FALLBACK_SETTINGS",
-        "path of rustup's fallback settings file (macOS runner, CI-measured); a child's rustup reads the same",
+        "path of rustup's fallback settings file; Homebrew's rustup shims set it, and a child's rustup reads the same",
     ),
     (
         "RUSTUP_TOOLCHAIN",
