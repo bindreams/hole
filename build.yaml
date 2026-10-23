@@ -185,6 +185,10 @@ targets:
     # satisfies `hole-msi`, darwin/{amd64,arm64} satisfies `hole-dmg`.
     platforms: [linux/amd64, windows/amd64, darwin/amd64, darwin/arm64]
     build:
+      # A lockfile out of sync with package.json fails the same way on every attempt. A dry run
+      # without the network finds it (a lockfile that needs a registry lookup fails it), so it
+      # runs before the retry.
+      - npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund
       - .github/scripts/retry.sh npm ci --no-audit --no-fund
       - npm run build
 
@@ -411,6 +415,10 @@ targets:
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
+      # A lockfile out of sync with package.json fails the same way on every attempt. A dry run
+      # without the network finds it (a lockfile that needs a registry lookup fails it), so it
+      # runs before the retry.
+      - npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund
       - .github/scripts/retry.sh npm ci --no-audit --no-fund
       - npm run check
       - npm test

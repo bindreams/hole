@@ -96,7 +96,7 @@ jobs:
 
       - name: Fetch crate sources
         if: ${{ inputs.dry-run && inputs.crates-publish }}
-        run: .github/scripts/retry.sh cargo fetch --locked
+        run: .github/scripts/cargo-fetch.sh
 
       - name: Run cargo publish --dry-run
         if: ${{ inputs.dry-run && inputs.crates-publish }}
@@ -170,7 +170,7 @@ jobs:
 
       - name: Fetch crate sources
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}
-        run: .github/scripts/retry.sh cargo fetch --locked
+        run: .github/scripts/cargo-fetch.sh
 
       - name: Publish to crates.io
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}

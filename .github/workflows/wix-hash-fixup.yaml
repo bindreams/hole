@@ -38,6 +38,14 @@ jobs:
 
       - uses: astral-sh/setup-uv@v10.3.0
 
+      # `uv run` would fetch the Python dependencies outside any retry, so a
+      # lost network fails the push as if the update were wrong. A stale
+      # lockfile fails the same way on every attempt: check it offline first.
+      - name: Fetch msi-installer dependencies
+        run: |
+          uv lock --check --offline --directory msi-installer
+          .github/scripts/retry.sh uv sync --directory msi-installer
+
       - name: Update WiX URL and SHA256
         run: uv run --directory msi-installer upgrade-wix
 

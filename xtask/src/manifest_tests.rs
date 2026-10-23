@@ -668,6 +668,10 @@ fn frontend_check_target_shape() {
         t.run,
         vec![
             Step::Bash {
+                command: "npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund".to_string(),
+                environment: HashMap::new(),
+            },
+            Step::Bash {
                 command: ".github/scripts/retry.sh npm ci --no-audit --no-fund".to_string(),
                 environment: HashMap::new(),
             },
@@ -707,6 +711,10 @@ fn frontend_build_target_shape() {
     assert_eq!(
         t.build,
         vec![
+            Step::Bash {
+                command: "npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund".to_string(),
+                environment: HashMap::new(),
+            },
             Step::Bash {
                 command: ".github/scripts/retry.sh npm ci --no-audit --no-fund".to_string(),
                 environment: HashMap::new(),

@@ -22,9 +22,11 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        toolchain="$(sed -n 's/^toolchain \(go[0-9][0-9.]*\).*/\1/p' crates/ex-ray/go.mod)"
-        if [[ -z "$toolchain" ]]; then
-            echo "::error::crates/ex-ray/go.mod has no toolchain directive to pin"
+        # The directive's first token, whole: `go1.27.0`, `go1.27rc1`,
+        # `go1.27.0-suffix`, quoted or followed by a comment.
+        toolchain="$(sed -n 's/^[[:space:]]*toolchain[[:space:]][[:space:]]*["`]*\([^[:space:]"`/]*\).*/\1/p' crates/ex-ray/go.mod)"
+        if [[ ! "$toolchain" =~ ^go[0-9] ]]; then
+            echo "::error::crates/ex-ray/go.mod has no toolchain directive naming a Go release to pin (found '$toolchain')"
             exit 1
         fi
         echo "::warning::actions/setup-go failed; pinning $toolchain through the go command instead"

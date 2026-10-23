@@ -2944,21 +2944,24 @@ and a rerun repeats the platform's whole job.
   share a command (`uv run`, `prek run`, `npx`), a fetch-only call runs first
   and fills the cache (`scripts/validate-docs.py --fetch-only` for the docs
   hook).
-  A retry must not hide a failure the network did not cause. Each tool's offline
-  check runs first where one exists (`uv lock --check --offline`,
-  `prek validate-config`). `until_ok` stops on a failure marked
+  A retry must not hide a failure the network did not cause. Each tool's
+  deterministic check runs outside the retry where one exists: `uv lock --check --offline`, `prek validate-config`, `npm ci --dry-run --offline` (a lockfile
+  out of sync with `package.json` needs a registry lookup, which offline
+  fails), and for cargo `.github/scripts/cargo-fetch.sh` (xtask:
+  `galoshes::fetch_crates`), which retries a plain `cargo fetch` and then
+  compares `Cargo.lock` with what it was, because `cargo fetch --locked` exits
+  101 both for a stale lock and for a lost network and the lock check needs the
+  registry index. `until_ok` stops on a failure marked
   `retry::permanent` (a 4xx other than 408 and 429, a complete body with the
   wrong hash, a missing working directory), `retry.ps1` stops on an HTTP 4xx
   other than 408 and 429, the MSI project's WiX download does the same, and the
   shell and xtask helpers stop on a missing program. 408 and 429 ask for another
   try, so they retry, and a `Retry-After` in seconds is waited out (the backoff
   is the floor; an HTTP-date `Retry-After` is read by `retry.ps1` on PowerShell
-  7 only). Where the tool offers no offline check, a deterministic failure
-  retries until the timeout and the log shows its cause on every attempt:
-  `cargo fetch --locked` (a stale `Cargo.lock` and a lost network both exit 101,
-  and the lock check needs the registry index), `npm ci`, `go mod download`,
-  `gh release download`, `git clone`, `curl -f`, `brew`,
-  `cargo binstall`/`install`.
+  7 only). Where the tool offers no way to tell, a deterministic failure retries
+  until the timeout and the log shows its cause on every attempt: `go mod download` (a nonexistent version or a checksum mismatch exits 1 like a lost
+  network; a stale `go.sum` does not loop, since `go build` fails it at once),
+  `GOTOOLCHAIN=goX.Y.Z go version` (a toolchain that does not exist), `gh release download`, `git clone`, `curl -f`, `brew`, `cargo binstall`/`install`.
   A `uses:` action that fetches cannot be wrapped: `setup-go` and the
   sccache action are `continue-on-error` with a visible warning and a
   fallback (`.github/actions/setup-go` pins the release through the `go`
@@ -3060,8 +3063,8 @@ Spotlight "Hole" must reveal it.
   same way for a broken cover and for a runner whose network dropped. A test's
   precondition on the host's primary IPv4 (`net_discovery::wait_for_primary_ipv4`,
   `HostNetwork::read_when_routed`) waits until the kernel has an off-link route,
-  with no cap and a log line per change of state; the nextest timeout is the
-  bound.
+  with no cap and a log line per change of state; the CI step's `timeout-minutes`
+  is the bound.
 - **Every crate runs in CI** — the `every_workspace_crate_runs_in_ci` conformance
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test

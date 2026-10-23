@@ -64,7 +64,7 @@ runs:
     # with no product defect behind it; `retry.sh` waits for the network.
     - name: Fetch crate sources
       shell: bash
-      run: .github/scripts/retry.sh cargo fetch --locked
+      run: .github/scripts/cargo-fetch.sh
 
     - name: Fetch runtime deps (ex-ray, wintun)
       shell: bash

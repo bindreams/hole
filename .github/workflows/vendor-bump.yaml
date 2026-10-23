@@ -114,7 +114,7 @@ jobs:
           echo "ref_name=$branch" >> "$GITHUB_OUTPUT"
 
       - name: Fetch crate sources
-        run: .github/scripts/retry.sh cargo fetch --locked
+        run: .github/scripts/cargo-fetch.sh
 
       - name: git identity
         run: |

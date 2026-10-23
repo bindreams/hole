@@ -65,8 +65,8 @@ impl HostNetwork {
     /// [`read`](Self::read), taken again until the snapshot has a usable off-link route.
     ///
     /// The whole snapshot is retaken, not just the route, so the interface list and the route still come
-    /// from one construction. A scan that failed outright is returned, not waited out. No cap: the test's
-    /// own nextest timeout is the bound.
+    /// from one construction. A scan that failed outright is returned, not waited out. No cap: the CI step's
+    /// `timeout-minutes` is the bound.
     pub(crate) fn read_when_routed() -> Result<Self, String> {
         Self::read_when_routed_with(Self::read, || std::thread::sleep(ROUTE_POLL_INTERVAL))
     }
@@ -153,7 +153,7 @@ const ROUTE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// A CI runner can lose its network for a minute, and the kernel then answers
 /// `Network is unreachable`: the environment, not the test. There is no cap; the
-/// test's own nextest timeout is the bound, and each change of the kernel's
+/// CI step's `timeout-minutes` is the bound, and each change of the kernel's
 /// answer is logged while it waits.
 pub(crate) fn wait_for_primary_ipv4() -> Ipv4Addr {
     wait_for_primary_ipv4_with(detect_primary_ipv4, || std::thread::sleep(ROUTE_POLL_INTERVAL))
