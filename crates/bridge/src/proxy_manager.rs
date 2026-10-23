@@ -903,7 +903,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         // cover can engage: the block-until-connected intent falls open
                         // here — logged so the gap is visible, not silent.
                         if covered {
-                            warn!(error = %e, "covered start could not resolve the server; host NOT blocked (no IP to permit)");
+                            warn!(error = %util::error_chain::error_chain(&e), "covered start could not resolve the server; host NOT blocked (no IP to permit)");
                         }
                     }
                     return Err(e);
@@ -1867,7 +1867,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     if let Some(mut d) = dispatcher.take() {
                         d.shutdown().await;
                     }
-                    return Err(ProxyError::DnsConfinementFailed { reason: e.to_string() });
+                    return Err(ProxyError::DnsConfinementFailed { source: Box::new(e) });
                 }
                 Err(DnsError::Io(e)) => {
                     if let Some(mut d) = dispatcher.take() {

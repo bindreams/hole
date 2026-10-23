@@ -29,6 +29,7 @@ use tower::ServiceExt;
 #[allow(unused_imports)]
 use tracing::warn;
 use tracing::{debug, error, info};
+use util::error_chain::error_chain;
 
 // IPC state ===========================================================================================================
 
@@ -375,7 +376,7 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         let mut pm = state.proxy.lock().await;
         if let Some(event) = pm.check_health() {
             if let Err(e) = pm.stop_with(event).await {
-                tracing::error!(error = %e, "error tearing down proxy after a failed health check");
+                tracing::error!(error = %error_chain(&e), "error tearing down proxy after a failed health check");
             }
         }
         StatusResponse {
@@ -572,7 +573,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
         Err(e) => {
             // AlreadyRunning is success-equivalent GUI-side; Cancelled is user-asked.
             if !matches!(e, ProxyError::Cancelled | ProxyError::AlreadyRunning) {
-                error!(error = %e, "proxy start failed");
+                error!(error = %error_chain(&e), "proxy start failed");
             }
             Err(StartHandlerError::Failed(redact_outgoing((&e).into())))
         }
@@ -727,7 +728,7 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
                 Ok(Json(EmptyResponse {}))
             }
             Err(e) => {
-                error!(error = %e, "failed to turn the kill switch off");
+                error!(error = %error_chain(&e), "failed to turn the kill switch off");
                 Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -743,7 +744,7 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
             Ok(Json(EmptyResponse {}))
         }
         Err(e) => {
-            error!(error = %e, "failed to set lockdown intent");
+            error!(error = %error_chain(&e), "failed to set lockdown intent");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { message: e.to_string() }),
@@ -792,7 +793,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     // that rule with `turn_lockdown_off` is what removes the discrepancy the
     // two bespoke `must_release` expressions used to carry.
     if let Err(e) = state.routing.release_all_covers() {
-        error!(error = %e, "unblock: release failed");
+        error!(error = %error_chain(&e), "unblock: release failed");
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1133,7 +1134,7 @@ async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(
     match pm.stop().await {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {
-            error!(error = %e, "proxy stop failed");
+            error!(error = %error_chain(&e), "proxy stop failed");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { message: e.to_string() }),
@@ -1169,7 +1170,7 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     match result {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {
-            error!(error = %e, "proxy reload failed");
+            error!(error = %error_chain(&e), "proxy reload failed");
             // Same reason as `handle_start`'s: the config is armed above, so
             // this covers a plain toString of the error, but an embedded
             // address can still arrive from outside Hole (e.g. garter's
@@ -1196,7 +1197,7 @@ async fn handle_metrics<P: Proxy + 'static, R: Routing + 'static>(
     let mut pm = state.proxy.lock().await;
     if let Some(event) = pm.check_health() {
         if let Err(e) = pm.stop_with(event).await {
-            tracing::error!(error = %e, "error tearing down proxy after a failed health check");
+            tracing::error!(error = %error_chain(&e), "error tearing down proxy after a failed health check");
         }
     }
     let filter = if pm.state() == ProxyState::Running {

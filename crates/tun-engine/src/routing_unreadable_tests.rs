@@ -820,7 +820,7 @@ fn a_toast_for_an_unreadable_record_names_the_file_and_not_the_path() {
 #[skuld::test]
 fn a_toast_for_any_other_routing_error_is_its_text() {
     for err in [
-        RoutingError::Gateway("no default route".into()),
+        RoutingError::Gateway(crate::gateway::GatewayError::NoDefaultRoute),
         RoutingError::RouteSetup("`route` (command 1 of 5) exited with code 1".into()),
     ] {
         assert_eq!(err.redacted(), err.to_string());

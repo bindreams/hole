@@ -270,7 +270,7 @@ impl Routing for MockRouting {
 
     fn default_gateway(&self, _dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
         if self.fail_gateway.load(Ordering::SeqCst) || self.fail_server_gateway_only.load(Ordering::SeqCst) {
-            return Err(RoutingError::Gateway("mock gateway failure".into()));
+            return Err(crate::test_support::mock_gateway_failure());
         }
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
@@ -288,7 +288,7 @@ impl Routing for MockRouting {
     /// `the_diagnostics_probe_does_not_take_a_server` would catch it.
     fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
         if self.fail_gateway.load(Ordering::SeqCst) {
-            return Err(RoutingError::Gateway("mock gateway failure".into()));
+            return Err(crate::test_support::mock_gateway_failure());
         }
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
@@ -2303,11 +2303,34 @@ fn status_error_excludes_failed_start_detail() {
     });
 }
 
-// No dedicated log-capture test for the `error!("proxy start failed")`
-// path (and the analogous `handle_stop`/`handle_reload` calls); the
-// HTTP-500 + error message is covered by `start_failure_returns_error`
-// (line ~363). A thread-local `set_default` capture could be added now
-// that the global subscriber level-rejects noisy third-party events.
+/// The toast text of a failed start is a fixed sentence that points at
+/// bridge.log; the cause it points at must actually be there.
+#[skuld::test]
+async fn a_failed_start_logs_the_cause_the_toast_points_at() {
+    let (subscriber, writer) = redacting_capture();
+    let result = {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::handle_start(
+            axum::extract::State(ipc_state(gateway_failing_proxy())),
+            axum::http::HeaderMap::new(),
+            Json(sample_config()),
+        )
+        .await
+    };
+
+    let Err(super::StartHandlerError::Failed(StartError::Failed { message })) = result else {
+        panic!("expected a generic start failure");
+    };
+    assert_eq!(
+        message, "gateway detection failed: Could not read the system routing table. See bridge.log for details.",
+        "the toast text must stay the fixed sentence"
+    );
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_GATEWAY_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}
 
 // Cancel tests ========================================================================================================
 

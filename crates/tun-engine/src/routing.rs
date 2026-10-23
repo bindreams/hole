@@ -1846,11 +1846,11 @@ impl Routing for SystemRouting {
 
     fn default_gateway(&self, dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
         clear_stale_server_bypass(&self.record_file, self.owner, dest, exec_one::<BestEffortPhase>);
-        gateway::upstream_route(dest).map_err(|e| RoutingError::Gateway(e.to_string()))
+        gateway::upstream_route(dest).map_err(RoutingError::Gateway)
     }
 
     fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
-        get_default_gateway_info().map_err(|e| RoutingError::Gateway(e.to_string()))
+        get_default_gateway_info().map_err(RoutingError::Gateway)
     }
 
     fn install_failclosed_cover(

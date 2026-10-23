@@ -407,7 +407,7 @@ impl Routing for MockRouting {
 
     fn default_gateway(&self, _dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
         if self.state.fail_gateway.load(Ordering::SeqCst) {
-            return Err(RoutingError::Gateway("mock gateway failure".into()));
+            return Err(crate::test_support::mock_gateway_failure());
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
@@ -420,7 +420,7 @@ impl Routing for MockRouting {
 
     fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
         if self.state.fail_gateway.load(Ordering::SeqCst) {
-            return Err(RoutingError::Gateway("mock gateway failure".into()));
+            return Err(crate::test_support::mock_gateway_failure());
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
@@ -1982,7 +1982,10 @@ fn gateway_failure_sets_last_error() {
         assert!(matches!(err, ProxyError::Gateway(_)));
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().is_some(), "default_gateway failure must set last_error");
-        assert!(pm.last_error().unwrap().contains("mock gateway failure"));
+        assert_eq!(
+            pm.last_error().unwrap(),
+            "gateway detection failed: Could not read the system routing table. See bridge.log for details."
+        );
     });
 }
 
@@ -2621,7 +2624,18 @@ fn confinement_failure_aborts_the_start() {
 
         let result = pm.start(&config).await;
         match result {
-            Err(ProxyError::DnsConfinementFailed { .. }) => {}
+            Err(e @ ProxyError::DnsConfinementFailed { .. }) => {
+                assert_eq!(
+                    e.to_string(),
+                    "could not confine DNS to the tunnel: could not reach the firewall",
+                    "the toast text must not change"
+                );
+                let chain = util::error_chain::error_chain(&e).to_string();
+                assert!(
+                    chain.contains("mock confine failure"),
+                    "the log line must carry the OS cause: {chain}"
+                );
+            }
             other => panic!(
                 "expected Err(DnsConfinementFailed), got {}",
                 describe_start_result(&other)

@@ -32,6 +32,18 @@ pub(crate) mod socks5_client;
 pub(crate) mod socks5_dns_upstream;
 pub(crate) mod udp_echo;
 
+/// The cause text inside [`mock_gateway_failure`], for asserting it reaches the log.
+pub(crate) const MOCK_GATEWAY_CAUSE: &str = "mock default-net cause";
+
+/// A gateway failure shaped like macOS's: the route query failed with an
+/// OS-level cause that `Display` deliberately omits.
+pub(crate) fn mock_gateway_failure() -> tun_engine::RoutingError {
+    tun_engine::RoutingError::Gateway(tun_engine::gateway::GatewayError::RouteQueryFailed {
+        code: 0,
+        source: std::io::Error::other(MOCK_GATEWAY_CAUSE),
+    })
+}
+
 /// Build a fresh tokio runtime for one test. Mirrors `ipc_tests::rt()`.
 ///
 /// Lives at the module root because it's useful to every test file.

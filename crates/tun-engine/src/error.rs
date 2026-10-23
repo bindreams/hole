@@ -4,12 +4,16 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::gateway::GatewayError;
+
 /// Errors surfaced by the `routing` module: gateway discovery and route
 /// table manipulation.
 #[derive(Debug, Error)]
 pub enum RoutingError {
+    /// `Display` is the toast sentence; the cause (`GatewayError::source()`) is
+    /// for the log, so log this with `util::error_chain`.
     #[error("gateway detection failed: {0}")]
-    Gateway(String),
+    Gateway(#[source] GatewayError),
     #[error("route setup failed: {0}")]
     RouteSetup(String),
     /// The route record is newer than this release, corrupt, or its read fails.
