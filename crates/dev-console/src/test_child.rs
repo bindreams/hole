@@ -18,6 +18,12 @@
 //! - `spawn-grandchild-same-group` — as above, but the grandchild STAYS in
 //!   this console group, so a `CTRL_BREAK` to the root reaches it. Pins the
 //!   graceful drain edge, where `spawn-grandchild` pins the job teardown.
+//! - `spawn-term-ignoring-grandchild` — POSIX only. As `spawn-grandchild`, but
+//!   the grandchild ignores `SIGTERM` (an ignored disposition survives `exec`),
+//!   so only a hard kill reaches it. The root keeps the default disposition and
+//!   parks, so the group `SIGTERM` ends it alone.
+//! - `spawn-term-ignoring-grandchild-and-exit` — as above, but the root exits
+//!   straight after spawning instead of parking.
 //! - `fake-bridge` — stand-in bridge for supervisor tests: speaks the
 //!   `--ready-notify` protocol (read `DEV_CONSOLE_READY_SPEC` as
 //!   `ADDR/TOKEN`, dial, echo the token) and then parks forever.
@@ -40,6 +46,10 @@ pub fn maybe_run() {
         "sleep" => run_sleep(),
         "spawn-grandchild" => run_spawn_grandchild(true),
         "spawn-grandchild-same-group" => run_spawn_grandchild(false),
+        #[cfg(unix)]
+        "spawn-term-ignoring-grandchild" => run_spawn_term_ignoring_grandchild(false),
+        #[cfg(unix)]
+        "spawn-term-ignoring-grandchild-and-exit" => run_spawn_term_ignoring_grandchild(true),
         "fake-bridge" => run_fake_bridge(),
         "echo-argv" => run_echo_argv(),
         "hole-root" => run_hole_root(),
@@ -121,5 +131,24 @@ fn run_spawn_grandchild(own_console_group: bool) -> ! {
     // kill; the grandchild must be reaped via the tree kill under test.
     #[allow(clippy::zombie_processes)]
     let _grandchild = cmd.spawn().expect("spawn grandchild");
+    park_forever()
+}
+
+#[cfg(unix)]
+fn run_spawn_term_ignoring_grandchild(then_exit: bool) -> ! {
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env(MODE_ENV, "sleep");
+    // SAFETY: `signal` with SIG_IGN/SIG_DFL has no preconditions. The ignore is
+    // set before the spawn so the grandchild inherits it across `exec`.
+    unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+    // Intentionally unwaited, as in `run_spawn_grandchild`.
+    #[allow(clippy::zombie_processes)]
+    let _grandchild = cmd.spawn().expect("spawn grandchild");
+    if then_exit {
+        std::process::exit(0)
+    }
+    // SAFETY: as above.
+    unsafe { libc::signal(libc::SIGTERM, libc::SIG_DFL) };
     park_forever()
 }

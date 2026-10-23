@@ -106,6 +106,30 @@ pub struct BinaryPlugin {
     extra_env: Vec<(String, String)>,
 }
 
+/// What a failed plugin spawn tells the user.
+///
+/// cosca reports every failed `exec` of a tokio `Command` on Unix (`ENOENT` and `EACCES` included) as
+/// `MayHaveStarted`, because it cannot prove the program never ran, and its text then talks about a child
+/// "reaped by someone else". When the fate says no child is left, the cause is the useful part. A child that
+/// may still be running keeps cosca's text, as does an elevation backend, whose fate says nothing about the
+/// program behind it.
+pub(crate) fn spawn_failure_text(error: &cosca::error::Error) -> String {
+    use cosca::error::{ChildFate, Error};
+    match error {
+        Error::MayHaveStarted {
+            fate,
+            wrapper_elevated: false,
+            source,
+        } => match fate {
+            ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone => source.to_string(),
+            ChildFate::Running { .. } | ChildFate::Unknown => error.to_string(),
+            // `ChildFate` is non-exhaustive: a fate this does not know is not one that says nothing is left.
+            _ => error.to_string(),
+        },
+        _ => error.to_string(),
+    }
+}
+
 impl BinaryPlugin {
     pub fn new(path: impl Into<PathBuf>, options: Option<&str>) -> Self {
         let path = path.into();
@@ -269,9 +293,13 @@ impl ChainPlugin for BinaryPlugin {
         // project does not support and does not bridge.
         cmd.contain();
         cmd.nesting(cosca::containment::Nesting::Mark);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| crate::Error::Chain(format!("failed to spawn '{}': {e}", self.path.display())))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            crate::Error::Chain(format!(
+                "failed to spawn '{}': {}",
+                self.path.display(),
+                spawn_failure_text(&e)
+            ))
+        })?;
 
         if let Some(sink) = &self.pid_sink {
             sink(child.id().pid());
@@ -930,10 +958,10 @@ impl PluginTree for cosca::tokio::Child {
         self.wait().await
     }
 
-    /// cosca's `Drop` runs the tree kill before it looks at whether the root was reaped, and for a
-    /// pgid mechanism that kill is a `killpg`. `detach` is the only way to skip it; it also clears a
-    /// job object's kill-on-close, so it is applied only where the drop's kill would be that `killpg`.
-    /// A tree kill that failed before the reap is therefore not retried by the drop.
+    /// cosca's `Drop` kills no pgid-addressed tree once the root is reaped, and `detach` keeps that
+    /// true whatever its drop policy becomes. It also clears a job object's kill-on-close, so it is
+    /// applied only where the drop's kill would be a `killpg`. A tree kill that failed before the
+    /// reap is therefore not retried by the drop.
     fn disarm(&mut self) {
         if kill_tree_addresses_a_releasable_id(self.containment()) {
             self.detach();

@@ -37,7 +37,7 @@ arc-swap = "1"
 aho-corasick = "1"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # `Win32_Foundation`, `Win32_Storage_FileSystem`: `versioned_file`'s POSIX-semantics

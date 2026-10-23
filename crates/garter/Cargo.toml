@@ -96,7 +96,7 @@ rustix = { version = "1", features = ["process"] }
 # The published crate excludes `src/bin/`, so neither reaches a consumer's build.
 [target.'cfg(unix)'.dependencies]
 # mock-plugin: signal(SIGTERM, SIG_IGN), for MOCK_PLUGIN_IGNORE_SIGNALS.
-libc = "0.2"
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Containment and handle hygiene are cosca's; these are the fixture's own calls.

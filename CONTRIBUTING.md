@@ -386,8 +386,8 @@ whose first element is a program name. Compile-time enforcement is
 [`clippy.toml`](clippy.toml): `std::process::Command::new`,
 `tokio::process::Command::new` and every `cosca` command constructor
 (`Command::new`, `run`, `run_line`, sync and `tokio`) are disallowed, and so are
-the `cosca::Command` methods that name its program (`executable`, `arg`, `args`,
-`commandline`), because `Command: Default` is a constructor no path can ban. A
+the `cosca::Command` methods that name its program (`executable`, `raw_executable`,
+`arg`, `args`, `commandline`), because `Command: Default` is a constructor no path can ban. A
 spawn that is not an OS tool (Hole's own executable, the unprivileged GUI's
 `osascript`, the developer's `sudo`, `xtask`/`dev-console` tooling, test
 harnesses) takes an `#[allow]` with its reason; test files and tooling files take

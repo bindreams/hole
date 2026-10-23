@@ -155,7 +155,7 @@ fn is_batch(p: &Path) -> bool {
 
 /// The containment discipline every preflight child gets, named so it can be
 /// pinned: without it, `kill_tree` has no mechanism to act through and neither
-/// the interrupt path nor the `Drop` backstop can reach a descendant.
+/// the interrupt path nor the exit path can reach a descendant.
 pub(crate) fn contain_preflight(cmd: &mut cosca::tokio::Command) -> &mut cosca::tokio::Command {
     cmd.kill_on_drop(true)
         .contain()
@@ -198,7 +198,9 @@ async fn run_step(
             let _ = child.wait().await;
             Err(Interrupted.into())
         }
-        status = child.wait() => {
+        // The root ended by itself: its tree is killed before the reap, as the
+        // interrupt arm does.
+        status = crate::supervise::wait_and_kill_leftovers(&mut child, what) => {
             let status = status.with_context(|| format!("waiting for {what}"))?;
             if status.success() {
                 Ok(())
