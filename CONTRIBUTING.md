@@ -2945,14 +2945,20 @@ and a rerun repeats the platform's whole job.
   and fills the cache (`scripts/validate-docs.py --fetch-only` for the docs
   hook).
   A retry must not hide a failure the network did not cause. Each tool's offline
-  check runs first where one exists (`uv lock --check --offline`, `prek validate-config`), `until_ok` stops on a failure marked `retry::permanent`
-  (a 4xx, a complete body with the wrong hash, a missing working directory),
-  `retry.ps1` stops on an HTTP 4xx, and both shell and xtask helpers stop on a
-  missing program. Where the tool offers no such check, a deterministic failure
-  retries until the timeout and the log shows its cause on every attempt: `cargo fetch --locked` (a stale `Cargo.lock`
-  and a lost network both exit 101, and the lock check needs the registry
-  index), `npm ci`, `go mod download`, `gh release download`, `git clone`,
-  `curl -f`, `brew`, `cargo binstall`/`install`.
+  check runs first where one exists (`uv lock --check --offline`,
+  `prek validate-config`). `until_ok` stops on a failure marked
+  `retry::permanent` (a 4xx other than 408 and 429, a complete body with the
+  wrong hash, a missing working directory), `retry.ps1` stops on an HTTP 4xx
+  other than 408 and 429, the MSI project's WiX download does the same, and the
+  shell and xtask helpers stop on a missing program. 408 and 429 ask for another
+  try, so they retry, and a `Retry-After` in seconds is waited out (the backoff
+  is the floor; an HTTP-date `Retry-After` is read by `retry.ps1` on PowerShell
+  7 only). Where the tool offers no offline check, a deterministic failure
+  retries until the timeout and the log shows its cause on every attempt:
+  `cargo fetch --locked` (a stale `Cargo.lock` and a lost network both exit 101,
+  and the lock check needs the registry index), `npm ci`, `go mod download`,
+  `gh release download`, `git clone`, `curl -f`, `brew`,
+  `cargo binstall`/`install`.
   A `uses:` action that fetches cannot be wrapped: `setup-go` and the
   sccache action are `continue-on-error` with a visible warning and a
   fallback (`.github/actions/setup-go` pins the release through the `go`

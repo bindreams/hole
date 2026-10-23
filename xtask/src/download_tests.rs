@@ -74,6 +74,43 @@ fn a_client_error_status_is_not_retried() {
     assert_eq!(served.load(Ordering::SeqCst), 1);
 }
 
+/// A 4xx that asks the client to try again rather than naming a wrong request.
+#[skuld::test]
+fn a_request_timeout_status_is_retried() {
+    let (url, served) = serve(vec![status(408), ok(b"the artifact")]);
+    let bytes = fetch_verified("test artifact", &url, 1 << 20, &sha256_hex(b"the artifact")).unwrap();
+    assert_eq!(bytes, b"the artifact");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+}
+
+#[skuld::test]
+fn a_rate_limit_status_is_retried() {
+    let (url, served) = serve(vec![status(429), status(429), ok(b"the artifact")]);
+    let bytes = fetch_verified("test artifact", &url, 1 << 20, &sha256_hex(b"the artifact")).unwrap();
+    assert_eq!(bytes, b"the artifact");
+    assert_eq!(served.load(Ordering::SeqCst), 3);
+}
+
+/// The server named the wait, and the first backoff step (1 s plus up to 1 s of jitter) is shorter than that.
+#[skuld::test]
+fn a_rate_limit_is_waited_out_for_as_long_as_the_server_says() {
+    const RETRY_AFTER_SECS: u64 = 3;
+    let limited = format!(
+        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {RETRY_AFTER_SECS}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let (url, served) = serve(vec![limited, ok(b"the artifact")]);
+    let started = std::time::Instant::now();
+    let bytes = fetch_verified("test artifact", &url, 1 << 20, &sha256_hex(b"the artifact")).unwrap();
+    assert_eq!(bytes, b"the artifact");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    assert!(
+        started.elapsed() >= Duration::from_secs(RETRY_AFTER_SECS),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[skuld::test]
 fn a_server_error_status_is_retried() {
     let (url, served) = serve(vec![status(503), ok(b"the artifact")]);

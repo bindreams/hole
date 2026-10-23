@@ -74,3 +74,32 @@ fn gives_up_on_a_permanent_failure() {
 fn an_ordinary_failure_is_not_permanent() {
     assert!(!is_permanent(&anyhow!("network down")));
 }
+
+#[skuld::test]
+fn waits_at_least_as_long_as_the_server_asked() {
+    let mut calls = 0;
+    let started = std::time::Instant::now();
+    until_ok_with(instant(), "test fetch", || {
+        calls += 1;
+        if calls == 1 {
+            Err(retry_after(anyhow!("HTTP 429"), Duration::from_secs(1)))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(calls, 2);
+    assert!(started.elapsed() >= Duration::from_secs(1), "{:?}", started.elapsed());
+}
+
+#[skuld::test]
+fn a_retry_after_survives_added_context() {
+    let err = retry_after(anyhow!("HTTP 429"), Duration::from_secs(7)).context("failed to download");
+    assert_eq!(requested_wait(&err), Some(Duration::from_secs(7)));
+    assert_eq!(requested_wait(&anyhow!("network down")), None);
+}
+
+#[skuld::test]
+fn a_retry_after_does_not_make_a_failure_permanent() {
+    assert!(!is_permanent(&retry_after(anyhow!("HTTP 429"), Duration::from_secs(1))));
+}

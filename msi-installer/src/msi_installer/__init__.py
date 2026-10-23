@@ -12,13 +12,14 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
 import httpx
 from rich.console import Console
 from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TransferSpeedColumn
-from tenacity import Retrying, retry_if_exception, wait_exponential_jitter
+from tenacity import RetryCallState, Retrying, retry_if_exception, wait_exponential_jitter
 
 _PKG_DIR = Path(__file__).resolve().parent
 WXS_PATH = _PKG_DIR / "hole.wxs"
@@ -192,15 +193,38 @@ def _accept_wix_eula(wix_exe: Path, version: str) -> None:
 _DOWNLOAD_WAIT = wait_exponential_jitter(initial=1, max=30)
 
 
+# Client errors that ask for another try rather than naming a wrong request.
+_RETRY_LATER_STATUSES = (408, 429)
+
+
+def _nap(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 def _is_transient(error: BaseException) -> bool:
     """Whether a download failure is the network's, so another attempt can succeed.
 
-    A transport failure (name resolution, connect, a body cut short) and a 5xx are; a 4xx names a request that is
-    wrong (a moved or removed asset) and will be wrong again.
+    A transport failure (name resolution, connect, a body cut short), a 5xx, and a 408 or 429 (the server asking
+    for another try) are; any other 4xx names a request that is wrong (a moved or removed asset) and will be
+    wrong again.
     """
     if isinstance(error, httpx.HTTPStatusError):
-        return error.response.status_code >= 500
+        return error.response.status_code >= 500 or error.response.status_code in _RETRY_LATER_STATUSES
     return isinstance(error, httpx.TransportError)
+
+
+def _requested_wait(error: BaseException | None) -> float:
+    """Seconds a `Retry-After: <seconds>` on `error` asks for, else 0. The HTTP-date form is left to the backoff."""
+    if not isinstance(error, httpx.HTTPStatusError):
+        return 0
+    value = error.response.headers.get("Retry-After", "").strip()
+    return int(value) if value.isascii() and value.isdigit() else 0
+
+
+def _wait_before_retry(state: RetryCallState) -> float:
+    """The backoff, or the wait the server named if that is longer."""
+    outcome = state.outcome
+    return max(_DOWNLOAD_WAIT(state), _requested_wait(outcome.exception() if outcome else None))
 
 
 def _download_and_hash(url: str, dest: Path, console: Console) -> str:
@@ -214,7 +238,11 @@ def _download_and_hash(url: str, dest: Path, console: Console) -> str:
         console.print(f"[yellow]download of {dest.name} failed ({state.outcome.exception()!r}); retrying[/]")
 
     for attempt in Retrying(
-        retry=retry_if_exception(_is_transient), wait=_DOWNLOAD_WAIT, before_sleep=report, reraise=True
+        retry=retry_if_exception(_is_transient),
+        wait=_wait_before_retry,
+        sleep=lambda seconds: _nap(seconds),
+        before_sleep=report,
+        reraise=True,
     ):
         with attempt:
             return _download_once(url, dest, console)
