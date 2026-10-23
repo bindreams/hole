@@ -110,7 +110,8 @@ pub struct BinaryPlugin {
 ///
 /// cosca reports every failed `exec` of a tokio `Command` on Unix (`ENOENT` and `EACCES` included) as
 /// `MayHaveStarted`, because it cannot prove the program never ran, and its text then talks about a child
-/// "reaped by someone else" or "still running". When the fate says no child is left, the cause is the useful part.
+/// "reaped by someone else" or "still running". When the fate says no child is left, or the kernel refused the file
+/// itself (off Linux the fate cannot say), the cause is the useful part.
 /// A child that may still be running keeps cosca's text, as does an elevation backend, whose fate says nothing about
 /// the program behind it.
 pub(crate) fn spawn_failure_text(error: &cosca::error::Error) -> String {
@@ -131,17 +132,36 @@ pub(crate) fn spawn_failure_text(error: &cosca::error::Error) -> String {
     }
 }
 
-/// Whether `cause` is the file itself being refused, as opposed to a failure of cosca's or tokio's setup.
+/// Whether `cause` is the kernel refusing to `exec` the program, so that it never ran.
 ///
-/// Off Linux a failed `exec` is reported as `Running { id: None }`, since only Linux's pidfd handshake sees std
-/// collect the child. `NotFound` and `PermissionDenied` there can only come from the `exec` (or the `chdir` before
-/// it): tokio's own steps after a successful spawn (kqueue registration of the stdio pipes, the SIGCHLD handler) and
-/// cosca's (unique-id and attach errors are not `Io`) do not produce them. On Linux the handshake answers, so
-/// `Running` there is not an exec failure.
+/// Off Linux a failed `exec` is reported as `Running { id: None }`, since only Linux's pidfd handshake sees std collect
+/// the child. On macOS (the only non-Linux Unix cosca supports) the errno decides. It must be one `execve(2)` or
+/// `posix_spawn(2)` documents, and none that a step after a successful spawn can also return: tokio's `kevent`
+/// registration of the stdio pipes (ENOMEM, EFAULT, EINVAL, EBADF, ENOTSUP), its `fcntl` (EBADF, EPERM) and its
+/// `sigaction` (EFAULT, EINVAL). cosca's own steps after the spawn carry no errno in an `Io`. ENOMEM and EFAULT are
+/// therefore left out, as is EPERM, which neither page documents; a cause outside the list keeps cosca's text.
+/// On Linux the handshake answers, so `Running` there is not an exec failure.
+#[cfg(target_os = "macos")]
 fn exec_refused_the_program(cause: &cosca::error::Error) -> bool {
-    use std::io::ErrorKind;
-    cfg!(all(unix, not(target_os = "linux")))
-        && matches!(cause, cosca::error::Error::Io(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied))
+    // execve(2) ERRORS, plus EBADARCH from posix_spawn(2), minus the errnos above.
+    const REFUSED_BY_EXEC_ONLY: [i32; 10] = [
+        libc::E2BIG,
+        libc::EACCES,
+        libc::EBADARCH,
+        libc::EIO,
+        libc::ELOOP,
+        libc::ENAMETOOLONG,
+        libc::ENOENT,
+        libc::ENOEXEC,
+        libc::ENOTDIR,
+        libc::ETXTBSY,
+    ];
+    matches!(cause, cosca::error::Error::Io(e) if e.raw_os_error().is_some_and(|errno| REFUSED_BY_EXEC_ONLY.contains(&errno)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exec_refused_the_program(_cause: &cosca::error::Error) -> bool {
+    false
 }
 
 impl BinaryPlugin {
