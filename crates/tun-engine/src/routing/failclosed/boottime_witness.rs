@@ -110,7 +110,7 @@ use super::ArmingWitness;
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// Filename under `state_dir`.
-pub(crate) const STATE_FILE_NAME: &str = "bridge-boottime.json";
+pub const STATE_FILE_NAME: &str = "bridge-boottime.json";
 
 /// The persisted record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
