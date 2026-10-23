@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::git_util::{index_blob_hash_or_deleted, run_git, run_git_raw, run_git_with_env};
 
-use super::Outcome;
+use super::{Outcome, PullRecord, StaleParentRetry};
 
 // See `Outcome::Conflicted`'s own doc for what `fixup_commit` carries and why.
 pub(super) fn handle_conflict(
@@ -22,17 +22,15 @@ pub(super) fn handle_conflict(
     subdir: &str,
     tag: &str,
     pull_output: &Output,
-    fixup_commit: Option<&str>,
+    retry: Option<&StaleParentRetry>,
 ) -> Result<Outcome> {
     // A real merge conflict is detected by the state git-subrepo actually
     // leaves behind — a temp worktree with unmerged paths — not by
     // matching a substring of its human-facing recovery prose in stdout.
     // That prose is printed via git-subrepo's own `say()`, which is a
-    // silent no-op whenever the ambient `GIT_SUBREPO_QUIET` env var is
-    // set (confirmed against the installed git-subrepo 0.4.9 source;
-    // this module doesn't control that var — a CI runner or a
-    // developer's shell profile could set it), so string-matching stdout
-    // is not a reliable signal.
+    // silent no-op under `GIT_SUBREPO_QUIET` (git-subrepo 0.4.9 source).
+    // `attempt_pull` clears that var, but the state check needs no such
+    // assumption about git-subrepo's wording.
     let unexpected_failure = |extra: Option<String>| {
         // `git subrepo pull` runs its own internal fold-in commit in
         // `repo_root` as part of a conflict-free merge — if that specific
@@ -174,7 +172,7 @@ pub(super) fn handle_conflict(
             worktree,
             unresolved,
             auto_resolved,
-            fixup_commit: fixup_commit.map(str::to_string),
+            fixup_commit: retry.map(|r| r.fixup_commit.clone()),
         });
     }
 
@@ -195,7 +193,9 @@ pub(super) fn handle_conflict(
 
     finish_conflict_fold_in(repo_root, subdir, tag)?;
     Ok(Outcome::Clean {
-        pull_log: super::describe_pull(pull_output),
+        pull: PullRecord::from_output(pull_output),
+        stale_parent_retry: retry.cloned(),
+        auto_resolved,
     })
 }
 

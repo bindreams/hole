@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use super::Outcome;
+use super::{Outcome, PullRecord, StaleParentRetry};
 
 /// Guards the `SKIP` env var against a cross-test race: `skuld` runs every
 /// `#[skuld::test]` in this crate's process concurrently, and
@@ -502,14 +502,28 @@ pub(crate) struct Conflict {
     pub(crate) fixup_commit: Option<String>,
 }
 
-/// Every test that expects a particular `Outcome` variant goes through these, so an
-/// unexpected one always fails with the full `Debug` form (the pull log for `Clean`).
+/// The fields of an `Outcome::Clean`, for a test that asserts on them.
+#[derive(Debug)]
+pub(crate) struct CleanPull {
+    pub(crate) pull: PullRecord,
+    pub(crate) stale_parent_retry: Option<StaleParentRetry>,
+    pub(crate) auto_resolved: Vec<String>,
+}
+
 impl Outcome {
-    /// Returns the pull log.
+    /// Panic with the full `Debug` form, which includes the pull record for `Clean`.
     #[track_caller]
-    pub(crate) fn expect_clean(self) -> String {
+    pub(crate) fn expect_clean(self) -> CleanPull {
         match self {
-            Outcome::Clean { pull_log } => pull_log,
+            Outcome::Clean {
+                pull,
+                stale_parent_retry,
+                auto_resolved,
+            } => CleanPull {
+                pull,
+                stale_parent_retry,
+                auto_resolved,
+            },
             other @ Outcome::Conflicted { .. } => panic!("expected Outcome::Clean, got {other:?}"),
         }
     }
