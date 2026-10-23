@@ -2963,17 +2963,6 @@ and a rerun repeats the platform's whole job.
   been seen there.
   `xtask/src/command.rs` names the command and the status in a failed child's
   error.
-- **A test that needs egress tells a network loss from a Hole defect.** The
-  oracle is Hole's own state, not a remote host: `hole_test_observability::egress`
-  takes a `HoleState` read (`tun_engine::test_utils::held_lockdown`, the cover
-  oracle in `routing/failclosed/cover_oracle.rs`: WFP keys on Windows, the pf
-  label and Hole's state record on macOS). A failed probe while Hole holds a
-  cover fails at once as a defect; with no Hole state and a control host down it
-  waits for the network, uncapped, and logs it. An in-cover probe that fails with the
-  network down re-runs the engage-and-probe scenario
-  (`rerun_until_network_holds`). A resolver-set reading is taken between control
-  probes (`read_with_network_up`). The macOS transient cover has no pf read
-  (pf keeps no label for it), so its oracle is the state record alone.
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 
@@ -3062,14 +3051,11 @@ Spotlight "Hole" must reveal it.
   rendezvous primitives (oneshot, `watch`, `WaitableWriter`, `CancellationToken`,
   `JoinHandle.await`, `tokio::time::pause/advance`) for intra-process sync (#383).
 - **A lost network is not a product defect** — a probe of real egress fails the
-  same way for a broken cover and for a runner whose network dropped. A
-  precondition (`egress::wait_for_egress`, `net_discovery::wait_for_primary_ipv4`)
-  waits until the network answers, with no cap and a log line per change of
-  state. A Hole assertion (`egress::assert_egress_restored`) probes a control
-  host the lifted cover never blocked: if that fails too the network is down and
-  the test waits and probes again; if only the target fails, twice, the block
-  outlived the cover. A comparison against the runner's own state (its resolver
-  set) is retaken once the network answers (`egress::read_until_network_agrees`).
+  same way for a broken cover and for a runner whose network dropped. A test's
+  precondition on the host's primary IPv4 (`net_discovery::wait_for_primary_ipv4`,
+  `HostNetwork::read_when_routed`) waits until the kernel has an off-link route,
+  with no cap and a log line per change of state; the nextest timeout is the
+  bound.
 - **Every crate runs in CI** — the `every_workspace_crate_runs_in_ci` conformance
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test

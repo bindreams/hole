@@ -58,6 +58,14 @@ const NON_PERMITTED_IP: &str = "8.8.8.8";
 #[cfg(target_os = "windows")]
 const DST_PORT: u16 = 53;
 
+/// External-event probe with a graceful failure bound: the timeout is the
+/// failure-to-human signal for baseline reachability, not a sync sleep.
+#[cfg(target_os = "windows")]
+fn tcp_reachable(addr: SocketAddr) -> bool {
+    use std::time::Duration;
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).is_ok()
+}
+
 // `pktmon`, `PktmonGuard`, `send_marker`, `capture_contains_nonce`, and
 // `nonce` live in `tun_engine::test_utils::pktmon` — promoted there so this
 // crate and `tun-engine`'s own `dns_confine` privileged tests share one copy
@@ -118,11 +126,10 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
 
     // Baseline (PRE-cover) reachability self-check: the egress path is healthy
     // before we touch the cover, so a Phase-B verdict is the cover's doing, not a
-    // dead network. A lost network is waited out, never a false pass.
-    hole_test_observability::egress::wait_for_egress(
-        "pre-cover baseline",
-        &[&non_permitted.to_string(), &permitted_tail.to_string()],
-        &|| tun_engine::test_utils::held_lockdown(dir.path()),
+    // dead network. Fail loud (a network blip must never be a false pass).
+    assert!(
+        tcp_reachable(non_permitted) && tcp_reachable(permitted_tail),
+        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts"
     );
 
     // One UDP socket pinned to the physical NIC index — used for every marker so

@@ -61,9 +61,6 @@ use crate::{GLOBAL_NET_STATE, TUN};
 /// nothing reaches 192.0.2.53 by accident.
 const RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
 const RESOLVER_NET: &str = "192.0.2.0/24";
-/// A host the runner reaches while its network is up; a failing probe of it means the network is
-/// gone, which takes the runner's own resolvers with it.
-const NETWORK_CONTROL: &str = "1.1.1.1:443";
 const TUN_LOCAL: Ipv4Addr = Ipv4Addr::new(10, 255, 254, 5);
 const TUN_PEER: Ipv4Addr = Ipv4Addr::new(10, 255, 254, 6);
 
@@ -342,14 +339,8 @@ impl Drop for RouteGuard {
 /// store thread, `Steering`) — not the mechanism itself — regressed.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_steer_global_net_state_steers_the_os_resolver() {
-    // Read with the network answering on both sides: the runner's own resolvers vanish with its network,
-    // and a baseline taken then would be compared against a healthy reading afterwards.
-    let (before_dns, before_nameservers) =
-        hole_test_observability::egress::read_with_network_up("the resolver set before", NETWORK_CONTROL, || {
-            let dns = scutil_dns();
-            let servers = nameservers(&dns);
-            (dns, servers)
-        });
+    let before_dns = scutil_dns();
+    let before_nameservers = nameservers(&before_dns);
     println!("[dns_steer] before:\n{before_dns}");
 
     // 1. Open a real utun. Name is NOT requested — kernel-assigned, read back
@@ -438,17 +429,8 @@ fn dns_steer_global_net_state_steers_the_os_resolver() {
     let out = route_guard.delete();
     println!("{out}");
 
-    // The runner's own resolvers vanish when its network does; a reading taken then says nothing about
-    // whether `withdraw` left them alone, so it is retaken once the network answers.
-    let (after_dns, after_nameservers) = hole_test_observability::egress::read_with_network_up(
-        "dns_steer: the resolver set after withdraw",
-        NETWORK_CONTROL,
-        || {
-            let dns = scutil_dns();
-            let servers = nameservers(&dns);
-            (dns, servers)
-        },
-    );
+    let after_dns = scutil_dns();
+    let after_nameservers = nameservers(&after_dns);
     println!("[dns_steer] after:\n{after_dns}");
 
     println!(
