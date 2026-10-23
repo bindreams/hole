@@ -57,6 +57,12 @@ fn real_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// The runner's own group: a uid is not a group it belongs to (macOS runners are uid 501, group 20).
+fn real_gid() -> u32 {
+    // SAFETY: getgid takes no arguments and cannot fail.
+    unsafe { libc::getgid() }
+}
+
 #[skuld::test]
 fn a_file_owned_by_neither_the_owner_nor_the_process_is_refused_by_the_real_open_and_left_alone() {
     let tmp = tempfile::tempdir().unwrap();
@@ -83,7 +89,7 @@ fn a_file_owned_by_the_expected_owner_is_accepted_by_the_real_open() {
     std::fs::write(&path, b"").unwrap();
     let mine = real_uid();
 
-    let file = open_locked(&path, false, Some((mine, mine)), mine + 1).unwrap();
+    let file = open_locked(&path, false, Some((mine, real_gid())), mine + 1).unwrap();
     assert!(file.is_some());
 }
 
@@ -171,7 +177,7 @@ fn a_file_swapped_in_after_the_open_is_the_one_locked() {
     let mine = real_uid();
     let mut swapped = false;
 
-    let file = open_locked_with(&path, false, Some((mine, mine)), mine + 1, || {
+    let file = open_locked_with(&path, false, Some((mine, real_gid())), mine + 1, || {
         if !std::mem::replace(&mut swapped, true) {
             std::fs::remove_file(&path).unwrap();
             std::fs::write(&path, b"second").unwrap();
@@ -196,7 +202,7 @@ fn a_file_unlinked_after_the_open_is_replaced_not_refused() {
     let mine = real_uid();
     let mut unlinked = false;
 
-    let file = open_locked_with(&path, false, Some((mine, mine)), mine + 1, || {
+    let file = open_locked_with(&path, false, Some((mine, real_gid())), mine + 1, || {
         if !std::mem::replace(&mut unlinked, true) {
             std::fs::remove_file(&path).unwrap();
         }
