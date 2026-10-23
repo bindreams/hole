@@ -50,6 +50,10 @@ pub const KEPT_TOOLCHAIN: &[(&str, &str)] = &[
         "where rustup finds toolchains; a child's `cargo` needs the same",
     ),
     (
+        "RUSTUP_OVERRIDE_UNIX_FALLBACK_SETTINGS",
+        "path of rustup's fallback settings file (macOS runner, CI-measured); a child's rustup reads the same",
+    ),
+    (
         "RUSTUP_TOOLCHAIN",
         "the toolchain selected for this run; a child must not pick another",
     ),
