@@ -413,9 +413,10 @@ fn to_ids(u: &hole_bridge::group::RealUser) -> (u32, u32) {
 
 /// `state_dir` as an absolute path, so a service whose cwd is `C:\Windows\System32` or `/` does not read it relative
 /// to that. Links are not resolved: the walk of `util::dir` judges every one in the path, and a path resolved here
-/// would have none left for it to refuse.
-fn absolute_state_dir(state_dir: std::path::PathBuf) -> std::path::PathBuf {
-    std::path::absolute(&state_dir).unwrap_or(state_dir)
+/// would have none left for it to refuse. An error when there is no absolute form (an empty path, or a working
+/// directory that cannot be read): the relative path is not a fallback, it is the thing this prevents.
+fn absolute_state_dir(state_dir: std::path::PathBuf) -> std::io::Result<std::path::PathBuf> {
+    std::path::absolute(&state_dir)
 }
 
 /// Per-user log directory under the resolved user's home, derived from `home`
@@ -689,7 +690,13 @@ fn handle_bridge(action: BridgeAction) -> i32 {
 
             #[cfg(target_os = "macos")]
             let state_dir = state_dir.or_else(|| owner.as_ref().map(|u| user_state_dir(&u.home)));
-            let state_dir = absolute_state_dir(state_dir.unwrap_or_else(hole_common::paths::default_state_dir));
+            let state_dir = match absolute_state_dir(state_dir.unwrap_or_else(hole_common::paths::default_state_dir)) {
+                Ok(state_dir) => state_dir,
+                Err(e) => {
+                    cli_log!(error, "bridge error: cannot resolve the state directory: {e}");
+                    return 1;
+                }
+            };
 
             let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
 

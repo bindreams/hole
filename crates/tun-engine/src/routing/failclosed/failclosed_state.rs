@@ -7,7 +7,7 @@
 //! Windows needs no analogue: its WFP filters carry fixed GUIDs and are swept
 //! by key, so there is nothing to persist.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -39,10 +39,6 @@ pub struct FailClosedState {
     /// `bool` rejects `null` — `state::load` then reads the file as absent and
     /// leaves `block out all` on the host.
     pub pf_was_enabled: bool,
-}
-
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join(STATE_FILE_NAME)
 }
 
 /// Atomically persist `state` to `<state_dir>/bridge-failclosed.json` (temp
@@ -101,11 +97,7 @@ pub fn load(state_dir: &Path) -> Option<FailClosedState> {
 
 /// Delete the state file; tolerates absence (`Ok`). `Err` only on real I/O error.
 pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(state_file(state_dir)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
 }
 
 #[cfg(test)]

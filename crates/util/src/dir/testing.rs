@@ -32,6 +32,14 @@ pub fn plant_link(target: &Path, link: &Path) {
     own(link);
 }
 
+/// A link at `base/state` to the folder the system owns that anyone may write in, owned by an unprivileged
+/// principal: the state directory a user could make a privileged step walk into. Returns the link.
+pub fn state_dir_linked_to_a_system_folder(base: &Path) -> PathBuf {
+    let link = base.join("state");
+    plant_link(SystemScratch::new().root(), &link);
+    link
+}
+
 /// A folder nobody may add a file or a subfolder to, until the guard drops: the state of a `ProgramData` folder whose
 /// ACL a machine tightened, which a reader can still read from. Windows only; on unix an open directory carries no
 /// such right.

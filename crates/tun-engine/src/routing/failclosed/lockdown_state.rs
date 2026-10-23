@@ -4,7 +4,7 @@
 //! user *wants*, surviving bridge restarts and crashes. Modeled on
 //! `failclosed_state.rs`: schema version, atomic save, load-None-on-mismatch.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -22,10 +22,6 @@ pub struct LockdownState {
     pub version: u32,
     /// Whether the standing kill switch is enabled.
     pub enabled: bool,
-}
-
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join(STATE_FILE_NAME)
 }
 
 /// Atomically persist `state` (temp file + same-dir rename, `sync_all`
@@ -147,11 +143,7 @@ pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -
 
 /// Delete the state file; tolerates absence.
 pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(state_file(state_dir)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
 }
 
 #[cfg(test)]

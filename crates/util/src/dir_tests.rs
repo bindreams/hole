@@ -493,6 +493,54 @@ fn write_state_file_refuses_a_link_to_a_folder_the_system_owns_and_writes_nothin
     );
 }
 
+// remove_state_file ===================================================================================================
+
+#[skuld::test]
+fn remove_state_file_removes_the_file_and_only_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("bridge-x.json"), b"{}").unwrap();
+    std::fs::write(tmp.path().join("bridge-y.json"), b"{}").unwrap();
+
+    remove_state_file(tmp.path(), &name("bridge-x.json")).unwrap();
+
+    assert_eq!(names(tmp.path()), vec![name("bridge-y.json")]);
+}
+
+#[skuld::test]
+fn remove_state_file_answers_ok_for_a_missing_file_and_for_a_missing_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    remove_state_file(tmp.path(), &name("bridge-x.json")).unwrap();
+    remove_state_file(&tmp.path().join("no-such-dir"), &name("bridge-x.json")).unwrap();
+
+    assert!(names(tmp.path()).is_empty(), "something was made");
+}
+
+#[skuld::test]
+fn remove_state_file_removes_a_symlink_at_the_name_and_not_what_it_points_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    std::fs::write(&target, b"keep").unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    plant_file_symlink(&target, &state.join("bridge-x.json"));
+
+    remove_state_file(&state, &name("bridge-x.json")).unwrap();
+
+    assert!(names(&state).is_empty());
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+}
+
+#[skuld::test]
+fn remove_state_file_refuses_a_link_to_a_folder_the_system_owns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+    let err = remove_state_file(&state, &name("bridge-x.json")).unwrap_err();
+
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink));
+}
+
 // read_state_file =====================================================================================================
 
 #[skuld::test]

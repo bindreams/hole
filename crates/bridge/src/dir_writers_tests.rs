@@ -45,6 +45,7 @@ const LOCK_NAME: &str = "writers.lock";
 const STATE_NAME: &str = "state.json";
 const LOG_NAME: &str = "bridge.log";
 const LOG_ROTATED_NAME: &str = "bridge.log.1";
+const SOCKET_NAME: &str = "hole-bridge.sock";
 const CRASH_PID: u32 = 4242;
 const CRASH_MARKER_NAME: &str = "crash-bridge-4242.marker";
 
@@ -137,6 +138,45 @@ fn writers() -> Vec<Writer> {
             sources: &["crates/common/src/update_marker.rs"],
             names: &[MARKER_FILE],
             run: |dir, _| update_marker::clear(dir),
+        },
+        Writer {
+            name: "the plugin state, cleared",
+            sources: &[],
+            names: &[crate::plugin_state::STATE_FILE_NAME],
+            run: |dir, _| crate::plugin_state::clear(dir),
+        },
+        Writer {
+            name: "the dns state, cleared",
+            sources: &[],
+            names: &[crate::dns_state::STATE_FILE_NAME],
+            run: |dir, _| crate::dns_state::clear(dir),
+        },
+        Writer {
+            name: "the dns state, superseded",
+            sources: &["crates/bridge/src/dns_state.rs"],
+            names: &[
+                crate::dns_state::STATE_FILE_NAME,
+                crate::dns_state::SUPERSEDED_FILE_NAME,
+            ],
+            run: |dir, _| crate::dns_state::supersede(dir),
+        },
+        Writer {
+            name: "the lockdown state, cleared",
+            sources: &[],
+            names: &[tun_engine::routing::failclosed::lockdown_state::STATE_FILE_NAME],
+            run: |dir, _| tun_engine::routing::failclosed::lockdown_state::clear(dir),
+        },
+        Writer {
+            name: "the socket, bound",
+            sources: &[],
+            names: &[SOCKET_NAME],
+            run: |dir, _| {
+                // `tokio`'s listener registers with the runtime that is current when it binds.
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async { crate::socket::bind(&dir.join(SOCKET_NAME)).map(drop) })
+            },
         },
         Writer {
             name: "the crash marker, written",
@@ -743,23 +783,49 @@ const PRIVILEGED_CRATES: &[&str] = &[
 const BY_PATH_ALLOWED: &[(&str, &str)] = &[
     ("crates/bridge/src/bin/test_plugin.rs", "a test binary"),
     ("crates/bridge/src/bin/test_service.rs", "a test binary"),
-    ("crates/bridge/src/test_support/dist_harness.rs", "test support: reads the log of a process the test started"),
     (
-        "crates/bridge/src/ipc.rs",
-        "reads the `installer-user-sid` file in the `hole` folder of `%ProgramData%`, where a standard user can add names on some hosts (routed to the follow-up branch azhukova/1118-2)",
+        "crates/bridge/src/test_support/dist_harness.rs",
+        "test support: reads the log of a process the test started",
     ),
     ("crates/tun-engine/src/test_utils/escape.rs", "test support"),
-    ("crates/tun-engine/src/test_utils/pktmon.rs", "test support: reads a capture the test made"),
+    (
+        "crates/tun-engine/src/test_utils/pktmon.rs",
+        "test support: reads a capture the test made",
+    ),
     ("crates/util/src/dir/testing.rs", "test fixtures"),
-    ("crates/common/src/config.rs", "the GUI's own user config: syncs the folder of the file the user's GUI wrote"),
-    ("crates/common/src/config_store.rs", "the GUI's own user config, read and written as the user"),
+    (
+        "crates/common/src/config.rs",
+        "the GUI's own user config: syncs the folder of the file the user's GUI wrote",
+    ),
+    (
+        "crates/common/src/config_store.rs",
+        "the GUI's own user config, read and written as the user",
+    ),
     ("crates/common/src/logging/logging_test_helpers.rs", "test helpers"),
-    ("crates/common/src/verify.rs", "hashes an installer the GUI downloaded, as the user"),
-    ("crates/hole/src/cli.rs", "`hole bridge log`, `hole proxy` and the log tail read files the user names, as the user"),
-    ("crates/hole/src/commands.rs", "the GUI imports a file the user picked, as the user"),
-    ("crates/hole/src/elevation.rs", "reads a request and a result file in the requester's own private temp folder"),
-    ("crates/hole/src/log_collector.rs", "the GUI zips its own user's logs, as the user"),
-    ("crates/hole/src/setup.rs", "reads the log of an elevated child from the requester's own private temp folder"),
+    (
+        "crates/common/src/verify.rs",
+        "hashes an installer the GUI downloaded, as the user",
+    ),
+    (
+        "crates/hole/src/cli.rs",
+        "`hole bridge log`, `hole proxy` and the log tail read files the user names, as the user",
+    ),
+    (
+        "crates/hole/src/commands.rs",
+        "the GUI imports a file the user picked, as the user",
+    ),
+    (
+        "crates/hole/src/elevation.rs",
+        "reads a request and a result file in the requester's own private temp folder",
+    ),
+    (
+        "crates/hole/src/log_collector.rs",
+        "the GUI zips its own user's logs, as the user",
+    ),
+    (
+        "crates/hole/src/setup.rs",
+        "reads the log of an elevated child from the requester's own private temp folder",
+    ),
 ];
 
 fn production_sources(dir: &Path, found: &mut Vec<PathBuf>) {

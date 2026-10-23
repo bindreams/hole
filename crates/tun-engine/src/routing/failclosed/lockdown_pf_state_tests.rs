@@ -53,6 +53,16 @@ fn load_rejects_unknown_field() {
 }
 
 #[skuld::test]
+fn clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+    let err = clear(&state).unwrap_err();
+
+    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+}
+
+#[skuld::test]
 fn clear_removes_file_and_tolerates_absence() {
     let tmp = tempfile::tempdir().unwrap();
     save(tmp.path(), &sample(), None).unwrap();
@@ -117,7 +127,7 @@ fn a_corrupt_pf_state_never_echoes_its_contents_into_the_log() {
     assert!(raw.contains(SECRET_ADDR), "guard: serde_json echoes the value: {raw}");
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(state_file(tmp.path()), &json).unwrap();
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), &json).unwrap();
 
     let writer = garter::test_utils::WaitableWriter::new();
     let subscriber = tracing_subscriber::registry().with(

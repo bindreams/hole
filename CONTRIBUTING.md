@@ -718,6 +718,14 @@ re-derive them.
    marker use, does not have it yet, because `VersionedFile::store` and the marker's claim make a second name for a
    live file themselves. The rule reaches them in the follow-up branch `azhukova/1118-2`.
 
+1. **Remove and move aside through the handle too.** A state file is removed with `util::dir::remove_state_file` and
+   moved aside with `Dir::rename_noreplace` (`dns_state::supersede`), never `std::fs::remove_file` or `rename` on a
+   path: a component the user swapped for a link redirects the call, and a probe followed by a rename replaces a name
+   that appeared in between. The same holds for the stale socket (`socket::remove`, `util::dir::make_dir_and_free_name`)
+   and the installer's SID file in the `hole` folder of `%ProgramData%`, to which a standard user can add names (it
+   inherits `BUILTIN\Users:(CI)(WD,AD,WEA,WA)`; the installer does not narrow it). The socket's bind and the mode or
+   DACL set on it afterwards still name it by path: no platform binds relative to a directory handle.
+
 1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a
    temp file, before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
 

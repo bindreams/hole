@@ -302,7 +302,7 @@ impl IpcServer {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = crate::socket::remove(&self.socket_path);
     }
 }
 
@@ -1450,17 +1450,9 @@ fn with_sddl_dacl(
 #[cfg(all(target_os = "windows", not(test)))]
 fn apply_socket_permissions(path: &Path) {
     let mut extra_sids = Vec::new();
-    let sid_file = installer_user_sid_path();
-    if let Ok(sid) = std::fs::read_to_string(&sid_file) {
-        let sid = sid.trim().to_string();
-        if !sid.is_empty() {
-            info!(sid = %sid, "including installer user SID in socket DACL");
-            extra_sids.push(sid);
-        }
-        // Delete the file after reading — the per-user SID is a temporary bridge
-        // that is no longer needed after the bridge restarts (group membership
-        // will be in the token after re-login).
-        let _ = std::fs::remove_file(&sid_file);
+    if let Some(sid) = take_installer_user_sid(&installer_user_sid_dir()) {
+        info!(sid = %sid, "including installer user SID in socket DACL");
+        extra_sids.push(sid);
     }
     let extra_refs: Vec<&str> = extra_sids.iter().map(|s| s.as_str()).collect();
     let sddl = build_sddl(&extra_refs);
@@ -1469,15 +1461,56 @@ fn apply_socket_permissions(path: &Path) {
     }
 }
 
-/// Path to the file where the installing user's SID is stored temporarily.
+/// Name of the file where the installing user's SID is stored temporarily.
 ///
 /// Written by [`prepare_ipc_access`], read and deleted by
 /// `apply_socket_permissions()` on bridge startup.
 #[cfg(target_os = "windows")]
-pub fn installer_user_sid_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
-        .join("hole")
-        .join("installer-user-sid")
+pub(crate) const INSTALLER_USER_SID_FILE: &str = "installer-user-sid";
+
+/// The folder of [`INSTALLER_USER_SID_FILE`]: the `hole` folder of `%ProgramData%`, which the system owns but to which
+/// a standard user can add names (it inherits `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` from `%ProgramData%`, and nothing in
+/// the installer narrows it). The file is read and written as a state file: through a handle on the folder, and a
+/// read refuses a file the folder's owner cannot vouch for, so a name a user planted does not grant its SID access.
+#[cfg(target_os = "windows")]
+pub fn installer_user_sid_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join("hole")
+}
+
+/// The SID the installer left in `dir`, as text. `NotFound` for a missing file or folder.
+#[cfg(target_os = "windows")]
+pub(crate) fn read_installer_user_sid(dir: &Path) -> std::io::Result<String> {
+    let bytes = util::dir::read_state_file(dir, INSTALLER_USER_SID_FILE.as_ref())?;
+    String::from_utf8(bytes)
+        .map(|sid| sid.trim().to_owned())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "the installer SID file is not text"))
+}
+
+/// Reads and removes the installer's SID in `dir`; `None` when there is no usable one. The file is removed after a
+/// read, because the per-user SID is a temporary bridge that is no longer needed after the bridge restarts (group
+/// membership will be in the token after re-login). A file that could not be read (a name a user planted, or a read
+/// error) is left, and reported.
+#[cfg(target_os = "windows")]
+pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
+    let sid = match read_installer_user_sid(dir) {
+        Ok(sid) => sid,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(error = %e, "could not read the installer user SID file; ignoring it");
+            return None;
+        }
+    };
+    if let Err(e) = util::dir::remove_state_file(dir, INSTALLER_USER_SID_FILE.as_ref()) {
+        warn!(error = %e, "could not remove the installer user SID file");
+    }
+    (!sid.is_empty()).then_some(sid)
+}
+
+/// Writes `sid` as the installer's SID in `dir`, making the folder if it is missing. The file is replaced as a whole,
+/// by name through a handle: a link a user planted at the name is replaced and what it leads to is left alone.
+#[cfg(target_os = "windows")]
+pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result<()> {
+    util::dir::write_state_file(dir, INSTALLER_USER_SID_FILE.as_ref(), sid.as_bytes(), None)
 }
 
 /// Set up IPC access control so that the current interactive user can
@@ -1500,8 +1533,8 @@ pub fn installer_user_sid_path() -> std::path::PathBuf {
 /// idempotent (macOS: verifies post-failure with `getgrnam(3)`;
 /// Windows: detects error code 1379) and `group::add_user_to_group`
 /// is idempotent (macOS: `dseditgroup -o edit -a` is naturally
-/// idempotent; Windows: detects error code 1378). `std::fs::write` on
-/// the SID file path unconditionally overwrites. An end-to-end test
+/// idempotent; Windows: detects error code 1378). The SID file write
+/// unconditionally replaces the file. An end-to-end test
 /// would require elevation (to actually call `dseditgroup` /
 /// `net localgroup`), so we don't add one — elevation is a runtime
 /// dependency, not a test-harness dependency. Integration coverage is
@@ -1515,12 +1548,8 @@ pub fn prepare_ipc_access() -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         let sid = crate::group::lookup_sid(&user)?;
-        let sid_path = installer_user_sid_path();
-        if let Some(parent) = sid_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&sid_path, &sid)?;
-        info!(sid = %sid, path = %sid_path.display(), "wrote installer user SID");
+        write_installer_user_sid(&installer_user_sid_dir(), &sid)?;
+        info!(sid = %sid, "wrote installer user SID");
     }
     Ok(())
 }

@@ -59,6 +59,16 @@ fn load_rejects_schema_mismatch() {
 }
 
 #[skuld::test]
+fn clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+    let err = clear(&state).unwrap_err();
+
+    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+}
+
+#[skuld::test]
 fn clear_removes_file_and_tolerates_absence() {
     let tmp = tempfile::tempdir().unwrap();
     let st = FailClosedState {

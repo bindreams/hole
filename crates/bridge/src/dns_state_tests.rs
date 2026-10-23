@@ -274,6 +274,16 @@ fn clear_existing_removes_file() {
 }
 
 #[skuld::test]
+fn clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+    let err = clear(&state).unwrap_err();
+
+    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+}
+
+#[skuld::test]
 fn state_file_name_is_bridge_dns_json() {
     assert_eq!(STATE_FILE_NAME, "bridge-dns.json");
 }
@@ -302,6 +312,73 @@ fn supersede_renames_and_load_no_longer_sees_it() {
         load(dir.path()).is_none(),
         "load must never read the superseded name — the bridge evaluates a file at most once"
     );
+}
+
+#[skuld::test]
+fn supersede_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+    let err = supersede(&state).unwrap_err();
+
+    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+}
+
+/// A name that is taken but that `Path::exists` does not see: a symlink to nothing. A check-then-rename takes it for
+/// free and replaces it, so the user's planted name is what a probe cannot tell from a free one.
+#[skuld::test]
+fn supersede_does_not_replace_a_name_a_probe_would_call_free() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(STATE_FILE_NAME), b"state").unwrap();
+    let superseded = dir.path().join(SUPERSEDED_FILE_NAME);
+    let nothing = dir.path().join("no-such-file");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&nothing, &superseded).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&nothing, &superseded).unwrap();
+    assert!(!superseded.exists(), "the fixture must look free to a probe");
+
+    supersede(dir.path()).unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(&superseded).unwrap().is_symlink(),
+        "the name that was taken was replaced"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("bridge-dns.superseded.2.json")).unwrap(),
+        b"state"
+    );
+}
+
+#[skuld::test]
+fn supersede_takes_the_first_free_archive_name() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(SUPERSEDED_FILE_NAME), b"oldest").unwrap();
+    std::fs::write(dir.path().join("bridge-dns.superseded.2.json"), b"older").unwrap();
+    std::fs::write(dir.path().join(STATE_FILE_NAME), b"newest").unwrap();
+
+    supersede(dir.path()).unwrap();
+
+    assert_eq!(std::fs::read(dir.path().join(SUPERSEDED_FILE_NAME)).unwrap(), b"oldest");
+    assert_eq!(
+        std::fs::read(dir.path().join("bridge-dns.superseded.2.json")).unwrap(),
+        b"older"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("bridge-dns.superseded.3.json")).unwrap(),
+        b"newest"
+    );
+}
+
+#[skuld::test]
+fn supersede_with_no_state_file_leaves_an_existing_superseded_file_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(SUPERSEDED_FILE_NAME), b"oldest").unwrap();
+
+    supersede(dir.path()).unwrap();
+
+    assert_eq!(std::fs::read(dir.path().join(SUPERSEDED_FILE_NAME)).unwrap(), b"oldest");
+    assert!(!dir.path().join("bridge-dns.superseded.2.json").exists());
 }
 
 /// A second `supersede` call (reinstall, rollback, or a second crash before
