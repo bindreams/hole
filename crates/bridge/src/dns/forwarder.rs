@@ -464,20 +464,6 @@ impl AttemptProbe {
     }
 }
 
-/// Walk `std::error::Error::source()` and join the chain with ` -> `.
-/// Used as the `caused_by=...` log field so the failure log surfaces the
-/// inner io::ErrorKind (e.g. `ConnectionRefused`, `UnexpectedEof`) instead
-/// of just the outer message.
-fn format_error_chain(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut s = format!("{e}");
-    let mut current = e.source();
-    while let Some(c) = current {
-        s.push_str(&format!(" -> {c}"));
-        current = c.source();
-    }
-    s
-}
-
 /// Walk `std::error::Error::source()` looking for the first
 /// `io::Error::raw_os_error()` value. Needed because tokio-rustls wraps
 /// its own `tls handshake eof` around a synthesized inner `io::Error`
@@ -912,7 +898,7 @@ impl DnsForwarder {
                     udp_sent = ?e.udp_sent,
                     udp_received = ?e.udp_received,
                     os_errno = ?e.os_errno,
-                    caused_by = %format_error_chain(&e.source),
+                    caused_by = %util::error_chain::error_chain(&e.source),
                     "upstream failed"
                 );
             }

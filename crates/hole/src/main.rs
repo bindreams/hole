@@ -131,7 +131,7 @@ fn launch_gui(show_dashboard: bool) {
             if let Err(e) = app.run_on_main_thread(move || {
                 tray::open_settings_window(&handle);
             }) {
-                tracing::warn!(error = %e, "single-instance: failed to dispatch to main thread");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "single-instance: failed to dispatch to main thread");
             }
         }))
         .plugin(tauri_plugin_autostart::init(
@@ -207,7 +207,7 @@ fn launch_gui(show_dashboard: bool) {
             // in gui.log rather than a toast.
             match hole::autostart_registration::migrate(&app.package_info().name, hole::launch::NO_SHOW_DASHBOARD) {
                 Ok(outcome) => tracing::debug!(?outcome, "autostart argument migration"),
-                Err(e) => tracing::warn!(error = %e, "autostart argument migration failed"),
+                Err(e) => tracing::warn!(error = %util::error_chain::error_chain(&e), "autostart argument migration failed"),
             }
             let settled = tray::apply_launch_window(app.handle(), show_dashboard);
             tray::spawn_status_reconciler(app.handle(), settled);

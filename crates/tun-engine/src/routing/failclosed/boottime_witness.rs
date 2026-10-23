@@ -136,7 +136,7 @@ pub fn load(state_dir: &Path) -> ArmingWitness {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ArmingWitness::Unset,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "boot-time witness read failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "boot-time witness read failed");
             return ArmingWitness::Unreadable;
         }
     };
@@ -152,7 +152,7 @@ pub fn load(state_dir: &Path) -> ArmingWitness {
             ArmingWitness::Unreadable
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "boot-time witness parse failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "boot-time witness parse failed");
             ArmingWitness::Unreadable
         }
     }
@@ -276,7 +276,7 @@ pub(crate) fn apply(state_dir: &Path, current: ArmingWitness, update: WitnessUpd
 fn write_or_warn(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) {
     if let Err(e) = save(state_dir, armed, owner) {
         tracing::warn!(
-            error = %e,
+            error = %util::error_chain::error_chain(&e),
             armed,
             path = %state_file(state_dir).display(),
             "the boot-time witness could not be written; a later sweep that can no longer see a \

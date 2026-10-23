@@ -181,7 +181,9 @@ impl Proxy for ShadowsocksProxy {
             let result = server.run().await;
             match &result {
                 Ok(()) => warn!("shadowsocks server task returned Ok — expected to run forever"),
-                Err(e) => error!(error = %e, "shadowsocks server task exited with error"),
+                Err(e) => {
+                    error!(error = %util::error_chain::error_chain(e), "shadowsocks server task exited with error")
+                }
             }
             result
         });

@@ -111,7 +111,7 @@ pub fn save_config(state: State<AppState>, settings: crate::ui_settings::UiSetti
     let mut updated = current.clone();
     apply_ui_settings(&mut updated, settings);
     state.config_store.save(&updated).map_err(|e| {
-        warn!(error = %e, path = %state.config_store.path().display(), "save_config: config save failed");
+        warn!(error = %util::error_chain::error_chain(&e), path = %state.config_store.path().display(), "save_config: config save failed");
         e.to_string()
     })?;
     *current = updated;
@@ -136,11 +136,17 @@ fn validate_and_read_import(path: &Path) -> Result<Vec<ServerEntry>, ImportFailu
 
     // Open once, then fstat the fd to avoid TOCTOU races.
     let mut file = std::fs::File::open(path).map_err(|e| {
-        debug!("failed to open import file: {e}");
+        debug!(
+            "failed to open import file: {error}",
+            error = util::error_chain::error_chain(&e)
+        );
         file_error("file not found or not accessible")
     })?;
     let metadata = file.metadata().map_err(|e| {
-        debug!("failed to read file metadata: {e}");
+        debug!(
+            "failed to read file metadata: {error}",
+            error = util::error_chain::error_chain(&e)
+        );
         file_error("file not found or not accessible")
     })?;
     if !metadata.is_file() {
@@ -152,7 +158,10 @@ fn validate_and_read_import(path: &Path) -> Result<Vec<ServerEntry>, ImportFailu
 
     let mut json = String::new();
     file.read_to_string(&mut json).map_err(|e| {
-        debug!("failed to read import file: {e}");
+        debug!(
+            "failed to read import file: {error}",
+            error = util::error_chain::error_chain(&e)
+        );
         file_error("failed to read file")
     })?;
     import::import_servers(&json).map_err(to_import_failure)
@@ -271,7 +280,7 @@ pub fn import_file(state: &AppState, path: &Path) -> Result<Vec<ServerEntry>, Im
     let (appended, _deduped) = apply_import(&mut updated, parsed);
 
     state.config_store.save(&updated).map_err(|e| {
-        warn!(error = %e, path = %state.config_store.path().display(), "import_file: config save failed");
+        warn!(error = %util::error_chain::error_chain(&e), path = %state.config_store.path().display(), "import_file: config save failed");
         ImportFailure::SaveFailed
     })?;
     *current = updated;
@@ -292,7 +301,7 @@ pub fn delete_server(state: State<AppState>, entry_id: String) -> Result<(), Str
     let mut updated = current.clone();
     let removed = remove_server(&mut updated, &entry_id);
     state.config_store.save(&updated).map_err(|e| {
-        warn!(error = %e, path = %state.config_store.path().display(), "delete_server: config save failed");
+        warn!(error = %util::error_chain::error_chain(&e), path = %state.config_store.path().display(), "delete_server: config save failed");
         e.to_string()
     })?;
     *current = updated;
@@ -361,7 +370,7 @@ fn map_status_response(
             serde_json::Value::Null,
         ),
         Err(e) => {
-            warn!(error = %e, "bridge unreachable for status");
+            warn!(error = %util::error_chain::error_chain(e), "bridge unreachable for status");
             (
                 0,
                 serde_json::Value::Null,
@@ -495,7 +504,7 @@ pub async fn test_server(state: State<'_, AppState>, entry_id: String) -> Result
                 outcome: outcome.clone(),
             });
             state.config_store.save(&cfg).map_err(|e| {
-                warn!(error = %e, path = %state.config_store.path().display(), "test_server: persist validation failed");
+                warn!(error = %util::error_chain::error_chain(&e), path = %state.config_store.path().display(), "test_server: persist validation failed");
                 e.to_string()
             })?;
         }
@@ -546,7 +555,7 @@ pub fn mark_validated_by_proxy_start(state: State<AppState>, entry_id: String) -
             });
         }
         state.config_store.save(&cfg).map_err(|e| {
-            warn!(error = %e, path = %state.config_store.path().display(), "mark_validated_by_proxy_start: persist failed");
+            warn!(error = %util::error_chain::error_chain(&e), path = %state.config_store.path().display(), "mark_validated_by_proxy_start: persist failed");
             e.to_string()
         })?;
     }

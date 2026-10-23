@@ -63,7 +63,7 @@ pub(crate) fn shutdown_signal() -> impl std::future::Future<Output = ()> {
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGTERM handler; Ctrl+C only");
+                tracing::error!(error = %util::error_chain::error_chain(&e), "failed to install SIGTERM handler; Ctrl+C only");
                 let _ = tokio::signal::ctrl_c().await;
                 tracing::info!("shutdown signal (SIGINT) received");
             }
@@ -77,7 +77,7 @@ pub(crate) fn shutdown_signal() -> impl std::future::Future<Output = ()> {
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "failed to install CTRL_BREAK handler; Ctrl+C only");
+                tracing::error!(error = %util::error_chain::error_chain(&e), "failed to install CTRL_BREAK handler; Ctrl+C only");
                 let _ = tokio::signal::ctrl_c().await;
                 tracing::info!("shutdown signal (Ctrl+C) received");
             }
@@ -98,11 +98,11 @@ async fn notify_ready(spec: &str) {
         Ok(mut conn) => {
             use tokio::io::AsyncWriteExt as _;
             if let Err(e) = conn.write_all(format!("{token}\n").as_bytes()).await {
-                tracing::warn!(error = %e, "ready-notify write failed");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "ready-notify write failed");
             }
             let _ = conn.shutdown().await;
         }
-        Err(e) => tracing::warn!(error = %e, addr, "ready-notify connect failed"),
+        Err(e) => tracing::warn!(error = %util::error_chain::error_chain(&e), addr, "ready-notify connect failed"),
     }
 }
 
@@ -128,7 +128,7 @@ pub(crate) fn shutdown_reason(marker_present: bool) -> crate::target::SessionEve
 /// service-path `platform::{macos,windows}::sweep_marker`.
 fn sweep_marker(log_dir: &Path) {
     if let Err(e) = hole_common::update_marker::clear(log_dir) {
-        tracing::warn!(error = %e, "failed to clear update-in-progress marker");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear update-in-progress marker");
     }
 }
 
@@ -258,7 +258,7 @@ async fn run_inner(
     let _etw_guard = match crate::diagnostics::etw::start_consumer() {
         Ok(g) => Some(g),
         Err(e) => {
-            tracing::error!(error = %e, "etw consumer failed to start");
+            tracing::error!(error = %util::error_chain::error_chain(&e), "etw consumer failed to start");
             None
         }
     };
@@ -286,7 +286,7 @@ async fn run_inner(
     tokio::select! {
         result = server.run() => {
             if let Err(e) = result {
-                tracing::error!(error = %e, "IPC server error");
+                tracing::error!(error = %util::error_chain::error_chain(&e), "IPC server error");
             }
         }
         _ = shutdown.cancelled() => {}
@@ -300,7 +300,7 @@ async fn run_inner(
     let mut pm = proxy_shutdown.lock().await;
     let event = shutdown_reason(hole_common::update_marker::is_present(log_dir));
     if let Err(e) = pm.stop_with(event).await {
-        tracing::error!(error = %e, "error stopping proxy during shutdown");
+        tracing::error!(error = %util::error_chain::error_chain(&e), "error stopping proxy during shutdown");
     }
 
     Ok(())

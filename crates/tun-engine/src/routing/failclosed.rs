@@ -288,7 +288,9 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Pat
             // to carry — is false for exactly that reason.
             match disengage_lockdown(state_dir) {
                 Ok(_clearance_is_persisted_not_reported_at_startup) => {}
-                Err(e) => tracing::warn!(error = %e, "lockdown sweep could not disengage the cover"),
+                Err(e) => {
+                    tracing::warn!(error = %util::error_chain::error_chain(&e), "lockdown sweep could not disengage the cover")
+                }
             }
         }
     }

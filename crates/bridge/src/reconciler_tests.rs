@@ -1023,3 +1023,32 @@ fn a_failed_boot_connect_leaves_the_host_reachable() {
         );
     });
 }
+
+/// A boot auto-connect that fails is only visible in bridge.log; the cause
+/// behind the error's `Display` must be there.
+#[skuld::test]
+async fn a_failed_boot_connect_logs_the_cause_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    target::save(dir.path(), &connectable(), None).unwrap();
+    let routing = MockRouting::failing_gateway(dir.path().to_path_buf());
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    let proxy = Arc::new(Mutex::new(pm));
+
+    let writer = garter::test_utils::WaitableWriter::new();
+    let sink = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
+    }
+
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_GATEWAY_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}

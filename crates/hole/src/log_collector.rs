@@ -63,7 +63,7 @@ fn collect_logs_into(dirs: &[(&'static str, PathBuf)], zip_path: &Path) -> Resul
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
-                warn!(dir = %dir.display(), error = %e, "failed to read log directory");
+                warn!(dir = %dir.display(), error = %util::error_chain::error_chain(&e), "failed to read log directory");
                 continue;
             }
         };
@@ -85,7 +85,7 @@ fn collect_logs_into(dirs: &[(&'static str, PathBuf)], zip_path: &Path) -> Resul
 
             let archive_name = format!("{prefix}/{file_name}");
             if let Err(e) = add_file_to_zip(&mut zip, &path, &archive_name, options) {
-                warn!(file = %path.display(), error = %e, "failed to add log file to zip");
+                warn!(file = %path.display(), error = %util::error_chain::error_chain(&*e), "failed to add log file to zip");
                 continue;
             }
             file_count += 1;

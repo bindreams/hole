@@ -130,7 +130,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
             tracing::warn!(
                 server = %hole_common::logging::redact_arm::token_for(&entry.id),
                 server_kind = hole_common::logging::redact_arm::server_kind(entry.server.expose()),
-                error = %e,
+                error = %util::error_chain::error_chain(&e),
                 "server_test: DoH bootstrap failed"
             );
             return ServerTestOutcome::DnsFailed;
@@ -291,7 +291,7 @@ fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
         Ok(crate::reachability::ProbeTransport::Quic { .. }) => true,
         Ok(_) => false,
         Err(e) => {
-            debug!(%e, "malformed SS_PLUGIN_OPTIONS in server_endpoint_is_udp, assuming UDP");
+            debug!(error = %util::error_chain::error_chain(&e), "malformed SS_PLUGIN_OPTIONS in server_endpoint_is_udp, assuming UDP");
             true
         }
     }

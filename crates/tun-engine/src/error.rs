@@ -4,12 +4,15 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::gateway::GatewayError;
+
 /// Errors surfaced by the `routing` module: gateway discovery and route
 /// table manipulation.
 #[derive(Debug, Error)]
 pub enum RoutingError {
+    /// Gateway failure; log with `util::error_chain`.
     #[error("gateway detection failed: {0}")]
-    Gateway(String),
+    Gateway(#[source] GatewayError),
     #[error("route setup failed: {0}")]
     RouteSetup(String),
     /// The route record is newer than this release, corrupt, or its read fails.
@@ -46,7 +49,7 @@ impl RoutingError {
     /// error's kind only (`tempfile`'s error text names the path); the full
     /// error goes to the log.
     pub(crate) fn state_write_failed(what: &str, e: &std::io::Error) -> Self {
-        tracing::error!(error = %e, "{what} could not be written");
+        tracing::error!(error = %util::error_chain::error_chain(e), "{what} could not be written");
         RoutingError::RouteSetup(format!("{what} could not be written ({})", e.kind()))
     }
 }

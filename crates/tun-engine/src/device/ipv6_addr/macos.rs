@@ -97,7 +97,7 @@ pub(super) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceEr
     let output = match SystemTool::Ifconfig.command().and_then(|mut c| c.args(&args).output()) {
         Ok(output) => output,
         Err(e) => {
-            warn!(interface = %if_name, error = %e, "spawning ifconfig failed; no IPv6 address on the TUN");
+            warn!(interface = %if_name, error = %util::error_chain::error_chain(&e), "spawning ifconfig failed; no IPv6 address on the TUN");
             return Ok(Assigned::Ipv6StackAbsent);
         }
     };

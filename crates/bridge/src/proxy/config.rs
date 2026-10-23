@@ -78,8 +78,9 @@ pub enum ProxyError {
     InvalidPluginName(String),
     #[error("proxy runtime error: {0}")]
     Runtime(#[from] std::io::Error),
+    /// Gateway failure; log with `util::error_chain`.
     #[error("gateway detection failed: {0}")]
-    Gateway(String),
+    Gateway(#[source] tun_engine::gateway::GatewayError),
     /// Private DoH bootstrap could not resolve the proxy server's hostname and
     /// `dns.allow_insecure_bootstrap` is off. PII-free `Display` (the wrapped
     /// error names neither host nor path) so it is safe to surface verbatim to
@@ -214,7 +215,11 @@ pub enum ProxyError {
     /// the intent afterward. PII-free by construction (no path, no detail) —
     /// an IPC message reaches a GUI toast verbatim.
     #[error("the network was unblocked, but the kill-switch setting could not be saved")]
-    LockdownIntentNotPersisted,
+    LockdownIntentNotPersisted {
+        /// Why the save failed: for the log (via `util::error_chain`), never the toast.
+        #[source]
+        source: Box<ProxyError>,
+    },
     /// A pre-existing `hole-tun` adapter does not carry Hole's own adapter
     /// GUID — most often a build of Hole itself that crashed before it
     /// could tear the adapter down. PII-free by construction: `alias` is a
@@ -224,10 +229,14 @@ pub enum ProxyError {
     /// The DNS-egress confinement (Windows-only) could not be engaged.
     /// Fail-fatal: the confinement is the only thing standing between OS
     /// DNS and the LAN resolver, so a session that could not confine it
-    /// must not go live. PII-free by construction — `reason` is the
-    /// confinement error's own `Display`, which names no path.
-    #[error("could not confine DNS to the tunnel: {reason}")]
-    DnsConfinementFailed { reason: String },
+    /// must not go live. PII-free by construction — `Display` is the
+    /// confinement error's own text, which names no path; its OS cause is
+    /// reachable through `source()` for the log.
+    #[error("could not confine DNS to the tunnel: {source}")]
+    DnsConfinementFailed {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl From<&ProxyError> for hole_common::protocol::StartError {
@@ -260,7 +269,7 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::TunnelSilent { .. }
             | ProxyError::TunnelSetupIncomplete { .. }
             | ProxyError::NoTunnelConnection { .. }
-            | ProxyError::LockdownIntentNotPersisted
+            | ProxyError::LockdownIntentNotPersisted { .. }
             | ProxyError::ForeignAdapter { .. }
             | ProxyError::DnsConfinementFailed { .. } => StartError::Failed { message: e.to_string() },
         }

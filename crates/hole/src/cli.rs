@@ -285,7 +285,7 @@ pub(crate) fn show_dashboard_from_argv(argv: &[String]) -> bool {
     match Cli::try_parse_from(argv) {
         Ok(cli) => cli.show_dashboard(),
         Err(e) => {
-            tracing::warn!(error = %e, "could not parse a duplicate launch's arguments; revealing the dashboard");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), "could not parse a duplicate launch's arguments; revealing the dashboard");
             true
         }
     }

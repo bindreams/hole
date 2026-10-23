@@ -100,7 +100,7 @@ impl BridgeClient {
             .map_err(|e| ClientError::Protocol(e.to_string()))?;
         let conn_task = tokio::spawn(async move {
             if let Err(e) = conn.await {
-                debug!(error = %e, "HTTP client connection ended");
+                debug!(error = %util::error_chain::error_chain(&e), "HTTP client connection ended");
             }
         });
         Ok(Self {
@@ -444,14 +444,14 @@ async fn parse_start_error(resp: http::Response<hyper::body::Incoming>) -> hole_
             Ok(e) => e,
             Err(e) => {
                 let preview = String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned();
-                warn!(error = %e, body = %preview, "unparseable StartError body (same-build contract breach)");
+                warn!(error = %util::error_chain::error_chain(&e), body = %preview, "unparseable StartError body (same-build contract breach)");
                 StartError::Failed {
                     message: "unknown error".to_string(),
                 }
             }
         },
         Err(e) => {
-            warn!(error = %e, "failed to read start-error body");
+            warn!(error = %util::error_chain::error_chain(&e), "failed to read start-error body");
             StartError::Failed {
                 message: "failed to read error response".to_string(),
             }

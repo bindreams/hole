@@ -415,7 +415,7 @@ pub(crate) fn handle_event(app: &AppHandle, event: MenuEvent) {
                 if let Err(e) = shown.await {
                     // Fully qualified: `warn` is reachable only from this
                     // non-macOS arm, so an import would be unused on macOS.
-                    tracing::warn!(error = %e, "menu: about dialog failed");
+                    tracing::warn!(error = %util::error_chain::error_chain(&e), "menu: about dialog failed");
                 }
             });
         }

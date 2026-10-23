@@ -1,5 +1,7 @@
 //! Small cross-platform utilities shared across the workspace.
 //!
+//! - [`error_chain`] — an error rendered with every cause in its `source()`
+//!   chain, for log fields.
 //! - [`ownership`] — generic `chown(2)` primitive (macOS; a no-op elsewhere).
 //! - [`parse_error`] — content-safe classification of a `serde_json` parse
 //!   failure, so an error that quotes its input never reaches a log.
@@ -23,6 +25,7 @@
 //! crates without license friction. Nothing here is Hole- or
 //! shadowsocks-specific.
 
+pub mod error_chain;
 pub mod ownership;
 pub mod parse_error;
 pub mod port_alloc;

@@ -33,7 +33,7 @@ fn running_bundled() -> bool {
         // Benign either way (the override is idempotent); default to unbundled, but
         // trace it so a real bundled install that ever hits this is diagnosable.
         Err(e) => {
-            tracing::debug!(error = %e, "current_exe() failed; treating process as unbundled for the Dock icon");
+            tracing::debug!(error = %util::error_chain::error_chain(&e), "current_exe() failed; treating process as unbundled for the Dock icon");
             false
         }
     }

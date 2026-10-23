@@ -97,7 +97,7 @@ fn turn_lockdown_off_reports_an_unsaved_intent_while_a_session_runs() {
             .turn_lockdown_off()
             .expect_err("an unpersistable intent must still be reported");
         assert!(
-            matches!(err, ProxyError::LockdownIntentNotPersisted),
+            matches!(err, ProxyError::LockdownIntentNotPersisted { .. }),
             "must be the SAME distinguishable error a failed release uses, not an opaque \
              ProxyError::Runtime the IPC layer's generic 500 path can't tell apart from it: {err:?}"
         );
@@ -168,7 +168,7 @@ fn turn_lockdown_off_failure_leaves_the_intent_on() {
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
 
         let err = pm.turn_lockdown_off().expect_err("a failed release must be reported");
-        assert!(!matches!(err, ProxyError::LockdownIntentNotPersisted));
+        assert!(!matches!(err, ProxyError::LockdownIntentNotPersisted { .. }));
         assert!(
             lockdown_state::load_enabled(dir.path()),
             "the intent must stay ON: flipping it off over a still-held cover would hide the tray escape"
@@ -191,8 +191,13 @@ fn turn_lockdown_off_reports_an_unsaved_intent_distinctly_from_a_failed_release(
             .turn_lockdown_off()
             .expect_err("an unpersistable intent must still be reported");
         assert!(
-            matches!(err, ProxyError::LockdownIntentNotPersisted),
+            matches!(err, ProxyError::LockdownIntentNotPersisted { .. }),
             "must be distinguishable from a failed release: {err:?}"
+        );
+        let chain = util::error_chain::error_chain(&err).to_string();
+        assert!(
+            chain.contains("no state_dir"),
+            "the persist failure behind the fixed sentence must stay in the chain: {chain}"
         );
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
