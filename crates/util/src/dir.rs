@@ -463,6 +463,34 @@ pub fn write_state_file(state_dir: &Path, name: &OsStr, bytes: &[u8], owner: Opt
     dir.write_atomic(name, bytes, owner, |_| Ok(()))
 }
 
+/// Removes the state file `name` in `state_dir`, the counterpart of [`write_state_file`] for a privileged step that
+/// runs in a folder the interactive user may own: the directory is opened without following a symlink and the name
+/// is unlinked through the handle, so a link planted in the path is refused ([`Refusal`]) and a link at the name is
+/// removed as itself. Missing is `Ok`, whether the file or the directory. Nothing is created.
+pub fn remove_state_file(state_dir: &Path, name: &OsStr) -> io::Result<()> {
+    let dir = match Dir::open(state_dir, false, None) {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    match dir.unlink(name) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+/// Makes `dir` (and the folders above it) if missing and frees `name` in it, for a privileged step about to create
+/// `name` itself by path, as a socket bind does, in a folder the interactive user may own. Both go through a handle
+/// opened without following a symlink: a link planted on the way is refused ([`Refusal`]), and what is at `name`
+/// (a stale file, or a link) is unlinked as itself. A name that is not there is `Ok`; one that cannot be unlinked is
+/// an error, as it is for [`remove_state_file`].
+pub fn make_dir_and_free_name(dir: &Path, name: &OsStr) -> io::Result<()> {
+    match Dir::open(dir, true, None)?.unlink(name) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 /// The whole file `name` in the state directory `state_dir`, the counterpart of [`write_state_file`] for a reader
 /// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`ReadDir::open`]: a
 /// link at the name, or a FIFO a user planted there, is an error, never the file it leads to and never a wait. So is a

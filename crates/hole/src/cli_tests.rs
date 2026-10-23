@@ -1177,13 +1177,22 @@ fn the_state_dir_keeps_the_link_the_walk_must_judge(#[fixture(temp_dir)] temp_di
     let link = temp_dir.join("state");
     util::dir::testing::plant_link(&root, &link);
 
-    assert_eq!(super::absolute_state_dir(link.clone()), link);
+    assert_eq!(super::absolute_state_dir(link.clone()).unwrap(), link);
 }
 
 #[skuld::test]
 fn a_relative_state_dir_is_joined_to_the_cwd_even_when_it_does_not_exist() {
     let relative = std::path::PathBuf::from("no-such-folder").join("state");
-    let absolute = super::absolute_state_dir(relative.clone());
+    let absolute = super::absolute_state_dir(relative.clone()).unwrap();
 
     assert_eq!(absolute, std::env::current_dir().unwrap().join(relative));
+}
+
+/// An empty path has no absolute form. Falling back to it would hand the privileged walk a path relative to the
+/// service's working directory, which is the thing the function exists to prevent.
+#[skuld::test]
+fn a_state_dir_with_no_absolute_form_is_an_error() {
+    let err = super::absolute_state_dir(std::path::PathBuf::new()).unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }

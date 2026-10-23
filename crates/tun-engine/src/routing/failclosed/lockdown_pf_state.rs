@@ -6,7 +6,7 @@
 //! Sweep to restore the host without `-Fa`, matching the engaged-without-flush
 //! contract).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -50,10 +50,6 @@ pub struct LockdownPfState {
 
 fn default_true() -> bool {
     true
-}
-
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join(STATE_FILE_NAME)
 }
 
 pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
@@ -121,11 +117,7 @@ pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
 }
 
 pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(state_file(state_dir)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
 }
 
 #[cfg(test)]
