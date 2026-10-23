@@ -1,5 +1,5 @@
 use super::*;
-use crate::dir::testing::{plant_link as plant, user_dir, SystemScratch};
+use crate::dir::testing::{as_unprivileged, plant_link as plant, user_dir, SystemScratch};
 use crate::dir::Dir;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -409,8 +409,8 @@ fn a_symlink_swapped_in_after_the_rename_is_not_followed() {
 
 // Search-only directories on the path ---------------------------------------------------------------------------------
 //
-// The path calls `Dir` replaces need only search permission on the directories above the file. As root
-// (which bypasses the check) these pass whatever the open flags are: the check only has teeth for anyone else.
+// The path calls `Dir` replaces need only search permission on the directories above the file. Root bypasses the
+// check, so the walk runs in `as_unprivileged`: a child that has dropped to `nobody` when the runner is root.
 
 /// Restores a directory's mode so the temp dir can be removed even when an assertion fails.
 struct Restore(PathBuf, u32);
@@ -419,6 +419,25 @@ impl Drop for Restore {
     fn drop(&mut self) {
         let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
     }
+}
+
+#[skuld::test]
+fn the_body_of_as_unprivileged_does_not_run_as_root() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    as_unprivileged(tmp.path(), || assert_ne!(unsafe { libc::geteuid() }, ROOT));
+}
+
+#[skuld::test]
+fn a_panic_in_the_body_of_as_unprivileged_is_a_panic_in_the_caller() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        as_unprivileged(tmp.path(), || panic!("the body failed"))
+    }));
+
+    assert!(result.is_err());
 }
 
 #[skuld::test]
@@ -431,8 +450,10 @@ fn a_directory_the_caller_can_search_but_not_read_is_walked_through() {
         let _restore = Restore(guarded.clone(), 0o755);
         std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(mode)).unwrap();
 
-        let dir = Dir::open(&leaf, false, None).unwrap_or_else(|err| panic!("mode {mode:o}: {err:?}"));
-        dir.write_atomic("state.json".as_ref(), b"x", None, |_| Ok(())).unwrap();
+        as_unprivileged(tmp.path(), || {
+            let dir = Dir::open(&leaf, false, None).unwrap_or_else(|err| panic!("mode {mode:o}: {err:?}"));
+            dir.write_atomic("state.json".as_ref(), b"x", None, |_| Ok(())).unwrap();
+        });
 
         assert_eq!(std::fs::read(leaf.join("state.json")).unwrap(), b"x", "mode {mode:o}");
     }
@@ -446,7 +467,9 @@ fn a_missing_directory_is_created_below_one_the_caller_can_search_but_not_read()
     let _restore = Restore(guarded.clone(), 0o755);
     std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o311)).unwrap();
 
-    Dir::open(&guarded.join("new").join("deeper"), true, None).unwrap();
+    as_unprivileged(tmp.path(), || {
+        Dir::open(&guarded.join("new").join("deeper"), true, None).unwrap();
+    });
 
     std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(guarded.join("new").join("deeper").is_dir());
@@ -462,8 +485,10 @@ fn a_symlink_below_a_directory_the_caller_can_only_search_is_followed_by_the_sam
     let _restore = Restore(guarded.clone(), 0o755);
     std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o311)).unwrap();
 
-    assert!(Dir::open(&guarded.join("link"), false, None).is_ok());
-    assert_eq!(refusal(Dir::open(&guarded.join("etc"), false, None)), Refusal::Symlink);
+    as_unprivileged(tmp.path(), || {
+        assert!(Dir::open(&guarded.join("link"), false, None).is_ok());
+        assert_eq!(refusal(Dir::open(&guarded.join("etc"), false, None)), Refusal::Symlink);
+    });
 }
 
 // rename_noreplace ----------------------------------------------------------------------------------------------------

@@ -140,6 +140,48 @@ fn both_entries_hand_the_owner_to_the_fchown() {
 
 // acquire (blocking) ==================================================================================================
 
+/// What names the calling thread to [`wait_until_blocked`]: its kernel thread id on Linux, nothing elsewhere.
+#[cfg(target_os = "linux")]
+fn this_thread() -> libc::c_long {
+    // SAFETY: gettid takes no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) }
+}
+#[cfg(not(target_os = "linux"))]
+fn this_thread() -> i64 {
+    0
+}
+
+/// Returns once the kernel shows `thread` (of this process) blocked in `flock`, which is the proof that its `acquire`
+/// is waiting on a lock somebody holds. The wait re-checks that, with no bound: if `acquire` returned instead,
+/// `waiter` is finished and the test fails. Linux only (`/proc/<pid>/task/<tid>/syscall`); other platforms have no such
+/// view, so they get only the mutual-exclusion check in the test, which sees an early return only when it happens
+/// before the holder lets go.
+#[cfg(target_os = "linux")]
+fn wait_until_blocked(thread: libc::c_long, waiter: &std::thread::JoinHandle<()>) {
+    let file = format!("/proc/self/task/{thread}/syscall");
+    loop {
+        assert!(!waiter.is_finished(), "acquire returned while the holder held the lock");
+        let state = match std::fs::read_to_string(&file) {
+            Ok(state) => state,
+            // The thread ended between the check and the read.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                panic!("acquire returned while the holder held the lock")
+            }
+            Err(err) => panic!("{file}: {err}"),
+        };
+        let syscall = state
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<libc::c_long>().ok());
+        if syscall == Some(libc::SYS_flock) {
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn wait_until_blocked(_thread: i64, _waiter: &std::thread::JoinHandle<()>) {}
+
 #[skuld::test]
 fn acquire_blocks_until_the_holder_releases() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -147,39 +189,43 @@ fn acquire_blocks_until_the_holder_releases() {
 
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("target.json.lock");
-    let released = Arc::new(AtomicBool::new(false));
+    let holding = Arc::new(AtomicBool::new(true));
 
     // Channels, not sleeps, order the threads.
     let (holding_tx, holding_rx) = mpsc::channel::<()>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let holder_path = path.clone();
-    let holder_released = Arc::clone(&released);
+    let holder_holding = Arc::clone(&holding);
     let holder = std::thread::spawn(move || {
         let guard = Exclusive::try_acquire(&holder_path, None).unwrap().unwrap();
         holding_tx.send(()).unwrap();
         release_rx.recv().unwrap();
-        holder_released.store(true, Ordering::SeqCst);
+        holder_holding.store(false, Ordering::SeqCst);
         drop(guard);
     });
     holding_rx.recv().unwrap();
 
+    let (entering_tx, entering_rx) = mpsc::channel();
     let (acquired_tx, acquired_rx) = mpsc::channel::<bool>();
     let waiter_path = path.clone();
-    let waiter_released = Arc::clone(&released);
+    let waiter_holding = Arc::clone(&holding);
     let waiter = std::thread::spawn(move || {
+        entering_tx.send(this_thread()).unwrap();
         let _guard = Exclusive::acquire(&waiter_path, None).unwrap();
-        acquired_tx.send(waiter_released.load(Ordering::SeqCst)).unwrap();
+        acquired_tx.send(waiter_holding.load(Ordering::SeqCst)).unwrap();
     });
+    let waiting = entering_rx.recv().unwrap();
 
     assert!(
         Exclusive::try_acquire(&path, None).unwrap().is_none(),
         "the lock must be held while the waiter waits"
     );
+    wait_until_blocked(waiting, &waiter);
     release_tx.send(()).unwrap();
 
     assert!(
-        acquired_rx.recv().unwrap(),
-        "the waiter acquired before the holder released"
+        !acquired_rx.recv().unwrap(),
+        "acquire returned while the holder still held the lock"
     );
     holder.join().unwrap();
     waiter.join().unwrap();

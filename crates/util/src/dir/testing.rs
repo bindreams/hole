@@ -127,6 +127,15 @@ pub fn planted_name_is_not_read(scratch: &Path, kind: PlantedName, reader: &Read
     }
 }
 
+/// Runs `f` as a caller that is not root. Root passes every permission check, so a test of what a walk needs from an
+/// unprivileged caller (search without read) proves nothing as root. For root: everything below `root` is given to
+/// `nobody`, a forked child drops to `nobody` and runs `f`, and a panic in `f` is a panic here. `f` is a test body, so
+/// it allocates in the child; a test process whose other threads sit idle can fork safely.
+#[cfg(unix)]
+pub fn as_unprivileged(root: &Path, f: impl FnOnce()) {
+    platform::as_unprivileged(root, f);
+}
+
 /// A name nothing in a folder the system owns has, removed again when dropped: the place to look for what a
 /// walk wrongly made in that folder.
 pub struct SystemScratch {
@@ -186,6 +195,59 @@ mod platform {
         // SAFETY: geteuid takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
             std::os::unix::fs::lchown(path, Some(NOBODY), Some(NOBODY)).unwrap();
+        }
+    }
+
+    /// Gives `path` and everything below it to `nobody`, links included and not followed.
+    fn give_tree(path: &Path) {
+        std::os::unix::fs::lchown(path, Some(NOBODY), Some(NOBODY)).unwrap();
+        if !std::fs::symlink_metadata(path).unwrap().is_dir() {
+            return;
+        }
+        for entry in std::fs::read_dir(path).unwrap() {
+            give_tree(&entry.unwrap().path());
+        }
+    }
+
+    pub(super) fn as_unprivileged(root: &Path, f: impl FnOnce()) {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            return f();
+        }
+        give_tree(root);
+        // SAFETY: the child runs only what is below and ends with `_exit`.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork: {}", std::io::Error::last_os_error()),
+            0 => {
+                // SAFETY: plain syscalls with valid arguments; the group list is emptied before the ids change.
+                let dropped = unsafe {
+                    libc::setgroups(0, std::ptr::null()) == 0
+                        && libc::setgid(NOBODY) == 0
+                        && libc::setuid(NOBODY) == 0
+                        && libc::geteuid() == NOBODY
+                };
+                let code = match dropped {
+                    false => 2,
+                    true => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                        Ok(()) => 0,
+                        Err(_) => 1,
+                    },
+                };
+                // SAFETY: ends the child without running the parent's destructors or its test harness.
+                unsafe { libc::_exit(code) }
+            }
+            child => {
+                let mut status = 0;
+                // SAFETY: `child` is this process's own child and `status` is a valid out-pointer.
+                while unsafe { libc::waitpid(child, &mut status, 0) } == -1 {
+                    let err = std::io::Error::last_os_error();
+                    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "waitpid: {err}");
+                }
+                assert!(
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                    "the unprivileged child failed (status {status:#x}; 1 is a panic in the test body, 2 is a failure to drop privileges): its output is above"
+                );
+            }
         }
     }
 
