@@ -1,3 +1,4 @@
+pub mod boot;
 pub mod cutover;
 pub mod diagnostics;
 pub mod dispatcher;

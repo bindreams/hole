@@ -5,8 +5,9 @@
 // token)` compared exactly, so a recycled pid is never mistaken for the
 // recorded process.
 //
-// One function, three callers: bridge startup (after the IPC socket binds,
-// same ordering as `routing::recover_routes`), plugin-chain stop
+// One function, three callers: bridge startup (`boot::recover_then_reconcile`:
+// after the IPC socket binds, after `routing::recover_routes`, and before the
+// boot reconcile can record a plugin of its own), plugin-chain stop
 // (`PluginChain::kill_tracked`), and the test harness's teardown.
 //
 // The invariant this exists to hold: the state file may be deleted only by a

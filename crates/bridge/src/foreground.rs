@@ -222,18 +222,11 @@ async fn run_inner(
         });
     }
 
-    crate::route_recovery::recover_and_record(state_dir, &proxy_shutdown).await;
-    // Reconcile the persisted target now, before any GUI or client has had a
-    // chance to connect (narrows, does not close, #617's boot->first-connect
-    // gap: a failed connect engages nothing) — must run after recovery above, see
-    // crate::reconciler::reconcile_once's own doc.
-    crate::reconciler::reconcile_once(state_dir, owner, &proxy_shutdown, &shutdown).await;
-    let state_dir_plugins = state_dir.to_path_buf();
-    if let Err(e) =
-        tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
-    {
-        tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
-    }
+    // Recover what a previous bridge left, then reconcile the persisted target
+    // now, before any GUI or client has had a chance to connect (narrows, does
+    // not close, #617's boot->first-connect gap: a failed connect engages
+    // nothing). One call, so the order cannot differ between entry points.
+    crate::boot::recover_then_reconcile(state_dir, owner, &proxy_shutdown, &shutdown).await;
 
     // Capture WFP + NDIS state after recovery has had a chance to clean
     // up. Each probe emits a one-line INFO (always) + WARN on anomaly +
