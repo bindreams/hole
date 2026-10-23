@@ -1,10 +1,14 @@
-//! Reads the code of a Rust source well enough to tell which functions it calls however it spells them: the full path,
-//! a name imported by `use` (in a group, a glob, or under another name), a turbofish, a method.
+//! Reads the code of a Rust source well enough to tell which functions it names however it spells them: the full path,
+//! a name imported by `use` (in a group, a glob, or under another name), a type reached through a `type` alias, a
+//! turbofish, a method; called, or used as a value (`.map(fs::read)`, `let f = fs::read;`).
 //!
 //! The guards in the parent module are scans of source text, and a scan of substrings sees one spelling. This one
-//! sees what the `use` declarations of the file say a name stands for, comments and string literals aside.
+//! sees what the `use` and `type` declarations of the file say a name stands for, comments and string literals aside.
+//!
+//! What it does not see: a name bound by something other than those two (a macro that expands to a path, a `let`
+//! that copies a function under a new name and is then called by that name).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 // Code without comments and strings -----------------------------------------------------------------------------------
 
@@ -164,32 +168,84 @@ fn tokens(chars: &[char]) -> Vec<Token> {
     found
 }
 
-/// What the `use` declarations of a file make a name stand for.
+/// What the `use` and `type` declarations of a file make a name stand for.
 #[derive(Debug, Default)]
 struct Imports {
-    /// A name the file imported, and the path it stands for.
+    /// A name the file imported or aliased, and the path it stands for.
     names: HashMap<String, Vec<String>>,
     /// The prefixes of `use prefix::*`.
     globs: Vec<Vec<String>>,
 }
 
+/// The text of each `use` declaration of `code`, as the offsets of the keyword and of the `;` that ends it.
+fn use_declarations(code: &[char]) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < code.len() {
+        let at_word = (i == 0 || !is_ident(code[i - 1])) && code[i..].starts_with(&['u', 's', 'e']);
+        let word_ends = code.get(i + 3).is_none_or(|c| !is_ident(*c));
+        if !(at_word && word_ends) {
+            i += 1;
+            continue;
+        }
+        let end = code[i..].iter().position(|c| *c == ';').map_or(code.len(), |n| i + n);
+        found.push((i, end));
+        i = end;
+    }
+    found
+}
+
+/// The text of each `type` declaration of `code`, after the keyword, up to its `;`.
+fn type_declarations(code: &[char]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < code.len() {
+        let at_word = (i == 0 || !is_ident(code[i - 1])) && code[i..].starts_with(&['t', 'y', 'p', 'e']);
+        let word_ends = code.get(i + 4).is_none_or(|c| !is_ident(*c));
+        if !(at_word && word_ends) {
+            i += 1;
+            continue;
+        }
+        let end = code[i..].iter().position(|c| *c == ';').map_or(code.len(), |n| i + n);
+        found.push(code[i + 4..end].iter().collect());
+        i = end;
+    }
+    found
+}
+
 impl Imports {
     fn of(code: &[char]) -> Imports {
         let mut imports = Imports::default();
-        let mut i = 0;
-        while i < code.len() {
-            let at_word = (i == 0 || !is_ident(code[i - 1])) && code[i..].starts_with(&['u', 's', 'e']);
-            let word_ends = code.get(i + 3).is_none_or(|c| !is_ident(*c));
-            if !(at_word && word_ends) {
-                i += 1;
-                continue;
-            }
-            let end = code[i..].iter().position(|c| *c == ';').map_or(code.len(), |n| i + n);
-            let declaration = tokens(&code[i + 3..end]);
+        for (start, end) in use_declarations(code) {
+            let declaration = tokens(&code[start + 3..end]);
             imports.add_tree(&declaration, &mut 0, Vec::new());
-            i = end;
+        }
+        for declaration in type_declarations(code) {
+            imports.add_alias(&declaration);
         }
         imports
+    }
+
+    /// `Alias = path::Type<..>`: the alias stands for the path, as an imported name does. A target that is not a plain
+    /// path (a reference, a tuple, a trait object) stands for nothing the scan names, and an associated type with no
+    /// target is not an alias.
+    fn add_alias(&mut self, declaration: &str) {
+        let Some((head, target)) = declaration.split_once('=') else {
+            return;
+        };
+        let alias: String = head.trim().chars().take_while(|c| is_ident(*c)).collect();
+        let path: Vec<String> = target
+            .split('<')
+            .next()
+            .unwrap_or_default()
+            .split("::")
+            .map(|segment| segment.trim().to_owned())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let plain = path.iter().all(|segment| segment.chars().all(is_ident));
+        if !alias.is_empty() && !path.is_empty() && plain {
+            self.names.insert(alias, path);
+        }
     }
 
     /// One tree of a `use` declaration, below `prefix`: `a::b`, `a::{b, c as d}`, `a::*`.
@@ -242,12 +298,20 @@ impl Imports {
         }
     }
 
-    /// Every path `written` can stand for: as written, with its first segment replaced by what the file imported under
-    /// that name, and below each glob import.
+    /// Every path `written` can stand for: as written, with its first segment replaced by what the file imported or
+    /// aliased under that name (and that path's first segment again, for an alias of an alias), and below each glob
+    /// import.
     fn resolve(&self, written: &[String]) -> Vec<Vec<String>> {
         let mut found = vec![written.to_vec()];
-        if let Some(path) = written.first().and_then(|first| self.names.get(first)) {
-            found.push(path.iter().chain(&written[1..]).cloned().collect());
+        // Each name is replaced at most once, so a cycle of aliases ends.
+        let mut replaced = HashSet::new();
+        let mut current = written.to_vec();
+        while let Some(first) = current.first().filter(|first| replaced.insert((*first).clone())) {
+            let Some(path) = self.names.get(first) else {
+                break;
+            };
+            current = path.iter().chain(&current[1..]).cloned().collect();
+            found.push(current.clone());
         }
         for glob in &self.globs {
             found.push(glob.iter().chain(written).cloned().collect());
@@ -256,21 +320,21 @@ impl Imports {
     }
 }
 
-// Calls ---------------------------------------------------------------------------------------------------------------
+// Uses ----------------------------------------------------------------------------------------------------------------
 
-/// One call in a source.
+/// One use of a function in a source: a call, or a path named as a value.
 #[derive(Debug)]
-pub(super) struct Call {
-    /// The line of the call, from 1.
+pub(super) struct Use {
+    /// The line of the use, from 1.
     pub line: usize,
     /// Whether it is `.name(..)` on a value.
     method: bool,
-    /// Every path the callee can stand for (see [`Imports::resolve`]).
+    /// Every path the name can stand for (see [`Imports::resolve`]).
     paths: Vec<Vec<String>>,
 }
 
-impl Call {
-    /// Whether the callee is `pattern`: a path whose last segments are the pattern's (`fs::read` is `std::fs::read`
+impl Use {
+    /// Whether the function is `pattern`: a path whose last segments are the pattern's (`fs::read` is `std::fs::read`
     /// and `tokio::fs::read`), or `.name` for a method. A last segment ending in `*` is a prefix.
     pub fn is(&self, pattern: &str) -> bool {
         let (method, pattern) = match pattern.strip_prefix('.') {
@@ -296,7 +360,7 @@ impl Call {
         })
     }
 
-    /// The first path the callee was written as, for a message.
+    /// The first path the function was written as, for a message.
     pub fn written(&self) -> String {
         let shown = if self.method { ".".to_owned() } else { String::new() };
         shown + &self.paths[0].join("::")
@@ -340,11 +404,30 @@ fn skip_space(code: &[char], mut at: usize) -> usize {
     at
 }
 
-/// Every call in `text`, resolved through the file's own imports. A function the file defines (`fn read`) is not a
-/// call, nor is a macro.
-pub(super) fn calls(text: &str) -> Vec<Call> {
+/// The words that, before a name, define it.
+const DEFINES: &[&str] = &[
+    "fn", "struct", "enum", "union", "trait", "mod", "type", "const", "static",
+];
+
+/// Whether the path that ends at `end` is followed by what makes it not a use: a macro's `!`, or the single `:` of a
+/// field in a struct literal or a pattern and of a parameter.
+fn is_not_a_use(code: &[char], end: usize) -> bool {
+    let after = skip_space(code, end);
+    match (code.get(after), code.get(after + 1)) {
+        (Some('!'), next) => next != Some(&'='),
+        (Some(':'), next) => next != Some(&':'),
+        _ => false,
+    }
+}
+
+/// Every use of a function in `text`, resolved through the file's own imports and aliases: a call, or a path named as a
+/// value (`.map(fs::read)`, `let f = fs::read;`, `(fs::read)(p)`). A method counts when it is called: `.name` without a
+/// call is a field. Not a use: a name inside a `use` declaration, a definition (`fn read`), a macro, a field or a
+/// parameter with the name.
+pub(super) fn uses(text: &str) -> Vec<Use> {
     let code = code(text, false);
     let imports = Imports::of(&code);
+    let declarations = use_declarations(&code);
     let mut found = Vec::new();
     let mut line = 1;
     let mut i = 0;
@@ -389,10 +472,12 @@ pub(super) fn calls(text: &str) -> Vec<Call> {
             }
             end = next;
         }
-        let paren = skip_space(&code, end);
-        let is_call = code.get(paren) == Some(&'(') && word != "fn";
-        if is_call {
-            found.push(Call {
+        let called = code.get(skip_space(&code, end)) == Some(&'(');
+        let imported = declarations.iter().any(|(start, stop)| (*start..*stop).contains(&i));
+        let is_use =
+            !imported && !DEFINES.contains(&word.as_str()) && if method { called } else { !is_not_a_use(&code, end) };
+        if is_use {
+            found.push(Use {
                 line,
                 method,
                 paths: if method {
@@ -441,8 +526,14 @@ const FORMATTING_MACROS: &[&str] = &[
     "anyhow",
 ];
 
-/// The calls that give a path as text.
-const PATH_AS_TEXT: &[&str] = &[".display", ".to_string_lossy"];
+/// The calls that give a path as text, as methods and as functions.
+const PATH_AS_TEXT: &[&str] = &[
+    ".display",
+    ".to_string_lossy",
+    "Path::display",
+    "Path::to_string_lossy",
+    "OsStr::to_string_lossy",
+];
 
 /// What, in a `let` binding, makes the binding a path.
 const MAKES_A_PATH: &[&str] = &["Path::new(", "PathBuf", ".join(", ".to_path_buf(", ".parent("];
@@ -525,9 +616,9 @@ pub(super) fn logged_paths(text: &str) -> Vec<String> {
     let mut lines = BTreeSet::new();
     let line_of = |at: usize| blanked[..at].iter().filter(|c| **c == '\n').count() + 1;
 
-    for call in calls(text) {
-        if PATH_AS_TEXT.iter().any(|name| call.is(name)) {
-            lines.insert(call.line);
+    for used in uses(text) {
+        if PATH_AS_TEXT.iter().any(|name| used.is(name)) {
+            lines.insert(used.line);
         }
     }
     let mut i = 0;
