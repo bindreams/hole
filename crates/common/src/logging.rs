@@ -694,10 +694,11 @@ pub fn init_dual(
     // The log directory sits in the user's profile when the bridge runs elevated on their behalf, so it is
     // opened once without following a symlink and every step below is by a name inside that handle. The
     // elevated bridge creates it as root; hand it to the real user so they can read `bridge.log` without
-    // `sudo` (#572). `owner` is `None` for the unprivileged GUI.
+    // `sudo`. `owner` is `None` for the unprivileged GUI.
     let dir = match Dir::open(log_dir, true, owner) {
         Ok(dir) => {
-            let _ = dir.secure(owner, None);
+            dir.secure(owner, None)
+                .expect("securing a directory with no mode has no step that can fail");
             cleanup_legacy_daily_logs(log_dir, &dir, log_filename);
             Some(dir)
         }

@@ -948,3 +948,61 @@ async fn sweep_returns_on_a_fifo_at_a_marker_name_and_removes_it() {
     assert!(std::fs::symlink_metadata(&fifo).is_err(), "the FIFO is removed");
     assert!(!real.exists(), "the real marker next to it is still swept");
 }
+
+/// The marker `name` in a folder the system owns, with a second name `name.second`: a file the folder's owner cannot
+/// vouch for, whoever runs the test (a user's file in the system's folder, or the system's with two names). Both
+/// names are removed when this drops.
+struct Unvouched {
+    root: std::path::PathBuf,
+    names: [String; 2],
+}
+
+impl Unvouched {
+    fn new(scratch: &util::dir::testing::SystemScratch) -> Self {
+        let first = format!("crash-bridge-{}.marker", scratch.name().to_string_lossy());
+        let second = format!("{first}.second");
+        let root = scratch.root().to_path_buf();
+        std::fs::write(
+            root.join(&first),
+            "tombstone-marker v1
+kind=victim
+pid=31337
+tid=0
+code=0x1
+fault_addr=0x0
+time=1
+",
+        )
+        .unwrap();
+        std::fs::hard_link(root.join(&first), root.join(&second)).unwrap();
+        Unvouched {
+            root,
+            names: [first, second],
+        }
+    }
+}
+
+impl Drop for Unvouched {
+    fn drop(&mut self) {
+        for name in &self.names {
+            let _ = std::fs::remove_file(self.root.join(name));
+        }
+    }
+}
+
+#[skuld::test]
+async fn sweep_does_not_read_a_marker_the_folders_owner_cannot_vouch_for() {
+    let scratch = util::dir::testing::SystemScratch::new();
+    let planted = Unvouched::new(&scratch);
+    let dir = util::dir::Dir::open(scratch.root(), false, None).unwrap();
+
+    let (subscriber, writer) = make_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+
+    // Only the one name: the scratch folder is shared, so the rest of it is not ours to sweep.
+    crate::crash::sweep_dir(&dir, [std::ffi::OsString::from(&planted.names[0])]);
+
+    let snap = writer.snapshot();
+    assert!(snap.contains("marker unreadable"), "{snap}");
+    assert!(!snap.contains("31337"), "the file was read: {snap}");
+}

@@ -35,10 +35,13 @@ pub(super) enum Verdict {
 /// process created it and died before its `fchown`, or a file it owns was linked
 /// at the name, and the two look alike. One owned by anyone else is refused.
 /// Without an `owner`, no ownership is expected and none is checked.
+///
+/// The file is regular: [`open_locked_with`] refuses anything else before it takes the lock.
 pub(super) fn vet(facts: Facts, euid: u32, owner: Option<(u32, u32)>) -> Result<Verdict, Refusal> {
-    if !facts.regular {
-        return Err(Refusal::NotRegular);
-    }
+    debug_assert!(
+        facts.regular,
+        "a file that is not regular is refused before it is locked"
+    );
     match owner {
         Some((uid, _)) if facts.uid != uid && facts.uid == euid => return Ok(Verdict::Replace),
         Some((uid, _)) if facts.uid != uid => return Err(Refusal::ForeignOwner { uid: facts.uid }),

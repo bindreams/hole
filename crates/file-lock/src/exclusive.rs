@@ -3,16 +3,9 @@
 //! is testable by opening the same path twice.
 //!
 //! `Exclusive` is the shared core: a bare acquired-lock token with no
-//! knowledge of what path means or who wraps it. Domain-specific callers (e.g.
-//! `TargetExclusive` in the bridge) wrap it with their own keyed path and
-//! `Send`-ness. `Exclusive` stays `Send`; a newtype opts out via
+//! knowledge of what path means or who wraps it. Callers wrap it with their own
+//! keyed path and `Send`-ness. `Exclusive` stays `Send`; a newtype opts out via
 //! `PhantomData<*const ()>` when its contract needs it.
-//!
-//! **Invariant: no token without holding the lock.** Constructing an
-//! `Exclusive` *is* acquiring it — there is no separate "acquired" state to
-//! forget to check, and no `Held` arm on the blocking path: a blocking
-//! acquisition cannot observe contention, only succeed or fail with an I/O
-//! error.
 //!
 //! # Open protocol
 //!
@@ -57,9 +50,6 @@
 //! install path), so it has nothing to redirect. It opens without
 //! `FILE_SHARE_DELETE`, so while the lock is held the name can be neither
 //! removed nor renamed and the vetted file stays the one at the name.
-//!
-//! **Hooks.** `on_acquire_entry` and `on_token_drop` are deliberate no-op seams
-//! for a caller-side depth guard; keep the calls.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -79,21 +69,19 @@ mod windows;
 #[cfg(windows)]
 use windows as platform;
 
-// Extensibility hooks =================================================================================================
+// Hooks ===============================================================================================================
 
-/// Called at the start of every acquisition attempt ([`Exclusive::try_acquire`]
-/// and [`Exclusive::acquire`]), before anything else.
+/// Empty seam at the start of every acquisition attempt, for a caller-side depth guard.
 #[inline]
 fn on_acquire_entry() {}
 
-/// Called when a held [`Exclusive`] token's lock is released (on `Drop`).
+/// Empty seam when a held token's lock is released, for the same guard.
 #[inline]
 fn on_token_drop() {}
 
 // Refusal =============================================================================================================
 
-/// Why an existing lock file was refused. The one place that decides how each
-/// reason reads.
+/// Why an existing lock file was refused.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     /// Not a regular file: a FIFO, device, socket or directory.

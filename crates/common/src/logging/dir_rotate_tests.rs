@@ -2,6 +2,7 @@ use super::DirRotate;
 use skuld::temp_dir;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use util::dir::testing::plant_link;
 use util::dir::Dir;
 
@@ -151,4 +152,104 @@ fn a_file_already_over_the_limit_is_rotated_before_the_next_byte(#[fixture(temp_
 
     assert_eq!(read(dir, "bridge.log.1"), old);
     assert_eq!(read(dir, "bridge.log"), b"next");
+}
+
+// A name the log cannot use ===========================================================================================
+
+/// A directory at `name`, so that opening it as the log fails and renaming the log over it fails, until it is removed.
+fn block(dir: &Path, name: &str) {
+    std::fs::create_dir(dir.join(name)).unwrap();
+    std::fs::write(dir.join(name).join("keep"), b"").unwrap();
+}
+
+fn unblock(dir: &Path, name: &str) {
+    std::fs::remove_dir_all(dir.join(name)).unwrap();
+}
+
+/// A writer whose notices are collected.
+fn noticing_writer(dir: &Path, limit: usize) -> (DirRotate, Arc<Mutex<Vec<String>>>) {
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&notices);
+    let w = DirRotate::with_notice(
+        Dir::open(dir, false, None).unwrap(),
+        "bridge.log".as_ref(),
+        limit,
+        None,
+        move |err| sink.lock().unwrap().push(err.to_string()),
+    );
+    (w, notices)
+}
+
+#[skuld::test]
+fn a_failed_rotation_keeps_the_line_and_retries_at_a_later_write(#[fixture(temp_dir)] dir: &Path) {
+    let bytes = stream(130);
+    let mut w = writer(dir, 100);
+    w.write_all(&bytes[..60]).unwrap();
+    block(dir, "bridge.log.1");
+
+    // Crosses the limit while the rotation cannot happen: nothing is lost and nothing is reported as failed.
+    w.write_all(&bytes[60..120]).unwrap();
+    w.flush().unwrap();
+    assert_eq!(read(dir, "bridge.log"), bytes[..120]);
+
+    unblock(dir, "bridge.log.1");
+    w.write_all(&bytes[120..]).unwrap();
+    drop(w);
+
+    assert_eq!(read(dir, "bridge.log.1"), bytes[..120]);
+    assert_eq!(read(dir, "bridge.log"), bytes[120..]);
+}
+
+#[skuld::test]
+fn a_write_that_took_bytes_never_fails_when_the_rotation_does(#[fixture(temp_dir)] dir: &Path) {
+    let bytes = stream(120);
+    let mut w = writer(dir, 100);
+    w.write_all(&bytes[..60]).unwrap();
+    block(dir, "bridge.log.1");
+
+    let mut rest = &bytes[60..];
+    while !rest.is_empty() {
+        let n = w.write(rest).expect("an Err after bytes went out is lost to write_all");
+        assert!(n > 0, "a write of a non-empty buffer that takes nothing");
+        rest = &rest[n..];
+    }
+    drop(w);
+
+    assert_eq!(read(dir, "bridge.log"), bytes);
+}
+
+#[skuld::test]
+fn a_file_that_could_not_be_opened_is_opened_again_at_the_next_write(#[fixture(temp_dir)] dir: &Path) {
+    block(dir, "bridge.log");
+    let mut w = writer(dir, 100);
+    // Far more than the limit, none of it written: none of it may count toward a rotation.
+    w.write_all(&stream(250)).unwrap();
+    unblock(dir, "bridge.log");
+
+    w.write_all(b"next").unwrap();
+    drop(w);
+
+    assert_eq!(names(dir), ["bridge.log"]);
+    assert_eq!(read(dir, "bridge.log"), b"next");
+}
+
+#[skuld::test]
+fn a_file_that_cannot_be_opened_is_said_once_and_without_a_path(#[fixture(temp_dir)] dir: &Path) {
+    block(dir, "bridge.log");
+    let (mut w, notices) = noticing_writer(dir, 100);
+    for _ in 0..3 {
+        w.write_all(b"line\n").unwrap();
+    }
+    let said = notices.lock().unwrap().clone();
+
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(!said[0].contains(dir.to_string_lossy().as_ref()), "{said:?}");
+}
+
+#[skuld::test]
+fn a_file_that_opens_is_not_spoken_of(#[fixture(temp_dir)] dir: &Path) {
+    let (mut w, notices) = noticing_writer(dir, 100);
+    w.write_all(&stream(250)).unwrap();
+
+    assert!(notices.lock().unwrap().is_empty());
 }

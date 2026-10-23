@@ -295,6 +295,18 @@ impl Dir {
     /// For a log in a folder a user may own, where a name the user planted must not make a privileged writer
     /// change a file it did not make.
     pub fn append_own_file(&self, name: &OsStr, mode: u32, owner: Option<(u32, u32)>) -> io::Result<File> {
+        self.append_own_file_with(name, mode, owner, || {})
+    }
+
+    /// [`Self::append_own_file`] with `before_append` run right before an existing name is opened: the point where a
+    /// name changed by another principal meets a guard that judged it earlier.
+    pub(crate) fn append_own_file_with(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        owner: Option<(u32, u32)>,
+        mut before_append: impl FnMut(),
+    ) -> io::Result<File> {
         // Each pass after the first means the user changed the name since the last one; the loop ends once they stop.
         loop {
             match self.open_file(name, OpenFile::CreateAppend { mode }) {
@@ -305,18 +317,19 @@ impl Dir {
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err),
             }
-            match self.kind_of(name)? {
-                None => continue,
-                Some(EntryKind::Symlink | EntryKind::Other) => {
-                    self.unlink_if_there(name)?;
-                    continue;
-                }
-                Some(EntryKind::File | EntryKind::Directory) => {}
-            }
+            before_append();
+            // Opened first and judged only on failure: a name judged first can change before it is opened.
             let file = match self.open_file(name, OpenFile::Append) {
                 Ok(file) => file,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(err),
+                Err(err) => match self.kind_of(name) {
+                    Ok(None) => continue,
+                    Ok(Some(EntryKind::Symlink | EntryKind::Other)) => {
+                        self.unlink_if_there(name)?;
+                        continue;
+                    }
+                    Ok(Some(EntryKind::File | EntryKind::Directory)) | Err(_) => return Err(err),
+                },
             };
             if platform::is_own_file(&file, owner)? {
                 return Ok(file);
@@ -441,8 +454,14 @@ impl Drop for Staged<'_> {
         // Closed first: Windows does not let a name be deleted while a handle that does not share delete is open.
         drop(self.temp.take());
         if self.pending {
-            // Not ours to keep, and nothing to report to: the caller already has its answer.
-            let _ = platform::unlink(&self.dir.file, &self.temp_name);
+            // The caller already has its answer, so a failure is logged, not returned: the name stays in a folder
+            // a user may own, and after a `claim` it is a second link to the published file. Gone already is fine.
+            match platform::unlink(&self.dir.file, &self.temp_name) {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                    tracing::warn!(error = %err, temp = %self.temp_name.to_string_lossy(), "a temporary file was left behind");
+                }
+                _ => {}
+            }
         }
     }
 }
