@@ -347,12 +347,15 @@ pub(super) fn is_vouched_for(dir: &File, file: &File) -> io::Result<bool> {
 pub(super) struct Facts {
     pub regular: bool,
     pub uid: u32,
+    /// The file's link count: how many names it has.
+    pub links: u64,
 }
 
-/// Whether a file found at a log's name is one a privileged writer may append to: a regular file that `owner`
-/// owns. With no `owner`, no ownership is expected and any regular file will do.
+/// Whether a file found at a log's name is one a privileged writer may append to: a regular file with no other name
+/// (a second name is what a hard link a user planted adds) that `owner` owns. With no `owner`, no ownership is
+/// expected and any such file will do.
 pub(super) fn trusted_appender(facts: Facts, owner: Option<(u32, u32)>) -> bool {
-    facts.regular && owner.is_none_or(|(uid, _)| facts.uid == uid)
+    facts.regular && facts.links == 1 && owner.is_none_or(|(uid, _)| facts.uid == uid)
 }
 
 pub(super) fn is_own_file(file: &File, owner: Option<(u32, u32)>) -> io::Result<bool> {
@@ -361,6 +364,7 @@ pub(super) fn is_own_file(file: &File, owner: Option<(u32, u32)>) -> io::Result<
         Facts {
             regular: meta.is_file(),
             uid: meta.uid(),
+            links: meta.nlink(),
         },
         owner,
     ))

@@ -15,6 +15,8 @@ use util::dir::{Dir, FileId, OpenFile};
 pub(super) struct Facts {
     pub regular: bool,
     pub uid: u32,
+    /// The file's link count: how many names it has.
+    pub links: u64,
 }
 
 /// What to do with an existing lock file that passed [`vet`].
@@ -50,6 +52,15 @@ pub(super) fn vet(facts: Facts, euid: u32, owner: Option<(u32, u32)>) -> Result<
     Ok(Verdict::Keep)
 }
 
+/// Whether the open may change the mode and owner of the file it holds.
+///
+/// Only a file this call made, or one the expected owner owns and that has no other name: a file with another name
+/// may be someone else's inode, hard-linked at the lock name, and is locked as it is. The count is read from the
+/// open file under the lock; a name added later is a name for the lock file itself.
+pub(super) fn changes(created: bool, facts: Facts, owner: Option<(u32, u32)>) -> bool {
+    created || (owner.is_some() && facts.links == 1)
+}
+
 /// Who is acquiring: this process's effective uid.
 pub(super) type Caller = u32;
 
@@ -64,6 +75,7 @@ fn facts_of(file: &File) -> io::Result<Facts> {
     Ok(Facts {
         regular: meta.file_type().is_file(),
         uid: meta.uid(),
+        links: meta.nlink(),
     })
 }
 
@@ -79,6 +91,12 @@ fn refuse(path: &Path, why: Refusal) -> io::Error {
 struct Opened {
     file: File,
     created: bool,
+}
+
+/// A locked file, and whether [`changes`] let its mode be set (its owner is set after, by [`open_locked`]).
+pub(super) struct Locked {
+    pub file: File,
+    changeable: bool,
 }
 
 /// Creates the lock file with `O_EXCL`, which never follows a symlink and never
@@ -130,7 +148,13 @@ pub(super) fn open_locked(
     owner: Option<(u32, u32)>,
     euid: Caller,
 ) -> io::Result<Option<File>> {
-    open_locked_with(path, block, owner, euid, || {})
+    let Some(Locked { file, changeable }) = open_locked_with(path, block, owner, euid, || {})? else {
+        return Ok(None);
+    };
+    if changeable {
+        chown_fd(&file, owner)?;
+    }
+    Ok(Some(file))
 }
 
 /// [`open_locked`] with `after_open` run right after each open: the point where
@@ -141,7 +165,7 @@ pub(super) fn open_locked_with(
     owner: Option<(u32, u32)>,
     euid: Caller,
     mut after_open: impl FnMut(),
-) -> io::Result<Option<File>> {
+) -> io::Result<Option<Locked>> {
     let (parent, name) = split(path)?;
     // Everything below goes through this handle, never through `path` again.
     let dir = Dir::open_as(parent, true, owner, euid).map_err(|err| Refused::from_dir_error(path, err))?;
@@ -178,18 +202,17 @@ pub(super) fn open_locked_with(
             Verdict::Keep => {}
         }
 
-        // A file may be changed only if this call created it or `owner` already owns it. The
-        // create mode is already at most 0600; this makes it exactly so, whatever the umask.
-        if created || owner.is_some() {
+        // The create mode is already at most 0600; this makes it exactly so, whatever the umask.
+        let changeable = changes(created, facts_of(&file)?, owner);
+        if changeable {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        return Ok(Some(file));
+        return Ok(Some(Locked { file, changeable }));
     }
 }
 
-/// `fchown` on the file descriptor, never on the path. No-op when `owner` is
-/// `None`.
-pub(super) fn chown_fd(file: &File, owner: Option<(u32, u32)>) -> io::Result<()> {
+/// `fchown` on the file descriptor, never on the path. No-op when `owner` is `None`.
+fn chown_fd(file: &File, owner: Option<(u32, u32)>) -> io::Result<()> {
     let Some((uid, gid)) = owner else {
         return Ok(());
     };

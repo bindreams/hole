@@ -123,11 +123,6 @@ pub(super) fn open_locked(
     }
 }
 
-/// No-op: NTFS ownership is a DACL/SID set by the install path.
-pub(super) fn chown_fd(_file: &File, _owner: Option<(u32, u32)>) -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;

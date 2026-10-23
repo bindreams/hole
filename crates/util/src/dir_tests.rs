@@ -791,6 +791,30 @@ fn another_name_of_a_file_is_replaced_and_the_file_is_left_alone() {
     assert_eq!(std::fs::read(tmp.path().join(LOG)).unwrap(), b"log\n");
 }
 
+#[cfg(unix)]
+#[skuld::test]
+fn another_name_of_the_owners_own_file_is_replaced_and_the_file_is_left_alone() {
+    // The owner's file, not a stranger's: a name the user planted for it must still not make the writer change it.
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, b"theirs\n").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let before = std::fs::metadata(&victim).unwrap();
+    std::fs::hard_link(&victim, tmp.path().join(LOG)).unwrap();
+
+    append_line(&dir, this_owner(), "log\n").unwrap();
+
+    assert_eq!(std::fs::read(&victim).unwrap(), b"theirs\n");
+    let after = std::fs::metadata(&victim).unwrap();
+    assert_eq!(
+        (after.uid(), after.mode(), after.nlink()),
+        (before.uid(), before.mode(), 1)
+    );
+    assert_eq!(std::fs::read(tmp.path().join(LOG)).unwrap(), b"log\n");
+}
+
 #[skuld::test]
 fn a_symlink_at_the_name_is_replaced_and_what_it_points_at_is_left_alone() {
     let tmp = tempfile::tempdir().unwrap();
