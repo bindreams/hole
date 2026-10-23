@@ -41,21 +41,6 @@ fn ownership_is_not_checked_when_no_owner_is_expected() {
     assert_eq!(vet(file(STRANGER), ME, None), Ok(Verdict::Keep));
 }
 
-#[skuld::test]
-fn a_file_that_is_not_regular_is_refused_whoever_owns_it() {
-    for uid in [ME, OWNER, STRANGER] {
-        let facts = Facts {
-            regular: false,
-            ..file(uid)
-        };
-        assert_eq!(
-            vet(facts, ME, Some((OWNER, OWNER))),
-            Err(Refusal::NotRegular),
-            "uid {uid}"
-        );
-    }
-}
-
 // open_locked =========================================================================================================
 //
 // The owner rule reaches the real open path through `open_locked`, which

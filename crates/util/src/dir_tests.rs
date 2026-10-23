@@ -849,6 +849,103 @@ fn a_continued_log_keeps_its_mode() {
     assert_eq!(mode & 0o777, 0o640, "an existing file's mode is not set again");
 }
 
+/// Runs `append_own_file` over a regular file at the log's name that `swap` replaces just before the open.
+fn append_while_the_name_changes(dir: &Dir, swap: impl FnOnce()) -> io::Result<()> {
+    let mut swap = Some(swap);
+    dir.append_own_file_with(&name(LOG), 0o644, None, || {
+        if let Some(swap) = swap.take() {
+            swap();
+        }
+    })?
+    .write_all(
+        b"log
+",
+    )
+}
+
+#[skuld::test]
+fn a_name_that_becomes_a_symlink_while_it_is_opened_is_replaced_and_what_it_points_at_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let target = tmp.path().join("secret");
+    std::fs::write(
+        &target, b"theirs
+",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(LOG),
+        b"before
+",
+    )
+    .unwrap();
+
+    append_while_the_name_changes(&dir, || {
+        std::fs::remove_file(tmp.path().join(LOG)).unwrap();
+        plant_file_symlink(&target, &tmp.path().join(LOG));
+    })
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"theirs
+"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join(LOG)).unwrap(),
+        b"log
+"
+    );
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_name_that_becomes_a_fifo_while_it_is_opened_is_replaced() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(
+        tmp.path().join(LOG),
+        b"before
+",
+    )
+    .unwrap();
+
+    append_while_the_name_changes(&dir, || {
+        std::fs::remove_file(tmp.path().join(LOG)).unwrap();
+        let fifo = std::ffi::CString::new(tmp.path().join(LOG).as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    })
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(tmp.path().join(LOG)).unwrap(),
+        b"log
+"
+    );
+}
+
+#[skuld::test]
+fn a_name_that_becomes_a_directory_while_it_is_opened_is_an_error_and_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(
+        tmp.path().join(LOG),
+        b"before
+",
+    )
+    .unwrap();
+
+    let result = append_while_the_name_changes(&dir, || {
+        std::fs::remove_file(tmp.path().join(LOG)).unwrap();
+        std::fs::create_dir(tmp.path().join(LOG)).unwrap();
+    });
+
+    assert!(result.is_err());
+    assert!(tmp.path().join(LOG).is_dir());
+}
+
 // link / rename / rename_noreplace / sync =============================================================================
 
 #[skuld::test]
@@ -973,6 +1070,53 @@ fn a_failed_protect_leaves_no_staged_file() {
 
     assert_eq!(err.kind(), io::ErrorKind::Other);
     assert!(names(tmp.path()).is_empty());
+}
+
+/// The temp file's name is taken by something `unlink` does not remove (a directory), as a user can arrange.
+#[skuld::test]
+fn a_temp_file_that_cannot_be_removed_is_logged_with_its_name() {
+    let writer = garter::test_utils::WaitableWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(
+        tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let mut staged = dir.stage(&name("state.json"), b"new", None, |_| Ok(())).unwrap();
+    // Closed first: Windows does not delete a name while a handle that does not share delete is open.
+    drop(staged.temp.take());
+    let temp_name = staged.temp_name.clone();
+    dir.unlink(&temp_name).unwrap();
+    std::fs::create_dir(tmp.path().join(&temp_name)).unwrap();
+    std::fs::write(tmp.path().join(&temp_name).join("keep"), b"").unwrap();
+
+    drop(staged);
+
+    let log = writer.snapshot();
+    assert!(log.contains(temp_name.to_string_lossy().as_ref()), "{log}");
+    assert!(!log.contains(tmp.path().to_string_lossy().as_ref()), "a path: {log}");
+}
+
+#[skuld::test]
+fn a_temp_file_that_is_already_gone_is_not_logged() {
+    let writer = garter::test_utils::WaitableWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(
+        tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let mut staged = dir.stage(&name("state.json"), b"new", None, |_| Ok(())).unwrap();
+    drop(staged.temp.take());
+    dir.unlink(&staged.temp_name.clone()).unwrap();
+
+    drop(staged);
+
+    assert_eq!(writer.snapshot(), "");
 }
 
 #[skuld::test]

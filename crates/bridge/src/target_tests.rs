@@ -844,9 +844,8 @@ fn a_leftover_temp_file_is_not_kept_when_the_write_fails() {
     assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
 }
 
-/// The writers the Troyka finding names, and the ones that share their pattern: a temp file written in
-/// a state directory the user may own, then owned, permissioned and renamed. Every one goes through
-/// `util::dir::Dir`; going back to a path for any step brings the swap attacks back.
+/// Every state-file writer: temp file written, owned, permissioned and renamed in a user-owned dir. Each goes through
+/// `util::dir::Dir`; any by-path step brings the swap attacks back.
 #[skuld::test]
 fn the_state_file_writers_never_chown_chmod_or_rename_by_path() {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");

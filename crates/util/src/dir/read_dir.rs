@@ -47,7 +47,7 @@ impl ReadDir {
     /// [`ReadDir::read`] for a privileged reader of a file the system publishes by rename: refused with
     /// [`super::Refusal::ForeignFile`] unless the folder's owner can vouch for the file (see
     /// [`super::read_state_file`]). Not for a file that has a second name by design.
-    pub(super) fn read_vouched(&self, name: &OsStr) -> io::Result<Vec<u8>> {
+    pub fn read_vouched(&self, name: &OsStr) -> io::Result<Vec<u8>> {
         read_whole_vouched(&self.file, name)
     }
 

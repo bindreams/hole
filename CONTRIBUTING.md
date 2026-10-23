@@ -2704,7 +2704,9 @@ callback does.
 `log_dir` (not `state_dir`) so the elevated bridge's marker is readable by the
 unprivileged GUI. The sweep opens `log_dir` through `Dir` and reads each marker
 through a `ReadDir` by its name inside that handle: a symlink at a marker name
-is reported unreadable and unlinked as itself, and a FIFO is never waited for.
+is reported unreadable and unlinked as itself, a FIFO is never waited for, and a
+marker the directory's owner cannot vouch for (`ReadDir::read_vouched`, the rule
+of `read_state_file`) is reported unreadable too.
 The listing of names is by path (names only; each read and removal is by name
 in the handle, as `cleanup_legacy_daily_logs` does).
 

@@ -853,7 +853,8 @@ unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
 ///
 /// The directory is opened once, without following a link the ownership-transition rule does not allow, and every
 /// marker is read and removed by its name inside that handle (see "The log directory" above): a symlink at a
-/// marker name is reported unreadable and removed as itself, a FIFO is never waited for.
+/// marker name is reported unreadable and removed as itself, a FIFO is never waited for, and so is a marker the
+/// directory's owner cannot vouch for (`ReadDir::read_vouched`).
 pub fn sweep(log_dir: &Path) {
     let dir = match Dir::open(log_dir, false, None) {
         Ok(dir) => dir,
@@ -896,7 +897,11 @@ fn sweep_dir(dir: &Dir, names: impl IntoIterator<Item = OsString>) {
 
 fn report_one(dir: &ReadDir, name: &OsStr) {
     let marker = name.to_string_lossy();
-    let Some(text) = dir.read(name).ok().and_then(|bytes| String::from_utf8(bytes).ok()) else {
+    let Some(text) = dir
+        .read_vouched(name)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
         tracing::error!(
             target: "crash",
             marker = %marker,

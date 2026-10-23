@@ -90,6 +90,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # WaitableWriter + tracing_test::set_default_in_current_thread for the
 # sweep-breadcrumb assertion (raw set_default is clippy-banned workspace-wide).
 garter = { path = "../garter", features = ["test-utils"] }
+# `SystemScratch`: a folder the system owns that a test may write in, for a file the folder's owner cannot vouch for.
+util = { path = "../util", features = ["test-support"] }
 
 # The helper bin links sadness-generator, so it only builds when the
 # `crash-child` feature is on. `cargo build --workspace --no-default-features

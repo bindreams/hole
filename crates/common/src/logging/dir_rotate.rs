@@ -23,12 +23,28 @@ pub struct DirRotate {
     file: Option<File>,
     /// Bytes in the active file.
     count: usize,
+    /// Told why the file could not be opened, the first time it cannot.
+    notice: Box<dyn FnMut(&io::Error) + Send>,
+    noticed: bool,
 }
 
 impl DirRotate {
     /// `owner` is given the active file each time it is created, so the user can read it without elevating, and is
     /// the only owner an existing active file may have.
     pub fn new(dir: Dir, name: &std::ffi::OsStr, limit: usize, owner: Option<(u32, u32)>) -> Self {
+        Self::with_notice(dir, name, limit, owner, |err| {
+            // No subscriber can carry this: the file is the log. The error carries no path.
+            let _ = writeln!(io::stderr(), "hole: the log file is disabled, it was not opened: {err}");
+        })
+    }
+
+    fn with_notice(
+        dir: Dir,
+        name: &std::ffi::OsStr,
+        limit: usize,
+        owner: Option<(u32, u32)>,
+        notice: impl FnMut(&io::Error) + Send + 'static,
+    ) -> Self {
         assert!(limit > 0, "a log file that holds no bytes cannot be rotated");
         let mut rotated = name.to_os_string();
         rotated.push(".1");
@@ -40,15 +56,26 @@ impl DirRotate {
             owner,
             file: None,
             count: 0,
+            notice: Box::new(notice),
+            noticed: false,
         };
         this.open_active();
         this
     }
 
     /// Opens the active file (see [`Dir::append_own_file`]: a file at the name that is not the owner's is replaced,
-    /// never written to), and counts what it already holds. A new file is given to `owner`.
+    /// never written to), and counts what it already holds. A new file is given to `owner`. The first failure to
+    /// open is said once; later ones, and the retry at every write, are silent.
     fn open_active(&mut self) {
-        self.file = self.dir.append_own_file(&self.name, 0o644, self.owner).ok();
+        match self.dir.append_own_file(&self.name, 0o644, self.owner) {
+            Ok(file) => self.file = Some(file),
+            Err(err) => {
+                self.file = None;
+                if !std::mem::replace(&mut self.noticed, true) {
+                    (self.notice)(&err);
+                }
+            }
+        }
         self.count = self
             .file
             .as_ref()
@@ -56,33 +83,41 @@ impl DirRotate {
             .map_or(0, |meta| meta.len() as usize);
     }
 
-    fn rotate(&mut self) -> io::Result<()> {
+    /// Renames the active file over the rotated one and opens a fresh active file. On a failed rename the same
+    /// file is reopened, still over the limit, and the next write tries again.
+    fn rotate(&mut self) {
         // Closed first: Windows does not rename a file that a handle without delete sharing has open, and no
         // other handle of ours does.
         self.file = None;
-        let renamed = self.dir.rename(&self.name, &self.rotated);
+        // Not reported: the file is reopened either way, and a log has nowhere to say that it could not rotate.
+        let _ = self.dir.rename(&self.name, &self.rotated);
         self.open_active();
-        renamed
     }
 }
 
 impl Write for DirRotate {
-    fn write(&mut self, mut buf: &[u8]) -> io::Result<usize> {
-        let written = buf.len();
-        while self.count + buf.len() > self.limit {
-            // A file from a run with a larger limit may already be over this one.
-            let room = self.limit.saturating_sub(self.count);
-            if let Some(file) = &mut self.file {
-                file.write_all(&buf[..room])?;
-            }
-            self.rotate()?;
-            buf = &buf[room..];
+    /// Takes at most the bytes that fit below the limit, so a line that straddles it is split exactly there across
+    /// two calls (`write_all` makes the second). Never fails after taking bytes. A line is dropped, and said to be
+    /// taken, while the file cannot be opened: a log must never take the process down.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.file.is_none() {
+            self.open_active();
         }
-        self.count += buf.len();
-        if let Some(file) = &mut self.file {
-            file.write_all(buf)?;
+        // A file from a run with a larger limit may already be over this one, and so may one whose rotation failed.
+        if self.file.is_some() && self.count >= self.limit {
+            self.rotate();
         }
-        Ok(written)
+        let Some(file) = &mut self.file else {
+            return Ok(buf.len());
+        };
+        let room = if self.count < self.limit {
+            self.limit - self.count
+        } else {
+            usize::MAX
+        };
+        let taken = file.write(&buf[..buf.len().min(room)])?;
+        self.count += taken;
+        Ok(taken)
     }
 
     fn flush(&mut self) -> io::Result<()> {
