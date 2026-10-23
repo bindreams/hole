@@ -378,6 +378,9 @@ environment and by an assignment `SystemPowershell::command` prepends to every s
 environment alone does not hold): its default begins with the invoking user's
 writable `Documents\WindowsPowerShell\Modules`, and cmdlet autoload would run a
 planted module as SYSTEM/admin.
+On Windows both constructors also set `CREATE_NO_WINDOW`: the release GUI and its
+elevated children have no console, so a console tool started without it would open
+a visible console window.
 `RouteCommand`/`SetupCommand` carry a `SystemTool` plus the arguments, not an argv
 whose first element is a program name. Compile-time enforcement is
 [`clippy.toml`](clippy.toml): `std::process::Command::new`,
