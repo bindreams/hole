@@ -113,7 +113,12 @@ targets:
     # Rust build — see the frontend-build note.
     depends: [galoshes, wintun, frontend-build]
     platforms: [windows/amd64]
-    build: uv run --directory msi-installer build
+    build:
+      # A stale lockfile fails the same way on every attempt: check it offline before the retry.
+      - uv lock --check --offline --directory msi-installer
+      # Fetch the Python dependencies under retry.
+      - .github/scripts/retry.sh uv sync --directory msi-installer
+      - uv run --directory msi-installer build
 
   hole-dmg:
     # Same logic as hole-msi: tauri does its own `cargo build --release`. No
@@ -124,6 +129,10 @@ targets:
     depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
     build:
+      # A stale lockfile fails the same way on every attempt: check it offline before the retry.
+      - uv lock --check --offline --directory dmg-installer
+      # Fetch the Python dependencies under retry.
+      - .github/scripts/retry.sh uv sync --directory dmg-installer
       # The dSYM must come from the same link as the shipped binary: std's
       # backtrace symbolizer matches it by Mach-O UUID, and any second build of
       # `hole` links a different one. So tauri builds once (`--no-bundle`), the
@@ -176,7 +185,11 @@ targets:
     # satisfies `hole-msi`, darwin/{amd64,arm64} satisfies `hole-dmg`.
     platforms: [linux/amd64, windows/amd64, darwin/amd64, darwin/arm64]
     build:
-      - npm ci --no-audit --no-fund
+      # A lockfile out of sync with package.json fails the same way on every attempt. A dry run
+      # without the network finds it (a lockfile that needs a registry lookup fails it), so it
+      # runs before the retry.
+      - npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund
+      - .github/scripts/retry.sh npm ci --no-audit --no-fund
       - npm run build
 
   # ===== Test targets =======================================================
@@ -310,6 +323,9 @@ targets:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
       - cd crates/ex-ray && go test ./...
+      # The vendored v2ray-core is a module of its own, so the fetch for `crates/ex-ray` above does not cover its
+      # dependencies. Fetch them under retry.
+      - .github/scripts/retry.sh go -C crates/ex-ray/third_party/v2ray-core mod download
       - cd crates/ex-ray/third_party/v2ray-core && go test ./transport/internet/tls/... ./transport/internet/quic/... ./transport/internet/hysteria2/... ./transport/internet/transportcommon/...
 
   # ===== Lint & check targets ==============================================
@@ -402,6 +418,10 @@ targets:
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
-      - npm ci --no-audit --no-fund
+      # A lockfile out of sync with package.json fails the same way on every attempt. A dry run
+      # without the network finds it (a lockfile that needs a registry lookup fails it), so it
+      # runs before the retry.
+      - npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund
+      - .github/scripts/retry.sh npm ci --no-audit --no-fund
       - npm run check
       - npm test

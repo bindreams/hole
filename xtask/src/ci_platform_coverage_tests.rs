@@ -484,6 +484,8 @@ jobs:
         run: echo
       - id: upload
         uses: actions/upload-artifact@v7
+      - id: diagnostics-upload
+        uses: ./.github/actions/upload-diagnostics
       - id: script
         run: echo
       - id: toolchain-action
@@ -493,10 +495,17 @@ jobs:
       - id: skipped-here
         run: echo
 ";
-    let ran: BTreeSet<String> = ["lane", "upload", "script", "toolchain-action", "other-action"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let ran: BTreeSet<String> = [
+        "lane",
+        "upload",
+        "diagnostics-upload",
+        "script",
+        "toolchain-action",
+        "other-action",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     assert_eq!(
         non_upload_steps_after(ci, "ci", "lane", &ran).unwrap(),
         vec!["script", "toolchain-action", "other-action"]
@@ -678,6 +687,7 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
         "test-ex-ray-ech",
         "setup-node-lts",
         "renovate-config",
+        "fetch-docs-tools",
     ] {
         g.insert(id, vec!["linux/amd64"]);
     }

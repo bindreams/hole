@@ -120,6 +120,35 @@ fn both_runs_are_derived_from_the_one_list() {
     );
 }
 
+/// The fetch of hook repositories and environments is retried on its own, over
+/// the same hooks the run covers: retrying the run would retry a lint failure.
+#[skuld::test]
+fn the_prepare_calls_cover_the_hooks_each_run_covers() {
+    let s = split(r#"platform-dependent = ["go-lint", "inline-a"]"#).unwrap();
+    assert_eq!(
+        s.portable_prepare_args(),
+        [
+            "install-hooks",
+            "--skip",
+            "cargo-clippy",
+            "--skip",
+            "go-lint",
+            "--skip",
+            "inline-a"
+        ]
+    );
+    assert_eq!(
+        s.platform_dependent_prepare_args().unwrap(),
+        ["install-hooks", "go-lint", "inline-a"]
+    );
+    assert_eq!(
+        split("platform-dependent = []")
+            .unwrap()
+            .platform_dependent_prepare_args(),
+        None
+    );
+}
+
 /// The portable run skips `cargo-clippy` by id. If prek.toml renames or drops it,
 /// that skip would be stale: clippy would run a second time in the portable step
 /// or prek would ignore the unknown id, depending on prek.
@@ -223,4 +252,97 @@ fn ci_runs_the_derived_prek_commands() {
         runs["lint-platform-dependent"].trim(),
         "cargo xtask prek platform-dependent"
     );
+}
+
+// ===== run ===========================================================================================================
+
+/// A fake `prek` that records its argument lists and fails each subcommand in `failures` that many times.
+struct FakePrek {
+    calls: Vec<Vec<String>>,
+    /// `(subcommand, times it fails before it succeeds)`.
+    failures: Vec<(&'static str, usize)>,
+}
+
+impl FakePrek {
+    fn new(failures: Vec<(&'static str, usize)>) -> Self {
+        Self {
+            calls: Vec::new(),
+            failures,
+        }
+    }
+
+    fn call(&mut self, args: &[String]) -> anyhow::Result<()> {
+        self.calls.push(args.to_vec());
+        let subcommand = args[0].as_str();
+        for (name, remaining) in &mut self.failures {
+            if *name == subcommand && *remaining > 0 {
+                *remaining -= 1;
+                return Err(anyhow::anyhow!("fake prek: {subcommand} failed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn subcommands(&self) -> Vec<&str> {
+        self.calls.iter().map(|c| c[0].as_str()).collect()
+    }
+}
+
+fn repo_with(lint_toml: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".github")).unwrap();
+    fs::write(dir.path().join(".github/lint.toml"), lint_toml).unwrap();
+    fs::write(dir.path().join("prek.toml"), PREK).unwrap();
+    dir
+}
+
+/// The config is checked once, before anything is retried; `install-hooks` repeats until it succeeds; the
+/// hook run is a separate call that happens once, after it.
+#[skuld::test]
+fn install_hooks_is_retried_and_the_hook_run_is_not() {
+    let repo = repo_with(r#"platform-dependent = ["go-lint"]"#);
+    let mut prek = FakePrek::new(vec![("install-hooks", 2)]);
+    crate::prek_split::run_with(crate::prek_split::PrekRun::Portable, repo.path(), &mut |a| prek.call(a)).unwrap();
+    assert_eq!(
+        prek.subcommands(),
+        [
+            "validate-config",
+            "install-hooks",
+            "install-hooks",
+            "install-hooks",
+            "run"
+        ]
+    );
+}
+
+/// A lint failure is the answer, not a fetch problem: it is returned after one run.
+#[skuld::test]
+fn a_failing_hook_run_is_executed_once() {
+    let repo = repo_with(r#"platform-dependent = ["go-lint"]"#);
+    let mut prek = FakePrek::new(vec![("run", usize::MAX)]);
+    let err = crate::prek_split::run_with(crate::prek_split::PrekRun::Portable, repo.path(), &mut |a| prek.call(a))
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("run failed"), "{err:#}");
+    assert_eq!(prek.subcommands(), ["validate-config", "install-hooks", "run"]);
+}
+
+/// A config prek rejects fails the same way on every attempt, so nothing is fetched or run after it.
+#[skuld::test]
+fn a_rejected_config_stops_before_any_fetch() {
+    let repo = repo_with(r#"platform-dependent = ["go-lint"]"#);
+    let mut prek = FakePrek::new(vec![("validate-config", usize::MAX)]);
+    crate::prek_split::run_with(crate::prek_split::PrekRun::Portable, repo.path(), &mut |a| prek.call(a)).unwrap_err();
+    assert_eq!(prek.subcommands(), ["validate-config"]);
+}
+
+/// With no platform-dependent hook the platform run has nothing to do: a bare `prek run` would run every hook.
+#[skuld::test]
+fn the_platform_run_with_no_listed_hook_runs_nothing() {
+    let repo = repo_with("platform-dependent = []");
+    let mut prek = FakePrek::new(vec![]);
+    crate::prek_split::run_with(crate::prek_split::PrekRun::PlatformDependent, repo.path(), &mut |a| {
+        prek.call(a)
+    })
+    .unwrap();
+    assert!(prek.calls.is_empty(), "{:?}", prek.calls);
 }
