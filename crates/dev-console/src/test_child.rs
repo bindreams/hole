@@ -136,19 +136,26 @@ fn run_spawn_grandchild(own_console_group: bool) -> ! {
 
 #[cfg(unix)]
 fn run_spawn_term_ignoring_grandchild(then_exit: bool) -> ! {
+    use std::os::unix::process::CommandExt as _;
+
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = std::process::Command::new(exe);
     cmd.env(MODE_ENV, "sleep");
-    // SAFETY: `signal` with SIG_IGN/SIG_DFL has no preconditions. The ignore is
-    // set before the spawn so the grandchild inherits it across `exec`.
-    unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+    // The grandchild alone ignores SIGTERM (an ignored disposition survives `exec`). Set in its own pre-exec, this
+    // process keeps the default throughout, so a test that has seen the grandchild's readiness byte can signal
+    // the group without racing a restore here.
+    // SAFETY: `signal` is async-signal-safe and the closure does nothing else.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            Ok(())
+        });
+    }
     // Intentionally unwaited, as in `run_spawn_grandchild`.
     #[allow(clippy::zombie_processes)]
     let _grandchild = cmd.spawn().expect("spawn grandchild");
     if then_exit {
         std::process::exit(0)
     }
-    // SAFETY: as above.
-    unsafe { libc::signal(libc::SIGTERM, libc::SIG_DFL) };
     park_forever()
 }

@@ -562,7 +562,14 @@ pub(crate) async fn wait_and_kill_leftovers(
     match cosca::tokio::Process::from_id(child.id()).wait().await {
         Ok(()) => kill_tree_reporting(child, what),
         // Waiting reaps below either way, which forfeits the kill; say so.
-        Err(e) => enote!("{YELLOW}{what} exit could not be watched ({e}); its tree is not killed{RESET}"),
+        Err(e) => {
+            let tree = if cfg!(windows) {
+                "its job object kills the tree when the child is dropped"
+            } else {
+                "its tree is not killed"
+            };
+            enote!("{YELLOW}{what} exit could not be watched ({e}); {tree}{RESET}");
+        }
     }
     child.wait().await
 }

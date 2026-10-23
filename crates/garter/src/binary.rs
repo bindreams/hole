@@ -110,9 +110,9 @@ pub struct BinaryPlugin {
 ///
 /// cosca reports every failed `exec` of a tokio `Command` on Unix (`ENOENT` and `EACCES` included) as
 /// `MayHaveStarted`, because it cannot prove the program never ran, and its text then talks about a child
-/// "reaped by someone else". When the fate says no child is left, the cause is the useful part. A child that
-/// may still be running keeps cosca's text, as does an elevation backend, whose fate says nothing about the
-/// program behind it.
+/// "reaped by someone else" or "still running". When the fate says no child is left, the cause is the useful part.
+/// A child that may still be running keeps cosca's text, as does an elevation backend, whose fate says nothing about
+/// the program behind it.
 pub(crate) fn spawn_failure_text(error: &cosca::error::Error) -> String {
     use cosca::error::{ChildFate, Error};
     match error {
@@ -122,12 +122,26 @@ pub(crate) fn spawn_failure_text(error: &cosca::error::Error) -> String {
             source,
         } => match fate {
             ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone => source.to_string(),
+            ChildFate::Running { id: None } if exec_refused_the_program(source) => source.to_string(),
             ChildFate::Running { .. } | ChildFate::Unknown => error.to_string(),
             // `ChildFate` is non-exhaustive: a fate this does not know is not one that says nothing is left.
             _ => error.to_string(),
         },
         _ => error.to_string(),
     }
+}
+
+/// Whether `cause` is the file itself being refused, as opposed to a failure of cosca's or tokio's setup.
+///
+/// Off Linux a failed `exec` is reported as `Running { id: None }`, since only Linux's pidfd handshake sees std
+/// collect the child. `NotFound` and `PermissionDenied` there can only come from the `exec` (or the `chdir` before
+/// it): tokio's own steps after a successful spawn (kqueue registration of the stdio pipes, the SIGCHLD handler) and
+/// cosca's (unique-id and attach errors are not `Io`) do not produce them. On Linux the handshake answers, so
+/// `Running` there is not an exec failure.
+fn exec_refused_the_program(cause: &cosca::error::Error) -> bool {
+    use std::io::ErrorKind;
+    cfg!(all(unix, not(target_os = "linux")))
+        && matches!(cause, cosca::error::Error::Io(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied))
 }
 
 impl BinaryPlugin {
