@@ -134,7 +134,7 @@ mod imp {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to remove stale socket file");
+                    tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to remove stale socket file");
                 }
             }
 

@@ -10,7 +10,7 @@ fn set_menu_bar_mode(app: &tauri::AppHandle, dock_visible: bool) {
         tauri::ActivationPolicy::Accessory
     };
     if let Err(e) = app.set_activation_policy(policy) {
-        tracing::warn!(error = %e, dock_visible, "failed to set macOS activation policy");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), dock_visible, "failed to set macOS activation policy");
     }
 }
 

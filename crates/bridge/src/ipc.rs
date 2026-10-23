@@ -285,13 +285,13 @@ impl IpcServer {
                         let router = self.router.clone();
                         tasks.spawn(async move {
                             if let Err(e) = serve_connection(TokioIo::new(stream), router).await {
-                                debug!(error = %e, "HTTP connection ended");
+                                debug!(error = %util::error_chain::error_chain(&e), "HTTP connection ended");
                             }
                             info!("IPC client disconnected");
                         });
                     }
                     Err(e) => {
-                        error!(error = %e, "failed to accept IPC connection");
+                        error!(error = %util::error_chain::error_chain(&e), "failed to accept IPC connection");
                     }
                 },
             }
@@ -672,7 +672,9 @@ async fn persist_after_start<P: Proxy, R: Routing>(
 
     match outcome {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => error!(error = %e, "failed to persist target/startup-preference after start"),
+        Ok(Err(e)) => {
+            error!(error = %util::error_chain::error_chain(&e), "failed to persist target/startup-preference after start")
+        }
         Err(e) => error!(error = %e, "target-persistence task panicked"),
     }
 }
@@ -875,8 +877,8 @@ fn unblock_error_message(e: &ProxyError) -> String {
 /// Map an extraction failure to a PII-free client response, logging the
 /// path-bearing detail to bridge.log (an IPC message reaches a GUI toast
 /// verbatim, so it must not carry a filesystem path).
-fn extraction_failure(detail: impl std::fmt::Display) -> (StatusCode, String) {
-    error!(error = %detail, "update extraction failed");
+fn extraction_failure(detail: &(dyn std::error::Error + 'static)) -> (StatusCode, String) {
+    error!(error = %error_chain(detail), "update extraction failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         "update extraction failed".to_string(),
@@ -990,7 +992,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         Ok(d) => d,
         Err(e) => {
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
             }
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1021,7 +1023,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         Ok(Ok(copy)) => copy,
         Ok(Err(StageError::Verify(e))) => {
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
             }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
@@ -1033,7 +1035,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         }
         Ok(Err(StageError::Io(e))) => {
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
             }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
@@ -1045,7 +1047,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         }
         Err(e) => {
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
             }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
@@ -1070,20 +1072,20 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         Ok(Err(e)) => {
             let (code, message) = extraction_failure(&e);
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
             }
             if let Err(e) = std::fs::remove_dir_all(&private_dir) {
-                tracing::warn!(error = %e, "failed to remove private update dir on error path");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to remove private update dir on error path");
             }
             return Err((code, Json(ErrorResponse { message })));
         }
         Err(e) => {
             let (code, message) = extraction_failure(&e);
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
             }
             if let Err(e) = std::fs::remove_dir_all(&private_dir) {
-                tracing::warn!(error = %e, "failed to remove private update dir on error path");
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to remove private update dir on error path");
             }
             return Err((code, Json(ErrorResponse { message })));
         }
@@ -1095,7 +1097,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // task that SIGTERMs THIS process only after this 200 is on the wire.
     if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version, app_dest.as_deref(), log_dir) {
         if let Err(e) = hole_common::update_marker::clear(log_dir) {
-            tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
         }
         let _ = std::fs::remove_dir_all(&private_dir);
         return Err((
@@ -1437,7 +1439,10 @@ fn apply_socket_permissions(path: &Path) {
     let extra_refs: Vec<&str> = extra_sids.iter().map(|s| s.as_str()).collect();
     let sddl = build_sddl(&extra_refs);
     if let Err(e) = set_dacl_from_sddl(path, &sddl, false) {
-        warn!("failed to set socket permissions: {e}");
+        warn!(
+            "failed to set socket permissions: {error}",
+            error = util::error_chain::error_chain(&e)
+        );
     }
 }
 
@@ -1523,7 +1528,10 @@ pub fn build_sddl(extra_sids: &[&str]) -> String {
             format!("{base}(A;;GA;;;{sid})")
         }
         Err(e) => {
-            warn!("'hole' group not found ({e}), IPC restricted to admin-only");
+            warn!(
+                "'hole' group not found ({error}), IPC restricted to admin-only",
+                error = util::error_chain::error_chain(&e)
+            );
             base.to_string()
         }
     };

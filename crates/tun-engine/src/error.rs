@@ -10,8 +10,7 @@ use crate::gateway::GatewayError;
 /// table manipulation.
 #[derive(Debug, Error)]
 pub enum RoutingError {
-    /// `Display` is the toast sentence; the cause (`GatewayError::source()`) is
-    /// for the log, so log this with `util::error_chain`.
+    /// Gateway failure; log with `util::error_chain`.
     #[error("gateway detection failed: {0}")]
     Gateway(#[source] GatewayError),
     #[error("route setup failed: {0}")]
@@ -50,7 +49,7 @@ impl RoutingError {
     /// error's kind only (`tempfile`'s error text names the path); the full
     /// error goes to the log.
     pub(crate) fn state_write_failed(what: &str, e: &std::io::Error) -> Self {
-        tracing::error!(error = %e, "{what} could not be written");
+        tracing::error!(error = %util::error_chain::error_chain(e), "{what} could not be written");
         RoutingError::RouteSetup(format!("{what} could not be written ({})", e.kind()))
     }
 }

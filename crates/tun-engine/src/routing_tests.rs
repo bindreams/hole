@@ -3606,3 +3606,25 @@ fn an_unresolvable_tool_is_a_spawn_failure_in_every_phase() {
     let best_effort = run_built(unresolvable(), "route delete".into(), BestEffortPhase::Teardown);
     assert!(matches!(best_effort, Err(CommandFailure::Spawn(_))), "{best_effort:?}");
 }
+
+// Gateway failures keep their cause ===================================================================================
+
+/// `SystemRouting::{default_gateway, default_route}` both route their lookup
+/// through `routing_gateway`: the typed error stays in the chain, so the
+/// diagnostic cause `Display` omits is still reachable through `source()`.
+#[skuld::test]
+fn a_gateway_lookup_failure_keeps_its_cause_in_the_source_chain() {
+    let lookup = Err(GatewayError::RouteQueryFailed {
+        code: 0,
+        source: std::io::Error::other("the OS routing answer"),
+    });
+
+    let err = routing_gateway(lookup).expect_err("a failed lookup is an error");
+
+    let RoutingError::Gateway(_) = &err else {
+        panic!("a gateway failure must stay a RoutingError::Gateway, got {err:?}");
+    };
+    let gateway = std::error::Error::source(&err).expect("the typed gateway error is the source");
+    let cause = std::error::Error::source(gateway).expect("the gateway error's own cause is the next link");
+    assert_eq!(cause.to_string(), "the OS routing answer");
+}

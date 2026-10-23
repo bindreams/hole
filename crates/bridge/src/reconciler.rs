@@ -333,7 +333,7 @@ pub async fn reconcile_once<P, R, D>(
         Ok(Ok(target)) => target,
         Ok(Err(error)) => {
             tracing::error!(
-                %error,
+                error = %util::error_chain::error_chain(&error),
                 "reconcile_once: failed to persist the startup-resolved target; reading current disk state instead of guessing"
             );
             target::load(state_dir)
@@ -361,7 +361,7 @@ pub async fn reconcile_once<P, R, D>(
             Phase::Cover(CoverStep::Release) => match pm.routing_handle().release_all_covers() {
                 Ok(()) => pm.set_standing_cover_adopted(false),
                 Err(error) => {
-                    tracing::warn!(%error, "reconcile_once: failed to release a stray standing cover");
+                    tracing::warn!(error = %util::error_chain::error_chain(&error), "reconcile_once: failed to release a stray standing cover");
                 }
             },
             // Engaging happens inside `start_cancellable` below, not here —

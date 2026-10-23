@@ -1120,6 +1120,36 @@ mod typed_error_logs {
         );
     }
 
+    /// A connect error whose own text omits its cause still has that cause in
+    /// `caused_by`: it is reachable only through `source()`.
+    #[skuld::test]
+    async fn upstream_failure_log_names_a_cause_only_source_carries() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        let _guard = set_default_in_current_thread(subscriber);
+
+        let dead = dead_addr(0);
+        let fwd = DnsForwarder::new_with_ports(
+            build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
+            crate::test_support::refusing_connector::CauseHidingConnector::new(),
+            true,
+            vec![dead.port()],
+        );
+        let _ = fwd.forward(&sample_query(0x0003)).await;
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains(&format!("-> {}", crate::test_support::MOCK_ROOT_CAUSE)),
+            "caused_by must carry the root cause after ` -> `; got:
+{output}"
+        );
+    }
+
     /// TCP stub that accepts then closes immediately → forwarder sees EOF
     /// while reading the framed reply. With `PlainTcp`, this is the `Io`
     /// layer (not `Connect` — we got past the connect, we hit an EOF on

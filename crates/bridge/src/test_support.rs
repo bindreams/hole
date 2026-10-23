@@ -32,8 +32,38 @@ pub(crate) mod socks5_client;
 pub(crate) mod socks5_dns_upstream;
 pub(crate) mod udp_echo;
 
-/// The cause text inside [`mock_gateway_failure`], for asserting it reaches the log.
+/// The cause text inside [`mock_gateway_failure`].
 pub(crate) const MOCK_GATEWAY_CAUSE: &str = "mock default-net cause";
+
+/// A root cause that only `source()` carries; see [`io_error_hiding`].
+pub(crate) const MOCK_ROOT_CAUSE: &str = "mock root cause";
+
+/// An error whose `Display` omits its cause, as the typed errors this crate logs
+/// do; only `source()` reaches `root`.
+#[derive(Debug)]
+pub(crate) struct CauseOmitted {
+    root: std::io::Error,
+}
+
+impl std::fmt::Display for CauseOmitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the wrapper's own sentence")
+    }
+}
+
+impl std::error::Error for CauseOmitted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.root)
+    }
+}
+
+/// An `io::Error` whose `Display` omits `root_cause`; it is reachable only
+/// through `source()`, which is where `util::error_chain` finds it.
+pub(crate) fn io_error_hiding(root_cause: &str) -> std::io::Error {
+    std::io::Error::other(CauseOmitted {
+        root: std::io::Error::other(root_cause.to_owned()),
+    })
+}
 
 /// A gateway failure shaped like macOS's: the route query failed with an
 /// OS-level cause that `Display` deliberately omits.

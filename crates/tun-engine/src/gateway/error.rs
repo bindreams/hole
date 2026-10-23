@@ -8,16 +8,13 @@
 //! `#[error(...)]` below is a bare literal with no payload interpolation, which
 //! makes that structural rather than a habit.
 //!
-//! `source()` carries the diagnostic cause, and the failure call sites log it
-//! with `util::error_chain`, which renders `Display` only: payload carried
-//! solely in `Debug` (`HopDetail`, `interface_index`) reaches no log. Three of
-//! the four sentences tell the user to read `bridge.log`; if the cause lived only
-//! in a `warn!` that someone must remember to write, deleting that line would
-//! turn the toast into a promise the log does not keep — leaving support with
-//! strictly less than the `"Default Interface not found"` string this type
-//! replaces. Carrying it in the error means it travels to every call site on its
-//! own, and the wrappers (`RoutingError::Gateway`, `ProxyError::Gateway`) hold
-//! the typed error rather than its `Display`, so the chain survives them.
+//! `source()` carries the diagnostic cause and call sites log it with
+//! `util::error_chain` (which renders `Display` only, so payload held solely in
+//! `Debug` — `HopDetail`, `interface_index` — is not in the chain: the site
+//! that builds the error logs it). Three of the four
+//! sentences point the user at `bridge.log`, so the cause must travel with the
+//! error; the wrappers (`RoutingError::Gateway`, `ProxyError::Gateway`) hold the
+//! typed error, so the chain survives them.
 
 use std::net::IpAddr;
 

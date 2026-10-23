@@ -83,7 +83,7 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "lockdown-pf-state read failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "lockdown-pf-state read failed");
             // No bytes, so nothing to salvage a token from.
             return StateFile::Unusable { pf_token: None };
         }

@@ -140,7 +140,7 @@ fn production_driver_liveness() -> DriverLiveness {
                 // A refusal, not a magic value: an identity that cannot be
                 // restored here names nothing to assess.
                 Err(e) => {
-                    tracing::warn!(error = %e, "cutover driver identity could not be restored");
+                    tracing::warn!(error = %util::error_chain::error_chain(&e), "cutover driver identity could not be restored");
                     cosca::identity::Liveness::Unknown
                 }
             }
@@ -281,7 +281,7 @@ impl BridgeLink {
             match BridgeClient::connect(socket_path).await {
                 Ok(client) => *guard = Some(client),
                 Err(e) => {
-                    warn!(error = %e, "failed to connect to bridge");
+                    warn!(error = %util::error_chain::error_chain(&e), "failed to connect to bridge");
                     return Err(e);
                 }
             }
@@ -301,7 +301,7 @@ impl BridgeLink {
             Err(e @ ClientError::VersionMismatch { .. }) => Err(e),
             Err(e) => {
                 // Connection broken — clear so next call reconnects
-                warn!(error = %e, "bridge communication error, will reconnect");
+                warn!(error = %util::error_chain::error_chain(&e), "bridge communication error, will reconnect");
                 *guard = None;
                 Err(e)
             }

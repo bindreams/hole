@@ -78,8 +78,7 @@ pub enum ProxyError {
     InvalidPluginName(String),
     #[error("proxy runtime error: {0}")]
     Runtime(#[from] std::io::Error),
-    /// `Display` is the toast sentence; the cause (`GatewayError::source()`) is
-    /// for the log, so log this with `util::error_chain`.
+    /// Gateway failure; log with `util::error_chain`.
     #[error("gateway detection failed: {0}")]
     Gateway(#[source] tun_engine::gateway::GatewayError),
     /// Private DoH bootstrap could not resolve the proxy server's hostname and

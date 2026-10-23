@@ -1403,7 +1403,7 @@ fn pre_delete_verdict(policy: StaleKeyPolicy, codes: &[(&'static str, u32)]) -> 
         return Err(e);
     }
     tracing::warn!(
-        error = %e,
+        error = %util::error_chain::error_chain(&e),
         "fail-closed cover refresh could not clear a key; keeping the stale filter rather \
          than failing the engage, which would leave the host with no cover at all"
     );
@@ -1988,7 +1988,7 @@ impl Drop for Cover {
                         .map(|k| (k.label, FwpmFilterDeleteByKey0(self.engine, &k.guid)))
                         .collect();
                     if let Some(e) = first_delete_failure(&codes) {
-                        tracing::warn!(error = %e, "lockdown cover release left a filter installed; egress may still be blocked");
+                        tracing::warn!(error = %util::error_chain::error_chain(&e), "lockdown cover release left a filter installed; egress may still be blocked");
                     }
                 }
             }
@@ -2047,7 +2047,7 @@ pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &s
             })
             .collect();
         if let Some(e) = first_delete_failure(&codes) {
-            tracing::warn!(error = %e, "stale TUN permit reclaim left a filter installed; a later adapter reusing this LUID would inherit unconditional egress");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), "stale TUN permit reclaim left a filter installed; a later adapter reusing this LUID would inherit unconditional egress");
         }
         let _ = FwpmEngineClose0(engine);
     }
@@ -2301,7 +2301,7 @@ unsafe fn delete_all(engine: HANDLE) {
         .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
         .collect();
     if let Some(e) = first_delete_failure(&codes) {
-        tracing::warn!(error = %e, "transient cover sweep left a filter installed; egress may still be blocked");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "transient cover sweep left a filter installed; egress may still be blocked");
     }
     let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
     let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);

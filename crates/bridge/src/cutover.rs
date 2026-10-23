@@ -56,7 +56,7 @@ pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()>
     // as part of the update itself. Best-effort: a failure here must not abort the
     // cutover (the swap + restart still proceed), so log and continue.
     if let Err(e) = crate::platform::os::ensure_failure_actions() {
-        tracing::warn!(error = %e, "cutover: could not ensure SCM restart-on-failure config");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "cutover: could not ensure SCM restart-on-failure config");
     }
 
     let install_dir = std::env::current_exe()?
@@ -83,7 +83,7 @@ pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()>
 fn clear_marker_on_cutover_failure(result: &std::io::Result<()>, log_dir: &Path) {
     if result.is_err() {
         if let Err(e) = hole_common::update_marker::clear(log_dir) {
-            tracing::warn!(error = %e, "cutover child: failed to clear marker on graceful failure");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), "cutover child: failed to clear marker on graceful failure");
         }
     }
 }
@@ -366,7 +366,7 @@ fn other_account_state_dirs() -> Vec<PathBuf> {
             Ok(u) => vec![hole_common::paths::user_state_dir(&u.home)],
             Err(e) => {
                 tracing::warn!(
-                    error = %e,
+                    error = %util::error_chain::error_chain(&e),
                     "could not resolve the real user behind this elevation; a bridge running under \
                      that account would not be seen by the liveness probe"
                 );
@@ -383,7 +383,7 @@ fn other_account_state_dirs() -> Vec<PathBuf> {
                 .collect(),
             Err(e) => {
                 tracing::warn!(
-                    error = %e,
+                    error = %util::error_chain::error_chain(&e),
                     "could not enumerate this host's user profiles; a bridge running under another \
                      account would not be seen by the liveness probe"
                 );
@@ -463,7 +463,9 @@ fn release_covers_with(
             // Not evidence of a bridge — an unreadable peer dir (another
             // account's home) says nothing either way, and refusing on it would
             // make the uninstall unrunnable on a multi-user host.
-            Err(e) => tracing::warn!(error = %e, "could not probe a peer state dir for a live bridge"),
+            Err(e) => {
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "could not probe a peer state dir for a live bridge")
+            }
         }
     }
 
@@ -483,10 +485,10 @@ fn release_covers_with(
 
     // Best-effort from here — see the fatality note on `release_covers`.
     if let Err(e) = crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None) {
-        tracing::warn!(error = %e, "covers released, but the auto-connect candidate could not be cleared");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "covers released, but the auto-connect candidate could not be cleared");
     }
     if let Err(e) = tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None) {
-        tracing::warn!(error = %e, "covers released, but the legacy lockdown intent could not be recorded off");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "covers released, but the legacy lockdown intent could not be recorded off");
     }
 
     drop(held);

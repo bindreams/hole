@@ -57,6 +57,10 @@ struct MockProxy {
     /// the resolved server address (garter formats `remote_host` into its
     /// chain errors), and that string reaches a GUI toast.
     fail_message: String,
+    /// `RunningProxy::stop` fails with a cause only `source()` carries.
+    fail_stop: Arc<AtomicBool>,
+    /// `RunningProxy::is_alive` reports a dead session.
+    crashed: Arc<AtomicBool>,
 }
 
 impl MockProxy {
@@ -69,6 +73,8 @@ impl MockProxy {
             start_gate: None,
             start_entered: std::sync::Mutex::new(None),
             fail_message: "mock failure".to_string(),
+            fail_stop: Arc::new(AtomicBool::new(false)),
+            crashed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -140,6 +146,8 @@ impl Proxy for MockProxy {
         Ok(MockRunning {
             handle: Some(handle),
             traffic: Arc::clone(&self.traffic),
+            fail_stop: Arc::clone(&self.fail_stop),
+            crashed: Arc::clone(&self.crashed),
         })
     }
 }
@@ -147,15 +155,22 @@ impl Proxy for MockProxy {
 struct MockRunning {
     handle: Option<JoinHandle<io::Result<()>>>,
     traffic: Arc<MockTraffic>,
+    fail_stop: Arc<AtomicBool>,
+    crashed: Arc<AtomicBool>,
 }
 
 impl RunningProxy for MockRunning {
     fn is_alive(&self) -> bool {
-        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+        !self.crashed.load(Ordering::SeqCst) && self.handle.as_ref().is_some_and(|h| !h.is_finished())
     }
     async fn stop(mut self) -> Result<(), ProxyError> {
         if let Some(h) = self.handle.take() {
             h.abort();
+        }
+        if self.fail_stop.load(Ordering::SeqCst) {
+            return Err(ProxyError::Runtime(crate::test_support::io_error_hiding(
+                crate::test_support::MOCK_ROOT_CAUSE,
+            )));
         }
         Ok(())
     }
@@ -192,7 +207,8 @@ struct MockRouting {
     /// (mirroring `MockProxy::traffic`) so a test can clone it out BEFORE
     /// `routing` moves into the `ProxyManager`.
     release_all_calls: Arc<AtomicU32>,
-    /// `release_all_covers` returns `RoutingError::RouteSetup` when set.
+    /// `release_all_covers` fails with `mock_gateway_failure()` when set: the
+    /// one `RoutingError` whose cause only `source()` carries.
     fail_release: Arc<AtomicBool>,
     /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
     /// probe. Defaults to `Absent`.
@@ -321,7 +337,7 @@ impl Routing for MockRouting {
     fn release_all_covers(&self) -> Result<(), RoutingError> {
         self.release_all_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_release.load(Ordering::SeqCst) {
-            return Err(RoutingError::RouteSetup("mock release_all_covers failure".into()));
+            return Err(crate::test_support::mock_gateway_failure());
         }
         Ok(())
     }
@@ -2303,8 +2319,7 @@ fn status_error_excludes_failed_start_detail() {
     });
 }
 
-/// The toast text of a failed start is a fixed sentence that points at
-/// bridge.log; the cause it points at must actually be there.
+/// A failed start's cause reaches bridge.log, not the toast.
 #[skuld::test]
 async fn a_failed_start_logs_the_cause_the_toast_points_at() {
     let (subscriber, writer) = redacting_capture();
@@ -2342,6 +2357,183 @@ async fn a_failed_network_probe_logs_the_cause() {
     };
 
     assert_eq!(diag.network, "error", "the diagnostics payload must stay as it was");
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_GATEWAY_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}
+
+// Failure sites log the cause chain ===================================================================================
+//
+// Each handler answers a failure with a fixed, PII-free sentence; the cause behind
+// it belongs in bridge.log. The causes below are carried by `source()` only, so a
+// site that logs `%e` instead of `error_chain` loses them.
+
+/// A started session whose stop can be made to fail, or whose liveness can be
+/// made to report dead.
+async fn started_proxy() -> (
+    Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+) {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(state_dir);
+    let mock = MockProxy::new();
+    let fail_stop = Arc::clone(&mock.fail_stop);
+    let crashed = Arc::clone(&mock.crashed);
+    let proxy = Arc::new(Mutex::new(ProxyManager::new(mock, routing)));
+    proxy.lock().await.start(&sample_config()).await.expect("mock start");
+    (proxy, fail_stop, crashed)
+}
+
+#[skuld::test]
+async fn a_failed_stop_logs_the_cause() {
+    let (proxy, fail_stop, _crashed) = started_proxy().await;
+    fail_stop.store(true, Ordering::SeqCst);
+    let (subscriber, writer) = redacting_capture();
+    let result = {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::handle_stop(axum::extract::State(ipc_state(proxy))).await
+    };
+
+    assert!(result.is_err(), "a failed stop must be reported");
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_ROOT_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}
+
+#[skuld::test]
+async fn a_failed_reload_logs_the_cause() {
+    let (subscriber, writer) = redacting_capture();
+    let result = {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::handle_reload(
+            axum::extract::State(ipc_state(gateway_failing_proxy())),
+            Json(sample_config()),
+        )
+        .await
+    };
+
+    let Err((_, Json(body))) = result else {
+        panic!("a failed reload must be reported");
+    };
+    assert_eq!(
+        body.message, "gateway detection failed: Could not read the system routing table. See bridge.log for details.",
+        "the toast text must stay the fixed sentence"
+    );
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_GATEWAY_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}
+
+/// The poll that notices a dead session also tears it down; a failed teardown
+/// is logged where the poll runs, `status` and `metrics` alike.
+#[skuld::test]
+async fn a_failed_teardown_after_a_dead_session_logs_the_cause_on_status() {
+    let (proxy, fail_stop, crashed) = started_proxy().await;
+    fail_stop.store(true, Ordering::SeqCst);
+    crashed.store(true, Ordering::SeqCst);
+    let (subscriber, writer) = redacting_capture();
+    {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        let _ = super::handle_status(axum::extract::State(ipc_state(proxy))).await;
+    }
+
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_ROOT_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}
+
+#[skuld::test]
+async fn a_failed_teardown_after_a_dead_session_logs_the_cause_on_metrics() {
+    let (proxy, fail_stop, crashed) = started_proxy().await;
+    fail_stop.store(true, Ordering::SeqCst);
+    crashed.store(true, Ordering::SeqCst);
+    let (subscriber, writer) = redacting_capture();
+    {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        let _ = super::handle_metrics(axum::extract::State(ipc_state(proxy))).await;
+    }
+
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_ROOT_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}
+
+/// With no state dir the intent cannot be saved. The message says only that the
+/// setting was not saved; why is in bridge.log.
+#[skuld::test]
+async fn a_kill_switch_off_that_cannot_save_logs_why() {
+    let (subscriber, writer) = redacting_capture();
+    let result = {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::handle_lockdown(
+            axum::extract::State(ipc_state(mock_proxy())),
+            Json(LockdownRequest { enabled: false }),
+        )
+        .await
+    };
+
+    let Err((_, Json(body))) = result else {
+        panic!("an unsaved intent must be reported");
+    };
+    assert_eq!(
+        body.message,
+        "the network was unblocked, but the kill-switch setting could not be saved"
+    );
+    let log = writer.snapshot();
+    assert!(
+        log.contains("bridge has no state_dir to persist it"),
+        "bridge.log must name the cause: {log}"
+    );
+}
+
+/// `ProxyError::Runtime` embeds its io cause in `Display` and returns it from
+/// `source()`, so the chain prints it a second time, joined with ` -> `.
+#[skuld::test]
+async fn a_failed_kill_switch_on_logs_the_chain() {
+    let (subscriber, writer) = redacting_capture();
+    let result = {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::handle_lockdown(
+            axum::extract::State(ipc_state(mock_proxy())),
+            Json(LockdownRequest { enabled: true }),
+        )
+        .await
+    };
+
+    assert!(result.is_err(), "an unsaved intent must be reported");
+    let log = writer.snapshot();
+    let cause = "cannot set lockdown intent: bridge has no state_dir to persist it";
+    assert!(
+        log.contains(&format!("proxy runtime error: {cause} -> {cause}")),
+        "bridge.log must carry the chain: {log}"
+    );
+}
+
+#[skuld::test]
+async fn a_failed_unblock_release_logs_the_cause() {
+    let (proxy, _calls, fail_release, _dir) = mock_proxy_with_release_state();
+    fail_release.store(true, Ordering::SeqCst);
+    let (subscriber, writer) = redacting_capture();
+    let result = {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::handle_unblock(axum::extract::State(ipc_state(proxy))).await
+    };
+
+    let Err((_, Json(body))) = result else {
+        panic!("a failed release must be reported");
+    };
+    assert_eq!(body.message, "the network could not be fully unblocked");
     let log = writer.snapshot();
     assert!(
         log.contains(crate::test_support::MOCK_GATEWAY_CAUSE),
@@ -2890,6 +3082,29 @@ fn extraction_failure_omits_the_path() {
     // The path-bearing detail must still reach bridge.log for diagnosis.
     let log = writer.snapshot();
     assert!(log.contains("ProgramData"), "log must carry the redacted detail: {log}");
+}
+
+#[skuld::test]
+fn extraction_failure_logs_the_cause_chain() {
+    use garter::test_utils::WaitableWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _g = set_default_in_current_thread(subscriber);
+
+    let e = crate::test_support::io_error_hiding(crate::test_support::MOCK_ROOT_CAUSE);
+    let (_, message) = super::extraction_failure(&e);
+
+    assert_eq!(message, "update extraction failed");
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_ROOT_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
 }
 
 // Redaction arming and the IPC boundary ===============================================================================

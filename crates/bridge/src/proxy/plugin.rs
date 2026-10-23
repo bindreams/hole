@@ -267,10 +267,12 @@ fn record_plugin_pid(state_dir: &Path, pid: u32, owner: Option<(u32, u32)>) {
         cosca::identity::Resolved::Found(id) => match id.to_record() {
             Ok(record) => {
                 if let Err(e) = crate::plugin_state::append_record(state_dir, record, owner) {
-                    tracing::warn!(pid, error = %e, "failed to persist plugin PID to state file");
+                    tracing::warn!(pid, error = %util::error_chain::error_chain(&e), "failed to persist plugin PID to state file");
                 }
             }
-            Err(e) => tracing::warn!(pid, error = %e, "plugin identity is not persistable; it will not be recoverable"),
+            Err(e) => {
+                tracing::warn!(pid, error = %util::error_chain::error_chain(&e), "plugin identity is not persistable; it will not be recoverable")
+            }
         },
         // The child died before we could look; there is nothing to recover.
         cosca::identity::Resolved::Gone => tracing::debug!(pid, "plugin exited before its identity could be read"),

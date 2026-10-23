@@ -466,7 +466,7 @@ pub fn run(
 /// from->to schema bump across the cutover cannot strand it.
 pub(crate) fn sweep_marker(log_dir: &std::path::Path) {
     if let Err(e) = hole_common::update_marker::clear(log_dir) {
-        tracing::warn!(error = %e, "failed to clear update-in-progress marker");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear update-in-progress marker");
     }
 }
 
@@ -480,7 +480,7 @@ pub(crate) async fn serve_until_signal(
     tokio::select! {
         result = server => {
             if let Err(e) = result {
-                tracing::error!(error = %e, "IPC server error");
+                tracing::error!(error = %util::error_chain::error_chain(&e), "IPC server error");
             }
         }
         _ = shutdown => {

@@ -53,7 +53,7 @@ pub(crate) fn reap_loaded_with(
         Loaded::Absent => return,
         Loaded::Unreadable(e) => {
             tracing::error!(
-                error = %e,
+                error = %util::error_chain::error_chain(&e),
                 path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
                 "plugin state file could not be read; keeping it so the next start retries"
             );
@@ -81,7 +81,7 @@ pub(crate) fn reap_loaded_with(
                 // for it would litter forever.
                 tracing::error!(
                     pid = record.pid,
-                    error = %e,
+                    error = %util::error_chain::error_chain(&e),
                     "recorded plugin identity cannot be restored on this host; nothing here can name it"
                 );
                 continue;
@@ -93,7 +93,7 @@ pub(crate) fn reap_loaded_with(
                 all_accounted = false;
                 tracing::warn!(
                     pid = record.pid,
-                    error = %e,
+                    error = %util::error_chain::error_chain(&e),
                     "recorded plugin identity could not be checked on this host; keeping the file so the next start retries"
                 );
                 continue;
@@ -122,7 +122,7 @@ pub(crate) fn reap_loaded_with(
                     pid = record.pid,
                     token = record.token,
                     observation,
-                    error = %e,
+                    error = %util::error_chain::error_chain(&e),
                     "failed to kill recorded plugin"
                 );
             }
@@ -171,7 +171,7 @@ fn settles_the_record(e: &cosca::error::Error) -> bool {
 /// same litter bug one layer down — so state the disposition at every call.
 fn clear_or_log(state_dir: &Path) {
     if let Err(e) = plugin_state::clear(state_dir) {
-        tracing::warn!(error = %e, "failed to clear plugin state file");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear plugin state file");
     }
 }
 
