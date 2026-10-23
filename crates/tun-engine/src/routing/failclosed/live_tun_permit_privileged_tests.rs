@@ -86,6 +86,7 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use tun::AbstractDevice;
 
+use super::cover_oracle::{held_covers, permit_scenario};
 use super::{engage_lockdown, SystemLuidResolver};
 use crate::test_utils::{classify, classify_send, EscapeGuard, OwnedRoute, RecordSpec};
 use crate::{GLOBAL_NET_STATE, TUN};
@@ -660,8 +661,6 @@ fn run_live_tun_permit_core(
             .await;
 
         let cover_blocking = TcpStream::connect_timeout(&NON_PERMITTED.parse().unwrap(), Duration::from_secs(5)).is_err();
-        let server_permit_ok =
-            TcpStream::connect_timeout(&format!("{SERVER_IP}:443").parse().unwrap(), Duration::from_secs(5)).is_ok();
 
         drop(cover);
 
@@ -689,17 +688,28 @@ fn run_live_tun_permit_core(
             "with the cover engaged, {NON_PERMITTED} must be blocked (if the block is inert nothing else means anything)"
         );
         assert!(
-            server_permit_ok,
-            "with the cover engaged, the server IP ({SERVER_IP}:443) must stay reachable — distinguishes a \
-             broken cover from a general network outage"
-        );
-        assert!(
             permit_seen && permit_seen_tcp,
             "PRODUCT BUG, not a test bug: the tunnel-permit rule did not match the interface it names \
              (device 1, '{}') — UDP permit_seen={permit_seen} (seen={seen2_udp:?}, send2={send2_fate:?}) \
              TCP permit_seen_tcp={permit_seen_tcp} (seen={seen2_tcp:?}, tcp2={tcp2_fate:?})",
             dev1.tun_name(),
         );
+
+        // The server permit, probed in an engage of its own: the cover blocks every control host, so a failed
+        // probe drops the cover and asks the control outside it, and a lost network runs the engage again.
+        let server = format!("{SERVER_IP}:443");
+        permit_scenario("server permit under the live-TUN cover", guard.state_dir(), &server, || {
+            let cover = engage_lockdown(server_ip(), dev1.tun_name(), &resolver, &[], guard.state_dir(), None)
+                .expect("engage real standing lockdown cover naming device 1 for the server probe");
+            let reached = TcpStream::connect_timeout(&server.parse().unwrap(), Duration::from_secs(5));
+            drop(cover);
+            reached.map(drop).map_err(|e| {
+                format!(
+                    "with the cover engaged, the server IP ({server}) must stay reachable: {:?}",
+                    e.kind()
+                )
+            })
+        });
 
         // Phase 3 — mutation: re-engage naming device 2, a genuinely live but
         // uninvolved interface. The anti-vacuity mechanism (module doc).
@@ -757,7 +767,8 @@ fn run_live_tun_permit_core(
         hole_test_observability::egress::assert_egress_restored(
             "restore: the box must be left open",
             &[NON_PERMITTED],
-            &format!("{SERVER_IP}:443"),
+            &server,
+            &|| held_covers(guard.state_dir()),
         );
 
         platform_pin(guard.state_dir());

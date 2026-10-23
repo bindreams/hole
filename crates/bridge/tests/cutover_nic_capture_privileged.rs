@@ -122,6 +122,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
     hole_test_observability::egress::wait_for_egress(
         "pre-cover baseline",
         &[&non_permitted.to_string(), &permitted_tail.to_string()],
+        &|| tun_engine::test_utils::held_lockdown(dir.path()),
     );
 
     // One UDP socket pinned to the physical NIC index — used for every marker so

@@ -1,0 +1,32 @@
+name: Setup Go
+description: Install the Go release crates/ex-ray/go.mod pins, with a fallback that fetches it through the go command when actions/setup-go cannot
+
+runs:
+  using: composite
+  steps:
+    # setup-go downloads from go.dev and GitHub, outside this repo's retry
+    # helpers; a runner that has lost its network fails it with no defect behind
+    # it. Its failure is not fatal here: the next step pins the same release a
+    # second way, and the step stays visibly red in the log.
+    - id: setup-go
+      uses: actions/setup-go@v7
+      continue-on-error: true
+      with:
+        go-version-file: crates/ex-ray/go.mod
+
+    # `GOTOOLCHAIN=goX.Y.Z` makes every `go` run that release, fetching it
+    # (checksum-verified) through the module proxy when the runner's Go is
+    # another one. The fetch is retried until the network answers.
+    - name: Pin Go through the go command (setup-go could not fetch it)
+      if: steps.setup-go.outcome == 'failure'
+      shell: bash
+      run: |
+        set -euo pipefail
+        toolchain="$(sed -n 's/^toolchain \(go[0-9][0-9.]*\).*/\1/p' crates/ex-ray/go.mod)"
+        if [[ -z "$toolchain" ]]; then
+            echo "::error::crates/ex-ray/go.mod has no toolchain directive to pin"
+            exit 1
+        fi
+        echo "::warning::actions/setup-go failed; pinning $toolchain through the go command instead"
+        echo "GOTOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+        GOTOOLCHAIN="$toolchain" .github/scripts/retry.sh go version

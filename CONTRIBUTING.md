@@ -2936,15 +2936,44 @@ and a rerun repeats the platform's whole job.
 - **Provisioning fetches retry until they succeed.** A runner that loses its
   network for a minute must not fail a step with no product defect behind it.
   Every download, clone, package or module fetch retries with no attempt cap
-  (the step's `timeout-minutes` is the bound) and prints each failure's cause:
-  `.github/scripts/retry.sh` for shell, `.github/scripts/retry.ps1` for
-  PowerShell, `xtask/src/retry.rs` (`retry::until_ok`) for xtask. Wrap only the
-  fetch, never a build or a test: a real failure would retry until the step
-  times out. Where the fetch and the work share a command (`uv run`, `prek run`,
-  `npx`), a fetch-only call runs first and fills the cache. A `uses:` action
-  that fetches (setup-\*, sccache, binstall, cache) cannot be wrapped, so it
-  keeps whatever retry the action has. `xtask/src/command.rs` names the command
-  and the status in a failed child's error.
+  (the job or step `timeout-minutes` is the bound) and prints each failure's
+  cause: `.github/scripts/retry.sh` for shell, `.github/scripts/retry.ps1` for
+  PowerShell, `xtask/src/retry.rs` (`retry::until_ok`) for xtask, `tenacity` for
+  the MSI project's WiX download. Wrap only the fetch, never a build or a test:
+  a real failure would retry until the timeout. Where the fetch and the work
+  share a command (`uv run`, `prek run`, `npx`), a fetch-only call runs first
+  and fills the cache (`scripts/validate-docs.py --fetch-only` for the docs
+  hook).
+  A retry must not hide a failure the network did not cause. Each tool's offline
+  check runs first where one exists (`uv lock --check --offline`, `prek validate-config`), `until_ok` stops on a failure marked `retry::permanent`
+  (a 4xx, a complete body with the wrong hash, a missing working directory),
+  `retry.ps1` stops on an HTTP 4xx, and both shell and xtask helpers stop on a
+  missing program. Where the tool offers no such check, a deterministic failure
+  retries until the timeout and the log shows its cause on every attempt: `cargo fetch --locked` (a stale `Cargo.lock`
+  and a lost network both exit 101, and the lock check needs the registry
+  index), `npm ci`, `go mod download`, `gh release download`, `git clone`,
+  `curl -f`, `brew`, `cargo binstall`/`install`.
+  A `uses:` action that fetches cannot be wrapped: `setup-go` and the
+  sccache action are `continue-on-error` with a visible warning and a
+  fallback (`.github/actions/setup-go` pins the release through the `go`
+  command; a build without sccache), and diagnostic-only artifact uploads go
+  through `.github/actions/upload-diagnostics`, which warns instead of
+  failing. The release workflows' `upload-artifact` steps feed later jobs and
+  stay unwrapped, as do the other actions (binstall, cache): no incident has
+  been seen there.
+  `xtask/src/command.rs` names the command and the status in a failed child's
+  error.
+- **A test that needs egress tells a network loss from a Hole defect.** The
+  oracle is Hole's own state, not a remote host: `hole_test_observability::egress`
+  takes a `HoleState` read (`tun_engine::test_utils::held_lockdown`, the cover
+  oracle in `routing/failclosed/cover_oracle.rs`: WFP keys on Windows, the pf
+  label and Hole's state record on macOS). A failed probe while Hole holds a
+  cover fails at once as a defect; with no Hole state and a control host down it
+  waits for the network, uncapped, and logs it. An in-cover probe that fails with the
+  network down re-runs the engage-and-probe scenario
+  (`rerun_until_network_holds`). A resolver-set reading is taken between control
+  probes (`read_with_network_up`). The macOS transient cover has no pf read
+  (pf keeps no label for it), so its oracle is the state record alone.
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 

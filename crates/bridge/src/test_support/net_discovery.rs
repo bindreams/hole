@@ -62,6 +62,37 @@ impl HostNetwork {
         })
     }
 
+    /// [`read`](Self::read), taken again until the snapshot has a usable off-link route.
+    ///
+    /// The whole snapshot is retaken, not just the route, so the interface list and the route still come
+    /// from one construction. A scan that failed outright is returned, not waited out. No cap: the test's
+    /// own nextest timeout is the bound.
+    pub(crate) fn read_when_routed() -> Result<Self, String> {
+        Self::read_when_routed_with(Self::read, || std::thread::sleep(ROUTE_POLL_INTERVAL))
+    }
+
+    pub(crate) fn read_when_routed_with(
+        mut read: impl FnMut() -> Result<Self, String>,
+        mut pause: impl FnMut(),
+    ) -> Result<Self, String> {
+        let mut last_logged: Option<String> = None;
+        loop {
+            let host = read()?;
+            match host.primary_ipv4() {
+                Ok(ip) => {
+                    if last_logged.is_some() {
+                        tracing::info!("the host has a primary IPv4 route again: {ip}");
+                    }
+                    return Ok(host);
+                }
+                Err(why) => {
+                    log_route_wait(&mut last_logged, why);
+                    pause();
+                }
+            }
+        }
+    }
+
     /// The source address the kernel picks for off-link IPv4 traffic.
     pub(crate) fn primary_ipv4(&self) -> Result<Ipv4Addr, String> {
         self.primary_ipv4.clone()
@@ -142,15 +173,18 @@ pub(crate) fn wait_for_primary_ipv4_with(
                 return ip;
             }
             Err(why) => {
-                if last_logged.as_ref() != Some(&why) {
-                    tracing::warn!(
-                        "waiting for the host to have a primary IPv4 route ({why}); this is the environment, not Hole"
-                    );
-                    last_logged = Some(why);
-                }
+                log_route_wait(&mut last_logged, why);
                 pause();
             }
         }
+    }
+}
+
+/// Log each change of the kernel's answer while a wait for the route goes on.
+fn log_route_wait(last_logged: &mut Option<String>, why: String) {
+    if last_logged.as_ref() != Some(&why) {
+        tracing::warn!("waiting for the host to have a primary IPv4 route ({why}); this is the environment, not Hole");
+        *last_logged = Some(why);
     }
 }
 

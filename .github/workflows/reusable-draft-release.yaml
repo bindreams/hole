@@ -61,6 +61,7 @@ jobs:
   validate:
     name: Validate version
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -95,6 +96,7 @@ jobs:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
     needs: validate
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     strategy:
       fail-fast: true
       matrix:
@@ -138,6 +140,7 @@ jobs:
     name: Create draft release
     needs: [validate, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v8
         with:

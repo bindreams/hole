@@ -114,6 +114,8 @@ targets:
     depends: [galoshes, wintun, frontend-build]
     platforms: [windows/amd64]
     build:
+      # A stale lockfile fails the same way on every attempt: check it offline before the retry.
+      - uv lock --check --offline --directory msi-installer
       # Fetch the Python dependencies under retry; retrying the build would retry a build error.
       - .github/scripts/retry.sh uv sync --directory msi-installer
       - uv run --directory msi-installer build
@@ -127,6 +129,8 @@ targets:
     depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
     build:
+      # A stale lockfile fails the same way on every attempt: check it offline before the retry.
+      - uv lock --check --offline --directory dmg-installer
       # Fetch the Python dependencies under retry; retrying the build would retry a build error.
       - .github/scripts/retry.sh uv sync --directory dmg-installer
       # The dSYM must come from the same link as the shipped binary: std's

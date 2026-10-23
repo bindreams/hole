@@ -221,14 +221,27 @@ fn dns_confine_global_net_state_leaves_other_ports_alone() {
     let dev = open_device("dns-confine-test-tun-c", "10.255.248.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
-    let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
-    let result = TcpStream::connect_timeout(&OFF_TUNNEL_OTHER_PORT.parse().expect("literal"), Duration::from_secs(5));
-    drop(confinement);
-
-    assert!(
-        result.is_ok(),
-        "a non-DNS port on an off-tunnel host must stay unaffected by the confinement: {result:?}"
+    // The confinement is a process-scoped dynamic session that dies with its guard, so once the guard is
+    // dropped nothing of Hole's is left installed; a probe that failed while it was engaged is blamed on the
+    // network only if a control host fails outside it too.
+    let control = format!("{SERVER_IP}:443");
+    let verdict = hole_test_observability::egress::rerun_until_network_holds(
+        "dns_confine: a non-DNS port",
+        &control,
+        &|| None,
+        || {
+            let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
+            let result =
+                TcpStream::connect_timeout(&OFF_TUNNEL_OTHER_PORT.parse().expect("literal"), Duration::from_secs(5));
+            drop(confinement);
+            result.map(drop).map_err(|e| {
+                format!("a non-DNS port on an off-tunnel host must stay unaffected by the confinement: {e:?}")
+            })
+        },
     );
+    if let Err(why) = verdict {
+        panic!("{why}");
+    }
 }
 
 /// Anti-vacuity: engage naming device A (a real, live, uninvolved TUN), then

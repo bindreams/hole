@@ -1,15 +1,16 @@
 //! Download a pinned artifact, retrying until a copy with the pinned SHA-256
 //! arrives.
 //!
-//! A hash mismatch retries too: a truncated body from a failing network looks
-//! exactly like a wrong pin, and the printed cause (expected and actual hash)
-//! tells them apart.
+//! Only a transport failure retries: a connection that fails, a 5xx, a body cut
+//! short. A 4xx and a complete body with the wrong hash are answers from the
+//! server (a wrong URL, a wrong pin) that a second attempt repeats, so they end
+//! the loop.
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 
-use crate::retry::until_ok;
+use crate::retry::{permanent, until_ok};
 
 // Each bound ends one attempt, never the retrying: the peer is a remote host
 // that may never answer, and expiry only starts the next attempt.
@@ -36,22 +37,39 @@ pub fn fetch_verified(what: &str, url: &str, max_bytes: u64, sha256: &str) -> Re
         let response = agent
             .get(url)
             .call()
-            .with_context(|| format!("failed to download {url}"))?;
+            .map_err(|e| classify(e, format!("failed to download {url}")))?;
         let bytes = response
             .into_body()
             .into_with_config()
             .limit(max_bytes)
             .read_to_vec()
-            .with_context(|| format!("failed to read the body of {url}"))?;
+            .map_err(|e| classify(e, format!("failed to read the body of {url}")))?;
         let actual = sha256_hex(&bytes);
         if actual != sha256 {
-            bail!(
+            // ureq's body reader errors on a short read, so these bytes are all the server sent.
+            return Err(permanent(anyhow::anyhow!(
                 "{what} hash mismatch ({} bytes): expected {sha256}, got {actual}",
                 bytes.len()
-            );
+            )));
         }
         Ok(bytes)
     })
+}
+
+/// A client error and an over-limit body repeat on every attempt; any other
+/// failure is the transport's.
+fn classify(err: ureq::Error, context: String) -> anyhow::Error {
+    let permanent_failure = match &err {
+        ureq::Error::StatusCode(code) => (400..500).contains(code),
+        ureq::Error::BodyExceedsLimit(_) => true,
+        _ => false,
+    };
+    let err = anyhow::Error::new(err).context(context);
+    if permanent_failure {
+        permanent(err)
+    } else {
+        err
+    }
 }
 
 #[cfg(test)]

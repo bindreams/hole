@@ -1,0 +1,39 @@
+name: Upload diagnostics
+description: Upload an artifact that nothing downstream consumes, without letting a failed upload fail the job
+
+inputs:
+  name:
+    description: Artifact name.
+    required: true
+  path:
+    description: Files to upload (the upload-artifact `path` syntax).
+    required: true
+  if-no-files-found:
+    description: What upload-artifact does when `path` matches nothing.
+    required: false
+    default: ignore
+  retention-days:
+    description: Retention, in days.
+    required: false
+    default: "14"
+
+runs:
+  using: composite
+  steps:
+    # The upload talks to the artifact service, outside this repo's retry
+    # helpers; a runner that has lost its network fails it with no defect
+    # behind it. These artifacts only help read a failure, so losing one must
+    # not become one.
+    - id: upload
+      uses: actions/upload-artifact@v7
+      continue-on-error: true
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+        retention-days: ${{ inputs.retention-days }}
+
+    - name: Say the upload was lost
+      if: steps.upload.outcome == 'failure'
+      shell: bash
+      run: echo "::warning::the '${{ inputs.name }}' artifact was not uploaded (see the upload step above); the job's result is unaffected"

@@ -324,8 +324,14 @@ mod macos_impl {
     /// rule this plan carries forward from route ownership.
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn macos_dns_global_net_state_session_keys_die_with_their_session() {
-        let before_dns = scutil_dns();
-        let before_nameservers = nameservers(&before_dns);
+        // Read with the network answering on both sides: the runner's own resolvers vanish with its network,
+        // and a baseline taken then would be compared against a healthy reading afterwards.
+        let (before_dns, before_nameservers) =
+            hole_test_observability::egress::read_with_network_up("the resolver set before", NETWORK_CONTROL, || {
+                let dns = scutil_dns();
+                let servers = nameservers(&dns);
+                (dns, servers)
+            });
         println!("[lifetime-probe] before:\n{before_dns}");
 
         let session = uuid::Uuid::new_v4().to_string();
@@ -361,7 +367,7 @@ mod macos_impl {
         let unmerged = notify.settle(budget(30), &resolver_str, false);
         // The runner's own resolvers vanish when its network does; a reading taken then says nothing about
         // whether the probe left them alone, so it is retaken once the network answers.
-        let (after_dns, after_nameservers) = hole_test_observability::egress::read_until_network_agrees(
+        let (after_dns, after_nameservers) = hole_test_observability::egress::read_with_network_up(
             "lifetime probe: the resolver set after the drop",
             NETWORK_CONTROL,
             || {
@@ -369,7 +375,6 @@ mod macos_impl {
                 let servers = nameservers(&dns);
                 (dns, servers)
             },
-            |(_, servers)| *servers == before_nameservers,
         );
         println!("[lifetime-probe] after drop (unmerged={unmerged}):\n{after_dns}");
 
@@ -436,8 +441,14 @@ mod macos_impl {
     /// improvising an ungated sweep to cover the gap — **stop and escalate**.
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn macos_dns_global_net_state_session_keys_die_with_a_killed_process() {
-        let before_dns = scutil_dns();
-        let before_nameservers = nameservers(&before_dns);
+        // Read with the network answering on both sides: the runner's own resolvers vanish with its network,
+        // and a baseline taken then would be compared against a healthy reading afterwards.
+        let (before_dns, before_nameservers) =
+            hole_test_observability::egress::read_with_network_up("the resolver set before", NETWORK_CONTROL, || {
+                let dns = scutil_dns();
+                let servers = nameservers(&dns);
+                (dns, servers)
+            });
         println!("[killed-process-probe] before:\n{before_dns}");
 
         let exe = std::env::current_exe().expect("HARNESS: current_exe");
@@ -488,7 +499,7 @@ mod macos_impl {
         let unmerged = notify.settle(budget(30), &resolver_str, false);
         // The runner's own resolvers vanish when its network does; a reading taken then says nothing about
         // whether the probe left them alone, so it is retaken once the network answers.
-        let (after_dns, after_nameservers) = hole_test_observability::egress::read_until_network_agrees(
+        let (after_dns, after_nameservers) = hole_test_observability::egress::read_with_network_up(
             "killed-process probe: the resolver set after SIGKILL",
             NETWORK_CONTROL,
             || {
@@ -496,7 +507,6 @@ mod macos_impl {
                 let servers = nameservers(&dns);
                 (dns, servers)
             },
-            |(_, servers)| *servers == before_nameservers,
         );
         println!("[killed-process-probe] after SIGKILL (unmerged={unmerged}):\n{after_dns}");
 

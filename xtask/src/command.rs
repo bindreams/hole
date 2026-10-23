@@ -29,7 +29,7 @@ pub fn describe(cmd: &Command) -> String {
 /// the status as the OS reports it.
 pub fn run_inherited(cmd: &mut Command) -> Result<()> {
     let line = describe(cmd);
-    let status = cmd.status().map_err(|e| spawn_error(&line, e))?;
+    let status = cmd.status().map_err(|e| spawn_error(cmd, &line, e))?;
     if !status.success() {
         bail!("`{line}` failed: {status}");
     }
@@ -40,7 +40,10 @@ pub fn run_inherited(cmd: &mut Command) -> Result<()> {
 /// command, the status and the captured stderr; success returns the output.
 pub fn run_captured(cmd: &mut Command) -> Result<Output> {
     let line = describe(cmd);
-    let output = cmd.stdin(Stdio::null()).output().map_err(|e| spawn_error(&line, e))?;
+    let output = cmd
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| spawn_error(cmd, &line, e))?;
     if !output.status.success() {
         bail!(
             "`{line}` failed: {}\nstderr:\n{}",
@@ -75,7 +78,15 @@ pub fn hint_if_not_found(e: anyhow::Error, hint: &str) -> anyhow::Error {
     }
 }
 
-fn spawn_error(line: &str, e: std::io::Error) -> anyhow::Error {
+fn spawn_error(cmd: &Command, line: &str, e: std::io::Error) -> anyhow::Error {
+    // POSIX reports a missing working directory as `NotFound`, the same kind as a
+    // missing program; Windows reports ERROR_DIRECTORY. Neither is for a retry to fix.
+    if let Some(dir) = cmd.get_current_dir().filter(|dir| !dir.exists()) {
+        return crate::retry::permanent(anyhow!(
+            "failed to run `{line}`: the working directory {} does not exist",
+            dir.display()
+        ));
+    }
     if e.kind() == std::io::ErrorKind::NotFound {
         anyhow::Error::new(ProgramNotFound { line: line.to_owned() })
     } else {

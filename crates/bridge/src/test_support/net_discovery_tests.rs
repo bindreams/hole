@@ -32,9 +32,8 @@ fn unowned_dsts_are_not_addresses_this_host_holds() {
 /// test in the binary.
 #[skuld::test(serial = TUN)]
 fn primary_ipv4_target_is_an_address_this_host_holds() {
-    // The route can be missing while the runner's network settles; read the snapshot once it is back.
-    wait_for_primary_ipv4();
-    let host = HostNetwork::read().expect("read host network state");
+    // The route can be missing while the runner's network settles; the snapshot is read until it has one.
+    let host = HostNetwork::read_when_routed().expect("read host network state");
     let primary = IpAddr::V4(host.primary_ipv4().expect("detect primary IPv4"));
     assert!(
         host.holder_of(primary).is_some(),
@@ -62,4 +61,44 @@ fn waiting_for_the_primary_ipv4_outlasts_a_lost_route() {
     );
     assert_eq!(found, Ipv4Addr::new(10, 0, 0, 7));
     assert_eq!(pauses, 3, "one pause per failed read");
+}
+
+fn snapshot(primary_ipv4: Result<Ipv4Addr, String>) -> HostNetwork {
+    HostNetwork {
+        interfaces: Vec::new(),
+        primary_ipv4,
+    }
+}
+
+/// The route and the interface list are one construction; a route that appears after a read is
+/// retaken together with the list, never read on its own beside an older list.
+#[skuld::test]
+fn a_snapshot_without_a_route_is_read_again_whole() {
+    let mut reads = 0;
+    let mut pauses = 0;
+    let host = HostNetwork::read_when_routed_with(
+        || {
+            reads += 1;
+            Ok(snapshot(if reads <= 3 {
+                Err("Network is unreachable (os error 101)".to_string())
+            } else {
+                Ok(Ipv4Addr::new(10, 0, 0, 7))
+            }))
+        },
+        || pauses += 1,
+    )
+    .expect("a snapshot with a route");
+    assert_eq!(host.primary_ipv4(), Ok(Ipv4Addr::new(10, 0, 0, 7)));
+    assert_eq!((reads, pauses), (4, 3));
+}
+
+/// A scan that failed outright is not a lost route, so it is reported rather than waited out.
+#[skuld::test]
+fn a_failed_scan_is_not_waited_out() {
+    let mut pauses = 0;
+    let err = HostNetwork::read_when_routed_with(|| Err("scan failed".to_string()), || pauses += 1)
+        .err()
+        .expect("the scan failure is returned");
+    assert_eq!(err, "scan failed");
+    assert_eq!(pauses, 0);
 }

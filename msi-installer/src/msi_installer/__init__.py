@@ -18,6 +18,7 @@ from pathlib import Path
 import httpx
 from rich.console import Console
 from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TransferSpeedColumn
+from tenacity import Retrying, retry_if_exception, wait_exponential_jitter
 
 _PKG_DIR = Path(__file__).resolve().parent
 WXS_PATH = _PKG_DIR / "hole.wxs"
@@ -186,8 +187,41 @@ def _accept_wix_eula(wix_exe: Path, version: str) -> None:
         )
 
 
+# Pause between download attempts: 1 s doubling to 30 s, with jitter. The ceiling bounds the pause, not the
+# number of attempts.
+_DOWNLOAD_WAIT = wait_exponential_jitter(initial=1, max=30)
+
+
+def _is_transient(error: BaseException) -> bool:
+    """Whether a download failure is the network's, so another attempt can succeed.
+
+    A transport failure (name resolution, connect, a body cut short) and a 5xx are; a 4xx names a request that is
+    wrong (a moved or removed asset) and will be wrong again.
+    """
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code >= 500
+    return isinstance(error, httpx.TransportError)
+
+
 def _download_and_hash(url: str, dest: Path, console: Console) -> str:
-    """Download a file and return its SHA256 hex digest."""
+    """Download a file and return its SHA256 hex digest.
+
+    A runner that loses its network mid-build must not fail the build, so a transient failure (see
+    `_is_transient`) is retried until the download completes, with no attempt cap. Anything else is raised.
+    """
+
+    def report(state) -> None:
+        console.print(f"[yellow]download of {dest.name} failed ({state.outcome.exception()!r}); retrying[/]")
+
+    for attempt in Retrying(
+        retry=retry_if_exception(_is_transient), wait=_DOWNLOAD_WAIT, before_sleep=report, reraise=True
+    ):
+        with attempt:
+            return _download_once(url, dest, console)
+    raise AssertionError("an uncapped Retrying yields until it returns or raises")
+
+
+def _download_once(url: str, dest: Path, console: Console) -> str:
     tmp = dest.with_suffix(".tmp")
     tmp.unlink(missing_ok=True)
 

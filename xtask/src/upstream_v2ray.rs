@@ -190,8 +190,10 @@ fn clone_build_and_install(repo_root: &Path, build_dir: &Path, bin_path: &Path) 
     crate::retry::until_ok("git clone of upstream v2ray-plugin", || {
         // A failed attempt can leave a partial checkout, which would fail the next `clone`.
         if build_dir.exists() {
+            // Fatal: a clone cannot succeed into a directory that cannot be cleared.
             std::fs::remove_dir_all(build_dir)
-                .with_context(|| format!("failed to remove partial clone {}", build_dir.display()))?;
+                .with_context(|| format!("failed to remove partial clone {}", build_dir.display()))
+                .map_err(crate::retry::permanent)?;
         }
         run_git(repo_root, &["clone", UPSTREAM_REPO, &build_dir.to_string_lossy()])
     })

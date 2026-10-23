@@ -164,6 +164,9 @@ pub fn run(which: PrekRun, repo_root: &Path) -> Result<()> {
             }
         }
     };
+    // A config prek cannot parse fails the same way on every attempt, so check it
+    // locally before the retry loop below.
+    run_prek(&["validate-config".to_string(), "prek.toml".to_string()], repo_root)?;
     // Hook repositories and environments come from the network: fetch them under
     // retry, then run the hooks once. Retrying the run would retry a lint failure.
     println!("xtask: prek {}", prepare.join(" "));

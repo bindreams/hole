@@ -131,6 +131,16 @@ jobs:
         shell: bash
         run: .github/scripts/retry.sh uv tool install prek
 
+      # The `validate-docs` hook is a `system` hook whose `uv run` downloads
+      # Sphinx when the hook runs, which `prek install-hooks` does not cover.
+      # Fetch it here under retry; retrying the lint would retry a docs failure.
+      - id: fetch-docs-tools
+        name: Fetch docs build tools (portable lint leg)
+        if: ${{ matrix.portable-lint == true }}
+        timeout-minutes: 5
+        shell: bash
+        run: .github/scripts/retry.sh uv run scripts/validate-docs.py --fetch-only
+
       # macOS runners ship only Apple's frozen Bash 3.2.57 on /usr/bin/bash,
       # ahead of Homebrew's on PATH; git-subrepo's `#!/usr/bin/env bash`
       # shebang hard-requires Bash 4+. Linux and Windows (Git for Windows)
@@ -359,6 +369,9 @@ jobs:
         shell: pwsh
         working-directory: msi-installer
         run: |
+          # A stale lockfile fails the same way on every attempt: check it offline before the retry.
+          uv lock --check --offline
+          if ($LASTEXITCODE -ne 0) { throw "uv lock --check exited with $LASTEXITCODE" }
           # Fetch the test dependencies under retry; retrying the run would retry a test failure.
           & ../.github/scripts/retry.ps1 -What 'uv sync (msi-installer)' -Script {
             uv sync --group dev
@@ -490,7 +503,7 @@ jobs:
         name: Upload DMG flake diagnostics
         if: ${{ !cancelled() && steps.dmg.outcome == 'failure' }}
         timeout-minutes: 5
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/upload-diagnostics
         with:
           name: dmg-flake-diag-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/dmg-flake-diag/**
@@ -793,7 +806,7 @@ jobs:
         name: Upload MSI logs
         if: ${{ always() && matrix.installer == true }}
         timeout-minutes: 5
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/upload-diagnostics
         with:
           name: msi-logs-windows-amd64
           path: |
@@ -815,7 +828,7 @@ jobs:
         name: Upload installed-bridge logs on failure
         if: ${{ failure() && matrix.installer == true }}
         timeout-minutes: 5
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/upload-diagnostics
         with:
           name: bridge-logs-installer-windows-amd64
           path: C:\ProgramData\hole\logs\**
@@ -994,7 +1007,7 @@ jobs:
         name: Upload bridge logs (darwin always; else on failure)
         if: ${{ matrix.hole == true && (matrix.os == 'darwin' || failure() || cancelled()) }}
         timeout-minutes: 5
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/upload-diagnostics
         with:
           name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/**/bridge.log

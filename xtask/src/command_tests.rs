@@ -39,3 +39,19 @@ fn a_missing_program_says_it_was_not_found() {
         "{msg}"
     );
 }
+
+#[skuld::test]
+fn a_missing_working_directory_is_not_reported_as_a_missing_program() {
+    let dir = std::env::temp_dir().join("hole-xtask-no-such-directory");
+    let err = run_inherited(Command::new("git").arg("--version").current_dir(&dir)).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(err.downcast_ref::<ProgramNotFound>().is_none(), "{msg}");
+    assert!(
+        msg.contains("working directory") && msg.contains("does not exist"),
+        "{msg}"
+    );
+    assert!(
+        crate::retry::is_permanent(&err),
+        "no retry can create the directory: {msg}"
+    );
+}
