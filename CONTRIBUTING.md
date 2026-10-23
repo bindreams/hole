@@ -748,11 +748,18 @@ token and read when it is a user). What a reader takes from a folder the user ow
 and never echoed: every reader turns its `serde_json::Error` into a `util::parse_error::ParseFailure` (category and
 position) where the parse happens, since the error's own text quotes the file, and the log goes to `bridge.log`, which
 the user can read (`no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse`, here and in `state_symlink_tests.rs`).
-Five source scans close the class. They read calls through the file's own `use` declarations (`dir_writers_tests/scan.rs`),
-so a name imported, aliased or globbed is seen as the call it stands for. `no_privileged_code_changes_an_owner_or_a_mode_by_name`
-(no privileged crate calls `fchownat`, `fchmodat`, `chown`, `chmod`, `set_permissions` or a Windows by-path ACL call,
-except the sites listed in `BY_NAME_ALLOWED`, each with its count and reason; a site marked "open owner question" waits for
-a decision), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates, `hole` among them, open no
+Five source scans close the class. They read every use of a function through the file's own `use` and `type` declarations
+(`dir_writers_tests/scan.rs`): a name imported, aliased, globbed or reached through a `type` alias is seen as the function it
+stands for, whether it is called or only named as a value (`.map(fs::read)`, `let f = fs::read;`, `(fs::read)(p)`). A `use`
+declaration itself, a definition, a macro, and a field or parameter that has the name are not uses; a method counts when it
+is called. What the scan does not see is a function bound by anything but `use` and `type` (a macro that expands to a
+path, a `let` that renames a function and is then called by the new name).
+`no_privileged_code_acts_on_a_file_by_name`
+(no privileged crate calls `fchownat`, `fchmodat`, `chown`, `chmod`, `set_permissions`, a Windows by-path ACL call, or one
+that makes, removes, renames or links a name by path (`remove_file`, `remove_dir*`, `rename`, `create_dir*`, `write`,
+`copy`, `File::create`, `symlink`, `libc::unlink` and kin), except the sites listed in `BY_NAME_ALLOWED`, each with its
+count and reason: a folder no user can add names to, the acting user's own, a test's, or an "open owner question" that
+waits for a decision), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates, `hole` among them, open no
 file by path, except the files listed in `BY_PATH_ALLOWED`, each with its reason),
 `no_privileged_code_resolves_a_link_before_the_walk` (the same crates call neither `canonicalize` nor `realpath`,
 except the lines listed in `RESOLVING_ALLOWED`, each with its reason), `no_state_module_logs_a_path` (the
@@ -3358,7 +3365,8 @@ close. See #892 for the tracking issue, #880 for the full-tunnel e2e gap, and
 
 ### Log destinations
 
-Both GUI and bridge write to stderr **and** a 10 MiB rotating file (one backup).
+Both GUI and bridge write to stderr **and** a 10 MiB rotating file (one backup; a second file, `<name>.1.fallback`, only
+while the first backup's name cannot take the rotation).
 Default dir is `dirs::state_dir()/hole/logs` (`gui.log`, `bridge.log`):
 
 - Windows `%LOCALAPPDATA%\hole\logs\`, macOS `~/Library/Application Support/hole/logs/`
@@ -3376,6 +3384,14 @@ open, the rotation rename, the legacy-file cleanup and the `chown` of each fresh
 active file are all by a single name in it. A log directory the walk refuses (a
 symlink a user could have planted) disables the file sink with one line on the
 real stderr, which carries no path; the bridge keeps running.
+
+The active file never holds more than the limit, whatever the user plants in the directory. A name the rotation
+cannot be renamed over (a directory at `bridge.log.1`, a handle without delete sharing on it) sends the full file to
+`bridge.log.1.fallback` instead, replacing the one before it, so at most one such file exists; a rotation that
+reaches `bridge.log.1` again removes the fallback, which holds older lines. When neither name can take the file (the
+active file itself is held without delete sharing, or both names are directories) it stays full and the lines are
+dropped, as they are while it cannot be opened, until a rotation succeeds: a log the user can block must not fill the
+volume of the account that writes it.
 
 ### WebView2 and Chromium logs
 

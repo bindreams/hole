@@ -1063,7 +1063,7 @@ fn the_json_parse_scan_sees_every_spelling_of_a_parse() {
 
 // No privileged read goes by path -------------------------------------------------------------------------------------
 
-/// What opens a file by a path, under any spelling (see [`scan::Call::is`]): the reads the privileged state code must
+/// What opens a file by a path, under any spelling (see [`scan::Use::is`]): the reads the privileged state code must
 /// make through `util::dir` instead.
 const READS_BY_PATH: &[&str] = &[
     "fs::read",
@@ -1150,10 +1150,10 @@ fn production_sources(dir: &Path, found: &mut Vec<PathBuf>) {
 
 /// The by-path reads in the code of `text`, each as it was written.
 fn by_path_reads(text: &str) -> Vec<String> {
-    scan::calls(text)
+    scan::uses(text)
         .iter()
         .filter(|call| READS_BY_PATH.iter().any(|read| call.is(read)))
-        .map(scan::Call::written)
+        .map(scan::Use::written)
         .collect()
 }
 
@@ -1251,6 +1251,80 @@ let text = read_to_string(path)?;"
     assert_eq!(sites("let o = std::fs::File::options();"), 1);
     assert_eq!(sites("let bytes = ::std::fs::read(path)?;"), 1);
     assert_eq!(sites("let bytes = std::fs::read::<&Path>(path)?;"), 1);
+    // A function named as a value, never called where it is named.
+    assert_eq!(sites("let all = paths.iter().map(std::fs::read_to_string).count();"), 1);
+    assert_eq!(
+        sites(
+            "use std::fs;
+let f = fs::read;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use std::fs;
+let all = paths.iter().map(fs::read);"
+        ),
+        1
+    );
+    assert_eq!(sites("let f = std::fs::File::open;"), 1);
+    assert_eq!(sites("let r = (std::fs::read)(path);"), 1);
+    assert_eq!(
+        sites(
+            "use std::fs::read;
+let all = paths.iter().map(read);"
+        ),
+        1
+    );
+    // A `type` alias of the type, resolved like a `use`.
+    assert_eq!(
+        sites(
+            "type F = std::fs::File;
+let file = F::open(path)?;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use std::fs;
+pub type F = fs::File;
+type G = F;
+let file = G::open(path)?;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "type Opts = std::fs::OpenOptions;
+let o = Opts::new();"
+        ),
+        1
+    );
+    // Not reads: a `use` is not a use, nor is a field or a parameter that has the name, a macro, or a definition.
+    assert_eq!(sites("use std::fs::read;"), 0);
+    assert_eq!(sites("pub use std::fs::{read, read_to_string as slurp};"), 0);
+    assert_eq!(
+        sites(
+            "use std::fs::read;
+let s = Settings { read: true };"
+        ),
+        0
+    );
+    assert_eq!(
+        sites(
+            "use std::fs::read;
+fn run(read: bool) {}"
+        ),
+        0
+    );
+    assert_eq!(
+        sites(
+            "use std::fs::*;
+fn read(path: &Path) {}
+struct File;"
+        ),
+        0
+    );
     // Not reads: a method of the same name, a function of the file's own, a listing, a name in a string or a comment.
     assert_eq!(
         sites(
@@ -1442,6 +1516,16 @@ fn the_path_logging_scan_sees_every_spelling_of_a_logged_path() {
         1
     );
     assert_eq!(sites(&with_dir("let text = state_dir.to_string_lossy();")), 1);
+    // The same calls spelled as functions, and as values.
+    assert_eq!(sites("let shown = Path::display(dir);"), 1);
+    assert_eq!(
+        sites("let shown: Vec<_> = dirs.iter().map(Path::display).collect();"),
+        1
+    );
+    assert_eq!(
+        sites("let shown: Vec<_> = names.iter().map(OsStr::to_string_lossy).collect();"),
+        1
+    );
     assert_eq!(sites(&with_dir("tracing::warn!(\"cannot write {state_dir:?}\");")), 1);
     assert_eq!(sites(&with_dir("tracing::warn!(\"cannot write {:?}\", state_dir);")), 1);
     assert_eq!(
@@ -1523,7 +1607,7 @@ fn sources_in(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// What a privileged writer calls to change a state directory (see [`scan::Call::is`]): open one, or hand it a file to
+/// What a privileged writer calls to change a state directory (see [`scan::Use::is`]): open one, or hand it a file to
 /// write or remove through `util::dir`, or write a versioned file, which stages through one.
 const WRITES_A_DIR: &[&str] = &[
     "Dir::open*",
@@ -1538,7 +1622,7 @@ const WRITES_A_DIR: &[&str] = &[
 
 /// Whether the production source `text` changes a state directory: it calls one of [`WRITES_A_DIR`].
 fn opens_a_dir(text: &str) -> bool {
-    scan::calls(text)
+    scan::uses(text)
         .iter()
         .any(|call| WRITES_A_DIR.iter().any(|writes| call.is(writes)))
 }
@@ -1588,6 +1672,13 @@ write_state_file(dir, name, bytes, owner)?;"
         "let dir = util::dir::Dir::open_as(path, true, owner, caller)?;"
     ));
     assert!(opens_a_dir("dir.write_atomic(name, bytes, owner, |_| Ok(()))"));
+    // A function named as a value, or a type reached through an alias.
+    assert!(opens_a_dir("names.iter().for_each(util::dir::remove_state_file);"));
+    assert!(opens_a_dir("let w = util::dir::write_state_file;"));
+    assert!(opens_a_dir(
+        "type D = util::dir::Dir;
+let dir = D::open(path, true, None)?;"
+    ));
     // Reading a state file writes nothing.
     assert!(!opens_a_dir("util::dir::read_state_file(dir, name)"));
 }
@@ -1600,12 +1691,16 @@ fn the_scan_tells_code_from_a_comment() {
     assert!(!opens_a_dir("/// see [`Dir::open_as`]"));
 }
 
-// No privileged step changes an owner or a mode by name ---------------------------------------------------------------
+// No privileged step acts on a file by name ---------------------------------------------------------------------------
 //
 // `chown(path)` and `chmod(path)` resolve the name again, so a name the user swaps (a hard link to a file of
-// root's, a directory of their own) is what changes. A privileged step changes a file through the handle it holds.
+// root's, a directory of their own) is what changes. `remove_file(path)`, `rename(path, ..)`, `create_dir_all(path)`
+// and `File::create(path)` resolve every component of the path again, so a link the user plants on the way takes the
+// unlink, the rename or the new name to a folder of root's. A privileged step in a folder a user may add names to
+// changes a file, and makes, removes or renames a name, through the handle it holds on the folder.
 
-/// What names its target: the by-path calls of unix and Windows that change an owner, a mode or an ACL.
+/// What names its target: the by-path calls of unix and Windows that change an owner, a mode or an ACL, and the ones
+/// that make, remove, rename or link a name.
 const BY_NAME: &[&str] = &[
     "fchownat",
     "fchmodat",
@@ -1619,21 +1714,50 @@ const BY_NAME: &[&str] = &[
     "SetNamedSecurityInfo*",
     "SetFileSecurity*",
     "SetFileAttributes*",
+    "fs::remove_file",
+    "fs::remove_dir",
+    "fs::remove_dir_all",
+    "fs::rename",
+    "fs::create_dir",
+    "fs::create_dir_all",
+    "fs::write",
+    "fs::copy",
+    "fs::hard_link",
+    "fs::soft_link",
+    "fs::symlink",
+    "fs::symlink_file",
+    "fs::symlink_dir",
+    "File::create",
+    "File::create_new",
+    "libc::unlink",
+    "libc::rmdir",
+    "libc::rename",
+    "libc::mkdir",
+    "libc::link",
+    "libc::symlink",
+    "DeleteFile*",
+    "MoveFile*",
+    "CreateDirectory*",
+    "RemoveDirectory*",
+    "CreateHardLink*",
+    "CreateSymbolicLink*",
 ];
 
 /// The by-name calls in the code of `text`, each as it was written. A call on a handle (`file.set_permissions(..)`)
 /// is not one.
 fn by_name_calls(text: &str) -> Vec<String> {
-    scan::calls(text)
+    scan::uses(text)
         .iter()
         .filter(|call| BY_NAME.iter().any(|name| call.is(name)))
-        .map(scan::Call::written)
+        .map(scan::Use::written)
         .collect()
 }
 
-/// By-name changes of an owner or a mode that stay, each with its count and why: the file, the call as written, how
-/// many, and the reason. A site not in it is new, and the guard reports it. "Open owner question" is a site whose
-/// folder is one a user may add names to and which waits for a decision of the owner (1134-troyka2.md).
+/// By-name acts on a file that stay, each with its count and why: the file, the call as written, how many, and the
+/// reason. A site not in it is new, and the guard reports it. "Open owner question" is a site whose folder is one a
+/// user may add names to and which waits for a decision of the owner (1134-troyka2.md). The others name whose folder
+/// it is: one no user can add names to (the Windows `%ProgramFiles%` folders grant `BUILTIN\Users` read and execute
+/// only; macOS's `/Library`, `/var/log` and `/var/db` are root's), the acting user's own, or a test's.
 const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "crates/bridge/src/cutover/extract.rs",
@@ -1689,6 +1813,258 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
         1,
         "no caller in production code: only tests/elevated_ownership_privileged.rs and its own tests call it",
     ),
+    (
+        "crates/bridge/src/cutover/extract.rs",
+        "std::fs::copy",
+        2,
+        "open owner question: the macOS update cutover stages and extracts by path in the state dir; on Windows, the Windows install folder under %ProgramFiles%, which users cannot add names to",
+    ),
+    (
+        "crates/bridge/src/cutover/extract.rs",
+        "std::fs::create_dir_all",
+        3,
+        "open owner question: the macOS update cutover stages and extracts by path in the state dir; on Windows, the Windows install folder under %ProgramFiles%, which users cannot add names to",
+    ),
+    (
+        "crates/bridge/src/cutover/extract.rs",
+        "std::fs::remove_dir_all",
+        3,
+        "open owner question: the macOS update cutover stages and extracts by path in the state dir; on Windows, the Windows install folder under %ProgramFiles%, which users cannot add names to",
+    ),
+    (
+        "crates/bridge/src/cutover/os/windows.rs",
+        "std::fs::remove_file",
+        1,
+        "the Windows install folder under %ProgramFiles%, which users cannot add names to (the swap of the installed binaries)",
+    ),
+    (
+        "crates/bridge/src/cutover/os/windows.rs",
+        "std::fs::rename",
+        5,
+        "the Windows install folder under %ProgramFiles%, which users cannot add names to (the swap of the installed binaries)",
+    ),
+    (
+        "crates/bridge/src/ipc.rs",
+        "std::fs::remove_dir_all",
+        7,
+        "open owner question: the macOS update cutover stages and extracts by path in the state dir (the private payload dir); on Windows, the Windows install folder under %ProgramFiles%, which users cannot add names to",
+    ),
+    (
+        "crates/bridge/src/platform/macos.rs",
+        "std::fs::copy",
+        1,
+        "the install and uninstall run as root, in /Library/PrivilegedHelperTools, /Library/LaunchDaemons, /var/log/hole and /var/db/hole/state, which only root can add names to",
+    ),
+    (
+        "crates/bridge/src/platform/macos.rs",
+        "std::fs::create_dir_all",
+        3,
+        "the install and uninstall run as root, in /Library/PrivilegedHelperTools, /Library/LaunchDaemons, /var/log/hole and /var/db/hole/state, which only root can add names to",
+    ),
+    (
+        "crates/bridge/src/platform/macos.rs",
+        "std::fs::remove_file",
+        2,
+        "the install and uninstall run as root, in /Library/PrivilegedHelperTools, /Library/LaunchDaemons, /var/log/hole and /var/db/hole/state, which only root can add names to",
+    ),
+    (
+        "crates/bridge/src/platform/macos.rs",
+        "std::fs::rename",
+        1,
+        "the install and uninstall run as root, in /Library/PrivilegedHelperTools, /Library/LaunchDaemons, /var/log/hole and /var/db/hole/state, which only root can add names to",
+    ),
+    (
+        "crates/bridge/src/platform/macos.rs",
+        "std::fs::write",
+        1,
+        "the install and uninstall run as root, in /Library/PrivilegedHelperTools, /Library/LaunchDaemons, /var/log/hole and /var/db/hole/state, which only root can add names to",
+    ),
+    (
+        "crates/bridge/src/platform/swap.rs",
+        "std::fs::remove_dir_all",
+        1,
+        "open owner question: the macOS update cutover stages and extracts by path in the state dir (the swap moves the staged images out of it and removes what is left)",
+    ),
+    (
+        "crates/bridge/src/platform/swap.rs",
+        "std::fs::rename",
+        1,
+        "open owner question: the macOS update cutover stages and extracts by path in the state dir (the swap moves the staged images out of it and removes what is left)",
+    ),
+    (
+        "crates/bridge/src/platform/windows.rs",
+        "std::fs::create_dir_all",
+        2,
+        "open owner question: install() makes the log and state folders under %ProgramData%\\hole, which users can add names to (the DACL follow-up)",
+    ),
+    (
+        "crates/bridge/src/platform/windows.rs",
+        "std::fs::remove_file",
+        1,
+        "the Windows install folder under %ProgramFiles%, which users cannot add names to (the sweep of hole.exe.old-* beside the running binary)",
+    ),
+    (
+        "crates/bridge/src/test_support/dist_harness.rs",
+        "std::fs::remove_file",
+        1,
+        "test support: removes the socket of a process the test started",
+    ),
+    (
+        "crates/common/src/config.rs",
+        "std::fs::create_dir_all",
+        1,
+        "the GUI's own user config folder, made as the user",
+    ),
+    (
+        "crates/common/src/config_store.rs",
+        "fs::remove_file",
+        2,
+        "the GUI's own user config, written as the user",
+    ),
+    (
+        "crates/common/src/config_store.rs",
+        "fs::rename",
+        1,
+        "the GUI's own user config, written as the user",
+    ),
+    (
+        "crates/common/src/logging/logging_test_helpers.rs",
+        "std::fs::write",
+        1,
+        "test helpers",
+    ),
+    (
+        "crates/hole/src/autostart_registration.rs",
+        "std::fs::remove_file",
+        1,
+        "the user's own LaunchAgents folder, written by the GUI as the user",
+    ),
+    (
+        "crates/hole/src/autostart_registration.rs",
+        "std::fs::rename",
+        1,
+        "the user's own LaunchAgents folder, written by the GUI as the user",
+    ),
+    (
+        "crates/hole/src/elevation.rs",
+        "std::fs::remove_file",
+        2,
+        "open owner question: elevation.rs names the request and result files by path (the requester's private temp folder)",
+    ),
+    (
+        "crates/hole/src/elevation.rs",
+        "std::fs::write",
+        1,
+        "open owner question: elevation.rs names the request and result files by path (the requester's private temp folder)",
+    ),
+    (
+        "crates/hole/src/log_collector.rs",
+        "std::fs::File::create",
+        1,
+        "the GUI zips its own user's logs into a temp folder it made, as the user",
+    ),
+    (
+        "crates/hole/src/orphan_sweep.rs",
+        "std::fs::remove_dir_all",
+        1,
+        "the GUI sweeps its own user's temp folder at start, as the user",
+    ),
+    (
+        "crates/hole/src/orphan_sweep.rs",
+        "std::fs::remove_file",
+        1,
+        "the GUI sweeps its own user's temp folder at start, as the user",
+    ),
+    (
+        "crates/hole/src/path_management.rs",
+        "std::fs::remove_file",
+        2,
+        "run by the administrator who invokes `hole path add` or `remove`: one fixed name, /usr/local/bin/hole",
+    ),
+    (
+        "crates/hole/src/path_management.rs",
+        "symlink",
+        1,
+        "run by the administrator who invokes `hole path add` or `remove`: one fixed name, /usr/local/bin/hole",
+    ),
+    (
+        "crates/hole/src/tray.rs",
+        "std::fs::copy",
+        1,
+        "the GUI copies the log bundle where its user chose, as the user",
+    ),
+    (
+        "crates/hole/src/tray.rs",
+        "std::fs::remove_dir",
+        1,
+        "the GUI removes the temp folder it made, as the user",
+    ),
+    (
+        "crates/hole/src/tray.rs",
+        "std::fs::remove_file",
+        1,
+        "the GUI removes the temp file it made, as the user",
+    ),
+    (
+        "crates/hole/src/update/download.rs",
+        "std::fs::File::create",
+        1,
+        "the GUI and `hole update` download to a path their user chose, as the user",
+    ),
+    (
+        "crates/hole/src/update/download.rs",
+        "std::fs::rename",
+        1,
+        "the GUI and `hole update` download to a path their user chose, as the user",
+    ),
+    (
+        "crates/tombstone/src/bin/crash_child.rs",
+        "std::fs::rename",
+        1,
+        "a test binary: built only by the test workflow (feature crash-child) to plant links under a crash",
+    ),
+    (
+        "crates/tombstone/src/bin/crash_child.rs",
+        "std::os::unix::fs::symlink",
+        2,
+        "a test binary: built only by the test workflow (feature crash-child) to plant links under a crash",
+    ),
+    (
+        "crates/tombstone/src/bin/crash_child.rs",
+        "std::os::windows::fs::symlink_dir",
+        1,
+        "a test binary: built only by the test workflow (feature crash-child) to plant links under a crash",
+    ),
+    (
+        "crates/tombstone/src/bin/crash_child.rs",
+        "std::os::windows::fs::symlink_file",
+        1,
+        "a test binary: built only by the test workflow (feature crash-child) to plant links under a crash",
+    ),
+    (
+        "crates/tun-engine/src/test_utils/escape.rs",
+        "std::fs::remove_file",
+        1,
+        "test support",
+    ),
+    (
+        "crates/tun-engine/src/test_utils/escape.rs",
+        "std::fs::write",
+        1,
+        "test support",
+    ),
+    (
+        "crates/util/src/versioned_file/fixtures.rs",
+        "std::fs::create_dir_all",
+        1,
+        "fixtures of the unit tests (`#[cfg(test)]`)",
+    ),
+    (
+        "crates/util/src/versioned_file/fixtures.rs",
+        "std::fs::write",
+        1,
+        "fixtures of the unit tests (`#[cfg(test)]`)",
+    ),
 ];
 
 /// The by-name calls of the privileged crates, once per file and spelling, with how many there are. Not
@@ -1707,7 +2083,7 @@ fn by_name_sites(root: &Path) -> BTreeMap<(String, String), usize> {
 }
 
 #[skuld::test]
-fn no_privileged_code_changes_an_owner_or_a_mode_by_name() {
+fn no_privileged_code_acts_on_a_file_by_name() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
     let covered = privileged_sources(&root);
     for must_cover in [
@@ -1734,7 +2110,7 @@ fn no_privileged_code_changes_an_owner_or_a_mode_by_name() {
 
     assert!(
         hits.is_empty(),
-        "privileged code changes an owner or a mode by name, which resolves the name again: do it through the handle (`fchown`, `fchmod`, `SetSecurityInfo`) after checking what it is, or add the site to BY_NAME_ALLOWED with the reason: {hits:#?}"
+        "privileged code acts on a file by name, which resolves the whole path again: do it through a handle on the folder (`util::dir::Dir`: `unlink`, `rename`, `write_atomic`; `fchown`, `fchmod`, `SetSecurityInfo` for an owner, a mode or an ACL), or add the site to BY_NAME_ALLOWED with the reason: {hits:#?}"
     );
 }
 
@@ -1791,8 +2167,48 @@ unsafe { chmod(path, 0o600) };"
         1
     );
     assert_eq!(sites("unsafe { libc::chmod(path.as_ptr(), 0o600) };"), 1);
+    // Making, removing or renaming a name by path.
+    assert_eq!(sites("std::fs::remove_file(path)?;"), 1);
+    assert_eq!(
+        sites(
+            "use std::fs::{remove_dir_all, create_dir_all};
+remove_dir_all(a)?;
+create_dir_all(b)?;"
+        ),
+        2
+    );
+    assert_eq!(sites("let r = fs::rename(from, to);"), 1);
+    assert_eq!(sites("let f = std::fs::File::create(path)?;"), 1);
+    assert_eq!(sites("std::fs::write(path, bytes)?;"), 1);
+    assert_eq!(sites("tokio::fs::remove_file(path).await?;"), 1);
+    assert_eq!(sites("unsafe { libc::unlink(path.as_ptr()) };"), 1);
+    assert_eq!(sites("paths.iter().for_each(|p| drop(std::fs::remove_file(p)));"), 1);
+    assert_eq!(sites("paths.into_iter().map(std::fs::remove_file).count();"), 1);
+    assert_eq!(
+        sites(
+            "use std::os::unix::fs::symlink;
+symlink(target, link)?;"
+        ),
+        1
+    );
+    // A function named as a value, never called where it is named.
+    assert_eq!(sites("let change = std::fs::set_permissions;"), 1);
+    assert_eq!(sites("let all = paths.iter().map(|p| p).for_each(libc::chmod);"), 1);
+    assert_eq!(
+        sites(
+            "use std::os::unix::fs as ufs;
+let f = ufs::lchown;"
+        ),
+        1
+    );
+    assert_eq!(sites("let f = SetNamedSecurityInfoW;"), 1);
     // Not by name: the methods that act on a handle, and a function of the file's own.
     assert_eq!(sites("file.set_permissions(perms)?;"), 0);
+    assert_eq!(sites("dir.unlink(name)?;"), 0);
+    assert_eq!(sites("dir.rename(from, to)?;"), 0);
+    assert_eq!(sites("self.fs.remove_file(&dir, name)"), 0);
+    assert_eq!(sites("util::dir::remove_state_file(dir, name)?;"), 0);
+    assert_eq!(sites("fs::read_dir(path)?;"), 0);
     assert_eq!(
         sites(
             "fn chown(fd: i32) {}
