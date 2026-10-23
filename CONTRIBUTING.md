@@ -2947,11 +2947,12 @@ and a rerun repeats the platform's whole job.
   A retry must not hide a failure the network did not cause. Each tool's
   deterministic check runs outside the retry where one exists: `uv lock --check --offline`, `prek validate-config`, `npm ci --dry-run --offline` (a lockfile
   out of sync with `package.json` needs a registry lookup, which offline
-  fails), and for cargo `.github/scripts/cargo-fetch.sh` (xtask:
-  `galoshes::fetch_crates`), which retries a plain `cargo fetch` and then
-  compares `Cargo.lock` with what it was, because `cargo fetch --locked` exits
-  101 both for a stale lock and for a lost network and the lock check needs the
-  registry index. `until_ok` stops on a failure marked
+  fails), and for cargo `.github/scripts/cargo-fetch.sh`, which retries a
+  plain `cargo fetch` and then compares `Cargo.lock` with what it was, because
+  `cargo fetch --locked` exits 101 both for a stale lock and for a lost network
+  and the lock check needs the registry index. That check is CI's only: it runs in
+  `setup-build` and the release jobs before any xtask step, and `cargo xtask`
+  leaves a developer's lock to cargo, which updates it as it always has. `until_ok` stops on a failure marked
   `retry::permanent` (a 4xx other than 408 and 429, a complete body with the
   wrong hash, a missing working directory), `retry.ps1` stops on an HTTP 4xx
   other than 408 and 429, the MSI project's WiX download does the same, and the
@@ -2961,6 +2962,8 @@ and a rerun repeats the platform's whole job.
   7 only). Where the tool offers no way to tell, a deterministic failure retries
   until the timeout and the log shows its cause on every attempt: `go mod download` (a nonexistent version or a checksum mismatch exits 1 like a lost
   network; a stale `go.sum` does not loop, since `go build` fails it at once),
+  `cargo fetch` (a manifest cargo cannot parse), `uv sync` and `uv tool install`
+  (a yanked pin or a source build that fails), `npm ci` and `npx`, `prek install-hooks`,
   `GOTOOLCHAIN=goX.Y.Z go version` (a toolchain that does not exist), `gh release download`, `git clone`, `curl -f`, `brew`, `cargo binstall`/`install`.
   A `uses:` action that fetches cannot be wrapped: `setup-go` and the
   sccache action are `continue-on-error` with a visible warning and a
@@ -3064,7 +3067,9 @@ Spotlight "Hole" must reveal it.
   precondition on the host's primary IPv4 (`net_discovery::wait_for_primary_ipv4`,
   `HostNetwork::read_when_routed`) waits until the kernel has an off-link route,
   with no cap and a log line per change of state; the CI step's `timeout-minutes`
-  is the bound.
+  is the bound. Only a lost network is waited out (`PrimaryIpv4Error::NetworkLoss`:
+  network or host unreachable, network down, a link-local source address); any
+  other error, such as a refused socket, fails at once with its cause.
 - **Every crate runs in CI** — the `every_workspace_crate_runs_in_ci` conformance
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test

@@ -135,7 +135,7 @@ pub(crate) fn start_http_target(bind: TargetBind) -> HttpTarget {
     let (listener, addr) = runtime.block_on(async move {
         match bind {
             TargetBind::Ipv4Primary => {
-                let primary = wait_for_primary_ipv4();
+                let primary = wait_for_primary_ipv4().expect("detect primary IPv4");
                 // Bind on 0.0.0.0:0 so we don't need a capability to bind a
                 // specific interface IP — but report the primary IP + the
                 // chosen port to the caller, since that's what the e2e tests

@@ -31,6 +31,7 @@ impl UdpEchoServer {
         // Blocking waits belong off the async executor.
         let primary = tokio::task::spawn_blocking(wait_for_primary_ipv4)
             .await
+            .map_err(std::io::Error::other)?
             .map_err(std::io::Error::other)?;
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
         let port = sock.local_addr()?.port();

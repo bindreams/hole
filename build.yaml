@@ -323,6 +323,9 @@ targets:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
       - cd crates/ex-ray && go test ./...
+      # The vendored v2ray-core is a module of its own, so the fetch for `crates/ex-ray` above does not cover its
+      # dependencies. Fetch them under retry; a retry around `go test` would retry a failing test.
+      - .github/scripts/retry.sh go -C crates/ex-ray/third_party/v2ray-core mod download
       - cd crates/ex-ray/third_party/v2ray-core && go test ./transport/internet/tls/... ./transport/internet/quic/... ./transport/internet/hysteria2/... ./transport/internet/transportcommon/...
 
   # ===== Lint & check targets ==============================================

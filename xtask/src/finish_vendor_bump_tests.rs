@@ -437,6 +437,8 @@ fn identity_checks_match_the_real_build_yaml_ex_ray_tests_target() {
         commands,
         vec![
             "cd crates/ex-ray && go test ./...",
+            // Provisioning only (a retried fetch); `run_identity_checks` runs the two `go test`s around it.
+            ".github/scripts/retry.sh go -C crates/ex-ray/third_party/v2ray-core mod download",
             "cd crates/ex-ray/third_party/v2ray-core && go test ./transport/internet/tls/... \
              ./transport/internet/quic/... ./transport/internet/hysteria2/... \
              ./transport/internet/transportcommon/...",

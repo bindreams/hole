@@ -18,6 +18,8 @@ jobs:
     # happening to stay idempotent on a repeat run.
     if: github.event.head_commit.author.name != 'nathan-blahaj[bot]'
     runs-on: ubuntu-latest
+    # The fetch below retries until it succeeds, so this is its bound. The last three runs took 6-8 s.
+    timeout-minutes: 10
     steps:
       # `uses: ./...` (below) resolves against the checked-out workspace,
       # which is empty at job start — this bootstrap checkout exists only

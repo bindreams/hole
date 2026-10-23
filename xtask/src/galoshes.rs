@@ -18,8 +18,6 @@ use anyhow::{anyhow, Context, Result};
 /// `<repo>/.cache/ex-ray/` by [`super::ex_ray::build`] (which
 /// is what `cargo xtask deps` does just before calling this).
 pub fn build(repo_root: &Path) -> Result<PathBuf> {
-    fetch_crates(repo_root)?;
-
     let args = build_args(std::env::var_os("HOLE_CRASH_DUMPS").is_some(), cfg!(windows));
     let mut build = Command::new("cargo");
     build.args(&args).current_dir(repo_root);
@@ -45,31 +43,6 @@ pub fn build(repo_root: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to stage galoshes sidecar to {}", sidecar.display()))?;
 
     Ok(binary)
-}
-
-/// Fetch the crate sources, so a network loss retries here instead of failing the build.
-///
-/// Stands in for `cargo fetch --locked`, whose stale-lock failure and lost-network failure are both
-/// exit 101: retried, a stale `Cargo.lock` would loop until someone interrupts. The fetch runs without
-/// `--locked` (cargo rewrites a stale lock instead of failing) and the lock is compared with what it was
-/// afterwards, outside the retry. A stale lock is put back as it was.
-pub(crate) fn fetch_crates(repo_root: &Path) -> Result<()> {
-    let lock = repo_root.join("Cargo.lock");
-    let before = std::fs::read(&lock).with_context(|| format!("failed to read {}", lock.display()))?;
-
-    let mut fetch = Command::new("cargo");
-    fetch.arg("fetch").current_dir(repo_root);
-    crate::retry::until_ok("cargo fetch", || crate::command::run_inherited(&mut fetch))?;
-
-    let after = std::fs::read(&lock).with_context(|| format!("failed to read {}", lock.display()))?;
-    if after != before {
-        std::fs::write(&lock, &before).with_context(|| format!("failed to restore {}", lock.display()))?;
-        return Err(anyhow!(
-            "{} is out of date with the manifests (`cargo fetch` had to rewrite it); update it and commit",
-            lock.display()
-        ));
-    }
-    Ok(())
 }
 
 /// Cargo args for the galoshes release build.
