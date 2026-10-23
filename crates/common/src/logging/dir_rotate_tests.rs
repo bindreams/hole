@@ -180,24 +180,67 @@ fn noticing_writer(dir: &Path, limit: usize) -> (DirRotate, Arc<Mutex<Vec<String
     (w, notices)
 }
 
+/// A stream through a 100-byte log whose `.1` is a directory the log cannot be renamed over: the active file never
+/// holds more than the limit, and the file that would have been `.1` is kept under the fallback name instead.
 #[skuld::test]
-fn a_failed_rotation_keeps_the_line_and_retries_at_a_later_write(#[fixture(temp_dir)] dir: &Path) {
-    let bytes = stream(130);
+fn a_directory_at_the_rotated_name_keeps_the_active_file_bounded_and_one_fallback(#[fixture(temp_dir)] dir: &Path) {
+    block(dir, "bridge.log.1");
+    let bytes = stream(1000);
+    let mut w = writer(dir, 100);
+    for chunk in bytes.chunks(10) {
+        w.write_all(chunk).unwrap();
+        w.flush().unwrap();
+        assert!(
+            read(dir, "bridge.log").len() <= 100,
+            "the active file outgrew the limit"
+        );
+    }
+    drop(w);
+
+    assert_eq!(names(dir), ["bridge.log", "bridge.log.1", "bridge.log.1.fallback"]);
+    assert_eq!(read(dir, "bridge.log.1.fallback"), bytes[800..900]);
+    assert_eq!(read(dir, "bridge.log"), bytes[900..]);
+}
+
+/// Once `.1` can take the file again the rotation goes there, and the fallback, which holds older lines than it,
+/// is not kept beside it.
+#[skuld::test]
+fn a_rotation_that_reaches_the_rotated_name_again_removes_the_fallback(#[fixture(temp_dir)] dir: &Path) {
+    block(dir, "bridge.log.1");
+    let bytes = stream(300);
+    let mut w = writer(dir, 100);
+    w.write_all(&bytes[..150]).unwrap();
+    assert_eq!(names(dir), ["bridge.log", "bridge.log.1", "bridge.log.1.fallback"]);
+
+    unblock(dir, "bridge.log.1");
+    w.write_all(&bytes[150..]).unwrap();
+    drop(w);
+
+    assert_eq!(names(dir), ["bridge.log", "bridge.log.1"]);
+    assert_eq!(read(dir, "bridge.log.1"), bytes[100..200]);
+    assert_eq!(read(dir, "bridge.log"), bytes[200..]);
+}
+
+/// A name the rotation can take the file to, and a fallback that is a directory too: nothing can take the full file, so
+/// it stays at the limit and the lines are dropped (as when the file cannot be opened), until a name is free.
+#[skuld::test]
+fn a_file_no_name_can_take_stays_at_the_limit_and_rotates_when_a_name_frees(#[fixture(temp_dir)] dir: &Path) {
+    let bytes = stream(260);
     let mut w = writer(dir, 100);
     w.write_all(&bytes[..60]).unwrap();
     block(dir, "bridge.log.1");
+    block(dir, "bridge.log.1.fallback");
 
-    // Crosses the limit while the rotation cannot happen: nothing is lost and nothing is reported as failed.
-    w.write_all(&bytes[60..120]).unwrap();
+    w.write_all(&bytes[60..200]).unwrap();
     w.flush().unwrap();
-    assert_eq!(read(dir, "bridge.log"), bytes[..120]);
+    assert_eq!(read(dir, "bridge.log"), bytes[..100]);
 
     unblock(dir, "bridge.log.1");
-    w.write_all(&bytes[120..]).unwrap();
+    w.write_all(&bytes[200..]).unwrap();
     drop(w);
 
-    assert_eq!(read(dir, "bridge.log.1"), bytes[..120]);
-    assert_eq!(read(dir, "bridge.log"), bytes[120..]);
+    assert_eq!(read(dir, "bridge.log.1"), bytes[..100]);
+    assert_eq!(read(dir, "bridge.log"), bytes[200..]);
 }
 
 #[skuld::test]
@@ -206,6 +249,7 @@ fn a_write_that_took_bytes_never_fails_when_the_rotation_does(#[fixture(temp_dir
     let mut w = writer(dir, 100);
     w.write_all(&bytes[..60]).unwrap();
     block(dir, "bridge.log.1");
+    block(dir, "bridge.log.1.fallback");
 
     let mut rest = &bytes[60..];
     while !rest.is_empty() {
@@ -215,7 +259,35 @@ fn a_write_that_took_bytes_never_fails_when_the_rotation_does(#[fixture(temp_dir
     }
     drop(w);
 
-    assert_eq!(read(dir, "bridge.log"), bytes);
+    assert_eq!(read(dir, "bridge.log"), bytes[..100]);
+}
+
+/// A reader that holds the active file without sharing delete: on Windows nothing can rename it, whatever the name.
+#[cfg(windows)]
+#[skuld::test]
+fn a_file_held_without_delete_sharing_stays_at_the_limit(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+    let bytes = stream(200);
+    let mut w = writer(dir, 100);
+    w.write_all(&bytes[..100]).unwrap();
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_READ_WRITE)
+        .open(dir.join("bridge.log"))
+        .unwrap();
+
+    w.write_all(&bytes[100..]).unwrap();
+    w.flush().unwrap();
+    assert_eq!(read(dir, "bridge.log"), bytes[..100]);
+    assert_eq!(names(dir), ["bridge.log"]);
+
+    drop(holder);
+    w.write_all(b"next").unwrap();
+    drop(w);
+    assert_eq!(read(dir, "bridge.log.1"), bytes[..100]);
+    assert_eq!(read(dir, "bridge.log"), b"next");
 }
 
 #[skuld::test]
