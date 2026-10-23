@@ -544,6 +544,245 @@ TCP only: every in-repo hop that is not the public one binds TCP alone. A hop th
 not speak sitrep (`ReadinessMode::Probe`) cannot, so its lost port is a failed
 start and is not restarted ([garter README](crates/garter/README.md)).
 
+### File lock
+
+A cross-process lock on a file goes through
+[`file_lock::Exclusive`](crates/file-lock/src/exclusive.rs) (`flock` /
+`LockFileEx`), not a second implementation. The bridge's liveness lock and
+`TargetExclusive` use it.
+
+The lock file sits in a state directory the interactive user may own, so
+whatever is at its name is attacker-chosen and the name can change between any
+two calls that take it. `Exclusive` therefore decides on what an attacker cannot
+change once the file is open: it creates with `O_EXCL` first (a file it creates is
+its own), reopens an existing name without `O_CREAT`, and on unix with an `owner`
+keeps only a file that `owner` already owns. A file owned by this process
+instead (a leftover from a run that died before its `fchown`, or an unrelated
+file linked at the name) is locked, has its *name* unlinked and is replaced by a
+fresh file, so it is never modified and the owner is never locked out. `fchmod`
+and `fchown` touch only a file the call created or one with a single name that
+the owner owns; the owner's file with another name is locked as it is. The full
+protocol and what it guarantees are in the
+[module doc](crates/file-lock/src/exclusive.rs); Windows opens without
+`FILE_SHARE_DELETE` so the name stays bound to the vetted file while the lock is
+held.
+
+The directory above the lock is as attacker-writable as the name (every
+component under the user's profile is theirs to replace), so `Exclusive` opens it
+first as a [`util::dir::Dir`](crates/util/src/dir.rs): one component at a
+time, relative to the handle already held (`openat` with `O_NOFOLLOW` and
+`mkdirat` on unix; `NtCreateFile` relative to the parent handle on Windows, which
+opens a reparse point as itself so it can be judged). Every later step on the lock
+file (the open, the name check, the unlink of a leftover) goes through that
+handle. A path call would resolve the whole path again and follow whatever the
+user swapped in.
+
+- **Which links are followed.** Under the ownership-transition rule of
+  [Privileged code in folders a user may own](#privileged-code-in-folders-a-user-may-own):
+  a link the system owns (macOS's `/var`, `/tmp` and `/etc`, hence `temp_dir()`;
+  Windows's `C:\Documents and Settings`) is followed, and so is a user's link to a
+  folder that user owns (a `~/Library` moved to another disk); a user's link into
+  a folder the system or another account owns is refused. Windows follows symlinks,
+  junctions and mount points under the same rule and refuses any other reparse
+  point. The refusal is a `Refused` that names the lock path and carries a
+  `util::dir::Refusal`.
+- **Ownership.** With an `owner`, the final directory must be owned by it or by
+  this process (the second covers a directory a previous run created and died
+  before handing over); any other owner is refused. Windows has no unix ids and
+  does not check.
+- **Search-only walk (unix).** Every component is opened for lookup only (Linux
+  `O_PATH`, macOS `O_SEARCH`), which asks for search permission and not read, so a
+  directory the caller can pass through but not list (`0o311`) is still on a usable
+  path; only the final directory is reopened readable, through the handle in hand,
+  for `fchown`, `fchmod` and `fsync`.
+- **OS floor.** `openat`, `mkdirat`, `fstatat`, `unlinkat`, `renameat` (Linux
+  2.6.39 for `O_PATH`, macOS 10.10) and `NtCreateFile` / `NtSetInformationFile` with a root
+  directory (every NT version). Neither `openat2(RESOLVE_NO_SYMLINKS)` (Linux 5.6)
+  nor `O_NOFOLLOW_ANY` (macOS 10.15) is used, so one code path serves every
+  version and there is no fallback to path resolution. The Windows replace uses
+  `FileRenameInformationEx` with POSIX semantics (Windows 10 1607, NTFS) and the
+  plain replace where the volume rejects it.
+- **Missing directories** above the file are created the same way, relative to
+  their parent's handle, never by `create_dir_all` on a path.
+
+A symlink (on Windows any reparse point), directory, socket or other non-regular
+file at the name, a file owned by a third party, or a directory in the path that
+`Dir` refuses, is **refused**: an `InvalidData` error holding a
+`file_lock::Refused`. A second name for the lock file is not: the count can change
+after it is read.
+
+State-file writers use the same handle. `bridge-target.json`,
+`bridge-startup.json`, `bridge-plugins.json` and the four fail-closed files
+(`bridge-failclosed.json`, `bridge-lockdown.json`, `bridge-lockdown-pf.json`,
+`bridge-boottime.json`) are written by `Dir::write_atomic` (most through
+`util::dir::write_state_file`): the temp file's owner, mode and ACL are set
+on its own handle before the rename and nothing touches the final name after it,
+so a name swapped for a hard link or symlink after the rename changes nothing.
+`the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps them on it.
+
+`bridge-routes.json` is a `util::versioned_file::VersionedFile`, which opens its
+directory as a `Dir` for each call (load, store, remove, move-aside) and does
+every step inside that handle: the read, the staged temp file (sealed through its
+own handle), the backup hard link, the no-clobber rename, the replace and the
+directory flush. A symlink at the file's own name is never read through: it is a
+file this release cannot read, and the file's role decides what happens to it.
+The update marker (`hole_common::update_marker`) and the log directory
+(`hole_common::logging::init_dual`, with `DirRotate`) are written the same way.
+
+`Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
+lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
+the path, and logging the error with `%e` or `?e` cannot put a username in
+`bridge.log` (which the support bundle collects). `Refused::path()` is the one way
+out; a caller that wants it chooses a sink that may hold a path (`gui.log`), never
+the bridge log or the bundle.
+
+### Privileged code in folders a user may own
+
+The bridge runs as root or SYSTEM, and some of what it reads and writes sits under the interactive user's
+profile: the state directory, the log directory, the update marker. Every component of such a path is the
+user's to replace between any two calls, so a path call (`create_dir_all`, `chown`, `rename`, `remove_file`,
+`File::create`) resolves the whole path again and can be sent anywhere. Code that acts in such a folder
+follows these rules, which [`util::dir::Dir`](crates/util/src/dir.rs) implements once; use it, do not
+re-derive them.
+
+1. **Walk through handles.** Open the directory once, one component at a time, each relative to the handle
+   already held (`openat` on unix, `NtCreateFile` relative to the parent handle on Windows). Every later step
+   names a file by one name *inside that handle*.
+
+1. **Hand the walk the path as it was given.** A state or log directory is never resolved first (`canonicalize`,
+   `realpath`): resolving follows every link with no rule, so the user's link to a folder of root's is the folder's
+   own name by the time the walk judges it, and the walk accepts it. `std::path::absolute` makes a path absolute
+   without following anything.
+
+1. **The ownership-transition rule.** A link is followed only if the walk never moves from a folder an
+   unprivileged user owns into one somebody else owns. This is systemd's `chase()` with `CHASE_SAFE`
+   (`safe_transition`), tightened in two places:
+
+   - A link is judged by its own owner as well as by the folder it sits in. A link the system owns (unix: root;
+     Windows: SYSTEM, Administrators, TrustedInstaller) is followed in a folder the system owns (macOS's `/var`,
+     Windows's `C:\Documents and Settings`), and refused in a user's folder, where it can only be a hard link the
+     user planted.
+   - A link an unprivileged user owns binds the walk to that user. The walk may pass through anyone's folders
+     (an absolute target restarts at the root), but it creates only in folders that user owns and ends only in
+     one. A user's link to their own relocated profile is followed; their link to `/etc` is refused, and so
+     is a link whose target is another user's.
+
+   Without the second tightening a link a user plants in a folder the system owns (`/tmp`) leads anywhere:
+   `safe_transition` lets any step away from a system-owned folder pass and never sees who owns the link; that
+   check is the cautionary case. The rule is one decision in one place (`dir/trail.rs`, `Owner::may_enter` and `Trail`), decided on
+   each link, never at a call site.
+
+   Two more things belong to the walk. It follows at most as many links as the OS itself follows in one path
+   (`MAXSYMLINKS` 40 on Linux, 32 on macOS; 63 reparse points on Windows), which also ends a loop: a user plants
+   the links and each can name the next several times, so without the bound a chain of forty costs exponential
+   time in a process that runs as root. And a folder the walk makes below a user's link is given to that user at
+   once, because a folder the bridge made is the bridge's on disk and the next walk through the link would refuse
+   it. The user owns the parent, so the name can be swapped between making the folder and giving it; the hand-over
+   therefore opens the name once (unix: `O_DIRECTORY | O_NOFOLLOW`), requires the handle to be a directory the
+   bridge itself owns (a swapped-in folder is the user's, a hard link is not a directory), and gives that handle
+   (`fchown`). On Windows the owner is set through a handle re-opened for the purpose and compared with the made
+   one (it takes the restore privilege an elevated token holds). A folder made on a path with no user's link is
+   left as its maker's, on Windows too: a folder SYSTEM made there is Administrators-owned, and if a user later
+   puts a link they own above it, the walk refuses it on every start after (unix hands the final folder over in
+   `Dir::secure`; Windows has no counterpart).
+
+1. **Never follow the final name.** A file operation opens its name with `O_NOFOLLOW` / `FILE_OPEN_REPARSE_POINT`
+   and creates with `O_EXCL`. A link there is renamed, linked or unlinked as itself and never read or written
+   through. A FIFO there is not waited for (`O_NONBLOCK`), and reading anything that is not a regular file is
+   refused.
+
+1. **Write only to a file you made or the owner already owns.** A file kept at a name across runs (the log) is
+   opened with `Dir::append_own_file`: created with `O_EXCL`, or an existing file taken only if it is the expected
+   owner's with no other name (unix: its uid and a link count of 1; Windows: no other name). Anything else at the
+   name (another name of a file, a link, a FIFO) is unlinked and replaced, never written through, and an existing file's owner and mode are
+   left alone.
+
+1. **Read through the handle too.** A privileged read of a fixed name in such a folder is `ReadDir::read` after the
+   same walk (`util::dir::read_state_file` for a state file). `std::fs::read` opens by path without `O_NONBLOCK`: a
+   FIFO the user plants at the name hangs the bridge (at start, before it serves; at shutdown, before it tears
+   down), a link to `/dev/zero` is read without end, and a link is read as any path the user names. A read by
+   path stays only where the reader is the unprivileged GUI. Code that only reads holds a `ReadDir`, not a `Dir`:
+   it has no method that writes, renames or removes, so writing through a directory opened for reading cannot be
+   written, on any platform. Windows is not asked for the right to add to a `ReadDir`'s directory, so a folder
+   whose ACL a machine tightened to read-only for the reader (the GUI reads the update marker as the user) is
+   still read. Code that also writes opens a `Dir` and takes a `ReadDir` view of it with `Dir::reader`
+   (`VersionedFile::store` and `remove` read the current file that way; `load` opens a `ReadDir`).
+
+   `read_state_file` also refuses a file the folder's owner cannot vouch for (`Refusal::ForeignFile`, decided by
+   `trail::may_read` on both platforms): the file must be owned by the folder's own user, or by the system (root,
+   SYSTEM, Administrators) with exactly one link. A user can hard-link any file the system can read at a state name
+   (macOS has no `protected_hardlinks`), and the planted name has two links. The rule stops that and nothing else
+   about ownership: a file the system owns that the user moved into the folder keeps its owner and its one link
+   (a rename moves the inode), so it is read. What the user could learn from it is limited by the readers, below.
+   This holds only for the state files,
+   which are published by rename and so have one name; `ReadDir::read`, which `VersionedFile::load` and the update
+   marker use, does not have it yet, because `VersionedFile::store` and the marker's claim make a second name for a
+   live file themselves. The rule reaches them in the follow-up branch `azhukova/1118-2`.
+
+1. **Remove and move aside through the handle too.** A state file is removed with `util::dir::remove_state_file` and
+   moved aside with `Dir::rename_noreplace` (`dns_state::supersede`), never `std::fs::remove_file` or `rename` on a
+   path: a component the user swapped for a link redirects the call, and a probe followed by a rename replaces a name
+   that appeared in between. The same holds for the stale socket (`socket::remove`, `util::dir::make_dir_and_free_name`)
+   and the installer's SID file in the `hole` folder of `%ProgramData%`, to which a standard user can add names (it
+   inherits `BUILTIN\Users:(CI)(WD,AD,WEA,WA)`; the installer does not narrow it). The socket's bind and the mode or
+   DACL set on it afterwards still name it by path: no platform binds relative to a directory handle.
+
+1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a
+   temp file, before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
+
+1. **Never touch a path after a rename.** Once the temp file has its final name the writer does nothing to that
+   name: a name swapped for a hard link or a symlink after the rename changes nothing.
+
+`the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps the state-file writers on the handle.
+`crates/bridge/src/dir_writers_tests.rs` holds every writer into a state directory to two properties: a hard link, a
+symlink or a FIFO planted at a name it acts on changes nothing it leads to, and the writer either takes the name over
+(or removes it) or refuses it with a typed refusal, and a second run in the same layout, with or without a user's link
+on the path, succeeds. A source file that opens a `Dir`, calls `write_state_file`, `remove_state_file`,
+`make_dir_and_free_name` or `append_own_file`, or writes a `VersionedFile`, and has no row in its table fails
+`every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. The readers have the same kind
+of table (`no_reader_reads_through_a_symlink_planted_at_its_name`, `no_reader_waits_on_a_fifo_planted_at_its_name`,
+and `state_symlink_tests.rs` in `tun-engine`): each writes a valid file, plants the name, and the reader must not
+report the file the name leads to. A hard link is the file's own inode, so only `read_state_file`'s ownership and link-count rule tells it from the
+file (`no_reader_reads_a_hard_link_the_system_would_not_have_made` and its `tun-engine` twin: a test cannot make a
+file the system owns without being the system, so the planted name is refused when the runner is root or an elevated
+token and read when it is a user). What a reader takes from a folder the user owns is parsed as that state's schema
+and never echoed: every reader turns its `serde_json::Error` into a `util::parse_error::ParseFailure` (category and
+position) where the parse happens, since the error's own text quotes the file, and the log goes to `bridge.log`, which
+the user can read (`no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse`, here and in `state_symlink_tests.rs`).
+The installer-SID reader (`take_installer_user_sid`) reads plain text and parses nothing as JSON; it logs a fixed
+warning for text that is not a SID and never the text (`text_that_is_not_a_sid_is_refused_and_never_logged`). Only text that passes
+`is_valid_sid_string` reaches the DACL builder, which logs no rejected text either.
+Five source scans close the class. They read every use of a function through the file's own `use` and `type` declarations
+(`dir_writers_tests/scan.rs`): a name imported, aliased, globbed or reached through a `type` alias is seen as the function it
+stands for, whether it is called or only named as a value (`.map(fs::read)`, `let f = fs::read;`, `(fs::read)(p)`). A `use`
+declaration itself, a definition, a macro, and a field or parameter that has the name are not uses; a method counts when it
+is called. A name that several `use` or `type` declarations bind (the arms of a `cfg` split) stands for every path they
+give it. The scans are lexical tripwires over the explicit lists in `dir_writers_tests.rs`, not a proof about every
+spelling: the resolver does not see a function bound by anything but `use` and `type` (a macro that expands to a
+path, a `let` that renames a function and is then called by the new name), a path through a module of the same file that
+re-exports it (`mod sys { pub use std::fs::remove_file; }`, then `sys::remove_file(p)`), or a call with a qualified self
+(`<std::fs::File>::create(p)`). A call the lists do not name is not seen either: a new spelling of a by-path call needs a
+new row in the list.
+`no_privileged_code_acts_on_a_file_by_name`
+(no privileged crate calls any of the `BY_NAME` list: `fchownat`, `fchmodat`, `libc::{chown, lchown, chmod, lchmod}`,
+`fs::{chown, lchown, set_permissions}`, `SetNamedSecurityInfo*`, `SetFileSecurity*`, `SetFileAttributes*`,
+`fs::{remove_file, remove_dir, remove_dir_all, rename, create_dir, create_dir_all, write, copy, hard_link, soft_link, symlink, symlink_file, symlink_dir}`, `File::{create, create_new, options}`, `OpenOptions::new`,
+`libc::{unlink, rmdir, rename, mkdir, link, symlink}`, `DeleteFile*`, `MoveFile*`, `CreateDirectory*`,
+`RemoveDirectory*`, `CreateHardLink*`, `CreateSymbolicLink*`; `OpenOptions::new` is on it so that a create by path is
+judged here even in a file that `BY_PATH_ALLOWED` exempts for reads), except the sites listed in `BY_NAME_ALLOWED`, each
+with its count and reason: a folder no user can add names to, the acting user's own, a test's, or an "open owner question" that
+waits for a decision), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates, `hole` among them, open no
+file by path, except the files listed in `BY_PATH_ALLOWED`, each with its reason),
+`no_privileged_code_resolves_a_link_before_the_walk` (the same crates call neither `canonicalize` nor `realpath`,
+except the lines listed in `RESOLVING_ALLOWED`, each with its reason), `no_state_module_logs_a_path` (the
+state modules log the file's name: no `.display()` or `.to_string_lossy()`, and no formatting or tracing macro takes a
+binding the file declares as a path, as an argument, a `?`/`%` field or a `{name:?}` placeholder) and `no_privileged_json_parse_keeps_the_raw_error` (every non-test `serde_json` parse in `bridge`,
+`tun-engine`, `util` and `common`, spelled `serde_json::from_*`, `Deserializer::from_*` or a `from_*` imported by name,
+converts its error before the next parse or `fn`; the parses listed in `JSON_PARSE_ALLOWED` do not, each with its reason). A test of
+a walk plants links with `util::dir::testing` (`plant_link`, `user_dir`, `SystemScratch`), which hand what they
+make to an unprivileged owner whoever runs the test: a link to a folder the system owns must be refused, a link
+to a folder its own owner owns must be followed, and the same through each writer.
+
 ### Route-command failure policy
 
 `netsh`/`route` subprocesses run through one of two phase runners in
@@ -2420,7 +2659,13 @@ The **marker** (`update-in-progress.json` in the service log dir, world-readable
 0o644 cross-privilege) does triple duty: the GUI holds its last snapshot instead
 of flashing Disconnected while it is set, the bridge shutdown disarms the cover
 while it is set, and it is the PR3 banner source. It is cleared unconditionally
-(remove-by-path) on the next bridge's post-bind sweep.
+(remove-by-name, never parse-then-clear) on the next bridge's post-bind sweep.
+Every write, the clear and the read go through the log directory's no-follow `Dir`
+handle (a temp file staged and sealed through its own handle, then renamed or, for
+the single-occupancy claim, hard-linked). The read is the same for the GUI as the
+user and for the bridge as root: the bridge reads it in a log directory a user may
+own, where a FIFO planted at the name must not be waited for. A link or a FIFO at
+the name reads as `Marker::Indeterminate`, a claim of no cutover.
 
 ### Config corruption recovery
 
@@ -2449,6 +2694,20 @@ Rust's unwinding panic hook. The first-party Apache-2.0
 signal-safe work: write a fixed-format `crash-<kind>-<pid>.marker` via raw
 syscalls (no heap/locks/`format!`). All I/O errors are swallowed.
 
+The log directory is the interactive user's while the bridge writes in it as
+root, so [`attach`](crates/tombstone/src/crash.rs) opens it once through
+`util::dir::Dir` (see
+[Privileged code in folders a user may own](#privileged-code-in-folders-a-user-may-own))
+and holds it for the process lifetime. The handler creates the marker, and the
+Windows dev-only `.dmp`, by a name pre-encoded at `attach` and relative to that
+handle: `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` on unix,
+`NtCreateFile(FILE_CREATE)` on Windows. An entry already at the name is never
+written through, truncated or replaced; `attach` picks a name that is free then
+(`-1`, `-2` after the pid when an earlier process's marker or dump with the same
+pid is unswept), so a name planted afterwards costs that one crash its marker
+and the entry nothing. A directory that cannot be opened leaves the handler
+attached (on macOS it still ends the process) and writing no marker.
+
 On Windows and Linux it then returns `Handled(false)` so the OS default path
 (WER / core dump) still runs. **On macOS it never returns** — it `_exit(70)`s,
 for every fault class, every attach kind and every build, so a macOS crash
@@ -2467,7 +2726,13 @@ callback does.
 `tombstone::sweep(log_dir)` runs at the next start of the same kind, emits a
 `tracing::error!(target: "crash", …)`, and deletes the marker. Markers land in
 `log_dir` (not `state_dir`) so the elevated bridge's marker is readable by the
-unprivileged GUI.
+unprivileged GUI. The sweep opens `log_dir` through `Dir` and reads each marker
+through a `ReadDir` by its name inside that handle: a symlink at a marker name
+is reported unreadable and unlinked as itself, a FIFO is never waited for, and a
+marker the directory's owner cannot vouch for (`ReadDir::read_vouched`, the rule
+of `read_state_file`) is reported unreadable too.
+The listing of names is by path (names only; each read and removal is by name
+in the handle, as `cleanup_legacy_daily_logs` does).
 
 - **Platform coverage:** marker + sweep work on Windows, macOS, **and Linux**
   (galoshes ships a Linux release, so `tombstone` must compile and run there).
@@ -2554,27 +2819,28 @@ Each publishable member declares a release group in
 `[package.metadata.hole-release].group` (enforced by `xtask-lib::version`).
 `publish = false` means not pushed to crates.io.
 
-| Directory / file                   | Crate · license · group                | Purpose                                                                          |
-| ---------------------------------- | -------------------------------------- | -------------------------------------------------------------------------------- |
-| `crates/common/`                   | `hole-common` · GPL · hole             | Shared types: protocol, config, import, logging                                  |
-| `crates/bridge/`                   | `hole-bridge` · GPL · hole             | Bridge library (TUN/routing/SS/IPC/DNS)                                          |
-| `crates/hole/`                     | `hole` · GPL · hole                    | Tauri app + CLI + bridge entry (binary `hole`)                                   |
-| `crates/tun-engine[-macros]/`      | GPL · hole                             | TUN + routing + packet-loop engine (+ `#[freeze]` macro)                         |
-| `crates/dump[-macros]/`            | GPL · hole                             | YAML-shaped logging representation (+ derive)                                    |
-| `crates/handle-holders/`           | GPL · hole                             | File-handle introspection (Win NtQuery / mac lsof)                               |
-| `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                          |
-| `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                                |
-| `crates/stepstool/`                | Apache · —                             | Elevation primitives: sudo priming + wrapping (POSIX), elevation detection (Win) |
-| `crates/garter[-bin]/`             | Apache · garter                        | SIP003u plugin-chain runner lib (**on crates.io**) + CLI + mock-plugin fixture   |
-| `crates/galoshes/`                 | Apache · galoshes                      | Bundled+standalone SIP003u plugin (YAMUX + embedded ex-ray)                      |
-| `crates/ex-ray/`                   | Apache · ex-ray                        | First-party Go SIP003u plugin on v2ray-core (wire-compatible with v2ray-plugin)  |
-| `crates/util/`                     | Apache · —                             | `port_alloc`, `retry` (Apache so plugins can depend)                             |
-| `crates/plugin-e2e/`               | GPL · —                                | Shared ss-server/cert harness + ex-ray↔stock + galoshes roundtrips (#197)        |
-| `crates/dev-console/`              | GPL · —                                | Dev-mode supervisor: bridge (elevated) + Vite + GUI, multiplexed logs (#454)     |
-| `build.yaml`                       | —                                      | Declarative build-target DAG for `cargo xtask build\|run\|list`                  |
-| `xtask/`, `xtask-lib/`             | —                                      | Task runner + helper crate shared with `crates/hole/build.rs`                    |
-| `msi-installer/`, `dmg-installer/` | —                                      | Windows MSI (WiX) + macOS DMG signature checks (Python, #364)                    |
-| `ui/`, `scripts/`, `tests/`        | —                                      | Frontend (Vite), utility scripts, E2E specs (WebDriverIO)                        |
+| Directory / file                   | Crate · license · group                | Purpose                                                                              |
+| ---------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------ |
+| `crates/common/`                   | `hole-common` · GPL · hole             | Shared types: protocol, config, import, logging                                      |
+| `crates/bridge/`                   | `hole-bridge` · GPL · hole             | Bridge library (TUN/routing/SS/IPC/DNS)                                              |
+| `crates/hole/`                     | `hole` · GPL · hole                    | Tauri app + CLI + bridge entry (binary `hole`)                                       |
+| `crates/tun-engine[-macros]/`      | GPL · hole                             | TUN + routing + packet-loop engine (+ `#[freeze]` macro)                             |
+| `crates/dump[-macros]/`            | GPL · hole                             | YAML-shaped logging representation (+ derive)                                        |
+| `crates/handle-holders/`           | GPL · hole                             | File-handle introspection (Win NtQuery / mac lsof)                                   |
+| `crates/file-lock/`                | Apache · —                             | `Exclusive` lock, safe in a user-writable directory (opens it with `util::dir::Dir`) |
+| `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                              |
+| `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                                    |
+| `crates/stepstool/`                | Apache · —                             | Elevation primitives: sudo priming + wrapping (POSIX), elevation detection (Win)     |
+| `crates/garter[-bin]/`             | Apache · garter                        | SIP003u plugin-chain runner lib (**on crates.io**) + CLI + mock-plugin fixture       |
+| `crates/galoshes/`                 | Apache · galoshes                      | Bundled+standalone SIP003u plugin (YAMUX + embedded ex-ray)                          |
+| `crates/ex-ray/`                   | Apache · ex-ray                        | First-party Go SIP003u plugin on v2ray-core (wire-compatible with v2ray-plugin)      |
+| `crates/util/`                     | Apache · —                             | `port_alloc`, `retry`, `dir` (Apache so plugins can depend)                          |
+| `crates/plugin-e2e/`               | GPL · —                                | Shared ss-server/cert harness + ex-ray↔stock + galoshes roundtrips (#197)            |
+| `crates/dev-console/`              | GPL · —                                | Dev-mode supervisor: bridge (elevated) + Vite + GUI, multiplexed logs (#454)         |
+| `build.yaml`                       | —                                      | Declarative build-target DAG for `cargo xtask build\|run\|list`                      |
+| `xtask/`, `xtask-lib/`             | —                                      | Task runner + helper crate shared with `crates/hole/build.rs`                        |
+| `msi-installer/`, `dmg-installer/` | —                                      | Windows MSI (WiX) + macOS DMG signature checks (Python, #364)                        |
+| `ui/`, `scripts/`, `tests/`        | —                                      | Frontend (Vite), utility scripts, E2E specs (WebDriverIO)                            |
 
 The Apache crates are Apache-2.0 per-crate (see [NOTICES.md](NOTICES.md)); Hole's
 own crates are GPL-3.0-or-later. Combined distributions (`hole.exe`, `hole.msi`,
@@ -3111,7 +3377,8 @@ close. See #892 for the tracking issue, #880 for the full-tunnel e2e gap, and
 
 ### Log destinations
 
-Both GUI and bridge write to stderr **and** a 10 MiB rotating file (one backup).
+Both GUI and bridge write to stderr **and** a 10 MiB rotating file (one backup; a second file, `<name>.1.fallback`, only
+while the first backup's name cannot take the rotation).
 Default dir is `dirs::state_dir()/hole/logs` (`gui.log`, `bridge.log`):
 
 - Windows `%LOCALAPPDATA%\hole\logs\`, macOS `~/Library/Application Support/hole/logs/`
@@ -3119,6 +3386,24 @@ Default dir is `dirs::state_dir()/hole/logs` (`gui.log`, `bridge.log`):
 
 `hole bridge log` defaults to the installed-service dir; override with `--log-dir`
 or `HOLE_LOG_DIR` to read a foreground/dev bridge's log.
+
+The log directory sits in the user's profile when the bridge runs elevated on
+their behalf, so `init_dual` opens it once as a
+[`util::dir::Dir`](crates/util/src/dir.rs) (no symlink followed, created if
+missing, handed to the user) and the log file is a
+[`DirRotate`](crates/common/src/logging/dir_rotate.rs) inside that handle: the
+open, the rotation rename, the legacy-file cleanup and the `chown` of each fresh
+active file are all by a single name in it. A log directory the walk refuses (a
+symlink a user could have planted) disables the file sink with one line on the
+real stderr, which carries no path; the bridge keeps running.
+
+The active file never holds more than the limit, whatever the user plants in the directory. A name the rotation
+cannot be renamed over (a directory at `bridge.log.1`, a handle without delete sharing on it) sends the full file to
+`bridge.log.1.fallback` instead, replacing the one before it, so at most one such file exists; a rotation that
+reaches `bridge.log.1` again removes the fallback, which holds older lines. When neither name can take the file (the
+active file itself is held without delete sharing, or both names are directories) it stays full and the lines are
+dropped, as they are while it cannot be opened, until a rotation succeeds: a log the user can block must not fill the
+volume of the account that writes it.
 
 ### WebView2 and Chromium logs
 
@@ -3169,7 +3454,7 @@ process-global registry of armed literals behind an `ArcSwap` (lock-free reads,
 so no logging call can block behind a concurrent arm) and an `aho-corasick`
 automaton (`LeftmostLongest`, ASCII-case-insensitive). `RedactingWriter` wraps
 four non-blocking writers in `init_dual`, and **exactly one of them is a log
-file**: the `UserOwnedRotate` appender. Wrapping that one closes the file leak;
+file**: the `DirRotate` appender. Wrapping that one closes the file leak;
 the other three (the stderr layer's writer and the two stdio-relay tees) are the
 developer's terminal and cannot reopen it either way.
 

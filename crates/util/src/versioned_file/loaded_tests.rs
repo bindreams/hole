@@ -262,7 +262,7 @@ fn load_never_rewrites() {
 struct DeniedFs;
 
 impl Fs for DeniedFs {
-    fn read(&self, _path: &std::path::Path) -> io::Result<Vec<u8>> {
+    fn read(&self, _dir: &crate::dir::ReadDir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }

@@ -27,10 +27,7 @@ mod imp {
 
     impl LocalListener {
         pub fn bind(path: &Path) -> io::Result<Self> {
-            let _ = std::fs::remove_file(path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            super::make_room(path)?;
             let inner = tokio::net::UnixListener::bind(path)?;
             Ok(Self { inner })
         }
@@ -129,18 +126,7 @@ mod imp {
         }
 
         fn bind_inner(path: &Path, restrict: bool) -> io::Result<Self> {
-            // Remove stale socket file (ignore "not found"; warn on other errors)
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to remove stale socket file");
-                }
-            }
-
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            super::make_room(path)?;
 
             let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
             let addr = SockAddr::unix(path)?;
@@ -150,7 +136,7 @@ mod imp {
                 // inherited ACEs from the parent directory.
                 let sddl = crate::ipc::SDDL_BASE.replacen("D:", "D:P", 1);
                 if let Err(e) = crate::ipc::set_dacl_from_sddl(path, &sddl, true) {
-                    let _ = std::fs::remove_file(path);
+                    let _ = super::remove(path);
                     return Err(e);
                 }
             }
@@ -235,6 +221,39 @@ mod imp {
 }
 
 pub use imp::{LocalListener, LocalStream};
+
+// The folder of the socket ============================================================================================
+//
+// The socket lives in a folder a standard user can add names to (on Windows the `hole` folder of `%ProgramData%`),
+// and the bridge removes and makes names in it as the system. Both go through a handle on the folder, opened without
+// following a link a user planted on the way to it. The bind itself, and the permissions set on the socket after it,
+// name the socket by path: no platform binds a socket relative to a directory handle.
+
+/// The folder of `path` (the working directory for a bare name) and the name in it.
+fn split(path: &Path) -> io::Result<(&Path, &std::ffi::OsStr)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a socket path names a file"))?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Ok((parent, name))
+}
+
+/// Removes the name at `path` (a stale socket), whatever it is, but not what it points at. A missing name or folder
+/// is `Ok`.
+pub fn remove(path: &Path) -> io::Result<()> {
+    let (parent, name) = split(path)?;
+    util::dir::remove_state_file(parent, name)
+}
+
+/// Makes the folder of `path` if it is missing and frees the name: a stale socket is removed. A name that cannot be
+/// removed is the bind's error, not a warning before the bind's own.
+fn make_room(path: &Path) -> io::Result<()> {
+    let (parent, name) = split(path)?;
+    util::dir::make_dir_and_free_name(parent, name)
+}
 
 /// Bind a listener at the given path, removing any stale socket file first.
 /// Creates parent directories if they don't exist.

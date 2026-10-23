@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::EnvFilter;
+use util::dir::Dir;
 
 // Test-only flush mechanism ===========================================================================================
 //
@@ -574,11 +575,9 @@ fn install_panic_hook_inner() {
 
 // init ================================================================================================================
 
-/// Size threshold at which the active log file is rotated.
+/// Size threshold at which the active log file is rotated. The on-disk layout is `<name>` (current) +
+/// `<name>.1` (previous).
 const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
-/// Number of rotated log files to keep alongside the active one.
-/// With a value of 1, the on-disk layout is `<name>` (current) + `<name>.1` (previous).
-const MAX_ROTATED_LOGS: usize = 1;
 
 /// Build one `EnvFilter` from a directive slice: global default `info`,
 /// `RUST_LOG` via `from_env_lossy`, the slice on top, then the
@@ -692,12 +691,26 @@ pub fn init_dual(
     stderr_directives: &[String],
     owner: Option<(u32, u32)>,
 ) -> LogGuard {
-    let _ = std::fs::create_dir_all(log_dir);
-    // The elevated bridge creates `log_dir` as root; hand it to the real user
-    // so they can read `bridge.log` without `sudo` (#572). No-op when `owner`
-    // is `None` (the unprivileged GUI) or off-macOS.
-    util::ownership::chown_if_some(log_dir, owner);
-    cleanup_legacy_daily_logs(log_dir, log_filename);
+    // The log directory sits in the user's profile when the bridge runs elevated on their behalf, so it is
+    // opened once without following a symlink and every step below is by a name inside that handle. The
+    // elevated bridge creates it as root; hand it to the real user so they can read `bridge.log` without
+    // `sudo`. `owner` is `None` for the unprivileged GUI.
+    let dir = match Dir::open(log_dir, true, owner) {
+        Ok(dir) => {
+            dir.secure(owner, None)
+                .expect("securing a directory with no mode has no step that can fail");
+            cleanup_legacy_daily_logs(log_dir, &dir, log_filename);
+            Some(dir)
+        }
+        Err(e) => {
+            // No subscriber and no redirect yet: the real stderr. The error carries no path.
+            let _ = writeln!(
+                io::stderr(),
+                "hole: the log file is disabled, its directory was not opened: {e}"
+            );
+            None
+        }
+    };
 
     // Order matters: redirect BEFORE constructing the non-blocking stderr
     // writer so the writer targets the saved-original handle, not the pipe.
@@ -717,13 +730,6 @@ pub fn init_dual(
         redirect_stdio_to_tracing().expect("stdio redirect failed")
     };
 
-    let file_appender = file_rotate::FileRotate::new(
-        log_dir.join(log_filename),
-        file_rotate::suffix::AppendCount::new(MAX_ROTATED_LOGS),
-        file_rotate::ContentLimit::Bytes(MAX_LOG_BYTES),
-        file_rotate::compression::Compression::None,
-        None,
-    );
     // The FILE appender is `lossy(false)`: the proxy-stop teardown burst
     // (SystemRoutes::drop sequence — route commands, state-file clear,
     // Remove-NetAdapter — emitted in tens of ms) must never be silently
@@ -734,15 +740,12 @@ pub fn init_dual(
     //
     // The STDERR non-blocking writer keeps `lossy(true)`: a wedged
     // terminal (Ctrl+S on a console session) MUST NOT block the bridge.
-    // Wrap the size-rotating appender so each rotation re-`chown`s the fresh
-    // root-owned active file back to the real user. `owner = None` is a perfect
-    // passthrough (the `reconcile_owner` early-return); off-macOS it is a no-op.
-    let owned = UserOwnedRotate::new(
-        file_appender,
-        log_dir.join(log_filename),
-        owner,
-        |p: &std::path::Path, uid: u32, gid: u32| util::ownership::chown_path(p, uid, gid),
-    );
+    // Each rotation hands the fresh root-owned active file back to the real user
+    // (`owner`; `None` leaves it alone).
+    let owned: Box<dyn Write + Send> = match dir {
+        Some(dir) => Box::new(DirRotate::new(dir, log_filename.as_ref(), MAX_LOG_BYTES, owner)),
+        None => Box::new(io::sink()),
+    };
     // The redaction wrap sits under the appender, so every formatted event
     // passes through it whoever authored it — a Hole site, a dependency at
     // the default global `info`, an OS command's argv, or a relayed plugin
@@ -807,7 +810,10 @@ pub fn init_dual(
 /// In practice each `init()` caller owns exactly one stem.
 ///
 /// Non-UTF-8 filenames are skipped (the old scheme produced pure-ASCII names).
-fn cleanup_legacy_daily_logs(log_dir: &Path, log_filename: &str) {
+fn cleanup_legacy_daily_logs(log_dir: &Path, dir: &Dir, log_filename: &str) {
+    // The listing is by path, but it only supplies names: each removal is by name inside `dir`, so a path
+    // swapped for another directory's listing can remove nothing outside `dir`, and only a name of the legacy
+    // shape inside it.
     let Ok(entries) = std::fs::read_dir(log_dir) else {
         return;
     };
@@ -817,7 +823,7 @@ fn cleanup_legacy_daily_logs(log_dir: &Path, log_filename: &str) {
             continue;
         };
         if is_legacy_daily_suffix(name_str, log_filename) {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = dir.unlink(&name);
         }
     }
 }
@@ -852,11 +858,11 @@ fn is_legacy_daily_suffix(candidate: &str, stem: &str) -> bool {
         && b[9].is_ascii_digit()
 }
 
-mod owned_rotate;
+pub mod dir_rotate;
 
 /// Arming the redaction registry from a server entry.
 pub mod redact_arm;
-use owned_rotate::UserOwnedRotate;
+use dir_rotate::DirRotate;
 
 pub(crate) mod yaml_format;
 

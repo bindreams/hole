@@ -2,12 +2,10 @@
 //! a rename or a delete is refused.
 
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 
 use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
-use tempfile::NamedTempFile;
 
 use super::{DefaultPlacement, Fs, Removal, VersionedFile};
 use crate::versioned_file::fixtures::{dir, names, put, unreadable_bytes, DecisionFile};
@@ -52,7 +50,7 @@ fn capture() -> (impl tracing::Subscriber + Send + Sync, WaitableWriter) {
 struct FailsPublish;
 
 impl Fs for FailsPublish {
-    fn publish(&self, _tmp: NamedTempFile, _dest: &Path) -> io::Result<()> {
+    fn publish(&self, _staged: crate::dir::Staged<'_>) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }
@@ -61,11 +59,16 @@ impl Fs for FailsPublish {
 struct NoRenameAndNoDelete;
 
 impl Fs for NoRenameAndNoDelete {
-    fn rename_noreplace(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+    fn rename_noreplace(
+        &self,
+        _dir: &crate::dir::Dir,
+        _from: &std::ffi::OsStr,
+        _to: &std::ffi::OsStr,
+    ) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
-    fn remove_file(&self, _path: &Path) -> io::Result<()> {
+    fn remove_file(&self, _dir: &crate::dir::Dir, _name: &std::ffi::OsStr) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }
@@ -73,7 +76,12 @@ impl Fs for NoRenameAndNoDelete {
 struct NoRename;
 
 impl Fs for NoRename {
-    fn rename_noreplace(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+    fn rename_noreplace(
+        &self,
+        _dir: &crate::dir::Dir,
+        _from: &std::ffi::OsStr,
+        _to: &std::ffi::OsStr,
+    ) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
@@ -156,7 +164,12 @@ fn a_failed_delete_after_the_link_leaves_a_logged_backup() {
 struct RenameRefused;
 
 impl Fs for RenameRefused {
-    fn rename_noreplace(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+    fn rename_noreplace(
+        &self,
+        _dir: &crate::dir::Dir,
+        _from: &std::ffi::OsStr,
+        _to: &std::ffi::OsStr,
+    ) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }

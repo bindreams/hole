@@ -592,13 +592,14 @@ fn engage_with(
     //    the `-E` before propagating — else the refcount leaks with no state
     //    file to recover it from, exactly as `engage_lockdown`'s `FreshEnable`
     //    and `Reenable` arms already unwind. The failures this covers are the
-    //    ones `state::save` really has: an unwritable state dir, a full disk.
-    //    NOT a failed chown — `save` chowns via `chown_if_some`, which logs
-    //    and swallows, so it cannot fail this call. Without the unwind, pf
+    //    ones `state::save` really has: an unwritable state dir, a full disk,
+    //    a state dir that is a symlink or has a third party's owner (refused).
+    //    NOT a failed chown — `save` hands the file over with `fchown`, which
+    //    logs and swallows, so it cannot fail this call. Without the unwind, pf
     //    stays enabled until reboot under an unreferenced token — a
     //    fail-CLOSED leak hiding behind a path whose traffic verdict is
     //    fail-open. The refcount is the ONLY thing stranded: `save` is
-    //    tempfile + `persist`, and `persist` is both the sole writer of
+    //    temp file + rename, and the rename is both the sole writer of
     //    `bridge-failclosed.json` and the last fallible step, so a failed save
     //    leaves no partial file for a later sweep to act on.
     let st = state::FailClosedState {

@@ -3,6 +3,7 @@ use hole_common::config::ServerEntry;
 use hole_common::protocol::TunnelMode;
 use std::sync::mpsc;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
+use util::dir::testing::{plant_link, user_dir, SystemScratch};
 
 use crate::test_support::log_capture::VecWriter;
 
@@ -464,7 +465,7 @@ fn apply_round_trips_through_load_and_save() {
 #[skuld::test]
 fn a_second_apply_call_sees_the_first_ones_write_not_a_value_captured_before_acquiring() {
     // Genuine two-thread race, real rendezvous (channels, no sleep/poll) —
-    // same shape as `tun_engine::exclusive`'s
+    // same shape as `file_lock::Exclusive`'s
     // `acquire_blocks_until_the_holder_releases`. Thread A holds `apply`'s
     // lock open (via a closure that blocks on a channel) while thread B's
     // `apply` call is issued; B must block until A's whole load-apply-save
@@ -772,4 +773,127 @@ fn the_persisted_file_shapes_still_carry_their_non_secret_payload() {
     );
     let text = yaml(PersistedTarget::Off.dump());
     assert!(text.contains("off"), "and `Off` still names itself: {text}");
+}
+
+// A symlink among the components of the state directory ===============================================================
+//
+// The elevated bridge writes here as root while the directory sits under the interactive user's profile,
+// so every component of its path is theirs to replace.
+
+#[skuld::test]
+fn every_state_file_writer_refuses_a_link_to_a_folder_the_system_owns_and_writes_nothing_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = SystemScratch::new();
+    let link = tmp.path().join("hole");
+    plant_link(scratch.root(), &link);
+    let pref = StartupPreference::default();
+    let written = [STATE_FILE_NAME, STARTUP_PREFERENCE_FILE_NAME].map(|name| scratch.root().join(name));
+    let before = written.clone().map(|path| path.exists());
+
+    // The link itself, and a directory that does not exist below it.
+    for state_dir in [link.clone(), link.join(scratch.name()).join("state")] {
+        assert!(save(&state_dir, &Target::Off, None).is_err(), "save {state_dir:?}");
+        assert!(
+            save_startup_preference(&state_dir, &pref, None).is_err(),
+            "save_startup_preference {state_dir:?}"
+        );
+        assert!(apply(&state_dir, None, |_| Target::Off).is_err(), "apply {state_dir:?}");
+        assert!(
+            apply_startup_preference(&state_dir, None, |_| {}).is_err(),
+            "apply_startup_preference {state_dir:?}"
+        );
+    }
+
+    assert_eq!(
+        written.map(|path| path.exists()),
+        before,
+        "a state file was written in the system's folder"
+    );
+    assert!(!scratch.path().exists(), "a folder was made in the system's folder");
+}
+
+#[skuld::test]
+fn the_state_file_writers_write_through_a_users_link_to_the_users_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    let link = tmp.path().join("hole");
+    plant_link(&real, &link);
+
+    save(&link, &Target::Off, None).unwrap();
+    save_startup_preference(&link, &StartupPreference::default(), None).unwrap();
+
+    assert!(real.join(STATE_FILE_NAME).is_file());
+    assert!(real.join(STARTUP_PREFERENCE_FILE_NAME).is_file());
+}
+
+#[skuld::test]
+fn a_leftover_temp_file_is_not_kept_when_the_write_fails() {
+    // A directory at the final name makes the rename fail after the temp file was written.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(STATE_FILE_NAME)).unwrap();
+
+    let err = save(tmp.path(), &Target::Off, None).expect_err("a directory is in the way");
+
+    assert!(matches!(err, TargetError::Write(_)), "{err:?}");
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|name| name != STATE_FILE_NAME)
+        .collect();
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+}
+
+/// Every state-file writer: temp file written, owned, permissioned and renamed in a user-owned dir. Each goes through
+/// `util::dir::Dir`; any by-path step brings the swap attacks back.
+#[skuld::test]
+fn the_state_file_writers_never_chown_chmod_or_rename_by_path() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let writers = [
+        "bridge/src/target.rs",
+        "bridge/src/plugin_state.rs",
+        "tun-engine/src/routing/failclosed/boottime_witness.rs",
+        "tun-engine/src/routing/failclosed/failclosed_state.rs",
+        "tun-engine/src/routing/failclosed/lockdown_pf_state.rs",
+        "tun-engine/src/routing/failclosed/lockdown_state.rs",
+    ];
+    // Each of these resolves a path again (or follows it) after the directory was chosen.
+    let by_path = [
+        "chown_if_some",
+        "create_dir_all",
+        "NamedTempFile",
+        ".persist(",
+        "std::fs::set_permissions",
+        "set_dacl_from_sddl(",
+    ];
+
+    let mut offenders = Vec::new();
+    for writer in writers {
+        let text = std::fs::read_to_string(crates.join(writer)).unwrap();
+        let code: Vec<(usize, &str)> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            code.iter()
+                .any(|(_, line)| line.contains("write_state_file(") || line.contains("Dir::open")),
+            "{writer} no longer writes through the directory handle"
+        );
+        for (idx, line) in code {
+            if let Some(call) = by_path.iter().find(|call| line.contains(**call)) {
+                offenders.push(format!("{writer}:{}: {call}", idx + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a state file is written by path:
+  {}",
+        offenders.join(
+            "
+  "
+        )
+    );
 }

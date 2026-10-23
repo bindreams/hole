@@ -1,6 +1,7 @@
-//! A link at the state path is an entry like any other: `remove` and
-//! `move_aside` act on the name, never on what it points at, and never call it
-//! absent while the name is taken.
+//! A link at the state path is an entry like any other: it is never read
+//! through (so it is a file this release cannot read, and its role decides),
+//! `remove` and `move_aside` act on the name, never on what it points at, and
+//! none of them calls it absent while the name is taken.
 
 use std::path::Path;
 
@@ -22,15 +23,21 @@ fn make_symlink(target: &Path, at: &Path) {
 }
 
 #[skuld::test]
-fn remove_of_a_dangling_symlink_state_path_removes_the_link() {
+fn remove_of_a_dangling_symlink_state_path_moves_the_link_aside() {
     let dir = dir();
     let state = dir.path().join("decision.json");
     make_symlink(&dir.path().join("nowhere"), &state);
 
     let removal = VersionedFile::<DecisionFile>::new(dir.path()).remove().unwrap();
 
-    assert_eq!(removal, Removal::Removed);
+    let Removal::MovedAside(backup) = removal else {
+        panic!("a link is a file the role moves aside, not an absent one: {removal:?}");
+    };
     assert!(std::fs::symlink_metadata(&state).is_err(), "the link is still there");
+    assert!(
+        std::fs::symlink_metadata(&backup).unwrap().is_symlink(),
+        "the backup is the link itself"
+    );
 }
 
 #[skuld::test]
@@ -43,9 +50,24 @@ fn remove_of_a_symlink_state_path_leaves_the_file_it_points_at() {
 
     let removal = VersionedFile::<DecisionFile>::new(dir.path()).remove().unwrap();
 
-    assert_eq!(removal, Removal::Removed);
+    assert!(matches!(removal, Removal::MovedAside(_)), "{removal:?}");
     assert!(std::fs::symlink_metadata(&state).is_err(), "the link is still there");
     assert_eq!(std::fs::read(&target).unwrap(), STATE);
+}
+
+#[skuld::test]
+fn a_symlink_state_path_is_not_read_through() {
+    let dir = dir();
+    let away = crate::versioned_file::fixtures::dir();
+    let target = put(&away, "elsewhere.json", STATE);
+    make_symlink(&target, &dir.path().join("decision.json"));
+
+    let loaded = VersionedFile::<DecisionFile>::new(dir.path()).load();
+
+    assert!(
+        matches!(loaded, crate::versioned_file::Loaded::Unreadable(_)),
+        "{loaded:?}"
+    );
 }
 
 #[skuld::test]
@@ -65,4 +87,28 @@ fn move_aside_of_a_dangling_symlink_state_path_moves_the_link() {
         std::fs::symlink_metadata(&backup).unwrap().is_symlink(),
         "the backup is the link itself"
     );
+}
+
+#[skuld::test]
+fn store_over_a_symlink_state_path_backs_up_the_link_and_not_its_target() {
+    let dir = dir();
+    let away = crate::versioned_file::fixtures::dir();
+    let target = put(&away, "elsewhere.json", STATE);
+    let state = dir.path().join("decision.json");
+    make_symlink(&target, &state);
+
+    VersionedFile::<DecisionFile>::new(dir.path())
+        .store(
+            &DecisionFile { value: "new".into() },
+            &crate::versioned_file::DefaultPlacement::default(),
+        )
+        .unwrap();
+
+    let backup = dir.path().join("decision.json.unreadable.bak");
+    assert!(
+        std::fs::symlink_metadata(&backup).unwrap().is_symlink(),
+        "the backup is the link itself"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), STATE, "the target was not touched");
+    assert!(std::fs::read_to_string(&state).unwrap().contains("\"new\""));
 }

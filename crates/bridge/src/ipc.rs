@@ -302,7 +302,7 @@ impl IpcServer {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = crate::socket::remove(&self.socket_path);
     }
 }
 
@@ -1304,18 +1304,61 @@ pub(crate) const SDDL_BASE: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 #[cfg(target_os = "windows")]
 pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
     use windows::core::HSTRING;
+    use windows::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+
+    let path_wide = HSTRING::from(path.as_os_str());
+    with_sddl_dacl(sddl, protect, |dacl, security_info| {
+        // SAFETY: `path_wide` is alive for the call. `dacl` points into the still-live
+        // security descriptor `with_sddl_dacl` holds. Owner/group pointers are correctly None.
+        unsafe { SetNamedSecurityInfoW(&path_wide, SE_FILE_OBJECT, security_info, None, None, Some(dacl), None) }
+    })
+}
+
+/// [`set_dacl_from_sddl`] on an open file or directory instead of a path: nothing is resolved by name,
+/// so a path swapped for a symlink cannot redirect it. The handle needs `WRITE_DAC`.
+#[cfg(target_os = "windows")]
+pub fn set_dacl_from_sddl_on_handle(handle: &std::fs::File, sddl: &str, protect: bool) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+
+    with_sddl_dacl(sddl, protect, |dacl, security_info| {
+        // SAFETY: `handle` is open for the call. `dacl` points into the still-live security
+        // descriptor `with_sddl_dacl` holds. Owner/group pointers are correctly None.
+        unsafe {
+            SetSecurityInfo(
+                HANDLE(handle.as_raw_handle()),
+                SE_FILE_OBJECT,
+                security_info,
+                None,
+                None,
+                Some(dacl),
+                None,
+            )
+        }
+    })
+}
+
+/// Parses `sddl`, hands its DACL and the `SECURITY_INFORMATION` for `protect` to `apply`, and frees
+/// the descriptor on every path.
+#[cfg(target_os = "windows")]
+fn with_sddl_dacl(
+    sddl: &str,
+    protect: bool,
+    apply: impl FnOnce(
+        *const windows::Win32::Security::ACL,
+        windows::Win32::Security::OBJECT_SECURITY_INFORMATION,
+    ) -> windows::Win32::Foundation::WIN32_ERROR,
+) -> std::io::Result<()> {
+    use windows::core::HSTRING;
     use windows::Win32::Foundation::LocalFree;
-    use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
-    };
+    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows::Win32::Security::{
         GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
 
     let sddl_wide = HSTRING::from(sddl);
-    let path_wide = HSTRING::from(path.as_os_str());
-
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `sddl_wide` is a valid HSTRING kept alive for the call.
     // `sd` is an out-parameter that Windows allocates via LocalAlloc on success;
@@ -1370,19 +1413,7 @@ pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Re
             UNPROTECTED_DACL_SECURITY_INFORMATION
         };
 
-    // SAFETY: `path_wide` is alive for the call. `dacl` points into the still-live
-    // `sd` allocation. Owner/group pointers are correctly None.
-    let result = unsafe {
-        SetNamedSecurityInfoW(
-            &path_wide,
-            SE_FILE_OBJECT,
-            security_info,
-            None,
-            None,
-            Some(dacl.cast()),
-            None,
-        )
-    };
+    let result = apply(dacl.cast(), security_info);
 
     // SAFETY: same as the early-return LocalFree above — `sd.0` was allocated by
     // Windows via LocalAlloc and is freed exactly once here.
@@ -1419,17 +1450,9 @@ pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Re
 #[cfg(all(target_os = "windows", not(test)))]
 fn apply_socket_permissions(path: &Path) {
     let mut extra_sids = Vec::new();
-    let sid_file = installer_user_sid_path();
-    if let Ok(sid) = std::fs::read_to_string(&sid_file) {
-        let sid = sid.trim().to_string();
-        if !sid.is_empty() {
-            info!(sid = %sid, "including installer user SID in socket DACL");
-            extra_sids.push(sid);
-        }
-        // Delete the file after reading — the per-user SID is a temporary bridge
-        // that is no longer needed after the bridge restarts (group membership
-        // will be in the token after re-login).
-        let _ = std::fs::remove_file(&sid_file);
+    if let Some(sid) = take_installer_user_sid(&installer_user_sid_dir()) {
+        info!(sid = %sid, "including installer user SID in socket DACL");
+        extra_sids.push(sid);
     }
     let extra_refs: Vec<&str> = extra_sids.iter().map(|s| s.as_str()).collect();
     let sddl = build_sddl(&extra_refs);
@@ -1438,15 +1461,61 @@ fn apply_socket_permissions(path: &Path) {
     }
 }
 
-/// Path to the file where the installing user's SID is stored temporarily.
+/// Name of the file where the installing user's SID is stored temporarily.
 ///
 /// Written by [`prepare_ipc_access`], read and deleted by
 /// `apply_socket_permissions()` on bridge startup.
 #[cfg(target_os = "windows")]
-pub fn installer_user_sid_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
-        .join("hole")
-        .join("installer-user-sid")
+pub(crate) const INSTALLER_USER_SID_FILE: &str = "installer-user-sid";
+
+/// The folder of [`INSTALLER_USER_SID_FILE`]: the `hole` folder of `%ProgramData%`, which the system owns but to which
+/// a standard user can add names (it inherits `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` from `%ProgramData%`, and nothing in
+/// the installer narrows it). The file is read and written as a state file: through a handle on the folder, and a
+/// read refuses a file the folder's owner cannot vouch for, so a name a user planted does not grant its SID access.
+#[cfg(target_os = "windows")]
+pub fn installer_user_sid_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join("hole")
+}
+
+/// The SID the installer left in `dir`, as text. `NotFound` for a missing file or folder.
+#[cfg(target_os = "windows")]
+pub(crate) fn read_installer_user_sid(dir: &Path) -> std::io::Result<String> {
+    let bytes = util::dir::read_state_file(dir, INSTALLER_USER_SID_FILE.as_ref())?;
+    String::from_utf8(bytes)
+        .map(|sid| sid.trim().to_owned())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "the installer SID file is not text"))
+}
+
+/// Reads and removes the installer's SID in `dir`; `None` when there is no usable one. The file is removed after a
+/// read, because the per-user SID is a temporary bridge that is no longer needed after the bridge restarts (group
+/// membership will be in the token after re-login). A file that could not be read (a name a user planted, or a read
+/// error) is left, and reported. Text that is not a SID is removed and reported without the text: the folder is one a
+/// user can add names to, and `bridge.log` is one the user can read.
+#[cfg(target_os = "windows")]
+pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
+    let sid = match read_installer_user_sid(dir) {
+        Ok(sid) => sid,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(error = %e, "could not read the installer user SID file; ignoring it");
+            return None;
+        }
+    };
+    if let Err(e) = util::dir::remove_state_file(dir, INSTALLER_USER_SID_FILE.as_ref()) {
+        warn!(error = %e, "could not remove the installer user SID file");
+    }
+    if !is_valid_sid_string(&sid) {
+        warn!("the installer user SID file does not hold a SID; ignoring it");
+        return None;
+    }
+    Some(sid)
+}
+
+/// Writes `sid` as the installer's SID in `dir`, making the folder if it is missing. The file is replaced as a whole,
+/// by name through a handle: a link a user planted at the name is replaced and what it leads to is left alone.
+#[cfg(target_os = "windows")]
+pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result<()> {
+    util::dir::write_state_file(dir, INSTALLER_USER_SID_FILE.as_ref(), sid.as_bytes(), None)
 }
 
 /// Set up IPC access control so that the current interactive user can
@@ -1469,8 +1538,8 @@ pub fn installer_user_sid_path() -> std::path::PathBuf {
 /// idempotent (macOS: verifies post-failure with `getgrnam(3)`;
 /// Windows: detects error code 1379) and `group::add_user_to_group`
 /// is idempotent (macOS: `dseditgroup -o edit -a` is naturally
-/// idempotent; Windows: detects error code 1378). `std::fs::write` on
-/// the SID file path unconditionally overwrites. An end-to-end test
+/// idempotent; Windows: detects error code 1378). The SID file write
+/// unconditionally replaces the file. An end-to-end test
 /// would require elevation (to actually call `dseditgroup` /
 /// `net localgroup`), so we don't add one — elevation is a runtime
 /// dependency, not a test-harness dependency. Integration coverage is
@@ -1484,12 +1553,8 @@ pub fn prepare_ipc_access() -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         let sid = crate::group::lookup_sid(&user)?;
-        let sid_path = installer_user_sid_path();
-        if let Some(parent) = sid_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&sid_path, &sid)?;
-        info!(sid = %sid, path = %sid_path.display(), "wrote installer user SID");
+        write_installer_user_sid(&installer_user_sid_dir(), &sid)?;
+        info!(sid = %sid, "wrote installer user SID");
     }
     Ok(())
 }
@@ -1529,7 +1594,7 @@ pub fn build_sddl(extra_sids: &[&str]) -> String {
         if is_valid_sid_string(sid) {
             sddl.push_str(&format!("(A;;GA;;;{sid})"));
         } else {
-            warn!(sid = %sid, "ignoring malformed SID string in DACL");
+            warn!("ignoring malformed SID string in DACL");
         }
     }
 

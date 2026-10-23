@@ -7,8 +7,7 @@
 //! Windows needs no analogue: its WFP filters carry fixed GUIDs and are swept
 //! by key, so there is nothing to persist.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,23 +41,11 @@ pub struct FailClosedState {
     pub pf_was_enabled: bool,
 }
 
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join(STATE_FILE_NAME)
-}
-
 /// Atomically persist `state` to `<state_dir>/bridge-failclosed.json` (temp
 /// file + same-dir rename, `sync_all` before persist). Creates `state_dir`.
 pub fn save(state_dir: &Path, state: &FailClosedState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    util::ownership::chown_if_some(state_dir, owner);
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let path = state_file(state_dir);
-    let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
-    tmp.write_all(&json)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
-    Ok(())
+    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
 }
 
 /// Trichotomy read distinguishing "no cover was ever engaged" (`Absent`) from
@@ -69,12 +56,11 @@ pub fn save(state_dir: &Path, state: &FailClosedState, owner: Option<(u32, u32)>
 /// read/parse/version failure is `Unusable` (keeps the existing `warn!` lines).
 pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
     use super::StateFile;
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "failclosed-state read failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "failclosed-state read failed");
             // No bytes, so nothing to salvage a token from.
             return StateFile::Unusable { pf_token: None };
         }
@@ -90,7 +76,9 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
             StateFile::unusable(&bytes)
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "failclosed-state parse failed");
+            // The error quotes the file, which the user may have put there: keep its position, not its text.
+            let e = util::parse_error::ParseFailure::from(&e);
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "failclosed-state parse failed");
             StateFile::unusable(&bytes)
         }
     }
@@ -109,11 +97,7 @@ pub fn load(state_dir: &Path) -> Option<FailClosedState> {
 
 /// Delete the state file; tolerates absence (`Ok`). `Err` only on real I/O error.
 pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(state_file(state_dir)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
 }
 
 #[cfg(test)]

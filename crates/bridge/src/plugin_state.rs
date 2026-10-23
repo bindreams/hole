@@ -10,8 +10,7 @@
 //! never restores to the recorded process — see `cosca::identity`.
 
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // Types ===============================================================================================================
 
@@ -47,27 +46,13 @@ pub enum Loaded {
     State(PluginState),
 }
 
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join(STATE_FILE_NAME)
-}
-
 // I/O =================================================================================================================
 
 /// Write `state` to `<state_dir>/bridge-plugins.json` atomically.
 /// Same atomic-write pattern as `routing::state::write`.
 pub fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    util::ownership::chown_if_some(state_dir, owner);
-
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let path = state_file(state_dir);
-    let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
-    tmp.write_all(&json)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
-    Ok(())
+    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
 }
 
 /// Append a single record to the state file. Creates the file if missing.
@@ -112,8 +97,7 @@ pub(crate) fn append_loaded(
 /// is detected; a failed read is reported to the caller instead, because the
 /// caller is the one that knows the consequence.
 pub fn load(state_dir: &Path) -> Loaded {
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Absent,
         Err(e) => return Loaded::Unreadable(e),
@@ -129,7 +113,9 @@ pub fn load(state_dir: &Path) -> Loaded {
             Loaded::Unusable
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "plugin-state parse failed");
+            // The error quotes the file, which the user may have put there: keep its position, not its text.
+            let e = util::parse_error::ParseFailure::from(&e);
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "plugin-state parse failed");
             Loaded::Unusable
         }
     }
@@ -137,12 +123,7 @@ pub fn load(state_dir: &Path) -> Loaded {
 
 /// Delete the state file. Tolerates a missing file.
 pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    let path = state_file(state_dir);
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
 }
 
 #[cfg(test)]

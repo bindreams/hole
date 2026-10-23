@@ -444,7 +444,7 @@ fn release_covers_with(
     let mut probed: Vec<&Path> = vec![state_dir];
     for peer in peers {
         // Skip a path already probed. The lock contends per open handle, not
-        // per owning process (`tun_engine::exclusive`'s module doc), so
+        // per owning process (`file_lock::Exclusive`'s module doc), so
         // probing one twice would answer "a bridge is running" against this
         // call's own guard — and duplicates are ordinary, not exotic: an
         // un-elevated run resolves `default_state_dir` and the real user's dir

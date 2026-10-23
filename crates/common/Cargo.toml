@@ -35,7 +35,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 tracing-log = "0.2"
 tracing-appender = "0.2"
-file-rotate = "0.8"
 os_pipe = "1"
 time = { version = "0.3", features = ["serde-well-known", "formatting", "macros"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
@@ -73,8 +72,14 @@ schemars = "0.8"
 serde_json = "1"
 yaml_serde = "0.10"
 
+[target.'cfg(windows)'.dev-dependencies]
+# `update_marker_tests`: a reader with no privileges, impersonated on one thread.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
 [dev-dependencies]
 skuld = { workspace = true }
+# `util::dir::testing`: the links and folders a test of the walk needs.
+util = { path = "../util", features = ["test-support"] }
 # Compile-fail probes pinning that `Password`/`ServerAddress` cannot grow a
 # second exit (`Display`, `Deref`). See `tests/secret_shape/`.
 trybuild = { workspace = true }

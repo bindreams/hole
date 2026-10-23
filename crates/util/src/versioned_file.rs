@@ -59,7 +59,6 @@ mod frame;
 mod loaded;
 mod role;
 mod store;
-mod sys;
 
 pub use chain::{Chain, ChainError, Obsolete, Schema};
 pub use loaded::{CannotRead, Loaded, Raw, WhyUnreadable};

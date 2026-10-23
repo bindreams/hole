@@ -24,10 +24,8 @@ bitflags = { workspace = true }
 # `raw_value`: `versioned_file` reads the `version` token's text, because a
 # float cannot tell `18446744073709551616` from `1e20`.
 serde_json = { workspace = true, features = ["raw_value"] }
-# `versioned_file`: schema chain decoding, plus the atomic temp-file write and
-# the typed errors around it.
+# `versioned_file`: schema chain decoding, plus the typed errors around it.
 serde = { workspace = true }
-tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 tracing = "0.1"
@@ -41,11 +39,16 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # `Win32_Foundation`, `Win32_Storage_FileSystem`: `versioned_file`'s POSIX-semantics
-# replace (with its `MoveFileExW` fallback) and no-clobber rename.
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemInformation"] }
+# replace (with its `MoveFileExW` fallback) and no-clobber rename. `dir` opens and
+# renames relative to a directory handle with `NtCreateFile` / `NtSetInformationFile`
+# (`Wdk_Storage_FileSystem`, whose `OBJECT_ATTRIBUTES` needs `Wdk_Foundation` and `Win32_Security`).
+# `Win32_Security_Authorization`: `GetSecurityInfo`, the owner of a folder or link; `Win32_System_Ioctl`:
+# `FSCTL_GET_REPARSE_POINT`; `Win32_System_Threading`: the process token the test fixtures adjust.
+windows = { version = "0.62", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
+tempfile = "3"
 hole-test-observability = { path = "../test-observability" }
 # `redact_tests` asserts on what `arm` itself logs: `WaitableWriter` as the
 # capture target (garter's `test-utils` feature) and the mandated
@@ -59,3 +62,4 @@ tokio = { version = "1", features = ["test-util"] }
 # `versioned_file`'s compile-fail fixtures pin that a gap in a migration chain
 # does not build.
 trybuild = { workspace = true }
+

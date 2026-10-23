@@ -79,6 +79,9 @@ fn scrub_reexec_env(cmd: &mut std::process::Command) -> &mut std::process::Comma
         .env_remove("TOMBSTONE_TEST_HANG_FOREVER")
         .env_remove("TOMBSTONE_TEST_EXIT_FAST")
         .env_remove("TOMBSTONE_TEST_ATTACH_KIND")
+        .env_remove("TOMBSTONE_TEST_PLANT")
+        .env_remove("TOMBSTONE_TEST_VICTIM")
+        .env_remove("TOMBSTONE_TEST_MOVED")
 }
 
 #[cfg(feature = "crash-child")]
@@ -92,12 +95,25 @@ fn run_crash_child(class: &str, log_dir: &std::path::Path) -> std::process::Outp
 // `"test"`) hitting the same fault class.
 #[cfg(feature = "crash-child")]
 fn run_crash_child_with_attach_kind(class: &str, log_dir: &std::path::Path, attach_kind: &str) -> std::process::Output {
+    run_crash_child_with_env(class, log_dir, attach_kind, &[])
+}
+
+// Like `run_crash_child_with_attach_kind`, with `env` set on the child on top: the `TOMBSTONE_TEST_PLANT` family,
+// which has the child tamper with the log directory between `attach` and the crash.
+#[cfg(feature = "crash-child")]
+fn run_crash_child_with_env(
+    class: &str,
+    log_dir: &std::path::Path,
+    attach_kind: &str,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
     let mut cmd = std::process::Command::new(crash_child_bin());
     scrub_reexec_env(&mut cmd);
     let child = cmd
         .env("TOMBSTONE_CRASH_CLASS", class)
         .env("TOMBSTONE_LOG_DIR", log_dir)
         .env("TOMBSTONE_TEST_ATTACH_KIND", attach_kind)
+        .envs(env.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -451,6 +467,70 @@ fn non_unicode_attach_kind() -> std::ffi::OsString {
 fn non_unicode_attach_kind() -> std::ffi::OsString {
     use std::os::windows::ffi::OsStringExt;
     std::ffi::OsString::from_wide(&[0x006b, 0xd800, 0x0064])
+}
+
+// The log directory is the interactive user's while the bridge writes into it as root, so what the user can do to
+// it between `attach` and the crash is what these two pin. The child plays the user (`TOMBSTONE_TEST_PLANT`); the
+// victim is a file or directory the crash handler has no business touching.
+
+// A symlink at the marker name must be left as it is: the handler creates the marker exclusively and does not follow.
+#[cfg(feature = "crash-child")]
+#[skuld::test]
+fn crash_marker_does_not_write_through_a_symlink_at_its_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_dir = dir.path().join("logs");
+    std::fs::create_dir(&log_dir).expect("log dir");
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "keep").expect("victim");
+
+    let output = run_crash_child_with_env(
+        "segfault",
+        &log_dir,
+        "crash-child",
+        &[
+            ("TOMBSTONE_TEST_PLANT", "symlink".as_ref()),
+            ("TOMBSTONE_TEST_VICTIM", victim.as_os_str()),
+        ],
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "keep",
+        "the handler wrote through the symlink"
+    );
+    assert_macos_terminated_by_tombstone(&output, "segfault with a planted symlink");
+}
+
+// The directory is held open from `attach`, so moving it away and putting a symlink at its path changes nothing: the
+// marker lands in the directory `attach` opened, and nothing in the victim directory.
+#[cfg(feature = "crash-child")]
+#[skuld::test]
+fn crash_marker_lands_in_the_directory_attach_opened_when_its_path_is_swapped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_dir = dir.path().join("logs");
+    let moved = dir.path().join("logs.moved");
+    let victim = dir.path().join("victim");
+    std::fs::create_dir(&log_dir).expect("log dir");
+    std::fs::create_dir(&victim).expect("victim dir");
+
+    let output = run_crash_child_with_env(
+        "segfault",
+        &log_dir,
+        "crash-child",
+        &[
+            ("TOMBSTONE_TEST_PLANT", "swap_dir".as_ref()),
+            ("TOMBSTONE_TEST_VICTIM", victim.as_os_str()),
+            ("TOMBSTONE_TEST_MOVED", moved.as_os_str()),
+        ],
+    );
+
+    assert_eq!(
+        std::fs::read_dir(&victim).unwrap().count(),
+        0,
+        "the handler wrote into the swapped-in directory"
+    );
+    assert_marker(&moved, "crash-child", true);
+    assert_macos_terminated_by_tombstone(&output, "segfault with a swapped log directory");
 }
 
 // x86-only: integer divide-by-zero raises SIGFPE on x86, but is non-trapping on

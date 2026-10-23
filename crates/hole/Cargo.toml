@@ -105,6 +105,8 @@ libc = "0.2"
 
 [dev-dependencies]
 skuld = { workspace = true }
+# `plant_link`: the state-directory tests plant the user's link.
+util = { path = "../util", features = ["test-support"] }
 icns = "0.4"
 png = "0.18"
 hole-test-observability = { path = "../test-observability" }

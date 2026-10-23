@@ -6,8 +6,7 @@
 //! Sweep to restore the host without `-Fa`, matching the engaged-without-flush
 //! contract).
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,21 +52,9 @@ fn default_true() -> bool {
     true
 }
 
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join(STATE_FILE_NAME)
-}
-
 pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    util::ownership::chown_if_some(state_dir, owner);
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let path = state_file(state_dir);
-    let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
-    tmp.write_all(&json)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
-    Ok(())
+    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
 }
 
 /// Trichotomy read distinguishing "no cover was ever engaged" (`Absent`) from
@@ -78,12 +65,11 @@ pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>
 /// read/parse/version failure is `Unusable` (keeps the existing `warn!` lines).
 pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
     use super::StateFile;
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "lockdown-pf-state read failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "lockdown-pf-state read failed");
             // No bytes, so nothing to salvage a token from.
             return StateFile::Unusable { pf_token: None };
         }
@@ -111,7 +97,7 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
             let e = util::parse_error::ParseFailure::from(&e);
             tracing::warn!(
                 error = %e,
-                path = %path.display(),
+                file = STATE_FILE_NAME,
                 "lockdown-pf-state parse failed"
             );
             StateFile::unusable(&bytes)
@@ -131,11 +117,7 @@ pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
 }
 
 pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(state_file(state_dir)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
 }
 
 #[cfg(test)]

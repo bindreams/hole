@@ -54,14 +54,14 @@ pub(crate) fn reap_loaded_with(
         Loaded::Unreadable(e) => {
             tracing::error!(
                 error = %e,
-                path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
+                file = plugin_state::STATE_FILE_NAME,
                 "plugin state file could not be read; keeping it so the next start retries"
             );
             return;
         }
         Loaded::Unusable => {
             tracing::error!(
-                path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
+                file = plugin_state::STATE_FILE_NAME,
                 "plugin state file is not usable at this schema; discarding it and accepting a one-time orphan leak"
             );
             clear_or_log(state_dir);
@@ -133,7 +133,7 @@ pub(crate) fn reap_loaded_with(
         clear_or_log(state_dir);
     } else {
         tracing::warn!(
-            path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
+            file = plugin_state::STATE_FILE_NAME,
             "keeping the plugin state file: a record could not be accounted for"
         );
     }

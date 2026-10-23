@@ -98,8 +98,7 @@
 //!   very twins go, and keeps reporting. Over-report, the same direction as
 //!   `Cover::drop` above.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -111,7 +110,7 @@ use super::ArmingWitness;
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// Filename under `state_dir`.
-pub(crate) const STATE_FILE_NAME: &str = "bridge-boottime.json";
+pub const STATE_FILE_NAME: &str = "bridge-boottime.json";
 
 /// The persisted record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,20 +122,15 @@ struct BootTimeState {
     armed: bool,
 }
 
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join(STATE_FILE_NAME)
-}
-
 /// Classify the record. Never collapses a failure into a recorded value — see
 /// [`ArmingWitness`], whose whole point is that "no file" and "a file I could
 /// not read" are different findings.
 pub fn load(state_dir: &Path) -> ArmingWitness {
-    let path = state_file(state_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ArmingWitness::Unset,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "boot-time witness read failed");
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "boot-time witness read failed");
             return ArmingWitness::Unreadable;
         }
     };
@@ -152,7 +146,9 @@ pub fn load(state_dir: &Path) -> ArmingWitness {
             ArmingWitness::Unreadable
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "boot-time witness parse failed");
+            // The error quotes the file, which the user may have put there: keep its position, not its text.
+            let e = util::parse_error::ParseFailure::from(&e);
+            tracing::warn!(error = %e, file = STATE_FILE_NAME, "boot-time witness parse failed");
             ArmingWitness::Unreadable
         }
     }
@@ -161,21 +157,13 @@ pub fn load(state_dir: &Path) -> ArmingWitness {
 /// Atomically persist `armed` (temp file + same-dir rename, `sync_all` before
 /// persist), the same write shape `lockdown_state` uses. Creates `state_dir`.
 fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    util::ownership::chown_if_some(state_dir, owner);
     let state = BootTimeState {
         version: SCHEMA_VERSION,
         armed,
     };
     let json =
         serde_json::to_vec_pretty(&state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let path = state_file(state_dir);
-    let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
-    tmp.write_all(&json)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
-    Ok(())
+    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
 }
 
 /// Record that a twin is outstanding on this host.
@@ -278,7 +266,7 @@ fn write_or_warn(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) {
         tracing::warn!(
             error = %e,
             armed,
-            path = %state_file(state_dir).display(),
+            file = STATE_FILE_NAME,
             "the boot-time witness could not be written; a later sweep that can no longer see a \
              standing cover's PERSISTENT sibling will have nothing to fall back on"
         );

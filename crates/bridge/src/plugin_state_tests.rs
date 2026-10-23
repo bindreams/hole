@@ -1,4 +1,5 @@
 use super::*;
+use util::dir::testing::{plant_link, SystemScratch};
 
 use cosca::identity::{Platform, ProcessId, ProcessIdRecord, RECORD_VERSION};
 
@@ -165,6 +166,16 @@ fn clear_tolerates_missing_file() {
 }
 
 #[skuld::test]
+fn clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+    let err = clear(&state).unwrap_err();
+
+    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+}
+
+#[skuld::test]
 fn save_creates_missing_dir() {
     let parent = tempfile::tempdir().unwrap();
     let nested = parent.path().join("a").join("b");
@@ -232,5 +243,31 @@ fn an_unreadable_append_writes_nothing_and_reports_the_error() {
         loaded.plugins,
         vec![first],
         "a failed read must write nothing: the prior record was dropped"
+    );
+}
+
+#[skuld::test]
+fn save_refuses_a_link_to_a_folder_the_system_owns_and_writes_nothing_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = SystemScratch::new();
+    let link = tmp.path().join("state");
+    plant_link(scratch.root(), &link);
+    let written = scratch.root().join(STATE_FILE_NAME);
+    let before = written.exists();
+
+    assert!(save(
+        &link,
+        &PluginState {
+            version: SCHEMA_VERSION,
+            plugins: vec![]
+        },
+        None
+    )
+    .is_err());
+
+    assert_eq!(
+        written.exists(),
+        before,
+        "a state file was written in the system's folder"
     );
 }

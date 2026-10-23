@@ -74,6 +74,9 @@ SOFTWARE.
   `crates/dump`, `crates/dump-macros`, `crates/handle-holders`,
   `crates/tun-engine`, `crates/tun-engine-macros`, `xtask`, `xtask-lib`)
   is licensed under GPL-3.0-or-later; see `LICENSE.md` at the repo root.
+- The libraries with no product of their own (`crates/util`, `crates/file-lock`)
+  are licensed under Apache-2.0, so that any project can use them: the libraries
+  are Apache-2.0 and the applications are GPL-3.0-or-later.
 - Ex-Galoshes code (`crates/garter`, `crates/garter-bin`,
   `crates/galoshes`) is licensed under Apache-2.0;
   see `crates/galoshes/LICENSE.md`.

@@ -1,0 +1,515 @@
+//! Unix half of [`super::Dir`]: `openat`, `mkdirat`, `fstatat`, `unlinkat`, `renameat`, `fchown`, `fchmod`.
+
+use std::collections::VecDeque;
+use std::ffi::{CString, OsStr, OsString};
+use std::fs::File;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Component, Path};
+
+use super::trail::{Owner, Trail};
+use super::{EntryKind, OpenFile, Refusal};
+
+/// Who is opening: this process's effective uid.
+pub type Caller = u32;
+
+/// The running process as a [`Caller`].
+pub(super) fn caller() -> Caller {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Root is the system; every other uid is a user.
+fn owner_of_uid(uid: u32) -> Owner<u32> {
+    match uid {
+        0 => Owner::Privileged,
+        uid => Owner::User(uid),
+    }
+}
+
+/// `(device, inode)`.
+pub(super) type FileId = (u64, u64);
+
+/// What `fstat` or `fstatat` says; the only input to the trust and kind decisions.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Meta {
+    pub dev: u64,
+    pub ino: u64,
+    pub uid: u32,
+    pub mode: u32,
+}
+
+impl Meta {
+    fn owner(&self) -> Owner<u32> {
+        owner_of_uid(self.uid)
+    }
+
+    #[allow(clippy::useless_conversion)] // `mode_t` is `u16` on macOS, `u32` on Linux
+    fn kind(&self) -> EntryKind {
+        match self.mode & u32::from(libc::S_IFMT) {
+            m if m == u32::from(libc::S_IFLNK) => EntryKind::Symlink,
+            m if m == u32::from(libc::S_IFDIR) => EntryKind::Directory,
+            m if m == u32::from(libc::S_IFREG) => EntryKind::File,
+            _ => EntryKind::Other,
+        }
+    }
+}
+
+// libc wrappers -------------------------------------------------------------------------------------------------------
+
+fn cstr(name: &OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL"))
+}
+
+fn check(rc: libc::c_int) -> io::Result<libc::c_int> {
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
+}
+
+fn open_fd(dir: RawFd, name: &CString, flags: libc::c_int, mode: u32) -> io::Result<OwnedFd> {
+    // SAFETY: `name` is a valid NUL-terminated string and `dir` an open directory, both for the call.
+    let fd = check(unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, mode) })?;
+    // SAFETY: `openat` returned a new descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Opens a directory for lookup only, which asks the caller for search permission and not for read: a
+/// directory a caller can pass through but not list (`0o311`) is on a usable path. A handle opened
+/// this way names children (`openat`, `fstatat`, `mkdirat`, `readlinkat`, `fstat`) and is not for
+/// `fchown`, `fchmod` or `fsync`. Other unix: an ordinary read open, which asks for read as well.
+#[cfg(target_os = "linux")]
+const SEARCH_ONLY: libc::c_int = libc::O_PATH;
+#[cfg(target_os = "macos")]
+const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
+
+/// The directory `name` in `dir`, for lookup only; see [`SEARCH_ONLY`].
+fn open_dir_at(dir: RawFd, name: &CString) -> io::Result<OwnedFd> {
+    open_fd(dir, name, SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW, 0)
+}
+
+/// `dir` again, for use: readable, so that `fchown`, `fchmod` and `fsync` work on it. Through the
+/// handle in hand (`.`), so no path is resolved again.
+fn reopen_for_use(dir: RawFd) -> io::Result<OwnedFd> {
+    open_fd(
+        dir,
+        &CString::new(".").expect("no NUL"),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    )
+}
+
+#[allow(clippy::unnecessary_cast, clippy::useless_conversion)] // the stat fields differ in width per platform
+fn meta_of(st: &libc::stat) -> Meta {
+    Meta {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        uid: st.st_uid,
+        mode: u32::from(st.st_mode),
+    }
+}
+
+fn fstat(fd: RawFd) -> io::Result<Meta> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fd` is open and `st` is a valid out-pointer.
+    check(unsafe { libc::fstat(fd, st.as_mut_ptr()) })?;
+    // SAFETY: `fstat` succeeded and filled `st`.
+    Ok(meta_of(&unsafe { st.assume_init() }))
+}
+
+/// What `name` in `dir` is, not following a symlink.
+fn fstatat_nofollow(dir: RawFd, name: &CString) -> io::Result<Meta> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is a valid NUL-terminated string, `dir` is open and `st` is a valid out-pointer.
+    check(unsafe { libc::fstatat(dir, name.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) })?;
+    // SAFETY: `fstatat` succeeded and filled `st`.
+    Ok(meta_of(&unsafe { st.assume_init() }))
+}
+
+fn readlink_at(dir: RawFd, name: &CString) -> io::Result<OsString> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: `buf` is valid for `buf.len()` bytes; the rest as above.
+    let n = unsafe { libc::readlinkat(dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(n as usize);
+    Ok(OsString::from_vec(buf))
+}
+
+fn open_start(path: &str) -> io::Result<OwnedFd> {
+    open_fd(
+        libc::AT_FDCWD,
+        &CString::new(path).expect("no NUL"),
+        SEARCH_ONLY | libc::O_DIRECTORY,
+        0,
+    )
+}
+
+// Path resolution -----------------------------------------------------------------------------------------------------
+
+enum Step {
+    Root,
+    Parent,
+    Name(OsString),
+}
+
+/// How many links one walk follows: the kernel's own bound on a path, `MAXSYMLINKS` (Linux
+/// `include/linux/namei.h`: 40; macOS and the BSDs `sys/param.h`: 32).
+#[cfg(target_os = "linux")]
+const MAX_LINKS: usize = 40;
+#[cfg(not(target_os = "linux"))]
+const MAX_LINKS: usize = 32;
+
+fn steps_of(path: &Path) -> VecDeque<Step> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::RootDir => Some(Step::Root),
+            Component::ParentDir => Some(Step::Parent),
+            Component::Normal(name) => Some(Step::Name(name.to_os_string())),
+            Component::CurDir | Component::Prefix(_) => None,
+        })
+        .collect()
+}
+
+/// The folder the walk stands in.
+struct Standing {
+    fd: OwnedFd,
+}
+
+impl Standing {
+    /// The folder's owner as the rule judges it.
+    fn owner(&self) -> io::Result<Owner<u32>> {
+        Ok(fstat(self.fd.as_raw_fd())?.owner())
+    }
+}
+
+/// What the walk has left to do and what it has followed: the inputs to [`Trail`]'s decisions.
+struct Walk {
+    steps: VecDeque<Step>,
+    trail: Trail<u32>,
+}
+
+/// Hands the folder `name` in `dir`, which the walk just made as the process of uid `maker`, to `uid` (the group is
+/// left as it is). The name is opened once, and it is that handle that is judged and handed over: the user who owns
+/// `dir` can swap the name between the `mkdirat` and here, and a swapped-in directory is theirs, a hard link is not a
+/// directory, and a link is never followed. Only a directory `maker` owns is the one the walk made.
+fn give_made_folder(dir: RawFd, name: &CString, maker: u32, uid: u32) -> io::Result<()> {
+    if uid == maker {
+        return Ok(());
+    }
+    let made = match open_fd(
+        dir,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => {
+            return Err(match fstatat_nofollow(dir, name).map(|entry| entry.kind()) {
+                Ok(EntryKind::Symlink) => Refusal::Symlink.into_io_error(),
+                Ok(EntryKind::File | EntryKind::Other) => Refusal::NotDirectory.into_io_error(),
+                Ok(EntryKind::Directory) | Err(_) => err,
+            });
+        }
+    };
+    let found = fstat(made.as_raw_fd())?.uid;
+    if found != maker {
+        return Err(Refusal::ForeignOwner { uid: found }.into_io_error());
+    }
+    // SAFETY: the descriptor is open for the call; a group of `-1` leaves the group alone.
+    check(unsafe { libc::fchown(made.as_raw_fd(), uid, libc::gid_t::MAX) }).map(|_| ())
+}
+
+/// Opens the directory `name` in `cur`, or makes progress towards it: `Ok(Some(next))` is the directory;
+/// `Ok(None)` is a followed symlink whose target was put in front of the walk's steps.
+fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::Result<Option<Standing>> {
+    let cname = cstr(name)?;
+    loop {
+        let open_err = match open_dir_at(cur.fd.as_raw_fd(), &cname) {
+            Ok(fd) => return Ok(Some(Standing { fd })),
+            Err(err) => err,
+        };
+        // The errno of a failed no-follow open differs per platform and per kind of entry, so
+        // what the entry is decides, not the errno.
+        let entry = match fstatat_nofollow(cur.fd.as_raw_fd(), &cname) {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == io::ErrorKind::NotFound && create => {
+                walk.trail.create_in(|| cur.owner())?;
+                // SAFETY: `cname` is a valid NUL-terminated string and `cur` an open directory.
+                match check(unsafe { libc::mkdirat(cur.fd.as_raw_fd(), cname.as_ptr(), 0o777) }) {
+                    Ok(_) => {
+                        // The folder is the maker's on disk. Below a user's link it must be the user's, or the next
+                        // walk through the link refuses what this one made.
+                        if let Some(&uid) = walk.trail.led_by() {
+                            give_made_folder(cur.fd.as_raw_fd(), &cname, caller(), uid)?;
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(err) => return Err(err),
+                }
+                continue;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(err),
+            Err(_) => return Err(open_err),
+        };
+        return match entry.kind() {
+            EntryKind::Symlink => {
+                let parent = fstat(cur.fd.as_raw_fd())?;
+                walk.trail
+                    .follow(&parent.owner(), &entry.owner())
+                    .map_err(Refusal::into_io_error)?;
+                let target = readlink_at(cur.fd.as_raw_fd(), &cname)?;
+                let mut expansion = steps_of(Path::new(&target));
+                expansion.append(&mut walk.steps);
+                walk.steps = expansion;
+                Ok(None)
+            }
+            EntryKind::Directory => Err(open_err),
+            EntryKind::File | EntryKind::Other => Err(Refusal::NotDirectory.into_io_error()),
+        };
+    }
+}
+
+pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<File> {
+    let mut walk = Walk {
+        steps: steps_of(path),
+        trail: Trail::new(MAX_LINKS),
+    };
+    let rooted = matches!(walk.steps.front(), Some(Step::Root));
+    let mut cur = Standing {
+        fd: open_start(if rooted { "/" } else { "." })?,
+    };
+    if rooted {
+        walk.steps.pop_front();
+    }
+    while let Some(step) = walk.steps.pop_front() {
+        match step {
+            Step::Root => cur = Standing { fd: open_start("/")? },
+            Step::Parent => {
+                cur = Standing {
+                    fd: open_dir_at(cur.fd.as_raw_fd(), &CString::new("..").expect("no NUL"))?,
+                };
+            }
+            Step::Name(name) => {
+                if let Some(next) = descend(&cur, &name, create, &mut walk)? {
+                    cur = next;
+                }
+            }
+        }
+    }
+
+    walk.trail.end_at(|| cur.owner())?;
+    if let Some((uid, _)) = owner {
+        let found = fstat(cur.fd.as_raw_fd())?.uid;
+        if found != uid && found != caller {
+            return Err(Refusal::ForeignOwner { uid: found }.into_io_error());
+        }
+    }
+    Ok(File::from(reopen_for_use(cur.fd.as_raw_fd())?))
+}
+
+// Operations relative to a directory ----------------------------------------------------------------------------------
+
+pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<File> {
+    // `O_NONBLOCK` keeps the open of a FIFO planted at the name from waiting for a peer that never comes; it does
+    // nothing to a regular file.
+    let (flags, mode) = match how {
+        OpenFile::CreateNew { mode } => (libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, mode),
+        OpenFile::Existing => (libc::O_RDWR, 0),
+        OpenFile::Read => (libc::O_RDONLY | libc::O_NONBLOCK, 0),
+        OpenFile::Append => (libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK, 0),
+        OpenFile::CreateAppend { mode } => (libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_EXCL, mode),
+    };
+    let file = File::from(open_fd(dir.as_raw_fd(), &cstr(name)?, flags | libc::O_NOFOLLOW, mode)?);
+    if matches!(how, OpenFile::Read) && !file.metadata()?.is_file() {
+        return Err(Refusal::NotRegular.into_io_error());
+    }
+    Ok(file)
+}
+
+/// Whether the folder's owner can vouch for `file`, a file read from `dir`: see [`super::trail::may_read`].
+pub(super) fn is_vouched_for(dir: &File, file: &File) -> io::Result<bool> {
+    let meta = file.metadata()?;
+    super::trail::may_read(&owner_of_uid(meta.uid()), meta.nlink(), || {
+        Ok(owner_of_uid(fstat(dir.as_raw_fd())?.uid))
+    })
+}
+
+/// What `fstat` says about a file opened to append to; the only input to [`trusted_appender`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Facts {
+    pub regular: bool,
+    pub uid: u32,
+    /// The file's link count: how many names it has.
+    pub links: u64,
+}
+
+/// Whether a file found at a log's name is one a privileged writer may append to: a regular file with no other name
+/// (a second name is what a hard link a user planted adds) that `owner` owns. With no `owner`, no ownership is
+/// expected and any such file will do.
+pub(super) fn trusted_appender(facts: Facts, owner: Option<(u32, u32)>) -> bool {
+    facts.regular && facts.links == 1 && owner.is_none_or(|(uid, _)| facts.uid == uid)
+}
+
+pub(super) fn is_own_file(file: &File, owner: Option<(u32, u32)>) -> io::Result<bool> {
+    let meta = file.metadata()?;
+    Ok(trusted_appender(
+        Facts {
+            regular: meta.is_file(),
+            uid: meta.uid(),
+            links: meta.nlink(),
+        },
+        owner,
+    ))
+}
+
+/// A new file for [`super::Dir::write_atomic`].
+pub(super) fn create_temp(dir: &File, name: &OsStr) -> io::Result<File> {
+    open_file(dir, name, OpenFile::CreateNew { mode: 0o600 })
+}
+
+pub(super) fn id_of(dir: &File, name: &OsStr) -> io::Result<Option<FileId>> {
+    match fstatat_nofollow(dir.as_raw_fd(), &cstr(name)?) {
+        Ok(meta) => Ok(Some((meta.dev, meta.ino))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+pub(super) fn kind_of(dir: &File, name: &OsStr) -> io::Result<Option<EntryKind>> {
+    match fstatat_nofollow(dir.as_raw_fd(), &cstr(name)?) {
+        Ok(meta) => Ok(Some(meta.kind())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+pub(super) fn file_id(file: &File) -> io::Result<FileId> {
+    let meta = file.metadata()?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+pub(super) fn unlink(dir: &File, name: &OsStr) -> io::Result<()> {
+    // SAFETY: the name is a valid NUL-terminated string and `dir` an open directory.
+    check(unsafe { libc::unlinkat(dir.as_raw_fd(), cstr(name)?.as_ptr(), 0) }).map(|_| ())
+}
+
+/// `from` to `to`, both in `dir`, replacing `to`. `_temp` is the open file at `from`: Windows renames by its handle.
+pub(super) fn rename(dir: &File, _temp: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    rename_by_name(dir, from, to)
+}
+
+/// `from` to `to`, both in `dir`, replacing `to`.
+pub(super) fn rename_by_name(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let (from, to) = (cstr(from)?, cstr(to)?);
+    // SAFETY: both names are valid NUL-terminated strings and `dir` an open directory.
+    check(unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) }).map(|_| ())
+}
+
+/// `from` to `to`, both in `dir`, in one step that fails with `AlreadyExists` instead of replacing `to`.
+/// `Unsupported` when the kernel or the filesystem has no such rename.
+#[cfg(target_os = "linux")]
+pub(super) fn rename_noreplace(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let (from, to) = (cstr(from)?, cstr(to)?);
+    // SAFETY: both names are valid NUL-terminated strings and `dir` an open directory, all for the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            dir.as_raw_fd(),
+            from.as_ptr(),
+            dir.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(errno) if renameat2_unavailable(errno) => Err(io::ErrorKind::Unsupported.into()),
+        _ => Err(err),
+    }
+}
+
+/// The kernel or the filesystem does not offer `renameat2` with the flag. `EPERM` is not among these: it is a
+/// refusal of this rename (a sticky directory, a security module), and the caller's hard-link fallback is allowed
+/// where the rename was not and would leave its backup when the delete that follows is refused.
+#[cfg(target_os = "linux")]
+pub(super) fn renameat2_unavailable(errno: i32) -> bool {
+    matches!(errno, libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn rename_noreplace(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let (from, to) = (cstr(from)?, cstr(to)?);
+    // SAFETY: both names are valid NUL-terminated strings and `dir` an open directory, all for the call.
+    let rc = unsafe {
+        libc::renameatx_np(
+            dir.as_raw_fd(),
+            from.as_ptr(),
+            dir.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        // The volume does not support `RENAME_EXCL`.
+        Some(libc::ENOTSUP | libc::EINVAL) => Err(io::ErrorKind::Unsupported.into()),
+        _ => Err(err),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn rename_noreplace(_dir: &File, _from: &OsStr, _to: &OsStr) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// A second name `new` for `existing`, both in `dir`. `linkat` without `AT_SYMLINK_FOLLOW` links a symlink as
+/// itself.
+pub(super) fn link(dir: &File, existing: &OsStr, new: &OsStr) -> io::Result<()> {
+    let (existing, new) = (cstr(existing)?, cstr(new)?);
+    // SAFETY: both names are valid NUL-terminated strings and `dir` an open directory.
+    check(unsafe { libc::linkat(dir.as_raw_fd(), existing.as_ptr(), dir.as_raw_fd(), new.as_ptr(), 0) }).map(|_| ())
+}
+
+/// `fchown`; a failure is logged and swallowed (see [`super::Dir::secure`]).
+fn chown_best_effort(file: &File, owner: Option<(u32, u32)>) {
+    let Some((uid, gid)) = owner else { return };
+    // SAFETY: the descriptor is open for the call.
+    if let Err(err) = check(unsafe { libc::fchown(file.as_raw_fd(), uid, gid) }) {
+        tracing::warn!(error = %err, "chown failed");
+    }
+}
+
+pub(super) fn give_file(file: &File, owner: Option<(u32, u32)>) {
+    chown_best_effort(file, owner);
+}
+
+pub(super) fn secure_dir(dir: &File, owner: Option<(u32, u32)>, mode: Option<u32>) -> io::Result<()> {
+    chown_best_effort(dir, owner);
+    match mode {
+        Some(mode) => dir.set_permissions(std::fs::Permissions::from_mode(mode)),
+        None => Ok(()),
+    }
+}
+
+pub(super) fn seal(file: &File, owner: Option<(u32, u32)>) -> io::Result<()> {
+    chown_best_effort(file, owner);
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(test)]
+#[path = "unix_tests.rs"]
+mod unix_tests;
