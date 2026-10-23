@@ -2956,7 +2956,7 @@ and a rerun repeats the platform's whole job.
   `retry::permanent` (a 4xx other than 408 and 429, a complete body with the
   wrong hash, a missing working directory), `retry.ps1` stops on an HTTP 4xx
   other than 408 and 429, the MSI project's WiX download does the same, and the
-  shell and xtask helpers stop on a missing program. 408 and 429 ask for another
+  shell and xtask helpers stop on a missing program. Ctrl-C ends the xtask loop, though xtask itself survives the signal (#568): the handler records it and `until_ok` checks between attempts and wakes from its backoff. 408 and 429 ask for another
   try, so they retry, and a `Retry-After` in seconds is waited out (the backoff
   is the floor; an HTTP-date `Retry-After` is read by `retry.ps1` on PowerShell
   7 only). Where the tool offers no way to tell, a deterministic failure retries

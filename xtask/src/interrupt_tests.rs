@@ -7,6 +7,38 @@
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
+use super::Interrupt;
+
+/// A raised flag ends a wait that would otherwise last an hour. The raise may land before or after the
+/// waiter blocks; the wait must return either way.
+#[skuld::test]
+fn raise_wakes_a_waiter() {
+    let interrupt = Interrupt::new();
+    let interrupted = std::thread::scope(|scope| {
+        scope.spawn(|| interrupt.raise());
+        interrupt.sleep(std::time::Duration::from_secs(3600))
+    });
+    assert!(interrupted);
+    assert!(interrupt.is_raised());
+}
+
+/// A wait nobody interrupts runs its whole delay and reports no interrupt.
+#[skuld::test]
+fn an_unraised_wait_runs_to_its_end() {
+    let interrupt = Interrupt::new();
+    assert!(!interrupt.sleep(std::time::Duration::ZERO));
+    assert!(!interrupt.is_raised());
+}
+
+/// The flag is sticky: a later wait returns at once.
+#[skuld::test]
+fn a_raised_flag_stays_raised() {
+    let interrupt = Interrupt::new();
+    interrupt.raise();
+    assert!(interrupt.sleep(std::time::Duration::from_secs(3600)));
+    assert!(interrupt.sleep(std::time::Duration::from_secs(3600)));
+}
+
 /// After installing the transparent handler, a SIGINT must NOT terminate the
 /// process (default disposition would). Reaching the line past the raise is the
 /// proof of survival — no timing (raise delivers synchronously before return).
