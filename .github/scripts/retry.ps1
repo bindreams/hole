@@ -46,8 +46,7 @@ while ($true) {
             $asked = [int]$response.Headers['Retry-After']
         }
 
-        # Exponential backoff to a 30 s ceiling, plus jitter. The ceiling bounds
-        # the delay between attempts, not the number of attempts.
+        # Exponential backoff to a 30 s ceiling, plus jitter.
         $wait = [Math]::Max($delay + (Get-Random -Maximum ($delay + 1)), $asked)
         Write-Host "retry: attempt $attempt of '$What' failed: $($_.Exception.Message); retrying in ${wait}s"
         Start-Sleep -Seconds $wait

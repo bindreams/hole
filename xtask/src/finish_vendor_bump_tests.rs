@@ -2,7 +2,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::finish_vendor_bump::test_support::FixtureBuilder;
+use super::finish_vendor_bump::test_support::{Fixture, FixtureBuilder};
 use super::finish_vendor_bump::{self, IdentityCheckOutcome};
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -405,13 +405,10 @@ fn run_refuses_when_the_module_has_no_existing_require_line() {
     );
 }
 
-/// `run_identity_checks`'s two `go test` invocations must match
-/// `build.yaml`'s `ex-ray-tests` target's `run:` steps exactly (this
-/// module's own reason for existing that way). Parses the REAL repo's
-/// build.yaml, not a fixture, so a future edit to that target fails this
-/// test loudly instead of drifting silently — the same drift-guard
-/// pattern `ci_nextest_parity_tests.rs`/`ci_timeouts_tests.rs` already
-/// establish in this codebase.
+/// `build.yaml`'s `ex-ray-tests` target runs what [`finish_vendor_bump::IDENTITY_STEPS`] says, in that order:
+/// each step's `go test`, and the retried module fetch before it for every module but `crates/ex-ray` itself
+/// (whose dependencies `cargo xtask deps` fetches earlier in CI). The expected commands are derived from the steps, not copied from the YAML, so an edit to either
+/// side fails this test. Parses the REAL repo's build.yaml, not a fixture.
 #[skuld::test]
 fn identity_checks_match_the_real_build_yaml_ex_ray_tests_target() {
     let root = crate::repo_root().expect("repo root");
@@ -433,19 +430,101 @@ fn identity_checks_match_the_real_build_yaml_ex_ray_tests_target() {
         })
         .collect();
 
+    let mut expected: Vec<String> = Vec::new();
+    for step in &finish_vendor_bump::IDENTITY_STEPS {
+        if step.dir != "crates/ex-ray" {
+            expected.push(format!(".github/scripts/retry.sh go -C {} mod download", step.dir));
+        }
+        expected.push(format!("cd {} && go {}", step.dir, step.test_args.join(" ")));
+    }
     assert_eq!(
-        commands,
-        vec![
-            "cd crates/ex-ray && go test ./...",
-            // Provisioning only (a retried fetch); `run_identity_checks` runs the two `go test`s around it.
-            ".github/scripts/retry.sh go -C crates/ex-ray/third_party/v2ray-core mod download",
-            "cd crates/ex-ray/third_party/v2ray-core && go test ./transport/internet/tls/... \
-             ./transport/internet/quic/... ./transport/internet/hysteria2/... \
-             ./transport/internet/transportcommon/...",
-        ],
-        "build.yaml's ex-ray-tests target has drifted from what run_identity_checks hardcodes — \
-         update finish_vendor_bump.rs to match"
+        commands, expected,
+        "build.yaml's ex-ray-tests target has drifted from finish_vendor_bump::IDENTITY_STEPS"
     );
+}
+
+/// Every module is fetched, under the caller-supplied fetch, before its own tests, and a failing test stops
+/// the later modules from being fetched or run.
+#[skuld::test]
+fn identity_checks_fetch_each_module_before_testing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2ray_core = dir.path().join("crates/ex-ray/third_party/v2ray-core");
+    let ex_ray = dir.path().join("crates/ex-ray");
+    std::fs::create_dir_all(&v2ray_core).unwrap();
+    std::fs::write(
+        ex_ray.join("go.mod"),
+        "module example.com/ex-ray
+
+go 1.25
+",
+    )
+    .unwrap();
+    std::fs::write(
+        ex_ray.join("main.go"),
+        "package main
+
+func main() {}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        v2ray_core.join("go.mod"),
+        "module example.com/v2ray-core
+
+go 1.25
+",
+    )
+    .unwrap();
+    for pkg in ["tls", "quic", "hysteria2", "transportcommon"] {
+        let pkg_dir = v2ray_core.join("transport/internet").join(pkg);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join(format!("{pkg}.go")),
+            format!(
+                "package {pkg}
+"
+            ),
+        )
+        .unwrap();
+    }
+
+    let mut fetched = Vec::new();
+    let outcome = finish_vendor_bump::run_identity_steps(dir.path(), &finish_vendor_bump::IDENTITY_STEPS, |d| {
+        fetched.push(d.to_path_buf());
+        Ok(())
+    })
+    .unwrap();
+    assert!(matches!(outcome, IdentityCheckOutcome::Passed));
+    assert_eq!(fetched, [ex_ray.clone(), v2ray_core]);
+
+    // A syntax error in crates/ex-ray fails the first step: its fetch ran, the second module's did not.
+    std::fs::write(
+        ex_ray.join("main.go"),
+        "package main
+
+func broken( {
+",
+    )
+    .unwrap();
+    let mut fetched = Vec::new();
+    let outcome = finish_vendor_bump::run_identity_steps(dir.path(), &finish_vendor_bump::IDENTITY_STEPS, |d| {
+        fetched.push(d.to_path_buf());
+        Ok(())
+    })
+    .unwrap();
+    assert!(matches!(outcome, IdentityCheckOutcome::Failed { .. }));
+    assert_eq!(fetched, [ex_ray]);
+}
+
+/// A fetch that gives up (a missing `go`) is an error of the run, not a failed test.
+#[skuld::test]
+fn a_fetch_that_cannot_run_is_not_reported_as_a_failed_test() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = finish_vendor_bump::run_identity_steps(dir.path(), &finish_vendor_bump::IDENTITY_STEPS, |_| {
+        Err(crate::retry::permanent(anyhow::anyhow!("no go")))
+    })
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("no go"), "{err:#}");
 }
 
 #[skuld::test]
@@ -703,6 +782,18 @@ fn a_tracked_go_sum_deleted_from_disk_has_its_deletion_committed() {
     );
 }
 
+/// `run` over a fixture whose `go mod tidy` fails on a local input, with the production retry swapped for
+/// none: the production step retries until it succeeds, which a local failure never does.
+fn run_with_a_tidy_that_fails_for_good(fx: &Fixture) -> anyhow::Result<IdentityCheckOutcome> {
+    finish_vendor_bump::run_with_tidy(
+        fx.root(),
+        "crates/ex-ray/third_party/widget",
+        "widget",
+        "v1.1.0",
+        &|dir| finish_vendor_bump::go_mod_tidy_once(dir).map_err(crate::retry::permanent),
+    )
+}
+
 /// When `go mod tidy` itself fails, the VENDORING.md version-note commit
 /// (an earlier, independent step) has already landed on the branch — that
 /// must be disclosed, not left a silent side effect (matches
@@ -721,7 +812,7 @@ fn run_discloses_the_landed_vendoring_commit_when_go_mod_tidy_itself_fails() {
         )
         .build();
 
-    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let result = run_with_a_tidy_that_fails_for_good(&fx);
     let err = result.expect_err("a nonexistent replace target must fail go mod tidy");
     let message = format!("{err:#}");
     assert!(
@@ -781,7 +872,7 @@ fn run_folds_a_restore_failure_into_the_returned_error() {
     readonly_perms.set_readonly(true);
     std::fs::set_permissions(&go_sum, readonly_perms).unwrap();
 
-    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let result = run_with_a_tidy_that_fails_for_good(&fx);
 
     // Restore writability before any assertion can early-return via
     // `assert!` panicking, so `TempDir`'s teardown can still delete it.

@@ -1,6 +1,9 @@
 """The WiX download waits out a lost network and fails at once on anything a retry cannot fix."""
 
 import hashlib
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 
 import httpx
@@ -10,6 +13,15 @@ from tenacity import wait_none
 
 import msi_installer
 from msi_installer import BuildError, _download_and_hash, _download_file
+
+
+@dataclass
+class CutShort:
+    """A 200 response whose body delivers `prefix`, then fails with `error`: the network lost mid-download."""
+
+    prefix: bytes
+    error: Exception
+
 
 BODY = b"wix-cli-x64 bytes"
 BODY_SHA256 = hashlib.sha256(BODY).hexdigest()
@@ -26,7 +38,7 @@ def no_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 def serve(monkeypatch: pytest.MonkeyPatch, responses: list) -> list[int]:
     """Answer successive requests from `responses`: an exception is raised, an int is a status code, a (status, headers)
-    pair is that status with those headers, bytes are a 200 body.
+    pair is that status with those headers, bytes are a 200 body, a `CutShort` is a body that fails part-way.
 
     Returns the list that records one entry per request made.
     """
@@ -37,6 +49,13 @@ def serve(monkeypatch: pytest.MonkeyPatch, responses: list) -> list[int]:
         item = responses[min(len(made), len(responses)) - 1]
         if isinstance(item, Exception):
             raise item
+        if isinstance(item, CutShort):
+
+            def body():
+                yield item.prefix
+                raise item.error
+
+            return httpx.Response(200, content=body())
         if isinstance(item, tuple):
             status, headers = item
             return httpx.Response(status, headers=headers)
@@ -89,13 +108,49 @@ def test_the_wait_the_server_names_is_honoured(
     assert no_backoff == [7]
 
 
-def test_a_wait_in_a_form_that_is_not_seconds_falls_back_to_the_backoff(
+def test_a_wait_named_as_a_date_is_honoured(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, no_backoff: list[float]
 ) -> None:
-    serve(monkeypatch, [(429, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}), BODY])
+    an_hour_on = format_datetime(datetime.now(timezone.utc) + timedelta(hours=1), usegmt=True)
+    serve(monkeypatch, [(429, {"Retry-After": an_hour_on}), BODY])
+
+    _download_and_hash("https://example.invalid/wix.msi", tmp_path / "wix.msi", console())
+    # The date is whole seconds, so the wait is an hour less the time since it was formed.
+    assert len(no_backoff) == 1 and 3590 < no_backoff[0] <= 3600
+
+
+def test_a_date_is_read_against_the_given_time() -> None:
+    response = httpx.Response(429, headers={"Retry-After": "Fri, 31 Dec 1999 23:59:59 GMT"})
+    error = httpx.HTTPStatusError("429", request=httpx.Request("GET", "https://example.invalid"), response=response)
+    thirty_s_before = datetime(1999, 12, 31, 23, 59, 29, tzinfo=timezone.utc)
+    assert msi_installer._requested_wait(error, now=thirty_s_before) == 30
+    assert msi_installer._requested_wait(error, now=thirty_s_before + timedelta(minutes=1)) == 0
+
+
+@pytest.mark.parametrize("value", ["soon", "", "-5", "Fri, 99 Dec 1999 99:99:99 GMT"])
+def test_a_wait_that_is_not_a_wait_falls_back_to_the_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, no_backoff: list[float], value: str
+) -> None:
+    serve(monkeypatch, [(429, {"Retry-After": value}), BODY])
 
     _download_and_hash("https://example.invalid/wix.msi", tmp_path / "wix.msi", console())
     assert no_backoff == [0]
+
+
+@pytest.mark.parametrize(
+    "error", [httpx.ReadError("connection reset"), httpx.RemoteProtocolError("peer closed connection")]
+)
+def test_a_network_lost_mid_body_is_waited_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    made = serve(monkeypatch, [CutShort(b"wix-cli", error), CutShort(b"wix-cli-x64", error), BODY])
+    dest = tmp_path / "wix.msi"
+
+    # The hash covers the final body alone, not the bytes of the attempts that were cut short.
+    assert _download_and_hash("https://example.invalid/wix.msi", dest, console()) == BODY_SHA256
+    assert len(made) == 3
+    assert dest.read_bytes() == BODY
+    assert not dest.with_suffix(".tmp").exists()
 
 
 def test_a_missing_file_is_not_retried(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

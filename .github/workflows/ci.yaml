@@ -133,7 +133,7 @@ jobs:
 
       # The `validate-docs` hook is a `system` hook whose `uv run` downloads
       # Sphinx when the hook runs, which `prek install-hooks` does not cover.
-      # Fetch it here under retry; retrying the lint would retry a docs failure.
+      # Fetch it here under retry.
       - id: fetch-docs-tools
         name: Fetch docs build tools (portable lint leg)
         if: ${{ matrix.portable-lint == true }}
@@ -182,7 +182,7 @@ jobs:
         timeout-minutes: 5
         shell: bash
         run: |
-          # Fetch the test dependencies under retry; retrying the run would retry a test failure.
+          # Fetch the test dependencies under retry.
           with=(--with pytest --with PyYAML --with pathspec)
           .github/scripts/retry.sh uv run "${with[@]}" python -c ""
           uv run "${with[@]}" pytest -o python_files="*.py" scripts/
@@ -372,7 +372,7 @@ jobs:
           # A stale lockfile fails the same way on every attempt: check it offline before the retry.
           uv lock --check --offline
           if ($LASTEXITCODE -ne 0) { throw "uv lock --check exited with $LASTEXITCODE" }
-          # Fetch the test dependencies under retry; retrying the run would retry a test failure.
+          # Fetch the test dependencies under retry.
           & ../.github/scripts/retry.ps1 -What 'uv sync (msi-installer)' -Script {
             uv sync --group dev
             if ($LASTEXITCODE -ne 0) { throw "uv sync exited with $LASTEXITCODE" }
@@ -393,17 +393,20 @@ jobs:
         shell: pwsh
         run: target\release\hole.exe version
 
-      # tauri-driver is installed via `cargo install`; the cargo registry cache
-      # and sccache from setup-build keep this fast. `--locked` and a pinned
-      # version guard against flakes from unrelated bumps in the crate. It, the
-      # driver and gsudo are tool installs that need nothing from the MSI, so
-      # they sit before `hole-build` with the rest of the toolchain users.
+      # tauri-driver is installed from cargo-quickinstall's prebuilt binary at a pinned
+      # version, so the only thing retried is a download: a compile inside the retry
+      # would retry a build error. It, the driver and gsudo are tool installs that
+      # need nothing from the MSI, so they sit before `hole-build` with the rest of
+      # the toolchain users.
       - id: installer-tauri-driver
         name: Install tauri-driver
         if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
         timeout-minutes: 5
         shell: bash
-        run: .github/scripts/retry.sh cargo install --locked --version 2.0.6 tauri-driver
+        env:
+          # See install-nextest: the unauthenticated GitHub API limit is 60 req/h.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/retry.sh cargo binstall --no-confirm --disable-strategies compile --version 2.0.6 tauri-driver
 
       # tauri-driver speaks to WebView2 via Microsoft Edge's WebDriver. The
       # runner's bundled msedgedriver (`$EDGEWEBDRIVER`) targets the Edge BROWSER
@@ -991,7 +994,7 @@ jobs:
         timeout-minutes: 10
         shell: bash
         run: |
-          # Fetch the validator under retry; retrying the run would retry a config error.
+          # Fetch the validator under retry.
           .github/scripts/retry.sh npx --yes --package renovate renovate-config-validator --version
           npx --yes --package renovate renovate-config-validator --strict --no-global .github/renovate.json
 

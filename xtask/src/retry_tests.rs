@@ -150,6 +150,33 @@ fn an_interrupt_during_an_attempt_stops_the_loop_after_it() {
 }
 
 #[skuld::test]
+fn an_attempt_that_succeeds_after_an_interrupt_still_ends_the_loop() {
+    // An attempt with no child to carry Ctrl-C (a download), or one that spawned its child after the
+    // handler ran, succeeds anyway; the user's interrupt must not be swallowed by that success.
+    let interrupt = Interrupt::new();
+    let mut calls = 0;
+    let err = until_ok_with(instant(), &interrupt, "test fetch", || {
+        calls += 1;
+        interrupt.raise();
+        Ok(calls)
+    })
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert!(is_interrupted(&err), "{err:#}");
+}
+
+#[skuld::test]
+fn a_permanent_failure_during_an_interrupt_still_reports_the_interrupt() {
+    let interrupt = Interrupt::new();
+    let err = until_ok_with(instant(), &interrupt, "test fetch", || -> Result<()> {
+        interrupt.raise();
+        Err(permanent(anyhow!("HTTP 404")))
+    })
+    .unwrap_err();
+    assert!(is_interrupted(&err), "{err:#}");
+}
+
+#[skuld::test]
 fn an_interrupt_raised_before_the_first_attempt_runs_nothing() {
     let interrupt = Interrupt::new();
     interrupt.raise();

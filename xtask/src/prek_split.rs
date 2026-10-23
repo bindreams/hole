@@ -150,6 +150,11 @@ fn prepare_args(run_args: &[String]) -> Vec<String> {
 
 /// Perform `which` against the repository at `repo_root`.
 pub fn run(which: PrekRun, repo_root: &Path) -> Result<()> {
+    run_with(which, repo_root, &mut |args| run_prek(args, repo_root))
+}
+
+/// [`run`] with the `prek` invocation as a parameter, so the order and retrying of its calls can be checked.
+pub(crate) fn run_with(which: PrekRun, repo_root: &Path, prek: &mut dyn FnMut(&[String]) -> Result<()>) -> Result<()> {
     let read = |rel: &str| std::fs::read_to_string(repo_root.join(rel)).with_context(|| format!("reading {rel}"));
     let split = LintSplit::parse(&read(".github/lint.toml")?, &read("prek.toml")?)?;
     let (prepare, args) = match which {
@@ -166,13 +171,13 @@ pub fn run(which: PrekRun, repo_root: &Path) -> Result<()> {
     };
     // A config prek cannot parse fails the same way on every attempt, so check it
     // locally before the retry loop below.
-    run_prek(&["validate-config".to_string(), "prek.toml".to_string()], repo_root)?;
+    prek(&["validate-config".to_string(), "prek.toml".to_string()])?;
     // Hook repositories and environments come from the network: fetch them under
     // retry, then run the hooks once. Retrying the run would retry a lint failure.
     println!("xtask: prek {}", prepare.join(" "));
-    crate::retry::until_ok("prek install-hooks", || run_prek(&prepare, repo_root))?;
+    crate::retry::until_ok("prek install-hooks", || prek(&prepare))?;
     println!("xtask: prek {}", args.join(" "));
-    run_prek(&args, repo_root)
+    prek(&args)
 }
 
 fn run_prek(args: &[String], repo_root: &Path) -> Result<()> {

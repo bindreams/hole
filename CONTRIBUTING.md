@@ -2954,17 +2954,28 @@ and a rerun repeats the platform's whole job.
   `setup-build` and the release jobs before any xtask step, and `cargo xtask`
   leaves a developer's lock to cargo, which updates it as it always has. `until_ok` stops on a failure marked
   `retry::permanent` (a 4xx other than 408 and 429, a complete body with the
-  wrong hash, a missing working directory), `retry.ps1` stops on an HTTP 4xx
+  wrong hash, a missing working directory, a transport error no attempt can
+  fix such as a malformed URL or a rejected certificate: only I/O errors,
+  timeouts, name-resolution and connection failures, 5xx, 408 and 429
+  retry), `retry.ps1` stops on an HTTP 4xx
   other than 408 and 429, the MSI project's WiX download does the same, and the
-  shell and xtask helpers stop on a missing program. Ctrl-C ends the xtask loop, though xtask itself survives the signal (#568): the handler records it and `until_ok` checks between attempts and wakes from its backoff. 408 and 429 ask for another
-  try, so they retry, and a `Retry-After` in seconds is waited out (the backoff
-  is the floor; an HTTP-date `Retry-After` is read by `retry.ps1` on PowerShell
-  7 only). Where the tool offers no way to tell, a deterministic failure retries
+  shell and xtask helpers stop on a missing program. Ctrl-C ends the xtask loop, though xtask itself survives the signal (#568): the handler records it, and `until_ok` checks before and after every attempt (a download also between body chunks) and wakes from its backoff. 408 and 429 ask for another
+  try, so they retry, and a `Retry-After`, in seconds or as an HTTP date, is
+  waited out (the backoff is the floor; `retry.ps1` reads the date form on
+  PowerShell 7 only). Where the tool offers no way to tell, a deterministic failure retries
   until the timeout and the log shows its cause on every attempt: `go mod download` (a nonexistent version or a checksum mismatch exits 1 like a lost
   network; a stale `go.sum` does not loop, since `go build` fails it at once),
   `cargo fetch` (a manifest cargo cannot parse), `uv sync` and `uv tool install`
   (a yanked pin or a source build that fails), `npm ci` and `npx`, `prek install-hooks`,
-  `GOTOOLCHAIN=goX.Y.Z go version` (a toolchain that does not exist), `gh release download`, `git clone`, `curl -f`, `brew`, `cargo binstall`/`install`.
+  `GOTOOLCHAIN=goX.Y.Z go version` (a toolchain that does not exist), `go mod tidy` (in the vendor bump), `gh release download`, `git clone`, `curl -f`, `brew`, `cargo binstall`.
+  Three tools get a discriminator instead: `git ls-remote --exit-code` tells a
+  tag upstream lacks (exit 2) from a lost network before `pull-subrepo`
+  fetches; `cargo package --offline` runs a release's packaging and verify
+  build from the fetched sources, so only `cargo publish --dry-run --no-verify`
+  (which always asks the registry) is retried; and the publish workflows wait
+  for `api.github.com` to answer before asking `gh release view` once. The real
+  `cargo publish` is not retried: a retry after an upload whose answer was lost
+  would fail on the version that just landed.
   A `uses:` action that fetches cannot be wrapped: `setup-go` and the
   sccache action are `continue-on-error` with a visible warning and a
   fallback (`.github/actions/setup-go` pins the release through the `go`

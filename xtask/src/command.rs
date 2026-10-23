@@ -1,8 +1,5 @@
-//! Run a child process and, when it fails, say which command failed.
-//!
-//! An `ExitStatus::code().unwrap_or(-1)` message names neither the command nor
-//! the cause of a signal death, so a failing step can print nothing useful
-//! (#1067). Every spawn that can fail a provisioning step goes through here.
+//! Run a child process and, when it fails, say which command failed and how (exit code or signal).
+//! Every spawn that can fail a provisioning step goes through here.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
@@ -40,10 +37,7 @@ pub fn run_inherited(cmd: &mut Command) -> Result<()> {
 /// command, the status and the captured stderr; success returns the output.
 pub fn run_captured(cmd: &mut Command) -> Result<Output> {
     let line = describe(cmd);
-    let output = cmd
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| spawn_error(cmd, &line, e))?;
+    let output = run_output(cmd)?;
     if !output.status.success() {
         bail!(
             "`{line}` failed: {}\nstderr:\n{}",
@@ -52,6 +46,15 @@ pub fn run_captured(cmd: &mut Command) -> Result<Output> {
         );
     }
     Ok(output)
+}
+
+/// Run `cmd` capturing its output, whatever its exit status: for a caller that reads the exit code itself.
+/// Only a failure to start it (a missing program or working directory) is an error.
+pub fn run_output(cmd: &mut Command) -> Result<Output> {
+    let line = describe(cmd);
+    cmd.stdin(Stdio::null())
+        .output()
+        .map_err(|e| spawn_error(cmd, &line, e))
 }
 
 /// The program is not installed. No retry can fix it, so [`crate::retry`] gives up on it.

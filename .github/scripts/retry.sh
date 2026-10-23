@@ -35,8 +35,7 @@ while true; do
         exit "$status"
     fi
 
-    # Exponential backoff to a 30 s ceiling, plus jitter. The ceiling bounds the
-    # delay between attempts, not the number of attempts.
+    # Exponential backoff to a 30 s ceiling, plus jitter.
     wait=$((delay + RANDOM % (delay + 1)))
     echo "retry: attempt $attempt of '$*' failed with exit $status; retrying in ${wait}s" >&2
     sleep "$wait"

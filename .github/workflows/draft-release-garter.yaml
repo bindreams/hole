@@ -28,7 +28,10 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/setup-rust
       - run: .github/scripts/cargo-fetch.sh
-      - run: cargo publish --dry-run -p garter
+      # Packaging and its verify build run offline from the fetched sources, so a packaging error fails at once.
+      - run: cargo package --offline -p garter
+      # `cargo publish` always asks the registry; only that round trip is retried.
+      - run: .github/scripts/retry.sh cargo publish --dry-run --no-verify -p garter
 
   draft:
     needs: validate-cargo-publish

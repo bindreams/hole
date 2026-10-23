@@ -152,7 +152,7 @@ jobs:
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
           TAG="releases/ex-ray/v${VERSION}"
-          # Fetch the script's dependencies under retry; retrying the run would retry a script error.
+          # Fetch the script's dependencies under retry.
           source/.github/scripts/retry.sh uv run source/scripts/generate-release-notes.py --help
           uv run source/scripts/generate-release-notes.py ex-ray \
             --new-tag "$TAG" \

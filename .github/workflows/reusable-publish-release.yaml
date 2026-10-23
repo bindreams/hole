@@ -98,10 +98,16 @@ jobs:
         if: ${{ inputs.dry-run && inputs.crates-publish }}
         run: .github/scripts/cargo-fetch.sh
 
+      # Packaging and its verify build run offline from the fetched sources, so a packaging error fails at once.
+      - name: Run cargo package
+        if: ${{ inputs.dry-run && inputs.crates-publish }}
+        run: cargo package --offline -p ${{ inputs.crates-name }}
+
+      # `cargo publish` always asks the registry; only that round trip is retried.
       - name: Run cargo publish --dry-run
         if: ${{ inputs.dry-run && inputs.crates-publish }}
         run: |
-          cargo publish --dry-run -p ${{ inputs.crates-name }}
+          .github/scripts/retry.sh cargo publish --dry-run --no-verify -p ${{ inputs.crates-name }}
           echo "Dry-run complete; exiting without touching crates.io or the GitHub release."
 
       # Real-publish branch (when not dry-run).
@@ -109,6 +115,8 @@ jobs:
         if: ${{ !inputs.dry-run }}
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          # Wait for the API to answer, then ask once: a missing release is the answer, not a lost network.
+          .github/scripts/retry.sh curl -fsS -o /dev/null https://api.github.com/zen
           RELEASE_JSON=$(gh release view "$TAG" --json isDraft,assets)
           IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')
           if [ "$IS_DRAFT" != "true" ]; then
@@ -149,16 +157,30 @@ jobs:
           CRATES_UA: "hole-release-pipeline (https://github.com/bindreams/hole)"
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          CODE=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}")
-          if [ "$CODE" = "200" ]; then
-            echo "already_published=true" >> "$GITHUB_OUTPUT"
-            echo "Version ${VERSION} already on crates.io; will skip publish."
-          elif [ "$CODE" = "404" ]; then
-            echo "already_published=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Unexpected HTTP $CODE from crates.io API"
-            exit 1
-          fi
+          # 200 and 404 are the answers. No answer (000), a rate limit and a server error are not: ask again
+          # until the job's timeout-minutes.
+          while true; do
+            CODE=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}" || true)
+            case "$CODE" in
+              200)
+                echo "already_published=true" >> "$GITHUB_OUTPUT"
+                echo "Version ${VERSION} already on crates.io; will skip publish."
+                break
+                ;;
+              404)
+                echo "already_published=false" >> "$GITHUB_OUTPUT"
+                break
+                ;;
+              000 | 429 | 5??)
+                echo "crates.io API answered HTTP $CODE; asking again in 10s"
+                sleep 10
+                ;;
+              *)
+                echo "::error::Unexpected HTTP $CODE from crates.io API"
+                exit 1
+                ;;
+            esac
+          done
 
       - uses: actions/checkout@v7
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}

@@ -7,7 +7,7 @@ runs:
     # setup-go downloads from go.dev and GitHub, outside this repo's retry
     # helpers; a runner that has lost its network fails it with no defect behind
     # it. Its failure is not fatal here: the next step pins the same release a
-    # second way, and the step stays visibly red in the log.
+    # second way.
     - id: setup-go
       uses: actions/setup-go@v7
       continue-on-error: true

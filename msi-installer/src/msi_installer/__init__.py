@@ -14,6 +14,8 @@ import subprocess
 import sys
 import time
 import tomllib
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
@@ -188,8 +190,7 @@ def _accept_wix_eula(wix_exe: Path, version: str) -> None:
         )
 
 
-# Pause between download attempts: 1 s doubling to 30 s, with jitter. The ceiling bounds the pause, not the
-# number of attempts.
+# Pause between download attempts: 1 s doubling to 30 s, with jitter.
 _DOWNLOAD_WAIT = wait_exponential_jitter(initial=1, max=30)
 
 
@@ -213,12 +214,20 @@ def _is_transient(error: BaseException) -> bool:
     return isinstance(error, httpx.TransportError)
 
 
-def _requested_wait(error: BaseException | None) -> float:
-    """Seconds a `Retry-After: <seconds>` on `error` asks for, else 0. The HTTP-date form is left to the backoff."""
+def _requested_wait(error: BaseException | None, now: datetime | None = None) -> float:
+    """Seconds a `Retry-After` on `error` asks for (whole seconds, or an HTTP date read against `now`), else 0."""
     if not isinstance(error, httpx.HTTPStatusError):
         return 0
     value = error.response.headers.get("Retry-After", "").strip()
-    return int(value) if value.isascii() and value.isdigit() else 0
+    if value.isascii() and value.isdigit():
+        return int(value)
+    try:
+        date = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return 0
+    if date.tzinfo is None:
+        return 0
+    return max(0.0, (date - (now or datetime.now(timezone.utc))).total_seconds())
 
 
 def _wait_before_retry(state: RetryCallState) -> float:

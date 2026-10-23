@@ -1,7 +1,6 @@
 //! Retry a provisioning fetch until it succeeds.
 //!
-//! A runner that briefly loses its network must not fail a build step (#1067,
-//! #670). There is no attempt cap: the step's own `timeout-minutes` is the bound,
+//! A runner that briefly loses its network must not fail a build step. There is no attempt cap: the step's own `timeout-minutes` is the bound,
 //! and every failed attempt prints its cause so the log shows why it waited.
 //!
 //! Only for operations that are safe to repeat and fail on the network
@@ -9,8 +8,9 @@
 //! program is not the only failure no retry can fix: an operation marks any other
 //! one [`permanent`], and a permanent failure ends the loop too. A server that
 //! names how long to wait ([`retry_after`]) is waited for at least that long.
-//! Ctrl-C ends the loop: xtask survives the signal by design (#568), so the loop
-//! observes the recorded interrupt itself, between attempts and during the backoff.
+//! Ctrl-C ends the loop: xtask survives the signal by design, so the loop
+//! observes the recorded interrupt itself: before an attempt, after one (whether it
+//! succeeded or failed) and during the backoff.
 
 use std::time::Duration;
 
@@ -76,8 +76,7 @@ pub fn requested_wait(err: &anyhow::Error) -> Option<Duration> {
     err.downcast_ref::<RetryAfter>().map(|r| r.0)
 }
 
-/// Backoff between attempts: 1 s, doubling to a 30 s ceiling, with jitter. The
-/// ceiling bounds the delay between attempts, not the number of attempts.
+/// Backoff between attempts: 1 s, doubling to a 30 s ceiling, with jitter.
 fn backoff() -> ExponentialBuilder {
     ExponentialBuilder::default()
         .with_max_delay(Duration::from_secs(30))
@@ -107,21 +106,25 @@ pub(crate) fn until_ok_with<T>(
         if interrupt.is_raised() {
             return Err(anyhow::Error::msg(Interrupted));
         }
-        let err = match op() {
+        let outcome = op();
+        attempt += 1;
+        // A raise during the attempt ends the loop whatever the attempt returned: Ctrl-C also killed its
+        // child, or the attempt has none (a download) or started it after the handler ran, and succeeded.
+        if interrupt.is_raised() {
+            if let Err(err) = &outcome {
+                eprintln!("xtask: {what}: attempt {attempt} failed: {err:#}; interrupted");
+            }
+            return Err(anyhow::Error::msg(Interrupted));
+        }
+        let err = match outcome {
             Ok(value) => return Ok(value),
             Err(err) if is_permanent(&err) => return Err(err),
             Err(err) => err,
         };
-        let Some(delay) = delays.next() else {
-            return Err(err);
-        };
-        attempt += 1;
-        let delay = delay.max(requested_wait(&err).unwrap_or_default());
-        // A raise during the attempt (Ctrl-C also killed its child) is seen here, before any wait.
-        if interrupt.is_raised() {
-            eprintln!("xtask: {what}: attempt {attempt} failed: {err:#}; interrupted");
-            return Err(anyhow::Error::msg(Interrupted));
-        }
+        let delay = delays
+            .next()
+            .expect("backoff() has no attempt cap")
+            .max(requested_wait(&err).unwrap_or_default());
         eprintln!("xtask: {what}: attempt {attempt} failed: {err:#}; retrying in {delay:.1?}");
         if interrupt.sleep(delay) {
             return Err(anyhow::Error::msg(Interrupted));

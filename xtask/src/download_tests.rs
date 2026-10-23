@@ -126,3 +126,133 @@ fn a_body_over_the_size_limit_is_not_retried() {
     assert!(crate::retry::is_permanent(&err), "{err:#}");
     assert_eq!(served.load(Ordering::SeqCst), 1);
 }
+
+#[skuld::test]
+fn only_transport_failures_and_retryable_statuses_are_transient() {
+    use ureq::Error as E;
+    let transient = [
+        E::Io(std::io::Error::other("connection reset")),
+        E::Timeout(ureq::Timeout::Connect),
+        E::HostNotFound,
+        E::ConnectionFailed,
+        E::StatusCode(500),
+        E::StatusCode(503),
+        E::StatusCode(408),
+        E::StatusCode(429),
+    ];
+    for err in &transient {
+        assert!(is_transient(err), "{err} must be retried");
+    }
+    let deterministic = [
+        E::BadUri("no host".into()),
+        E::Tls("certificate rejected"),
+        E::TooManyRedirects,
+        E::RedirectFailed,
+        E::InvalidProxyUrl,
+        E::BodyExceedsLimit(4),
+        E::StatusCode(400),
+        E::StatusCode(404),
+    ];
+    for err in &deterministic {
+        assert!(!is_transient(err), "{err} repeats on every attempt");
+    }
+}
+
+#[skuld::test]
+fn an_unsupported_scheme_is_not_retried() {
+    let err = fetch_verified(
+        "test artifact",
+        "ftp://127.0.0.1:1/artifact",
+        1 << 20,
+        &sha256_hex(b"x"),
+    )
+    .unwrap_err();
+    assert!(crate::retry::is_permanent(&err), "{err:#}");
+}
+
+#[skuld::test]
+fn retry_after_names_whole_seconds() {
+    let now = std::time::UNIX_EPOCH;
+    assert_eq!(parse_retry_after("120", now), Some(Duration::from_secs(120)));
+    assert_eq!(parse_retry_after(" 7 ", now), Some(Duration::from_secs(7)));
+    assert_eq!(parse_retry_after("soon", now), None);
+}
+
+/// RFC 9110's example date, `Fri, 31 Dec 1999 23:59:59 GMT`, is 946684799 s after the epoch.
+#[skuld::test]
+fn retry_after_names_an_http_date() {
+    let thirty_s_before = std::time::UNIX_EPOCH + Duration::from_secs(946_684_799 - 30);
+    assert_eq!(
+        parse_retry_after("Fri, 31 Dec 1999 23:59:59 GMT", thirty_s_before),
+        Some(Duration::from_secs(30))
+    );
+}
+
+#[skuld::test]
+fn a_retry_after_date_in_the_past_asks_for_no_wait() {
+    let after = std::time::UNIX_EPOCH + Duration::from_secs(946_684_799 + 30);
+    assert_eq!(
+        parse_retry_after("Fri, 31 Dec 1999 23:59:59 GMT", after),
+        Some(Duration::ZERO)
+    );
+}
+
+/// The server named the wait as a date; the first backoff step (1 s plus up to 1 s of jitter) is shorter.
+#[skuld::test]
+fn a_rate_limit_dated_retry_after_is_waited_out() {
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(5));
+    let limited = format!(
+        "HTTP/1.1 429 Too Many Requests
+Retry-After: {date}
+Content-Length: 0
+Connection: close
+
+"
+    )
+    .into_bytes();
+    let (url, served) = serve(vec![limited, ok(b"the artifact")]);
+    let started = std::time::Instant::now();
+    let bytes = fetch_verified("test artifact", &url, 1 << 20, &sha256_hex(b"the artifact")).unwrap();
+    assert_eq!(bytes, b"the artifact");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    // The date is `now + 5 s` cut to whole seconds, so at least 4 s away when the response is read.
+    assert!(started.elapsed() >= Duration::from_secs(3), "{:?}", started.elapsed());
+}
+
+/// Never reaches the end of the body; raises the interrupt after the third chunk, as Ctrl-C would.
+struct EndlessBody<'a> {
+    interrupt: &'a Interrupt,
+    reads: usize,
+}
+
+impl std::io::Read for EndlessBody<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reads += 1;
+        if self.reads == 3 {
+            self.interrupt.raise();
+        }
+        buf[0] = 0;
+        Ok(1)
+    }
+}
+
+#[skuld::test]
+fn reading_a_body_stops_when_the_user_interrupts() {
+    let interrupt = Interrupt::new();
+    let err = read_body(
+        EndlessBody {
+            interrupt: &interrupt,
+            reads: 0,
+        },
+        &interrupt,
+        "failed to read the body",
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("interrupted"), "{err:#}");
+}
+
+#[skuld::test]
+fn reading_a_body_returns_every_byte() {
+    let body = read_body(&b"the artifact"[..], &Interrupt::new(), "failed to read the body").unwrap();
+    assert_eq!(body, b"the artifact");
+}

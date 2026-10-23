@@ -24,6 +24,18 @@ pub enum IdentityCheckOutcome {
 }
 
 pub fn run(repo_root: &Path, subdir: &str, dep_name: &str, new_tag: &str) -> Result<IdentityCheckOutcome> {
+    run_with_tidy(repo_root, subdir, dep_name, new_tag, &run_go_mod_tidy)
+}
+
+/// [`run`] with the `go mod tidy` step as a parameter: the production step retries until it succeeds, so a
+/// test of a tidy that fails for good supplies one that does not.
+pub(crate) fn run_with_tidy(
+    repo_root: &Path,
+    subdir: &str,
+    dep_name: &str,
+    new_tag: &str,
+    tidy: &dyn Fn(&Path) -> Result<()>,
+) -> Result<IdentityCheckOutcome> {
     // `dep_name` and `subdir` are two independent CLI/API arguments only
     // because every real caller (the CI workflow and a human running this by
     // hand) always computes both from the same `<name>` — this cross-check is
@@ -58,7 +70,7 @@ pub fn run(repo_root: &Path, subdir: &str, dep_name: &str, new_tag: &str) -> Res
         }
     };
 
-    if let Err(e) = run_go_mod_tidy_and_commit(repo_root, subdir, new_tag) {
+    if let Err(e) = run_go_mod_tidy_and_commit(repo_root, subdir, new_tag, tidy) {
         return Err(disclose_note_commit(e));
     }
 
@@ -225,7 +237,12 @@ pub fn update_vendoring_note_and_commit(repo_root: &Path, dep_name: &str, new_ta
 /// locally-replaced module, so it would otherwise silently keep
 /// advertising the old tag. The module path is read from the vendored
 /// dep's own `go.mod` `module` line rather than hardcoded.
-fn run_go_mod_tidy_and_commit(repo_root: &Path, subdir: &str, new_tag: &str) -> Result<()> {
+fn run_go_mod_tidy_and_commit(
+    repo_root: &Path,
+    subdir: &str,
+    new_tag: &str,
+    tidy: &dyn Fn(&Path) -> Result<()>,
+) -> Result<()> {
     let module_path = read_module_path(&repo_root.join(subdir).join("go.mod"))?;
     let ex_ray_go_mod = repo_root.join("crates/ex-ray/go.mod");
     let ex_ray_go_sum = repo_root.join("crates/ex-ray/go.sum");
@@ -260,7 +277,7 @@ fn run_go_mod_tidy_and_commit(repo_root: &Path, subdir: &str, new_tag: &str) -> 
 
     run_go_mod_edit(&ex_ray_dir, &format!("-require={module_path}@{new_tag}"))?;
 
-    if let Err(e) = run_go_mod_tidy(&ex_ray_dir) {
+    if let Err(e) = tidy(&ex_ray_dir) {
         // Leave the tree as it was found rather than with a half-applied,
         // uncommitted rewrite. Restore failures are folded into the same
         // error so they're never silently dropped.
@@ -374,21 +391,19 @@ fn run_go_mod_edit(ex_ray_dir: &Path, arg: &str) -> Result<()> {
     );
 }
 
+/// `go mod tidy` fetches the bumped module's dependencies, so it retries until it succeeds. It rewrites
+/// go.mod and go.sum idempotently, and the caller restores both if it never does.
 fn run_go_mod_tidy(ex_ray_dir: &Path) -> Result<()> {
-    let output = Command::new("go")
-        .args(["mod", "tidy"])
-        .current_dir(ex_ray_dir)
-        .output()
-        .with_context(|| format!("failed to run `go mod tidy` in {}", ex_ray_dir.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    bail!(
-        "`go mod tidy` failed in {}:\nstdout:\n{}\nstderr:\n{}",
-        ex_ray_dir.display(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::retry::until_ok("go mod tidy", || go_mod_tidy_once(ex_ray_dir))
+}
+
+/// One `go mod tidy` attempt.
+pub(crate) fn go_mod_tidy_once(ex_ray_dir: &Path) -> Result<()> {
+    let mut cmd = Command::new("go");
+    cmd.args(["mod", "tidy"]).current_dir(ex_ray_dir);
+    crate::command::run_captured(&mut cmd).map(|_| ()).map_err(|e| {
+        crate::ex_ray::go_not_found_hint(e).context(format!("`go mod tidy` failed in {}", ex_ray_dir.display()))
+    })
 }
 
 /// Asks the Go toolchain what version `module_path` currently resolves to
@@ -426,41 +441,69 @@ pub(crate) fn read_module_path(go_mod_path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{} has no `module` line", go_mod_path.display()))
 }
 
-/// Matches `build.yaml`'s `ex-ray-tests` target (what ci.yaml's
-/// `test-ex-ray-ech` step runs), less its retried `go mod download`
-/// provisioning step: `crates/ex-ray`'s own `go test ./...`,
-/// plus a scoped `go test` inside `crates/ex-ray/third_party/v2ray-core`
-/// specifically. Both commands are unconditional in build.yaml — this is
-/// the single whole-crate CI test target, run identically regardless of
-/// which vendored dep a bump touched, so it does NOT scope the second
-/// command to whatever `subdir` this `finish-vendor-bump` invocation is
-/// for (a utls bump still needs v2ray-core's own scoped tests to have
-/// run, exactly as CI would). Not literally `cargo xtask run
-/// ex-ray-tests` itself: that needs the full build.yaml environment,
-/// unavailable to the fixture repos this module's tests build.
-/// `identity_checks_match_the_real_build_yaml_ex_ray_tests_target`
-/// (finish_vendor_bump_tests.rs) parses the real build.yaml and fails
-/// loudly if that target's `run:` steps ever drift from what's hardcoded
-/// here.
+/// One module of `build.yaml`'s `ex-ray-tests` target: where its `go test` runs and with what.
+pub(crate) struct IdentityStep {
+    /// The module directory, relative to the repository root.
+    pub dir: &'static str,
+    /// The `go` arguments of the test run.
+    pub test_args: &'static [&'static str],
+}
+
+/// What `build.yaml`'s `ex-ray-tests` target (and so ci.yaml's `test-ex-ray-ech` step) runs, in order:
+/// `crates/ex-ray`'s own `go test ./...`, then a scoped `go test` inside
+/// `crates/ex-ray/third_party/v2ray-core`. Both are unconditional there: the target is the single whole-crate
+/// CI test, run identically whichever vendored dep a bump touched, so the second is not scoped to this
+/// invocation's `subdir` (a utls bump still needs v2ray-core's own scoped tests, exactly as CI would). Not
+/// literally `cargo xtask run ex-ray-tests`: that needs the full build.yaml environment, unavailable to the
+/// fixture repos this module's tests build. `identity_checks_match_the_real_build_yaml_ex_ray_tests_target`
+/// derives the expected target from this list, so the two cannot drift apart.
+pub(crate) const IDENTITY_STEPS: [IdentityStep; 2] = [
+    IdentityStep {
+        dir: "crates/ex-ray",
+        test_args: &["test", "./..."],
+    },
+    IdentityStep {
+        dir: "crates/ex-ray/third_party/v2ray-core",
+        test_args: &[
+            "test",
+            "./transport/internet/tls/...",
+            "./transport/internet/quic/...",
+            "./transport/internet/hysteria2/...",
+            "./transport/internet/transportcommon/...",
+        ],
+    },
+];
+
+/// Run [`IDENTITY_STEPS`]. A bump has just rewritten go.mod, so the modules it names are not in the cache:
+/// each module's dependencies are fetched under retry before its tests run, and a network loss never
+/// reads as a failed test.
 pub(crate) fn run_identity_checks(repo_root: &Path) -> Result<IdentityCheckOutcome> {
-    let ex_ray_dir = repo_root.join("crates/ex-ray");
-    if let Some(detail) = go_command_failure(&ex_ray_dir, &["test", "./..."])? {
-        return Ok(IdentityCheckOutcome::Failed { detail });
-    }
+    run_identity_steps(repo_root, &IDENTITY_STEPS, fetch_modules)
+}
 
-    let v2ray_core_dir = repo_root.join("crates/ex-ray/third_party/v2ray-core");
-    let args = [
-        "test",
-        "./transport/internet/tls/...",
-        "./transport/internet/quic/...",
-        "./transport/internet/hysteria2/...",
-        "./transport/internet/transportcommon/...",
-    ];
-    if let Some(detail) = go_command_failure(&v2ray_core_dir, &args)? {
-        return Ok(IdentityCheckOutcome::Failed { detail });
+/// [`run_identity_checks`] over `steps`, with the module fetch as a parameter.
+pub(crate) fn run_identity_steps(
+    repo_root: &Path,
+    steps: &[IdentityStep],
+    mut fetch: impl FnMut(&Path) -> Result<()>,
+) -> Result<IdentityCheckOutcome> {
+    for step in steps {
+        let dir = repo_root.join(step.dir);
+        fetch(&dir)?;
+        if let Some(detail) = go_command_failure(&dir, step.test_args)? {
+            return Ok(IdentityCheckOutcome::Failed { detail });
+        }
     }
-
     Ok(IdentityCheckOutcome::Passed)
+}
+
+/// `go mod download` in `dir`, retried until it succeeds.
+fn fetch_modules(dir: &Path) -> Result<()> {
+    let mut cmd = Command::new("go");
+    cmd.args(["mod", "download"]).current_dir(dir);
+    crate::retry::until_ok(&format!("go mod download ({})", dir.display()), || {
+        crate::ex_ray::run_go(&mut cmd)
+    })
 }
 
 /// Returns `Ok(None)` on success, `Ok(Some(detail))` on a go-command

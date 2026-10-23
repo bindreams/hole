@@ -1,4 +1,4 @@
-//! Transparent interrupt handling for the xtask launcher (issue #568).
+//! Transparent interrupt handling for the xtask launcher.
 //!
 //! xtask is a pass-through launcher: every subcommand spawns child processes
 //! (cargo, dev-console, ...) and waits with `Command::status()`. On Ctrl+C the
@@ -9,8 +9,8 @@
 //! teardown, and the child keeps printing to the inherited TTY after the prompt
 //! returns.
 //!
-//! Fix: install a SIGINT / console-ctrl handler. A handler — unlike
-//! `SIG_IGN` — is reset to the default disposition across `execve`, so spawned
+//! The handler installed here is a SIGINT / console-ctrl handler. Unlike
+//! `SIG_IGN` it is reset to the default disposition across `execve`, so spawned
 //! children stay interruptible; xtask itself survives the signal and its
 //! `status()` wait resumes and returns the child's real exit status. The handler
 //! records the interrupt in [`PROCESS`] so a loop that spawns children again and
@@ -58,7 +58,7 @@ impl Interrupt {
         *raised
     }
 
-    // The flag is a plain bool: a panic elsewhere cannot leave it inconsistent.
+    // A poisoned lock still holds a valid bool.
     fn lock(&self) -> MutexGuard<'_, bool> {
         self.raised.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -80,8 +80,8 @@ pub fn install_transparent_interrupt() {
     // `ctrlc` handles SIGINT (POSIX) and CTRL_C_EVENT (Windows console) behind
     // one API. The handler only records the interrupt, so xtask itself survives
     // the signal; the child in the same process/console group still receives and
-    // acts on it. Loops with no child to carry the signal (a retry backoff, a
-    // download) end on the recorded flag.
+    // acts on it. Loops that outlive the keystroke (a retry backoff, a download's
+    // body read) end on the recorded flag.
     let _ = ctrlc::set_handler(|| PROCESS.raise());
 }
 

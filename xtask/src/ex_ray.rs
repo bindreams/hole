@@ -50,6 +50,10 @@ pub fn build(repo_root: &Path) -> Result<PathBuf> {
 
 /// Run a `go` command, saying "Go toolchain not found" when there is none.
 pub(crate) fn run_go(cmd: &mut Command) -> Result<()> {
-    crate::command::run_inherited(cmd)
-        .map_err(|e| crate::command::hint_if_not_found(e, "Go toolchain not found. Install from https://go.dev/dl/"))
+    crate::command::run_inherited(cmd).map_err(go_not_found_hint)
+}
+
+/// Add the install hint to `e` when it is a missing `go`.
+pub(crate) fn go_not_found_hint(e: anyhow::Error) -> anyhow::Error {
+    crate::command::hint_if_not_found(e, "Go toolchain not found. Install from https://go.dev/dl/")
 }

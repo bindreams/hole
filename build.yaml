@@ -116,7 +116,7 @@ targets:
     build:
       # A stale lockfile fails the same way on every attempt: check it offline before the retry.
       - uv lock --check --offline --directory msi-installer
-      # Fetch the Python dependencies under retry; retrying the build would retry a build error.
+      # Fetch the Python dependencies under retry.
       - .github/scripts/retry.sh uv sync --directory msi-installer
       - uv run --directory msi-installer build
 
@@ -131,7 +131,7 @@ targets:
     build:
       # A stale lockfile fails the same way on every attempt: check it offline before the retry.
       - uv lock --check --offline --directory dmg-installer
-      # Fetch the Python dependencies under retry; retrying the build would retry a build error.
+      # Fetch the Python dependencies under retry.
       - .github/scripts/retry.sh uv sync --directory dmg-installer
       # The dSYM must come from the same link as the shipped binary: std's
       # backtrace symbolizer matches it by Mach-O UUID, and any second build of
@@ -324,7 +324,7 @@ targets:
     run:
       - cd crates/ex-ray && go test ./...
       # The vendored v2ray-core is a module of its own, so the fetch for `crates/ex-ray` above does not cover its
-      # dependencies. Fetch them under retry; a retry around `go test` would retry a failing test.
+      # dependencies. Fetch them under retry.
       - .github/scripts/retry.sh go -C crates/ex-ray/third_party/v2ray-core mod download
       - cd crates/ex-ray/third_party/v2ray-core && go test ./transport/internet/tls/... ./transport/internet/quic/... ./transport/internet/hysteria2/... ./transport/internet/transportcommon/...
 

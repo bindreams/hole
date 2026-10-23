@@ -38,6 +38,8 @@ jobs:
       - name: Verify draft release exists with signature
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          # Wait for the API to answer, then ask once: a missing release is the answer, not a lost network.
+          .github/scripts/retry.sh curl -fsS -o /dev/null https://api.github.com/zen
           RELEASE_JSON=$(gh release view "$TAG" --json isDraft,assets)
 
           IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')

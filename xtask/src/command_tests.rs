@@ -22,12 +22,30 @@ fn a_failing_captured_command_reports_command_status_and_stderr() {
     assert!(msg.contains("no-such-flag"), "stderr missing: {msg}");
 }
 
+/// The caller reads the exit code itself, so a non-zero exit is not an error here.
+#[skuld::test]
+fn a_command_that_ran_and_failed_returns_its_output() {
+    let output = run_output(Command::new("git").arg("--no-such-flag")).unwrap();
+    assert_eq!(output.status.code(), Some(129));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no-such-flag"));
+}
+
+#[skuld::test]
+fn a_command_that_cannot_start_is_an_error_from_run_output() {
+    let err = run_output(&mut Command::new("hole-xtask-no-such-program")).unwrap_err();
+    assert!(err.downcast_ref::<ProgramNotFound>().is_some(), "{err:#}");
+}
+
 #[skuld::test]
 fn a_failing_inherited_command_reports_the_command_and_status() {
-    let err = run_inherited(Command::new("git").args(["rev-parse", "-q", "--verify", "refs/no-such-ref"])).unwrap_err();
+    let args = ["rev-parse", "-q", "--verify", "refs/no-such-ref"];
+    // The status text is the OS's own, so take it from the same command run on its own.
+    let status = Command::new("git").args(args).status().unwrap();
+    assert!(!status.success());
+    let err = run_inherited(Command::new("git").args(args)).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("refs/no-such-ref"), "{msg}");
-    assert!(msg.contains("failed: ") && msg.contains('1'), "{msg}");
+    assert!(msg.ends_with(&format!("failed: {status}")), "{msg}");
 }
 
 #[skuld::test]

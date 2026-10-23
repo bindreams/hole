@@ -28,7 +28,6 @@ pub struct UdpEchoServer {
 impl UdpEchoServer {
     /// Bind `0.0.0.0:0` and report the host's primary non-loopback IPv4.
     pub async fn start() -> std::io::Result<Self> {
-        // Blocking waits belong off the async executor.
         let primary = tokio::task::spawn_blocking(wait_for_primary_ipv4)
             .await
             .map_err(std::io::Error::other)?
