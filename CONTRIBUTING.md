@@ -733,10 +733,12 @@ re-derive them.
    name: a name swapped for a hard link or a symlink after the rename changes nothing.
 
 `the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps the state-file writers on the handle.
-`crates/bridge/src/dir_writers_tests.rs` holds every writer that opens a `Dir` to two properties: a hard link, a
-symlink or a FIFO planted at a name it writes to changes nothing it leads to, and a second run in the same layout,
-with or without a user's link on the path, succeeds. A source file that opens a `Dir` and has no row in its table
-fails `every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. The readers have the same kind
+`crates/bridge/src/dir_writers_tests.rs` holds every writer into a state directory to two properties: a hard link, a
+symlink or a FIFO planted at a name it acts on changes nothing it leads to, and the writer either takes the name over
+(or removes it) or refuses it with a typed refusal, and a second run in the same layout, with or without a user's link
+on the path, succeeds. A source file that opens a `Dir`, calls `write_state_file`, `remove_state_file`,
+`make_dir_and_free_name` or `append_own_file`, or writes a `VersionedFile`, and has no row in its table fails
+`every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. The readers have the same kind
 of table (`no_reader_reads_through_a_symlink_planted_at_its_name`, `no_reader_waits_on_a_fifo_planted_at_its_name`,
 and `state_symlink_tests.rs` in `tun-engine`): each writes a valid file, plants the name, and the reader must not
 report the file the name leads to. A hard link is the file's own inode, so only `read_state_file`'s ownership and link-count rule tells it from the
@@ -746,13 +748,16 @@ token and read when it is a user). What a reader takes from a folder the user ow
 and never echoed: every reader turns its `serde_json::Error` into a `util::parse_error::ParseFailure` (category and
 position) where the parse happens, since the error's own text quotes the file, and the log goes to `bridge.log`, which
 the user can read (`no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse`, here and in `state_symlink_tests.rs`).
-Five source scans close the class: `no_privileged_dir_code_changes_an_owner_or_a_mode_by_name` (nothing in
-`util::dir` or in a file that opens a `Dir` calls `fchownat`, `fchmodat`, `chown`, `chmod`, `set_permissions` or a
-Windows by-path ACL call), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates, `hole` among them, open no
+Five source scans close the class. They read calls through the file's own `use` declarations (`dir_writers_tests/scan.rs`),
+so a name imported, aliased or globbed is seen as the call it stands for. `no_privileged_code_changes_an_owner_or_a_mode_by_name`
+(no privileged crate calls `fchownat`, `fchmodat`, `chown`, `chmod`, `set_permissions` or a Windows by-path ACL call,
+except the sites listed in `BY_NAME_ALLOWED`, each with its count and reason; a site marked "open owner question" waits for
+a decision), `no_privileged_state_code_reads_a_file_by_path` (the privileged crates, `hole` among them, open no
 file by path, except the files listed in `BY_PATH_ALLOWED`, each with its reason),
 `no_privileged_code_resolves_a_link_before_the_walk` (the same crates call neither `canonicalize` nor `realpath`,
 except the lines listed in `RESOLVING_ALLOWED`, each with its reason), `no_state_module_logs_a_path` (the
-state modules log the file's name) and `no_privileged_json_parse_keeps_the_raw_error` (every non-test `serde_json` parse in `bridge`,
+state modules log the file's name: no `.display()` or `.to_string_lossy()`, and no formatting or tracing macro takes a
+binding the file declares as a path, as an argument, a `?`/`%` field or a `{name:?}` placeholder) and `no_privileged_json_parse_keeps_the_raw_error` (every non-test `serde_json` parse in `bridge`,
 `tun-engine`, `util` and `common`, spelled `serde_json::from_*`, `Deserializer::from_*` or a `from_*` imported by name,
 converts its error before the next parse or `fn`; the parses listed in `JSON_PARSE_ALLOWED` do not, each with its reason). A test of
 a walk plants links with `util::dir::testing` (`plant_link`, `user_dir`, `SystemScratch`), which hand what they

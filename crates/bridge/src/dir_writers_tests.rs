@@ -1,19 +1,22 @@
-//! Every privileged writer that goes through [`util::dir::Dir`], held to the same two properties, and the readers of
-//! the same names held to a third (below).
+//! Every privileged writer into a state directory, held to the same two properties, and the readers of the same names
+//! held to a third (below).
 //!
 //! These code paths run as root/SYSTEM in folders the interactive user may own, so the user can plant a name and
 //! shape the layout above it:
 //!
-//! - A hard link, a symlink or a FIFO planted at a name the writer writes to is never written through, and the
-//!   file it leads to is left as it was (content, mode, owner).
+//! - A hard link, a symlink or a FIFO planted at a name the writer acts on is never written through, and the file it
+//!   leads to is left as it was (content, mode, owner). The writer also answers the name: it takes it over or removes
+//!   it, or refuses it with a typed refusal ([`AtAPlantedName`]); one that fails for another reason, or succeeds and
+//!   leaves the name alone, fails the test.
 //! - A second run in the same layout succeeds, with or without a link the user owns on the path: the folders the
 //!   first run made must pass the walk of the second.
 //!
-//! The table below is the list of writers. A source file that opens a `Dir` and is not in it fails
-//! [`every_file_that_opens_a_dir_has_a_row`], so a new writer cannot skip these tests. The owner observations
-//! (a file given away, a made folder handed over) need root or an elevated token; run as the user, the same
-//! tests check what they can.
+//! The table below is the list of writers. A source file that changes a state directory (see [`WRITES_A_DIR`]) and is
+//! not in it fails [`every_file_that_opens_a_dir_has_a_row`], so a new writer cannot skip these tests. The owner
+//! observations (a file given away, a made folder handed over) need root or an elevated token; run as the user, the
+//! same tests check what they can.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -22,21 +25,118 @@ use hole_common::logging::dir_rotate::DirRotate;
 use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE, MARKER_VERSION};
 use tun_engine::routing::state as route_state;
 use util::dir::testing::{plant_link, user_dir};
-use util::dir::Dir;
+use util::dir::{Dir, Refusal};
 
-use crate::target::{self, Target};
+use crate::target::{self, Target, TargetError};
+use util::versioned_file::StoreError;
+
+mod scan;
 
 // The table -----------------------------------------------------------------------------------------------------------
 
 /// The unix ids a writer hands its files to.
 type Owner = Option<(u32, u32)>;
 
+/// What a writer does with a name a user planted where it writes, one answer per row. A refusal that names what was
+/// refused (`util::dir::Refusal`, `file_lock::Refused`) is an acceptable answer to any plant.
+#[derive(Debug, Clone, Copy)]
+enum AtAPlantedName {
+    /// Takes the name over or removes it, whatever sits there: afterwards the name no longer leads to what was
+    /// planted.
+    Replaces,
+    /// Like [`Self::Replaces`], except that a file the expected owner already owns is kept and used as it is (the lock
+    /// and the log do this by contract): a hard link to a file of the owner's own.
+    KeepsAFileItsOwnerOwns,
+    /// A claim that is lost: `AlreadyExists`, with the planted name left as it was.
+    ClaimedElsewhere,
+    /// Writes under another name and leaves the planted one as it was.
+    WritesElsewhere,
+}
+
+impl AtAPlantedName {
+    /// Whether `result` of running the writer is what this kind answers, given what the folder shows afterwards.
+    fn accepts(self, result: &io::Result<()>, after: &Afterwards) -> Result<(), String> {
+        if let Err(err) = result {
+            let refusal = is_a_refusal(err);
+            let lost_claim =
+                matches!(self, AtAPlantedName::ClaimedElsewhere) && err.kind() == io::ErrorKind::AlreadyExists;
+            return match refusal || lost_claim {
+                true => Ok(()),
+                false => Err(format!(
+                    "failed with something that is not a refusal of that name: {err}"
+                )),
+            };
+        }
+        match self {
+            AtAPlantedName::Replaces if after.name_leads_to_the_victim => {
+                Err("succeeded, and the name still leads to the file that was planted".to_owned())
+            }
+            AtAPlantedName::Replaces => Ok(()),
+            AtAPlantedName::KeepsAFileItsOwnerOwns if after.name_leads_to_the_victim && !after.victim_is_the_owners => {
+                Err("succeeded, and the name still leads to the file that was planted".to_owned())
+            }
+            AtAPlantedName::KeepsAFileItsOwnerOwns => Ok(()),
+            AtAPlantedName::ClaimedElsewhere => Err("succeeded at a name somebody else holds".to_owned()),
+            AtAPlantedName::WritesElsewhere if after.holds_another_name => Ok(()),
+            AtAPlantedName::WritesElsewhere => Err("succeeded, and wrote nothing under another name".to_owned()),
+        }
+    }
+}
+
+/// What a writer reports when it left a file it could not read as it was: the route record's `Cleared::Kept`.
+#[derive(Debug)]
+struct LeftAsItIs;
+
+impl std::fmt::Display for LeftAsItIs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the file was left as it is")
+    }
+}
+
+impl std::error::Error for LeftAsItIs {}
+
+/// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's, or a
+/// versioned file's decision to leave a file it cannot read as it is.
+fn is_a_refusal(err: &io::Error) -> bool {
+    let mut current = err.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static));
+    while let Some(error) = current {
+        let versioned_file_left_it = matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::Unreadable { .. } | StoreError::ReadFailed { .. })
+        );
+        if error.downcast_ref::<Refusal>().is_some()
+            || error.downcast_ref::<file_lock::Refused>().is_some()
+            || error.downcast_ref::<LeftAsItIs>().is_some()
+            || versioned_file_left_it
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+/// What the folder shows after a writer ran at a planted name.
+struct Afterwards {
+    /// The name is, or leads to, the file that was planted.
+    name_leads_to_the_victim: bool,
+    /// The folder holds a name besides the planted one.
+    holds_another_name: bool,
+    /// The victim is a file of the owner the writer was given: a hard link to it is the owner's own file.
+    victim_is_the_owners: bool,
+}
+
 struct Writer {
     name: &'static str,
-    /// The production source files whose `Dir` use this row exercises, from the workspace root.
+    /// The production source files whose writes this row exercises, from the workspace root. Every file that writes
+    /// into a state directory (see [`WRITES_A_DIR`]) is in the rows, for every platform: the scan reads text.
     sources: &'static [&'static str],
-    /// The names in the writer's directory it writes to, which a user can plant.
+    /// The names in the writer's directory it acts on, which a user can plant.
     names: &'static [&'static str],
+    /// What it does at one.
+    at_a_planted_name: AtAPlantedName,
+    /// Whether this platform runs the row: a writer of another platform is listed for its sources only.
+    runs_here: bool,
     /// Runs the writer once in `dir`, creating it if missing.
     run: fn(dir: &Path, owner: Owner) -> io::Result<()>,
 }
@@ -75,16 +175,105 @@ fn route_record() -> route_state::RouteState {
     }
 }
 
-/// A claim that is lost is the right second answer of a single-occupancy write.
-fn claimed_or_taken(result: io::Result<()>) -> io::Result<()> {
-    match result {
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        result => result,
-    }
+/// The macOS rows. Another platform lists their sources and runs none of them.
+#[cfg(target_os = "macos")]
+fn macos_writers() -> Vec<Writer> {
+    use tun_engine::routing::failclosed::{failclosed_state, lockdown_pf_state};
+    vec![
+        Writer {
+            name: "the pf cover state, saved",
+            sources: &["crates/tun-engine/src/routing/failclosed/failclosed_state.rs"],
+            names: &[failclosed_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| {
+                let state = failclosed_state::FailClosedState {
+                    version: failclosed_state::SCHEMA_VERSION,
+                    pf_token: "0".to_owned(),
+                    pf_was_enabled: false,
+                };
+                failclosed_state::save(dir, &state, owner)
+            },
+        },
+        Writer {
+            name: "the pf cover state, cleared",
+            sources: &[],
+            names: &[failclosed_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, _| failclosed_state::clear(dir),
+        },
+        Writer {
+            name: "the pf lockdown state, saved",
+            sources: &["crates/tun-engine/src/routing/failclosed/lockdown_pf_state.rs"],
+            names: &[lockdown_pf_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| {
+                let state = lockdown_pf_state::LockdownPfState {
+                    version: lockdown_pf_state::SCHEMA_VERSION,
+                    pf_token: "0".to_owned(),
+                    main_snapshot: String::new(),
+                    nat_snapshot: String::new(),
+                    main_snapshot_captured: true,
+                };
+                lockdown_pf_state::save(dir, &state, owner)
+            },
+        },
+        Writer {
+            name: "the pf lockdown state, cleared",
+            sources: &[],
+            names: &[lockdown_pf_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, _| lockdown_pf_state::clear(dir),
+        },
+    ]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_writers() -> Vec<Writer> {
+    vec![Writer {
+        name: "the pf states (macOS)",
+        sources: &[
+            "crates/tun-engine/src/routing/failclosed/failclosed_state.rs",
+            "crates/tun-engine/src/routing/failclosed/lockdown_pf_state.rs",
+        ],
+        names: &[],
+        at_a_planted_name: AtAPlantedName::Replaces,
+        runs_here: false,
+        run: |_, _| unreachable!("a row of another platform is not run"),
+    }]
+}
+
+/// The Windows rows. Another platform lists their sources and runs none of them.
+#[cfg(windows)]
+fn windows_writers() -> Vec<Writer> {
+    vec![Writer {
+        name: "the installer SID, written",
+        sources: &["crates/bridge/src/ipc.rs"],
+        names: &[crate::ipc::INSTALLER_USER_SID_FILE],
+        at_a_planted_name: AtAPlantedName::Replaces,
+        runs_here: true,
+        run: |dir, _| crate::ipc::write_installer_user_sid(dir, "S-1-5-32-545"),
+    }]
+}
+
+#[cfg(not(windows))]
+fn windows_writers() -> Vec<Writer> {
+    vec![Writer {
+        name: "the installer SID (Windows)",
+        sources: &["crates/bridge/src/ipc.rs"],
+        names: &[],
+        at_a_planted_name: AtAPlantedName::Replaces,
+        runs_here: false,
+        run: |_, _| unreachable!("a row of another platform is not run"),
+    }]
 }
 
 fn writers() -> Vec<Writer> {
-    vec![
+    use tun_engine::routing::failclosed::{boottime_witness, lockdown_state};
+    let mut rows = vec![
         Writer {
             name: "the lock",
             sources: &[
@@ -92,84 +281,155 @@ fn writers() -> Vec<Writer> {
                 "crates/file-lock/src/exclusive/windows.rs",
             ],
             names: &[LOCK_NAME],
+            at_a_planted_name: AtAPlantedName::KeepsAFileItsOwnerOwns,
+            runs_here: true,
             run: |dir, owner| file_lock::Exclusive::acquire(&dir.join(LOCK_NAME), owner).map(drop),
         },
         Writer {
             name: "write_state_file",
             sources: &["crates/util/src/dir.rs"],
             names: &[STATE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
             run: |dir, owner| util::dir::write_state_file(dir, OsStr::new(STATE_NAME), b"{}", owner),
         },
         Writer {
             name: "the route record, written",
-            sources: &["crates/util/src/versioned_file/store.rs"],
+            sources: &[
+                "crates/util/src/versioned_file/store.rs",
+                "crates/tun-engine/src/routing/state.rs",
+            ],
             names: &[route_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
             run: |dir, owner| {
-                route_state::write(&route_state::file(dir), &route_record(), owner)
-                    .map_err(|err| io::Error::other(err.to_string()))
+                route_state::write(&route_state::file(dir), &route_record(), owner).map_err(io::Error::other)
             },
         },
         Writer {
             name: "the route record, removed",
-            sources: &["crates/util/src/versioned_file/store.rs"],
+            sources: &[],
             names: &[route_state::STATE_FILE_NAME],
-            run: |dir, _| route_state::remove(&route_state::file(dir)).map(drop),
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, _| match route_state::remove(&route_state::file(dir))? {
+                route_state::Cleared::Kept => Err(io::Error::other(LeftAsItIs)),
+                _ => Ok(()),
+            },
         },
         Writer {
             name: "the target file",
             sources: &["crates/bridge/src/target.rs"],
             names: &[target::STATE_FILE_NAME],
-            run: |dir, owner| target::save(dir, &Target::Off, owner).map_err(|err| io::Error::other(err.to_string())),
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| {
+                target::save(dir, &Target::Off, owner).map_err(|err| match err {
+                    // The io error inside is where a refusal of the walk is.
+                    TargetError::CreateDir(err)
+                    | TargetError::Write(err)
+                    | TargetError::SetPermissions(err)
+                    | TargetError::Lock(err) => err,
+                    err => io::Error::other(err),
+                })
+            },
         },
         Writer {
             name: "the update marker, written",
             sources: &["crates/common/src/update_marker.rs"],
             names: &[MARKER_FILE],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
             run: |dir, owner| update_marker::write(dir, &marker_info(), owner),
         },
         Writer {
             name: "the update marker, claimed",
-            sources: &["crates/common/src/update_marker.rs"],
+            sources: &[],
             names: &[MARKER_FILE],
-            run: |dir, owner| claimed_or_taken(update_marker::write_new(dir, &marker_info(), owner)),
+            at_a_planted_name: AtAPlantedName::ClaimedElsewhere,
+            runs_here: true,
+            run: |dir, owner| update_marker::write_new(dir, &marker_info(), owner),
         },
         Writer {
             name: "the update marker, cleared",
-            sources: &["crates/common/src/update_marker.rs"],
+            sources: &[],
             names: &[MARKER_FILE],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
             run: |dir, _| update_marker::clear(dir),
+        },
+        Writer {
+            name: "the plugin state, saved",
+            sources: &["crates/bridge/src/plugin_state.rs"],
+            names: &[crate::plugin_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| {
+                let state = crate::plugin_state::PluginState {
+                    version: crate::plugin_state::SCHEMA_VERSION,
+                    plugins: Vec::new(),
+                };
+                crate::plugin_state::save(dir, &state, owner)
+            },
         },
         Writer {
             name: "the plugin state, cleared",
             sources: &[],
             names: &[crate::plugin_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
             run: |dir, _| crate::plugin_state::clear(dir),
         },
         Writer {
             name: "the dns state, cleared",
             sources: &[],
             names: &[crate::dns_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
             run: |dir, _| crate::dns_state::clear(dir),
         },
         Writer {
             name: "the dns state, superseded",
             sources: &["crates/bridge/src/dns_state.rs"],
-            names: &[
-                crate::dns_state::STATE_FILE_NAME,
-                crate::dns_state::SUPERSEDED_FILE_NAME,
-            ],
+            // The name it moves aside; where it moves it to (a free name, never a taken one) is not a name it acts on.
+            names: &[crate::dns_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
             run: |dir, _| crate::dns_state::supersede(dir),
+        },
+        Writer {
+            name: "the lockdown state, saved",
+            sources: &["crates/tun-engine/src/routing/failclosed/lockdown_state.rs"],
+            names: &[lockdown_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| lockdown_state::set_enabled(dir, true, owner),
         },
         Writer {
             name: "the lockdown state, cleared",
             sources: &[],
-            names: &[tun_engine::routing::failclosed::lockdown_state::STATE_FILE_NAME],
-            run: |dir, _| tun_engine::routing::failclosed::lockdown_state::clear(dir),
+            names: &[lockdown_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, _| lockdown_state::clear(dir),
+        },
+        Writer {
+            name: "the boot-time witness, recorded",
+            sources: &["crates/tun-engine/src/routing/failclosed/boottime_witness.rs"],
+            names: &[boottime_witness::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, _| {
+                boottime_witness::record_armed_for_test(dir);
+                Ok(())
+            },
         },
         Writer {
             name: "the socket, bound",
-            sources: &[],
+            sources: &["crates/bridge/src/socket.rs"],
             names: &[SOCKET_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
             run: |dir, _| {
                 // `tokio`'s listener registers with the runtime that is current when it binds.
                 tokio::runtime::Builder::new_current_thread()
@@ -182,13 +442,17 @@ fn writers() -> Vec<Writer> {
             name: "the crash marker, written",
             sources: &["crates/tombstone/src/crash.rs"],
             names: &[CRASH_MARKER_NAME],
+            at_a_planted_name: AtAPlantedName::WritesElsewhere,
+            runs_here: true,
             // The marker is the crash handler's, left root-owned on purpose: it takes no owner.
             run: |dir, _| tombstone::crash::write_marker_for("bridge", CRASH_PID, dir),
         },
         Writer {
             name: "the crash marker, swept",
-            sources: &["crates/tombstone/src/crash.rs"],
+            sources: &[],
             names: &[CRASH_MARKER_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
             run: |dir, _| {
                 tombstone::sweep(dir);
                 Ok(())
@@ -201,13 +465,23 @@ fn writers() -> Vec<Writer> {
                 "crates/common/src/logging/dir_rotate.rs",
             ],
             names: &[LOG_NAME, LOG_ROTATED_NAME],
+            at_a_planted_name: AtAPlantedName::KeepsAFileItsOwnerOwns,
+            runs_here: true,
             run: |dir, owner| {
                 let handle = Dir::open(dir, true, owner)?;
                 // More than the limit, so that the file is rotated and opened again.
                 DirRotate::new(handle, OsStr::new(LOG_NAME), 16, owner).write_all(&[b'x'; 40])
             },
         },
-    ]
+    ];
+    rows.extend(macos_writers());
+    rows.extend(windows_writers());
+    rows
+}
+
+/// The rows this platform runs.
+fn writers_here() -> Vec<Writer> {
+    writers().into_iter().filter(|writer| writer.runs_here).collect()
 }
 
 // Layout --------------------------------------------------------------------------------------------------------------
@@ -222,23 +496,6 @@ fn owner() -> Owner {
         match uid {
             0 => Some((65534, 65534)),
             _ => Some((uid, gid)),
-        }
-    }
-    #[cfg(windows)]
-    None
-}
-
-/// An owner that is not the runner, so that the victim a test plants (the runner's own file) is not the owner's: a
-/// writer must replace the name rather than take the victim for the owner's file. An unprivileged runner cannot
-/// give a file to it, so a writer may fail on that; the test looks only at the victim.
-fn owner_other_than_the_runner() -> Owner {
-    #[cfg(unix)]
-    {
-        // SAFETY: geteuid and getegid take no arguments and cannot fail.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        match uid {
-            0 => Some((65534, 65534)),
-            _ => Some((uid + 1, gid + 1)),
         }
     }
     #[cfg(windows)]
@@ -277,11 +534,6 @@ enum Plant {
     Fifo,
 }
 
-#[cfg(unix)]
-const PLANTS: &[Plant] = &[Plant::HardLink, Plant::Symlink, Plant::Fifo];
-#[cfg(windows)]
-const PLANTS: &[Plant] = &[Plant::HardLink, Plant::Symlink];
-
 fn plant(kind: Plant, victim: &Path, at: &Path) {
     match kind {
         Plant::HardLink => std::fs::hard_link(victim, at).unwrap(),
@@ -299,11 +551,41 @@ fn plant(kind: Plant, victim: &Path, at: &Path) {
     }
 }
 
+#[cfg(unix)]
+const PLANTS: &[Plant] = &[Plant::HardLink, Plant::Symlink, Plant::Fifo];
+#[cfg(windows)]
+const PLANTS: &[Plant] = &[Plant::HardLink, Plant::Symlink];
+
+/// Whether `at` is, or leads to, what [`plant`] made from `victim`.
+fn leads_to_the_victim(at: &Path, victim: &Path) -> bool {
+    let meta = match std::fs::symlink_metadata(at) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return false,
+        Err(err) => panic!("{at:?}: {err}"),
+    };
+    #[cfg(unix)]
+    if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
+        return true;
+    }
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    if !meta.is_file() {
+        return false;
+    }
+    // What cannot be opened (a socket's file on Windows) is not the victim's file, which can.
+    let Ok(file) = std::fs::File::open(at) else {
+        return false;
+    };
+    let id = |file: &std::fs::File| util::dir::FileId::of(file).unwrap();
+    id(&file) == id(&std::fs::File::open(victim).unwrap())
+}
+
 // What a planted name does to a writer --------------------------------------------------------------------------------
 
 #[skuld::test]
 fn no_writer_changes_the_file_a_planted_name_leads_to() {
-    for writer in writers() {
+    for writer in writers_here() {
         for &name in writer.names {
             for &kind in PLANTS {
                 let tmp = tempfile::tempdir().unwrap();
@@ -316,8 +598,7 @@ fn no_writer_changes_the_file_a_planted_name_leads_to() {
                 // A FIFO has no victim: what is observed is that the writer does not block on it.
                 plant(kind, &victim, &dir.join(name));
 
-                // The writer may refuse or replace the name: what it may not do is write through it.
-                let _ = (writer.run)(&dir, owner_other_than_the_runner());
+                let result = (writer.run)(&dir, owner());
 
                 assert_eq!(
                     Victim::of(&victim),
@@ -325,6 +606,18 @@ fn no_writer_changes_the_file_a_planted_name_leads_to() {
                     "{}: a {kind:?} planted at {name} changed the file it leads to",
                     writer.name
                 );
+                let after = Afterwards {
+                    name_leads_to_the_victim: leads_to_the_victim(&dir.join(name), &victim),
+                    holds_another_name: std::fs::read_dir(&dir)
+                        .unwrap()
+                        .any(|entry| entry.unwrap().file_name() != name),
+                    // The runner made the victim; the owner is the runner's unless the runner is the system.
+                    victim_is_the_owners: !util::dir::testing::runner_is_the_system(),
+                };
+                let verdict = writer.at_a_planted_name.accepts(&result, &after);
+                if let Err(why) = verdict {
+                    panic!("{}: at a {kind:?} planted at {name} it {why}", writer.name);
+                }
             }
         }
     }
@@ -334,13 +627,19 @@ fn no_writer_changes_the_file_a_planted_name_leads_to() {
 
 fn run_twice(writer: &Writer, dir: &Path, layout: &str) {
     for run in ["first", "second"] {
-        (writer.run)(dir, owner()).unwrap_or_else(|err| panic!("{}: the {run} run {layout}: {err}", writer.name));
+        let result = (writer.run)(dir, owner());
+        // A claim that is lost is the right second answer of a single-occupancy write.
+        let result = match (writer.at_a_planted_name, result) {
+            (AtAPlantedName::ClaimedElsewhere, Err(err)) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            (_, result) => result,
+        };
+        result.unwrap_or_else(|err| panic!("{}: the {run} run {layout}: {err}", writer.name));
     }
 }
 
 #[skuld::test]
 fn every_writer_runs_twice_in_a_layout_with_no_link() {
-    for writer in writers() {
+    for writer in writers_here() {
         let tmp = tempfile::tempdir().unwrap();
 
         run_twice(
@@ -354,7 +653,7 @@ fn every_writer_runs_twice_in_a_layout_with_no_link() {
 #[skuld::test]
 fn every_writer_runs_twice_below_a_link_the_user_owns() {
     // `link` is the user's, to the user's profile: the bridge makes `hole` and `state` below it, as itself.
-    for writer in writers() {
+    for writer in writers_here() {
         let tmp = tempfile::tempdir().unwrap();
         user_dir(&tmp.path().join("profile"));
         plant_link(&tmp.path().join("profile"), &tmp.path().join("link"));
@@ -764,8 +1063,15 @@ fn the_json_parse_scan_sees_every_spelling_of_a_parse() {
 
 // No privileged read goes by path -------------------------------------------------------------------------------------
 
-/// What opens a file by a path: the reads the privileged state code must make through `util::dir` instead.
-const READS_BY_PATH: &[&str] = &["fs::read(", "fs::read_to_string(", "File::open(", "OpenOptions::new("];
+/// What opens a file by a path, under any spelling (see [`scan::Call::is`]): the reads the privileged state code must
+/// make through `util::dir` instead.
+const READS_BY_PATH: &[&str] = &[
+    "fs::read",
+    "fs::read_to_string",
+    "File::open",
+    "File::options",
+    "OpenOptions::new",
+];
 
 /// The crates whose code runs privileged on state or log directories. `hole` is one: `hole bridge run` is the bridge.
 const PRIVILEGED_CRATES: &[&str] = &[
@@ -842,11 +1148,12 @@ fn production_sources(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// The by-path reads on the code lines of `text`.
-fn by_path_reads(text: &str) -> Vec<&'static str> {
-    text.lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .flat_map(|line| READS_BY_PATH.iter().copied().filter(move |read| line.contains(read)))
+/// The by-path reads in the code of `text`, each as it was written.
+fn by_path_reads(text: &str) -> Vec<String> {
+    scan::calls(text)
+        .iter()
+        .filter(|call| READS_BY_PATH.iter().any(|read| call.is(read)))
+        .map(scan::Call::written)
         .collect()
 }
 
@@ -883,10 +1190,93 @@ fn every_by_path_allowance_still_reads_by_path() {
 
 #[skuld::test]
 fn the_by_path_scan_tells_a_read_from_a_comment() {
-    assert_eq!(by_path_reads("let bytes = std::fs::read(&path)?;"), ["fs::read("]);
-    assert_eq!(by_path_reads("let f = std::fs::File::open(p)?;"), ["File::open("]);
+    assert_eq!(by_path_reads("let bytes = std::fs::read(&path)?;"), ["std::fs::read"]);
+    assert_eq!(
+        by_path_reads("let f = std::fs::File::open(p)?;"),
+        ["std::fs::File::open"]
+    );
     assert!(by_path_reads("    // `std::fs::read(path)` is what this replaces").is_empty());
     assert!(by_path_reads("util::dir::read_state_file(dir, name)").is_empty());
+}
+
+#[skuld::test]
+fn the_by_path_scan_sees_every_spelling_of_a_read() {
+    let sites = |text: &str| by_path_reads(text).len();
+
+    assert_eq!(
+        sites(
+            "use std::fs::read_to_string;
+let text = read_to_string(path)?;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use std::fs::{self, read};
+let bytes = read(path)?;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use std::fs::File as F;
+let file = F::open(path)?;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use std::fs::{
+    File,
+    OpenOptions,
+};
+let o = OpenOptions::new();"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use tokio::fs as tfs;
+let bytes = tfs::read(path).await?;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use std::fs::*;
+let text = read_to_string(path)?;"
+        ),
+        1
+    );
+    assert_eq!(sites("let o = std::fs::File::options();"), 1);
+    assert_eq!(sites("let bytes = ::std::fs::read(path)?;"), 1);
+    assert_eq!(sites("let bytes = std::fs::read::<&Path>(path)?;"), 1);
+    // Not reads: a method of the same name, a function of the file's own, a listing, a name in a string or a comment.
+    assert_eq!(
+        sites(
+            "use std::io::Read;
+file.read(&mut buffer)?;"
+        ),
+        0
+    );
+    assert_eq!(sites("reader.read_to_string(&mut text)?;"), 0);
+    assert_eq!(
+        sites(
+            "fn read(path: &Path) {}
+read(path);"
+        ),
+        0
+    );
+    assert_eq!(
+        sites(
+            "use std::fs::read_dir;
+let entries = read_dir(path)?;"
+        ),
+        0
+    );
+    assert_eq!(sites("let message = \"call std::fs::read(path)\";"), 0);
+    assert_eq!(sites("let a = 1; /* std::fs::read(path) */"), 0);
+    assert_eq!(sites("let a = 1; // std::fs::read(path)"), 0);
 }
 
 // No privileged step resolves a link before the walk ------------------------------------------------------------------
@@ -1023,16 +1413,96 @@ fn no_state_module_logs_a_path() {
     let mut hits = Vec::new();
     for module in STATE_MODULES {
         let text = std::fs::read_to_string(root.join(module)).unwrap_or_else(|err| panic!("{module}: {err}"));
-        for (n, line) in text.lines().enumerate() {
-            if !line.trim_start().starts_with("//") && line.contains(".display()") {
-                hits.push(format!("{module}:{}: {}", n + 1, line.trim()));
-            }
-        }
+        hits.extend(
+            scan::logged_paths(&text)
+                .into_iter()
+                .map(|hit| format!("{module}:{hit}")),
+        );
     }
 
     assert!(
         hits.is_empty(),
         "a state module formats a path (log the file's name): {hits:#?}"
+    );
+}
+
+#[skuld::test]
+fn the_path_logging_scan_sees_every_spelling_of_a_logged_path() {
+    let sites = |text: &str| scan::logged_paths(text).len();
+    let with_dir = |statement: &str| {
+        format!(
+            "fn save(state_dir: &Path) {{
+    {statement}
+}}"
+        )
+    };
+
+    assert_eq!(
+        sites(&with_dir("tracing::warn!(\"cannot write {}\", state_dir.display());")),
+        1
+    );
+    assert_eq!(sites(&with_dir("let text = state_dir.to_string_lossy();")), 1);
+    assert_eq!(sites(&with_dir("tracing::warn!(\"cannot write {state_dir:?}\");")), 1);
+    assert_eq!(sites(&with_dir("tracing::warn!(\"cannot write {:?}\", state_dir);")), 1);
+    assert_eq!(
+        sites(&with_dir("tracing::warn!(dir = ?state_dir, \"cannot write\");")),
+        1
+    );
+    assert_eq!(
+        sites(&with_dir(
+            "tracing::warn!(dir = %state_dir.display(), \"cannot write\");"
+        )),
+        1
+    );
+    assert_eq!(
+        sites(&with_dir(
+            "tracing::warn!(
+        error = %e,
+        ?state_dir,
+        \"cannot write\",
+    );"
+        )),
+        1
+    );
+    assert_eq!(
+        sites(
+            "fn save(dir: PathBuf) {
+    let e = io::Error::other(format!(\"{dir:?}\"));
+}"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "struct S { dir: PathBuf }
+fn f(s: &S) { tracing::warn!(\"{:?}\", s.dir); }"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "fn f(p: &Path) {
+    let target = p.join(NAME);
+    tracing::warn!(?target);
+}"
+        ),
+        1
+    );
+    // Not a path: the file's name, an error, a field that only shares a word with a path binding.
+    assert_eq!(
+        sites(&with_dir(
+            "tracing::warn!(error = %e, file = STATE_FILE_NAME, \"cannot write\");"
+        )),
+        0
+    );
+    assert_eq!(
+        sites(&with_dir("tracing::warn!(\"cannot write {STATE_FILE_NAME}: {e}\");")),
+        0
+    );
+    assert_eq!(sites(&with_dir("let dir = Dir::open(state_dir, true, owner)?;")), 0);
+    assert_eq!(
+        sites(&with_dir("// tracing::warn!(\"cannot write {state_dir:?}\");")),
+        0
     );
 }
 
@@ -1053,11 +1523,24 @@ fn sources_in(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// Whether the production source `text` opens a `Dir`: a line of code, not a comment, that names one of the openers.
+/// What a privileged writer calls to change a state directory (see [`scan::Call::is`]): open one, or hand it a file to
+/// write or remove through `util::dir`, or write a versioned file, which stages through one.
+const WRITES_A_DIR: &[&str] = &[
+    "Dir::open*",
+    "write_state_file",
+    "remove_state_file",
+    "make_dir_and_free_name",
+    "VersionedFile::new",
+    ".append_own_file",
+    ".write_atomic",
+    ".rename_noreplace",
+];
+
+/// Whether the production source `text` changes a state directory: it calls one of [`WRITES_A_DIR`].
 fn opens_a_dir(text: &str) -> bool {
-    text.lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .any(|line| line.contains("Dir::open") || line.contains("append_own_file("))
+    scan::calls(text)
+        .iter()
+        .any(|call| WRITES_A_DIR.iter().any(|writes| call.is(writes)))
 }
 
 #[skuld::test]
@@ -1092,6 +1575,24 @@ fn every_file_that_opens_a_dir_has_a_row() {
 }
 
 #[skuld::test]
+fn the_completeness_scan_sees_every_way_to_write_into_a_state_directory() {
+    assert!(opens_a_dir("util::dir::write_state_file(dir, name, bytes, owner)"));
+    assert!(opens_a_dir(
+        "use util::dir::write_state_file;
+write_state_file(dir, name, bytes, owner)?;"
+    ));
+    assert!(opens_a_dir("util::dir::remove_state_file(dir, name)"));
+    assert!(opens_a_dir("util::dir::make_dir_and_free_name(dir, name)"));
+    assert!(opens_a_dir("VersionedFile::<State>::new(dir)"));
+    assert!(opens_a_dir(
+        "let dir = util::dir::Dir::open_as(path, true, owner, caller)?;"
+    ));
+    assert!(opens_a_dir("dir.write_atomic(name, bytes, owner, |_| Ok(()))"));
+    // Reading a state file writes nothing.
+    assert!(!opens_a_dir("util::dir::read_state_file(dir, name)"));
+}
+
+#[skuld::test]
 fn the_scan_tells_code_from_a_comment() {
     assert!(opens_a_dir("let dir = Dir::open(path, true, None)?;"));
     assert!(opens_a_dir("dir.append_own_file(&name, 0o644, owner)"));
@@ -1115,85 +1616,205 @@ const BY_NAME: &[&str] = &[
     "fs::chown",
     "fs::lchown",
     "fs::set_permissions",
-    "SetNamedSecurityInfo",
-    "SetFileSecurity",
-    "SetFileAttributes",
+    "SetNamedSecurityInfo*",
+    "SetFileSecurity*",
+    "SetFileAttributes*",
 ];
 
-/// The by-name calls on the code lines of `text`.
-fn by_name_calls(text: &str) -> Vec<&'static str> {
-    text.lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .flat_map(|line| BY_NAME.iter().copied().filter(move |call| line.contains(call)))
+/// The by-name calls in the code of `text`, each as it was written. A call on a handle (`file.set_permissions(..)`)
+/// is not one.
+fn by_name_calls(text: &str) -> Vec<String> {
+    scan::calls(text)
+        .iter()
+        .filter(|call| BY_NAME.iter().any(|name| call.is(name)))
+        .map(scan::Call::written)
         .collect()
 }
 
-/// The files that must not call one: the sources of `util::dir` and every source file that opens a `Dir`. Not
+/// By-name changes of an owner or a mode that stay, each with its count and why: the file, the call as written, how
+/// many, and the reason. A site not in it is new, and the guard reports it. "Open owner question" is a site whose
+/// folder is one a user may add names to and which waits for a decision of the owner (1134-troyka2.md).
+const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
+    (
+        "crates/bridge/src/cutover/extract.rs",
+        "std::fs::set_permissions",
+        1,
+        "open owner question: the folder that stages an update payload is the state dir, which only the service owns",
+    ),
+    (
+        "crates/bridge/src/ipc.rs",
+        "SetNamedSecurityInfoW",
+        1,
+        "open owner question: socket folder (the Windows DACL of the socket file, by path)",
+    ),
+    (
+        "crates/bridge/src/ipc.rs",
+        "libc::chmod",
+        3,
+        "open owner question: socket folder (the mode of the socket file, by path)",
+    ),
+    (
+        "crates/bridge/src/ipc.rs",
+        "libc::chown",
+        1,
+        "open owner question: socket folder (the owner of the socket file, by path)",
+    ),
+    (
+        "crates/bridge/src/socket.rs",
+        "libc::chmod",
+        1,
+        "open owner question: socket folder (the mode of the socket file, by path)",
+    ),
+    (
+        "crates/bridge/src/platform/macos.rs",
+        "std::fs::set_permissions",
+        1,
+        "the install runs once as root, on a file in /Library/PrivilegedHelperTools, which only root can add names to",
+    ),
+    (
+        "crates/common/src/config.rs",
+        "std::fs::set_permissions",
+        1,
+        "the GUI's own user config folder, changed as the user",
+    ),
+    (
+        "crates/hole/src/setup.rs",
+        "std::os::unix::fs::lchown",
+        1,
+        "open owner question: the macOS repair of a user's data folder walks it as root and changes each entry by path",
+    ),
+    (
+        "crates/util/src/ownership.rs",
+        "libc::lchown",
+        1,
+        "no caller in production code: only tests/elevated_ownership_privileged.rs and its own tests call it",
+    ),
+];
+
+/// The by-name calls of the privileged crates, once per file and spelling, with how many there are. Not
 /// `util::dir::testing`, which is compiled for tests and changes only the fixtures a test made.
-fn privileged_dir_sources(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for krate in std::fs::read_dir(root.join("crates")).unwrap() {
-        let src = krate.unwrap().path().join("src");
-        if src.is_dir() {
-            sources_in(&src, &mut found);
+fn by_name_sites(root: &Path) -> BTreeMap<(String, String), usize> {
+    let mut sites = BTreeMap::new();
+    for (relative, path) in privileged_sources(root) {
+        if relative == "crates/util/src/dir/testing.rs" {
+            continue;
+        }
+        for call in by_name_calls(&std::fs::read_to_string(&path).unwrap()) {
+            *sites.entry((relative.clone(), call)).or_insert(0) += 1;
         }
     }
-    found.retain(|path| opens_a_dir(&std::fs::read_to_string(path).unwrap()));
-    let util_dir = root.join("crates").join("util").join("src").join("dir");
-    found.push(root.join("crates").join("util").join("src").join("dir.rs"));
-    for entry in std::fs::read_dir(util_dir).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if path.is_file() && name.ends_with(".rs") && !name.ends_with("_tests.rs") && name != "testing.rs" {
-            found.push(path);
-        }
-    }
-    let windows = root.join("crates").join("util").join("src").join("dir").join("windows");
-    for entry in std::fs::read_dir(windows).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.ends_with(".rs") && !name.ends_with("_tests.rs") {
-            found.push(path);
-        }
-    }
-    found.sort();
-    found.dedup();
-    found
+    sites
 }
 
 #[skuld::test]
-fn no_privileged_dir_code_changes_an_owner_or_a_mode_by_name() {
+fn no_privileged_code_changes_an_owner_or_a_mode_by_name() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    let sources = privileged_dir_sources(&root);
-    assert!(
-        sources.iter().any(|path| path.ends_with("dir/unix.rs")) && sources.iter().any(|path| path.ends_with("dir.rs")),
-        "the scan must cover util::dir itself: {sources:?}"
-    );
+    let covered = privileged_sources(&root);
+    for must_cover in [
+        "crates/util/src/dir.rs",
+        "crates/util/src/dir/unix.rs",
+        "crates/bridge/src/ipc.rs",
+    ] {
+        assert!(
+            covered.iter().any(|(relative, _)| relative == must_cover),
+            "the scan must cover {must_cover}"
+        );
+    }
 
     let mut hits = Vec::new();
-    for path in &sources {
-        for call in by_name_calls(&std::fs::read_to_string(path).unwrap()) {
-            hits.push(format!("{}: {call}", path.strip_prefix(&root).unwrap().display()));
+    for ((file, call), count) in by_name_sites(&root) {
+        let allowed = BY_NAME_ALLOWED
+            .iter()
+            .find(|(allowed_file, allowed_call, ..)| *allowed_file == file && *allowed_call == call)
+            .map_or(0, |(_, _, count, _)| *count);
+        if count > allowed {
+            hits.push(format!("{file}: {call} x{count} (allowed: {allowed})"));
         }
     }
 
     assert!(
         hits.is_empty(),
-        "a privileged step changes an owner or a mode by name; do it through the handle (`fchown`, `fchmod`, \
-         `SetSecurityInfo`) after checking what it is: {hits:#?}"
+        "privileged code changes an owner or a mode by name, which resolves the name again: do it through the handle (`fchown`, `fchmod`, `SetSecurityInfo`) after checking what it is, or add the site to BY_NAME_ALLOWED with the reason: {hits:#?}"
+    );
+}
+
+#[skuld::test]
+fn every_by_name_allowance_still_applies() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let sites = by_name_sites(&root);
+    for (file, call, count, reason) in BY_NAME_ALLOWED {
+        assert_eq!(
+            sites.get(&(file.to_string(), call.to_string())),
+            Some(count),
+            "{file} no longer calls `{call}` {count} time(s): update or remove its allowance ({reason})"
+        );
+    }
+}
+
+#[skuld::test]
+fn the_by_name_scan_sees_every_spelling_of_a_call() {
+    let sites = |text: &str| by_name_calls(text).len();
+
+    assert_eq!(
+        sites(
+            "use std::os::unix::fs::chown;
+chown(path, Some(0), None)?;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use std::fs::{set_permissions, File};
+set_permissions(path, perms)?;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use std::os::unix::fs as ufs;
+ufs::lchown(path, None, None)?;"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
+SetNamedSecurityInfoW(p);"
+        ),
+        1
+    );
+    assert_eq!(
+        sites(
+            "use libc::*;
+unsafe { chmod(path, 0o600) };"
+        ),
+        1
+    );
+    assert_eq!(sites("unsafe { libc::chmod(path.as_ptr(), 0o600) };"), 1);
+    // Not by name: the methods that act on a handle, and a function of the file's own.
+    assert_eq!(sites("file.set_permissions(perms)?;"), 0);
+    assert_eq!(
+        sites(
+            "fn chown(fd: i32) {}
+chown(fd);"
+        ),
+        0
     );
 }
 
 #[skuld::test]
 fn the_by_name_scan_tells_a_name_from_a_handle() {
-    assert_eq!(by_name_calls("libc::fchownat(dir, name, uid, gid, 0)"), ["fchownat"]);
+    assert_eq!(
+        by_name_calls("libc::fchownat(dir, name, uid, gid, 0)"),
+        ["libc::fchownat"]
+    );
     assert_eq!(
         by_name_calls("std::fs::set_permissions(path, perms)"),
-        ["fs::set_permissions"]
+        ["std::fs::set_permissions"]
     );
     assert_eq!(
         by_name_calls("SetNamedSecurityInfoW(&path, ..)"),
-        ["SetNamedSecurityInfo"]
+        ["SetNamedSecurityInfoW"]
     );
     assert!(by_name_calls("libc::fchown(fd, uid, gid)").is_empty());
     assert!(by_name_calls("file.set_permissions(perms)").is_empty());
