@@ -44,8 +44,8 @@ enum AtAPlantedName {
     /// Takes the name over or removes it, whatever sits there: afterwards the name no longer leads to what was
     /// planted.
     Replaces,
-    /// Like [`Self::Replaces`], except that a file the expected owner already owns is kept and used as it is (the lock
-    /// and the log do this by contract): a hard link to a file of the owner's own.
+    /// Like [`Self::Replaces`], except that a file the expected owner already owns is kept and locked as it is (the lock
+    /// does this by contract, without changing it): a hard link to a file of the owner's own.
     KeepsAFileItsOwnerOwns,
     /// A claim that is lost: `AlreadyExists`, with the planted name left as it was.
     ClaimedElsewhere,
@@ -466,7 +466,7 @@ fn writers() -> Vec<Writer> {
                 "crates/common/src/logging/dir_rotate.rs",
             ],
             names: &[LOG_NAME, LOG_ROTATED_NAME, LOG_FALLBACK_NAME],
-            at_a_planted_name: AtAPlantedName::KeepsAFileItsOwnerOwns,
+            at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
             run: |dir, owner| {
                 let handle = Dir::open(dir, true, owner)?;

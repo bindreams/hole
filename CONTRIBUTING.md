@@ -560,7 +560,8 @@ keeps only a file that `owner` already owns. A file owned by this process
 instead (a leftover from a run that died before its `fchown`, or an unrelated
 file linked at the name) is locked, has its *name* unlinked and is replaced by a
 fresh file, so it is never modified and the owner is never locked out. `fchmod`
-and `fchown` touch only a file the call created or the owner owns. The full
+and `fchown` touch only a file the call created or one with a single name that
+the owner owns; the owner's file with another name is locked as it is. The full
 protocol and what it guarantees are in the
 [module doc](crates/file-lock/src/exclusive.rs); Windows opens without
 `FILE_SHARE_DELETE` so the name stays bound to the vetted file while the lock is
@@ -692,8 +693,8 @@ re-derive them.
 
 1. **Write only to a file you made or the owner already owns.** A file kept at a name across runs (the log) is
    opened with `Dir::append_own_file`: created with `O_EXCL`, or an existing file taken only if it is the expected
-   owner's (unix: its uid; Windows: no other name). Anything else at the name (another name of someone else's
-   file, a link, a FIFO) is unlinked and replaced, never written through, and an existing file's owner and mode are
+   owner's with no other name (unix: its uid and a link count of 1; Windows: no other name). Anything else at the
+   name (another name of a file, a link, a FIFO) is unlinked and replaced, never written through, and an existing file's owner and mode are
    left alone.
 
 1. **Read through the handle too.** A privileged read of a fixed name in such a folder is `ReadDir::read` after the

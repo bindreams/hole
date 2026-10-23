@@ -29,15 +29,19 @@
 //!    to an unrelated file this process owns that was hard-linked at the name:
 //!    the unlink touches only the name, never that file. A file owned by anyone
 //!    else is refused.
-//! 4. `fchmod` and `fchown` are applied only to a file this call created or the
-//!    `owner` already owns. With no `owner` an existing file is only locked.
+//! 4. `fchmod` and `fchown` are applied only to a file this call created, or one the
+//!    `owner` already owns and that has one name (link count 1, read from the open
+//!    file under the lock). A file with another name may be someone else's inode
+//!    hard-linked at the lock name: it is locked and used as it is, since the lock
+//!    only `flock`s it. With no `owner` an existing file is only locked.
 //! 5. Once locked, the name must still name the open file (device and inode);
 //!    if the previous holder unlinked it, start over.
 //!
 //! So whatever an attacker does to the name or its links, before or after the
-//! open, no file but one this call created or the `owner` owns is
-//! re-permissioned or chowned. A second name for the kept file is not refused:
-//! the count can change after it is read, so a check on it would not protect.
+//! open, no file but one this call created, or one with a single name that the
+//! `owner` owns, is re-permissioned or chowned. A second name for the kept file is
+//! not refused (that would lock out a legitimate state): it only withholds the
+//! change. A name added after the count is read is a name for the lock file itself.
 //!
 //! The directory part of `path` is opened once, as a [`Dir`] (missing components
 //! created, a link followed only under `Dir`'s ownership-transition rule, and with an
@@ -217,7 +221,7 @@ impl Exclusive {
     /// `Ok(None)` means the lock is currently held by someone else (this
     /// process or another) — contention, not an error. `owner`, when
     /// `Some((uid, gid))`, is applied via `fchown` once the lock is held (unix;
-    /// Windows ignores it), and an existing lock file is only used if `uid`
+    /// Windows ignores it) to a file with one name, and an existing lock file is only used if `uid`
     /// owns it; `None` expects no owner and leaves an existing file as it is
     /// (the root-owned `--service` daemon case). See the module doc's open
     /// protocol.
@@ -237,13 +241,7 @@ impl Exclusive {
     /// otherwise make fail.
     fn try_acquire_as(path: &Path, owner: Option<(u32, u32)>, caller: platform::Caller) -> io::Result<Option<Self>> {
         on_acquire_entry();
-        match platform::open_locked(path, false, owner, caller)? {
-            Some(file) => {
-                platform::chown_fd(&file, owner)?;
-                Ok(Some(Exclusive { file }))
-            }
-            None => Ok(None),
-        }
+        Ok(platform::open_locked(path, false, owner, caller)?.map(|file| Exclusive { file }))
     }
 
     /// Acquire the lock, blocking until it is available. See [`Self::try_acquire`]
@@ -259,7 +257,6 @@ impl Exclusive {
     fn acquire_as(path: &Path, owner: Option<(u32, u32)>, caller: platform::Caller) -> io::Result<Self> {
         on_acquire_entry();
         let file = platform::open_locked(path, true, owner, caller)?.expect("blocking open_locked always returns Some");
-        platform::chown_fd(&file, owner)?;
         Ok(Exclusive { file })
     }
 }

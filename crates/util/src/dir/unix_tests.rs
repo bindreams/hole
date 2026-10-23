@@ -533,7 +533,7 @@ fn the_real_open_refuses_a_directory_of_a_third_party_only_when_the_caller_can_m
 // trusted_appender ====================================================================================================
 
 fn facts(regular: bool, uid: u32) -> Facts {
-    Facts { regular, uid }
+    Facts { regular, uid, links: 1 }
 }
 
 #[skuld::test]
@@ -552,6 +552,18 @@ fn a_regular_file_of_anyone_else_is_not_trusted_whoever_made_it() {
 fn with_no_expected_owner_any_regular_file_is_trusted() {
     assert!(trusted_appender(facts(true, ROOT), None));
     assert!(trusted_appender(facts(true, 1001), None));
+}
+
+#[skuld::test]
+fn a_file_with_another_name_is_not_trusted_whoever_owns_it() {
+    // A name for the file is what a hard link a user planted adds, and appending would change the file at the other name.
+    let linked = |uid| Facts {
+        regular: true,
+        uid,
+        links: 2,
+    };
+    assert!(!trusted_appender(linked(1000), Some((1000, 1000))));
+    assert!(!trusted_appender(linked(1000), None));
 }
 
 #[skuld::test]

@@ -8,7 +8,11 @@ const OWNER: u32 = 2001;
 const STRANGER: u32 = 3002;
 
 fn file(uid: u32) -> Facts {
-    Facts { regular: true, uid }
+    Facts {
+        regular: true,
+        uid,
+        links: 1,
+    }
 }
 
 // vet =================================================================================================================
@@ -110,9 +114,10 @@ fn a_lock_file_left_by_a_crash_before_its_fchown_is_replaced_by_a_fresh_one() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let mine = real_uid();
 
-    let file = open_locked(&path, false, Some((mine + 2, mine + 2)), mine)
+    let file = open_locked_with(&path, false, Some((mine + 2, mine + 2)), mine, || {})
         .unwrap()
-        .expect("a leftover must not lock the owner out");
+        .expect("a leftover must not lock the owner out")
+        .file;
 
     assert_eq!(
         std::fs::read(&path).unwrap(),
@@ -146,7 +151,8 @@ fn a_victim_unlinked_from_the_lock_name_after_the_open_is_left_alone() {
         }
     })
     .unwrap()
-    .expect("acquired");
+    .expect("acquired")
+    .file;
 
     let meta = std::fs::metadata(&victim).unwrap();
     assert_eq!(meta.mode() & 0o777, 0o644, "the victim must not be re-permissioned");
@@ -172,7 +178,8 @@ fn a_file_swapped_in_after_the_open_is_the_one_locked() {
         }
     })
     .unwrap()
-    .expect("acquired");
+    .expect("acquired")
+    .file;
 
     assert_eq!(
         file.metadata().unwrap().ino(),
@@ -195,7 +202,8 @@ fn a_file_unlinked_after_the_open_is_replaced_not_refused() {
         }
     })
     .unwrap()
-    .expect("acquired");
+    .expect("acquired")
+    .file;
 
     assert_eq!(std::fs::read(&path).unwrap(), b"");
     assert_eq!(file.metadata().unwrap().ino(), ino(&path));
@@ -267,7 +275,8 @@ fn a_directory_swapped_for_a_symlink_after_the_open_is_not_followed() {
         },
     )
     .unwrap()
-    .expect("acquired");
+    .expect("acquired")
+    .file;
 
     assert_eq!(
         std::fs::read(outside.join("target.json.lock")).unwrap(),
@@ -309,4 +318,93 @@ fn a_lock_below_a_directory_the_caller_can_only_search_is_acquired() {
         let held = crate::Exclusive::try_acquire(&lock_dir.join("target.json.lock"), None);
         assert!(held.unwrap().is_some());
     });
+}
+
+// A file that has other names -----------------------------------------------------------------------------------------
+
+/// A group other than this process's own that it may give a file to: any group as root, else one it is a member of.
+fn another_gid() -> u32 {
+    // SAFETY: getegid and geteuid take no arguments and cannot fail.
+    let (egid, euid) = unsafe { (libc::getegid(), libc::geteuid()) };
+    if euid == 0 {
+        return egid + 1;
+    }
+    let mut groups = [0 as libc::gid_t; 256];
+    // SAFETY: `groups` holds the 256 entries the call is told it may fill.
+    let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+    assert!(n >= 0, "getgroups failed: {}", std::io::Error::last_os_error());
+    groups[..n as usize]
+        .iter()
+        .copied()
+        .find(|gid| *gid != egid)
+        .expect("this test needs the user to be in a second group, to give a file to it")
+}
+
+fn gid(path: &std::path::Path) -> u32 {
+    std::fs::symlink_metadata(path).unwrap().gid()
+}
+
+#[skuld::test]
+fn a_file_with_another_name_is_locked_and_its_mode_and_group_are_not_changed() {
+    // The owner's own file, hard-linked at the lock name: the expected owner owns it, so it is kept, and it is
+    // not this call's to re-permission or hand to another group.
+    let tmp = tempfile::tempdir().unwrap();
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, b"victim").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let path = tmp.path().join("target.json.lock");
+    std::fs::hard_link(&victim, &path).unwrap();
+    let (mine, group_before, other) = (real_uid(), gid(&victim), another_gid());
+
+    let held = crate::Exclusive::try_acquire_as(&path, Some((mine, other)), mine)
+        .unwrap()
+        .expect("a file the owner owns, with another name, is still lockable");
+
+    assert_eq!(mode(&victim), 0o644, "the victim must not be re-permissioned");
+    assert_eq!(
+        gid(&victim),
+        group_before,
+        "the victim must not be handed to another group"
+    );
+    assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+    assert_eq!(ino(&path), ino(&victim), "the lock is the file at the name");
+    assert_eq!(held.file.metadata().unwrap().ino(), ino(&path));
+}
+
+#[skuld::test]
+fn a_file_with_one_name_that_the_owner_owns_is_made_private_and_handed_to_the_owners_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("target.json.lock");
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (mine, other) = (real_uid(), another_gid());
+
+    let _held = crate::Exclusive::try_acquire_as(&path, Some((mine, other)), mine)
+        .unwrap()
+        .expect("acquired");
+
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(gid(&path), other);
+}
+
+#[skuld::test]
+fn a_file_is_changed_only_when_this_call_made_it_or_it_has_one_name_and_an_owner_is_expected() {
+    let facts = |links| Facts {
+        regular: true,
+        uid: ME,
+        links,
+    };
+    let owner = Some((ME, ME));
+    assert!(changes(true, facts(1), owner), "made by this call");
+    assert!(
+        changes(true, facts(2), owner),
+        "made by this call, then linked by someone"
+    );
+    assert!(changes(true, facts(1), None), "made by this call, no owner");
+    assert!(
+        changes(false, facts(1), owner),
+        "the owner's own file, with no other name"
+    );
+    assert!(!changes(false, facts(2), owner), "another name leads to it");
+    assert!(!changes(false, facts(1), None), "no owner is expected");
 }
