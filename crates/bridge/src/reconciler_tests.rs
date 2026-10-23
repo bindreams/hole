@@ -671,8 +671,8 @@ fn a_call_inside_a_closure_belongs_to_its_enclosing_function() {
 
 // Boot cancellation ===================================================================================================
 
-/// All three of `reconcile_once`'s call sites sit in
-/// startup paths that own a shutdown signal — SIGINT/SIGTERM in the
+/// `reconcile_once`'s one call site (`boot.rs`) is reached from three
+/// startup paths, each owning a shutdown signal — SIGINT/SIGTERM in the
 /// foreground, SCM Stop and launchd's SIGTERM in the two service paths — and
 /// that signal is exactly what has nothing to reach while a boot auto-connect
 /// is in flight. A token nothing else holds cannot be cancelled by anyone.

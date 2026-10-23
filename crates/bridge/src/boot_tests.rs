@@ -130,3 +130,22 @@ fn the_boot_steps_are_called_only_from_the_boot_sequence() {
         }
     }
 }
+
+/// Structural guard: every bridge entry point runs the boot sequence exactly once.
+/// Lexical, like the guard above.
+#[skuld::test]
+fn every_entry_point_runs_the_boot_sequence_once() {
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for entry_point in ["foreground.rs", "platform/macos.rs", "platform/windows.rs"] {
+        let text = std::fs::read_to_string(src_root.join(entry_point)).expect("failed to read an entry point");
+        let calls = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("boot::recover_then_reconcile("))
+            .count();
+        assert_eq!(
+            calls, 1,
+            "{entry_point} must call boot::recover_then_reconcile exactly once"
+        );
+    }
+}

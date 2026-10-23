@@ -901,7 +901,7 @@ leaves working DNS + broken routes, not the inverse):
   order, for all three entry points): the reap kills every recorded plugin and
   cannot tell a previous bridge's from the one the reconcile's auto-connect
   records. No request is served until the boot returns — the IPC socket is bound
-  early, but `server.run` starts after it — so an IPC start cannot interleave.
+  early, but `server.run` (`run_until` in the Windows service) starts after it — so an IPC start cannot interleave.
 - **`bridge-dns.json`** — read-only now. The bridge stopped writing this file
   (DNS confinement is process-scoped WFP state, not a file — see
   [DNS forwarder](#dns-forwarder)); what's left is the evidence-gated upgrade

@@ -28,8 +28,10 @@ fn sweep_wiring_reports_and_deletes_bridge_marker() {
     // Route recovery, the plugin reap and the boot reconcile are no longer in
     // that cohort: their call sites collapsed into
     // `boot::recover_then_reconcile`, whose order is proven by
-    // `the_boot_reap_spares_the_plugin_of_the_boot_auto_connect` and whose sole
-    // callership is guarded by `the_boot_steps_are_called_only_from_the_boot_sequence`.
+    // `the_boot_reap_spares_the_plugin_of_the_boot_auto_connect`; its sole callership
+    // and its one call per entry point are guarded by
+    // `the_boot_steps_are_called_only_from_the_boot_sequence` and
+    // `every_entry_point_runs_the_boot_sequence_once`.
     use garter::test_utils::WaitableWriter;
     use garter::tracing_test::set_default_in_current_thread;
 
