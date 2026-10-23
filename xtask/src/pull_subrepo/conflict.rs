@@ -194,7 +194,9 @@ pub(super) fn handle_conflict(
     commit_in_worktree(&worktree, &["commit", "--no-edit"], already_staged_note)?;
 
     finish_conflict_fold_in(repo_root, subdir, tag)?;
-    Ok(Outcome::Clean)
+    Ok(Outcome::Clean {
+        pull_log: super::describe_pull(pull_output),
+    })
 }
 
 /// An unmerged `path` gets an explicit, separate check rather than falling

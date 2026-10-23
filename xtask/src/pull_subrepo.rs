@@ -33,8 +33,11 @@ pub enum Outcome {
     /// Pull succeeded (cleanly, or after auto-resolving only the
     /// documented-safe allowlist). Usually a new commit updating `<subdir>`
     /// now sits on HEAD; if `<subdir>` was already at `tag`, `git subrepo
-    /// pull` is a no-op and HEAD is unchanged instead.
-    Clean,
+    /// pull` is a no-op and HEAD is unchanged instead. `pull_log` is the
+    /// exit code, stdout and stderr of the `git subrepo pull` that produced
+    /// this result: it is the only record of whether git-subrepo itself saw
+    /// a conflict, for a caller that did not expect `Clean`.
+    Clean { pull_log: String },
     /// A conflict remains outside the safe allowlist. The pull attempt
     /// itself committed nothing to the caller's branch. `unresolved`'s
     /// paths are left in the temp merge worktree exactly as `git merge`
@@ -75,7 +78,9 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
              this failure — check `git log -1` before assuming nothing happened"
                 .to_string()
         })?;
-        return Ok(Outcome::Clean);
+        return Ok(Outcome::Clean {
+            pull_log: describe_pull(&first),
+        });
     }
 
     let stderr = String::from_utf8_lossy(&first.stderr);
@@ -85,6 +90,23 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     }
 
     conflict::handle_conflict(repo_root, subdir, tag, &first, None)
+}
+
+/// What a `git subrepo pull` did, as `Outcome::Clean::pull_log` carries it.
+fn describe_pull(pull: &Output) -> String {
+    let code = pull
+        .status
+        .code()
+        .map_or_else(|| "none (terminated by a signal)".to_string(), |c| c.to_string());
+    format!(
+        "git subrepo pull exit code: {code}
+stdout:
+{}
+stderr:
+{}",
+        String::from_utf8_lossy(&pull.stdout),
+        String::from_utf8_lossy(&pull.stderr)
+    )
 }
 
 /// Every fallible step after `fix_stale_parent` lands its `.gitrepo`
@@ -113,7 +135,9 @@ fn retry_after_stale_parent_fixup(repo_root: &Path, subdir: &str, tag: &str, fix
     if second.status.success() {
         best_effort_clean(repo_root, subdir);
         ensure_tag_pin_matches(repo_root, subdir, tag).with_context(disclose)?;
-        return Ok(Outcome::Clean);
+        return Ok(Outcome::Clean {
+            pull_log: describe_pull(&second),
+        });
     }
     conflict::handle_conflict(repo_root, subdir, tag, &second, Some(fixup_commit)).with_context(disclose)
 }

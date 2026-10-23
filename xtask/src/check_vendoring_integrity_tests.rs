@@ -645,7 +645,10 @@ fn always_run_hazard_end_to_end_clean_path() {
 
     let outcome = pull_subrepo::run(&downstream, "crates/ex-ray/third_party/widget", "v1.1.0")
         .expect("pull-subrepo's own intermediate commits must succeed despite the always-failing hook");
-    assert!(matches!(outcome, pull_subrepo::Outcome::Clean), "expected a clean pull");
+    assert!(
+        matches!(outcome, pull_subrepo::Outcome::Clean { .. }),
+        "expected a clean pull"
+    );
 
     let identity = finish_vendor_bump::run(&downstream, "crates/ex-ray/third_party/widget", "widget", "v1.1.0")
         .expect("finish-vendor-bump's own commits must succeed despite the always-failing hook");
