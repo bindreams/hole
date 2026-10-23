@@ -128,8 +128,7 @@ mod tools {
     }
 
     /// Starts the child in a console of its own with no window, so a console
-    /// tool spawned from a process that has no console does not open one. The
-    /// output is still captured through pipes.
+    /// tool spawned from a process that has no console does not open one.
     pub(super) fn hide_console_window(command: &mut Command) {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -261,16 +260,14 @@ impl SystemTool {
 
     /// The only sanctioned constructor of a `Command` for a system tool. Its
     /// program is [`path`](Self::path), never a bare name. On Windows the
-    /// command carries `CREATE_NO_WINDOW`: a console tool started from a process
-    /// with no console (the release GUI and its elevated children) would
-    /// otherwise open a visible console window.
+    /// command is created with `CREATE_NO_WINDOW` (see `hide_console_window`).
     ///
     /// # Errors
     ///
     /// As [`path`](Self::path).
     #[allow(clippy::disallowed_methods)] // this IS the sanctioned constructor; clippy.toml routes every other site here
     pub fn command(self) -> io::Result<Command> {
-        #[allow(unused_mut)] // only Windows mutates it
+        #[allow(unused_mut)]
         let mut command = Command::new(self.path()?);
         #[cfg(windows)]
         tools::hide_console_window(&mut command);

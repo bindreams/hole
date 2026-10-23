@@ -45,8 +45,8 @@ libc = "0.2"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemInformation"] }
 
 [target.'cfg(windows)'.dev-dependencies]
-# `system_tool_console_tests`: finds the console host a child owns.
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+# `system_tool_console_tests`: process enumeration.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
