@@ -1094,7 +1094,10 @@ const BY_PATH_ALLOWED: &[(&str, &str)] = &[
         "crates/bridge/src/test_support/dist_harness.rs",
         "test support: reads the log of a process the test started",
     ),
-    ("crates/tun-engine/src/test_utils/escape.rs", "test support"),
+    (
+        "crates/tun-engine/src/test_utils/escape.rs",
+        "test support: opens the tty a test announces on, and writes its recovery record",
+    ),
     (
         "crates/tun-engine/src/test_utils/pktmon.rs",
         "test support: reads a capture the test made",
@@ -1108,7 +1111,10 @@ const BY_PATH_ALLOWED: &[(&str, &str)] = &[
         "crates/common/src/config_store.rs",
         "the GUI's own user config, read and written as the user",
     ),
-    ("crates/common/src/logging/logging_test_helpers.rs", "test helpers"),
+    (
+        "crates/common/src/logging/logging_test_helpers.rs",
+        "test helpers: tee files and the result file of a child test process",
+    ),
     (
         "crates/common/src/verify.rs",
         "hashes an installer the GUI downloaded, as the user",
@@ -1952,13 +1958,13 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
         "crates/common/src/logging/logging_test_helpers.rs",
         "OpenOptions::new",
         3,
-        "test helpers",
+        "test helpers: creates the tee files of a child test process",
     ),
     (
         "crates/common/src/logging/logging_test_helpers.rs",
         "std::fs::write",
         1,
-        "test helpers",
+        "test helpers: writes the result file of a child test process",
     ),
     (
         "crates/hole/src/autostart_registration.rs",
@@ -2072,19 +2078,19 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
         "crates/tun-engine/src/test_utils/escape.rs",
         "std::fs::OpenOptions::new",
         1,
-        "test support",
+        "test support: opens the tty a test announces on",
     ),
     (
         "crates/tun-engine/src/test_utils/escape.rs",
         "std::fs::remove_file",
         1,
-        "test support",
+        "test support: removes the recovery record of a test that released its cover",
     ),
     (
         "crates/tun-engine/src/test_utils/escape.rs",
         "std::fs::write",
         1,
-        "test support",
+        "test support: writes the recovery record of a test that engages a cover",
     ),
     (
         "crates/util/src/versioned_file/fixtures.rs",

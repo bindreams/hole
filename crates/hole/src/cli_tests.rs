@@ -268,7 +268,7 @@ fn upgrade_parses_yes_flag() {
 // Tests: bridge_log_watch rotation detection ==========================================================================
 //
 // These exercise the `open_watch_reader` + `file_was_rotated` helpers in
-// isolation. They simulate the rename+recreate sequence that `file-rotate`
+// isolation. They simulate the rename+recreate sequence that `DirRotate`
 // performs on size-based rollover.
 
 #[skuld::test]
@@ -278,7 +278,7 @@ fn file_was_rotated_detects_rename_and_recreate(#[fixture(temp_dir)] dir: &Path)
 
     let (_reader, handle) = super::open_watch_reader(&path).expect("open_watch_reader");
 
-    // Simulate file-rotate: rename current → .1, create a fresh active file.
+    // Simulate `DirRotate`: rename current → .1, create a fresh active file.
     std::fs::rename(&path, dir.join("watched.log.1")).expect("rename watched.log");
     std::fs::write(&path, b"").expect("recreate watched.log");
 
@@ -319,7 +319,7 @@ fn file_was_rotated_reports_false_when_path_missing(#[fixture(temp_dir)] dir: &P
 
     let (_reader, handle) = super::open_watch_reader(&path).expect("open_watch_reader");
 
-    // Simulate the sub-millisecond window in file-rotate between rename and
+    // Simulate the sub-millisecond window in `DirRotate` between rename and
     // recreate: the path is transiently missing. `file_was_rotated` must
     // return Ok(false), not Err, so the watch loop will just retry on the
     // next poll tick.
