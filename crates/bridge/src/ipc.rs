@@ -809,7 +809,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     let state_dir = state.state_dir.clone();
     let owner = state.owner;
     let generation = Arc::clone(&state.unblock_generation);
-    let persisted = tokio::task::spawn_blocking(move || -> Result<(), String> {
+    let persisted = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // The bump is the COMMIT hook, not part of the closure: it must not
         // announce a write that `save` then failed to make, and it must happen
         // before the exclusive lock is released so a concurrent
@@ -821,21 +821,20 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
             || {
                 generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
-        )
-        .map_err(|e| e.to_string())?;
-        lockdown_state::set_enabled(&state_dir, false, owner).map_err(|e| e.to_string())?;
+        )?;
+        lockdown_state::set_enabled(&state_dir, false, owner)?;
         // Clear the auto-connect candidate too. `resolve_startup_target` feeds
         // it to `AlwaysConnect` over an `Off` target, so leaving it would let
         // the next boot reconnect to the server the user just escaped from —
         // the escape undone by a record it never touched.
-        target::apply_startup_preference(&state_dir, owner, |pref| pref.candidate = None).map_err(|e| e.to_string())?;
+        target::apply_startup_preference(&state_dir, owner, |pref| pref.candidate = None)?;
         Ok(())
     })
     .await;
     match persisted {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            error!(error = %e, "unblock: failed to persist target/intent off");
+            error!(error = %error_chain(&*e), "unblock: failed to persist target/intent off");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -866,7 +865,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
 /// every other failure means the release itself did not confirm, which gets
 /// its own fixed sentence.
 fn unblock_error_message(e: &ProxyError) -> String {
-    if matches!(e, ProxyError::LockdownIntentNotPersisted) {
+    if matches!(e, ProxyError::LockdownIntentNotPersisted { .. }) {
         e.to_string()
     } else {
         "the network could not be fully unblocked".into()
@@ -1249,7 +1248,10 @@ async fn handle_diagnostics<P: Proxy + 'static, R: Routing + 'static>(
     // `server_ip`) exists.
     let network = match pm.default_route() {
         Ok(_) => "ok".to_string(),
-        Err(_) => "error".to_string(),
+        Err(e) => {
+            warn!(error = %error_chain(&e), "diagnostics: the default-route probe failed");
+            "error".to_string()
+        }
     };
 
     // vpn_server and internet are computed by the GUI from the selected

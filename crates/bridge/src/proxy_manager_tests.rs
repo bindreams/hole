@@ -297,7 +297,7 @@ impl MockRouting {
         m
     }
 
-    fn failing_gateway(state_dir: PathBuf) -> Self {
+    pub(crate) fn failing_gateway(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_gateway.store(true, Ordering::SeqCst);
         m

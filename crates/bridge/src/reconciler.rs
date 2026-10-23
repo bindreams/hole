@@ -385,7 +385,7 @@ pub async fn reconcile_once<P, R, D>(
                 // switch on, which engages the STANDING cover instead; that
                 // path is untouched and still holds on failure.
                 if let Err(error) = pm.start_cancellable(config, false, cancel.child_token()).await {
-                    tracing::warn!(%error, "reconcile_once: failed to start the persisted target");
+                    tracing::warn!(error = %util::error_chain::error_chain(&error), "reconcile_once: failed to start the persisted target");
                 }
             }
             Phase::Tunnel(TunnelStep::Hold) => {}

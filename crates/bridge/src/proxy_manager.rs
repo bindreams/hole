@@ -789,7 +789,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // persist failure here means only the SETTING did not save, which
         // the caller must be able to say distinctly from a failed release.
         self.set_lockdown_intent(false)
-            .map_err(|_| ProxyError::LockdownIntentNotPersisted)
+            .map_err(|source| ProxyError::LockdownIntentNotPersisted {
+                source: Box::new(source),
+            })
     }
 
     /// Non-cancellable convenience wrapper around

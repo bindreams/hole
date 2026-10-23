@@ -447,7 +447,7 @@ pub async fn tear_down_service<F, P, R, E, H>(
         |progress| async move {
             let mut pm = proxy_for_stop.lock().await;
             if let Err(e) = pm.stop_with_progress(event, |phase| progress.enter(phase)).await {
-                tracing::error!(error = %e, "error stopping proxy during shutdown");
+                tracing::error!(error = %util::error_chain::error_chain(&e), "error stopping proxy during shutdown");
             }
         },
         etw,

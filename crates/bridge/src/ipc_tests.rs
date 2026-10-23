@@ -2332,6 +2332,23 @@ async fn a_failed_start_logs_the_cause_the_toast_points_at() {
     );
 }
 
+/// The diagnostics poll reports only "error"; the cause belongs in bridge.log.
+#[skuld::test]
+async fn a_failed_network_probe_logs_the_cause() {
+    let (subscriber, writer) = redacting_capture();
+    let Json(diag) = {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::handle_diagnostics(axum::extract::State(ipc_state(gateway_failing_proxy()))).await
+    };
+
+    assert_eq!(diag.network, "error", "the diagnostics payload must stay as it was");
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_GATEWAY_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}
+
 // Cancel tests ========================================================================================================
 
 /// Parse the typed `StartError` from a Start-route 500 body.

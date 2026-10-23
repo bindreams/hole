@@ -300,7 +300,7 @@ async fn run_inner(
     let mut pm = proxy_shutdown.lock().await;
     let event = shutdown_reason(hole_common::update_marker::is_present(log_dir));
     if let Err(e) = pm.stop_with(event).await {
-        tracing::error!(error = %e, "error stopping proxy during shutdown");
+        tracing::error!(error = %util::error_chain::error_chain(&e), "error stopping proxy during shutdown");
     }
 
     Ok(())

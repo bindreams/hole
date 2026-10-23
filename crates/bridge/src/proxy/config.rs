@@ -216,7 +216,11 @@ pub enum ProxyError {
     /// the intent afterward. PII-free by construction (no path, no detail) —
     /// an IPC message reaches a GUI toast verbatim.
     #[error("the network was unblocked, but the kill-switch setting could not be saved")]
-    LockdownIntentNotPersisted,
+    LockdownIntentNotPersisted {
+        /// Why the save failed: for the log (via `util::error_chain`), never the toast.
+        #[source]
+        source: Box<ProxyError>,
+    },
     /// A pre-existing `hole-tun` adapter does not carry Hole's own adapter
     /// GUID — most often a build of Hole itself that crashed before it
     /// could tear the adapter down. PII-free by construction: `alias` is a
@@ -266,7 +270,7 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::TunnelSilent { .. }
             | ProxyError::TunnelSetupIncomplete { .. }
             | ProxyError::NoTunnelConnection { .. }
-            | ProxyError::LockdownIntentNotPersisted
+            | ProxyError::LockdownIntentNotPersisted { .. }
             | ProxyError::ForeignAdapter { .. }
             | ProxyError::DnsConfinementFailed { .. } => StartError::Failed { message: e.to_string() },
         }

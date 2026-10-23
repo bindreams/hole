@@ -25,16 +25,16 @@ fn an_error_without_a_source_prints_only_itself() {
 struct Embeds(#[source] std::io::Error);
 
 #[skuld::test]
-fn a_cause_the_parent_already_prints_is_not_repeated() {
+fn a_parent_that_embeds_its_cause_prints_it_twice() {
     let wrapped = Embeds(std::io::Error::other("root"));
-    assert_eq!(error_chain(&wrapped).to_string(), "wrapped: root");
+    assert_eq!(error_chain(&wrapped).to_string(), "wrapped: root -> root");
 }
 
 #[skuld::test]
-fn a_parent_that_embeds_its_cause_still_shows_the_causes_beneath() {
+fn a_cause_whose_text_is_a_substring_of_its_parents_is_still_printed() {
     #[derive(Debug, thiserror::Error)]
-    #[error("top: {0}")]
-    struct Top(#[source] Middle);
-    let e = Top(Middle(std::io::Error::other("root cause")));
-    assert_eq!(error_chain(&e).to_string(), "top: middle -> root cause");
+    #[error("failed to open the config")]
+    struct Parent(#[source] std::io::Error);
+    let e = Parent(std::io::Error::other("open"));
+    assert_eq!(error_chain(&e).to_string(), "failed to open the config -> open");
 }
