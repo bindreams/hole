@@ -243,7 +243,7 @@ fn split(path: &Path) -> io::Result<(&Path, &std::ffi::OsStr)> {
 
 /// Removes the name at `path` (a stale socket), whatever it is, but not what it points at. A missing name or folder
 /// is `Ok`.
-pub(crate) fn remove(path: &Path) -> io::Result<()> {
+pub fn remove(path: &Path) -> io::Result<()> {
     let (parent, name) = split(path)?;
     util::dir::remove_state_file(parent, name)
 }
