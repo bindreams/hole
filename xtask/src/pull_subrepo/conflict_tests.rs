@@ -6,17 +6,17 @@
 
 use std::path::Path;
 
+use crate::pull_subrepo;
 use crate::pull_subrepo::test_support::{
-    git, git_init, git_output, install_rejecting_pre_commit_hook, ConflictKind, Fixture,
+    git, git_init, git_output, install_rejecting_pre_commit_hook, Conflict, ConflictKind, Fixture,
 };
-use crate::pull_subrepo::{self, Outcome};
 
 #[skuld::test]
 fn allowlisted_conflict_auto_resolves_to_upstream() {
     let fx = Fixture::build(ConflictKind::Allowlisted);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
@@ -61,22 +61,15 @@ fn allowlisted_go_mod_conflict_declines_when_a_downstream_replace_would_be_lost(
 
     let outcome =
         pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted { mut unresolved, .. } => {
-            unresolved.sort();
-            assert_eq!(
-                unresolved,
-                vec!["go.mod".to_string(), "go.sum".to_string()],
-                "go.mod must be treated as unresolved when a downstream replace would be lost, \
-                 and go.sum must be declined along with it rather than silently resolved to an \
-                 inconsistent upstream version"
-            );
-        }
-        Outcome::Clean { pull_log } => panic!(
-            "expected go.mod to be left for a human, not silently resolved; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict { mut unresolved, .. } = outcome.expect_conflicted();
+    unresolved.sort();
+    assert_eq!(
+        unresolved,
+        vec!["go.mod".to_string(), "go.sum".to_string()],
+        "go.mod must be treated as unresolved when a downstream replace would be lost, \
+         and go.sum must be declined along with it rather than silently resolved to an \
+         inconsistent upstream version"
+    );
 }
 #[skuld::test]
 fn allowlisted_go_mod_conflict_declines_when_a_block_form_replace_would_be_lost() {
@@ -89,22 +82,15 @@ fn allowlisted_go_mod_conflict_declines_when_a_block_form_replace_would_be_lost(
 
     let outcome =
         pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted { mut unresolved, .. } => {
-            unresolved.sort();
-            assert_eq!(
-                unresolved,
-                vec!["go.mod".to_string(), "go.sum".to_string()],
-                "go.mod must be treated as unresolved when a block-form downstream replace would \
-                 be lost, and go.sum (which also conflicts in this fixture) must be declined \
-                 along with it"
-            );
-        }
-        Outcome::Clean { pull_log } => panic!(
-            "expected go.mod to be left for a human, not silently resolved; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict { mut unresolved, .. } = outcome.expect_conflicted();
+    unresolved.sort();
+    assert_eq!(
+        unresolved,
+        vec!["go.mod".to_string(), "go.sum".to_string()],
+        "go.mod must be treated as unresolved when a block-form downstream replace would \
+         be lost, and go.sum (which also conflicts in this fixture) must be declined \
+         along with it"
+    );
 }
 #[skuld::test]
 fn allowlisted_go_mod_conflict_declines_when_upstream_retargets_a_shared_replace_directive() {
@@ -118,21 +104,14 @@ fn allowlisted_go_mod_conflict_declines_when_upstream_retargets_a_shared_replace
 
     let outcome =
         pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted { mut unresolved, .. } => {
-            unresolved.sort();
-            assert_eq!(
-                unresolved,
-                vec!["go.mod".to_string(), "go.sum".to_string()],
-                "go.mod must be treated as unresolved when upstream retargets our replace \
-                 directive to a different destination"
-            );
-        }
-        Outcome::Clean { pull_log } => panic!(
-            "expected go.mod to be left for a human, not silently resolved; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict { mut unresolved, .. } = outcome.expect_conflicted();
+    unresolved.sort();
+    assert_eq!(
+        unresolved,
+        vec!["go.mod".to_string(), "go.sum".to_string()],
+        "go.mod must be treated as unresolved when upstream retargets our replace \
+         directive to a different destination"
+    );
 }
 #[skuld::test]
 fn allowlisted_go_mod_conflict_auto_resolves_when_upstream_already_carries_the_same_replace() {
@@ -142,7 +121,7 @@ fn allowlisted_go_mod_conflict_auto_resolves_when_upstream_already_carries_the_s
     let fx = Fixture::build(ConflictKind::AllowlistedWithMatchingReplace);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
@@ -159,7 +138,7 @@ fn allowlisted_delete_conflict_removes_the_file_instead_of_erroring() {
     let fx = Fixture::build(ConflictKind::AllowlistedDelete);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
     assert!(
         !fx.downstream.join("vendor/go.sum").exists(),
         "go.sum should be removed, matching upstream's deletion"
@@ -177,18 +156,12 @@ fn go_sum_conflict_declines_when_go_mod_merged_cleanly_but_diverged_from_upstrea
 
     let outcome =
         pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted { unresolved, .. } => {
-            assert_eq!(
-                unresolved,
-                vec!["go.sum".to_string()],
-                "go.sum must be declined when go.mod (never itself conflicted) diverged from upstream"
-            );
-        }
-        Outcome::Clean { .. } => {
-            panic!("expected go.sum to be left for a human, not silently resolved against a mismatched go.mod")
-        }
-    }
+    let Conflict { unresolved, .. } = outcome.expect_conflicted();
+    assert_eq!(
+        unresolved,
+        vec!["go.sum".to_string()],
+        "go.sum must be declined when go.mod (never itself conflicted) diverged from upstream"
+    );
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
@@ -215,21 +188,14 @@ fn allowlisted_go_mod_conflict_declines_when_upstream_deletes_go_mod_and_a_repla
 
     let outcome =
         pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted { mut unresolved, .. } => {
-            unresolved.sort();
-            assert_eq!(
-                unresolved,
-                vec!["go.mod".to_string(), "go.sum".to_string()],
-                "go.mod must be treated as unresolved when deleting it would lose a downstream \
-                 replace, and go.sum must decline alongside it since go.mod's fate isn't decided"
-            );
-        }
-        Outcome::Clean { pull_log } => panic!(
-            "expected go.mod to be left for a human, not silently deleted; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict { mut unresolved, .. } = outcome.expect_conflicted();
+    unresolved.sort();
+    assert_eq!(
+        unresolved,
+        vec!["go.mod".to_string(), "go.sum".to_string()],
+        "go.mod must be treated as unresolved when deleting it would lose a downstream \
+         replace, and go.sum must decline alongside it since go.mod's fate isn't decided"
+    );
     assert!(
         fx.downstream.join("vendor/go.mod").exists(),
         "go.mod must not be deleted while the conflict is unresolved"
@@ -245,7 +211,7 @@ fn go_mod_conflict_resolves_to_upstream_when_downstream_deleted_it() {
     let fx = Fixture::build(ConflictKind::DownstreamDeletesGoMod);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
@@ -263,7 +229,7 @@ fn allowlisted_workflow_conflict_auto_resolves_to_upstream() {
     let fx = Fixture::build(ConflictKind::AllowlistedWorkflow);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let workflow = std::fs::read_to_string(fx.downstream.join("vendor/.github/workflows/ci.yml")).unwrap();
     assert!(
@@ -282,7 +248,7 @@ fn glob_metacharacter_filename_conflict_resolves_without_touching_the_sibling() 
     let fx = Fixture::build(ConflictKind::AllowlistedGlobMetacharacterFilename);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     assert!(
         !fx.downstream.join("vendor/.github/workflows/x[1].yml").exists(),
@@ -302,7 +268,7 @@ fn non_ascii_workflow_filename_conflict_auto_resolves_to_upstream() {
     let fx = Fixture::build(ConflictKind::AllowlistedWorkflowNonAscii);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let workflow = std::fs::read_to_string(fx.downstream.join("vendor/.github/workflows/café.yml")).unwrap();
     assert_eq!(
@@ -321,7 +287,7 @@ fn go_sum_conflict_auto_resolves_when_go_mod_never_conflicted_and_already_matche
     let fx = Fixture::build(ConflictKind::GoSumConflictsAloneWithMatchingGoMod);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_sum = std::fs::read_to_string(fx.downstream.join("vendor/go.sum")).unwrap();
     assert!(
@@ -342,7 +308,7 @@ fn go_mod_matching_upstream_via_a_clean_merge_does_not_falsely_flag_an_untouched
     let fx = Fixture::build(ConflictKind::UpstreamOnlyGoModChangeWithConflictingWorkflow);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
@@ -372,7 +338,7 @@ fn go_mod_conflict_auto_resolves_and_silently_realigns_a_now_stale_go_sum() {
     let fx = Fixture::build(ConflictKind::GoModConflictsAloneLeavingGoSumStale);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
@@ -399,7 +365,7 @@ fn go_mod_conflict_auto_resolves_and_removes_a_go_sum_upstream_never_shipped() {
     let fx = Fixture::build(ConflictKind::GoModConflictsAloneWithGoSumNeverUpstream);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
@@ -422,7 +388,7 @@ fn go_mod_conflict_auto_resolves_and_resurrects_a_go_sum_downstream_deleted() {
     let fx = Fixture::build(ConflictKind::DownstreamDeletesGoSumWhileUpstreamKeepsIt);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
@@ -445,7 +411,7 @@ fn go_mod_conflict_auto_resolves_when_go_sum_is_absent_on_both_sides() {
     let fx = Fixture::build(ConflictKind::GoModConflictsAloneWithGoSumAbsentEverywhere);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
@@ -465,30 +431,23 @@ fn mixed_conflict_auto_resolves_the_allowlisted_part_only() {
 
     let outcome =
         pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted {
-            unresolved,
-            mut auto_resolved,
-            ..
-        } => {
-            assert_eq!(
-                unresolved,
-                vec!["patched.txt".to_string()],
-                "go.mod should have been auto-resolved, leaving only the real conflict"
-            );
-            auto_resolved.sort();
-            assert_eq!(
-                auto_resolved,
-                vec!["go.mod".to_string(), "go.sum".to_string()],
-                "go.mod's auto-resolution and go.sum's silent realignment must both be \
-                 disclosed in Outcome::Conflicted's auto_resolved field"
-            );
-        }
-        Outcome::Clean { pull_log } => panic!(
-            "expected a real conflict on patched.txt to survive; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict {
+        unresolved,
+        mut auto_resolved,
+        ..
+    } = outcome.expect_conflicted();
+    assert_eq!(
+        unresolved,
+        vec!["patched.txt".to_string()],
+        "go.mod should have been auto-resolved, leaving only the real conflict"
+    );
+    auto_resolved.sort();
+    assert_eq!(
+        auto_resolved,
+        vec!["go.mod".to_string(), "go.sum".to_string()],
+        "go.mod's auto-resolution and go.sum's silent realignment must both be \
+         disclosed in Outcome::Conflicted's auto_resolved field"
+    );
 }
 #[skuld::test]
 fn real_conflict_stops_uncommitted_like_git_pull() {
@@ -497,15 +456,8 @@ fn real_conflict_stops_uncommitted_like_git_pull() {
 
     let outcome =
         pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted { unresolved, .. } => {
-            assert_eq!(unresolved, vec!["patched.txt".to_string()]);
-        }
-        Outcome::Clean { pull_log } => panic!(
-            "expected a conflict on patched.txt; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict { unresolved, .. } = outcome.expect_conflicted();
+    assert_eq!(unresolved, vec!["patched.txt".to_string()]);
 
     let after_head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
     assert_eq!(
@@ -526,22 +478,15 @@ fn real_conflict_stops_uncommitted_from_a_linked_worktree() {
 
     let outcome =
         pull_subrepo::run(&worktree_path, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted {
-            worktree, unresolved, ..
-        } => {
-            assert_eq!(unresolved, vec!["patched.txt".to_string()]);
-            assert!(
-                worktree.is_dir(),
-                "the reported conflict worktree should exist: {}",
-                worktree.display()
-            );
-        }
-        Outcome::Clean { pull_log } => panic!(
-            "expected a conflict on patched.txt; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict {
+        worktree, unresolved, ..
+    } = outcome.expect_conflicted();
+    assert_eq!(unresolved, vec!["patched.txt".to_string()]);
+    assert!(
+        worktree.is_dir(),
+        "the reported conflict worktree should exist: {}",
+        worktree.display()
+    );
 
     let after_head = git_output(&worktree_path, &["rev-parse", "HEAD"]);
     assert_eq!(
@@ -554,19 +499,12 @@ fn two_real_conflicts_are_both_reported() {
     let fx = Fixture::build(ConflictKind::TwoReal);
     let outcome =
         pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted { mut unresolved, .. } => {
-            unresolved.sort();
-            assert_eq!(
-                unresolved,
-                vec!["also_patched.txt".to_string(), "patched.txt".to_string()]
-            );
-        }
-        Outcome::Clean { pull_log } => panic!(
-            "expected both files to conflict; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict { mut unresolved, .. } = outcome.expect_conflicted();
+    unresolved.sort();
+    assert_eq!(
+        unresolved,
+        vec!["also_patched.txt".to_string(), "patched.txt".to_string()]
+    );
 }
 #[skuld::test]
 fn an_unexpected_pull_failure_surfaces_as_an_error_not_a_conflict() {
@@ -575,11 +513,8 @@ fn an_unexpected_pull_failure_surfaces_as_an_error_not_a_conflict() {
     // handle_conflict's catch-all bail branch, otherwise untested by every
     // other ConflictKind (which only ever produce one of those two).
     let fx = Fixture::build(ConflictKind::None);
-    let result = pull_subrepo::run(&fx.downstream, "vendor", "this-tag-does-not-exist");
-    assert!(
-        result.is_err(),
-        "a nonexistent tag should surface as an Err, not Outcome::Conflicted"
-    );
+    let _err = pull_subrepo::run(&fx.downstream, "vendor", "this-tag-does-not-exist")
+        .expect_err("a nonexistent tag should surface as an Err, not Outcome::Conflicted");
 }
 #[skuld::test]
 fn allowlisted_conflict_resolves_from_a_linked_worktree() {
@@ -592,7 +527,7 @@ fn allowlisted_conflict_resolves_from_a_linked_worktree() {
 
     let outcome = pull_subrepo::run(&worktree_path, "vendor", "v2")
         .expect("conflict resolution should succeed from a linked worktree");
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(worktree_path.join("vendor/go.mod")).unwrap();
     assert!(go_mod.contains("newdep"));
@@ -601,7 +536,7 @@ fn allowlisted_conflict_resolves_from_a_linked_worktree() {
 fn force_commit_conflicted_commits_the_conflicted_tree_and_fixes_the_branch_field() {
     let fx = Fixture::build(ConflictKind::Real);
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").unwrap();
-    assert!(matches!(outcome, Outcome::Conflicted { .. }));
+    outcome.expect_conflicted();
 
     pull_subrepo::force_commit_conflicted(&fx.downstream, "vendor", "v2")
         .expect("force-commit should succeed even with conflict markers present");
@@ -627,13 +562,8 @@ fn force_commit_conflicted_preserves_already_resolved_allowlisted_files() {
     // just a single conflicted file like the test above.
     let fx = Fixture::build(ConflictKind::Mixed);
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").unwrap();
-    match outcome {
-        Outcome::Conflicted { unresolved, .. } => assert_eq!(unresolved, vec!["patched.txt".to_string()]),
-        Outcome::Clean { pull_log } => panic!(
-            "expected patched.txt to remain conflicted; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict { unresolved, .. } = outcome.expect_conflicted();
+    assert_eq!(unresolved, vec!["patched.txt".to_string()]);
 
     pull_subrepo::force_commit_conflicted(&fx.downstream, "vendor", "v2")
         .expect("force-commit should succeed on a mixed conflict");
@@ -669,7 +599,7 @@ fn force_commit_conflicted_refuses_when_the_worktree_has_no_unmerged_paths() {
     // rather than force-committing what isn't actually a conflicted pull.
     let fx = Fixture::build(ConflictKind::Real);
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").unwrap();
-    assert!(matches!(outcome, Outcome::Conflicted { .. }));
+    outcome.expect_conflicted();
 
     let worktree = fx.dir.path().join("downstream/.git/tmp/subrepo/vendor");
     std::fs::write(worktree.join("patched.txt"), "resolved by hand\n").unwrap();
@@ -690,7 +620,7 @@ fn force_commit_conflicted_errors_when_no_conflict_worktree_exists() {
     // operate on nothing.
     let fx = Fixture::build(ConflictKind::None);
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").unwrap();
-    assert!(matches!(outcome, Outcome::Clean { .. }));
+    outcome.expect_clean();
 
     let err = pull_subrepo::force_commit_conflicted(&fx.downstream, "vendor", "v2")
         .expect_err("must error when there's no conflict worktree to force-commit");
@@ -712,7 +642,7 @@ fn force_commit_conflicted_refuses_when_an_untracked_file_exists_in_the_outer_su
     // destructively half-wiping <subdir>.
     let fx = Fixture::build(ConflictKind::Real);
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").unwrap();
-    assert!(matches!(outcome, Outcome::Conflicted { .. }));
+    outcome.expect_conflicted();
 
     std::fs::write(fx.downstream.join("vendor/untracked.txt"), "oops\n").unwrap();
 
@@ -737,10 +667,8 @@ fn real_conflict_under_rebase_method_is_refused_before_touching_ours_theirs() {
     let fx = Fixture::build(ConflictKind::Real);
     fx.set_join_method_rebase();
 
-    let err = match pull_subrepo::run(&fx.downstream, "vendor", "v2") {
-        Err(e) => e,
-        Ok(_) => panic!("a non-merge join method must be refused, not silently resolved with inverted semantics"),
-    };
+    let err = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect_err("a non-merge join method must be refused, not silently resolved with inverted semantics");
     assert!(
         format!("{err:#}").contains("method = rebase"),
         "error should name the actual method mismatch: {err:#}"
@@ -799,19 +727,12 @@ fn unmerged_path_with_a_leading_space_is_reported_verbatim_not_trimmed() {
 
     let outcome =
         pull_subrepo::run(&downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
-    match outcome {
-        Outcome::Conflicted { unresolved, .. } => {
-            assert_eq!(
-                unresolved,
-                vec![" lead.txt".to_string()],
-                "the leading space in the conflicted path must survive verbatim, not be trimmed off"
-            );
-        }
-        Outcome::Clean { pull_log } => panic!(
-            "expected a conflict on ` lead.txt`; git subrepo said:
-{pull_log}"
-        ),
-    }
+    let Conflict { unresolved, .. } = outcome.expect_conflicted();
+    assert_eq!(
+        unresolved,
+        vec![" lead.txt".to_string()],
+        "the leading space in the conflicted path must survive verbatim, not be trimmed off"
+    );
 }
 
 #[skuld::test]
@@ -824,10 +745,8 @@ fn allowlisted_conflict_commit_failure_is_disclosed() {
     let fx = Fixture::build(ConflictKind::Allowlisted);
     install_rejecting_pre_commit_hook(&fx.downstream);
 
-    let err = match pull_subrepo::run(&fx.downstream, "vendor", "v2") {
-        Err(e) => e,
-        Ok(_) => panic!("expected the blocked worktree commit to surface as an error"),
-    };
+    let err = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect_err("expected the blocked worktree commit to surface as an error");
     let message = format!("{err:#}");
     assert!(
         message.contains("already resolved and staged"),
@@ -842,7 +761,7 @@ fn force_commit_conflicted_commit_failure_is_disclosed() {
     // it runs — a blocked commit here must say so.
     let fx = Fixture::build(ConflictKind::Real);
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").unwrap();
-    assert!(matches!(outcome, Outcome::Conflicted { .. }));
+    outcome.expect_conflicted();
 
     install_rejecting_pre_commit_hook(&fx.downstream);
 
@@ -899,10 +818,8 @@ fn finish_conflict_fold_in_subrepo_commit_failure_is_disclosed() {
     let fx = Fixture::build(ConflictKind::Allowlisted);
     install_pre_commit_hook_rejecting_outside(&fx.downstream, "vendor");
 
-    let err = match pull_subrepo::run(&fx.downstream, "vendor", "v2") {
-        Err(e) => e,
-        Ok(_) => panic!("expected the blocked fold-in commit to surface as an error"),
-    };
+    let err = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect_err("expected the blocked fold-in commit to surface as an error");
     let message = format!("{err:#}");
     assert!(
         message.contains("a commit was already made in the subrepo temp worktree"),
@@ -933,10 +850,8 @@ fn handle_conflict_bails_when_the_worktree_has_no_unmerged_paths() {
     let fx = Fixture::build(ConflictKind::None);
     install_rejecting_pre_commit_hook(&fx.downstream);
 
-    let err = match pull_subrepo::run(&fx.downstream, "vendor", "v2") {
-        Err(e) => e,
-        Ok(_) => panic!("expected the blocked internal fold-in commit to surface as an error"),
-    };
+    let err = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect_err("expected the blocked internal fold-in commit to surface as an error");
     let message = format!("{err:#}");
     assert!(
         message.contains("but has no unmerged paths"),
@@ -1044,7 +959,7 @@ fn force_commit_conflicted_against_a_delete_modify_conflict_writes_a_sentinel_re
     let (_upstream, downstream) = build_delete_modify_fixture(dir.path());
 
     let outcome = pull_subrepo::run(&downstream, "vendor", "v2").unwrap();
-    assert!(matches!(outcome, Outcome::Conflicted { .. }));
+    outcome.expect_conflicted();
 
     pull_subrepo::force_commit_conflicted(&downstream, "vendor", "v2").expect("force-commit should succeed");
 
@@ -1088,7 +1003,7 @@ fn force_commit_conflicted_against_a_binary_content_conflict_writes_a_sentinel_w
     let (_upstream, downstream) = build_binary_conflict_fixture(dir.path());
 
     let outcome = pull_subrepo::run(&downstream, "vendor", "v2").unwrap();
-    assert!(matches!(outcome, Outcome::Conflicted { .. }));
+    outcome.expect_conflicted();
 
     pull_subrepo::force_commit_conflicted(&downstream, "vendor", "v2").expect("force-commit should succeed");
 

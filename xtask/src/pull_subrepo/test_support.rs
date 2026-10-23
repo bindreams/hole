@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
+use super::Outcome;
+
 /// Guards the `SKIP` env var against a cross-test race: `skuld` runs every
 /// `#[skuld::test]` in this crate's process concurrently, and
 /// `pull_subrepo::skip_check_vendoring_integrity_matches_prek_toml_hook_id`
@@ -489,5 +491,44 @@ pub(crate) fn install_rejecting_pre_commit_hook(repo: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// The fields of an `Outcome::Conflicted`, for a test that asserts on them.
+pub(crate) struct Conflict {
+    pub(crate) worktree: PathBuf,
+    pub(crate) unresolved: Vec<String>,
+    pub(crate) auto_resolved: Vec<String>,
+    pub(crate) fixup_commit: Option<String>,
+}
+
+/// Every test that expects a particular `Outcome` variant goes through these, so an
+/// unexpected one always fails with the full `Debug` form (the pull log for `Clean`).
+impl Outcome {
+    /// Returns the pull log.
+    #[track_caller]
+    pub(crate) fn expect_clean(self) -> String {
+        match self {
+            Outcome::Clean { pull_log } => pull_log,
+            other @ Outcome::Conflicted { .. } => panic!("expected Outcome::Clean, got {other:?}"),
+        }
+    }
+
+    #[track_caller]
+    pub(crate) fn expect_conflicted(self) -> Conflict {
+        match self {
+            Outcome::Conflicted {
+                worktree,
+                unresolved,
+                auto_resolved,
+                fixup_commit,
+            } => Conflict {
+                worktree,
+                unresolved,
+                auto_resolved,
+                fixup_commit,
+            },
+            other @ Outcome::Clean { .. } => panic!("expected Outcome::Conflicted, got {other:?}"),
+        }
     }
 }

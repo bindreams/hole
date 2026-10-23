@@ -11,6 +11,7 @@
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -60,6 +61,32 @@ pub enum Outcome {
     },
 }
 
+/// Prints `pull_log` verbatim, with real line breaks, so any `{outcome:?}` — and
+/// `Result::expect_err`, which formats its `Ok` value this way — shows the pull's
+/// exit code, stdout and stderr readably instead of as one escaped line.
+impl fmt::Debug for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Outcome::Clean { pull_log } => f
+                .debug_struct("Clean")
+                .field("pull_log", &format_args!("\n{pull_log}"))
+                .finish(),
+            Outcome::Conflicted {
+                worktree,
+                unresolved,
+                auto_resolved,
+                fixup_commit,
+            } => f
+                .debug_struct("Conflicted")
+                .field("worktree", worktree)
+                .field("unresolved", unresolved)
+                .field("auto_resolved", auto_resolved)
+                .field("fixup_commit", fixup_commit)
+                .finish(),
+        }
+    }
+}
+
 pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     let subdir = &normalize_subdir(subdir);
     assert_subdir_is_ref_safe(repo_root, subdir)?;
@@ -93,17 +120,13 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
 }
 
 /// What a `git subrepo pull` did, as `Outcome::Clean::pull_log` carries it.
-fn describe_pull(pull: &Output) -> String {
+pub(crate) fn describe_pull(pull: &Output) -> String {
     let code = pull
         .status
         .code()
         .map_or_else(|| "none (terminated by a signal)".to_string(), |c| c.to_string());
     format!(
-        "git subrepo pull exit code: {code}
-stdout:
-{}
-stderr:
-{}",
+        "git subrepo pull exit code: {code}\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&pull.stdout),
         String::from_utf8_lossy(&pull.stderr)
     )
