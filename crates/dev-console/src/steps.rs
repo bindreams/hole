@@ -198,8 +198,6 @@ async fn run_step(
             let _ = child.wait().await;
             Err(Interrupted.into())
         }
-        // The root ended by itself: its tree is killed before the reap, as the
-        // interrupt arm does.
         status = crate::supervise::wait_and_kill_leftovers(&mut child, what) => {
             let status = status.with_context(|| format!("waiting for {what}"))?;
             if status.success() {

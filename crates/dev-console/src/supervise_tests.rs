@@ -165,7 +165,6 @@ async fn assert_grandchild_died(mut conn: tokio::net::TcpStream, what: &str) {
 /// The root ends on the group `SIGTERM` within the grace; a member that ignores
 /// `SIGTERM` is what outlives it. No `kill_tree` ran, and cosca's `Drop` no
 /// longer kills the group once the root is reaped, so teardown itself must.
-/// Nothing is dropped before the check, which is the point.
 #[cfg(unix)]
 #[skuld::test]
 async fn teardown_kills_a_term_ignoring_member_after_a_graceful_root_exit() {
@@ -202,6 +201,32 @@ async fn waiting_for_a_root_kills_the_member_it_left_behind() {
 
     assert!(status.success(), "the root's own status is returned: {status:?}");
     assert_grandchild_died(conn, "the wait must kill a member its root left behind").await;
+}
+
+/// Both teardown paths act on a root that is still unreaped; a reaped one has a pgid that may name another group.
+#[cfg(all(unix, debug_assertions))]
+#[skuld::test]
+async fn teardown_refuses_a_root_that_was_already_reaped() {
+    let (mut child, _conn) = spawn_term_ignoring_tree("spawn-term-ignoring-grandchild").await;
+    child.kill_tree().unwrap();
+    child.wait().await.unwrap();
+
+    let teardown = tokio::spawn(async move { teardown_grouped(&mut child, ChildRole::Vite).await });
+
+    assert!(teardown.await.unwrap_err().is_panic());
+}
+
+/// Same contract for the steady-state wait.
+#[cfg(all(unix, debug_assertions))]
+#[skuld::test]
+async fn waiting_for_a_root_refuses_one_that_was_already_reaped() {
+    let (mut child, _conn) = spawn_term_ignoring_tree("spawn-term-ignoring-grandchild").await;
+    child.kill_tree().unwrap();
+    child.wait().await.unwrap();
+
+    let wait = tokio::spawn(async move { wait_and_kill_leftovers(&mut child, "Vite").await.map(|_| ()) });
+
+    assert!(wait.await.unwrap_err().is_panic());
 }
 
 /// cosca's argv **includes argv[0]** — `executable()` only overrides which file

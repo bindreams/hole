@@ -30,12 +30,10 @@ pub(crate) const GRACE_TIMEOUT: Duration = Duration::from_secs(10);
 /// same reason: the WarnRecovery bridge keeps its pipes open forever.
 const PRINTER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// dev.py:306-307 parity (`terminate_tree`: `if proc.poll() is not None:
-/// return`). The guard must not be deleted as redundant with anything cosca
-/// does internally: `terminate_tree`'s `killpg` takes an **unpinned pgid**
-/// (bindreams/cosca#54), so signalling an exited child's group can land on an
-/// unrelated one. The lone `terminate()` is identity-bound and needs no such
-/// guard — which is exactly what makes this one look droppable.
+/// Whether `child` has exited; `shutdown()` asks it of the bridge only, whose wait reaps it in the supervision arms.
+/// `terminate_tree`'s `killpg` takes an **unpinned pgid** (bindreams/cosca#54), so signalling a reaped child's group
+/// can land on an unrelated one. Vite and the GUI never reach `shutdown()` reaped: their funnel only sees an unreaped
+/// root (see [`wait_and_kill_leftovers`] and [`teardown_grouped`]).
 ///
 /// cosca also refuses a graceful op on Windows once an exit has been *reported*,
 /// because its async backend can release the process handle and stop pinning
@@ -453,8 +451,7 @@ async fn startup_and_supervise(
 
     // Steady state: first exit / Ctrl+C / SIGTERM wins (replaces dev.py's
     // done.wait(0.5) poll loop and reaper threads — tokio makes them events).
-    // A vite/gui root that exited by itself is reaped here, so its tree is killed
-    // first and the slot emptied: the funnel must not tear a reaped root down.
+    // The funnel must not tear down a reaped root, hence `slot.take()`.
     Ok(tokio::select! {
         status = bridge.wait() => exited("bridge", status),
         status = wait_and_kill_leftovers(vite, "Vite") => {
@@ -553,25 +550,37 @@ async fn shutdown(bridge: Option<&mut Child>, vite: Option<&mut Child>, gui: Opt
 /// pgid-based tree once the root is reaped (the pgid may name an unrelated
 /// group by then), and an unreaped root keeps its pgid ours.
 ///
-/// The root must not have been waited on yet; afterwards the child needs no
-/// teardown.
+/// The root must not have been waited on yet (asserted in debug builds);
+/// afterwards the child needs no teardown.
+///
+/// If the exit cannot be watched without reaping, the root is reaped anyway to
+/// end the wait and its tree is left running on POSIX: a group kill after the
+/// reap could hit an unrelated group. That is reported, not repaired.
 pub(crate) async fn wait_and_kill_leftovers(
     child: &mut Child,
     what: &str,
 ) -> Result<std::process::ExitStatus, cosca::error::Error> {
+    debug_assert_root_unreaped(child, what);
     match cosca::tokio::Process::from_id(child.id()).wait().await {
         Ok(()) => kill_tree_reporting(child, what),
-        // Waiting reaps below either way, which forfeits the kill; say so.
         Err(e) => {
             let tree = if cfg!(windows) {
                 "its job object kills the tree when the child is dropped"
             } else {
-                "its tree is not killed"
+                "its tree is left running, as a group kill after the reap could hit an unrelated group"
             };
             enote!("{YELLOW}{what} exit could not be watched ({e}); {tree}{RESET}");
         }
     }
     child.wait().await
+}
+
+/// A root that was reaped has a pgid that may name another group, so a tree kill through it is unsafe.
+fn debug_assert_root_unreaped(child: &Child, what: &str) {
+    debug_assert!(
+        child.id().exists() != cosca::identity::Existence::Gone,
+        "{what}: the root was already reaped; its pgid may name an unrelated group"
+    );
 }
 
 /// Signal-only, so the caller's wait is what reaps. A refusal is reported
@@ -588,9 +597,9 @@ fn kill_tree_reporting(child: &mut Child, what: &str) {
 /// The tree is killed on every path, with the root still unreaped: a root that
 /// ended on the signal can leave a member that ignores it, and cosca's `Drop`
 /// will not reach that member once the root is reaped. `child` must not have
-/// been waited on (see [`wait_and_kill_leftovers`]).
+/// been waited on (see [`wait_and_kill_leftovers`]; asserted in debug builds).
 pub(crate) async fn teardown_grouped(child: &mut Child, role: ChildRole) {
-    // Non-reaping watch: the root stays unreaped, so its pgid stays ours.
+    debug_assert_root_unreaped(child, &format!("{role:?}"));
     let root = cosca::tokio::Process::from_id(child.id());
     let exited = match root.wait_timeout(Duration::ZERO).await {
         Ok(exited) => exited,

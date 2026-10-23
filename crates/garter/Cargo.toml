@@ -93,7 +93,7 @@ harness = false
 rustix = { version = "1", features = ["process"] }
 
 [target.'cfg(unix)'.dependencies]
-# The macOS exec errnos in `binary.rs`; mock-plugin's signal(SIGTERM, SIG_IGN), for MOCK_PLUGIN_IGNORE_SIGNALS.
+# macOS exec errnos (`binary.rs`); mock-plugin's SIGTERM ignore.
 libc = "0.2"
 
 # `src/bin/mock-plugin.rs`, the test fixture; the published crate excludes `src/bin/`.

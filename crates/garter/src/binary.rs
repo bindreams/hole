@@ -108,12 +108,9 @@ pub struct BinaryPlugin {
 
 /// What a failed plugin spawn tells the user.
 ///
-/// cosca reports every failed `exec` of a tokio `Command` on Unix (`ENOENT` and `EACCES` included) as
-/// `MayHaveStarted`, because it cannot prove the program never ran, and its text then talks about a child
-/// "reaped by someone else" or "still running". When the fate says no child is left, or the kernel refused the file
-/// itself (off Linux the fate cannot say), the cause is the useful part.
-/// A child that may still be running keeps cosca's text, as does an elevation backend, whose fate says nothing about
-/// the program behind it.
+/// cosca reports a failed `exec` on Unix as `MayHaveStarted` even when the program never ran, and its text then talks
+/// about a child that may be running. Where the fate or the errno proves none is left, the cause alone is reported;
+/// otherwise (a child that may run, an elevation backend) cosca's text stays.
 pub(crate) fn spawn_failure_text(error: &cosca::error::Error) -> String {
     use cosca::error::{ChildFate, Error};
     match error {
@@ -132,30 +129,28 @@ pub(crate) fn spawn_failure_text(error: &cosca::error::Error) -> String {
     }
 }
 
+/// The errnos only a refused `exec` returns on macOS: those `execve(2)` and `posix_spawn(2)` document, minus every one
+/// that `kevent` (kqueue(2)), `fcntl(2)` or `sigaction(2)` document, since tokio calls those after a successful spawn.
+/// ENOENT and EACCES are therefore absent: a missing or non-executable plugin keeps cosca's text until cosca can tell
+/// an exec failure from a failed setup.
+#[cfg(target_os = "macos")]
+pub(crate) const REFUSED_BY_EXEC_ONLY: [i32; 8] = [
+    libc::E2BIG,
+    libc::EBADARCH,
+    libc::EIO,
+    libc::ELOOP,
+    libc::ENAMETOOLONG,
+    libc::ENOEXEC,
+    libc::ENOTDIR,
+    libc::ETXTBSY,
+];
+
 /// Whether `cause` is the kernel refusing to `exec` the program, so that it never ran.
 ///
-/// Off Linux a failed `exec` is reported as `Running { id: None }`, since only Linux's pidfd handshake sees std collect
-/// the child. On macOS (the only non-Linux Unix cosca supports) the errno decides. It must be one `execve(2)` or
-/// `posix_spawn(2)` documents, and none that a step after a successful spawn can also return: tokio's `kevent`
-/// registration of the stdio pipes (ENOMEM, EFAULT, EINVAL, EBADF, ENOTSUP), its `fcntl` (EBADF, EPERM) and its
-/// `sigaction` (EFAULT, EINVAL). cosca's own steps after the spawn carry no errno in an `Io`. ENOMEM and EFAULT are
-/// therefore left out, as is EPERM, which neither page documents; a cause outside the list keeps cosca's text.
-/// On Linux the handshake answers, so `Running` there is not an exec failure.
+/// On macOS the errno decides: only [`REFUSED_BY_EXEC_ONLY`] counts, any other cause keeps cosca's text. On Linux the
+/// pidfd handshake answers, so `Running` there is not an exec failure.
 #[cfg(target_os = "macos")]
 fn exec_refused_the_program(cause: &cosca::error::Error) -> bool {
-    // execve(2) ERRORS, plus EBADARCH from posix_spawn(2), minus the errnos above.
-    const REFUSED_BY_EXEC_ONLY: [i32; 10] = [
-        libc::E2BIG,
-        libc::EACCES,
-        libc::EBADARCH,
-        libc::EIO,
-        libc::ELOOP,
-        libc::ENAMETOOLONG,
-        libc::ENOENT,
-        libc::ENOEXEC,
-        libc::ENOTDIR,
-        libc::ETXTBSY,
-    ];
     matches!(cause, cosca::error::Error::Io(e) if e.raw_os_error().is_some_and(|errno| REFUSED_BY_EXEC_ONLY.contains(&errno)))
 }
 
@@ -975,9 +970,8 @@ impl PluginTree for cosca::tokio::Child {
         self.wait_tree().await.map(|_| ())
     }
 
-    // cosca's `kill_tree` closes the job handle, and a `wait_tree` after it answers `Unassessable`; the wait must be
-    // armed before the kill, but it borrows the child that `kill_tree` borrows mutably. Until cosca can drain a job
-    // after killing it (bindreams/hole#1124), every take-down on Windows takes the reader-wait fallback of
+    // cosca's `kill_tree` closes the job handle, so a `wait_tree` after it answers `Unassessable`; arming the wait first
+    // needs a borrow `kill_tree` also takes. Every Windows take-down therefore uses the reader-wait fallback of
     // `drain_readers_after_exit`.
     #[cfg(windows)]
     async fn wait_tree_drained(&self) -> Result<(), cosca::error::Error> {
@@ -992,10 +986,9 @@ impl PluginTree for cosca::tokio::Child {
         self.wait().await
     }
 
-    /// cosca's `Drop` kills no pgid-addressed tree once the root is reaped, and `detach` keeps that
-    /// true whatever its drop policy becomes. It also clears a job object's kill-on-close, so it is
-    /// applied only where the drop's kill would be a `killpg`. A tree kill that failed before the
-    /// reap is therefore not retried by the drop.
+    /// cosca's `Drop` kills no pgid-addressed tree once the root is reaped. `detach` also clears a job object's
+    /// kill-on-close, so it is applied only where the drop's kill would be a `killpg`. A tree kill that failed before
+    /// the reap is therefore not retried by the drop.
     fn disarm(&mut self) {
         if kill_tree_addresses_a_releasable_id(self.containment()) {
             self.detach();

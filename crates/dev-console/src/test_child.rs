@@ -24,6 +24,10 @@
 //!   parks, so the group `SIGTERM` ends it alone.
 //! - `spawn-term-ignoring-grandchild-and-exit` — as above, but the root exits
 //!   straight after spawning instead of parking.
+//! - `spawn-term-ignoring-grandchild-and-exit-when-released` — as above, but the
+//!   root first dials the control address with `r`, then exits once it reads a
+//!   byte from that connection. The member's own `+` arrives on a second
+//!   connection, so the test can release the root after the member is up.
 //! - `fake-bridge` — stand-in bridge for supervisor tests: speaks the
 //!   `--ready-notify` protocol (read `DEV_CONSOLE_READY_SPEC` as
 //!   `ADDR/TOKEN`, dial, echo the token) and then parks forever.
@@ -47,9 +51,13 @@ pub fn maybe_run() {
         "spawn-grandchild" => run_spawn_grandchild(true),
         "spawn-grandchild-same-group" => run_spawn_grandchild(false),
         #[cfg(unix)]
-        "spawn-term-ignoring-grandchild" => run_spawn_term_ignoring_grandchild(false),
+        "spawn-term-ignoring-grandchild" => run_spawn_term_ignoring_grandchild(RootEnd::Park),
         #[cfg(unix)]
-        "spawn-term-ignoring-grandchild-and-exit" => run_spawn_term_ignoring_grandchild(true),
+        "spawn-term-ignoring-grandchild-and-exit" => run_spawn_term_ignoring_grandchild(RootEnd::Exit),
+        #[cfg(unix)]
+        "spawn-term-ignoring-grandchild-and-exit-when-released" => {
+            run_spawn_term_ignoring_grandchild(RootEnd::ExitWhenReleased)
+        }
         "fake-bridge" => run_fake_bridge(),
         "echo-argv" => run_echo_argv(),
         "hole-root" => run_hole_root(),
@@ -135,15 +143,21 @@ fn run_spawn_grandchild(own_console_group: bool) -> ! {
 }
 
 #[cfg(unix)]
-fn run_spawn_term_ignoring_grandchild(then_exit: bool) -> ! {
+enum RootEnd {
+    Park,
+    Exit,
+    ExitWhenReleased,
+}
+
+#[cfg(unix)]
+fn run_spawn_term_ignoring_grandchild(end: RootEnd) -> ! {
     use std::os::unix::process::CommandExt as _;
 
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = std::process::Command::new(exe);
     cmd.env(MODE_ENV, "sleep");
-    // The grandchild alone ignores SIGTERM (an ignored disposition survives `exec`). Set in its own pre-exec, this
-    // process keeps the default throughout, so a test that has seen the grandchild's readiness byte can signal
-    // the group without racing a restore here.
+    // Set in the grandchild's own pre-exec so this process keeps the default throughout: a test that has seen the
+    // readiness byte can signal the group without racing a restore here.
     // SAFETY: `signal` is async-signal-safe and the closure does nothing else.
     unsafe {
         cmd.pre_exec(|| {
@@ -154,8 +168,16 @@ fn run_spawn_term_ignoring_grandchild(then_exit: bool) -> ! {
     // Intentionally unwaited, as in `run_spawn_grandchild`.
     #[allow(clippy::zombie_processes)]
     let _grandchild = cmd.spawn().expect("spawn grandchild");
-    if then_exit {
-        std::process::exit(0)
+    match end {
+        RootEnd::Park => park_forever(),
+        RootEnd::Exit => std::process::exit(0),
+        RootEnd::ExitWhenReleased => {
+            use std::io::Read as _;
+            let addr = std::env::var(CONTROL_ENV).expect("control address env");
+            let mut conn = TcpStream::connect(addr).expect("dial control listener");
+            conn.write_all(b"r").expect("announce the root");
+            conn.read_exact(&mut [0u8; 1]).expect("release byte");
+            std::process::exit(0)
+        }
     }
-    park_forever()
 }

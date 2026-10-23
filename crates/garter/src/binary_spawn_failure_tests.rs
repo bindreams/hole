@@ -1,8 +1,4 @@
-// A spawn that never ran the program ----------------------------------------------------------------------------------
-//
-// cosca reports a failed `exec` of a tokio `Command` on Unix as `MayHaveStarted`, because it cannot prove the program never
-// ran. When the kernel refused the file, that text is wrong for the reader: it says a child "had been reaped by someone
-// else" or "may still be running" where the OS error says what is the matter.
+// Failed plugin spawns report the OS error, not cosca's "may have started" text (see `spawn_failure_text`).
 #![allow(clippy::disallowed_methods)] // CancellationToken::new roots the shutdown of a run that never starts
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -11,6 +7,8 @@ use cosca::error::{ChildFate, Error};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(target_os = "macos")]
+use crate::binary::REFUSED_BY_EXEC_ONLY;
 use crate::binary::{spawn_failure_text, BinaryPlugin};
 use crate::plugin::ChainPlugin;
 
@@ -38,6 +36,17 @@ fn assert_reports_only_the_os_error(message: &str, errno: i32) {
     assert!(!message.contains("may still be running"), "{message}");
 }
 
+/// `message` is the spawn failure for `errno`, in cosca's words: the OS error, and the possibility of a running child.
+#[cfg(target_os = "macos")]
+fn assert_keeps_the_cosca_text(message: &str, errno: i32) {
+    let os_error = std::io::Error::from_raw_os_error(errno).to_string();
+    assert!(message.contains("failed to spawn"), "{message}");
+    assert!(message.contains(&os_error), "{message}: expected `{os_error}`");
+    assert!(message.contains("may have started"), "{message}");
+    assert!(message.contains("may still be running"), "{message}");
+}
+
+#[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_missing_plugin_reports_the_os_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -47,6 +56,7 @@ async fn a_missing_plugin_reports_the_os_error() {
     assert_reports_only_the_os_error(&message, libc::ENOENT);
 }
 
+#[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_non_executable_plugin_reports_the_os_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -57,6 +67,31 @@ async fn a_non_executable_plugin_reports_the_os_error() {
     let message = spawn_failure_of(BinaryPlugin::new(path, None)).await;
 
     assert_reports_only_the_os_error(&message, libc::EACCES);
+}
+
+/// kevent(2) documents ENOENT and EACCES, and tokio calls it after a successful spawn, so on macOS they do not prove
+/// the program never ran.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn a_missing_plugin_keeps_the_cosca_text() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let message = spawn_failure_of(BinaryPlugin::new(dir.path().join("no-such-plugin"), None)).await;
+
+    assert_keeps_the_cosca_text(&message, libc::ENOENT);
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn a_non_executable_plugin_keeps_the_cosca_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("not-executable");
+    std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let message = spawn_failure_of(BinaryPlugin::new(path, None)).await;
+
+    assert_keeps_the_cosca_text(&message, libc::EACCES);
 }
 
 #[skuld::test]
@@ -125,37 +160,42 @@ fn a_child_that_may_still_run_keeps_the_cosca_text() {
     }
 }
 
-/// Off Linux cosca answers a failed `exec` with a child that may be running. These are the errnos that macOS's
-/// `execve(2)` and `posix_spawn(2)` document (ERRORS) and that nothing after the exec can return (tokio's `kevent`
-/// registration, `fcntl` and `sigaction`; cosca's own errors are not `Io` carrying an errno): the program never ran.
-#[cfg(target_os = "macos")]
-const REFUSED_BY_EXEC_ONLY: [i32; 10] = [
-    libc::E2BIG,
-    libc::EACCES,
-    libc::EBADARCH,
-    libc::EIO,
-    libc::ELOOP,
-    libc::ENAMETOOLONG,
-    libc::ENOENT,
-    libc::ENOEXEC,
-    libc::ENOTDIR,
-    libc::ETXTBSY,
-];
+/// A reported child is a running one whatever the cause says: only an unreported child (`id: None`) can be a failed
+/// exec. ENOTDIR is on macOS's refusal list, ENOENT on neither list.
+#[skuld::test]
+fn a_reported_child_keeps_the_cosca_text_whatever_the_cause() {
+    for errno in [libc::ENOTDIR, libc::ENOENT] {
+        let fate = ChildFate::Running {
+            id: Some(cosca::identity::ProcessId::current()),
+        };
+        let error = may_have_started_from(fate, false, std::io::Error::from_raw_os_error(errno));
+        assert_eq!(spawn_failure_text(&error), error.to_string(), "errno {errno}");
+    }
+}
 
-/// Errnos that tokio's or cosca's steps after a successful spawn can return (`kevent`: ENOMEM, EFAULT, EINVAL, EBADF, ENOTSUP;
-/// `fcntl`: EBADF, EPERM; `sigaction`: EFAULT, EINVAL) or that no exec documents (EPERM, EAGAIN, EMFILE, ENFILE): the
-/// program may be running, or nothing says it is not.
+/// Errnos that do not prove the program never ran: each is documented by `kevent(2)`, `fcntl(2)` or `sigaction(2)`,
+/// which tokio calls after a successful spawn, or by no exec page at all. Written out by hand from the man pages.
 #[cfg(target_os = "macos")]
-const NOT_PROVABLY_UNSTARTED: [i32; 9] = [
-    libc::ENOMEM,
-    libc::EFAULT,
-    libc::EINVAL,
-    libc::EBADF,
-    libc::EPERM,
+const NOT_PROVABLY_UNSTARTED: [i32; 19] = [
+    libc::EACCES,
     libc::EAGAIN,
+    libc::EBADF,
+    libc::EDEADLK,
+    libc::EFAULT,
+    libc::EFBIG,
+    libc::EINTR,
+    libc::EINVAL,
     libc::EMFILE,
     libc::ENFILE,
+    libc::ENOENT,
+    libc::ENOLCK,
+    libc::ENOMEM,
+    libc::ENOSPC,
     libc::ENOTSUP,
+    libc::EOVERFLOW,
+    libc::EPERM,
+    libc::ESRCH,
+    libc::EXDEV,
 ];
 
 #[cfg(target_os = "macos")]
@@ -228,7 +268,8 @@ fn an_elevation_backend_keeps_the_cosca_text() {
 fn a_child_that_is_gone_reports_only_the_cause() {
     for fate in [ChildFate::Reaped, ChildFate::Killed, ChildFate::Gone] {
         let text = spawn_failure_text(&may_have_started(fate, false));
-        assert!(text.contains("No such file or directory"), "{fate:?}: {text}");
+        let os_error = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+        assert!(text.contains(&os_error), "{fate:?}: {text}");
         assert!(!text.contains("may have started"), "{fate:?}: {text}");
     }
 }
