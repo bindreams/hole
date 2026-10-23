@@ -11,27 +11,22 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 /// Build (or rebuild) the galoshes binary in release mode. Assumes the
 /// ex-ray binary has already been produced at
 /// `<repo>/.cache/ex-ray/` by [`super::ex_ray::build`] (which
 /// is what `cargo xtask deps` does just before calling this).
 pub fn build(repo_root: &Path) -> Result<PathBuf> {
-    let args = build_args(std::env::var_os("HOLE_CRASH_DUMPS").is_some(), cfg!(windows));
-    let mut cmd = Command::new("cargo");
-    let status = cmd
-        .args(&args)
-        .current_dir(repo_root)
-        .status()
-        .context("failed to run `cargo build -p galoshes`")?;
+    // Fetch the crate sources first, so a network loss retries here instead of failing the build.
+    let mut fetch = Command::new("cargo");
+    fetch.args(["fetch", "--locked"]).current_dir(repo_root);
+    crate::retry::until_ok("cargo fetch", || crate::command::run_inherited(&mut fetch))?;
 
-    if !status.success() {
-        bail!(
-            "`cargo build -p galoshes` failed with exit code {}",
-            status.code().unwrap_or(-1)
-        );
-    }
+    let args = build_args(std::env::var_os("HOLE_CRASH_DUMPS").is_some(), cfg!(windows));
+    let mut build = Command::new("cargo");
+    build.args(&args).current_dir(repo_root);
+    crate::command::run_inherited(&mut build)?;
 
     let exe_suffix = if cfg!(windows) { ".exe" } else { "" };
     let binary = repo_root

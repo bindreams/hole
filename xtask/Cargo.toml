@@ -39,6 +39,8 @@ payload-archive = { path = "../crates/payload-archive" } # `update-archive` pack
 # (linux/darwin) archives, so we need both `zip` and `flate2`+`tar`.
 sha2 = "0.11"
 ureq = "3"
+# `retry::until_ok`: provisioning fetches retry until they succeed (#1067). Blocking sleep only.
+backon = { version = "1.6", default-features = false, features = ["std", "std-blocking-sleep"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"

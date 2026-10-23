@@ -78,6 +78,12 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=releases/${{ inputs.track }}/v${V}" >> "$GITHUB_OUTPUT"
 
+      # Only `.github/scripts` (retry.sh) is needed from the repository.
+      - uses: actions/checkout@v7
+        if: ${{ !inputs.dry-run }}
+        with:
+          sparse-checkout: .github/scripts
+
       # dry-run branch: checkout, install Rust, run dry-run, exit.
       # No draft verification, no crates.io publish, no GitHub release edit.
       - uses: actions/checkout@v7
@@ -87,6 +93,10 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         if: ${{ inputs.dry-run && inputs.crates-publish }}
+
+      - name: Fetch crate sources
+        if: ${{ inputs.dry-run && inputs.crates-publish }}
+        run: .github/scripts/retry.sh cargo fetch --locked
 
       - name: Run cargo publish --dry-run
         if: ${{ inputs.dry-run && inputs.crates-publish }}
@@ -116,12 +126,12 @@ jobs:
 
       - name: Download verification files
         if: ${{ !inputs.dry-run && inputs.verify-signature }}
-        run: gh release download "${{ steps.version.outputs.tag }}" --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
+        run: .github/scripts/retry.sh gh release download "${{ steps.version.outputs.tag }}" --clobber --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
 
       - name: Install minisign
         if: ${{ !inputs.dry-run && inputs.verify-signature }}
         run: |
-          curl -sL -o minisign.tar.gz https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
+          .github/scripts/retry.sh curl -fsSL -o minisign.tar.gz https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
           tar xzf minisign.tar.gz
           install minisign-linux/x86_64/minisign /usr/local/bin/minisign
           rm -rf minisign.tar.gz minisign-linux
@@ -157,6 +167,10 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}
+
+      - name: Fetch crate sources
+        if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}
+        run: .github/scripts/retry.sh cargo fetch --locked
 
       - name: Publish to crates.io
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}

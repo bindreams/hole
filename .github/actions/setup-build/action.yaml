@@ -50,6 +50,12 @@ runs:
 
     - uses: mozilla-actions/sccache-action@v0.0.11
 
+    # Compiling `xtask` below fetches crates, so a network loss would fail it
+    # with no product defect behind it; `retry.sh` waits for the network.
+    - name: Fetch crate sources
+      shell: bash
+      run: .github/scripts/retry.sh cargo fetch --locked
+
     - name: Fetch runtime deps (ex-ray, wintun)
       shell: bash
       run: cargo xtask deps

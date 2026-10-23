@@ -47,7 +47,7 @@ jobs:
           token: ${{ steps.nathan.outputs.token }}
 
       - name: Ensure origin/main is available
-        run: git fetch origin main --quiet
+        run: .github/scripts/retry.sh git fetch origin main --quiet
 
       - uses: ./.github/actions/setup-rust
 
@@ -62,7 +62,7 @@ jobs:
       # workflow's fixup logic targets.
       - name: Install git-subrepo 0.4.9
         run: |
-          git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
+          .github/scripts/retry.sh git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
           echo "$RUNNER_TEMP/git-subrepo/lib" >> "$GITHUB_PATH"
 
       - name: Determine dep + tag
@@ -114,6 +114,9 @@ jobs:
           branch="vendor-bump-manual/${{ steps.target.outputs.dep }}-${{ steps.target.outputs.tag }}-${{ github.run_id }}"
           git checkout -b "$branch"
           echo "ref_name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch crate sources
+        run: .github/scripts/retry.sh cargo fetch --locked
 
       - name: git identity
         run: |

@@ -114,6 +114,46 @@ pub(crate) fn detect_primary_ipv4() -> Result<Ipv4Addr, String> {
     }
 }
 
+/// How long to wait between two reads of the kernel's route while it has none.
+/// Pacing for an external event; every round re-reads the real condition.
+const ROUTE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// [`detect_primary_ipv4`], waiting until the host has a usable off-link route.
+///
+/// A CI runner can lose its network for a minute, and the kernel then answers
+/// `Network is unreachable`: the environment, not the test. There is no cap; the
+/// test's own nextest timeout is the bound, and each change of the kernel's
+/// answer is logged while it waits.
+pub(crate) fn wait_for_primary_ipv4() -> Ipv4Addr {
+    wait_for_primary_ipv4_with(detect_primary_ipv4, || std::thread::sleep(ROUTE_POLL_INTERVAL))
+}
+
+pub(crate) fn wait_for_primary_ipv4_with(
+    mut detect: impl FnMut() -> Result<Ipv4Addr, String>,
+    mut pause: impl FnMut(),
+) -> Ipv4Addr {
+    let mut last_logged: Option<String> = None;
+    loop {
+        match detect() {
+            Ok(ip) => {
+                if last_logged.is_some() {
+                    tracing::info!("the host has a primary IPv4 route again: {ip}");
+                }
+                return ip;
+            }
+            Err(why) => {
+                if last_logged.as_ref() != Some(&why) {
+                    tracing::warn!(
+                        "waiting for the host to have a primary IPv4 route ({why}); this is the environment, not Hole"
+                    );
+                    last_logged = Some(why);
+                }
+                pause();
+            }
+        }
+    }
+}
+
 // Unowned probe destinations ==========================================================================================
 
 /// IPv4 transit-oracle destination: `203.0.113.9`, RFC 5737 TEST-NET-3,

@@ -26,6 +26,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-rust
+      - run: .github/scripts/retry.sh cargo fetch --locked
       - run: cargo publish --dry-run -p garter
 
   draft:

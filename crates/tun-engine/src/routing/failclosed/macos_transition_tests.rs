@@ -385,13 +385,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // sync sleep or a poll on state this test controls.
     let connect = |addr: &str, timeout: Duration| TcpStream::connect_timeout(&addr.parse().unwrap(), timeout);
 
-    let baseline = connect(NON_PERMITTED, SETTLED_TIMEOUT);
-    assert!(
-        baseline.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach \
-         {NON_PERMITTED}: {:?}",
-        baseline.err().map(|e| e.kind()),
-    );
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[NON_PERMITTED]);
 
     // One `state_dir` for the whole run: each engage's persist-before-mutate
     // save overwrites the previous cover's state file with its own token
@@ -702,11 +696,10 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
 
     // The last cover's normal Drop restores /etc/pf.conf.
     drop(held.take());
-    let restored = connect(NON_PERMITTED, SETTLED_TIMEOUT);
-    assert!(
-        restored.is_ok(),
-        "final disengage must restore egress: {NON_PERMITTED}={:?}",
-        restored.err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "final disengage must restore egress",
+        &[NON_PERMITTED],
+        &format!("{SERVER_A}:443"),
     );
 }
 
@@ -800,8 +793,9 @@ fn macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage() {
 
     // 2. Establish the flow the cover must kill, and HOLD it open — a closed
     //    socket's state would drain on its own and prove nothing.
+    hole_test_observability::egress::wait_for_egress("pre-cover flow", &[NON_PERMITTED]);
     let _flow = TcpStream::connect_timeout(&NON_PERMITTED.parse().unwrap(), SETTLED_TIMEOUT)
-        .unwrap_or_else(|e| panic!("NETWORK/ENVIRONMENT problem (not the cover): must reach {NON_PERMITTED}: {e:?}"));
+        .unwrap_or_else(|e| panic!("could not open the flow the cover must kill to {NON_PERMITTED}: {e:?}"));
     assert!(
         states().contains(NON_PERMITTED_IP),
         "PRECONDITION: pf must hold a state entry for the flow before the cover engages, or this \

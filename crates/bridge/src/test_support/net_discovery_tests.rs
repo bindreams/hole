@@ -32,6 +32,8 @@ fn unowned_dsts_are_not_addresses_this_host_holds() {
 /// test in the binary.
 #[skuld::test(serial = TUN)]
 fn primary_ipv4_target_is_an_address_this_host_holds() {
+    // The route can be missing while the runner's network settles; read the snapshot once it is back.
+    wait_for_primary_ipv4();
     let host = HostNetwork::read().expect("read host network state");
     let primary = IpAddr::V4(host.primary_ipv4().expect("detect primary IPv4"));
     assert!(
@@ -39,4 +41,25 @@ fn primary_ipv4_target_is_an_address_this_host_holds() {
         "the host must hold its own primary IPv4 {primary}; if the ownership scan cannot see it, \
          every assertion built on assert_host_does_not_own is unsound"
     );
+}
+
+/// A runner that briefly has no route reports `Network is unreachable`; that is
+/// the environment, so the wait re-reads the kernel until it names an address.
+#[skuld::test]
+fn waiting_for_the_primary_ipv4_outlasts_a_lost_route() {
+    let mut reads = 0;
+    let mut pauses = 0;
+    let found = wait_for_primary_ipv4_with(
+        || {
+            reads += 1;
+            if reads <= 3 {
+                Err("Network is unreachable (os error 101)".to_string())
+            } else {
+                Ok(Ipv4Addr::new(10, 0, 0, 7))
+            }
+        },
+        || pauses += 1,
+    );
+    assert_eq!(found, Ipv4Addr::new(10, 0, 0, 7));
+    assert_eq!(pauses, 3, "one pause per failed read");
 }

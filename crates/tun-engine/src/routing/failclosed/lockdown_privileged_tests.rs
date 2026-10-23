@@ -114,15 +114,7 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
     // Baseline (PRE-cover): both hosts must be reachable. A failure here is a
     // network/reachability problem, not the cover — fail loud and self-validate the
     // probe so a network blip is never a false pass.
-    let base_permitted = connect(PERMITTED);
-    let base_non = connect(NON_PERMITTED);
-    assert!(
-        base_permitted.is_ok() && base_non.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        base_permitted.err().map(|e| e.kind()),
-        base_non.err().map(|e| e.kind()),
-    );
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED]);
 
     // Pre-engage, the OS must report a clean host. This is the assertion that
     // would have caught `lockdown_cover_present`'s hardcoded `true` — the value
@@ -170,10 +162,10 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 
     // Drop sweeps the lockdown filters (kind-aware Cover Drop); egress restored.
     drop(cover);
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "disengage must restore egress to the previously-blocked host",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
     assert_eq!(
         super::lockdown_cover_presence(dir.path()),
@@ -217,15 +209,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     // Baseline (PRE-cover): both hosts must be reachable. A failure here is a
     // network/reachability problem, not the cover — fail loud and self-validate the
     // probe so a network blip is never a false pass.
-    let base_permitted = connect(PERMITTED);
-    let base_non = connect(NON_PERMITTED);
-    assert!(
-        base_permitted.is_ok() && base_non.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        base_permitted.err().map(|e| e.kind()),
-        base_non.err().map(|e| e.kind()),
-    );
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED]);
 
     assert_eq!(
         super::lockdown_cover_presence(dir.path()),
@@ -289,10 +273,10 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         !String::from_utf8_lossy(&after.stdout).contains("block drop out quick all"),
         "snapshot restore must remove our lockdown block rule"
     );
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "disengage must restore egress to the previously-blocked host",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
     // Exercises BOTH halves of the fold: the label is gone from pf AND
     // `disengage_lockdown` cleared the state file.
@@ -336,15 +320,7 @@ fn a_simulated_reboot_rearms_the_cover() {
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    let base_permitted = connect(PERMITTED);
-    let base_non = connect(NON_PERMITTED);
-    assert!(
-        base_permitted.is_ok() && base_non.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        base_permitted.err().map(|e| e.kind()),
-        base_non.err().map(|e| e.kind()),
-    );
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED]);
 
     // First engage: FreshEnable (no persisted state yet).
     let cover = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
@@ -387,9 +363,10 @@ fn a_simulated_reboot_rearms_the_cover() {
         !super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info.stdout)),
         "the simulated reboot must actually leave pf disabled"
     );
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "the simulated reboot must actually reopen egress, else re-blocking it below proves nothing new"
+    hole_test_observability::egress::assert_egress_restored(
+        "the simulated reboot must actually reopen egress, else re-blocking it below proves nothing new",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 
     // The production sequence startup takes: recovery measures presence and
@@ -430,9 +407,10 @@ fn a_simulated_reboot_rearms_the_cover() {
     // doc. No manual cleanup is needed.
     drop(rearmed);
     drop(cover);
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "the final disengage must restore egress to the previously-blocked host"
+    hole_test_observability::egress::assert_egress_restored(
+        "the final disengage must restore egress to the previously-blocked host",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }
 
@@ -456,14 +434,7 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
 
     // Baseline (PRE-cover): both hosts reachable — self-validates the probe so a
     // network blip is never a false pass.
-    let (bp, bn) = (connect(PERMITTED), connect(NON_PERMITTED));
-    assert!(
-        bp.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        bp.err().map(|e| e.kind()),
-        bn.err().map(|e| e.kind()),
-    );
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED]);
 
     let cover = engage(server_ip, None, dir.path(), None).expect("engage real WFP transient cover");
 
@@ -479,10 +450,10 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
     );
 
     drop(cover);
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "disengage must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "disengage must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }
 
@@ -504,20 +475,9 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    let (bp, br, bpo, bn) = (
-        connect(PERMITTED),
-        connect(RESOLVER),
-        connect(RESOLVER_OTHER_PORT),
-        connect(NON_PERMITTED),
-    );
-    assert!(
-        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
-         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
-        bp.err().map(|e| e.kind()),
-        br.err().map(|e| e.kind()),
-        bpo.err().map(|e| e.kind()),
-        bn.err().map(|e| e.kind()),
+    hole_test_observability::egress::wait_for_egress(
+        "pre-cover baseline",
+        &[PERMITTED, RESOLVER, RESOLVER_OTHER_PORT, NON_PERMITTED],
     );
 
     let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
@@ -553,12 +513,10 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
     );
 
     drop(cover);
-    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
-    assert!(
-        rn.is_ok() && rpo.is_ok(),
-        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
-        rn.err().map(|e| e.kind()),
-        rpo.err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "disengage must restore egress",
+        &[NON_PERMITTED, RESOLVER_OTHER_PORT],
+        PERMITTED,
     );
 }
 
@@ -577,14 +535,7 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    let (bp, bn) = (connect(PERMITTED), connect(NON_PERMITTED));
-    assert!(
-        bp.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        bp.err().map(|e| e.kind()),
-        bn.err().map(|e| e.kind()),
-    );
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED]);
 
     let cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
 
@@ -609,10 +560,10 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
 
     // (c) Drop restores /etc/pf.conf: egress restored.
     drop(cover);
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "disengage must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "disengage must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }
 
@@ -631,20 +582,9 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    let (bp, br, bpo, bn) = (
-        connect(PERMITTED),
-        connect(RESOLVER),
-        connect(RESOLVER_OTHER_PORT),
-        connect(NON_PERMITTED),
-    );
-    assert!(
-        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
-         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
-        bp.err().map(|e| e.kind()),
-        br.err().map(|e| e.kind()),
-        bpo.err().map(|e| e.kind()),
-        bn.err().map(|e| e.kind()),
+    hole_test_observability::egress::wait_for_egress(
+        "pre-cover baseline",
+        &[PERMITTED, RESOLVER, RESOLVER_OTHER_PORT, NON_PERMITTED],
     );
 
     let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
@@ -687,11 +627,9 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
     );
 
     drop(cover);
-    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
-    assert!(
-        rn.is_ok() && rpo.is_ok(),
-        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
-        rn.err().map(|e| e.kind()),
-        rpo.err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "disengage must restore egress",
+        &[NON_PERMITTED, RESOLVER_OTHER_PORT],
+        PERMITTED,
     );
 }

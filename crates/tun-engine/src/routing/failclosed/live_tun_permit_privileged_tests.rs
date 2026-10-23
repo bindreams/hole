@@ -754,9 +754,10 @@ fn run_live_tun_permit_core(
         let mut seen4 = Vec::new();
         let restored = dev1.capture(Duration::from_secs(5), &mut seen4, udp_matches(5)).await;
         assert!(restored, "restore: probe must surface with no cover engaged; seen={seen4:?}");
-        assert!(
-            TcpStream::connect_timeout(&NON_PERMITTED.parse().unwrap(), Duration::from_secs(5)).is_ok(),
-            "restore: {NON_PERMITTED} must be reachable again — the box was left open"
+        hole_test_observability::egress::assert_egress_restored(
+            "restore: the box must be left open",
+            &[NON_PERMITTED],
+            &format!("{SERVER_IP}:443"),
         );
 
         platform_pin(guard.state_dir());

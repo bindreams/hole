@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 
 /// Returns the platform-specific output filename matching what shadowsocks-rust
 /// expects and what `crates/galoshes/build.rs` reads via
@@ -32,20 +32,24 @@ pub fn build(repo_root: &Path) -> Result<PathBuf> {
 
     std::fs::create_dir_all(&output_dir).with_context(|| format!("failed to create {}", output_dir.display()))?;
 
-    let status = Command::new("go")
+    // Fetch the modules first, so a network loss retries here instead of failing the build.
+    let mut download = Command::new("go");
+    download.args(["mod", "download"]).current_dir(&source_dir);
+    crate::retry::until_ok("go mod download (ex-ray)", || run_go(&mut download))?;
+
+    let mut build = Command::new("go");
+    build
         .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
         .arg(&output_path)
         .arg(".")
         .current_dir(&source_dir)
-        .env("CGO_ENABLED", "0")
-        .status();
+        .env("CGO_ENABLED", "0");
+    run_go(&mut build)?;
+    Ok(output_path)
+}
 
-    match status {
-        Ok(s) if s.success() => Ok(output_path),
-        Ok(s) => bail!("go build failed with exit code {}", s.code().unwrap_or(-1)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(anyhow!("Go toolchain not found. Install from https://go.dev/dl/"))
-        }
-        Err(e) => Err(anyhow!("failed to run go build: {e}")),
-    }
+/// Run a `go` command, saying "Go toolchain not found" when there is none.
+pub(crate) fn run_go(cmd: &mut Command) -> Result<()> {
+    crate::command::run_inherited(cmd)
+        .map_err(|e| crate::command::hint_if_not_found(e, "Go toolchain not found. Install from https://go.dev/dl/"))
 }

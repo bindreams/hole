@@ -90,15 +90,7 @@ fn connect(addr: &str) -> std::io::Result<std::net::TcpStream> {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn assert_baseline_reachable() {
-    let base_permitted = connect(PERMITTED);
-    let base_non = connect(NON_PERMITTED);
-    assert!(
-        base_permitted.is_ok() && base_non.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        base_permitted.err().map(|e| e.kind()),
-        base_non.err().map(|e| e.kind()),
-    );
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED]);
 }
 
 // windows_release_all_clears_a_stranded_lockdown_cover / macos counterpart ============================================
@@ -131,10 +123,10 @@ fn windows_release_all_clears_a_stranded_lockdown_cover() {
         .release_all_covers()
         .expect("release_all_covers must clear the stranded lockdown cover");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "release_all_covers must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }
 
@@ -162,10 +154,10 @@ fn macos_release_all_clears_a_stranded_lockdown_cover() {
         .release_all_covers()
         .expect("release_all_covers must clear the stranded lockdown cover");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "release_all_covers must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
     let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
     assert!(
@@ -204,10 +196,10 @@ fn windows_release_all_clears_a_stranded_transient_cover() {
         .release_all_covers()
         .expect("release_all_covers must clear the stranded transient cover");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "release_all_covers must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }
 
@@ -235,10 +227,10 @@ fn macos_release_all_clears_a_stranded_transient_cover() {
         .release_all_covers()
         .expect("release_all_covers must clear the stranded transient cover");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "release_all_covers must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
     assert!(
         !dir.path().join(super::failclosed_state::STATE_FILE_NAME).exists(),
@@ -280,10 +272,10 @@ fn windows_release_all_clears_both_stranded_covers() {
         .release_all_covers()
         .expect("release_all_covers must clear both stranded covers in one call");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "release_all_covers must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }
 
@@ -315,10 +307,10 @@ fn macos_release_all_clears_both_stranded_covers() {
         .release_all_covers()
         .expect("release_all_covers must clear both stranded covers in one call");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "release_all_covers must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
     assert!(!dir.path().join(super::lockdown_pf_state::STATE_FILE_NAME).exists());
     assert!(!dir.path().join(super::failclosed_state::STATE_FILE_NAME).exists());
@@ -338,10 +330,10 @@ fn windows_release_all_on_a_clean_host_is_ok() {
     // ambient policy): reachability is the only local signal available.
     routing.release_all_covers().expect("a clean host must return Ok");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "a clean host's reachability must be unaffected: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "a clean host's reachability must be unaffected",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
     assert_eq!(
         super::lockdown_cover_presence(dir.path()),
@@ -426,10 +418,10 @@ fn macos_release_all_on_a_clean_host_is_ok() {
         enabled_before, enabled_after,
         "a clean host's pf-enabled flag must be unaffected"
     );
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "a clean host's reachability must be unaffected: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "a clean host's reachability must be unaffected",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }
 
@@ -458,10 +450,10 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
         .release_all_covers()
         .expect("an unreadable state file must still be treated as a cover to clear");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress even with an unreadable state file: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "release_all_covers must restore egress even with an unreadable state file",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }
 
@@ -522,7 +514,11 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
 
     crate::routing::failclosed::recover_cover(dir.path(), false);
 
-    let restored = connect(NON_PERMITTED);
+    let restored = hole_test_observability::egress::check_egress_restored(
+        "recover_cover must restore egress even with an unreadable state file",
+        &[NON_PERMITTED],
+        PERMITTED,
+    );
 
     // Safety net, not the balance: the sweep salvages the `pf_token` out of
     // the unusable record itself (`StateFile::unusable`) and drops it, so this
@@ -532,11 +528,9 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     // the measurement, so it can neither mask nor cause the verdict.
     let _ = SystemTool::Pfctl.command().unwrap().args(["-X", &token]).output();
 
-    assert!(
-        restored.is_ok(),
-        "recover_cover must restore egress even with an unreadable state file: {NON_PERMITTED}={:?}",
-        restored.err().map(|e| e.kind()),
-    );
+    if let Err(why) = restored {
+        panic!("{why}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -568,9 +562,9 @@ fn macos_release_all_falls_back_when_the_snapshot_will_not_load() {
         .release_all_covers()
         .expect("a snapshot that will not load must fall back to the default ruleset");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress via the fallback: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    hole_test_observability::egress::assert_egress_restored(
+        "release_all_covers must restore egress via the fallback",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }

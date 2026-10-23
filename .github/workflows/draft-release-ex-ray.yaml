@@ -40,6 +40,9 @@ jobs:
       - name: Create local tag for build
         run: git tag "releases/ex-ray/v${{ steps.version.outputs.version }}"
 
+      - name: Fetch crate sources
+        run: .github/scripts/retry.sh cargo fetch --locked
+
       - name: Validate version.toml matches version
         run: cargo xtask version --check --exact --group ex-ray
 
@@ -70,6 +73,10 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: crates/ex-ray/go.mod
+
+      - name: Fetch crate sources
+        shell: bash
+        run: .github/scripts/retry.sh cargo fetch --locked
 
       - name: Build ex-ray (native)
         shell: bash
@@ -144,6 +151,8 @@ jobs:
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
           TAG="releases/ex-ray/v${VERSION}"
+          # Fetch the script's dependencies under retry; retrying the run would retry a script error.
+          source/.github/scripts/retry.sh uv run source/scripts/generate-release-notes.py --help
           uv run source/scripts/generate-release-notes.py ex-ray \
             --new-tag "$TAG" \
             --head "${{ github.sha }}" \

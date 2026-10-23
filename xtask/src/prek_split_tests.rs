@@ -120,6 +120,35 @@ fn both_runs_are_derived_from_the_one_list() {
     );
 }
 
+/// The fetch of hook repositories and environments is retried on its own, over
+/// the same hooks the run covers: retrying the run would retry a lint failure.
+#[skuld::test]
+fn the_prepare_calls_cover_the_hooks_each_run_covers() {
+    let s = split(r#"platform-dependent = ["go-lint", "inline-a"]"#).unwrap();
+    assert_eq!(
+        s.portable_prepare_args(),
+        [
+            "install-hooks",
+            "--skip",
+            "cargo-clippy",
+            "--skip",
+            "go-lint",
+            "--skip",
+            "inline-a"
+        ]
+    );
+    assert_eq!(
+        s.platform_dependent_prepare_args().unwrap(),
+        ["install-hooks", "go-lint", "inline-a"]
+    );
+    assert_eq!(
+        split("platform-dependent = []")
+            .unwrap()
+            .platform_dependent_prepare_args(),
+        None
+    );
+}
+
 /// The portable run skips `cargo-clippy` by id. If prek.toml renames or drops it,
 /// that skip would be stale: clippy would run a second time in the portable step
 /// or prek would ignore the unknown id, depending on prek.

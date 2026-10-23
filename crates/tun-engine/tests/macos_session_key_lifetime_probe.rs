@@ -122,6 +122,10 @@ mod macos_impl {
     const LIFETIME_PROBE_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 60);
     const KILLED_PROCESS_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 61);
 
+    /// A host the runner reaches while its network is up; a failing probe of it means the network is
+    /// gone, which takes the runner's own resolvers with it.
+    const NETWORK_CONTROL: &str = "1.1.1.1:443";
+
     const DNS_CONFIG_NOTIFY_KEY: &str = "com.apple.system.SystemConfiguration.dns_configuration";
 
     fn budget(secs: u64) -> Instant {
@@ -355,8 +359,18 @@ mod macos_impl {
         drop(store);
 
         let unmerged = notify.settle(budget(30), &resolver_str, false);
-        let after_dns = scutil_dns();
-        let after_nameservers = nameservers(&after_dns);
+        // The runner's own resolvers vanish when its network does; a reading taken then says nothing about
+        // whether the probe left them alone, so it is retaken once the network answers.
+        let (after_dns, after_nameservers) = hole_test_observability::egress::read_until_network_agrees(
+            "lifetime probe: the resolver set after the drop",
+            NETWORK_CONTROL,
+            || {
+                let dns = scutil_dns();
+                let servers = nameservers(&dns);
+                (dns, servers)
+            },
+            |(_, servers)| *servers == before_nameservers,
+        );
         println!("[lifetime-probe] after drop (unmerged={unmerged}):\n{after_dns}");
 
         println!(
@@ -472,8 +486,18 @@ mod macos_impl {
         println!("[killed-process-probe] holder child exit status: {status:?}");
 
         let unmerged = notify.settle(budget(30), &resolver_str, false);
-        let after_dns = scutil_dns();
-        let after_nameservers = nameservers(&after_dns);
+        // The runner's own resolvers vanish when its network does; a reading taken then says nothing about
+        // whether the probe left them alone, so it is retaken once the network answers.
+        let (after_dns, after_nameservers) = hole_test_observability::egress::read_until_network_agrees(
+            "killed-process probe: the resolver set after SIGKILL",
+            NETWORK_CONTROL,
+            || {
+                let dns = scutil_dns();
+                let servers = nameservers(&dns);
+                (dns, servers)
+            },
+            |(_, servers)| *servers == before_nameservers,
+        );
         println!("[killed-process-probe] after SIGKILL (unmerged={unmerged}):\n{after_dns}");
 
         let mut stderr = String::new();

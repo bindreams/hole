@@ -13,7 +13,7 @@
 //!
 //! `Drop` aborts the echo task.
 
-use crate::test_support::net_discovery::detect_primary_ipv4;
+use crate::test_support::net_discovery::wait_for_primary_ipv4;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -28,7 +28,10 @@ pub struct UdpEchoServer {
 impl UdpEchoServer {
     /// Bind `0.0.0.0:0` and report the host's primary non-loopback IPv4.
     pub async fn start() -> std::io::Result<Self> {
-        let primary = detect_primary_ipv4().map_err(std::io::Error::other)?;
+        // Blocking waits belong off the async executor.
+        let primary = tokio::task::spawn_blocking(wait_for_primary_ipv4)
+            .await
+            .map_err(std::io::Error::other)?;
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
         let port = sock.local_addr()?.port();
         let reported = SocketAddr::from((primary, port));

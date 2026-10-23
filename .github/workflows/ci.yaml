@@ -120,7 +120,7 @@ jobs:
           # back to `cargo install`, which fails because nextest's
           # `locked-tripwire` crate requires --locked.
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo binstall --no-confirm --locked cargo-nextest
+        run: .github/scripts/retry.sh cargo binstall --no-confirm --locked cargo-nextest
 
       # `package(xtask)` (run on every leg) drives a real `prek` hook through
       # `pull_subrepo`/`finish_vendor_bump`, and per this repo's policy those
@@ -129,7 +129,7 @@ jobs:
         name: Install prek
         timeout-minutes: 5
         shell: bash
-        run: uv tool install prek
+        run: .github/scripts/retry.sh uv tool install prek
 
       # macOS runners ship only Apple's frozen Bash 3.2.57 on /usr/bin/bash,
       # ahead of Homebrew's on PATH; git-subrepo's `#!/usr/bin/env bash`
@@ -140,7 +140,7 @@ jobs:
         if: ${{ matrix.os == 'darwin' }}
         timeout-minutes: 5
         shell: bash
-        run: brew install bash
+        run: .github/scripts/retry.sh brew install bash
 
       # The last provisioning step: every later step requires its success, so a
       # broken VM fails once instead of once per lane.
@@ -149,7 +149,7 @@ jobs:
         timeout-minutes: 5
         shell: bash
         run: |
-          git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
+          .github/scripts/retry.sh git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
           echo "$RUNNER_TEMP/git-subrepo/lib" >> "$GITHUB_PATH"
 
       # Lint ===========================================================================================================
@@ -171,7 +171,11 @@ jobs:
         if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.portable-lint == true }}
         timeout-minutes: 5
         shell: bash
-        run: uv run --with pytest --with PyYAML --with pathspec pytest -o python_files="*.py" scripts/
+        run: |
+          # Fetch the test dependencies under retry; retrying the run would retry a test failure.
+          with=(--with pytest --with PyYAML --with pathspec)
+          .github/scripts/retry.sh uv run "${with[@]}" python -c ""
+          uv run "${with[@]}" pytest -o python_files="*.py" scripts/
 
       - id: lint-platform-dependent
         name: Lint (hooks that depend on the host)
@@ -354,7 +358,13 @@ jobs:
         timeout-minutes: 5
         shell: pwsh
         working-directory: msi-installer
-        run: uv run --group dev pytest -v
+        run: |
+          # Fetch the test dependencies under retry; retrying the run would retry a test failure.
+          & ../.github/scripts/retry.ps1 -What 'uv sync (msi-installer)' -Script {
+            uv sync --group dev
+            if ($LASTEXITCODE -ne 0) { throw "uv sync exited with $LASTEXITCODE" }
+          }
+          uv run --group dev pytest -v
 
       - id: installer-build-msi
         name: Build MSI
@@ -379,8 +389,8 @@ jobs:
         name: Install tauri-driver
         if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
         timeout-minutes: 5
-        shell: pwsh
-        run: cargo install --locked --version 2.0.6 tauri-driver
+        shell: bash
+        run: .github/scripts/retry.sh cargo install --locked --version 2.0.6 tauri-driver
 
       # tauri-driver speaks to WebView2 via Microsoft Edge's WebDriver. The
       # runner's bundled msedgedriver (`$EDGEWEBDRIVER`) targets the Edge BROWSER
@@ -401,7 +411,7 @@ jobs:
           $url = "https://msedgedriver.microsoft.com/$webview2/edgedriver_win64.zip"
           $zip = "$env:RUNNER_TEMP\edgedriver.zip"
           $out = "$env:RUNNER_TEMP\edgedriver"
-          Invoke-WebRequest -Uri $url -OutFile $zip
+          & .github/scripts/retry.ps1 -What 'download msedgedriver' -Script { Invoke-WebRequest -Uri $url -OutFile $zip }
           Expand-Archive -Path $zip -DestinationPath $out -Force
           Add-Content -Path $env:GITHUB_PATH -Value $out
 
@@ -421,7 +431,8 @@ jobs:
         run: |
           $zip = "$env:RUNNER_TEMP\gsudo.zip"
           $dir = "$env:RUNNER_TEMP\gsudo"
-          Invoke-WebRequest -Uri "https://github.com/gerardog/gsudo/releases/download/v$env:GSUDO_VERSION/gsudo.portable.zip" -OutFile $zip
+          $url = "https://github.com/gerardog/gsudo/releases/download/v$env:GSUDO_VERSION/gsudo.portable.zip"
+          & .github/scripts/retry.ps1 -What 'download gsudo' -Script { Invoke-WebRequest -Uri $url -OutFile $zip }
           Expand-Archive -Path $zip -DestinationPath $dir -Force
           $exe = "$dir\x64\gsudo.exe"
           if (-not (Test-Path $exe)) { throw "gsudo.exe not found at $exe after extract" }
@@ -966,7 +977,10 @@ jobs:
         if: ${{ !cancelled() && steps.setup-node-lts.outcome == 'success' }}
         timeout-minutes: 10
         shell: bash
-        run: npx --yes --package renovate renovate-config-validator --strict --no-global .github/renovate.json
+        run: |
+          # Fetch the validator under retry; retrying the run would retry a config error.
+          .github/scripts/retry.sh npx --yes --package renovate renovate-config-validator --version
+          npx --yes --package renovate renovate-config-validator --strict --no-global .github/renovate.json
 
       # Logs ============================================================================================================
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches files

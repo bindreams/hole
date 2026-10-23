@@ -2933,6 +2933,18 @@ and a rerun repeats the platform's whole job.
   `ProgramFiles(x86)`), runs under a real `cargo run`, and fails on any variable
   cargo started adding that is neither the parent's, stripped, nor on
   `KEPT_TOOLCHAIN` (`xtask/src/run_injected_env.rs`).
+- **Provisioning fetches retry until they succeed.** A runner that loses its
+  network for a minute must not fail a step with no product defect behind it.
+  Every download, clone, package or module fetch retries with no attempt cap
+  (the step's `timeout-minutes` is the bound) and prints each failure's cause:
+  `.github/scripts/retry.sh` for shell, `.github/scripts/retry.ps1` for
+  PowerShell, `xtask/src/retry.rs` (`retry::until_ok`) for xtask. Wrap only the
+  fetch, never a build or a test: a real failure would retry until the step
+  times out. Where the fetch and the work share a command (`uv run`, `prek run`,
+  `npx`), a fetch-only call runs first and fills the cache. A `uses:` action
+  that fetches (setup-\*, sccache, binstall, cache) cannot be wrapped, so it
+  keeps whatever retry the action has. `xtask/src/command.rs` names the command
+  and the status in a failed child's error.
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 
@@ -3020,6 +3032,15 @@ Spotlight "Hole" must reveal it.
   framework/job timeout is the failure-to-human signal). Use the codebase's
   rendezvous primitives (oneshot, `watch`, `WaitableWriter`, `CancellationToken`,
   `JoinHandle.await`, `tokio::time::pause/advance`) for intra-process sync (#383).
+- **A lost network is not a product defect** — a probe of real egress fails the
+  same way for a broken cover and for a runner whose network dropped. A
+  precondition (`egress::wait_for_egress`, `net_discovery::wait_for_primary_ipv4`)
+  waits until the network answers, with no cap and a log line per change of
+  state. A Hole assertion (`egress::assert_egress_restored`) probes a control
+  host the lifted cover never blocked: if that fails too the network is down and
+  the test waits and probes again; if only the target fails, twice, the block
+  outlived the cover. A comparison against the runner's own state (its resolver
+  set) is retaken once the network answers (`egress::read_until_network_agrees`).
 - **Every crate runs in CI** — the `every_workspace_crate_runs_in_ci` conformance
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test

@@ -113,7 +113,10 @@ targets:
     # Rust build — see the frontend-build note.
     depends: [galoshes, wintun, frontend-build]
     platforms: [windows/amd64]
-    build: uv run --directory msi-installer build
+    build:
+      # Fetch the Python dependencies under retry; retrying the build would retry a build error.
+      - .github/scripts/retry.sh uv sync --directory msi-installer
+      - uv run --directory msi-installer build
 
   hole-dmg:
     # Same logic as hole-msi: tauri does its own `cargo build --release`. No
@@ -124,6 +127,8 @@ targets:
     depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
     build:
+      # Fetch the Python dependencies under retry; retrying the build would retry a build error.
+      - .github/scripts/retry.sh uv sync --directory dmg-installer
       # The dSYM must come from the same link as the shipped binary: std's
       # backtrace symbolizer matches it by Mach-O UUID, and any second build of
       # `hole` links a different one. So tauri builds once (`--no-bundle`), the
@@ -176,7 +181,7 @@ targets:
     # satisfies `hole-msi`, darwin/{amd64,arm64} satisfies `hole-dmg`.
     platforms: [linux/amd64, windows/amd64, darwin/amd64, darwin/arm64]
     build:
-      - npm ci --no-audit --no-fund
+      - .github/scripts/retry.sh npm ci --no-audit --no-fund
       - npm run build
 
   # ===== Test targets =======================================================
@@ -402,6 +407,6 @@ targets:
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
-      - npm ci --no-audit --no-fund
+      - .github/scripts/retry.sh npm ci --no-audit --no-fund
       - npm run check
       - npm test

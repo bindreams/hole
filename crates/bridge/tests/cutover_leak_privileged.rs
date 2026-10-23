@@ -108,11 +108,8 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
     let server_ip: std::net::IpAddr = SERVER_IP.parse().unwrap();
 
     // Baseline (PRE-cover): both hosts reachable. A failure here is a network/
-    // environment problem, not the cover -- fail loud and self-validate the probe.
-    assert!(
-        connect(PERMITTED).is_ok() && connect(NON_PERMITTED).is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts"
-    );
+    // environment problem, not the cover -- wait for the network to answer.
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED]);
 
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
     let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path(), None)
@@ -148,8 +145,9 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
     lockdown_state::set_enabled(dir.path(), false, None).unwrap();
     let _clearance_has_no_reader_in_cleanup =
         disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "cleanup disengage must restore egress: {NON_PERMITTED}"
+    hole_test_observability::egress::assert_egress_restored(
+        "cleanup disengage must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
     );
 }
