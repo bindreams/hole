@@ -34,6 +34,8 @@ jobs:
       - name: Verify draft release exists
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          # Wait for the API to answer, then ask once: a missing release is the answer, not a lost network.
+          .github/scripts/retry.sh curl -fsS -o /dev/null https://api.github.com/zen
           IS_DRAFT=$(gh release view "$TAG" --json isDraft -q .isDraft)
           if [ "$IS_DRAFT" != "true" ]; then
             echo "::error::Release $TAG is not a draft"
