@@ -913,15 +913,16 @@ impl PluginTree for cosca::tokio::Child {
         self.wait_tree().await.map(|_| ())
     }
 
-    // cosca 0.3's job-object `wait_tree` future is `!Send` (it holds a raw `HANDLE` across its await), and
-    // `BinaryPlugin::run` must be `Send`. Until cosca's wait is `Send` (bindreams/hole#1124), every take-down on
-    // Windows takes the reader-wait fallback of `drain_readers_after_exit`.
+    // cosca's `kill_tree` closes the job handle, and a `wait_tree` after it answers `Unassessable`; the wait must be
+    // armed before the kill, but it borrows the child that `kill_tree` borrows mutably. Until cosca can drain a job
+    // after killing it (bindreams/hole#1124), every take-down on Windows takes the reader-wait fallback of
+    // `drain_readers_after_exit`.
     #[cfg(windows)]
     async fn wait_tree_drained(&self) -> Result<(), cosca::error::Error> {
         Err(cosca::error::Error::Unsupported {
             op: "wait_tree".into(),
             platform: "windows",
-            detail: "cosca 0.3's job-object wait_tree future is not Send".into(),
+            detail: "cosca closes the job handle on kill_tree, so the drain cannot be awaited after it".into(),
         })
     }
 
