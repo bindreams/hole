@@ -1,6 +1,7 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
+use util::dir::testing::as_unprivileged;
 
 const ME: u32 = 1000;
 const OWNER: u32 = 2001;
@@ -285,17 +286,27 @@ fn a_directory_swapped_for_a_symlink_after_the_open_is_not_followed() {
 
 // A directory above the lock that the caller can search but not read --------------------------------------------------
 
+/// Gives a directory its mode back when dropped, so the temp dir can be removed whatever an assertion says.
+struct Restore(std::path::PathBuf);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 #[skuld::test]
 fn a_lock_below_a_directory_the_caller_can_only_search_is_acquired() {
     let tmp = tempfile::tempdir().unwrap();
     let guarded = tmp.path().join("a");
     let lock_dir = guarded.join("state");
     std::fs::create_dir_all(&lock_dir).unwrap();
+    let _restore = Restore(guarded.clone());
     std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o311)).unwrap();
 
-    let held = crate::Exclusive::try_acquire(&lock_dir.join("target.json.lock"), None);
-
-    // Restored first so the temp dir can be removed whatever the assertion says.
-    std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(held.unwrap().is_some());
+    // Root bypasses the check, so the walk runs as a child that has dropped to `nobody` when the runner is root.
+    as_unprivileged(tmp.path(), || {
+        let held = crate::Exclusive::try_acquire(&lock_dir.join("target.json.lock"), None);
+        assert!(held.unwrap().is_some());
+    });
 }
