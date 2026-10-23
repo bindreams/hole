@@ -3,6 +3,9 @@
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+use hole_bridge::disable_record::{DisabledBy, DisabledState};
+use hole_bridge::service_start::{InstallStart, RepairStep};
+
 // Status detection ====================================================================================================
 
 /// Installation state of the bridge service.
@@ -12,19 +15,142 @@ pub enum BridgeInstallStatus {
     Running,
     /// Service is registered but not currently running.
     Installed,
+    /// Service is registered with its start type disabled, so it cannot start;
+    /// who disabled it decides what the GUI offers.
+    Disabled(DisabledBy),
+    /// A retirement, repair or enable of the service is under way (Windows):
+    /// its start type and record are being changed, so neither says whether
+    /// the service is disabled yet.
+    ChangeInProgress,
     /// Service is not registered.
     NotInstalled,
 }
 
 /// Query the current bridge installation status.
 pub fn bridge_install_status() -> BridgeInstallStatus {
-    if !hole_bridge::platform::os::is_installed() {
+    bridge_install_status_with(
+        hole_bridge::platform::os::is_installed,
+        hole_bridge::platform::os::is_running,
+        hole_bridge::platform::os::disabled_state,
+    )
+}
+
+/// [`bridge_install_status`] over the probes, each asked only when the answer
+/// before it leaves the question open. A running service is not "disabled": it
+/// works, whatever its start type says.
+pub fn bridge_install_status_with(
+    installed: impl FnOnce() -> bool,
+    running: impl FnOnce() -> bool,
+    disabled: impl FnOnce() -> DisabledState,
+) -> BridgeInstallStatus {
+    if !installed() {
         return BridgeInstallStatus::NotInstalled;
     }
-    if hole_bridge::platform::os::is_running() {
-        BridgeInstallStatus::Running
-    } else {
-        BridgeInstallStatus::Installed
+    if running() {
+        return BridgeInstallStatus::Running;
+    }
+    match disabled() {
+        DisabledState::By(by) => BridgeInstallStatus::Disabled(by),
+        DisabledState::InChange => BridgeInstallStatus::ChangeInProgress,
+        DisabledState::NotDisabled => BridgeInstallStatus::Installed,
+    }
+}
+
+/// What the GUI offers to do about the bridge before it connects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPrompt {
+    /// Register the service.
+    Install,
+    /// Undo the disable an interrupted uninstall or update left.
+    Repair,
+    /// Enable a service an administrator disabled.
+    Enable,
+}
+
+/// What the connect does about the service's state before it goes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallGate {
+    /// Nothing is in the way.
+    Proceed,
+    /// Offer to do this first.
+    Prompt(InstallPrompt),
+    /// The service's start type is being changed; offer nothing and say so.
+    ChangeInProgress,
+}
+
+/// The connect's failure while the service's start type is being changed.
+pub const CHANGE_IN_PROGRESS_ERROR: &str =
+    "The Hole service is being changed by an uninstall, a repair or an update that is in progress. Try again when it finishes.";
+
+impl BridgeInstallStatus {
+    /// What the connect does, from the status.
+    pub fn install_gate(self) -> InstallGate {
+        match self {
+            BridgeInstallStatus::Running => InstallGate::Proceed,
+            BridgeInstallStatus::Installed => InstallGate::Proceed,
+            BridgeInstallStatus::Disabled(DisabledBy::InterruptedChange) => InstallGate::Prompt(InstallPrompt::Repair),
+            BridgeInstallStatus::Disabled(DisabledBy::Elsewhere) => InstallGate::Prompt(InstallPrompt::Enable),
+            BridgeInstallStatus::ChangeInProgress => InstallGate::ChangeInProgress,
+            BridgeInstallStatus::NotInstalled => InstallGate::Prompt(InstallPrompt::Install),
+        }
+    }
+}
+
+impl InstallPrompt {
+    /// The dialog's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "Hole — First-Time Setup",
+            InstallPrompt::Repair => "Hole — Repair",
+            InstallPrompt::Enable => "Hole — Service Disabled",
+        }
+    }
+
+    /// The dialog's question.
+    pub fn body(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "The Hole bridge is not installed. It is required for the transparent proxy to work.\n\nInstall it now? (requires administrator privileges)",
+            InstallPrompt::Repair => "An interrupted uninstall or update left Hole's service disabled, so the bridge cannot start.\n\nRepair it now? (requires administrator privileges)",
+            InstallPrompt::Enable => "The Hole service is disabled on this computer, so the bridge cannot start.\n\nEnable and start it now? (requires administrator privileges)",
+        }
+    }
+
+    /// The label of the button that goes ahead.
+    pub fn confirm_label(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "Install",
+            InstallPrompt::Repair => "Repair",
+            InstallPrompt::Enable => "Enable",
+        }
+    }
+
+    /// The connect's failure when the user declines.
+    pub fn declined_error(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "The Hole bridge must be installed to connect.",
+            InstallPrompt::Repair => {
+                "An interrupted uninstall or update left Hole's service disabled; it must be repaired to connect."
+            }
+            InstallPrompt::Enable => "The Hole service is disabled on this computer; it must be enabled to connect.",
+        }
+    }
+
+    /// The headline of the dialog that reports the elevated run failing.
+    pub fn failure_headline(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "Failed to install the Hole bridge.",
+            InstallPrompt::Repair => "Failed to repair the Hole bridge.",
+            InstallPrompt::Enable => "Failed to enable the Hole bridge.",
+        }
+    }
+
+    /// The connect's failure when it may not prompt (unattended startup).
+    pub fn unattended_error(self) -> &'static str {
+        match self {
+            InstallPrompt::Install => "The Hole bridge is not installed.",
+            InstallPrompt::Repair => "An interrupted uninstall or update left Hole's service disabled.",
+            InstallPrompt::Enable => "The Hole service is disabled on this computer.",
+        }
     }
 }
 
@@ -381,19 +507,111 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
     // after install, so the installer must not silently continue.
     hole_bridge::ipc::prepare_ipc_access()?;
 
+    install_bridge_with(
+        hole_bridge::platform::os::hold_start_type,
+        hole_bridge::platform::os::disabled_by,
+        hole_bridge::platform::os::is_installed,
+        || {
+            hole_bridge::platform::os::ensure_stopped()?;
+            Ok(())
+        },
+        || {
+            hole_bridge::platform::os::uninstall()?;
+            Ok(())
+        },
+        |start| {
+            #[cfg(target_os = "windows")]
+            hole_bridge::platform::os::install_as(&binary_path, start)?;
+            #[cfg(not(target_os = "windows"))]
+            match start {
+                InstallStart::Automatic => hole_bridge::platform::os::install(&binary_path)?,
+                InstallStart::LeaveDisabled => unreachable!("only the Windows bridge reports a disabled service"),
+            }
+            Ok(())
+        },
+        hole_bridge::platform::os::repair_interrupted_change,
+        // On macOS, install() already bootstraps with RunAtLoad=true, so the bridge starts automatically.
+        // On Windows, we need to explicitly start the service.
+        || {
+            #[cfg(target_os = "windows")]
+            hole_bridge::platform::os::start()?;
+            Ok(())
+        },
+    )
+}
+
+/// `install_bridge`'s ordering, with the effects injected so tests can drive it
+/// without touching SCM/launchd.
+///
+/// **A Disabled start type an administrator chose survives a reinstall.** The
+/// reinstall deletes and recreates the service, so the start type is read
+/// first; a service found Disabled with no record of ours is registered
+/// Disabled again and is not started, and the install still succeeds (the MSI's
+/// custom action reads the exit code). `hole bridge enable` is what undoes it.
+/// A start type the read cannot answer fails the install before anything
+/// changes: guessing "not disabled" would re-enable it.
+///
+/// **The install holds the start-type lock from its first read to its last
+/// step.** `hold` is taken before `disabled_by` and kept until this returns, so
+/// no retirement, repair or enable runs between the read that decides the start
+/// type and the registration and repair that act on it. The steps take the lock
+/// themselves; the thread running them already owns it, so they proceed. A lock
+/// that cannot be taken fails the install before anything changes.
+///
+/// **The repair follows the registration.** A record an interrupted uninstall
+/// left is cleared by the stop's restore, or, if the stop fails, dies with the
+/// old service's key at the deregistration; the repair reads the new key and
+/// says whether the service may be started.
+#[allow(clippy::too_many_arguments)] // private seam: one injected closure per step, bundling them adds more noise than the warning.
+fn install_bridge_with<Hold>(
+    hold: impl FnOnce() -> std::io::Result<Hold>,
+    disabled_by: impl FnOnce() -> std::io::Result<Option<DisabledBy>>,
+    is_installed: impl FnOnce() -> bool,
+    ensure_stopped: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    deregister: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    register: impl FnOnce(InstallStart) -> Result<(), Box<dyn std::error::Error>>,
+    repair: impl FnOnce() -> std::io::Result<RepairStep>,
+    start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _hold = hold().map_err(|e| {
+        format!("could not take the lock over the service's start type, so the service was not changed: {e}")
+    })?;
+
+    let start_type = match disabled_by() {
+        Ok(disabled_by) => InstallStart::for_disabled_by(disabled_by),
+        Err(e) => {
+            return Err(
+                format!("could not tell whether the service is disabled, so the service was not changed: {e}").into(),
+            )
+        }
+    };
+
     // Idempotent: if already installed, stop and uninstall first
-    if hole_bridge::platform::os::is_installed() {
+    if is_installed() {
         cli_log!(info, "bridge already installed, reinstalling...");
-        let _ = hole_bridge::platform::os::ensure_stopped();
-        let _ = hole_bridge::platform::os::uninstall();
+        // Neither failure ends the reinstall: `register` follows and reports
+        // what is left. The cause is what `register`'s generic failure hides.
+        if let Err(e) = ensure_stopped() {
+            cli_log!(warn, "could not stop the installed bridge before reinstalling: {e}");
+        }
+        if let Err(e) = deregister() {
+            cli_log!(
+                warn,
+                "could not deregister the installed bridge before reinstalling: {e}"
+            );
+        }
     }
 
-    // Install and start
-    hole_bridge::platform::os::install(&binary_path)?;
-    // On macOS, install() already bootstraps with RunAtLoad=true, so the bridge starts automatically.
-    // On Windows, we need to explicitly start the service.
-    #[cfg(target_os = "windows")]
-    hole_bridge::platform::os::start()?;
+    register(start_type)?;
+    let repaired = repair().map_err(|e| format!("could not repair the service's start type: {e}"))?;
+    if !repaired.starts_service() {
+        cli_log!(
+            warn,
+            "bridge installed; the service is disabled on this computer and was left disabled, so it is not running. Run `hole bridge enable` to enable and start it"
+        );
+        return Ok(());
+    }
+    start()?;
 
     cli_log!(info, "bridge installed and started");
     Ok(())
@@ -406,6 +624,7 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
 pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Error>> {
     uninstall_bridge_with(
         keep_covers,
+        hole_bridge::platform::os::hold_start_type,
         // Statement form, not `Ok(..?)`: the platforms return different error
         // types (macOS `io::Error`, Windows `Box<dyn Error>`), so on Windows
         // the `?` inside an `Ok` would convert nothing and trip
@@ -439,19 +658,26 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
     )
 }
 
-/// `uninstall_bridge`'s ordering, with the four effects injected so tests can
+/// `uninstall_bridge`'s ordering, with the five effects injected so tests can
 /// drive it without touching SCM/launchd or the host firewall.
+///
+/// **The uninstall holds the start-type lock for its whole run.** `hold` is
+/// taken before the stop and kept until this returns, so no repair or enable
+/// runs between the stop's restore and the delete, and the delete never
+/// discards a start type that one just set. The steps take the lock themselves;
+/// the thread running them already owns it, so they proceed. A lock that cannot
+/// be taken skips the stop and the deregistration, leaving the service as it
+/// is, and fails the uninstall; the release below does not touch the start type
+/// and still runs.
 ///
 /// **Stop, deregister, release — and the stop is gated on nothing.** Whether a
 /// bridge is running and whether a registration record still names it are
 /// independent facts; the fail-closed covers are held by the live process, not
 /// by the record. Gating the stop on `is_installed` made the two look like one,
-/// and that is what turned an uninstall into a dead end: a `DeleteService`
-/// against a live service marks the entry for deletion, `OpenService` then
-/// answers `ERROR_SERVICE_MARKED_FOR_DELETE`, `is_installed` goes false, and
-/// every retry skips the teardown that would have stopped the bridge — whose
-/// liveness lock then refuses the release forever. macOS reaches the same place
-/// through a plist deleted over a still-loaded job.
+/// and a lost record then skipped the teardown that would have stopped the
+/// bridge — whose liveness lock refuses the release forever. A service marked
+/// for deletion still opens (`is_installed` stays true), and a stop reaches it
+/// through its handle. macOS has the plist deleted over a still-loaded job.
 ///
 /// **Deregistration requires a confirmed stop.** The registration is the only
 /// handle a later attempt has, so a stop that could not be confirmed leaves it
@@ -478,8 +704,9 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
 /// major-upgrade path (`RemoveExistingProducts`) must tear the old service down
 /// so its image can be replaced WITHOUT disarming the kill switch: the standing
 /// cover is what holds the update-cutover gap, and the new bridge re-adopts it.
-fn uninstall_bridge_with(
+fn uninstall_bridge_with<Hold>(
     keep_covers: bool,
+    hold: impl FnOnce() -> std::io::Result<Hold>,
     ensure_stopped: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
     is_installed: impl FnOnce() -> bool,
     deregister: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
@@ -487,18 +714,30 @@ fn uninstall_bridge_with(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut failures: Vec<String> = Vec::new();
 
-    let stopped = ensure_stopped();
-    if let Err(e) = &stopped {
-        failures.push(format!("could not stop the bridge: {e}"));
-    }
+    let held = match hold() {
+        Ok(held) => Some(held),
+        Err(e) => {
+            failures.push(format!(
+                "could not take the lock over the service's start type, so the service was not changed: {e}"
+            ));
+            None
+        }
+    };
 
-    if stopped.is_ok() {
-        if is_installed() {
-            if let Err(e) = deregister() {
-                failures.push(format!("could not deregister the bridge service: {e}"));
+    if held.is_some() {
+        let stopped = ensure_stopped();
+        if let Err(e) = &stopped {
+            failures.push(format!("could not stop the bridge: {e}"));
+        }
+
+        if stopped.is_ok() {
+            if is_installed() {
+                if let Err(e) = deregister() {
+                    failures.push(format!("could not deregister the bridge service: {e}"));
+                }
+            } else {
+                cli_log!(warn, "bridge is not installed");
             }
-        } else {
-            cli_log!(warn, "bridge is not installed");
         }
     }
 
@@ -515,23 +754,54 @@ fn uninstall_bridge_with(
     }
 }
 
+/// The arguments of the elevated `hole bridge` run that does what `prompt`
+/// offers. `--repair-user-data-dir` belongs to the install alone.
+pub(crate) fn elevated_bridge_args(
+    prompt: InstallPrompt,
+    log_dir: &str,
+    repair_user_data_dir: Option<&str>,
+) -> Vec<String> {
+    let build = |verb: &str, user_data_dir: Option<&str>| {
+        let mut args: Vec<String> = ["bridge", verb, "--log-dir", log_dir].map(String::from).into();
+        if let Some(dir) = user_data_dir {
+            args.extend(["--repair-user-data-dir".to_string(), dir.to_string()]);
+        }
+        args
+    };
+    match prompt {
+        InstallPrompt::Install => build("install", repair_user_data_dir),
+        InstallPrompt::Repair => build("install", repair_user_data_dir),
+        InstallPrompt::Enable => build("enable", None),
+    }
+}
+
+/// Run `bridge enable`: set the service to start automatically and start it.
+pub fn enable_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    hole_bridge::platform::os::enable()?;
+    cli_log!(info, "bridge enabled and started");
+    Ok(())
+}
+
 // GUI install prompt ==================================================================================================
 
 /// Prompt the user to install the bridge, run the elevated install, and
 /// return whether the bridge is now reachable. Returns `false` on cancel,
 /// elevation failure, or post-install IPC unreachability.
-pub async fn prompt_bridge_install(app: tauri::AppHandle) -> bool {
+pub async fn prompt_bridge_install(app: tauri::AppHandle, prompt: InstallPrompt) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
     let confirmed = app
         .dialog()
-        .message("The Hole bridge is not installed. It is required for the transparent proxy to work.\n\nInstall it now? (requires administrator privileges)")
-        .title("Hole — First-Time Setup")
-        .buttons(MessageDialogButtons::OkCancelCustom("Install".into(), "Later".into()))
+        .message(prompt.body())
+        .title(prompt.title())
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            prompt.confirm_label().into(),
+            "Later".into(),
+        ))
         .blocking_show();
 
     if !confirmed {
-        tracing::info!("user declined bridge install");
+        tracing::info!(?prompt, "user declined the bridge prompt");
         return false;
     }
 
@@ -555,13 +825,13 @@ pub async fn prompt_bridge_install(app: tauri::AppHandle) -> bool {
     let result = tokio::task::spawn_blocking({
         let exe = exe.clone();
         let user_data_dir_arg = user_data_dir_arg.clone();
-        move || run_elevated_install(&exe, user_data_dir_arg.as_deref())
+        move || run_elevated_bridge(&exe, prompt, user_data_dir_arg.as_deref())
     })
     .await;
 
     match result {
         Ok(Ok(())) => {
-            tracing::info!("bridge installed successfully via elevation");
+            tracing::info!(?prompt, "bridge prompt succeeded via elevation");
             // Poll IPC to verify bridge is reachable
             let reachable = poll_bridge_ipc().await;
             if !reachable {
@@ -581,7 +851,7 @@ pub async fn prompt_bridge_install(app: tauri::AppHandle) -> bool {
         Ok(Err(e)) => {
             tracing::error!("elevation failed: {e}");
             app.dialog()
-                .message(format!("Failed to install the Hole bridge.\n\n{e}"))
+                .message(format!("{}\n\n{e}", prompt.failure_headline()))
                 .title("Setup Error")
                 .blocking_show();
             false
@@ -603,15 +873,16 @@ pub async fn prompt_bridge_install(app: tauri::AppHandle) -> bool {
 /// becomes the `log_path` of `SetupError::ExitCode`, so the user can
 /// attach the full file to support if the truncated copy in the dialog
 /// isn't sufficient.
-fn run_elevated_install(exe: &Path, repair_user_data_dir: Option<&str>) -> Result<(), SetupError> {
+fn run_elevated_bridge(
+    exe: &Path,
+    prompt: InstallPrompt,
+    repair_user_data_dir: Option<&str>,
+) -> Result<(), SetupError> {
     let tempdir = tempfile::TempDir::with_prefix("hole-install-")?;
     let log_dir_arg = tempdir.path().to_string_lossy().into_owned();
 
-    let mut args: Vec<&str> = vec!["bridge", "install", "--log-dir", &log_dir_arg];
-    if let Some(d) = repair_user_data_dir {
-        args.push("--repair-user-data-dir");
-        args.push(d);
-    }
+    let args = elevated_bridge_args(prompt, &log_dir_arg, repair_user_data_dir);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
     match run_elevated(exe, &args) {
         Ok(()) => Ok(()),

@@ -11,9 +11,18 @@ use std::io;
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::Services::{
-    CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
-    SERVICE_START, SERVICE_STOP,
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_HANDLE, SC_MANAGER_CONNECT,
 };
+
+use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
+
+fn failed(call: ScmCall, e: windows::core::Error) -> io::Error {
+    ScmCallError {
+        call,
+        code: win32_code_of_hresult(e.code().0),
+    }
+    .into_io()
+}
 
 /// An open SCM or service handle, closed exactly once when this drops.
 struct ScHandle(SC_HANDLE);
@@ -38,23 +47,19 @@ pub(super) struct Handles {
 }
 
 impl Handles {
-    pub(super) fn open(service_name: &HSTRING) -> io::Result<Self> {
+    /// Opens the service with `access` (`SERVICE_*` rights).
+    pub(super) fn open(service_name: &HSTRING, access: u32) -> io::Result<Self> {
         let scm = ScHandle(
             // SAFETY: null machine and database names select the local, active
             // SCM database; no pointer is read.
-            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.map_err(io::Error::other)?,
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+                .map_err(|e| failed(ScmCall::OpenScManager, e))?,
         );
         let service = ScHandle(
             // SAFETY: `scm.0` is live (it closes only when `scm` drops, after
             // this call), and an `HSTRING` is NUL-terminated and outlives it.
-            unsafe {
-                OpenServiceW(
-                    scm.0,
-                    PCWSTR(service_name.as_ptr()),
-                    SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START,
-                )
-            }
-            .map_err(io::Error::other)?,
+            unsafe { OpenServiceW(scm.0, PCWSTR(service_name.as_ptr()), access) }
+                .map_err(|e| failed(ScmCall::OpenService, e))?,
         );
         Ok(Self { service, _scm: scm })
     }

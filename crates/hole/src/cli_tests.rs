@@ -225,7 +225,10 @@ fn dispatch_installs_cli_log_guard_for_write_actions() {
         },
     }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
-        action: BridgeAction::Uninstall { keep_covers: false },
+        action: BridgeAction::Uninstall {
+            keep_covers: false,
+            log_dir: None,
+        },
     }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
         action: BridgeAction::Status,
@@ -759,6 +762,43 @@ fn resolve_cli_log_dir_falls_back_to_default_without_override() {
     assert_eq!(resolved, Some(hole_common::logging::default_log_dir()));
 }
 
+/// The MSI's custom actions pass `--log-dir`, so the installer's own
+/// `gui-cli.log` lands in a directory every principal can find rather than in
+/// whichever profile the elevated process resolved.
+#[skuld::test]
+fn resolve_cli_log_dir_honors_the_uninstall_and_release_covers_log_dir() {
+    let custom = std::path::PathBuf::from("/tmp/hole msi logs");
+    let uninstall = Command::Bridge {
+        action: BridgeAction::Uninstall {
+            keep_covers: true,
+            log_dir: Some(custom.clone()),
+        },
+    };
+    assert_eq!(resolve_cli_log_dir(&uninstall), Some(custom.clone()));
+    let release = Command::Bridge {
+        action: BridgeAction::ReleaseCovers {
+            log_dir: Some(custom.clone()),
+        },
+    };
+    assert_eq!(resolve_cli_log_dir(&release), Some(custom));
+}
+
+#[skuld::test]
+fn resolve_cli_log_dir_falls_back_to_default_for_uninstall_and_release_covers_without_override() {
+    let default = Some(hole_common::logging::default_log_dir());
+    let uninstall = Command::Bridge {
+        action: BridgeAction::Uninstall {
+            keep_covers: false,
+            log_dir: None,
+        },
+    };
+    assert_eq!(resolve_cli_log_dir(&uninstall), default);
+    let release = Command::Bridge {
+        action: BridgeAction::ReleaseCovers { log_dir: None },
+    };
+    assert_eq!(resolve_cli_log_dir(&release), default);
+}
+
 // `bridge cutover` / `bridge unlock` parsing ==========================================================================
 
 #[skuld::test]
@@ -813,14 +853,25 @@ fn bridge_unlock_takes_no_args() {
 // installer's uninstall custom actions (bindreams/hole#1003).
 
 #[skuld::test]
-fn bridge_release_covers_takes_no_args() {
+fn bridge_release_covers_takes_only_a_log_dir() {
     let cli = Cli::try_parse_from(["hole", "bridge", "release-covers"]).expect("parse bridge release-covers");
     assert!(matches!(
         cli.command,
         Some(Command::Bridge {
-            action: BridgeAction::ReleaseCovers
+            action: BridgeAction::ReleaseCovers { log_dir: None }
         })
     ));
+
+    let dir = r"C:\ProgramData\hole\logs";
+    let cli = Cli::try_parse_from(["hole", "bridge", "release-covers", "--log-dir", dir])
+        .expect("parse bridge release-covers --log-dir");
+    let Some(Command::Bridge {
+        action: BridgeAction::ReleaseCovers { log_dir },
+    }) = cli.command
+    else {
+        panic!("not release-covers");
+    };
+    assert_eq!(log_dir, Some(std::path::PathBuf::from(dir)));
 }
 
 #[skuld::test]
@@ -829,7 +880,10 @@ fn bridge_uninstall_keeps_covers_only_when_asked() {
     assert!(matches!(
         bare.command,
         Some(Command::Bridge {
-            action: BridgeAction::Uninstall { keep_covers: false }
+            action: BridgeAction::Uninstall {
+                keep_covers: false,
+                log_dir: None
+            }
         })
     ));
 
@@ -838,9 +892,27 @@ fn bridge_uninstall_keeps_covers_only_when_asked() {
     assert!(matches!(
         kept.command,
         Some(Command::Bridge {
-            action: BridgeAction::Uninstall { keep_covers: true }
+            action: BridgeAction::Uninstall {
+                keep_covers: true,
+                log_dir: None
+            }
         })
     ));
+}
+
+#[skuld::test]
+fn bridge_uninstall_takes_a_log_dir_next_to_keep_covers() {
+    let dir = r"C:\ProgramData\hole\logs";
+    let cli = Cli::try_parse_from(["hole", "bridge", "uninstall", "--keep-covers", "--log-dir", dir])
+        .expect("parse bridge uninstall --keep-covers --log-dir");
+    let Some(Command::Bridge {
+        action: BridgeAction::Uninstall { keep_covers, log_dir },
+    }) = cli.command
+    else {
+        panic!("not uninstall");
+    };
+    assert!(keep_covers);
+    assert_eq!(log_dir, Some(std::path::PathBuf::from(dir)));
 }
 
 #[skuld::test]
@@ -1164,4 +1236,51 @@ fn redaction_is_armed_only_by_the_wire_funnel() {
     let arm_at = body.find("arm_request_redaction(").expect("the driver must arm");
     let connect_at = body.find("BridgeClient::connect(").expect("the driver must connect");
     assert!(arm_at < connect_at, "arming must precede the connect");
+}
+
+// `bridge enable` and `bridge status` =================================================================================
+
+#[skuld::test]
+fn bridge_enable_parses_with_and_without_a_log_dir() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "enable"]).expect("parse bridge enable");
+    let Some(Command::Bridge {
+        action: BridgeAction::Enable { log_dir },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Enable");
+    };
+    assert!(log_dir.is_none());
+
+    let cli = Cli::try_parse_from(["hole", "bridge", "enable", "--log-dir", "/tmp/L"]).expect("parse with --log-dir");
+    let Some(Command::Bridge {
+        action: BridgeAction::Enable { log_dir },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Enable");
+    };
+    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/L")));
+}
+
+#[skuld::test]
+fn bridge_enable_writes_its_gui_cli_log_where_the_gui_reads_it_back() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "enable", "--log-dir", "/tmp/L"]).unwrap();
+    let command = cli.command.expect("a command");
+    assert!(
+        should_install_cli_log_guard(&command),
+        "enable is a write action with an audit trail"
+    );
+    assert_eq!(resolve_cli_log_dir(&command), Some(std::path::PathBuf::from("/tmp/L")));
+}
+
+#[skuld::test]
+fn bridge_status_prints_disabled_with_its_own_exit_code() {
+    use crate::setup::BridgeInstallStatus::*;
+    use hole_bridge::disable_record::DisabledBy;
+    assert_eq!(status_report(Running), ("installed (running)", 0));
+    assert_eq!(status_report(Installed), ("installed (stopped)", 1));
+    assert_eq!(status_report(NotInstalled), ("not installed", 2));
+    for by in [DisabledBy::InterruptedChange, DisabledBy::Elsewhere] {
+        assert_eq!(status_report(Disabled(by)), ("installed (disabled)", 3), "{by:?}");
+    }
+    assert_eq!(status_report(ChangeInProgress), ("installed (being changed)", 4));
 }

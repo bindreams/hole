@@ -282,11 +282,10 @@ fn ensure_stopped_verdict(registration: Registration) -> std::io::Result<()> {
 
 /// Stop, unload, and remove the bridge.
 ///
-/// The stop is FATAL here, not the best-effort it used to be. `is_installed()`
-/// is a `PLIST_PATH` existence check, so deleting the plist over a still-loaded
-/// job makes every later `uninstall` skip its teardown — nothing would ever
-/// stop the bridge again, and the cover release refuses against it forever
-/// (bindreams/hole#1003).
+/// The stop is FATAL here, not best-effort. `is_installed()` is a `PLIST_PATH`
+/// existence check, so deleting the plist over a still-loaded job makes every
+/// later `uninstall` skip its teardown — nothing would ever stop the bridge
+/// again, and the cover release refuses against it forever.
 pub fn uninstall() -> std::io::Result<()> {
     ensure_stopped()?;
 
@@ -323,6 +322,38 @@ pub fn stop() -> std::io::Result<()> {
 /// Check whether the bridge plist is installed.
 pub fn is_installed() -> bool {
     Path::new(PLIST_PATH).exists()
+}
+
+/// What [`hold_start_type`] returns.
+pub struct StartTypeHold;
+
+/// launchd has no start type, so a change to it has nothing to hold.
+pub fn hold_start_type() -> std::io::Result<StartTypeHold> {
+    Ok(StartTypeHold)
+}
+
+/// launchd has no start type to disable: there is nothing to repair.
+pub fn repair_interrupted_change() -> std::io::Result<crate::service_start::RepairStep> {
+    Ok(crate::service_start::RepairStep::Nothing)
+}
+
+/// launchd has no start type to disable, so the bridge is never disabled.
+pub fn disabled_by() -> std::io::Result<Option<crate::disable_record::DisabledBy>> {
+    Ok(None)
+}
+
+/// [`disabled_by`] for the GUI's status.
+pub fn disabled_state() -> crate::disable_record::DisabledState {
+    crate::disable_record::DisabledState::NotDisabled
+}
+
+/// launchd has no disabled start type to undo, so `hole bridge enable` has no
+/// macOS meaning.
+pub fn enable() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the macOS bridge has no start type to enable",
+    ))
 }
 
 /// Check whether the bridge is currently running.

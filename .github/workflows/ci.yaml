@@ -676,9 +676,9 @@ jobs:
       # The MSI's `LaunchApp` custom action runs `hole.exe --show-dashboard`
       # after a fresh install. Tauri's single-instance plugin would route
       # tauri-driver's new launch into that already-running instance, so we
-      # need a clean slate. The shared script resolves the processes before
-      # killing them and waits on those objects, so an SCM-restarted bridge
-      # cannot be mistaken for one that never died.
+      # need a clean slate. The shared script kills the GUI only, not the
+      # HoleBridge service process: the bridge is not in the way, and killing
+      # it starts the SCM's 1s restart clock.
       - id: installer-kill-launch
         name: Kill any running hole.exe (post-install LaunchApp)
         if: ${{ !cancelled() && steps.installer-install.outcome == 'success' }}
@@ -730,7 +730,8 @@ jobs:
       # Same TerminateProcess-returns-before-reap gap as the earlier "Kill any
       # running hole.exe" step above, and the same script: without the wait,
       # the Uninstall step's msiexec can start while hole.exe still holds
-      # file/service handles it needs to release.
+      # file/service handles it needs to release. The bridge stays up, so the
+      # Uninstall step stops it the way a user's uninstall does.
       - id: installer-kill
         name: Kill hole.exe after E2E
         if: ${{ always() && matrix.installer == true && steps.installer-install.outcome != 'skipped' }}
@@ -768,6 +769,19 @@ jobs:
           if ($svc) { throw "HoleBridge service still registered" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
+
+      # What the uninstall's own processes did. The MSI's custom actions run
+      # `hole bridge uninstall` / `release-covers` as SYSTEM with no console, so
+      # their only record is the CLI log in `%ProgramData%\hole\logs`; the SCM
+      # events in the System log give the service's kills, restarts and state
+      # changes. A failed uninstall otherwise reports only an exit code.
+      - id: installer-dump-uninstall-diagnostics
+        name: Dump uninstall diagnostics on failure
+        if: ${{ failure() && matrix.installer == true }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          & .github/scripts/dump-uninstall-diagnostics.ps1 -MsiInstallLog "$env:RUNNER_TEMP\msi-install.log"
 
       # Evidence outlives the runner. The bounded wait in
       # invoke-msiexec-bounded.ps1 is what lets a wedged msiexec fail its step
@@ -807,7 +821,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: bridge-logs-installer-windows-amd64
-          path: C:\ProgramData\hole\logs\**
+          path: |
+            C:\ProgramData\hole\logs\**
+            C:\Windows\System32\config\systemprofile\AppData\Local\hole\logs\**
           if-no-files-found: ignore
           retention-days: 14
 

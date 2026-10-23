@@ -11,21 +11,16 @@ pub mod extract;
 pub mod os;
 
 #[cfg(any(target_os = "windows", test))]
-mod registration;
-
-#[cfg(target_os = "windows")]
-pub mod scm_wait;
-
-#[cfg(any(target_os = "windows", test))]
 mod windows_profiles;
 
 use std::path::{Path, PathBuf};
 
 use tun_engine::routing::failclosed::Clearance;
 
-/// The privileged service's state dir, where the lockdown intent + cover state
-/// files live. `unlock` needs it without a running bridge, so it resolves the
-/// same per-platform location `install()` provisions.
+/// The privileged service's state dir (Windows: `C:\ProgramData\hole\state`),
+/// where the crash-recovery state and the lockdown intent + cover state live.
+/// `unlock` needs it without a running bridge, so it
+/// resolves the same per-platform location `install()` provisions.
 pub fn service_state_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -43,14 +38,72 @@ pub fn service_state_dir() -> PathBuf {
 /// bridge cannot SCM-restart itself, so it spawns this LocalSystem child). Swaps
 /// the staged binaries into the install dir and SCM-restarts the service. The
 /// marker is left for the new bridge's post-bind sweep to clear (it is the
-/// authoritative, always-runs clear once any new bridge binds).
+/// authoritative, always-runs clear once any new bridge binds), except where no
+/// bridge will bind: a failure, or a service an administrator disabled, which
+/// is left stopped and reported as success.
 ///
 /// `payload` is the staging dir holding the extracted binaries; `target_version`
 /// names the `.old-<ver>` rename-away path.
+///
+/// The child carries the service's SID, so a retirement or install that holds
+/// the start-type lock waits for the child to exit (it scans for the service's
+/// processes). The child therefore never waits for the lock: it tries it once,
+/// and if a change holds it the update is abandoned. A child that took it first
+/// holds it for the whole cutover, and the other change waits for the child. No
+/// other process that carries the service's SID takes the lock: the service
+/// itself and the plugins it starts never do.
+///
+/// The update marker is settled by how the whole run ended (see
+/// [`run_while_holding`]).
 #[cfg(target_os = "windows")]
 pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()> {
-    use crate::cutover::os::run_cutover;
-    use crate::cutover::os::windows::WindowsCutoverOs;
+    run_while_holding(
+        crate::platform::os::try_hold_start_type,
+        &hole_common::update_marker::service_log_dir(),
+        || run_held(payload, target_version),
+    )
+    .map(|_| ())
+}
+
+/// Runs `run` while holding the start-type lock `try_hold` takes, and settles
+/// the update marker in `log_dir` by how the whole run ended: it stays only for
+/// a cutover that started a new bridge to sweep it, and any other ending
+/// (a failed `try_hold`, a lock another change holds, an error out of `run`, a
+/// service left disabled) clears it, since the old bridge may keep serving and
+/// no new one would bind. A lock another change holds is not waited for: `run`
+/// does not run and this fails with `WouldBlock`. The lock belongs to this
+/// thread, so every step of `run` takes it again on this thread without waiting.
+#[cfg(target_os = "windows")]
+fn run_while_holding<H>(
+    try_hold: impl FnOnce() -> std::io::Result<Option<H>>,
+    log_dir: &Path,
+    run: impl FnOnce() -> std::io::Result<crate::cutover::os::CutoverOutcome>,
+) -> std::io::Result<crate::cutover::os::CutoverOutcome> {
+    let _held = match try_hold() {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            clear_marker(log_dir);
+            tracing::warn!(
+                "cutover: an uninstall, install, repair or enable holds the service's start type, so this update is abandoned"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "a change to the service holds its start type, so the update was abandoned",
+            ));
+        }
+        Err(e) => {
+            clear_marker(log_dir);
+            return Err(e);
+        }
+    };
+    let result = run();
+    settle_marker(&result, log_dir);
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn run_held(payload: &Path, target_version: &str) -> std::io::Result<crate::cutover::os::CutoverOutcome> {
+    use crate::cutover::os::CutoverOutcome;
 
     // Bring an install base predating the restart-on-failure SCM config up to date
     // as part of the update itself. Best-effort: a failure here must not abort the
@@ -63,28 +116,58 @@ pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()>
         .parent()
         .ok_or_else(|| std::io::Error::other("current_exe has no parent dir"))?
         .to_path_buf();
+    let outcome = run_in(&install_dir, payload, target_version)?;
+    if outcome == CutoverOutcome::LeftDisabled {
+        tracing::info!(
+            "cutover: the new files are installed, but the Hole service is disabled on this computer, so it was not started; enable it to run the new version"
+        );
+    }
+    Ok(outcome)
+}
+
+/// Plans the swap of every bundled binary from `payload` into `install_dir`,
+/// then runs it.
+#[cfg(target_os = "windows")]
+fn run_in(
+    install_dir: &Path,
+    payload: &Path,
+    target_version: &str,
+) -> std::io::Result<crate::cutover::os::CutoverOutcome> {
+    use crate::cutover::os::run_cutover;
+    use crate::cutover::os::windows::WindowsCutoverOs;
+
     let names = xtask_lib::bindir::bindir_dest_names(xtask_lib::bindir::Os::Windows);
-    let images = plan_windows_images(&install_dir, payload, &names)?;
+    let images = plan_windows_images(install_dir, payload, &names)?;
     let mut os = WindowsCutoverOs {
         images,
         target_version: target_version.to_string(),
     };
-    let result = run_cutover(&mut os);
-    clear_marker_on_cutover_failure(&result, &hole_common::update_marker::service_log_dir());
-    result
+    run_cutover(&mut os)
 }
 
-/// On a graceful cutover failure clear the marker so a retry is not blocked by
-/// the single-occupancy claim. Load-bearing for the stop/swap sub-case (no new
-/// bridge binds to sweep it); an idempotent second clear for the start-failure
-/// sub-case (the SCM's restart-on-failure also sweeps post-bind). A crash is
-/// covered by the GUI liveness net.
+/// Clear the marker unless a new bridge will bind and sweep it. A graceful
+/// failure clears it so a retry is not blocked by the single-occupancy claim
+/// (load-bearing for the stop/swap sub-case; an idempotent second clear for the
+/// start-failure sub-case, which the SCM's restart-on-failure also sweeps
+/// post-bind). A service left disabled starts no bridge, so its outcome clears
+/// it too. A crash is covered by the GUI liveness net.
 #[cfg(target_os = "windows")]
-fn clear_marker_on_cutover_failure(result: &std::io::Result<()>, log_dir: &Path) {
-    if result.is_err() {
-        if let Err(e) = hole_common::update_marker::clear(log_dir) {
-            tracing::warn!(error = %e, "cutover child: failed to clear marker on graceful failure");
-        }
+fn settle_marker(result: &std::io::Result<crate::cutover::os::CutoverOutcome>, log_dir: &Path) {
+    let leaves_marker = match result {
+        Ok(outcome) => outcome.leaves_marker_for_new_bridge(),
+        Err(_) => false,
+    };
+    if leaves_marker {
+        return;
+    }
+    clear_marker(log_dir);
+}
+
+/// Clear the marker no new bridge will sweep; a failure is logged, not fatal.
+#[cfg(target_os = "windows")]
+fn clear_marker(log_dir: &Path) {
+    if let Err(e) = hole_common::update_marker::clear(log_dir) {
+        tracing::warn!(error = %e, "cutover child: failed to clear the marker no new bridge will sweep");
     }
 }
 
@@ -195,7 +278,7 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<Cle
 /// next bridge start to sweep a transient cover stranded by an earlier crash,
 /// and on Windows the filters are `FWPM_FILTER_FLAG_PERSISTENT` — the Base
 /// Filtering Engine re-adds them every boot, and the uninstaller is about to
-/// delete the only binary that could remove them (bindreams/hole#1003).
+/// delete the only binary that could remove them.
 ///
 /// The desync hazard is answered structurally, not by ordering: like [`unlock`]
 /// this REFUSES against a live bridge instance, so there is never an
@@ -253,7 +336,7 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// host: the exit code is 0 either way (see [`release_covers`] for why an
 /// unproven key must not fail an uninstall), so this message IS the
 /// qualification. Without it the `Ok` is silent again and the installer reads
-/// it as proof (bindreams/hole#1003).
+/// it as proof.
 ///
 /// It deliberately does NOT assert that a cover is present. An unproven key is
 /// equally consistent with never having been installed — which is what it will

@@ -3335,6 +3335,7 @@ dependencies = [
  "same-file",
  "serde",
  "serde_json",
+ "sha1",
  "shadowsocks",
  "shadowsocks-service",
  "skuld",

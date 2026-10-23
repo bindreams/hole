@@ -1,13 +1,16 @@
 //! Real Windows `CutoverOs`: rename-away-then-move-in swap (D1) + raw SCM
-//! stop/start driven by the `scm_wait` state machine. The detached-child
+//! stop/start driven by the `service_scm` state machine. The detached-child
 //! lifetime + breakaway probe live at the apply layer, which spawns THIS process
 //! as `hole bridge cutover`; this impl is the swap+restart body that child runs.
 
 use std::path::{Path, PathBuf};
 
-use crate::cutover::os::CutoverOs;
-use crate::cutover::scm_wait::{start_via_notify, stop_via_notify, SystemScmActor};
-use crate::platform::os::SERVICE_NAME;
+use crate::cutover::os::{CutoverOs, ServiceHold};
+use crate::platform::os::{RetireSession, StopSession, SERVICE_NAME};
+use crate::service_scm::retire::{self, Hardened, Opening};
+use crate::service_scm::settle::{settle_stopped, SettleError};
+use crate::service_scm::{start_via_notify, SystemScmActor};
+use crate::service_start::RepairStep;
 
 /// One image to rename-away-then-move-in: the live binary at `installed` is
 /// renamed aside, then the staged new bytes are moved onto `installed`.
@@ -151,14 +154,45 @@ fn undo_all<O: WindowsSwapStep>(completed: &[Completed], ops: &O) {
     }
 }
 
+/// The service as the cutover holds it: the start-type lock, which the open
+/// session keeps, and what hardening it changed. No session when the SCM has
+/// no entry, which the stop then reports.
+struct WindowsServiceHold {
+    held: Option<(RetireSession, Hardened)>,
+}
+
+impl ServiceHold for WindowsServiceHold {
+    fn restore(&mut self) {
+        let Some((session, hardened)) = self.held.as_mut() else {
+            return;
+        };
+        retire::restore_hardened(session, hardened);
+    }
+}
+
 impl CutoverOs for WindowsCutoverOs {
+    fn hold_service(&mut self) -> std::io::Result<Box<dyn ServiceHold>> {
+        let mut session = match RetireSession::open().map_err(|e| std::io::Error::other(e.to_string()))? {
+            Opening::Opened(session) => session,
+            Opening::Absent(_) => return Ok(Box::new(WindowsServiceHold { held: None })),
+        };
+        let hardened = retire::harden(&mut session).map_err(std::io::Error::other)?;
+        Ok(Box::new(WindowsServiceHold {
+            held: Some((session, hardened)),
+        }))
+    }
+
     fn swap_images(&mut self) -> std::io::Result<()> {
         execute_image_swaps(&self.images, &self.target_version, &FsSwapStep)
     }
 
     fn stop_service_wait_stopped(&mut self) -> std::io::Result<()> {
-        let mut actor = SystemScmActor::open(SERVICE_NAME)?;
-        stop_via_notify(&mut actor)
+        let mut session = StopSession::open()?;
+        settle_stopped(&mut session).map_err(SettleError::into_io)
+    }
+
+    fn repair_start_type(&mut self) -> std::io::Result<RepairStep> {
+        crate::platform::os::repair_interrupted_change()
     }
 
     fn start_service_wait_running(&mut self) -> std::io::Result<()> {

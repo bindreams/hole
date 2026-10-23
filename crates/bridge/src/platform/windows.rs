@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{error, info, warn};
-use windows::core::HRESULT;
-use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, WIN32_ERROR};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
     ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus,
@@ -15,8 +13,38 @@ use windows_service::service::{
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::disable_record::{DisabledBy, DisabledState};
 use crate::service_ctrl::{self, Control, ControlResult, StatusHandle};
+use crate::service_scm::call_error::{ScmCall, ServiceGone};
+use crate::service_scm::repair;
+use crate::service_scm::retire::{retire_over, Disposition};
+use crate::service_start::{InstallStart, RepairStep};
 use crate::service_stop::{self, StopPhase, StopProgress};
+
+#[path = "windows/retire_session.rs"]
+mod retire_session;
+pub use crate::service_scm::retire::Opening;
+pub use retire_session::{GoneSession, RetireSession};
+#[path = "windows/stop_session.rs"]
+mod stop_session;
+pub use stop_session::StopSession;
+#[path = "windows/start_type_lock.rs"]
+mod start_type_lock;
+pub use start_type_lock::{Held, StartTypeLock, BOUNDARY_NAME, MUTEX_LEAF, REQUIRED_SID};
+#[path = "windows/repair_session.rs"]
+mod repair_session;
+use repair_session::{RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
+#[path = "windows/status_session.rs"]
+mod status_session;
+use status_session::StatusSession;
+#[path = "windows/registration.rs"]
+pub mod registration;
+#[path = "windows/service_processes.rs"]
+mod service_processes;
+pub use service_processes::scan_service_processes;
+#[path = "windows/service_sid.rs"]
+mod service_sid;
+pub use service_sid::{ServiceSid, SidRepair, SidRepairOutcome};
 
 // Constants ===========================================================================================================
 
@@ -40,7 +68,7 @@ static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 static VERSION_OVERRIDE: OnceLock<String> = OnceLock::new();
 
 /// Run as a Windows Service (called by the service control manager).
-pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) -> Result<(), windows_service::Error> {
+pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) -> std::io::Result<()> {
     let default = hole_common::protocol::default_bridge_socket_path();
     if socket_path != default {
         SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();
@@ -49,6 +77,18 @@ pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) 
     LOG_DIR_OVERRIDE.set(log_dir.to_owned()).ok();
     VERSION_OVERRIDE.set(version.to_owned()).ok();
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+        .map_err(|e| scm_failure(ScmCall::StartServiceCtrlDispatcher, e))
+}
+
+/// `error`, which a `windows_service` call returned, as `call`'s typed failure.
+/// `windows_service::Error::Winapi` displays only as "IO error in winapi call",
+/// keeping the OS error as its source, so a failure that reaches a log through
+/// `{e}` loses both the call and the Win32 code unless it is re-typed here.
+fn scm_failure(call: ScmCall, error: windows_service::Error) -> std::io::Error {
+    match error {
+        windows_service::Error::Winapi(os) => call.failed_with(&os),
+        other => std::io::Error::other(format!("{} failed: {other}", call.name())),
+    }
 }
 
 windows_service::define_windows_service!(ffi_service_main, service_main);
@@ -206,53 +246,22 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             })
         })?;
         info!("Windows service started");
-        // DNS recovery runs first; see crate::dns::recovery docs for ordering.
-        let state_dir_for_dns = state_dir.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir_for_dns)).await
-        {
-            tracing::warn!(error = %e, "recover_dns_config task panicked");
-        }
         // Root cancellation token for the SCM service, fed by the same
-        // `shutdown_rx` oneshot the control handler signals. Created before
-        // reconciliation so an SCM Stop arriving mid-boot abandons the
-        // auto-connect rather than racing it.
+        // `shutdown_rx` oneshot the control handler signals; the startup forwards
+        // the Stop to it before reconciling, so an SCM Stop arriving mid-boot
+        // abandons the auto-connect rather than racing it.
         #[allow(clippy::disallowed_methods)]
         // Service entry point — see clippy.toml's CancellationToken::new list.
         let shutdown = tokio_util::sync::CancellationToken::new();
-        {
-            let shutdown = shutdown.clone();
-            let stop_progress = std::sync::Arc::clone(&stop_progress);
-            tokio::spawn(async move {
-                service_stop::forward_stop(&stop_progress, shutdown_rx, || shutdown.cancel()).await;
-            });
-        }
-
-        crate::route_recovery::recover_and_record(&state_dir, &proxy_shutdown).await;
-        // Reconcile the persisted target now, before any GUI or client has had a
-        // chance to connect (narrows, does not close, #617's boot->first-connect
-        // gap: a failed connect engages nothing) — must run after recovery above, see
-        // crate::reconciler::reconcile_once's own doc.
-        crate::reconciler::reconcile_once(&state_dir, None, &proxy_shutdown, &shutdown).await;
-        let state_dir_for_plugins = state_dir.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_for_plugins))
-                .await
-        {
-            tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
-        }
-        // Native-crash observability (bindreams/hole#438): sweep crash
-        // markers left by a previously-crashed service bridge. Markers land
-        // in the service log dir (C:\ProgramData\hole\logs), NOT state_dir.
-        let log_dir_sweep = log_dir.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
-            tracing::warn!(error = %e, "crash sweep task panicked");
-        }
-        // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
-        // (it fails while an old process still maps the renamed inode).
-        if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
-            tracing::warn!(error = %e, "old-binary sweep task panicked");
-        }
+        registration::run_startup_steps(&mut ServiceStartup {
+            state_dir: state_dir.clone(),
+            log_dir: log_dir.clone(),
+            proxy: std::sync::Arc::clone(&proxy_shutdown),
+            shutdown: shutdown.clone(),
+            stop_progress: std::sync::Arc::clone(&stop_progress),
+            shutdown_rx: Some(shutdown_rx),
+        })
+        .await;
 
         // Capture WFP + NDIS state after recovery; see
         // `diagnostics::{wfp,ndis}`.
@@ -311,6 +320,90 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     run_result
+}
+
+/// The startup steps of the real service, taken in the order
+/// [`registration::run_startup_steps`] gives.
+struct ServiceStartup<F> {
+    state_dir: PathBuf,
+    log_dir: PathBuf,
+    proxy: std::sync::Arc<tokio::sync::Mutex<crate::proxy_manager::ProxyManager>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    stop_progress: std::sync::Arc<StopProgress<F>>,
+    /// Taken by [`forward_shutdown`](registration::StartupSteps::forward_shutdown),
+    /// which runs once.
+    shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl<F> registration::StartupSteps for ServiceStartup<F>
+where
+    F: Fn(StopPhase) -> std::io::Result<()> + Send + Sync + 'static,
+{
+    async fn repairs(&mut self) {
+        // A failure never stops this start (see `run_startup_repairs`).
+        if let Err(e) = tokio::task::spawn_blocking(registration::run_startup_repairs).await {
+            warn!(error = %e, "startup repairs task panicked");
+        }
+    }
+
+    async fn recover_dns(&mut self) {
+        // DNS recovery runs first of the state recoveries; see crate::dns::recovery
+        // docs for ordering.
+        let state_dir = self.state_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir)).await
+        {
+            tracing::warn!(error = %e, "recover_dns_config task panicked");
+        }
+    }
+
+    fn forward_shutdown(&mut self) {
+        let shutdown_rx = self
+            .shutdown_rx
+            .take()
+            .expect("the startup forwards the Stop once, so the receiver is still here");
+        let shutdown = self.shutdown.clone();
+        let stop_progress = std::sync::Arc::clone(&self.stop_progress);
+        tokio::spawn(async move {
+            service_stop::forward_stop(&stop_progress, shutdown_rx, || shutdown.cancel()).await;
+        });
+    }
+
+    async fn recover_routes(&mut self) {
+        crate::route_recovery::recover_and_record(&self.state_dir, &self.proxy).await;
+    }
+
+    async fn reconcile(&mut self) {
+        // Reconcile the persisted target before any GUI or client can connect.
+        // Must run after route recovery; see reconcile_once.
+        crate::reconciler::reconcile_once(&self.state_dir, None, &self.proxy, &self.shutdown).await;
+    }
+
+    async fn reap_plugins(&mut self) {
+        let state_dir = self.state_dir.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir)).await
+        {
+            tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
+        }
+    }
+
+    async fn sweep_crash_markers(&mut self) {
+        // Native-crash observability: sweep crash markers left by a
+        // previously-crashed service bridge. Markers land in the service log dir
+        // (C:\ProgramData\hole\logs), NOT state_dir.
+        let log_dir = self.log_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir)).await {
+            tracing::warn!(error = %e, "crash sweep task panicked");
+        }
+    }
+
+    async fn sweep_old_binaries(&mut self) {
+        // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
+        // (it fails while an old process still maps the renamed inode).
+        if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
+            tracing::warn!(error = %e, "old-binary sweep task panicked");
+        }
+    }
 }
 
 /// The `StopPending` status reported while `phase` is in progress.
@@ -433,18 +526,6 @@ fn service_log_dir() -> PathBuf {
     hole_common::update_marker::service_log_dir()
 }
 
-/// System state directory for the Windows service (`C:\ProgramData\hole\state`).
-///
-/// Holds the bridge crash-recovery state files (`bridge-dns.json`,
-/// `bridge-routes.json`, `bridge-plugins.json`). Writable by LocalSystem;
-/// pre-created by `install()` so the service has somewhere to write on its
-/// first run.
-fn service_state_dir() -> PathBuf {
-    PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
-        .join("hole")
-        .join("state")
-}
-
 /// Install the bridge as a Windows Service.
 ///
 /// The service is registered to run
@@ -457,24 +538,50 @@ fn service_state_dir() -> PathBuf {
 /// refresh (see `cutover::run_detached`), which also brings an install base that
 /// predates this config up to date — so a bare `install()` is not the only path
 /// that provisions it.
-pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
+pub fn install(binary_path: &Path) -> std::io::Result<()> {
+    install_as(binary_path, InstallStart::Automatic)
+}
+
+/// [`install`] with the start type the service is registered with.
+pub fn install_as(binary_path: &Path, start: InstallStart) -> std::io::Result<()> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
-    )?;
+    )
+    .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
 
     let log_dir = service_log_dir();
-    let state_dir = service_state_dir();
+    let state_dir = crate::cutover::service_state_dir();
     // Create log + state dirs during install (running elevated) so the service
     // itself (running as LocalSystem) can write to them on its first run.
     let _ = std::fs::create_dir_all(&log_dir);
     let _ = std::fs::create_dir_all(&state_dir);
 
-    let service_info = ServiceInfo {
+    let service_info = service_info(binary_path, start, log_dir, state_dir);
+
+    // Re-entrant: the elevated install holds it already, and this hold then
+    // ends nothing. Held here too, a lone `install` marks and ends its change.
+    let held = hold_start_type()?;
+    registration::install_service(&mut NewService {
+        manager: &manager,
+        info: &service_info,
+        held: &held,
+    })?;
+    info!("Windows service installed");
+    Ok(())
+}
+
+/// What `install` registers: the bridge as `LocalSystem`, running
+/// `<binary_path> bridge run --service --log-dir <log> --state-dir <state>`.
+fn service_info(binary_path: &Path, start: InstallStart, log_dir: PathBuf, state_dir: PathBuf) -> ServiceInfo {
+    ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(SERVICE_DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
+        start_type: match start {
+            InstallStart::Automatic => ServiceStartType::AutoStart,
+            InstallStart::LeaveDisabled => ServiceStartType::Disabled,
+        },
         error_control: ServiceErrorControl::Normal,
         executable_path: binary_path.to_path_buf(),
         launch_arguments: vec![
@@ -489,20 +596,43 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
-    };
-
-    let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
-
-    service.set_description(SERVICE_DESCRIPTION)?;
-    // Auto-restart is hardening, applied on the just-created handle (no re-open,
-    // which can race SCM propagation right after create_service). Best-effort: the
-    // service is installed regardless — failing the whole install (an MSI custom
-    // action) over the restart config would be worse than shipping without it.
-    if let Err(e) = apply_failure_actions(&service) {
-        warn!(error = %e, "could not configure SCM restart-on-failure; service installed without auto-restart");
     }
-    info!("Windows service installed");
-    Ok(())
+}
+
+/// The steps of [`install`] against the SCM.
+struct NewService<'a> {
+    manager: &'a ServiceManager,
+    info: &'a ServiceInfo,
+    /// The hold of the change this install is part of.
+    held: &'a Held,
+}
+
+impl registration::NewServiceSteps for NewService<'_> {
+    type Service = windows_service::service::Service;
+
+    fn create(&mut self) -> std::io::Result<Self::Service> {
+        self.manager
+            .create_service(self.info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+            .map_err(|e| scm_failure(ScmCall::CreateService, e))
+    }
+
+    /// The registration made a key with no change mark: it is marked before any
+    /// other step, so a status read between here and the end of the change sees
+    /// one in progress.
+    fn registered(&mut self) {
+        self.held.mark_again();
+    }
+
+    /// The description and the service SID type (what lets an uninstall tell the
+    /// service's process from a stranger that reuses its id) are required: their
+    /// failure fails the install.
+    fn configure(&mut self, service: &Self::Service) -> std::io::Result<()> {
+        registration::configure_new_service(service)
+    }
+
+    fn failure_actions(&mut self, service: &Self::Service) -> std::io::Result<()> {
+        apply_failure_actions(service)
+    }
 }
 
 /// Restart-on-failure SCM actions. Fires on a crash / non-zero exit, not a
@@ -520,41 +650,81 @@ fn restart_failure_actions() -> ServiceFailureActions {
     }
 }
 
+/// The rights a handle needs for [`apply_failure_actions`]: `CHANGE_CONFIG` for
+/// `ChangeServiceConfig2W`, and `START` because the actions include a restart
+/// ([`ChangeServiceConfig2W`, `SERVICE_CONFIG_FAILURE_ACTIONS`](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w)):
+/// "If the service controller handles the SC_ACTION_RESTART action, hService
+/// must have the SERVICE_START access right."
+const FAILURE_ACTIONS_ACCESS: ServiceAccess = ServiceAccess::CHANGE_CONFIG.union(ServiceAccess::START);
+
 /// Write the restart-on-failure SCM config to an open `HoleBridge` handle (needs
-/// `CHANGE_CONFIG`): the `Restart` action plus the non-crash-failures flag (so a
+/// [`FAILURE_ACTIONS_ACCESS`]): the `Restart` action plus the non-crash-failures flag (so a
 /// graceful `Stopped(1)` from a failed bind is restarted too, while a clean
 /// `Stopped(0)` user/cutover stop is not).
-fn apply_failure_actions(service: &windows_service::service::Service) -> Result<(), windows_service::Error> {
-    service.update_failure_actions(restart_failure_actions())?;
-    service.set_failure_actions_on_non_crash_failures(true)
+fn apply_failure_actions(service: &windows_service::service::Service) -> std::io::Result<()> {
+    service
+        .update_failure_actions(restart_failure_actions())
+        .and_then(|()| service.set_failure_actions_on_non_crash_failures(true))
+        .map_err(|e| scm_failure(ScmCall::ChangeServiceConfig2, e))
 }
 
 /// Open the installed `HoleBridge` service and apply the restart-on-failure
 /// config. Idempotent (a re-apply re-writes the same config). Called by the
 /// cutover child so an install base predating this config is brought up to date
-/// as part of the update itself.
-pub fn ensure_failure_actions() -> Result<(), windows_service::Error> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)?;
+/// as part of the update itself. Under the start-type lock: a retirement in
+/// progress has turned them off, and this would turn them back on under it.
+pub fn ensure_failure_actions() -> std::io::Result<()> {
+    let _held = StartTypeLock::machine_wide().acquire()?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
+    let service = manager
+        .open_service(SERVICE_NAME, FAILURE_ACTIONS_ACCESS)
+        .map_err(|e| scm_failure(ScmCall::OpenService, e))?;
     apply_failure_actions(&service)
+}
+
+/// Takes the start-type lock for a change that spans several of this module's
+/// calls (the elevated install: it reads the start type, retires, registers,
+/// repairs and starts). The calls each take the lock themselves; this thread
+/// already owns it, so they proceed, and no other thread's retirement, repair
+/// or enable runs between them. Hold it on the thread that runs the calls: a
+/// mutex belongs to its thread, and a call from another one would wait on this
+/// one for good.
+pub fn hold_start_type() -> std::io::Result<Held> {
+    hold_start_type_noting(&StartTypeLock::machine_wide(), start_type_lock::log_wait)
+}
+
+/// [`hold_start_type`] for the process that must never wait: the cutover child
+/// carries the service's SID, and a change holding the lock waits for it.
+/// `None`: another thread holds the lock.
+pub fn try_hold_start_type() -> std::io::Result<Option<Held>> {
+    StartTypeLock::machine_wide().try_acquire()
+}
+
+/// [`hold_start_type`] over `lock`, calling `on_busy` if another holds it.
+fn hold_start_type_noting(lock: &StartTypeLock, on_busy: impl FnOnce()) -> std::io::Result<Held> {
+    lock.acquire_noting_wait(on_busy)
 }
 
 /// Stop and uninstall the bridge Windows Service.
 ///
-/// The stop is FATAL here, not the best-effort it used to be. `DeleteService`
-/// against a still-running service *succeeds* — it only marks the entry for
-/// deletion — and from that moment `OpenService` answers
-/// `ERROR_SERVICE_MARKED_FOR_DELETE`, so nothing can send the service a stop
-/// control ever again and no retry can even find it. The registration is the
-/// only handle a later attempt has; keeping it over a failed stop is what
-/// makes the uninstall retryable instead of terminal (bindreams/hole#1003).
+/// The stop is FATAL here, not best-effort. `DeleteService` against a
+/// still-running service *succeeds*: it only marks the entry for deletion, and
+/// the service keeps running until stopped. The registration is the handle a
+/// later attempt has, so keeping it over a failed stop is what makes the
+/// uninstall retryable instead of terminal.
+///
+/// The stop, the delete and the check after it are one SCM session
+/// ([`retire`](crate::service_scm::retire::retire)) under the start-type
+/// lock ([`StartTypeLock`]), because the service
+/// carries restart-on-failure: a service the SCM is about to restart reads
+/// STOPPED, and separate probes and acts each decided on a state the SCM could
+/// change under them. A service already
+/// marked for deletion still opens, and is stopped through its handle.
 pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
-    stop()?;
-
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE)?;
-    service.delete()?;
-    info!("Windows service uninstalled");
+    if retire_service(Disposition::Deregister)? {
+        info!("Windows service uninstalled");
+    }
     Ok(())
 }
 
@@ -566,116 +736,119 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
 /// has a row for it are independent facts, and the fail-closed covers are held
 /// by the live process, not by the row. See `setup::uninstall_bridge_with`.
 ///
-/// An absent row — never registered, or already marked for deletion by a prior
-/// `DeleteService` — is `Ok`: there is no handle SCM could act through, so
-/// there is nothing here to fail over. The cover release that follows carries
-/// the real guarantee; it holds the bridge's own liveness lock and refuses
-/// outright if a bridge is still alive.
-///
-/// The stop is issued FIRST and its own failure is what gets classified. The
-/// predecessor opened the service to classify SCM's answer, dropped that
-/// handle, and then called [`stop`], which opens again — so the classification
-/// was applied to a handle deliberately thrown away before the act, and the
-/// act's open answered `ERROR_SERVICE_DOES_NOT_EXIST` unclassified whenever
-/// the row went away in between (a concurrent uninstall attempt's
-/// `DeleteService`, or the row being finalised as its last handle closed).
-/// The uninstall then refused to deregister over a service provably not
-/// running. A probe answers about the moment it was taken; only the act's own
-/// error is about the act.
+/// An absent entry (never registered) is `Ok`: there is nothing here to fail
+/// over. A service marked for deletion by a prior `DeleteService` still opens,
+/// so it is stopped like any other; if it has nothing to wait on and its state
+/// is live, that is an error. The cover release that follows carries the real
+/// guarantee; it holds the bridge's own liveness lock and refuses outright if a
+/// bridge is still alive.
 pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
-    match stop() {
-        Ok(()) => Ok(()),
-        Err(e) if stop_error_is_absent(&*e) => {
-            info!("no Windows service registration to stop");
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+    retire_service(Disposition::StopOnly).map(|_| ())
 }
 
-/// The SCM status codes that mean there is no service row left to act through.
-/// `ERROR_SERVICE_MARKED_FOR_DELETE` counts: the row survives only until its
-/// last handle closes, and no handle opened through it can carry a control.
-///
-/// One table, two spellings below, because the layers report it in two: a
-/// Win32 status and the `HRESULT` the `windows` bindings widen it to.
-const ABSENT_SERVICE_CODES: [WIN32_ERROR; 2] = [ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE];
-
-fn is_absent_service_code(code: i32) -> bool {
-    ABSENT_SERVICE_CODES.iter().any(|c| c.0 as i32 == code)
+/// [`retire_over`] on a fresh session. `Ok(false)` when the SCM has no entry to
+/// act on, after waiting out any process of it that outlived the entry;
+/// `Ok(true)` when the retirement ran.
+fn retire_service(disposition: Disposition) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(retire_over(RetireSession::open()?, disposition)?)
 }
 
-fn is_absent_service_hresult(code: HRESULT) -> bool {
-    ABSENT_SERVICE_CODES.iter().any(|c| code == HRESULT::from_win32(c.0))
-}
-
-/// Whether an `open_service` failure means SCM has no service left to act on.
+/// Whether an `open_service` failure means the entry does not exist.
 fn open_error_is_absent(e: &windows_service::Error) -> bool {
     let windows_service::Error::Winapi(io) = e else {
         return false;
     };
-    io.raw_os_error().is_some_and(is_absent_service_code)
+    io.raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .and_then(ServiceGone::of_code)
+        .is_some_and(ServiceGone::is_absent_at_open)
 }
 
-/// Whether a failed [`stop`] failed BECAUSE SCM has no service left to act on.
-///
-/// [`stop`] reaches SCM through three layers and each reports that same answer
-/// in its own shape, so the classification has to span all three or it is a
-/// classification of whichever layer happened to speak:
-///
-/// - `windows_service`'s `open_service` raises `Error::Winapi(io)`, carrying
-///   the Win32 status as an OS error;
-/// - `cutover::scm_wait`'s `SystemScmActor::open` calls `OpenServiceW` through
-///   the `windows` bindings and re-wraps their `HRESULT`-carrying error in
-///   `io::Error::other`, where it survives as a nested error and NOT as an OS
-///   code;
-/// - `NotifyServiceStatusChangeW` returns a bare Win32 status, which
-///   `stop_via_notify` turns into `io::Error::from_raw_os_error` (it completes
-///   with `ERROR_SERVICE_MARKED_FOR_DELETE` when the row is deleted under it).
-///
-/// Whichever layer it came from, the fact is the same one
-/// [`open_error_is_absent`] reads, and the consequence for the caller is the
-/// same: nothing SCM could stop, so nothing to fail over.
-fn stop_error_is_absent(e: &(dyn std::error::Error + 'static)) -> bool {
-    if let Some(service) = e.downcast_ref::<windows_service::Error>() {
-        return open_error_is_absent(service);
+/// Puts the service's start type right before an elevated path starts it, and
+/// says what it found ([`repair::repair`]): the Disabled start type an
+/// interrupted uninstall left is reset to automatic and the record cleared; a
+/// Disabled start type with no record is an administrator's and is left, and
+/// the caller does not start the service. With no service registered there is
+/// nothing to repair: the record lived in the service's key. Waits for the
+/// start-type lock, so it never repairs a retirement that is still running.
+pub fn repair_interrupted_change() -> std::io::Result<RepairStep> {
+    let Some(mut session) = RepairSession::open(REPAIR_ACCESS)? else {
+        return Ok(RepairStep::Nothing);
+    };
+    let step = repair::repair(&mut session).map_err(std::io::Error::other)?;
+    match step {
+        RepairStep::Nothing => {}
+        RepairStep::ClearRecordOnly => {
+            info!("swept a record that an uninstall disabled a service that is not disabled")
+        }
+        RepairStep::ResetThenClear => {
+            info!("an interrupted uninstall had left the service disabled; set it to automatic")
+        }
+        RepairStep::LeaveDisabled => info!("the service is disabled on this computer, and is left disabled"),
     }
-    if let Some(win32) = e.downcast_ref::<windows::core::Error>() {
-        return is_absent_service_hresult(win32.code());
-    }
-    if let Some(io) = e.downcast_ref::<std::io::Error>() {
-        return io.raw_os_error().is_some_and(is_absent_service_code)
-            || io.get_ref().is_some_and(|inner| stop_error_is_absent(inner));
-    }
-    false
+    Ok(step)
+}
+
+/// Who disabled the service, if it is disabled, for an elevated caller: an
+/// unreadable start type is its error, because the caller acts on it.
+/// A record that cannot be read counts as present. Waits for the start-type
+/// lock, so the answer is never a retirement's half-done state.
+pub fn disabled_by() -> std::io::Result<Option<DisabledBy>> {
+    let Some(mut session) = RepairSession::open(READ_ACCESS)? else {
+        return Ok(None);
+    };
+    let step = repair::observe(&mut session).map_err(|e| std::io::Error::other(repair::RepairError::StartType(e)))?;
+    Ok(step.disabled_by())
+}
+
+/// [`disabled_by`] for a reader that must never fail (the GUI's status, which
+/// runs unprivileged). It never touches the start-type lock: a record whose
+/// writer is still running, or a change mark whose holder is, means a
+/// retirement, repair, enable or install is changing the start type, and the
+/// answer is [`DisabledState::InChange`], neither of the two it would give. A service it cannot open or read is "not disabled", and
+/// the reason is logged, the convention of [`is_installed`].
+pub fn disabled_state() -> DisabledState {
+    let mut session = match StatusSession::open() {
+        Ok(Some(session)) => session,
+        Ok(None) => return DisabledState::NotDisabled,
+        Err(e) => {
+            warn!(error = %e, "could not open the service to read whether it is disabled");
+            return DisabledState::NotDisabled;
+        }
+    };
+    repair::display(&mut session)
+}
+
+/// Sets the service's start type to automatic, clears the record, and starts
+/// it: the administrator's explicit request to undo a disable, whoever made
+/// it. A service already running is success. Holds the start-type lock from
+/// the first write to the start.
+pub fn enable() -> std::io::Result<()> {
+    let Some(mut session) = RepairSession::open(ENABLE_ACCESS)? else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the Hole service is not installed",
+        ));
+    };
+    repair::enable(&mut session).map_err(std::io::Error::other)?;
+    session.start()?;
+    info!("Windows service enabled and started");
+    Ok(())
 }
 
 // Start/stop ==========================================================================================================
 
 /// Start the Windows Service via SCM.
-pub fn start() -> Result<(), windows_service::Error> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::START)?;
-    service.start::<&str>(&[])?;
+pub fn start() -> std::io::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::START)
+        .map_err(|e| scm_failure(ScmCall::OpenService, e))?;
+    service
+        .start::<&str>(&[])
+        .map_err(|e| scm_failure(ScmCall::StartService, e))?;
     info!("Windows service started");
-    Ok(())
-}
-
-/// Send a stop control to the service and wait until it is really stopped via
-/// `NotifyServiceStatusChangeW` — a kernel rendezvous on the STOPPED transition,
-/// not a sleep-poll. Returns immediately when already stopped.
-pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)?;
-    if service.query_status()?.current_state == ServiceState::Stopped {
-        return Ok(());
-    }
-    drop(service);
-
-    info!("stop signal sent, waiting for service to stop");
-    let mut actor = crate::cutover::scm_wait::SystemScmActor::open(SERVICE_NAME)?;
-    crate::cutover::scm_wait::stop_via_notify(&mut actor)?;
-    info!("Windows service stopped");
     Ok(())
 }
 

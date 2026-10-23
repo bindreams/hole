@@ -888,6 +888,12 @@ leaves working DNS + broken routes, not the inverse):
   [Route ownership](#route-ownership). The same call also sweeps a stale
   [fail-closed cover](#fail-closed-cover) (Windows by fixed WFP GUID, macOS via
   `bridge-failclosed.json`).
+- **`HoleDisabledByHole`** (Windows; a registry value under the service's
+  own key, not a file in `<state_dir>`) — present while an uninstall's Disabled
+  start type is in force; `repair_interrupted_change` (the cutover child,
+  `bridge install`) and the next retirement reset what it names and sweep a
+  stale one. It goes with the service's key. See
+  [A Disabled service](#a-disabled-service-whose-disable-it-is).
 - **`bridge-failclosed.json`** (macOS only) — the `pfctl -E` enable token of an
   engaged fail-closed cover; `routing::failclosed::recover_cover` restores
   `/etc/pf.conf` and drops the refcount. Windows keys its cover by fixed WFP
@@ -1892,11 +1898,253 @@ are the whole of #1003's second half:
   concurrent uninstall attempt, an operator's own bootout, the daemon exiting
   and being reaped — after which the act fails over a bridge that is provably
   stopped and the uninstall refuses to deregister it. Windows classifies the
-  failed `stop()` (`windows::stop_error_is_absent`, which spans all three
-  layers the stop reaches SCM through); macOS asks launchd what it has *after*
+  failed stop (`RetireError::means_service_is_gone`, over the typed
+  `ScmCallError` or a bare OS code); macOS asks launchd what it has *after*
   the bootout (`macos::ensure_stopped_verdict`), because launchd's exit code
   for "no such job" differs by subcommand and is not a classification to build
   on.
+
+###### The Windows stop is one SCM session, decided by observation
+
+The service carries restart-on-failure (1 s), so a killed or crashed bridge is
+STOPPED, then START_PENDING, then RUNNING again within a second, and the SCM
+refuses `ControlService(STOP)` in every state but RUNNING. A stop decided from a
+state read before its act loses that race, so four rules close it:
+
+- **Every step is decided on a look.** `service_scm::settle::settle_stopped` loops
+  over looks at the service (state, the process it names, the fate of that
+  process) and `Look::settle_step` is the one decision. A Stop goes out only into
+  RUNNING over a process that has not exited; START_PENDING, STOP_PENDING and a
+  RUNNING that names an exited process are left by the SCM's own transition;
+  STOPPED is final only with no held process alive and a scan of the host that
+  itself finds no process carrying the service's token ("Only a scan ends the
+  wait", below). A wait for the SCM's reaction to
+  our own Stop arms **before** the Stop (`arm_leaving`: every state but the one
+  the service is in), so the Stop's effect is a state entry after the arm. A
+  wait for the SCM's own transition arms, looks again, and sleeps only if that
+  look still asks for the same wait, because an arm that excludes the current
+  state fires on the next transition and never for a state the service merely
+  stays in (measured), so a restart that completed before the arm is found by
+  the second look. Each arm is taken on handles opened for it, which closing
+  cancels, and a fresh-handle arm fires at once for a state in its mask
+  (measured). A Stop that fails is an error only if the look after it still
+  finds the service RUNNING over a process; any other state was a race with the
+  service's own change, whatever code answered. Every failing SCM call, including
+  the `windows_service` ones whose own error displays only as "IO error in winapi
+  call", is a typed `ScmCallError` naming the call and the Win32 code, and
+  reaches `gui-cli.log` that way.
+- **One session.** `service_scm::retire::retire` (both `ensure_stopped` and
+  `uninstall` run it over `windows::RetireSession`) opens the service once,
+  before anything changes, and runs **harden, settle, then restore or delete**.
+  Harden writes the record that the disable is ours (see
+  [A Disabled service](#a-disabled-service-whose-disable-it-is)), disables the
+  start type, and turns restart-on-failure off. The disabled start type is what
+  makes STOPPED final: Microsoft documents that the service "must be explicitly
+  disabled to prevent it from restarting" (`ChangeServiceConfig2W`, Remarks),
+  and the `..._probe_disabled_refuses_*` probes can only falsify that and have
+  not. `StopOnly` restores the failure actions and the start type; `Deregister`
+  deletes **last**, and nothing touches the handle after the delete. A failure
+  before the delete restores and returns the step's own error; a failed
+  failure-actions write only warns. An entry that is already gone is `Ok`, so a
+  row that leaves between the `is_installed` probe and the act is not a failed
+  uninstall.
+- **The process, not the state, is what is waited out.** The SCM reports STOPPED
+  before the process has exited, and `dwProcessId` is 0 once it has, so every
+  process the service shows (the first look, and every stop-wait callback that
+  names one) is opened for `SYNCHRONIZE` (and `PROCESS_QUERY_LIMITED_INFORMATION`,
+  to read its token) while it is named, and the settle ends with a wait on all of
+  them: `uninstall` and `ensure_stopped` return with no service process left. The
+  update cutover's stop runs the same loop over the same `windows::StopSession`
+  (`RetireSession` delegates its stop to it), so it too returns with none left,
+  bar its own process: the cutover child carries the bridge's token, and the
+  scan skips the calling process. The service *row* is not waited for; the SCM
+  removes it once the handles close.
+- **Only a scan ends the wait.** The
+  host listing is a snapshot (the system process list, `NtQuerySystemInformation`,
+  which also gives each process's creation time), and a process in it can start a
+  child after the snapshot, then exit before it is probed or looked at. So the stop
+  wait and the removed-entry wait end only on a scan whose own alive list is empty
+  and that probed every listed process (`scan::ScanFinding::Nothing`). What an
+  earlier scan held and saw exit proves nothing, and a process the listing named
+  that no process had at its probe, or that had exited by then
+  (`ScanResult::vanished`), forces another scan: it may have started a process the
+  listing does not show, which the next listing, taken after its exit, does. The
+  listing must be complete: a failed read is returned, never a short list, and the
+  System Idle Process (id 0, which is listed and never opens, measured) is left out
+  so it cannot read as vanished on every pass. A process that has exited is not in
+  a later listing (measured, with its handle still held; the list's zero-thread
+  entries are dropped too). A probe checks the creation time of the process it opened against
+  the listing's: an id held by a process created at another time is the OS's
+  reuse of it, the listed process is gone at its probe (a stranger's token says
+  nothing about a child the listed process started), and another scan follows.
+  The exemption that ends the rescan of a process that never
+  opens keys it by id AND creation time (`scan::ListedProcess`), because the OS
+  hands an id to a new process, and that process can have started a child after
+  the listing and exited before its probe. Passes repeat without a count or a
+  timer; each one is a real scan, and each is separated from the last by the
+  exit of what it found alive. Any other process on the host that exits
+  between a listing and its probe also costs one more scan.
+- **No wait here has a bound.** Each is the exit of a process the SCM has been
+  told to stop, or an SCM notification, and every iteration of the loop ends in
+  one of those or in a state change a query read; nothing retries on a count or
+  a timer. A bridge that never exits on its stop hangs the uninstall. That is the
+  owner's ruling: no hang of that kind is on record, so no bound is built, and
+  the trail a hang leaves is the `stop wait:` and `held = N` lines the wait logs
+  (bridge.log for the service, `gui-cli.log` for the CLI) beside the SCM's own
+  checkpoints. A wait later seen to hang is fixed at its cause. That holds for
+  the service's own process, the one the SCM named in a state whose id is valid
+  (RUNNING, `Origin::Named`) and told to stop, even when it outlives its
+  STOPPED: it is waited on, with no bound. The exception is a process the SCM's
+  Stop is not known to reach. Once the SCM reports STOPPED
+  (`ExitWait::TerminateOrphansThenWait`, chosen from the look alone), or the
+  entry is gone, every such **orphan** is terminated (`TerminateProcess`, with
+  `SeDebugPrivilege` enabled first, which an elevated administrator holds
+  disabled) and then waited on. Two kinds are orphans: a process only a scan
+  found carrying the service's token (a plugin left by a crashed bridge, a
+  cutover child left suspended: the SCM tells them nothing, and they would hold
+  the machine-wide lock for ever), and a process first held on an id the SCM
+  named in START_PENDING or STOP_PENDING (`Origin::Claimed`: the id "may not be
+  valid", so a SID-carrying stranger that took it would otherwise be waited on
+  for ever). The service is Disabled, so nothing starts another. A claimed
+  process is the real service mid-stop as often as not, so before STOPPED it is
+  waited on like a named one; at STOPPED the SCM's Stop and the bridge's
+  teardown are done, and only process exit remains, which is what owner
+  2026-10-20 [2/7] a asks not to bound for a bridge that never finishes its stop,
+  not for one found only by a late scan. A claim that settles makes a process the
+  service's: the SCM naming a held process again in RUNNING makes it `Named`
+  (`ReportedPid::is_a_claim_about_the_service`), and nothing else does. A scan
+  that finds the process the SCM named does not make it an orphan. While the
+  service is not STOPPED, the wait covers only the processes the SCM named,
+  validly or not (`ProcessHolds::awaited`): a scanned orphan has no Stop on its
+  way and may be a live bridge's plugin still being torn down, so it is neither
+  waited on nor terminated until the SCM reports STOPPED or the entry is gone.
+  Which of these a process is, and what each is waited on or ended for, is one
+  exhaustive match per question on `Origin`, never a match at a call site. A
+  service marked for deletion refuses every arm, so there the loop has no event
+  but a named process's exit; with only a scanned orphan alive outside STOPPED
+  it has none, and the result is the SCM's refusal of the arm (as for any live
+  state with nothing to wait on), not a wait on the orphan.
+- **A process id the SCM names is a claim; the service SID in the token is the
+  identity.** Microsoft documents that the id
+  ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks))
+  "is valid provided that the state of the service is one of SERVICE_RUNNING,
+  SERVICE_PAUSE_PENDING, SERVICE_PAUSED, or SERVICE_CONTINUE_PENDING. If the
+  service is in a SERVICE_START_PENDING or SERVICE_STOP_PENDING state, however,
+  the process identifier may not be valid, and if the service is in the
+  SERVICE_STOPPED state, it is never valid." START_PENDING and STOP_PENDING are
+  states the stop wait acts on, so no state makes the id safe to
+  trust. `hole bridge install` therefore gives the service a service SID
+  (`registration::configure_new_service`, which the privileged tests' service
+  fixture also calls; `ChangeServiceConfig2`, `SERVICE_CONFIG_SERVICE_SID_INFO`,
+  `SERVICE_SID_TYPE_UNRESTRICTED`), which the SCM puts as `NT SERVICE\HoleBridge`
+  into the token of every process it starts as the service; the children such a
+  process spawns (ex-ray, galoshes, `SystemTool` children) inherit the token and
+  carry it too. An in-app update (cutover) is run by the old release's code, which
+  never sets the type, so the `--service` bridge also makes sure of it at
+  startup (`registration::run_startup_repairs`, called first in `run_service` once
+  it reports Running, before any recovery, reconcile or sweep that could wedge or
+  be stopped; `ensure_own_service_sid` is its one repair): it reads its own
+  service's type and writes
+  `SERVICE_SID_TYPE_UNRESTRICTED` only when that differs, so an ordinary start
+  writes nothing. A failure is a warning and the start goes on, since the SID
+  gates only the uninstaller's wait and a bridge that would not start for it
+  locks the user out. The SCM applies the type at the service's next start (a
+  reboot or the next update); none is forced, and the uninstaller's check is
+  unchanged. A process is opened by id and its token read
+  (`ProcessSource::open`, `ServiceSid::is_in_token_of`); it is kept only if the
+  token carries the SID. A reused id fails that in every state unless its new
+  owner is a child of the service. A token that cannot be read is decided by
+  the state the id was read in (`Basis::verdict`): where the id is documented
+  valid (RUNNING) the process is the service's own, so one that cannot be opened
+  or read fails the retirement (`RetireError::Hold`); where it may be invalid (the
+  pending states) a denial is a stranger that reused the id
+  (`Named::NotTheService`); a scanned process's denial is another principal's.
+  A restarted instance of the same service carries the SID too, which
+  is right: it is still the service's. `ProcessHolds::hold_current` still confirms the open: read the
+  service, open the pid it names, read again, and act on the open only if the
+  second read names the same pid; otherwise drop the handle and act on the
+  second read, so a service that keeps changing is followed. A live process
+  without the SID is `Named::NotTheService`: it is closed, never held and never
+  waited on, and its `ProcessFate` is `Unheld` (not `Exited`: a live process
+  that merely is not proven the service's is not evidence that the service's
+  process is gone). That is also what a service process started before the SID
+  type was set looks like, so on such a host the exit of the process is not
+  awaited, and the stop and the SCM's own notifications are all that is, until
+  the start after the one that ran the startup repair above. This gap is accepted (owner 2026-10-21): it is
+  the one-time window after an in-app update from a release without the SID type,
+  and it closes at that host's next service start.
+
+A held process is also the ground truth for whether the status is current: the
+SCM's status can lag a process's exit by its own latency, so a process that has
+exited (a zero-timeout wait on the held handle) counts as gone **whatever state
+the SCM still reports**. An id no process has counts the same only where
+Microsoft documents the id as valid (`Observed::reported_pid`: RUNNING). In
+START_PENDING and STOP_PENDING the id "may not be valid", so an id no process
+has is a fact about the id, not about the service: the look is `Unheld` and the
+wait rests on the SCM's own transition. The stop wait treats an exit as
+stopped (`Look::settle_step`): a Stop that failed because the
+process died under it is explained, not an error, and a RUNNING or STOP_PENDING
+status over a dead process is not waited on. The failure that remains is a Stop
+refused by a process that is still alive. A refusal to open the process at all
+(`OpenProcess` access denied, say) is its own `RetireError::Hold` naming the call
+and the code; it is not "the service did not stop".
+
+**A service marked for deletion** (by us mid-flight, or by anyone else) still
+opens, queries and takes a Stop (measured), so it is stopped through the handle
+and waited out on process handles like any other. What Microsoft documents as 1072
+(`ERROR_SERVICE_MARKED_FOR_DELETE`) is handled where it can occur:
+
+- A start-type write (or read) that answers 1072 is `Hardened::Marked`: nothing
+  was disabled, so there is nothing to restore and no delete to issue; the record
+  this call wrote is cleared and the settle loop runs.
+- An arm that is refused with 1072 makes the loop go on without arming
+  (`Settle::without_arm`): it holds what the scan finds and waits on those
+  processes. With a held RUNNING process it never arms at all. A look that shows
+  the service's process gone (the one it named has exited, or an id no process
+  has in a state whose id is valid, or nothing named and every held process
+  exited) settles the wait once a scan finds nothing.
+- A `DeleteService` that answers 1072 is a success: someone else's delete got
+  there first.
+- The one state with no event to wait on is a live or pending state with nothing
+  ever held and no arm possible (a process without the service SID, or
+  START_PENDING before its process exists). It fails with the refusal, naming the
+  state: retryable, reported, never `Ok`.
+
+**A gone entry** (1060 at open) is stopped as far as the SCM is concerned, so
+only the scan can see a process of it that lingers. `wait_out_survivors` scans,
+holds, terminates and waits for the held processes, and scans again until a scan
+finds nothing alive and loses no listed process; no hit is `Ok(false)`, the
+common never-registered answer. The survivors hold the start-type lock the open
+took (`Opening::Absent` carries them), so an install cannot register and start
+the service under the wait.
+
+What is measured and what is not. **Measured** in this project's Windows CI
+(privileged tests and probes, `cutover_global_net_state_*`): `OpenService` on a
+marked service succeeds; `ControlService(STOP)` on a running marked service
+works, as do queries and an arm on a handle opened before the mark; the host scan
+finds the marked service's live process, from an elevated administrator and from
+SYSTEM; a Stop is refused 1052 in START_PENDING after the process attaches and
+1062 before it attaches and in STOPPED with a restart pending; a four-state arm
+reports the current state at once; `StartService` on a marked, STOPPED service is
+refused 1058 (disabled), not 1072; the SCM reports STOPPED for a killed process;
+the service SID type takes effect at the next service start (no reboot); and the
+computed service SID equals `LookupAccountName` and `sc showsid`. The
+`..._uninstall_stops_a_service_marked_before_it_was_opened`,
+`..._marked_between_the_hardening_and_the_stop`,
+`..._of_a_marked_and_already_stopped_service_succeeds` and
+`..._waits_out_a_process_whose_entry_is_already_gone` tests pin the marked and
+gone cases above, and `..._uninstall_smoke_whichever_side_of_the_scm_restart_wins`
+runs the SCM-restart timer race itself (restart delay 0, process killed,
+uninstall at once) five times and asserts no row and no process remains.
+
+**Documented, not measured:** 1072 from an arm, a configuration write, a delete
+or a start on a marked service; 1060 from `OpenService` once the entry is gone;
+that an entry is removed only once every handle is closed and the service is not
+running (`DeleteService`, Remarks). **Unmeasured, and no code depends on it:**
+`QueryServiceConfig` and `ChangeServiceConfig2W` on a marked service (a 1072 from
+the start-type read or write is classified by kind, whichever call it comes from)
+and whether the SCM recovery-restarts a marked service (the loop re-observes and
+stops any instance it sees before it settles).
 
 Steps do not short-circuit each other and the error names all of them; an early
 `?` on the release swallowed the context that explains why it refused.
@@ -1917,6 +2165,259 @@ Two more properties are load-bearing:
   reconciles toward `Off` and sweeps. `HOLE_KEEP_COVERS=1` is the documented
   escape from the gate itself, so a release that can never succeed cannot make
   the product unremovable (see RELEASE-OPS.md).
+
+###### A Disabled service: whose disable it is
+
+A retirement disables the start type so that STOPPED is final, then puts it
+back. A process killed in between leaves a Disabled service that looks exactly
+like one an administrator disabled, and the two want opposite treatment: the
+first is broken, the second is a choice. Two writes cannot be one, so a record,
+the string value `HoleDisabledByHole` under the service's own key
+(`HKLM\SYSTEM\CurrentControlSet\Services\HoleBridge`; see
+[`RecordKey`](crates/bridge/src/disable_record/record_key.rs)), is written
+**before** the Disabled write and cleared only **after** the start type is
+written back (`StopOnly`) or the service is deleted (`Deregister`). Its
+presence is the fact: any value of that name, of any type, is the record. The
+value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
+(`Stamp`), which is what tells a change in progress from an interrupted one.
+**Record and start type together decide, one exhaustive match each**
+(`Hardening::plan`, `RepairStep::of`, `DisabledBy::of`):
+
+| Record  | Start type   | Cutover child, before its start        | `bridge install`                                                              | Retirement's restore                  | GUI                                                                       |
+| ------- | ------------ | -------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------- |
+| present | Disabled     | set Automatic, clear the record, start | the stop sets Automatic and clears the record, re-registers Automatic, starts | Automatic, clear the record           | "an interrupted uninstall or update left Hole's service disabled": Repair |
+| present | not Disabled | clear the record (stale), start        | the stop clears the record, re-registers, start                               | restore as observed, clear the record | nothing                                                                   |
+| absent  | Disabled     | untouched, not started (below)         | registers Disabled again, not started, exits 0                                | stays Disabled                        | "the Hole service is disabled on this computer": Enable                   |
+| absent  | not Disabled | nothing, start                         | start                                                                         | as observed                           | nothing                                                                   |
+
+- **The kill-point invariant.** At no point of a retirement is a service it
+  disabled left Disabled without its record: the record is written first, a
+  failed record write changes nothing, a failed start-type write clears only the
+  record this call wrote, a restore whose start-type write failed leaves the
+  record, and a stale record (present over a service that is not Disabled) is
+  swept by the restore (including the stop `bridge install` runs before it
+  re-registers the service), the delete and the cutover child; a
+  retirement that finds the service marked for deletion sweeps none, and
+  keeps a stale record. The
+  class is pinned by `at_no_point_is_a_service_we_disabled_left_without_a_record`
+  and `a_service_an_administrator_disabled_is_never_touched_at_any_step` (a model
+  of the service and the record, checked after every call, for every start state
+  and every failing, killed or marked call) and, against a real service in CI, by
+  `..._at_every_step_of_a_stop_only_retirement_a_disabled_service_has_its_record`
+  and its `deregistration` twin.
+- **Place, and why not a file.** The record is a registry value rather than a
+  file in `<state_dir>` because the GUI must read it unprivileged and the state
+  directory cannot grant that: it holds the password, so its DACL is protected
+  and names SYSTEM and Administrators only (`target.rs` `state_sddl`), so Users
+  read nothing in it. A service key grants Users read and nothing else, so the
+  GUI reads the value and no user can forge it.
+  The record also dies with the service, so nothing sweeps a record over a
+  service the SCM no longer has, and `repair_interrupted_change` finds nothing
+  to do then. Windows only: the macOS service has no start type and no record.
+- **Role.** The record is a hint about wording and about whether to
+  self-repair. A missing key or value is absent; every other failure to read it
+  (the key refuses the open, the query fails) leaves its existence unknown and
+  counts as present on every path (`RecordKey::state`, which cannot fail),
+  because only a Hole release writes the value. None ever blocks an uninstall,
+  an install, a cutover or a connect: a record that could block them is the
+  lockout this design removes, and the MSI goes on to remove files under a
+  running service when the uninstall fails. A write needs the key and fails
+  without it (nothing else has changed yet, and a key made there would outlive
+  the service); a clear with no key or no value is success.
+- **One lock, from the first read to the last write.** Every path that reads
+  the start type and the record and then writes either holds the machine-wide
+  mutex `HoleBridgeStartTypeLock\Lock`
+  ([`StartTypeLock`](crates/bridge/src/platform/windows/start_type_lock.rs)):
+  a retirement (`uninstall`, `ensure_stopped`: the `RetireSession`), the repair
+  and the elevated `disabled_by` read (the `RepairSession`), `enable`,
+  `ensure_failure_actions`, and the update cutover, which holds it from before
+  its stop to after its start, and the elevated `bridge install`, which holds
+  it (`hold_start_type`, taken in `setup::install_bridge_with` before the
+  `disabled_by` read) through the stop, the deregistration, the registration,
+  the repair and the start, so no retirement, repair or enable runs between the
+  read that decides the start type and the registration that acts on it; an
+  install waits for a running uninstall and fails, changing nothing, if it
+  cannot take the lock. The elevated `bridge uninstall` holds it the same way
+  (`setup::uninstall_bridge_with`) through the stop and the deregistration, so
+  no repair or enable runs between the stop's restore and the delete; if it
+  cannot take the lock it leaves the service alone, fails, and still releases
+  the covers, which do not touch the start type. `bridge enable` and the cutover
+  each hold it in one session or hold already, and the cover release, the
+  `release-covers` action and the bridge service itself never read or write the
+  start type. The session owns the guard (its last field), so
+  no start-type read exists without it, and a waiter blocks with no bound,
+  because a retirement waits for the service to stop. Without it overlapping
+  retirements left the service Disabled with no record, and a repair or an
+  `enable` run during a live uninstall reset the start type and cleared the
+  record under it.
+  **Who can take it.** A wait on a mutex takes it, so the right to wait is the
+  right to hold the lock for ever; no one but SYSTEM and Administrators has it.
+  The mutex lives in a *private namespace*
+  ([`namespace.rs`](crates/bridge/src/platform/windows/start_type_lock/namespace.rs);
+  Microsoft: [Object Namespaces](https://learn.microsoft.com/en-us/windows/win32/sync/object-namespaces))
+  whose boundary descriptor requires the Administrators SID, which "the caller
+  must be within ... for the create operation to succeed", and whose DACL names
+  SYSTEM and Administrators, because "a process can open an existing namespace
+  even if it is not within the boundary unless the creator restricted access".
+  "Each namespace is uniquely identified by its name and boundaries", so a
+  namespace made under the same name with another SID is another namespace and
+  cannot stand in for ours (measured). Opening the namespace is not checked
+  against the DACL (measured: a caller it leaves out opens it), but making or
+  opening an object in it is, so a standard user can neither create the
+  namespace before any Hole process does, make or open the mutex in it (squat
+  the name), nor wait on the lock; SYSTEM's token holds Administrators, so the cutover child
+  and an elevated administrator meet on the one lock. Each process makes or
+  opens the namespace once and keeps the handle: the namespace lives while any
+  process holds one (measured), and the mutex is reachable by name only
+  through it. A holder that ends without releasing hands the lock on abandoned,
+  which counts as taken. The thread that holds it may take it again (the
+  cutover's repair step and every step of the install and uninstall do);
+  another thread of the same process does not, so a hold is taken on the thread
+  that runs the steps it covers.
+  **Who must not wait for it.** A process that carries the service's SID is
+  waited for by whoever holds the lock (the scan for the service's processes
+  waits on every one), so such a process that waited for the lock would wait
+  for the holder that waits for it. The only one that takes the lock is the
+  cutover child (`bridge cutover`, spawned by the service): it tries the lock
+  once, before anything else (`run_while_holding`), and if a change holds it
+  the update is abandoned; if it took the lock first it holds it for the
+  whole cutover and the other change waits for it. The same wrapper settles
+  the update marker by how the whole run ended: it stays only for a cutover
+  that started a new bridge to sweep it, and every other ending (an abandoned
+  update, a lock that cannot be tried, any error out of the run such as a
+  staged payload missing a bundled file, a service left disabled) clears it,
+  because the old bridge may keep serving and no new one would bind. The service process
+  (`bridge run`) and the plugins it starts never take the lock.
+  Proofs: the lock's own tests (a second thread waits and gets it once the
+  holder lets go, abandonment, re-entry, a caller outside the boundary, two
+  threads on first use, a namespace another process made, a same-named boundary
+  of another SID), `opening_a_retirement_waits_for_the_start_type_lock` and
+  `opening_for_a_repair_or_an_enable_waits_for_the_start_type_lock` (each
+  opener waits on a holder), `a_child_that_finds_the_lock_held_abandons_the_update_and_the_holder_waiting_for_it_finishes`
+  and `a_holder_that_arrives_during_a_cutover_waits_for_it_and_then_finishes`
+  (both orders of the cutover child and a holder finish), and, in CI,
+  `..._a_token_without_administrators_can_neither_make_open_nor_wait_on_the_start_type_lock`,
+  `..._a_retirement_holds_the_start_type_lock_until_it_ends`,
+  `..._the_cutover_hold_hardens_the_service_and_restores_it` and
+  `..._an_install_holds_the_start_type_lock_through_every_step`; the install's
+  order is `the_install_holds_the_start_type_from_before_its_first_read_to_after_its_last_step`
+  and the uninstall's `the_uninstall_holds_the_start_type_from_before_its_first_step_to_after_its_last`;
+  `the_start_type_hold_is_wired_to_both_elevated_changes` pins who takes it.
+- **The update cutover hardens the service like a retirement.** Its stop is
+  not final on its own: the SCM can restart a service that fails or exits
+  non-zero after the settle's last look, and the old image would run, or race
+  the move-in. So the cutover takes the lock, writes the record, sets the start
+  type Disabled and turns restart-on-failure off (`retire::harden`, the
+  retirement's own), then stops and swaps; it puts the failure actions, the
+  start type and the record back (`retire::restore_hardened`) before the repair
+  step and the start, on every path out of the swap, and lets go of the lock
+  after the start (`run_cutover`, `ServiceHold`). A cutover killed between the
+  hardening and the restore leaves what a killed retirement leaves: a Disabled
+  service with its record, which the next cutover, `bridge install` or the GUI's
+  Repair resets. A service an administrator disabled is hardened without a
+  record and put back Disabled, so the cutover still leaves it stopped.
+- **The GUI never touches the lock.** An unprivileged user has no right to it.
+  Every writer that changes the start type stamps the record with its own
+  identity first (a retirement, including over a record that is already there;
+  the repair of an interrupted change; `enable`), and the status read asks
+  whether that process is still running
+  ([`display`](crates/bridge/src/service_scm/repair.rs),
+  `Stamp::is_running`): running, the read is `DisabledState::InChange` over any
+  start type, the status is `BridgeInstallStatus::ChangeInProgress`, and the
+  connect gate offers neither Repair nor Enable: it fails the connect with "the
+  Hole service is being changed by an uninstall, a repair or an update that is
+  in progress. Try again when it finishes." (`InstallGate::ChangeInProgress`,
+  also when unattended); `hole bridge status` prints `installed (being changed)` and exits 4. Gone, or the pid now another process's (a different
+  creation time), the change was interrupted and the table above decides. A
+  record whose value is not a stamp, or whose process list cannot be read, has
+  no running changer, so a user is never left waiting on a change that ended.
+  Liveness comes from the system process list (`NtQuerySystemInformation`),
+  not `OpenProcess`: a standard user is refused every SYSTEM process (measured:
+  `ERROR_ACCESS_DENIED` for `services.exe`, `svchost.exe` and the System process,
+  even for `PROCESS_QUERY_LIMITED_INFORMATION`), and the cutover child and an
+  installer's custom actions are SYSTEM. The list holds the creation time in
+  bytes `winternl.h` calls opaque (`Reserved1`, offset 24); a test compares it
+  with `GetProcessTimes`. A lock that cannot be read costs nothing here, since
+  the GUI never takes it; a start type that cannot be read says nothing is
+  disabled, but a running changer is still seen.
+  **The change mark** makes the lock-free read exact. The start type and the
+  record are separate reads, so a change that began or ended between them would
+  be read half done (a retirement's whole Disable-to-restore span inside one
+  read says "disabled by someone else"). Every holder of the lock sets a
+  `HoleChangeMark` value in the service's key (`ChangeKey`,
+  [`change_mark.rs`](crates/bridge/src/disable_record/change_mark.rs)) when its
+  outermost hold on a thread begins, `<n>:<pid>:<creation>`, and again when that
+  hold ends, `<n>` (`n` counts transitions; the nested holds of a change's own
+  steps are no transition). `display` reads the mark, the start type, the
+  record and the mark again, and goes again unless the two marks are equal; a
+  mark that names a running holder is `InChange` too, so a holder that stamps
+  nothing (an administrator-disabled service's hardening, a first install, the
+  failure-actions repair) is seen as well. A holder that crashed leaves its mark
+  naming a dead process, which reads as no holder and does not change, so the
+  passes end; the next holder takes it over. The passes have no count or timer.
+  A failed write of the mark is a warning at the holder (a status read may see
+  that change half done); no key is no service, so nothing is written. A reinstall
+  deletes the key and the mark with it, so the install marks the new key right
+  after the registration (`Held::mark_again`, before any other step), and the
+  hold's end still ends the change.
+- **An administrator's Disable survives every Hole path that is not an explicit
+  enable.** The retirement's restore, the in-app update's cutover, `hole bridge install` and the GUI's status read leave it. A reinstall deletes and recreates
+  the service, so `bridge install` reads who disabled it first, registers the new
+  service Disabled again and does not start it; it still exits 0 (the MSI's
+  `BridgeInstall` is `Return="check"`) and logs why the service is not running. A
+  start type it cannot read fails the install before anything changes, since
+  guessing "not disabled" would re-enable it. Only `hole bridge enable [--log-dir DIR]` (elevated; set Automatic, clear the record, start; an already running
+  service is success; `Unsupported` on macOS, whose service has no start type)
+  and the GUI's Enable action, which runs it, override it.
+- **The in-app update over an administrator's Disable succeeds.** The cutover
+  child (`run_cutover`: hold, stop, swap, restore, repair, start) swaps the new files in, does
+  not start the service, and returns `CutoverOutcome::LeftDisabled`, which is
+  success: the update did install, and the service is off because an
+  administrator turned it off. `run_held` logs the reason at info and the wrapper
+  around the child's run (`run_while_holding`), unlike after a started cutover,
+  clears the update marker, because the marker is
+  left for the next bridge's post-bind sweep and no bridge will bind
+  (`CutoverOutcome::leaves_marker_for_new_bridge`, read by `settle_marker`; a
+  failure clears it too). A marker left behind would show the GUI a failed update
+  and refuse the next one. The GUI's connect gate then says the service is
+  disabled. Nothing downstream waits for the service to be running.
+- **A manual MSI major upgrade re-enables a service an administrator disabled.**
+  The old product's `BridgeUninstall --keep-covers` deletes the service before
+  the new product's `BridgeInstall` runs, so there is no start type left to read,
+  and the new install registers the service Automatic and starts it; no state is
+  carried across the upgrade, by design.
+- **A rolled-back MSI uninstall re-enables a service an administrator disabled.**
+  `BridgeUninstallRollback` re-runs `bridge install` after `BridgeUninstall` has
+  deleted the service, so the same holds: the install finds no service to read,
+  registers it Automatic and starts it. Deletion carries no state, by design.
+- **The GUI tells the two cases apart at the connect gate**, where the install
+  prompt already lives. `BridgeInstallStatus` is, in precedence order, not
+  installed, running (a running service that is Disabled works), disabled
+  (`Disabled(DisabledBy)`), installed; the gate maps it to `InstallPrompt`
+  (`Install`, `Repair`, `Enable`), each with its own title, body, button, declined
+  and unattended text. `Repair` runs `bridge install`, `Enable` runs `bridge enable`; an unattended startup (`Prompts::Forbidden`) fails passively with the
+  prompt's text. `hole bridge status` prints `installed (disabled)` and exits 3
+  (running 0, stopped 1, not installed 2, being changed 4: see the lock above). A reinstall deletes the
+  service and registers it again, and its change mark lives in the service's key, so between the delete
+  and the registration the read says not installed rather than being changed (accepted, owner
+  2026-10-21: it lasts seconds, and an install started then waits on the lock); from the
+  registration on, the new key is marked. The GUI's read is unprivileged and
+  never fails (`disabled_state`: a start type it cannot read is none, a record it
+  cannot read counts as present, as on every path). That read works as
+  installed because nothing sets a security descriptor on the service or on its
+  key, so both keep the Windows defaults; the proof is the
+  `..._the_service_dacl_lets_an_interactive_user_query_its_config` and
+  `..._the_service_key_lets_an_interactive_user_read_the_record` tests (CI),
+  which ask `GetEffectiveRightsFromAclW` for the groups an interactive user's
+  token holds on a service made by the production `install()`;
+  `..._the_service_key_refuses_an_interactive_user_a_write` proves the other
+  half, that no user can write the record.
+- **A service marked for deletion.** The mark
+  leaves the key (and so the record) in place until the last handle closes;
+  that the key still opens and reads, and what `disabled_state()` and the status
+  then say, is unmeasured here and is read from the CI line `MARKED ANSWER` of
+  `..._probe_marked_service_start_type_read`. A key that refuses the read counts
+  the record as present, like any unreadable record.
 
 ##### What the MSI must guarantee for the keep-covers path to be safe
 
@@ -2263,17 +2764,16 @@ Disclosed residuals:
    record there. Deleting nothing is always safe; deleting the wrong thing
    during an uninstall has no in-band recovery.
 
-1. A stop that never returns is not covered at all. `platform::os::stop` waits
-   on a real SCM `STOPPED` callback with no bound, and `ProxyManager`'s
+1. A stop that never returns is not covered at all. The Windows stop wait
+   (`service_scm::settle::settle_stopped`) waits on a real SCM `STOPPED` callback with no
+   bound, and `ProxyManager`'s
    teardown is itself unbounded (#556) — so against the known
    windows-installer uninstall hang the release never runs, and the user's end
    state is #1003 minus the deleted binary. The fix here addresses the stop
    that *fails*, not the stop that hangs. What the stop no longer does is
-   fail spuriously against a service that is merely already stopping:
-   `ControlService` answers `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` there, which
-   `stop_via_notify` now treats as benign because its arm already covers
-   `STOPPED`/`STOP_PENDING`/`RUNNING` and it re-issues the control on the
-   `RUNNING` a refused `START_PENDING` resolves to.
+   fail spuriously against a service that is merely already stopping or just
+   restarted: it sends no Stop until it has observed RUNNING (see "The Windows
+   stop is one SCM session" above).
 
 1. On macOS, uninstall only runs when the user takes it: the tray's Uninstall
    Helper shells out to `hole bridge uninstall`. Dragging Hole.app to the
@@ -2401,15 +2901,18 @@ deferred until the whole set commits, which is what makes the rollback possible)
 
 The restart is **OS-asymmetric**. Windows spawns a detached LocalSystem
 `hole bridge cutover` child (a service cannot SCM-restart itself) that
-stops → swaps → starts via `NotifyServiceStatusChange` (a real kernel rendezvous,
-gated on a RUNNING callback, never a sleep or loopback probe). macOS runs inline:
+stops → swaps → repairs the start type → starts via `NotifyServiceStatusChange`
+(a real kernel rendezvous, gated on a RUNNING callback, never a sleep or
+loopback probe). A service an administrator disabled is not started, and that is
+a successful cutover: see
+[A Disabled service](#a-disabled-service-whose-disable-it-is). macOS runs inline:
 swap first, then `launchctl kill SIGTERM` rides the graceful shutdown
 (`pm.stop()` → the marker-conditional disarm fires), and `KeepAlive=true`
 respawns the now-swapped binary.
 
-`scm_wait::SystemScmActor` **deliberately leaks** the notify record of a
+`service_scm::SystemScmActor` **deliberately leaks** the notify record of a
 `NotifyServiceStatusChangeW` call whose callback has not run (mechanics:
-`cutover::registration`): one 88-byte record (64-bit Windows; `size_of` of the
+`service_scm::registration`): one 88-byte record (64-bit Windows; `size_of` of the
 record, asserted at compile time) per call that did not settle, including each
 `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` return. Nothing caps how many such calls
 are made (the LAGGING retry has no cap), so nothing caps the leak. Do not "fix" the leak without a
@@ -3358,7 +3861,8 @@ User-facing commands are in [README.md](README.md#commands). The rest:
 ```
 hole bridge run [--socket-path P] [--log-dir DIR] [--state-dir DIR]   run bridge (foreground, needs elevation)
 hole bridge run --service [--log-dir DIR] [--state-dir DIR]           run as service (invoked by SCM/launchd)
-hole bridge install | uninstall | status                             register/start | stop/remove | status (elevation)
+hole bridge install | uninstall [--log-dir DIR] | status             register/start | stop/remove | status (elevation)
+hole bridge enable [--log-dir DIR]                                     enable + start a disabled service (elevation)
 hole bridge log [path | watch [--tail N]] [--log-dir DIR]            print | locate | stream the bridge log
 hole bridge grant-access [--then-send B64 | --then-send-file PATH]    create hole group, add user, write SID file
 hole bridge ipc-send (--base64 B64 | --request-file PATH)            proxy a single IPC command (elevation)

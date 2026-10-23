@@ -311,13 +311,14 @@ fn build_elevation_script_output_compiles_and_roundtrips_via_osascript() {
 
 struct UninstallOutcome {
     result: Result<(), Box<dyn std::error::Error>>,
-    steps: Vec<&'static str>,
+    steps: Vec<String>,
 }
 
 /// The scripted outcome of each injected effect. `installed` is what
 /// `is_installed` reports; every other field is the `Result` its step returns.
 struct UninstallScript {
     keep_covers: bool,
+    hold: std::io::Result<()>,
     stopped: Result<(), Box<dyn std::error::Error>>,
     installed: bool,
     deregister: Result<(), Box<dyn std::error::Error>>,
@@ -330,6 +331,7 @@ impl Default for UninstallScript {
     fn default() -> Self {
         Self {
             keep_covers: false,
+            hold: Ok(()),
             stopped: Ok(()),
             installed: true,
             deregister: Ok(()),
@@ -338,21 +340,28 @@ impl Default for UninstallScript {
     }
 }
 
-fn uninstall_probe(script: UninstallScript) -> UninstallOutcome {
-    let steps = std::cell::RefCell::new(Vec::new());
+/// `uninstall_bridge_with` over `script`, and every step it ran, "hold" and
+/// "unhold" included.
+fn uninstall_probe_raw(script: UninstallScript) -> UninstallOutcome {
+    let steps: StepLog = std::cell::RefCell::new(Vec::new());
+    let note = |step: &str| steps.borrow_mut().push(step.to_string());
     let result = uninstall_bridge_with(
         script.keep_covers,
         || {
-            steps.borrow_mut().push("stop");
+            note("hold");
+            script.hold.map(|()| Unhold(&steps))
+        },
+        || {
+            note("stop");
             script.stopped
         },
         || script.installed,
         || {
-            steps.borrow_mut().push("deregister");
+            note("deregister");
             script.deregister
         },
         || {
-            steps.borrow_mut().push("release");
+            note("release");
             script.release
         },
     );
@@ -360,6 +369,18 @@ fn uninstall_probe(script: UninstallScript) -> UninstallOutcome {
         result,
         steps: steps.into_inner(),
     }
+}
+
+/// [`uninstall_probe_raw`] with the hold and the unhold taken off the ends of
+/// the steps, after checking they are on them: the lock is taken before the
+/// first step and let go after the last, whichever way the uninstall ends.
+fn uninstall_probe(script: UninstallScript) -> UninstallOutcome {
+    let mut out = uninstall_probe_raw(script);
+    assert_eq!(out.steps.first().map(String::as_str), Some("hold"), "{:?}", out.steps);
+    assert_eq!(out.steps.last().map(String::as_str), Some("unhold"), "{:?}", out.steps);
+    out.steps.pop();
+    out.steps.remove(0);
+    out
 }
 
 #[skuld::test]
@@ -391,12 +412,10 @@ fn uninstall_stops_the_bridge_even_when_the_service_is_not_registered() {
     );
 }
 
-/// The dead end #1003's first fix opened: `DeleteService` against a live
-/// service succeeds by marking the row for deletion, after which `OpenService`
-/// answers `ERROR_SERVICE_MARKED_FOR_DELETE`, `is_installed` reads false, and
-/// no later run can find the service to stop it — while the bridge keeps the
-/// liveness lock the release needs. Keeping the registration over an
-/// unconfirmed stop is what leaves a retry something to work with.
+/// `DeleteService` against a live service succeeds by marking the row for
+/// deletion, and the bridge keeps the liveness lock the release needs. Keeping
+/// the registration over an unconfirmed stop is what leaves a retry something
+/// to work with.
 #[skuld::test]
 fn uninstall_never_deregisters_over_an_unconfirmed_stop() {
     let out = uninstall_probe(UninstallScript {
@@ -470,6 +489,517 @@ fn uninstall_keep_covers_tears_down_without_releasing() {
         vec!["stop", "deregister"],
         "the MSI's major-upgrade path replaces the service image but must not disarm the kill switch"
     );
+}
+
+/// The stop and the deregistration are two retirements of the service; a repair
+/// or an enable that ran between them would act on a start type the second one
+/// then discards.
+#[skuld::test]
+fn the_uninstall_holds_the_start_type_from_before_its_first_step_to_after_its_last() {
+    let out = uninstall_probe_raw(UninstallScript::default());
+
+    assert!(out.result.is_ok());
+    assert_eq!(out.steps, ["hold", "stop", "deregister", "release", "unhold"]);
+}
+
+#[skuld::test]
+fn the_uninstall_lets_go_of_the_start_type_after_a_failed_step_too() {
+    let out = uninstall_probe_raw(UninstallScript {
+        stopped: Err("service is still STOP_PENDING".into()),
+        release: Err("a bridge instance is running".into()),
+        ..Default::default()
+    });
+
+    assert!(out.result.is_err());
+    assert_eq!(out.steps, ["hold", "stop", "release", "unhold"]);
+}
+
+/// Without the lock a repair could run between the stop and the delete, so the
+/// service is left alone. The release does not touch the start type and is the
+/// way out of a fail-closed host, so it still runs.
+#[skuld::test]
+fn an_uninstall_that_cannot_take_the_start_type_leaves_the_service_and_still_releases_the_covers() {
+    let out = uninstall_probe_raw(UninstallScript {
+        hold: Err(std::io::Error::other("injected hold failure")),
+        stopped: Err("must never be called".into()),
+        deregister: Err("must never be called".into()),
+        ..Default::default()
+    });
+
+    let report = out.result.expect_err("the service was not uninstalled").to_string();
+    assert!(report.contains("injected hold failure"), "{report}");
+    assert!(report.contains("the service was not changed"), "{report}");
+    assert_eq!(out.steps, ["hold", "release"]);
+}
+
+// Bridge status and what the GUI offers ===============================================================================
+
+const DISABLED_STATES: [DisabledState; 4] = [
+    DisabledState::NotDisabled,
+    DisabledState::By(DisabledBy::InterruptedChange),
+    DisabledState::By(DisabledBy::Elsewhere),
+    DisabledState::InChange,
+];
+
+#[skuld::test]
+fn status_precedence_is_not_installed_then_running_then_disabled_then_installed() {
+    for installed in [false, true] {
+        for running in [false, true] {
+            for disabled in DISABLED_STATES {
+                let status = bridge_install_status_with(|| installed, || running, || disabled);
+                // Written out from the rule, not from the code: a service that is not
+                // registered is not running or disabled; a running one works, whatever its
+                // start type says; a stopped one is disabled only if it says so.
+                let expected = if !installed {
+                    BridgeInstallStatus::NotInstalled
+                } else if running {
+                    BridgeInstallStatus::Running
+                } else {
+                    match disabled {
+                        DisabledState::By(by) => BridgeInstallStatus::Disabled(by),
+                        DisabledState::InChange => BridgeInstallStatus::ChangeInProgress,
+                        DisabledState::NotDisabled => BridgeInstallStatus::Installed,
+                    }
+                };
+                assert_eq!(
+                    status, expected,
+                    "installed={installed} running={running} disabled={disabled:?}"
+                );
+            }
+        }
+    }
+}
+
+#[skuld::test]
+fn status_probes_only_what_the_answer_before_leaves_open() {
+    use std::cell::Cell;
+    let (ran, disabled_read) = (Cell::new(false), Cell::new(false));
+    bridge_install_status_with(
+        || false,
+        || {
+            ran.set(true);
+            false
+        },
+        || {
+            disabled_read.set(true);
+            DisabledState::NotDisabled
+        },
+    );
+    assert!(
+        !ran.get() && !disabled_read.get(),
+        "nothing is asked about a service that is not there"
+    );
+
+    bridge_install_status_with(
+        || true,
+        || true,
+        || {
+            disabled_read.set(true);
+            DisabledState::NotDisabled
+        },
+    );
+    assert!(!disabled_read.get(), "a running service's start type is never read");
+}
+
+#[skuld::test]
+fn install_gate_per_variant() {
+    use BridgeInstallStatus::*;
+    assert_eq!(NotInstalled.install_gate(), InstallGate::Prompt(InstallPrompt::Install));
+    assert_eq!(
+        Disabled(DisabledBy::InterruptedChange).install_gate(),
+        InstallGate::Prompt(InstallPrompt::Repair)
+    );
+    assert_eq!(
+        Disabled(DisabledBy::Elsewhere).install_gate(),
+        InstallGate::Prompt(InstallPrompt::Enable)
+    );
+    assert_eq!(Installed.install_gate(), InstallGate::Proceed);
+    assert_eq!(Running.install_gate(), InstallGate::Proceed);
+    // A change under way offers neither Repair nor Enable, and does not let a
+    // connect run into a service whose start type is mid-change.
+    assert_eq!(ChangeInProgress.install_gate(), InstallGate::ChangeInProgress);
+}
+
+#[skuld::test]
+fn the_error_for_a_change_in_progress_says_so_and_asks_nothing() {
+    let text = CHANGE_IN_PROGRESS_ERROR.to_lowercase();
+    assert!(text.contains("in progress"), "{text}");
+    assert!(!text.contains('?'), "no prompt: {text}");
+}
+
+#[skuld::test]
+fn each_prompt_text_carries_its_own_words() {
+    let repair = "an interrupted uninstall or update left hole's service disabled";
+    let enable = "the hole service is disabled on this computer";
+    for (prompt, own, other) in [
+        (InstallPrompt::Repair, repair, enable),
+        (InstallPrompt::Enable, enable, repair),
+    ] {
+        for text in [prompt.body(), prompt.unattended_error(), prompt.declined_error()] {
+            assert!(text.to_lowercase().contains(own), "{prompt:?}: {text}");
+            assert!(!text.to_lowercase().contains(other), "{prompt:?}: {text}");
+        }
+    }
+    // The install's words are the ones the gate always had.
+    assert!(InstallPrompt::Install.body().contains("not installed"));
+    assert!(InstallPrompt::Install.unattended_error().contains("not installed"));
+    // Three prompts, three buttons, three titles: none shows another's.
+    let all = [InstallPrompt::Install, InstallPrompt::Repair, InstallPrompt::Enable];
+    let confirms: std::collections::BTreeSet<_> = all.map(InstallPrompt::confirm_label).into();
+    assert_eq!(confirms, ["Enable", "Install", "Repair"].into());
+    let titles: std::collections::BTreeSet<_> = all.map(InstallPrompt::title).into();
+    assert_eq!(titles.len(), 3);
+}
+
+#[skuld::test]
+fn every_prompt_has_a_failure_headline_naming_what_failed() {
+    assert!(InstallPrompt::Install
+        .failure_headline()
+        .to_lowercase()
+        .contains("install"));
+    assert!(InstallPrompt::Repair
+        .failure_headline()
+        .to_lowercase()
+        .contains("repair"));
+    assert!(InstallPrompt::Enable
+        .failure_headline()
+        .to_lowercase()
+        .contains("enable"));
+}
+
+#[skuld::test]
+fn the_elevated_run_per_prompt_is_install_install_enable_and_only_install_reclaims_the_data_dir() {
+    let args = |prompt, repair| elevated_bridge_args(prompt, "LOG", repair);
+    let install = [
+        "bridge",
+        "install",
+        "--log-dir",
+        "LOG",
+        "--repair-user-data-dir",
+        "DATA",
+    ];
+    assert_eq!(args(InstallPrompt::Install, Some("DATA")), install);
+    assert_eq!(
+        args(InstallPrompt::Install, None),
+        ["bridge", "install", "--log-dir", "LOG"]
+    );
+    // A repair re-registers the service: the same run as the install.
+    assert_eq!(args(InstallPrompt::Repair, Some("DATA")), install);
+    // Enable edits the one registration it finds; the data dir is not its business.
+    assert_eq!(
+        args(InstallPrompt::Enable, Some("DATA")),
+        ["bridge", "enable", "--log-dir", "LOG"]
+    );
+}
+
+// `bridge install` orchestration ======================================================================================
+
+// An administrator's Disabled start type survives a reinstall (the service is
+// deleted and recreated, so it is read first), an interrupted uninstall's does
+// not, and an install over the first still succeeds so the MSI's custom action
+// does not fail on it.
+
+type StepLog = std::cell::RefCell<Vec<String>>;
+
+/// The scripted outcome of each injected effect of `install_bridge_with`.
+struct InstallScript {
+    hold: std::io::Result<()>,
+    disabled_by: std::io::Result<Option<DisabledBy>>,
+    installed: bool,
+    stop: Result<(), &'static str>,
+    deregister: Result<(), &'static str>,
+    repair: std::io::Result<RepairStep>,
+    register: Result<(), &'static str>,
+    start: Result<(), &'static str>,
+}
+
+impl Default for InstallScript {
+    /// A first install: nothing registered, nothing to repair.
+    fn default() -> Self {
+        Self {
+            hold: Ok(()),
+            disabled_by: Ok(None),
+            installed: false,
+            stop: Ok(()),
+            deregister: Ok(()),
+            repair: Ok(RepairStep::Nothing),
+            register: Ok(()),
+            start: Ok(()),
+        }
+    }
+}
+
+/// Notes "unhold" when an install or uninstall lets go of what `hold` returned.
+struct Unhold<'a>(&'a StepLog);
+
+impl Drop for Unhold<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().push("unhold".to_string());
+    }
+}
+
+/// `install_bridge_with` over `script`, and every step it ran, "hold" and
+/// "unhold" included.
+fn install_probe_raw(script: InstallScript) -> (Result<(), Box<dyn std::error::Error>>, Vec<String>) {
+    let steps: StepLog = std::cell::RefCell::new(Vec::new());
+    let note = |step: &str| steps.borrow_mut().push(step.to_string());
+    let result = install_bridge_with(
+        || {
+            note("hold");
+            script.hold.map(|()| Unhold(&steps))
+        },
+        || {
+            note("disabled_by");
+            script.disabled_by
+        },
+        || {
+            note("is_installed");
+            script.installed
+        },
+        || {
+            note("stop");
+            script.stop.map_err(Into::into)
+        },
+        || {
+            note("deregister");
+            script.deregister.map_err(Into::into)
+        },
+        |start| {
+            note(&format!("register({start:?})"));
+            script.register.map_err(Into::into)
+        },
+        || {
+            note("repair");
+            script.repair
+        },
+        || {
+            note("start");
+            script.start.map_err(Into::into)
+        },
+    );
+    (result, steps.into_inner())
+}
+
+/// [`install_probe_raw`] with the hold and the release taken off the ends of
+/// the steps, after checking they are on them: the lock is taken before the
+/// first step and let go after the last, whichever way the install ends.
+fn install_probe(script: InstallScript) -> (Result<(), Box<dyn std::error::Error>>, Vec<String>) {
+    let (result, mut steps) = install_probe_raw(script);
+    assert_eq!(steps.first().map(String::as_str), Some("hold"), "{steps:?}");
+    assert_eq!(steps.last().map(String::as_str), Some("unhold"), "{steps:?}");
+    steps.pop();
+    steps.remove(0);
+    (result, steps)
+}
+
+#[skuld::test]
+fn a_first_install_registers_automatic_repairs_and_starts() {
+    let (result, steps) = install_probe(InstallScript::default());
+    assert!(result.is_ok());
+    assert_eq!(
+        steps,
+        ["disabled_by", "is_installed", "register(Automatic)", "repair", "start"]
+    );
+}
+
+#[skuld::test]
+fn a_reinstall_stops_and_deregisters_first_and_repairs_between_the_registration_and_the_start() {
+    let (result, steps) = install_probe(InstallScript {
+        installed: true,
+        ..InstallScript::default()
+    });
+    assert!(result.is_ok());
+    assert_eq!(
+        steps,
+        [
+            "disabled_by",
+            "is_installed",
+            "stop",
+            "deregister",
+            "register(Automatic)",
+            "repair",
+            "start"
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_service_an_administrator_disabled_is_registered_disabled_not_started_and_the_install_succeeds() {
+    let (result, steps) = install_probe(InstallScript {
+        disabled_by: Ok(Some(DisabledBy::Elsewhere)),
+        installed: true,
+        repair: Ok(RepairStep::LeaveDisabled),
+        ..InstallScript::default()
+    });
+    // Ok: the MSI's custom action fails the install on a nonzero exit.
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        steps,
+        [
+            "disabled_by",
+            "is_installed",
+            "stop",
+            "deregister",
+            "register(LeaveDisabled)",
+            "repair",
+        ],
+        "the Disabled start type is read before the delete, and the service is never started"
+    );
+}
+
+#[skuld::test]
+fn a_service_an_interrupted_uninstall_disabled_is_registered_automatic_and_started() {
+    let (result, steps) = install_probe(InstallScript {
+        disabled_by: Ok(Some(DisabledBy::InterruptedChange)),
+        installed: true,
+        ..InstallScript::default()
+    });
+    assert!(result.is_ok());
+    assert!(steps.contains(&"register(Automatic)".to_string()), "{steps:?}");
+    assert_eq!(steps.last().map(String::as_str), Some("start"));
+}
+
+#[skuld::test]
+fn a_start_type_that_cannot_be_read_fails_the_install_before_the_service_changes() {
+    let (result, steps) = install_probe(InstallScript {
+        disabled_by: Err(std::io::Error::other("injected")),
+        installed: true,
+        ..InstallScript::default()
+    });
+    let message = result
+        .expect_err("guessing not-disabled would re-enable an administrator's choice")
+        .to_string();
+    assert!(message.contains("injected"), "{message}");
+    // The service is what the install leaves alone; `prepare_ipc_access` has
+    // already run, so the message must not claim the install changed nothing.
+    assert!(message.contains("the service was not changed"), "{message}");
+    assert_eq!(steps, ["disabled_by"]);
+}
+
+#[skuld::test]
+fn the_install_holds_the_start_type_from_before_its_first_read_to_after_its_last_step() {
+    let (result, steps) = install_probe_raw(InstallScript {
+        installed: true,
+        ..InstallScript::default()
+    });
+    assert!(result.is_ok());
+    assert_eq!(
+        steps,
+        [
+            "hold",
+            "disabled_by",
+            "is_installed",
+            "stop",
+            "deregister",
+            "register(Automatic)",
+            "repair",
+            "start",
+            "unhold"
+        ]
+    );
+}
+
+#[skuld::test]
+fn an_install_that_cannot_take_the_start_type_changes_nothing_and_says_why() {
+    let (result, steps) = install_probe_raw(InstallScript {
+        hold: Err(std::io::Error::other("injected hold failure")),
+        installed: true,
+        ..InstallScript::default()
+    });
+    let message = result
+        .expect_err("a change without the lock could race a retirement")
+        .to_string();
+    assert!(message.contains("injected hold failure"), "{message}");
+    assert!(message.contains("the service was not changed"), "{message}");
+    assert_eq!(steps, ["hold"]);
+}
+
+/// A reinstall whose stop or deregistration fails goes on to register, which
+/// then fails generically; the typed causes are in the log.
+#[skuld::test]
+fn a_failed_stop_or_deregistration_before_a_reinstall_is_logged_with_its_cause() {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+    let (result, steps) = install_probe(InstallScript {
+        installed: true,
+        stop: Err("stop refused: process 1234 is alive"),
+        deregister: Err("deregister refused: marked"),
+        register: Err("registration failed"),
+        ..InstallScript::default()
+    });
+    assert!(result.is_err());
+    assert_eq!(steps.last().map(String::as_str), Some("register(Automatic)"));
+    let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("WARN"), "{logged:?}");
+    assert!(logged.contains("stop refused: process 1234 is alive"), "{logged:?}");
+    assert!(logged.contains("deregister refused: marked"), "{logged:?}");
+}
+
+#[skuld::test]
+fn a_failed_registration_or_repair_or_start_is_the_installs_failure() {
+    let (result, steps) = install_probe(InstallScript {
+        register: Err("registration failed"),
+        ..InstallScript::default()
+    });
+    assert!(result.is_err());
+    assert_eq!(steps.last().map(String::as_str), Some("register(Automatic)"));
+
+    let (result, steps) = install_probe(InstallScript {
+        repair: Err(std::io::Error::other("repair failed")),
+        ..InstallScript::default()
+    });
+    assert!(result.is_err());
+    assert_eq!(steps.last().map(String::as_str), Some("repair"));
+
+    let (result, _) = install_probe(InstallScript {
+        start: Err("start failed"),
+        ..InstallScript::default()
+    });
+    assert!(result.is_err());
+}
+
+#[skuld::test]
+fn the_service_is_started_exactly_when_the_repair_says_it_may_be() {
+    for step in [
+        RepairStep::Nothing,
+        RepairStep::ClearRecordOnly,
+        RepairStep::ResetThenClear,
+        RepairStep::LeaveDisabled,
+    ] {
+        let (result, steps) = install_probe(InstallScript {
+            repair: Ok(step),
+            ..InstallScript::default()
+        });
+        assert!(result.is_ok(), "{step:?}");
+        assert_eq!(steps.contains(&"start".to_string()), step.starts_service(), "{step:?}");
+    }
 }
 
 // Uninstall wiring ====================================================================================================
@@ -557,6 +1087,20 @@ fn the_cover_release_is_wired_to_both_of_its_entry_points() {
     );
 }
 
+/// `install_bridge_with` and `uninstall_bridge_with` take their hold from the
+/// closure they are given, so every test of them stays green if the real lock
+/// is replaced by `|| Ok(())`. Pin who passes it.
+#[skuld::test]
+fn the_start_type_hold_is_wired_to_both_elevated_changes() {
+    let pattern = regex::Regex::new(r"\bhold_start_type\b").expect("regex must compile");
+
+    assert_eq!(
+        production_call_sites(&pattern),
+        expected_sites(&[("setup.rs", "install_bridge"), ("setup.rs", "uninstall_bridge"),]),
+        "a change that spans several start-type steps must hold the lock across them"
+    );
+}
+
 /// The other half of #1003's dead end: the stop must not be conditional on a
 /// registration record. A severed `ensure_stopped` leaves nothing stopping the
 /// bridge, and the release then refuses forever.
@@ -567,8 +1111,9 @@ fn the_bridge_stop_is_wired_ahead_of_every_deregistration() {
     assert_eq!(
         production_call_sites(&pattern),
         expected_sites(&[
-            ("setup.rs", "install_bridge"),   // reinstall: stop before replacing the image.
-            ("setup.rs", "uninstall_bridge"), // uninstall: stop before deregistering.
+            ("setup.rs", "install_bridge"),      // reinstall: stop before replacing the image.
+            ("setup.rs", "install_bridge_with"), // the injected effect's own invocation, as below.
+            ("setup.rs", "uninstall_bridge"),    // uninstall: stop before deregistering.
             // The injected effect's own invocation, which shares the name. Worth
             // pinning rather than pattern-matching away: a body that stopped
             // calling it would leave `uninstall_bridge`'s wiring intact and dead.

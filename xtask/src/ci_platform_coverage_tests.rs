@@ -727,8 +727,9 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
     g
 }
 
-const FAILURE_ONLY: [&str; 4] = [
+const FAILURE_ONLY: [&str; 5] = [
     "installer-dump-log",
+    "installer-dump-uninstall-diagnostics",
     "installer-upload-bridge-logs",
     "dmg-diagnostics",
     "dmg-upload-diagnostics",
@@ -1052,8 +1053,9 @@ fn a_failed_dmg_still_captures_diagnostics_and_runs_the_hole_lanes() {
 
 /// Steps that are meant to run when something failed earlier: log dumps and
 /// artifact uploads.
-const RUNS_AFTER_A_FAILURE: [&str; 4] = [
+const RUNS_AFTER_A_FAILURE: [&str; 5] = [
     "installer-dump-log",
+    "installer-dump-uninstall-diagnostics",
     "installer-upload-msi-logs",
     "installer-upload-bridge-logs",
     "hole-upload-bridge-logs",
