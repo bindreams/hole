@@ -671,7 +671,7 @@ fn a_call_inside_a_closure_belongs_to_its_enclosing_function() {
 
 // Boot cancellation ===================================================================================================
 
-/// `reconcile_once`'s one call site (`boot.rs`) is reached from three
+/// `reconcile_once`'s one call site is reached from three
 /// startup paths, each owning a shutdown signal — SIGINT/SIGTERM in the
 /// foreground, SCM Stop and launchd's SIGTERM in the two service paths — and
 /// that signal is exactly what has nothing to reach while a boot auto-connect

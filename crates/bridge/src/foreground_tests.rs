@@ -25,13 +25,9 @@ fn sweep_wiring_reports_and_deletes_bridge_marker() {
     // recover_dns_config call placement is likewise untested (the entry-point
     // bodies block on server.run()).
     //
-    // Route recovery, the plugin reap and the boot reconcile are no longer in
-    // that cohort: their call sites collapsed into
-    // `boot::recover_then_reconcile`, whose order is proven by
-    // `the_boot_reap_spares_the_plugin_of_the_boot_auto_connect`; its sole callership
-    // and its one call per entry point are guarded by
-    // `the_boot_steps_are_called_only_from_the_boot_sequence` and
-    // `every_entry_point_runs_the_boot_sequence_once`.
+    // Route recovery, the plugin reap and the boot reconcile are not in that
+    // cohort: boot_tests.rs guards their callership and the
+    // recovery-before-reconcile and reap-before-reconcile orders.
     use garter::test_utils::WaitableWriter;
     use garter::tracing_test::set_default_in_current_thread;
 

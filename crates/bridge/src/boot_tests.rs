@@ -8,6 +8,8 @@ use crate::proxy_manager::ProxyState;
 use crate::target::{self, Target};
 use crate::test_support::reap_child::EchoChild;
 use crate::test_support::rt;
+use std::sync::atomic::Ordering;
+use tun_engine::routing::{CoverPresence, CoverRecovery, Recovery};
 
 fn connectable() -> Target {
     Target::Connected {
@@ -88,63 +90,134 @@ fn the_boot_reap_spares_the_plugin_of_the_boot_auto_connect() {
     });
 }
 
-/// Structural guard: the three boot steps are called from `boot.rs` and nowhere
-/// else, so an entry point cannot hand-write its own order. `reap_recorded_plugins`
-/// has one further sanctioned caller, the chain-stop path
-/// (`PluginChain::kill_tracked`). Lexical, like
-/// `recover_routes_has_exactly_one_bridge_caller`: a rename or a re-export
-/// under another path evades it, and comment lines are skipped.
+/// The boot reconcile must see the standing cover route recovery adopted. No
+/// lockdown intent is on file (`Unset`), so only the adopted claim stops the
+/// reconcile from releasing the live cover; recovery that runs after the
+/// reconcile, or not at all, lets it release a cover the host still needs.
+/// The real `recover_routes` needs elevation to find a live cover, so the
+/// recovery verdict is injected; everything downstream of it is real.
 #[skuld::test]
-fn the_boot_steps_are_called_only_from_the_boot_sequence() {
-    let steps: [(&str, &[&str]); 3] = [
-        ("route_recovery::recover_and_record(", &["boot.rs"]),
-        ("reconciler::reconcile_once(", &["boot.rs"]),
-        ("plugin_recovery::reap_recorded_plugins(", &["boot.rs", "plugin.rs"]),
-    ];
-    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+fn the_boot_reconcile_sees_the_cover_route_recovery_adopted() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        target::save(dir.path(), &connectable(), None).unwrap();
 
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let routing_state = routing.state();
+        *routing_state.cover_presence.lock().unwrap() = CoverPresence::Live;
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+        #[allow(clippy::disallowed_methods)]
+        // Test-side root token; production roots live at the three entry points.
+        let cancel = CancellationToken::new();
+
+        recover_then_reconcile_with(dir.path(), None, &proxy, &cancel, |_, _| Recovery {
+            action: CoverRecovery::Adopt,
+            record_intent_on: false,
+            presence: CoverPresence::Live,
+        })
+        .await;
+
+        assert_eq!(
+            routing_state.release_all_calls.load(Ordering::SeqCst),
+            0,
+            "the reconcile released a live cover: route recovery's adopted claim was not recorded before it ran"
+        );
+        assert_eq!(proxy.lock().await.state(), ProxyState::Running);
+    });
+}
+
+/// Every non-comment line of the production sources under `crates/bridge/src`
+/// (not `*_tests.rs`, not `test_support/`), as (path relative to `src/` with
+/// `/` separators, 1-based line number, line).
+fn production_source_lines() -> Vec<(String, usize, String)> {
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut lines = Vec::new();
     for entry in walkdir::WalkDir::new(&src_root) {
         let entry = entry.expect("failed to walk crates/bridge/src");
         let path = entry.path();
         if !entry.file_type().is_file() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if file_name.ends_with("_tests.rs") || path.components().any(|c| c.as_os_str() == "test_support") {
+        let rel = path
+            .strip_prefix(&src_root)
+            .expect("a walked file is under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.ends_with("_tests.rs") || rel.starts_with("test_support/") {
             continue;
         }
         let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
-        for (line_no, line) in text.lines().enumerate() {
-            if line.trim_start().starts_with("//") {
-                continue;
+        for (i, line) in text.lines().enumerate() {
+            if !line.trim_start().starts_with("//") {
+                lines.push((rel.clone(), i + 1, line.to_owned()));
             }
-            for (call, allowed) in steps {
-                assert!(
-                    !line.contains(call) || allowed.contains(&file_name),
-                    "{}:{}: `{call}` may be called only from {allowed:?}; boot::recover_then_reconcile \
-                     owns the order of the boot steps",
-                    path.display(),
-                    line_no + 1,
-                );
-            }
+        }
+    }
+    lines
+}
+
+/// Structural guard: the boot steps and the boot sequence itself are named
+/// outside their sanctioned files by no call, bare or qualified, and no `use`
+/// line, so an entry point cannot hand-write its own order.
+/// `reap_recorded_plugins` is also called by `PluginChain::kill_tracked`.
+/// Lexical: comment lines are skipped and a renamed path evades it.
+#[skuld::test]
+fn the_boot_steps_are_called_only_from_the_boot_sequence() {
+    let entry_points = ["foreground.rs", "platform/macos.rs", "platform/windows.rs"];
+    let steps: [(&str, Vec<&str>); 5] = [
+        ("recover_and_record", vec!["boot.rs"]),
+        ("reconcile_once", vec!["boot.rs"]),
+        ("reap_recorded_plugins", vec!["boot.rs", "proxy/plugin.rs"]),
+        ("recover_then_reconcile_with", vec!["boot.rs"]),
+        (
+            "recover_then_reconcile",
+            vec!["boot.rs", entry_points[0], entry_points[1], entry_points[2]],
+        ),
+    ];
+    let lines = production_source_lines();
+
+    for (name, allowed) in steps {
+        // A call (qualified or bare) or any `use` line naming the step; `\b`
+        // keeps `recover_then_reconcile` apart from `recover_then_reconcile_with`.
+        let pattern = regex::Regex::new(&format!(
+            r"(\b{name}\b\s*\()|(^\s*(pub(\([a-z]+\))?\s+)?use\s.*\b{name}\b)"
+        ))
+        .expect("the step pattern is a valid regex");
+        let definition = regex::Regex::new(&format!(r"\bfn\s+{name}\b")).expect("the definition pattern is valid");
+        for (path, line_no, line) in &lines {
+            let defines = definition.is_match(line);
+            assert!(
+                defines || !pattern.is_match(line) || allowed.contains(&path.as_str()),
+                "{path}:{line_no}: `{name}` may be named only in {allowed:?}; boot::recover_then_reconcile \
+                 owns the order of the boot steps"
+            );
         }
     }
 }
 
-/// Structural guard: every bridge entry point runs the boot sequence exactly once.
-/// Lexical, like the guard above.
+/// Structural guard: every bridge entry point runs the boot sequence exactly
+/// once, as `boot::recover_then_reconcile(`, and names it no other way (a
+/// `use` import or a bare call would hide it from the count). Lexical, like
+/// the guard above.
 #[skuld::test]
 fn every_entry_point_runs_the_boot_sequence_once() {
-    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let name = regex::Regex::new(r"\brecover_then_reconcile\b").unwrap();
+    let lines = production_source_lines();
     for entry_point in ["foreground.rs", "platform/macos.rs", "platform/windows.rs"] {
-        let text = std::fs::read_to_string(src_root.join(entry_point)).expect("failed to read an entry point");
-        let calls = text
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .filter(|line| line.contains("boot::recover_then_reconcile("))
-            .count();
+        let mentions: Vec<_> = lines
+            .iter()
+            .filter(|(path, _, line)| path == entry_point && name.is_match(line))
+            .collect();
+        for (path, line_no, line) in &mentions {
+            assert!(
+                line.contains("boot::recover_then_reconcile("),
+                "{path}:{line_no}: the boot sequence may be named only as a `boot::recover_then_reconcile(` call"
+            );
+        }
         assert_eq!(
-            calls, 1,
+            mentions.len(),
+            1,
             "{entry_point} must call boot::recover_then_reconcile exactly once"
         );
     }

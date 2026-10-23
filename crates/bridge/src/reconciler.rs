@@ -282,9 +282,8 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// argument below). Closing #617 needs a cover that survives reboot on its
 /// own; see #1000.
 ///
-/// Called only from `boot::recover_then_reconcile`, which also reaps the previous
-/// bridge's recorded plugins first: the reap kills every recorded plugin, so
-/// running it after this start would kill the session's own.
+/// Called only from `boot::recover_then_reconcile`, which owns the order of the
+/// boot steps.
 ///
 /// Must run strictly after `route_recovery::recover_and_record` completes —
 /// that call is what measures `CoverPresence` and folds a live-cover finding

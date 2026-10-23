@@ -222,10 +222,8 @@ async fn run_inner(
         });
     }
 
-    // Recover what a previous bridge left, then reconcile the persisted target
-    // now, before any GUI or client has had a chance to connect (narrows, does
-    // not close, #617's boot->first-connect gap: a failed connect engages
-    // nothing). One call, so the order cannot differ between entry points.
+    // Reconcile the persisted target before any client can connect (narrows,
+    // does not close, the boot->first-connect gap).
     crate::boot::recover_then_reconcile(state_dir, owner, &proxy_shutdown, &shutdown).await;
 
     // Capture WFP + NDIS state after recovery has had a chance to clean
