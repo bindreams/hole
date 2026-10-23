@@ -13,10 +13,16 @@ use util::dir::Dir;
 
 /// `<name>` (current) and `<name>.1` (the previous one): the active file is renamed over `<name>.1` once it
 /// reaches `limit` bytes, and a write that straddles the limit is split exactly there.
+///
+/// The active file never holds more than `limit` bytes. A name the user holds (a directory at `<name>.1`, a handle
+/// without delete sharing) cannot take the rotation, and the log is theirs to block, so the file goes to
+/// `<name>.1.fallback` instead, replacing the one before it: at most one such file exists. When no name can take it
+/// the file stays full and the lines are dropped, as they are while it cannot be opened, until one can.
 pub struct DirRotate {
     dir: Dir,
     name: OsString,
     rotated: OsString,
+    fallback: OsString,
     limit: usize,
     owner: Option<(u32, u32)>,
     /// `None` when the file could not be opened: a line is then dropped, as a log must never take the process down.
@@ -48,10 +54,13 @@ impl DirRotate {
         assert!(limit > 0, "a log file that holds no bytes cannot be rotated");
         let mut rotated = name.to_os_string();
         rotated.push(".1");
+        let mut fallback = rotated.clone();
+        fallback.push(".fallback");
         let mut this = Self {
             dir,
             name: name.to_os_string(),
             rotated,
+            fallback,
             limit,
             owner,
             file: None,
@@ -83,14 +92,23 @@ impl DirRotate {
             .map_or(0, |meta| meta.len() as usize);
     }
 
-    /// Renames the active file over the rotated one and opens a fresh active file. On a failed rename the same
-    /// file is reopened, still over the limit, and the next write tries again.
+    /// Renames the active file over `<name>.1` and opens a fresh active file. If `<name>.1` cannot take it, the fallback
+    /// does; once `<name>.1` can again, the fallback, which holds older lines, is removed. If neither can, the same
+    /// file is reopened, still full, and the next write tries again.
     fn rotate(&mut self) {
         // Closed first: Windows does not rename a file that a handle without delete sharing has open, and no
         // other handle of ours does.
         self.file = None;
-        // Not reported: the file is reopened either way, and a log has nowhere to say that it could not rotate.
-        let _ = self.dir.rename(&self.name, &self.rotated);
+        // Neither failure is reported: the file is reopened either way, and a log has nowhere to say that it could
+        // not rotate.
+        match self.dir.rename(&self.name, &self.rotated) {
+            Ok(()) => {
+                let _ = self.dir.unlink(&self.fallback);
+            }
+            Err(_) => {
+                let _ = self.dir.rename(&self.name, &self.fallback);
+            }
+        }
         self.open_active();
     }
 }
@@ -98,7 +116,8 @@ impl DirRotate {
 impl Write for DirRotate {
     /// Takes at most the bytes that fit below the limit, so a line that straddles it is split exactly there across
     /// two calls (`write_all` makes the second). Never fails after taking bytes. A line is dropped, and said to be
-    /// taken, while the file cannot be opened: a log must never take the process down.
+    /// taken, while the file cannot be opened or, being full, cannot be rotated: a log must never take the process
+    /// down, and must never fill the disk.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.file.is_none() {
             self.open_active();
@@ -110,10 +129,9 @@ impl Write for DirRotate {
         let Some(file) = &mut self.file else {
             return Ok(buf.len());
         };
-        let room = if self.count < self.limit {
-            self.limit - self.count
-        } else {
-            usize::MAX
+        // Still full: nothing could take it.
+        let Some(room) = self.limit.checked_sub(self.count).filter(|room| *room > 0) else {
+            return Ok(buf.len());
         };
         let taken = file.write(&buf[..buf.len().min(room)])?;
         self.count += taken;
