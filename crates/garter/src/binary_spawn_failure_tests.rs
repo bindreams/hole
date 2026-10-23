@@ -51,12 +51,7 @@ async fn a_missing_plugin_reports_the_os_error() {
 async fn a_non_executable_plugin_reports_the_os_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("not-executable");
-    std::fs::write(
-        &path,
-        b"#!/bin/sh
-",
-    )
-    .unwrap();
+    std::fs::write(&path, b"#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
     let message = spawn_failure_of(BinaryPlugin::new(path, None)).await;

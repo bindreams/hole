@@ -92,12 +92,11 @@ harness = false
 # `exit_watch`: waitid(WNOWAIT), the exit watch for a kernel without pidfd_open. cosca depends on the same crate.
 rustix = { version = "1", features = ["process"] }
 
-# Both target blocks below exist for `src/bin/mock-plugin.rs`, the test fixture.
-# The published crate excludes `src/bin/`, so neither reaches a consumer's build.
 [target.'cfg(unix)'.dependencies]
-# mock-plugin: signal(SIGTERM, SIG_IGN), for MOCK_PLUGIN_IGNORE_SIGNALS.
+# The macOS exec errnos in `binary.rs`; mock-plugin's signal(SIGTERM, SIG_IGN), for MOCK_PLUGIN_IGNORE_SIGNALS.
 libc = "0.2"
 
+# `src/bin/mock-plugin.rs`, the test fixture; the published crate excludes `src/bin/`.
 [target.'cfg(windows)'.dependencies]
 # Containment and handle hygiene are cosca's; these are the fixture's own calls.
 windows = { version = "0.62", features = [
