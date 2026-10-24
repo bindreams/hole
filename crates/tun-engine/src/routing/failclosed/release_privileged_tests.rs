@@ -30,9 +30,11 @@
 //! drops it from the group.
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use super::cover_oracle::held_covers;
+use super::cover_oracle::{held_covers, permit_scenario};
 use crate::device::TunIdentity;
 use crate::routing::{CoverGuard, Routing, SystemRouting};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use hole_test_observability::egress::InCover;
 
 // `skuld` requires each label to be declared exactly once per test binary;
 // every module under this crate compiles into the SAME `tun-engine` test
@@ -85,11 +87,6 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn connect(addr: &str) -> std::io::Result<std::net::TcpStream> {
-    std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), std::time::Duration::from_secs(5))
-}
-
 /// The precondition every test starts from: egress is open and no cover is installed. A cover left by
 /// an earlier test fails here at once instead of reading as a lost network.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -114,6 +111,25 @@ fn check_restored(what: &str, targets: &[&str], state_dir: &std::path::Path) -> 
     hole_test_observability::egress::check_egress_restored(what, targets, PERMITTED, &|| held_covers(state_dir))
 }
 
+/// Strands `what` with `engage`, probes that it still blocks (the server permit answers, `NON_PERMITTED`
+/// does not), then clears it with `release_all_covers`. The cover is gone when the verdict is judged, as
+/// the egress window requires; a lost network reruns the whole engage.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[track_caller]
+fn release_stranded(what: &str, routing: &SystemRouting, state_dir: &std::path::Path, mut engage: impl FnMut()) {
+    let claim = format!("{what} must still be blocking egress (leak!)");
+    permit_scenario("release_all of a stranded cover", state_dir, PERMITTED, || {
+        engage();
+        let verdict = InCover::new(PERMITTED, "the server-IP permit must beat the stranded block-all")
+            .blocked(NON_PERMITTED, &claim)
+            .run();
+        routing
+            .release_all_covers()
+            .unwrap_or_else(|e| panic!("release_all_covers must clear {what}: {e}"));
+        verdict
+    });
+}
+
 // windows_release_all_clears_a_stranded_lockdown_cover / macos counterpart ============================================
 
 #[cfg(target_os = "windows")]
@@ -126,23 +142,16 @@ fn windows_release_all_clears_a_stranded_lockdown_cover() {
 
     assert_baseline_reachable(dir.path());
 
-    let cover = routing
-        .install_lockdown(
-            server_ip,
-            &TunIdentity::synthetic(0, "Loopback Pseudo-Interface 1"),
-            &[],
-        )
-        .expect("engage real WFP lockdown cover");
-    cover.disarm(); // strand it — no guard remains to remove it
-
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "the stranded lockdown cover must still be blocking egress"
-    );
-
-    routing
-        .release_all_covers()
-        .expect("release_all_covers must clear the stranded lockdown cover");
+    release_stranded("the stranded lockdown cover", &routing, dir.path(), || {
+        let cover = routing
+            .install_lockdown(
+                server_ip,
+                &TunIdentity::synthetic(0, "Loopback Pseudo-Interface 1"),
+                &[],
+            )
+            .expect("engage real WFP lockdown cover");
+        cover.disarm(); // strand it — no guard remains to remove it
+    });
 
     assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
 }
@@ -157,19 +166,12 @@ fn macos_release_all_clears_a_stranded_lockdown_cover() {
 
     assert_baseline_reachable(dir.path());
 
-    let cover = routing
-        .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
-        .expect("engage real pf lockdown cover");
-    cover.disarm();
-
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "the stranded lockdown cover must still be blocking egress"
-    );
-
-    routing
-        .release_all_covers()
-        .expect("release_all_covers must clear the stranded lockdown cover");
+    release_stranded("the stranded lockdown cover", &routing, dir.path(), || {
+        let cover = routing
+            .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
+            .expect("engage real pf lockdown cover");
+        cover.disarm();
+    });
 
     assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
     let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
@@ -195,19 +197,12 @@ fn windows_release_all_clears_a_stranded_transient_cover() {
 
     assert_baseline_reachable(dir.path());
 
-    let cover = routing
-        .install_failclosed_cover(server_ip, None)
-        .expect("engage real WFP transient cover");
-    cover.disarm();
-
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "the stranded transient cover must still be blocking egress"
-    );
-
-    routing
-        .release_all_covers()
-        .expect("release_all_covers must clear the stranded transient cover");
+    release_stranded("the stranded transient cover", &routing, dir.path(), || {
+        let cover = routing
+            .install_failclosed_cover(server_ip, None)
+            .expect("engage real WFP transient cover");
+        cover.disarm();
+    });
 
     assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
 }
@@ -222,19 +217,12 @@ fn macos_release_all_clears_a_stranded_transient_cover() {
 
     assert_baseline_reachable(dir.path());
 
-    let cover = routing
-        .install_failclosed_cover(server_ip, None)
-        .expect("engage real pf transient cover");
-    cover.disarm();
-
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "the stranded transient cover must still be blocking egress"
-    );
-
-    routing
-        .release_all_covers()
-        .expect("release_all_covers must clear the stranded transient cover");
+    release_stranded("the stranded transient cover", &routing, dir.path(), || {
+        let cover = routing
+            .install_failclosed_cover(server_ip, None)
+            .expect("engage real pf transient cover");
+        cover.disarm();
+    });
 
     assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
     assert!(
@@ -255,27 +243,20 @@ fn windows_release_all_clears_both_stranded_covers() {
 
     assert_baseline_reachable(dir.path());
 
-    let lockdown = routing
-        .install_lockdown(
-            server_ip,
-            &TunIdentity::synthetic(0, "Loopback Pseudo-Interface 1"),
-            &[],
-        )
-        .expect("engage real WFP lockdown cover");
-    lockdown.disarm();
-    let transient = routing
-        .install_failclosed_cover(server_ip, None)
-        .expect("engage real WFP transient cover");
-    transient.disarm();
-
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "both stranded covers must still be blocking egress"
-    );
-
-    routing
-        .release_all_covers()
-        .expect("release_all_covers must clear both stranded covers in one call");
+    release_stranded("both stranded covers", &routing, dir.path(), || {
+        let lockdown = routing
+            .install_lockdown(
+                server_ip,
+                &TunIdentity::synthetic(0, "Loopback Pseudo-Interface 1"),
+                &[],
+            )
+            .expect("engage real WFP lockdown cover");
+        lockdown.disarm();
+        let transient = routing
+            .install_failclosed_cover(server_ip, None)
+            .expect("engage real WFP transient cover");
+        transient.disarm();
+    });
 
     assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
 }
@@ -290,23 +271,16 @@ fn macos_release_all_clears_both_stranded_covers() {
 
     assert_baseline_reachable(dir.path());
 
-    let lockdown = routing
-        .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
-        .expect("engage real pf lockdown cover");
-    lockdown.disarm();
-    let transient = routing
-        .install_failclosed_cover(server_ip, None)
-        .expect("engage real pf transient cover");
-    transient.disarm();
-
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "both stranded covers must still be blocking egress"
-    );
-
-    routing
-        .release_all_covers()
-        .expect("release_all_covers must clear both stranded covers in one call");
+    release_stranded("both stranded covers", &routing, dir.path(), || {
+        let lockdown = routing
+            .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
+            .expect("engage real pf lockdown cover");
+        lockdown.disarm();
+        let transient = routing
+            .install_failclosed_cover(server_ip, None)
+            .expect("engage real pf transient cover");
+        transient.disarm();
+    });
 
     assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
     assert!(!dir.path().join(super::lockdown_pf_state::STATE_FILE_NAME).exists());
@@ -575,51 +549,58 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
 
     assert_baseline_reachable(dir.path());
 
-    // The TRANSIENT cover — `recover_cover`'s subject.
-    let cover = routing
-        .install_failclosed_cover(server_ip, None)
-        .expect("engage real pf transient cover");
-    // Read the real enable token back BEFORE overwriting the file, so the
-    // rolled-back payload below carries the REAL token and the safety net at
-    // the end of this test has one to fall back on.
-    let token = super::failclosed_state::load(dir.path())
-        .expect("the engage must have persisted a state file")
-        .pf_token;
-    cover.disarm(); // stand in for the crash: no guard remains
+    // Best-effort and AFTER the sweep: the sweep salvages the `pf_token` out of the unusable record
+    // itself and drops it, so this normally finds the refcount already released and fails harmlessly.
+    // It stays so that a sweep whose own `-X` failed cannot leave the runner's pf enabled under an
+    // unreferenced token until reboot.
+    let drop_token = |token: &str| {
+        let _ = SystemTool::Pfctl.command().unwrap().args(["-X", token]).output();
+    };
 
-    let rolled_back = format!(
-        r#"{{"version":{},"pf_token":"{token}","pf_was_enabled":false}}"#,
-        super::failclosed_state::SCHEMA_VERSION + 1
-    );
-    std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();
-    let presence = super::failclosed_state::load_presence(dir.path());
-    assert!(
-        matches!(presence, super::StateFile::Unusable { .. }),
-        "this test's premise: the payload must be UNREADABLE to this binary. On `Present` the \
-         sweep takes the arm it handled before this fix and proves nothing: {rolled_back} -> \
-         {presence:?}"
-    );
+    let token = permit_scenario("recover_cover of an unreadable record", dir.path(), PERMITTED, || {
+        // The TRANSIENT cover — `recover_cover`'s subject.
+        let cover = routing
+            .install_failclosed_cover(server_ip, None)
+            .expect("engage real pf transient cover");
+        // Read the real enable token back BEFORE overwriting the file, so the rolled-back payload
+        // below carries the REAL token and the safety net has one to fall back on.
+        let token = super::failclosed_state::load(dir.path())
+            .expect("the engage must have persisted a state file")
+            .pf_token;
+        cover.disarm(); // stand in for the crash: no guard remains
 
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "the stranded transient cover must still be blocking egress before the sweep runs"
-    );
+        let rolled_back = format!(
+            r#"{{"version":{},"pf_token":"{token}","pf_was_enabled":false}}"#,
+            super::failclosed_state::SCHEMA_VERSION + 1
+        );
+        std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();
+        let presence = super::failclosed_state::load_presence(dir.path());
+        assert!(
+            matches!(presence, super::StateFile::Unusable { .. }),
+            "this test's premise: the payload must be UNREADABLE to this binary. On `Present` the \
+             sweep takes the arm it handled before this fix and proves nothing: {rolled_back} -> \
+             {presence:?}"
+        );
 
-    crate::routing::failclosed::recover_cover(dir.path(), false);
+        let verdict = InCover::new(PERMITTED, "the server-IP permit must beat the stranded block-all")
+            .blocked(
+                NON_PERMITTED,
+                "the stranded transient cover must still be blocking egress before the sweep runs (leak!)",
+            )
+            .run();
+
+        crate::routing::failclosed::recover_cover(dir.path(), false);
+
+        // The cover is gone before the verdict is judged; a rerun engages a new token.
+        verdict.inspect_err(|_| drop_token(&token)).map(|()| token)
+    });
 
     let restored = check_restored(
         "recover_cover must restore egress even with an unreadable state file",
         &[NON_PERMITTED],
         dir.path(),
     );
-
-    // Safety net, not the balance: the sweep salvages the `pf_token` out of
-    // the unusable record itself (`StateFile::unusable`) and drops it, so this
-    // normally finds the refcount already released and fails harmlessly. It
-    // stays so that a sweep whose own `-X` failed cannot leave the runner's pf
-    // enabled under an unreferenced token until reboot. Best-effort and AFTER
-    // the measurement, so it can neither mask nor cause the verdict.
-    let _ = SystemTool::Pfctl.command().unwrap().args(["-X", &token]).output();
+    drop_token(&token);
 
     if let Err(why) = restored {
         panic!("{why}");

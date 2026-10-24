@@ -689,6 +689,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                 "the control prober made no attempt at all — the positive control is vacuous"
             );
             if raw_rate < CONTROL_RATE_FLOOR_PCT {
+                // Residual: an outage inside the run that ends before this probe reads as a starved budget.
                 // The cold engage's probes answered; the permitted server is probed again before the
                 // cover goes, so a network that dropped during the run is told from a starved budget.
                 let permit_after = hole_test_observability::egress::probe(&format!("{SERVER_A}:443")).is_ok();

@@ -442,7 +442,8 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // Phase B reruns if the runner's network dropped mid-run: a lockdown cover blocks every control host, so
     // each run is bracketed by a `Window` and judged only after the cover is released. The cover permits
     // only the session's own server, a loopback fixture here, so nothing off the box can vouch for the
-    // network inside it (`Failure::Unvouched`).
+    // network inside it (`Failure::Unvouched`). Residual: an outage that starts and ends inside a run
+    // reads as a defect.
     let (cover_presence, tun_outcome, no_leak, permitted_reachable, path_to_no_leak) = loop {
         let window = hole_test_observability::egress::Window::open("live-tun-permit phase B", &control, &held)
             .unwrap_or_else(|why| panic!("HARNESS: {why}"));

@@ -174,6 +174,7 @@ impl<'a> InCover<'a> {
             return Err(Failure::Failed { why, targets });
         }
 
+        // Residual: an outage over every in-cover probe, ended by teardown, reads the same.
         if !answered.iter().any(|a| *a) {
             return Err(Failure::Failed {
                 why: format!("{}: {readings}", self.permit_claim),
