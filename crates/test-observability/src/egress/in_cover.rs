@@ -14,8 +14,10 @@ use super::{Host, System};
 pub enum Failure {
     /// A defect no network loss explains: a probe got through the block.
     Defect(String),
-    /// The permit answered at some readings and not others within one engage, so the network wavered
-    /// inside the run. The run says nothing about the cover; run it again once the network answers.
+    /// A probe outside any cover failed, so the network wavered inside the run. The run says nothing
+    /// about the cover; run it again once the network answers. Only readings of a host nothing
+    /// blocks produce it: a miss inside a cover is [`Failure::Failed`], since a rerun needs a failed
+    /// probe outside any cover or a defect that shows only sometimes would be rerun without end.
     Wavered(String),
     /// `targets` failed with the permit answering on both sides of each (or the permit itself never
     /// answered). The judge probes them outside the cover: a target that is down there is waited for,
@@ -44,15 +46,11 @@ impl Failure {
 
     /// A run whose markers were read from a local capture of the NIC, with `vouch` the readings of a
     /// permitted host probed over TCP on both sides of the markers in the same engage. A missing
-    /// `vouch` reading is a wavering network. Otherwise the capture decides: whether a datagram leaves
-    /// the NIC does not depend on the network upstream, so a missing marker is `Failed`, and the
-    /// control around the teardown decides. `outside` is the target the judge probes when no marker
-    /// was seen.
+    /// marker is `Failed` whatever the vouch said (whether a datagram leaves the NIC does not depend
+    /// on the network upstream), and the control around the teardown decides. `outside` is the target
+    /// the judge probes when nothing in the engage answered: neither a vouch reading nor a marker.
     pub fn captured(why: String, outside: &str, vouch: &[bool], markers: &[bool]) -> Failure {
-        if !vouch.iter().all(|a| *a) {
-            return Failure::Wavered(why);
-        }
-        let targets = if markers.iter().any(|a| *a) {
+        let targets = if vouch.iter().chain(markers).any(|a| *a) {
             Vec::new()
         } else {
             vec![outside.to_string()]
@@ -89,14 +87,15 @@ struct Claim<'a> {
 /// permit, and so on, so every claim has a reading on both sides.
 ///
 /// * a target expected blocked that answers is a [`Failure::Defect`], whatever the network did;
-/// * a failed target with the permit answering on both sides is [`Failure::Failed`]; with a side
-///   missing it is [`Failure::Wavered`], and a target expected blocked that failed with a side
-///   missing proves nothing about the block;
+/// * a failed target with the permit answering on both sides is [`Failure::Failed`] with that target;
+///   with a side missing it is [`Failure::Failed`] with no target, so the control around the teardown
+///   decides, and a target expected blocked that failed with a side missing proves nothing about the
+///   block;
 /// * no reading of the permit answered: the permit itself failed ([`Failure::Failed`] with the permit as
 ///   target).
 ///
-/// The one thing no reading can rule out is an outage that covers every in-cover probe of one engage
-/// and ends before the cover is torn down; a cover that blocks its own permit looks the same.
+/// No reading can tell an outage that covers an in-cover reading and ends before the teardown probe
+/// from a cover that breaks its permit, so it is a defect.
 pub struct InCover<'a> {
     permit: &'a str,
     permit_claim: &'a str,
@@ -201,7 +200,10 @@ impl<'a> InCover<'a> {
             .map(|(_, (c, _))| format!("{}: {} failed", c.claim, c.target))
             .collect();
         if !unproven.is_empty() {
-            return Err(Failure::Wavered(format!("{} ({readings})", unproven.join("; "))));
+            return Err(Failure::Failed {
+                why: format!("{} ({readings})", unproven.join("; ")),
+                targets: Vec::new(),
+            });
         }
         Ok(())
     }

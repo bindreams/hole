@@ -54,11 +54,14 @@ fn a_blocked_target_that_failed_with_the_permit_answering_on_both_sides_is_block
 #[skuld::test]
 fn a_blocked_target_that_failed_beside_a_failed_permit_proves_nothing() {
     // permit (tick 0), block probe (tick 1), permit (tick 2): an outage over the block probe and
-    // either permit leaves it unvouched.
+    // either permit leaves it unvouched, and the control around the teardown decides.
     for outage in [0..2, 1..3] {
         let net = Net::new(outage.clone(), &[]);
         let failure = run(&net, standard()).unwrap_err();
-        assert!(matches!(failure, Failure::Wavered(_)), "{outage:?}: {failure:?}");
+        assert!(
+            matches!(&failure, Failure::Failed { targets, .. } if targets.is_empty()),
+            "{outage:?}: {failure:?}"
+        );
     }
 }
 
@@ -78,7 +81,7 @@ fn a_target_that_must_answer_and_failed_with_the_permit_on_both_sides_is_a_failu
 }
 
 #[skuld::test]
-fn a_target_that_must_answer_and_failed_beside_a_failed_permit_is_a_wavering() {
+fn a_target_that_must_answer_and_failed_beside_a_failed_permit_is_left_to_the_control() {
     for outage in [0..2, 1..3] {
         let net = Net::new(outage.clone(), &[]);
         let failure = run(
@@ -86,7 +89,10 @@ fn a_target_that_must_answer_and_failed_beside_a_failed_permit_is_a_wavering() {
             InCover::new(PERMIT, "the permit").answers(SECOND, "the resolver permit"),
         )
         .unwrap_err();
-        assert!(matches!(failure, Failure::Wavered(_)), "{outage:?}: {failure:?}");
+        assert!(
+            matches!(&failure, Failure::Failed { targets, .. } if targets.is_empty()),
+            "{outage:?}: {failure:?}"
+        );
     }
 }
 
@@ -135,13 +141,17 @@ fn covered_readings_are_never_wavered() {
 }
 
 #[skuld::test]
-fn a_missing_vouch_reading_around_the_markers_is_a_wavering() {
+fn captured_readings_are_never_wavered() {
+    // A rerun needs a probe outside any cover to have failed; the vouch readings are inside the engage.
     let why = || "x".to_string();
-    for vouch in [[true, false], [false, true], [false, false]] {
-        for markers in [[true, false], [false, false]] {
+    for vouch in [[true, true], [true, false], [false, true]] {
+        for markers in [[true, false], [false, true], [false, false]] {
             assert_eq!(
                 Failure::captured(why(), CONTROL, &vouch, &markers),
-                Failure::Wavered(why()),
+                Failure::Failed {
+                    why: why(),
+                    targets: vec![]
+                },
                 "{vouch:?} {markers:?}"
             );
         }
@@ -149,20 +159,10 @@ fn a_missing_vouch_reading_around_the_markers_is_a_wavering() {
 }
 
 #[skuld::test]
-fn captured_readings_with_both_vouch_readings_are_judged_by_the_control() {
+fn captured_readings_with_nothing_answering_leave_the_outside_host_to_the_judge() {
     let why = || "x".to_string();
-    for markers in [[true, false], [false, true]] {
-        assert_eq!(
-            Failure::captured(why(), CONTROL, &[true, true], &markers),
-            Failure::Failed {
-                why: why(),
-                targets: vec![]
-            },
-            "{markers:?}"
-        );
-    }
     assert_eq!(
-        Failure::captured(why(), CONTROL, &[true, true], &[false, false]),
+        Failure::captured(why(), CONTROL, &[false, false], &[false, false]),
         Failure::Failed {
             why: why(),
             targets: vec![CONTROL.to_string()]
@@ -207,6 +207,13 @@ fn a_defect_is_a_defect_with_the_control_down() {
 #[skuld::test]
 fn a_wavering_is_waited_out_and_never_a_defect() {
     let net = Net::new(1..4, &[]);
+    judged(&net, &clean, Failure::Wavered("wavered".into())).unwrap();
+}
+
+#[skuld::test]
+fn a_miss_outside_any_cover_is_rerun_though_the_control_answers_at_the_teardown() {
+    // The failed probe was outside any cover, so the outage is evidenced: no judgment by the control.
+    let net = Net::new(0..0, &[]);
     judged(&net, &clean, Failure::Wavered("wavered".into())).unwrap();
 }
 

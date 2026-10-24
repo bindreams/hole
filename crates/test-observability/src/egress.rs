@@ -24,6 +24,9 @@
 //!   after teardown, answer there with the control answering around them. A
 //!   scenario that reads a capture of the NIC probes the permit over TCP on both
 //!   sides of its markers the same way ([`Failure::captured`]).
+//!   A rerun needs a probe outside any cover to have failed: a reading missing
+//!   inside a cover, whether within one engage or across reloads, is judged by
+//!   the control around the teardown, down being a rerun and answering a defect.
 //!
 //! A reading of runner state is vouched for by the control around it: a read
 //! that fails, or is not bracketed by an answering control, is taken again; a
@@ -33,10 +36,10 @@
 //! What no probe can rule out is an outage that falls entirely between two
 //! adjacent probes of one engage: a probe cannot show the network up at an
 //! instant. A cover that blocks its own permit looks the same as an outage over
-//! every in-cover probe, so that case is a defect. So is a permit that readings
-//! taken across cover reloads find broken ([`Failure::covered`]) while the control
-//! answers around the teardown: a rerun needs a probe outside any cover to have
-//! failed, or a defect that shows only sometimes would be rerun without end.
+//! every in-cover probe, so that case is a defect, and so is an outage that
+//! covers some in-cover reading and has ended by the teardown probe: it cannot be
+//! told from a permit that breaks only sometimes, and rerunning that would be an
+//! uncapped wait on no external event.
 //!
 //! No wait here has a cap: each round re-probes the real condition, the test's
 //! own nextest timeout is the bound, and every change of state is logged.
@@ -159,8 +162,8 @@ pub fn rerun_until_network_holds<T>(
 ///
 /// * Hole holds a cover: the scenario left one behind, a defect;
 /// * [`Failure::Defect`]: a defect;
-/// * [`Failure::Wavered`]: the network wavered inside the run. It waits for `control` and returns
-///   `Ok(())`: run the scenario again;
+/// * [`Failure::Wavered`]: a probe outside any cover failed, so the network wavered. It waits for
+///   `control` and returns `Ok(())`: run the scenario again;
 /// * [`Failure::Failed`] (and [`Failure::Unvouched`], with no targets): `control` and the failing
 ///   targets are probed outside the cover. `control` failing means the network is down: wait, run
 ///   again. A target failing while `control` answers means the target is down outside any cover: wait

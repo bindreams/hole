@@ -3003,21 +3003,22 @@ and a rerun repeats the platform's whole job.
   sides and the failing targets, probed outside the cover, answer there with the
   control answering around them; a target that is down outside any cover is
   waited for (`check_egress_restored` does the same for a restored-egress
-  target, so only a cover Hole still holds fails it), and a permit that answered
-  at some readings and not others within one engage is a wavering network,
-  rerun. A read of runner state goes through
+  target, so only a cover Hole still holds fails it). A rerun needs a probe
+  outside any cover to have failed, because rerunning a defect that shows only
+  sometimes would be an uncapped wait on no external event: a reading missing
+  inside a cover, whether within one engage or across reloads, is judged by the
+  control around the teardown, down being a rerun and answering a defect. A read
+  of runner state goes through
   `read_with_network_up`, which retakes a read the control did not bracket; a
   read that fails with the control answering on both sides is a defect. A
   reading of a marker in a NIC capture is `Failure::captured`: the scenario
-  probes the permit over TCP on both sides of its markers, a missing probe is a
-  wavering network, and a missing marker with both answering is judged by the
-  control around the teardown. Readings taken across cover reloads
-  (`Failure::covered`) are judged by that control too: a permit that breaks only
-  after the reloads, with the control answering, is a defect, because a rerun
-  needs a probe outside any cover to have failed. What no probe can rule
-  out is an outage that falls entirely between two adjacent probes of one
-  engage; a cover that blocks its own permit looks like an outage over every
-  in-cover probe, so that is a defect. A scenario with no permitted host to
+  probes the permit over TCP on both sides of its markers, and a missing marker
+  is judged by the control around the teardown like any other miss. What no
+  probe can rule out is an outage that falls entirely between two adjacent
+  probes of one engage, and one that covers an in-cover reading and has ended
+  by the teardown probe: neither can be told from a cover that breaks its
+  permit (including one that blocks it outright), so both are defects.
+  A scenario with no permitted host to
   vouch with (the live-TUN e2e, whose cover permits only a loopback server) is
   judged by the control outside the run alone (`Failure::Unvouched`). The
   mechanism is in `hole_test_observability::egress` and

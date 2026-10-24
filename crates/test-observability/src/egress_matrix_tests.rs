@@ -97,6 +97,16 @@ fn wrong_verdicts(
         .collect()
 }
 
+/// Every outage that starts and ends inside the in-cover probes `lo..hi` of the first run. One that
+/// covers an in-cover reading and has ended when the judge probes the control reads as a mixed reading
+/// the control cannot excuse, so it is a defect: a rerun needs a probe outside any cover to have failed.
+fn within(lo: u32, hi: u32) -> Vec<Range<u32>> {
+    placements()
+        .into_iter()
+        .filter(|d| !d.is_empty() && d.start >= lo && d.end <= hi)
+        .collect()
+}
+
 /// An outage over every in-cover probe of the first run (ticks 1..=3: permit, block, permit) that has
 /// ended when the judge looks: indistinguishable from a cover that blocks its own permit.
 const OVER_EVERY_IN_COVER_PROBE: Range<u32> = 1..4;
@@ -111,10 +121,18 @@ fn no_outage_placement_is_charged_to_a_healthy_cover() {
         Cover::Healthy,
         false,
         true,
-        &[OVER_EVERY_IN_COVER_PROBE, OVER_THE_RESTORE_PROBE_ALONE],
+        &[within(1, 4), vec![OVER_THE_RESTORE_PROBE_ALONE]].concat(),
         |d| Net::new(d, &[]),
     );
     assert!(defects.is_empty(), "outages read as defects: {defects:#?}");
+}
+
+#[skuld::test]
+fn an_outage_over_an_in_cover_reading_that_ended_before_the_teardown_probe_is_a_defect() {
+    // The permit before the block probe is missing (tick 1) and the network is back by tick 2: nothing
+    // outside the cover failed, so a rerun would be a wait on no failed probe.
+    let net = Net::new(1..2, &[]);
+    assert!(full_run(&net, Cover::Healthy, false).is_err());
 }
 
 #[skuld::test]
@@ -160,7 +178,9 @@ fn a_permitted_host_that_is_down_on_its_own_is_waited_for_not_charged_to_the_cov
     // The second permit is down for a stretch of ticks that covers its in-cover probe and the judge's
     // look at it; the cover permits it, so nothing is wrong with the cover. With the second permit the
     // run has five in-cover probes (ticks 1..=5) and a restore probe at tick 8.
-    let defects = wrong_verdicts(Cover::Healthy, true, true, &[1..6, 8..9], |d| {
+    let mut residual = within(1, 6);
+    residual.push(8..9);
+    let defects = wrong_verdicts(Cover::Healthy, true, true, &residual, |d| {
         Net::new(d, &[]).with_host_down(SECOND_PERMIT, 0..40)
     });
     assert!(
@@ -194,26 +214,25 @@ fn wire_run(net: &Net, readings: fn(&[bool], &[bool]) -> Failure) -> Result<(), 
     rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)
 }
 
-/// The ticks of a wire run's first pass: window open 0, permit 1, head 2, leak 3, tail 4, permit 5.
-/// An outage that starts after the first permit probe and ends by the second is between two adjacent
-/// probes of one engage, so the run cannot tell it from a marker the cover dropped.
-fn between_the_vouch_probes(down: &Range<u32>) -> bool {
-    !down.is_empty() && down.start >= 2 && down.end <= 5
-}
+/// The ticks of a wire run's first pass: window open 0, permit 1, head 2, leak 3, tail 4, permit 5, then
+/// the judge's control probe at 6.
+const WIRE_TEARDOWN_PROBE: u32 = 6;
 
 #[skuld::test]
-fn a_wire_run_with_an_outage_inside_it_is_rerun_not_charged() {
+fn a_wire_run_with_the_control_down_at_the_teardown_is_rerun_not_charged() {
     let defects: Vec<_> = placements()
         .into_iter()
-        .filter(|down| !between_the_vouch_probes(down))
+        .filter(|down| down.contains(&WIRE_TEARDOWN_PROBE))
         .filter(|down| wire_run(&Net::new(down.clone(), &[]), wire_failure).is_err())
         .collect();
     assert!(defects.is_empty(), "a wire run was charged under outages {defects:?}");
 }
 
 #[skuld::test]
-fn an_outage_between_the_vouch_probes_is_the_stated_residual() {
-    let net = Net::new(2..3, &[]);
+fn a_wire_outage_that_ended_before_the_teardown_probe_is_the_stated_residual() {
+    // The vouch before and the head are missing, the control answers at the teardown: a rerun needs a
+    // probe outside any cover to have failed, so this is a defect.
+    let net = Net::new(1..3, &[]);
     assert!(wire_run(&net, wire_failure).is_err());
 }
 
