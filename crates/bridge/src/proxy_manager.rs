@@ -1797,9 +1797,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // began before an unblock cannot install a cover after it; any other
         // fresh read (`On`, `Unreadable`, `Unset`) leaves the snapshot's own
         // verdict (which already folded in `adopted_standing_cover`) alone.
-        // This narrows, never widens, the window a full lock would close —
-        // the remaining gap is the same class of race #878 tracks and this
-        // plan does not fix.
+        // This narrows, never widens, the window a full lock would close. What
+        // remains is an Unblock whose release lands before this cover install.
         let standing_cover_expected = match state_dir.map(lockdown_state::load_intent) {
             Some(Intent::Off) => false,
             _ => standing_cover_expected,

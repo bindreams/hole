@@ -897,8 +897,8 @@ leaves working DNS + broken routes, not the inverse):
   GUIDs and needs no file. See [Fail-closed cover](#fail-closed-cover).
 - **`bridge-plugins.json`** — persisted cosca process identities;
   `plugin_recovery::reap_recorded_plugins` kills survivors by exact identity —
-  no tolerance window — and deletes the file only after accounting for every
-  record it named. The same reap runs at bridge start, at chain stop, and in the
+  no tolerance window — and removes only the records it accounted for, deleting
+  the file when none remain. The same reap runs at bridge start, at chain stop, and in the
   test harness's teardown. At bridge start it runs before the boot reconcile
   (`boot::recover_then_reconcile`: route recovery, reap, reconcile): the reap
   kills every recorded plugin, so running it after would kill the auto-connect's
@@ -2325,7 +2325,8 @@ Disclosed residuals:
    claim can outlive an unblock done this way. Harmless in practice — both
    public reads of the claim already fold in the persisted intent and
    short-circuit to "not armed" the moment intent reads `Off`, which
-   `handle_unblock` writes before it ever attempts the release — and the
+   `handle_unblock` writes once its release is confirmed (it releases first and
+   persists after, so a failed release leaves the Unblock item in place) — and the
    connect path calls `install_lockdown` unconditionally whenever a standing
    cover is expected, never skipping it because the claim was already `true`.
    Only `turn_lockdown_off` clears the persisted intent, so the escape still
@@ -2370,6 +2371,43 @@ one sanctioned site (`stop_with`'s own teardown), and
 documented reasons each releases directly instead of routing through the
 others. Both are blind to an added accessor under a different name; see each
 guard's own doc for its disclosed gap.
+
+#### Concurrent writers
+
+The tray's Unblock (`handle_unblock`) takes none of `ProxyManager`'s locks, so it
+runs while a start, a stop or a reconcile is mid-flight. Every record both can
+write is therefore ordered by something that is not that mutex:
+
+- `bridge-lockdown.json`: `lockdown_state::update` classifies, decides and writes
+  under one in-process lock. The start's adoption promotion is
+  `promote_unrecorded`, which writes only over `Unset` / `Unreadable`
+  (`Intent::admits_adoption_promotion`), so an Unblock's `Off` is never
+  overwritten.
+- `bridge-boottime.json`: a sweep takes a `Snapshot` (record and arm epoch) before
+  it deletes anything, and `apply` re-reads under the lock. An engage's
+  `record_armed` bumps the epoch, and a `Disarm` is dropped when the epoch moved:
+  `Armed` to `Armed` is invisible to a value comparison. A dropped disarm is an
+  over-report, and the next sweep makes it.
+- `bridge-plugins.json`: append, `remove_accounted` and `clear_if_unusable` run
+  under one lock, kills outside it. A reap removes only the records it accounted
+  for; the file goes when none remain.
+- macOS `bridge-failclosed.json` and `bridge-lockdown-pf.json`: a `pfctl` call
+  cannot run under a lock, so these are optimistic. An engage reads the record at
+  entry, writes with `swap` (a compare against that view), and checks `holds`
+  after its ruleset loads; a release clears with `clear_if_token`, only the record
+  it acted on. A lost compare or a failed check is
+  `RoutingError::SupersededByRelease`: the engage drops what it took, restores the
+  host, and the start reports cancelled.
+
+The leaf rule: while one of these locks is held nothing else is acquired, and no
+`.await`, firewall, `pfctl` or process call runs. That is what lets Unblock take
+them without waiting on a wedged start.
+
+Not closed by any of this, and tracked in
+[#1119](https://github.com/bindreams/hole/issues/1119): a start whose cover
+install lands after an Unblock's release leaves the host blocked with intent
+`Off`, and on macOS a release that begins before an engage's `holds` check and
+ends after it can clear a record the engage then reports as held.
 
 ### Update cutover
 
