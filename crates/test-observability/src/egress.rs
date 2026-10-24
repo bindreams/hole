@@ -16,10 +16,20 @@
 //!   from a target that is unreachable for another reason, and it is probed on
 //!   both sides of whatever it vouches for.
 //! * **A [`Window`]** around a scenario that probes while a cover is engaged. A
-//!   cover blocks every host but its own permits, so nothing can be probed inside
-//!   it; the control is probed just before the engage and just after the teardown
-//!   instead. A failed run is excused only when the control failed at either end.
-//!   The residual: an outage that starts and ends inside one scenario run.
+//!   cover blocks every host but its own permits, so the control cannot be probed
+//!   inside it: the scenario probes a host the cover permits, before and after
+//!   each probe whose result it reports ([`InCover`]), and hands the readings to
+//!   the judge as a [`Failure`]. A failure is a defect only when the permit
+//!   answered on both sides and the failing targets, probed outside the cover
+//!   after teardown, answer there with the control answering around them.
+//!
+//! A reading of runner state is vouched for by its own validity: a read that
+//! fails is taken again ([`read_with_network_up`]).
+//!
+//! What no probe can rule out is an outage that falls entirely between two
+//! adjacent probes of one engage: a probe cannot show the network up at an
+//! instant. A cover that blocks its own permit looks the same as an outage over
+//! every in-cover probe, so that case is a defect.
 //!
 //! No wait here has a cap: each round re-probes the real condition, the test's
 //! own nextest timeout is the bound, and every change of state is logged.
@@ -29,6 +39,9 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 mod diagnostics;
+mod in_cover;
+
+pub use in_cover::{Failure, InCover};
 
 /// Bound on one connect. The peer is a remote host that may never answer, so
 /// expiry is a failure of that probe, not a verdict.
@@ -96,48 +109,55 @@ pub fn check_egress_restored(
     check_egress_restored_on(&mut System, what, targets, control, hole_state)
 }
 
-/// Take `read()` with `control` answering on both sides of it.
+/// Take `read()` with `control` answering on both sides of it, and return what it read.
 ///
-/// For a comparison against the runner's own state (its resolver set): the
-/// network going away takes that state with it, so a reading taken while it was
-/// away is not evidence about Hole. A control probe that failed before or after
-/// the read sends it back to wait for the network and read again, and a cover
-/// Hole holds while it waits panics at once ([`wait_for_egress`]): a cover that
-/// blocks `control` is no network loss. A reading that disagrees with the
-/// network up on both sides is the caller's to assert on.
+/// For a reading of the runner's own state (its default gateway, its resolver set): the network going
+/// away takes that state with it, so a reading taken while it was away is not evidence about Hole. A
+/// read that fails (`Err`) is taken again, and so is one with a control probe that failed before or
+/// after it; a cover Hole holds while it waits panics at once ([`wait_for_egress`]), since a cover that
+/// blocks `control` is no network loss. A reading that disagrees with the network up on both sides is
+/// the caller's to assert on.
+///
+/// A read that keeps failing with the network up is retaken without end, once a pause, each failure
+/// logged: the test's own timeout bounds it.
 #[track_caller]
-pub fn read_with_network_up<T>(what: &str, control: &str, hole_state: HoleState<'_>, read: impl FnMut() -> T) -> T {
+pub fn read_with_network_up<T, E: std::fmt::Display>(
+    what: &str,
+    control: &str,
+    hole_state: HoleState<'_>,
+    read: impl FnMut() -> Result<T, E>,
+) -> T {
     read_with_network_up_on(&mut System, what, control, hole_state, read).unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// Run `scenario` (engage a cover, probe while it is engaged, tear it down) until it holds, and
 /// return its value.
 ///
-/// A probe made while the cover is engaged cannot use a control host: the cover blocks everything but
-/// its own permits. So a failed permit probe is reported as `Err(why)` AFTER the scenario has dropped
-/// its cover, and every run is bracketed by a [`Window`]: opened before the run (the control answers,
-/// Hole holds nothing), judged after it. Each rerun therefore starts only after the control answered.
+/// A scenario that fails reports a [`Failure`] AFTER dropping its cover, built from the readings it
+/// took inside the cover ([`InCover`]); each run is bracketed by a [`Window`].
 pub fn rerun_until_network_holds<T>(
     what: &str,
     control: &str,
     hole_state: HoleState<'_>,
-    scenario: impl FnMut() -> Result<T, String>,
+    scenario: impl FnMut() -> Result<T, Failure>,
 ) -> Result<T, String> {
     rerun_until_network_holds_on(&mut System, what, control, hole_state, scenario)
 }
 
 /// The control probes that bracket one run of a scenario that probes while a cover is engaged.
 ///
-/// [`Window::open`] waits (uncapped) until `control` answers and Hole holds nothing, then starts the
-/// clock. After the scenario tore its cover down, [`Window::judge`] decides what a failed run was:
+/// [`Window::open`] waits (uncapped) until `control` answers and Hole holds nothing. After the
+/// scenario tore its cover down, [`Window::judge`] decides what a [`Failure`] was:
 ///
 /// * Hole holds a cover: the scenario left one behind, a defect;
-/// * `control` answers: it answered before the run and answers after it, so the network was up on both
-///   sides and the cover is the cause, a defect;
-/// * `control` fails: the network was down at the end of the run. It waits for `control` and returns
-///   `Ok(())`: run the scenario again.
+/// * [`Failure::Defect`]: a defect;
+/// * [`Failure::Wavered`]: the network wavered inside the run. It waits for `control` and returns
+///   `Ok(())`: run the scenario again;
+/// * [`Failure::Failed`] (and [`Failure::Unvouched`], with no targets): `control` and the failing
+///   targets are probed outside the cover. `control` failing means the network is down: wait, run
+///   again. A target failing while `control` answers means the target is down outside any cover: wait
+///   for it, run again. Both answering is a defect.
 ///
-/// Only [`Window::open`] builds one, so a caller cannot judge without a reading from before the run.
 /// For a caller whose scenario cannot be a sync closure (it awaits); the rest use
 /// [`rerun_until_network_holds`].
 pub struct Window<'a> {
@@ -154,11 +174,10 @@ impl<'a> Window<'a> {
         open_window_on(&mut System, what, control, hole_state)
     }
 
-    /// The verdict on one failed run, after its cover is torn down: `Ok(())` means the network was down
-    /// at the end of it and has answered again, so run the scenario again; `Err` is a defect, `why`
-    /// and what the window saw.
-    pub fn judge(self, why: String) -> Result<(), String> {
-        judge_on(&mut System, self, why)
+    /// The verdict on one failed run, after its cover is torn down: `Ok(())` is to run the scenario
+    /// again, `Err` is a defect.
+    pub fn judge(self, failure: Failure) -> Result<(), String> {
+        judge_on(&mut System, self, failure)
     }
 }
 
@@ -255,10 +274,13 @@ pub(crate) fn connect_when_reachable_on<T>(
         wait_for_egress_on(host, what, &[addr], hole_state)?;
         match connect(addr) {
             Ok(held) => return Ok(held),
-            Err(e) => tracing::warn!(
-                "{what}: {addr} answered a probe but the connection failed ({:?}); waiting again",
-                e.kind()
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    "{what}: {addr} answered a probe but the connection failed ({:?}); waiting again",
+                    e.kind()
+                );
+                host.pause();
+            }
         }
     }
 }
@@ -290,24 +312,29 @@ pub(crate) fn check_egress_restored_on(
     }
 }
 
-pub(crate) fn read_with_network_up_on<T>(
+pub(crate) fn read_with_network_up_on<T, E: std::fmt::Display>(
     host: &mut impl Host,
     what: &str,
     control: &str,
     hole_state: HoleState<'_>,
-    mut read: impl FnMut() -> T,
+    mut read: impl FnMut() -> Result<T, E>,
 ) -> Result<T, String> {
     loop {
         let before = host.probe(control).is_ok();
         let reading = read();
         let after = host.probe(control).is_ok();
-        if before && after {
-            return Ok(reading);
+        match reading {
+            Ok(value) if before && after => return Ok(value),
+            Ok(_) => tracing::warn!(
+                "{what}: {control} did not answer around the reading; waiting for the network and reading again"
+            ),
+            Err(e) => tracing::warn!("{what}: the reading failed ({e}); reading again"),
         }
-        tracing::warn!(
-            "{what}: {control} did not answer around the reading; waiting for the network and reading again"
-        );
         wait_for_egress_on(host, what, &[control], hole_state)?;
+        if before && after {
+            // The network answered throughout, so the wait returned at once; pace the next read.
+            host.pause();
+        }
     }
 }
 
@@ -316,13 +343,13 @@ pub(crate) fn rerun_until_network_holds_on<T>(
     what: &str,
     control: &str,
     hole_state: HoleState<'_>,
-    mut scenario: impl FnMut() -> Result<T, String>,
+    mut scenario: impl FnMut() -> Result<T, Failure>,
 ) -> Result<T, String> {
     loop {
         let window = open_window_on(host, what, control, hole_state)?;
         match scenario() {
             Ok(value) => return Ok(value),
-            Err(why) => judge_on(host, window, why)?,
+            Err(failure) => judge_on(host, window, failure)?,
         }
     }
 }
@@ -347,31 +374,61 @@ pub(crate) fn open_window_on<'a>(
     })
 }
 
-pub(crate) fn judge_on(host: &mut impl Host, window: Window<'_>, why: String) -> Result<(), String> {
+pub(crate) fn judge_on(host: &mut impl Host, window: Window<'_>, failure: Failure) -> Result<(), String> {
     let Window {
         what,
         control,
         hole_state,
         opened,
     } = window;
+    let (why, targets) = match failure {
+        Failure::Defect(why) => return Err(with_held_cover(why, what, hole_state)),
+        Failure::Wavered(why) => {
+            if let Some(held) = hole_state() {
+                return Err(left_behind(why, what, &held));
+            }
+            tracing::warn!(
+                "{what}: {why}\nthe network wavered inside the run; running the scenario again once {control} answers"
+            );
+            return wait_for_egress_on(host, what, &[control], hole_state);
+        }
+        Failure::Failed { why, targets } => (why, targets),
+        Failure::Unvouched(why) => (why, Vec::new()),
+    };
     if let Some(held) = hole_state() {
-        return Err(format!(
-            "{why}
-{what}: the scenario ended with Hole still holding {held}"
-        ));
+        return Err(left_behind(why, what, &held));
     }
-    if host.probe(control).is_ok() {
-        return Err(format!(
-            "{why}
-{what}: {control} answered before and after a {:?} window and Hole holds no cover, so the cover is the cause",
-            opened.elapsed()
-        ));
+    let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+    let control_before = host.probe(control).is_ok();
+    let failing = failing_targets(host, &targets);
+    let control_after = host.probe(control).is_ok();
+    if !(control_before && control_after) {
+        tracing::warn!(
+            "{what}: {why}\n{control} does not answer around the run's teardown, so the network was down; running the scenario again once it does"
+        );
+        return wait_for_egress_on(host, what, &[control], hole_state);
     }
-    tracing::warn!(
-        "{what}: {why}
-{control} does not answer after the run, so the network was down; running the scenario again once it does"
-    );
-    wait_for_egress_on(host, what, &[control], hole_state)
+    if !failing.is_empty() {
+        tracing::warn!(
+            "{what}: {why}\n{failing:?} are unreachable outside the cover while {control} answers and Hole holds no cover, so they are down on their own; waiting for them"
+        );
+        return wait_for_egress_on(host, what, &targets, hole_state);
+    }
+    Err(format!(
+        "{why}\n{what}: {control} and {targets:?} answer outside the cover after a {:?} window and Hole holds no cover, so the run is the cause",
+        opened.elapsed()
+    ))
+}
+
+fn left_behind(why: String, what: &str, held: &str) -> String {
+    format!("{why}\n{what}: the scenario ended with Hole still holding {held}")
+}
+
+fn with_held_cover(why: String, what: &str, hole_state: HoleState<'_>) -> String {
+    match hole_state() {
+        Some(held) => left_behind(why, what, &held),
+        None => why,
+    }
 }
 
 #[cfg(test)]

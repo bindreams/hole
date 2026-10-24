@@ -132,16 +132,28 @@ mod macos_impl {
         Instant::now() + Duration::from_secs(secs)
     }
 
-    fn run(cmd: &str, args: &[&str]) -> String {
+    fn run(cmd: &str, args: &[&str]) -> (bool, String) {
         match Command::new(cmd).args(args).output() {
-            Ok(out) => format!(
-                "$ {cmd} {}\n[{}]\n{}{}",
-                args.join(" "),
-                out.status,
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr),
+            Ok(out) => (
+                out.status.success(),
+                format!(
+                    "$ {cmd} {}
+[{}]
+{}{}",
+                    args.join(" "),
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                ),
             ),
-            Err(e) => format!("$ {cmd} {}\n[spawn failed] {e}", args.join(" ")),
+            Err(e) => (
+                false,
+                format!(
+                    "$ {cmd} {}
+[spawn failed] {e}",
+                    args.join(" ")
+                ),
+            ),
         }
     }
 
@@ -156,15 +168,23 @@ mod macos_impl {
             NETWORK_CONTROL,
             &|| tun_engine::test_utils::held_covers(no_cover_dir.path()),
             || {
-                let dns = scutil_dns();
+                let dns = scutil_dns_checked()?;
                 let servers = nameservers(&dns);
-                (dns, servers)
+                Ok::<_, String>((dns, servers))
             },
         )
     }
 
     fn scutil_dns() -> String {
-        run("scutil", &["--dns"])
+        run("scutil", &["--dns"]).1
+    }
+
+    /// `scutil --dns`, or why it could not be read: a failed read is taken again, not compared.
+    fn scutil_dns_checked() -> Result<String, String> {
+        match run("scutil", &["--dns"]) {
+            (true, dns) => Ok(dns),
+            (false, why) => Err(why),
+        }
     }
 
     /// Every `nameserver[N] : ADDR` line, sorted and deduped — the structural

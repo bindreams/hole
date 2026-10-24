@@ -66,6 +66,7 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use hole_common::config::{DnsConfig, FilterAction, FilterRule, MatchType, ServerEntry};
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
+use hole_test_observability::egress::Failure;
 use tun_engine::test_utils::{classify, describe_output, EscapeGuard, OwnedRoute, ProbeFate, RecordSpec};
 use tun_engine::GatewayInfo;
 use util::port_alloc::Protocols;
@@ -341,17 +342,15 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // up is a defect.
     let control = no_leak_target_addr().to_string();
 
-    // The default route disappears with the runner's network, so a gateway read taken then is not a
-    // verdict about anything. The harness's state directory does not exist yet; the oracle reads the OS
-    // (WFP filters, the live pf ruleset), so a directory of its own names nothing.
+    // The harness's state directory does not exist yet; the oracle reads the OS (WFP filters, the live pf
+    // ruleset), so a directory of its own names nothing.
     let early_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
     let gw = hole_test_observability::egress::read_with_network_up(
         "live-tun-permit: the default gateway",
         &control,
         &|| tun_engine::test_utils::held_covers(early_dir.path()),
         tun_engine::get_default_gateway_info,
-    )
-    .expect("HARNESS: get_default_gateway_info");
+    );
     // A route-table write to the gateway just read: no packet leaves the box.
     let bypass = install_bypass_route(&gw);
 
@@ -384,11 +383,12 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // provably cannot manufacture, so this is the baseline phase B is judged
     // against, not merely a smoke test.
     //
-    // A Full-mode Start installs routes through the default gateway, so it fails with no default route: a
-    // refused Start is judged against the control host like phase B's probes.
+    // A Full-mode Start installs routes through the default gateway, so it fails with no default route. No
+    // cover blocks the control in this phase, so it is probed on both sides of the Start.
     loop {
         let window = hole_test_observability::egress::Window::open("live-tun-permit phase A", &control, &held)
             .unwrap_or_else(|why| panic!("HARNESS: {why}"));
+        let control_before = hole_test_observability::egress::probe(&control).is_ok();
         let resp = harness
             .send(BridgeRequest::Start {
                 config: config.clone(),
@@ -400,7 +400,12 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         if matches!(resp, BridgeResponse::Ack) {
             break;
         }
-        if let Err(why) = window.judge(format!("HARNESS/CONTROL FAILED: phase A Start did not Ack: {resp:?}")) {
+        let control_after = hole_test_observability::egress::probe(&control).is_ok();
+        let failure = Failure::uncovered(
+            format!("HARNESS/CONTROL FAILED: phase A Start did not Ack: {resp:?}"),
+            &[control_before, control_after],
+        );
+        if let Err(why) = window.judge(failure) {
             panic!("{why}");
         }
     }
@@ -434,10 +439,10 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         "HARNESS: phase A Stop did not Ack: {resp:?}"
     );
 
-    // Phase B runs again while the runner's network is down: the probes that need a route off the box (the
-    // bypass route's winner, the no-leak target) cannot tell a lost network from a cover, and a lockdown
-    // cover blocks every control host. Each run is bracketed by a `Window` (control probes outside any
-    // cover); a run whose probes failed is judged only after the cover is released.
+    // Phase B reruns if the runner's network dropped mid-run: a lockdown cover blocks every control host, so
+    // each run is bracketed by a `Window` and judged only after the cover is released. The cover permits
+    // only the session's own server, a loopback fixture here, so nothing off the box can vouch for the
+    // network inside it (`Failure::Unvouched`).
     let (cover_presence, tun_outcome, no_leak, permitted_reachable, path_to_no_leak) = loop {
         let window = hole_test_observability::egress::Window::open("live-tun-permit phase B", &control, &held)
             .unwrap_or_else(|why| panic!("HARNESS: {why}"));
@@ -500,15 +505,26 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         let permitted_reachable = start_b_acked.then(|| connect(ss.addr));
         let path_to_no_leak = start_b_acked.then(|| bypass.winner_for(no_leak_target_ip()));
 
-        // Release (best-effort — the guard below is the real backstop), THEN assert.
-        let _ = harness.send(BridgeRequest::Stop).await;
-        let _ = harness.send(BridgeRequest::SetLockdown { enabled: false }).await;
+        // Release, THEN assert. A release that did not Ack is logged; the guard below is the backstop, and
+        // the oracle read after it is the verdict on whether the cover is gone.
+        let stop = harness.send(BridgeRequest::Stop).await;
+        let unlock = harness.send(BridgeRequest::SetLockdown { enabled: false }).await;
+        for (step, resp) in [("Stop", &stop), ("SetLockdown(false)", &unlock)] {
+            if !matches!(resp, Ok(BridgeResponse::Ack)) {
+                tracing::warn!("live-tun-permit phase B: {step} did not Ack: {resp:?}");
+            }
+        }
         // Explicit drop (not scope-end): must run while `harness` — and its
         // TempDir — is still alive. `harness`'s own Drop (later, at function
         // end) kills the child if it hasn't already exited; a killed bridge
         // leaves the cover engaged by design, which is exactly what this guard
         // is the escape from.
         drop(guard);
+        assert_eq!(
+            held(),
+            None,
+            "phase B ended with Hole still holding a cover: the release did not take"
+        );
 
         // A refused arm or Start counts like a failed probe: Start needs the default route (see phase A),
         // and an outage that begins mid-iteration is what the window brackets.
@@ -535,7 +551,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
             None
         };
         if let Some(why) = failed_step {
-            if let Err(why) = window.judge(why) {
+            if let Err(why) = window.judge(Failure::Unvouched(why)) {
                 panic!("HARNESS: {why}");
             }
             continue;

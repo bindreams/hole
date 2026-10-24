@@ -86,7 +86,7 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use tun::AbstractDevice;
 
-use hole_test_observability::egress::Window;
+use hole_test_observability::egress::{InCover, Window};
 
 use super::cover_oracle::held_covers;
 use super::{engage_lockdown, SystemLuidResolver};
@@ -643,33 +643,33 @@ fn run_live_tun_permit_core(
 
         // Phase 2 — positive: engage naming device 1 (the one carrying the route).
         //
-        // The cover blocks every control host, so the block probe and the server-permit probe share ONE
-        // engage and run before anything is sent: a permit that answers vouches that the network was up
-        // for the block probe taken just before it, and a failure drops the cover and is judged against
-        // the control outside it, leaving no nonce or SYN of the failed attempt for the next to capture.
+        // The cover blocks every control host, so the block probe is bracketed by the server permit
+        // (permit, block, permit) in ONE engage, before anything is sent; a failure drops the cover and
+        // is judged outside it, leaving no nonce or SYN of the failed attempt for the next to capture.
         let server = format!("{SERVER_IP}:443");
         let held = || held_covers(guard.state_dir());
-        let (send2, seen2_udp, permit_seen, tcp2, seen2_tcp, permit_seen_tcp, cover_blocking) = loop {
+        let (send2, seen2_udp, permit_seen, tcp2, seen2_tcp, permit_seen_tcp) = loop {
             let window = Window::open("live-tun-permit phase 2", &server, &held).unwrap_or_else(|why| panic!("{why}"));
             let cover = engage_lockdown(server_ip(), dev1.tun_name(), &resolver, &[], guard.state_dir(), None)
                 .expect("engage real standing lockdown cover naming device 1");
 
-            let cover_blocking =
-                TcpStream::connect_timeout(&NON_PERMITTED.parse().unwrap(), Duration::from_secs(5)).is_err();
-            let server_permit = TcpStream::connect_timeout(&server.parse().unwrap(), Duration::from_secs(5));
-            if let Err(e) = server_permit {
+            let probes = InCover::new(&server, "with the cover engaged, the server IP must stay reachable")
+                .blocked(
+                    NON_PERMITTED,
+                    "with the cover engaged, the block must hold (if it is inert nothing else means anything)",
+                )
+                .run();
+            if let Err(failure) = probes {
                 drop(cover);
-                let why = format!(
-                    "with the cover engaged, the server IP ({server}) must stay reachable: {:?}",
-                    e.kind()
-                );
-                window.judge(why).unwrap_or_else(|why| panic!("{why}"));
+                window.judge(failure).unwrap_or_else(|why| panic!("{why}"));
                 continue;
             }
 
             let send2 = send_udp_probe(2);
             let mut seen2_udp = Vec::new();
-            let permit_seen = dev1.capture(Duration::from_secs(5), &mut seen2_udp, udp_matches(2)).await;
+            let permit_seen = dev1
+                .capture(Duration::from_secs(5), &mut seen2_udp, udp_matches(2))
+                .await;
 
             let tcp2 = TcpStream::connect_timeout(
                 &SocketAddr::from((PROBE_TCP_IP, TCP_PROBE_PORT_PHASE2)),
@@ -685,15 +685,7 @@ fn run_live_tun_permit_core(
                 .await;
 
             drop(cover);
-            break (
-                send2,
-                seen2_udp,
-                permit_seen,
-                tcp2,
-                seen2_tcp,
-                permit_seen_tcp,
-                cover_blocking,
-            );
+            break (send2, seen2_udp, permit_seen, tcp2, seen2_tcp, permit_seen_tcp);
         };
 
         // Assert only after the cover is released, in the mandated order.
@@ -714,10 +706,6 @@ fn run_live_tun_permit_core(
             send2_fate.is_verdict() && tcp2_fate.is_verdict(),
             "HARNESS: a phase-2 probe never reached the network stack (send2={send2_fate:?}, tcp2={tcp2_fate:?}) \
              — this says nothing about the cover, fix the harness first",
-        );
-        assert!(
-            cover_blocking,
-            "with the cover engaged, {NON_PERMITTED} must be blocked (if the block is inert nothing else means anything)"
         );
         assert!(
             permit_seen && permit_seen_tcp,
@@ -779,7 +767,10 @@ fn run_live_tun_permit_core(
         send_udp_probe(5).expect("HARNESS: restore probe (nonce 5) failed to leave the process");
         let mut seen4 = Vec::new();
         let restored = dev1.capture(Duration::from_secs(5), &mut seen4, udp_matches(5)).await;
-        assert!(restored, "restore: probe must surface with no cover engaged; seen={seen4:?}");
+        assert!(
+            restored,
+            "restore: probe must surface with no cover engaged; seen={seen4:?}"
+        );
         hole_test_observability::egress::assert_egress_restored(
             "restore: the box must be left open",
             &[NON_PERMITTED],
@@ -1196,13 +1187,11 @@ fn frame_parse_identifies_a_bare_syn_and_not_a_syn_ack() {
 
 // Phase-2 structure tripwire (unprivileged) ===========================================================================
 
-/// Lexical tripwire over [`run_live_tun_permit_core`]'s phase 2: the block probe and the server-permit
-/// probe run under ONE engage, block first.
+/// Lexical tripwire over [`run_live_tun_permit_core`]'s phase 2: the block probe is bracketed by the
+/// server permit under ONE engage, and the cover is released only after the last capture.
 ///
 /// A permit probed in an engage of its own leaves the block probe unvouched: a network that drops while
 /// the first engage is held reads as "blocked" and the test passes over a cover it never saw block.
-/// The property needs the real cover and a network that fails on cue, so no scripted host reaches it;
-/// this pins the structure instead.
 #[skuld::test]
 fn the_live_cover_test_probes_block_and_server_permit_under_one_engage() {
     let source = include_str!("live_tun_permit_privileged_tests.rs");
@@ -1229,14 +1218,24 @@ fn the_live_cover_test_probes_block_and_server_permit_under_one_engage() {
             .find(needle)
             .unwrap_or_else(|| panic!("phase 2 no longer contains `{needle}`"))
     };
-    let (engage, block, permit, release) = (
+    let (engage, probes, run, last_capture) = (
         at("engage_lockdown("),
-        at("NON_PERMITTED.parse()"),
-        at("server.parse()"),
-        at("drop(cover)"),
+        at("InCover::new("),
+        at(".run();"),
+        phase2.rfind(".capture(").expect("phase 2 captures on a device"),
     );
     assert!(
-        engage < block && block < permit && permit < release,
-        "phase 2 must engage, probe the block, probe the server permit, then release"
+        engage < probes && probes < run,
+        "phase 2 must engage, then probe the block bracketed by the server permit"
+    );
+    let drops: Vec<usize> = phase2.match_indices("drop(cover)").map(|(i, _)| i).collect();
+    assert!(!drops.is_empty(), "phase 2 must release the cover");
+    assert!(
+        drops.iter().all(|d| *d > run),
+        "the cover must not be released before the probes ran"
+    );
+    assert!(
+        drops.iter().max().is_some_and(|last| *last > last_capture),
+        "the last release must come after the final capture, or the captures run over a released cover"
     );
 }

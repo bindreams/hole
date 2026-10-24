@@ -2992,39 +2992,26 @@ and a rerun repeats the platform's whole job.
   `xtask/src/command.rs` names the command and the status in a failed child's
   error.
 - **A test that needs egress tells a network loss from a Hole defect.** The
-  oracle is Hole's own state, not a remote host: `hole_test_observability::egress`
-  takes a `HoleState` read, `tun_engine::test_utils::held_covers`
-  (`routing/failclosed/cover_oracle.rs`), which covers both cover kinds on both
-  OSes and never answers from the engaging test's own records alone, so a cover
-  an earlier test left under another state directory is seen too. Windows reads
-  the WFP filter keys of the standing and the transient cover. macOS reads the
-  standing cover's pf label and state record, and for the transient cover
-  (which pf keeps no label for) its state record plus the live main ruleset: a
-  clean runner lists no `block` rule in `pfctl -sr`, so one is a cover, even
-  after a release cleared the record. A pf that cannot be asked counts as held.
-  A failed probe while Hole holds a cover fails at once as a defect. With no
-  Hole state and a control host down it waits for the network, uncapped, and
-  logs each change.
-  A probe made while a cover is engaged cannot use a control host: the cover
-  blocks every host but its permits. Each such scenario runs inside an
-  `egress::Window`: opened (control answers, Hole holds nothing) just before
-  the engage, judged just after the teardown. A failed run is rerun only when
-  the control failed after it; a control that answered at both ends, or
-  any Hole state, is a defect and fails with the window length in the message
-  (`rerun_until_network_holds`, or `Window` directly for an async scenario).
-  The one residual is an outage that starts and ends inside one scenario run;
-  every outage seen in CI lasted 20 s or more. The block probe and the permit
-  probe of one test share an engage, so a permit that answers vouches for the
-  block probe taken just before it. `check_egress_restored` (and
-  `assert_egress_restored`) probes the targets once with the control on both
-  sides; a failure with the control down on either side waits for the network
-  and probes again, and one with the control up on both is the release's.
-  A read of runner state (the resolver set, the default gateway) is taken
-  between control probes (`read_with_network_up`), which takes the same
-  `HoleState`: a cover that blocks the control fails the read at once. Every
-  step of a privileged test that needs a route off the box goes through one of
-  these (a refused `Start` included); a step that touches only loopback, a TUN
-  the test owns, or local files does not.
+  oracle is Hole's own state, not a remote host
+  (`tun_engine::test_utils::held_covers`): a failed probe while Hole holds a
+  cover fails at once as a defect, and with no cover and the control host down
+  the test waits for the network, uncapped. A probe made while a cover is engaged
+  cannot use a control host, so the scenario vouches for the network from inside
+  the cover: it probes a host the cover permits before and after each probe whose
+  result it reports (`egress::InCover`), and `egress::Window` judges the readings
+  after the teardown. A failure is a defect only when the permit answered on both
+  sides and the failing targets, probed outside the cover, answer there with the
+  control answering around them; a target that is down outside any cover is
+  waited for, and a permit that answered at some readings and not others is a
+  wavering network, rerun. A read of runner state goes through
+  `read_with_network_up`, which retakes a read that fails. What no probe can rule
+  out is an outage that falls entirely between two adjacent probes of one
+  engage; a cover that blocks its own permit looks like an outage over every
+  in-cover probe, so that is a defect. A scenario with no permitted host to
+  vouch with (the live-TUN e2e, whose cover permits only a loopback server) is
+  judged by the control outside the run alone (`Failure::Unvouched`). The
+  mechanism is in `hole_test_observability::egress` and
+  `routing/failclosed/cover_oracle.rs`.
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 
@@ -3120,10 +3107,8 @@ Spotlight "Hole" must reveal it.
   is the bound. Only a lost network is waited out (`PrimaryIpv4Error::NetworkLoss`:
   network or host unreachable, network down, a link-local source address); any
   other error, such as a refused socket, fails at once with its cause.
-  A test that probes real egress (`hole_test_observability::egress`) waits the
-  same way when its target is unreachable and Hole holds no cover, and fails at
-  once, as a defect, when Hole does; see
-  [CI layout](#ci-layout) for the oracle and the in-cover window.
+  See [CI layout](#ci-layout) for how a test that probes real egress tells a
+  network loss from a Hole defect.
 - **Every crate runs in CI** — the `every_workspace_crate_runs_in_ci` conformance
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test

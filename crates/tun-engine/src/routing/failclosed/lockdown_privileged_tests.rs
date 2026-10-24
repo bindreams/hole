@@ -49,6 +49,8 @@
 use super::cover_oracle::{held_covers, permit_scenario};
 use super::*;
 use crate::{GLOBAL_NET_STATE, TUN};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use hole_test_observability::egress::InCover;
 #[cfg(target_os = "macos")]
 use util::system_tool::SystemTool;
 
@@ -98,6 +100,42 @@ fn assert_restored(what: &str, targets: &[&str], state_dir: &std::path::Path) {
     hole_test_observability::egress::assert_egress_restored(what, targets, PERMITTED, &|| held_covers(state_dir));
 }
 
+/// The probes of the standing lockdown cover: the server permit answers, a non-permitted host is blocked.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn server_permit_probes() -> InCover<'static> {
+    InCover::new(
+        PERMITTED,
+        "server-IP permit must beat block-all (else the cover blocks everything)",
+    )
+    .blocked(
+        NON_PERMITTED,
+        "lockdown must block egress to a non-permitted host (leak!)",
+    )
+}
+
+/// The probes of the transient cover: the server permit answers, a non-permitted host is blocked.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn transient_probes() -> InCover<'static> {
+    InCover::new(PERMITTED, "server-IP permit must beat block-all")
+        .blocked(NON_PERMITTED, "transient cover must block a non-permitted host (leak!)")
+}
+
+/// The probes of the transient cover with a resolver permit: the server and the resolver answer, the
+/// resolver's other port and a third host are blocked.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn resolver_probes() -> InCover<'static> {
+    InCover::new(PERMITTED, "server-IP permit must beat block-all")
+        .answers(RESOLVER, "resolver-IP permit must beat block-all")
+        .blocked(
+            RESOLVER_OTHER_PORT,
+            "the resolver permit must be scoped to TCP/443, not the whole IP (leak!)",
+        )
+        .blocked(
+            NON_PERMITTED,
+            "a third, non-permitted host must still be blocked (leak!)",
+        )
+}
+
 /// Windows real-engage verification. Engages the REAL WFP lockdown cover with
 /// `server_ip = 1.1.1.1` and proves it is SELECTIVE: egress to the permitted
 /// server IP stays Ok (the permit beats block-all — the assertion that catches
@@ -117,16 +155,9 @@ fn assert_restored(what: &str, targets: &[&str], state_dir: &std::path::Path) {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
-    use std::net::TcpStream;
-    use std::time::Duration;
-
     let dir = tempfile::tempdir().unwrap();
     let resolver = SystemLuidResolver;
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-
-    // External-event probe with a graceful failure bound: the timeout is the
-    // failure-to-human signal, not a sync sleep; assertions are Ok/Err, not timing.
-    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
     // Baseline (PRE-cover): both hosts must be reachable. A failure here is a
     // network/reachability problem, not the cover — fail loud and self-validate the
@@ -142,8 +173,8 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         "pre-engage the firewall must report no lockdown cover"
     );
 
-    // The cover blocks every control host, so a failed permit probe drops the cover and asks the control
-    // outside it: a lost network re-runs the engage, a live control means the permit really failed.
+    // The cover blocks every control host, so the scenario vouches for the network with the permit it
+    // holds, on both sides of the block probe; the verdict is judged after the cover is dropped.
     permit_scenario("lockdown permit", dir.path(), PERMITTED, || {
         // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
         // source to exercise the real resolve + `LocalInterface` filter path.
@@ -163,27 +194,13 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
             "while the cover is held the firewall must report it present"
         );
 
-        let permitted = connect(PERMITTED);
-        let non = connect(NON_PERMITTED);
-
-        // Permit beats block-all: the server IP stays reachable (catches block-everything).
-        if let Err(e) = permitted {
-            return Err(format!(
-                "server-IP permit must beat block-all (else the cover blocks everything): \
-                 {PERMITTED}={:?}; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
-                e.kind(),
-            ));
-        }
-        // No leak: egress to a non-permitted host is blocked at ALE_AUTH_CONNECT.
-        assert!(
-            non.is_err(),
-            "lockdown must block egress to a non-permitted host (leak!): \
-             {NON_PERMITTED} connected; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
-        );
+        // Permit beats block-all (catches block-everything); a non-permitted host is blocked at
+        // ALE_AUTH_CONNECT (no leak).
+        let verdict = server_permit_probes().run();
 
         // Drop sweeps the lockdown filters (kind-aware Cover Drop).
         drop(cover);
-        Ok(())
+        verdict
     });
     assert_restored(
         "disengage must restore egress to the previously-blocked host",
@@ -218,16 +235,9 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
-    use std::net::TcpStream;
-    use std::time::Duration;
-
     let dir = tempfile::tempdir().unwrap();
     let resolver = SystemLuidResolver;
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-
-    // External-event probe with a graceful failure bound: the timeout is the
-    // failure-to-human signal, not a sync sleep; assertions are Ok/Err, not timing.
-    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
     // Baseline (PRE-cover): both hosts must be reachable. A failure here is a
     // network/reachability problem, not the cover — fail loud and self-validate the
@@ -274,23 +284,12 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
             "while the cover is held pf must report it present"
         );
 
-        let permitted = connect(PERMITTED);
-        let non = connect(NON_PERMITTED);
-
         // (b) Selective: permit beats block (server IP reachable), non-permitted blocked.
-        if let Err(e) = permitted {
-            return Err(format!(
-                "server-IP permit must beat block-all (else the cover blocks everything): {PERMITTED}={:?}; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
-                e.kind(),
-            ));
-        }
-        assert!(
-            non.is_err(),
-            "lockdown must block egress to a non-permitted host (leak!): {NON_PERMITTED} connected; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
-        );
+        let verdict = server_permit_probes().run();
 
         // (c) Drop restores the pre-lockdown snapshot: block rule gone.
         drop(cover);
+        verdict?;
         let after = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
         assert!(
             !String::from_utf8_lossy(&after.stdout).contains("block drop out quick all"),
@@ -338,12 +337,8 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn a_simulated_reboot_rearms_the_cover() {
-    use std::net::TcpStream;
-    use std::time::Duration;
-
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
     wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
@@ -351,10 +346,16 @@ fn a_simulated_reboot_rearms_the_cover() {
         // First engage: FreshEnable (no persisted state yet).
         let cover = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
             .expect("engage real pf lockdown cover");
-        assert!(
-            connect(NON_PERMITTED).is_err(),
-            "sanity: the cover must actually be blocking before the reboot is simulated"
-        );
+        // The cover is released by its guard on this early return, as on every other.
+        InCover::new(
+            PERMITTED,
+            "the server-IP permit must hold before the reboot is simulated",
+        )
+        .blocked(
+            NON_PERMITTED,
+            "sanity: the cover must actually be blocking before the reboot is simulated",
+        )
+        .run()?;
 
         // Simulate the reboot's effect on pf: flush every loaded rule/state, then
         // disable pf and drop its refcount to 0 — the two things a reboot resets.
@@ -427,16 +428,15 @@ fn a_simulated_reboot_rearms_the_cover() {
         let rearmed = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
             .expect("re-engage after simulated reboot");
 
-        if let Err(e) = connect(PERMITTED) {
-            return Err(format!(
-                "the server-IP permit must still beat block-all after the rearm: {PERMITTED}={:?}",
-                e.kind()
-            ));
-        }
-        assert!(
-            connect(NON_PERMITTED).is_err(),
-            "a post-reboot reconciliation must rearm the block, not leave the host fail-open"
-        );
+        let verdict = InCover::new(
+            PERMITTED,
+            "the server-IP permit must still beat block-all after the rearm",
+        )
+        .blocked(
+            NON_PERMITTED,
+            "a post-reboot reconciliation must rearm the block, not leave the host fail-open",
+        )
+        .run();
 
         // Both guards disengage on drop via `lockdown_disengage(state_dir)`, which
         // reads the state file rather than the guard's own (stale, pre-reboot for
@@ -446,7 +446,7 @@ fn a_simulated_reboot_rearms_the_cover() {
         // doc. No manual cleanup is needed.
         drop(rearmed);
         drop(cover);
-        Ok(())
+        verdict
     });
     assert_restored(
         "the final disengage must restore egress to the previously-blocked host",
@@ -463,15 +463,8 @@ fn a_simulated_reboot_rearms_the_cover() {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_failclosed_permits_server_blocks_other_egress() {
-    use std::net::TcpStream;
-    use std::time::Duration;
-
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-
-    // External-event probe with a graceful failure bound: the timeout is the
-    // failure-to-human signal, not a sync sleep; assertions are Ok/Err, not timing.
-    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
     // Baseline (PRE-cover): both hosts reachable — self-validates the probe so a
     // network blip is never a false pass.
@@ -480,20 +473,10 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
     permit_scenario("transient permit", dir.path(), PERMITTED, || {
         let cover = engage(server_ip, None, dir.path(), None).expect("engage real WFP transient cover");
 
-        let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
-        if let Err(e) = p {
-            return Err(format!(
-                "server-IP permit must beat block-all: {PERMITTED}={:?}",
-                e.kind()
-            ));
-        }
-        assert!(
-            n.is_err(),
-            "transient cover must block a non-permitted host (leak!): {NON_PERMITTED} connected"
-        );
+        let verdict = transient_probes().run();
 
         drop(cover);
-        Ok(())
+        verdict
     });
     assert_restored("disengage must restore egress", &[NON_PERMITTED], dir.path());
 }
@@ -507,14 +490,9 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_failclosed_permits_resolver_blocks_other_egress() {
-    use std::net::TcpStream;
-    use std::time::Duration;
-
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
     let resolver_ip: std::net::IpAddr = "1.0.0.1".parse().unwrap();
-
-    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
     wait_for_baseline(dir.path(), &[PERMITTED, RESOLVER, RESOLVER_OTHER_PORT, NON_PERMITTED]);
 
@@ -522,36 +500,10 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
         let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
             .expect("engage real WFP transient cover with a resolver permit");
 
-        let (p, r, po, n) = (
-            connect(PERMITTED),
-            connect(RESOLVER),
-            connect(RESOLVER_OTHER_PORT),
-            connect(NON_PERMITTED),
-        );
-        if let Err(e) = p {
-            return Err(format!(
-                "server-IP permit must beat block-all: {PERMITTED}={:?}",
-                e.kind()
-            ));
-        }
-        if let Err(e) = r {
-            return Err(format!(
-                "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-                e.kind()
-            ));
-        }
-        assert!(
-            po.is_err(),
-            "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
-             {RESOLVER_OTHER_PORT} connected"
-        );
-        assert!(
-            n.is_err(),
-            "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
-        );
+        let verdict = resolver_probes().run();
 
         drop(cover);
-        Ok(())
+        verdict
     });
     assert_restored(
         "disengage must restore egress",
@@ -567,13 +519,8 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_permits_server_blocks_other_egress() {
-    use std::net::TcpStream;
-    use std::time::Duration;
-
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-
-    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
     wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
@@ -588,21 +535,11 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
             "ruleset must carry the block:\n{rules}"
         );
 
-        let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
-        if let Err(e) = p {
-            return Err(format!(
-                "server-IP permit must beat block-all: {PERMITTED}={:?}",
-                e.kind()
-            ));
-        }
-        assert!(
-            n.is_err(),
-            "transient cover must block a non-permitted host (leak!): {NON_PERMITTED} connected"
-        );
+        let verdict = transient_probes().run();
 
         // (c) Drop restores /etc/pf.conf: egress restored.
         drop(cover);
-        Ok(())
+        verdict
     });
     assert_restored("disengage must restore egress", &[NON_PERMITTED], dir.path());
 }
@@ -613,14 +550,9 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_permits_resolver_blocks_other_egress() {
-    use std::net::TcpStream;
-    use std::time::Duration;
-
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
     let resolver_ip: std::net::IpAddr = "1.0.0.1".parse().unwrap();
-
-    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
     wait_for_baseline(dir.path(), &[PERMITTED, RESOLVER, RESOLVER_OTHER_PORT, NON_PERMITTED]);
 
@@ -635,36 +567,10 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
             "live ruleset must carry the resolver permit:\n{rules}"
         );
 
-        let (p, r, po, n) = (
-            connect(PERMITTED),
-            connect(RESOLVER),
-            connect(RESOLVER_OTHER_PORT),
-            connect(NON_PERMITTED),
-        );
-        if let Err(e) = p {
-            return Err(format!(
-                "server-IP permit must beat block-all: {PERMITTED}={:?}",
-                e.kind()
-            ));
-        }
-        if let Err(e) = r {
-            return Err(format!(
-                "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-                e.kind()
-            ));
-        }
-        assert!(
-            po.is_err(),
-            "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
-             {RESOLVER_OTHER_PORT} connected"
-        );
-        assert!(
-            n.is_err(),
-            "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
-        );
+        let verdict = resolver_probes().run();
 
         drop(cover);
-        Ok(())
+        verdict
     });
     assert_restored(
         "disengage must restore egress",

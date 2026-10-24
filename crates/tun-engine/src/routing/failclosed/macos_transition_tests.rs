@@ -373,13 +373,6 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // timeout probers keeps several SYNs in flight at every instant instead.
     const PROBER_THREADS: usize = 16;
     const PROBER_TIMEOUT: Duration = Duration::from_millis(20);
-    // The bound for the three one-shot verdicts that must be SETTLED rather
-    // than sampled (reachable baseline, cold-engage post-condition, restored
-    // egress). The same value both ways round on purpose: "blocked" means the
-    // host stayed silent for the very bound it cleared when open. It is the
-    // 5s the neighbouring privileged cover tests already use.
-    const SETTLED_TIMEOUT: Duration = Duration::from_secs(5);
-
     // External-event probe with a graceful failure bound: the timeout is the
     // failure-to-human signal for a remote host that might not respond, not a
     // sync sleep or a poll on state this test controls.
@@ -394,9 +387,11 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         crate::routing::failclosed::cover_oracle::held_covers(dir.path())
     });
 
-    // The positive control (a permitted server reachable inside the probe budget) is the one in-cover
-    // probe here; a lost network starves it exactly as a broken budget would, so a failed floor drops
-    // the cover and the control host outside it decides between re-running and failing.
+    // The cold engage's block probe is bracketed by the permitted server. The positive control (a permitted
+    // server reachable inside the probe budget) is sampled across the whole run, and a failed floor is
+    // vouched for by a probe of the server after the run: a lost network starves the control exactly as a
+    // broken budget would, so the cover is dropped and the control host outside it decides between
+    // re-running and failing.
     crate::routing::failclosed::cover_oracle::permit_scenario(
         "transition sampling",
         dir.path(),
@@ -413,13 +408,17 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
             let mut held: Option<Cover> = Some(
                 engage(addrs[0].parse().unwrap(), None, dir.path(), None).expect("cold engage real pf transient cover"),
             );
-            let cold = connect(NON_PERMITTED, SETTLED_TIMEOUT);
-            assert!(
-                cold.is_err(),
-                "a cold engage that returned Ok must already block {NON_PERMITTED} — the cover is INERT: \
-             reported armed while egress runs in the clear (pf never enabled, or enabled under a \
-             ruleset that is not ours)",
-            );
+            // The permitted server answers on both sides of the block probe, so a network loss cannot
+            // pass for a block. The cover is released by `held` on an early return.
+            hole_test_observability::egress::InCover::new(
+                &format!("{SERVER_A}:443"),
+                "a cold engage must permit its server",
+            )
+            .blocked(
+                NON_PERMITTED,
+                "a cold engage that returned Ok must already block the host — the cover is INERT: reported armed                  while egress runs in the clear (pf never enabled, or enabled under a ruleset that is not ours)",
+            )
+            .run()?;
 
             let leaked = AtomicBool::new(false);
             let stop = AtomicBool::new(false);
@@ -690,9 +689,13 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                 "the control prober made no attempt at all — the positive control is vacuous"
             );
             if raw_rate < CONTROL_RATE_FLOOR_PCT {
+                // The cold engage's probes answered; the permitted server is probed again before the
+                // cover goes, so a network that dropped during the run is told from a starved budget.
+                let permit_after = hole_test_observability::egress::probe(&format!("{SERVER_A}:443")).is_ok();
                 drop(held.take());
-                return Err(format!(
-                    "positive control: only {raw_hits}/{control_total_attempts} ({raw_rate:.1}%) connects to a \
+                return Err(hole_test_observability::egress::Failure::covered(
+                    format!(
+                        "positive control: only {raw_hits}/{control_total_attempts} ({raw_rate:.1}%) connects to a \
              PERMITTED server ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?}, under the \
              {CONTROL_RATE_FLOOR_PCT:.0}% floor (of which {permitted_attempts} survived the \
              commit-generation filter). The never-admitted assertion above is therefore not trustworthy: \
@@ -704,6 +707,9 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
              do NOT lower the floor: {PROBER_TIMEOUT:?} is the prober pool's budget too, and raising it \
              thins the pool's probe density, which IS this guard's sensitivity. The knob is loaded both \
              ways."
+                    ),
+                    &format!("{SERVER_A}:443"),
+                    &[true, permit_after],
                 ));
             }
 

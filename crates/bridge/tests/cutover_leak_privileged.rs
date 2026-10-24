@@ -33,9 +33,7 @@ const TUN: skuld::Label;
 const GLOBAL_NET_STATE: skuld::Label;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::net::TcpStream;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::time::Duration;
+use hole_test_observability::egress::InCover;
 
 // Routable anycast hosts on :443 (the runner has outbound internet). The cover
 // permits the server IP and blocks everything else, so this proves no-leak.
@@ -45,13 +43,6 @@ const SERVER_IP: &str = "1.1.1.1";
 const PERMITTED: &str = "1.1.1.1:443";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const NON_PERMITTED: &str = "8.8.8.8:443";
-
-/// External-event probe with a graceful failure bound: the timeout is the
-/// failure-to-human signal, not a sync sleep; assertions are Ok/Err, not timing.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn connect(addr: &str) -> std::io::Result<TcpStream> {
-    TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5))
-}
 
 // The wire-level NIC-capture UDP no-leak proof lives in
 // `cutover_nic_capture_privileged.rs` (Windows in-box pktmon — no pcap crate /
@@ -126,17 +117,11 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
             let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path(), None)
                 .expect("engage the real standing lockdown cover");
 
-            // Engaged: server permitted (permit beats block-all), others blocked (no leak).
-            if let Err(e) = connect(PERMITTED) {
-                return Err(format!(
-                    "server-IP permit must hold while engaged: {PERMITTED}={:?}",
-                    e.kind()
-                ));
-            }
-            assert!(
-                connect(NON_PERMITTED).is_err(),
-                "non-permitted egress must be blocked: {NON_PERMITTED}"
-            );
+            // Engaged: server permitted (permit beats block-all), others blocked (no leak). The cover is
+            // released by its guard on an early return.
+            InCover::new(PERMITTED, "server-IP permit must hold while engaged")
+                .blocked(NON_PERMITTED, "non-permitted egress must be blocked")
+                .run()?;
 
             // The cutover-shutdown action: disarm (persist-without-disengage), NOT drop.
             cover.disarm();
@@ -144,8 +129,12 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
             // THE INVARIANT: the block survives disarm -- the filters persist across the
             // restart gap (server still permitted, others still blocked). A disarm that
             // disengaged would let NON_PERMITTED through here (the leak this guards).
-            let permit_after_disarm = connect(PERMITTED);
-            let leak_after_disarm = connect(NON_PERMITTED);
+            let after_disarm = InCover::new(PERMITTED, "server-IP permit must survive disarm")
+                .blocked(
+                    NON_PERMITTED,
+                    "disarm must NOT disengage the cover (leak!): connected after disarm",
+                )
+                .run();
 
             // Cleanup before any verdict: no live guard remains after disarm, so fully disengage via the
             // persisted state, restoring egress so the box is left open whatever the verdict.
@@ -153,13 +142,7 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
             let _clearance_has_no_reader_in_cleanup =
                 disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
 
-            assert!(
-                leak_after_disarm.is_err(),
-                "disarm must NOT disengage the cover (leak!): {NON_PERMITTED} connected after disarm"
-            );
-            permit_after_disarm
-                .map(drop)
-                .map_err(|e| format!("server-IP permit must survive disarm: {PERMITTED}={:?}", e.kind()))
+            after_disarm
         },
     );
     if let Err(why) = verdict {

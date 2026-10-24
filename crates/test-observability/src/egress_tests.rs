@@ -105,6 +105,14 @@ fn clean() -> Option<String> {
     None
 }
 
+/// A failure the permit vouched for: the control and nothing else decides it.
+fn failed(why: &str) -> Failure {
+    Failure::Failed {
+        why: why.to_string(),
+        targets: Vec::new(),
+    }
+}
+
 fn wait(net: &Net, targets: &[&str], hole: HoleState<'_>) -> Result<(), String> {
     wait_for_egress_on(&mut { net }, "t", targets, hole)
 }
@@ -230,18 +238,12 @@ fn every_target_must_answer_not_just_the_first() {
 
 #[skuld::test]
 fn a_reading_taken_as_the_network_returns_is_retaken() {
-    // The outage covers the first operation only. A read followed by one control probe (the old shape)
-    // read during the outage, probed after it, and kept the degraded reading. With the control probed
-    // first, the outage is seen and the reading is taken again, whatever the first one said.
+    // The outage covers only the first operation (the control probe before the read), so the reading is retaken.
     let net = Net::new(0..1, &[]);
     let readings = Cell::new(0);
     let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
         readings.set(readings.get() + 1);
-        if net.step() {
-            1
-        } else {
-            0
-        }
+        Ok::<_, String>(if net.step() { 1 } else { 0 })
     })
     .unwrap();
     assert_eq!(reading, 1);
@@ -254,11 +256,7 @@ fn a_reading_taken_during_an_outage_is_retaken() {
     let readings = Cell::new(0);
     let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
         readings.set(readings.get() + 1);
-        if net.step() {
-            1
-        } else {
-            0
-        }
+        Ok::<_, String>(if net.step() { 1 } else { 0 })
     })
     .unwrap();
     assert_eq!(reading, 1);
@@ -271,7 +269,7 @@ fn a_reading_with_the_network_up_on_both_sides_is_returned_as_it_is() {
     let net = Net::new(0..0, &[]);
     let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
         net.step();
-        0
+        Ok::<_, String>(0)
     })
     .unwrap();
     assert_eq!(reading, 0);
@@ -284,7 +282,7 @@ fn a_resolver_set_reading_is_retaken_after_a_network_loss() {
     let (raw, servers) = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
         let raw = if net.step() { "nameserver[0] : 192.168.64.1" } else { "" };
         let servers: Vec<String> = raw.lines().map(str::to_owned).collect();
-        (raw.to_string(), servers)
+        Ok::<_, String>((raw.to_string(), servers))
     })
     .unwrap();
     assert_eq!(servers, vec!["nameserver[0] : 192.168.64.1".to_string()]);
@@ -300,7 +298,7 @@ fn a_reading_taken_while_hole_holds_a_cover_and_the_control_is_down_fails_at_onc
         "t",
         CONTROL,
         &|| Some("a lockdown cover".to_string()),
-        || 1,
+        || Ok::<_, String>(1),
     )
     .unwrap_err();
     assert!(err.contains("a lockdown cover"), "{err}");
@@ -316,9 +314,26 @@ fn a_cover_found_while_waiting_out_a_network_loss_fails_the_reading() {
         polls.set(polls.get() + 1);
         (polls.get() >= 2).then(|| "a transient cover".to_string())
     };
-    let err = read_with_network_up_on(&mut { &net }, "t", CONTROL, &hole, || 1).unwrap_err();
+    let err = read_with_network_up_on(&mut { &net }, "t", CONTROL, &hole, || Ok::<_, String>(1)).unwrap_err();
     assert!(err.contains("a transient cover"), "{err}");
     assert_eq!(net.pauses.get(), 1);
+}
+
+#[skuld::test]
+fn a_reading_that_keeps_failing_with_the_network_up_is_paced_not_spun() {
+    let net = Net::new(0..0, &[]);
+    let tries = Cell::new(0);
+    let got = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+        tries.set(tries.get() + 1);
+        if tries.get() < 4 {
+            Err("no default route")
+        } else {
+            Ok(7)
+        }
+    })
+    .unwrap();
+    assert_eq!(got, 7);
+    assert_eq!(net.pauses.get(), 3);
 }
 
 // rerun_until_network_holds ===========================================================================================
@@ -326,7 +341,7 @@ fn a_cover_found_while_waiting_out_a_network_loss_fails_the_reading() {
 fn scenario_result<T>(
     net: &Net,
     hole: HoleState<'_>,
-    scenario: impl FnMut() -> Result<T, String>,
+    scenario: impl FnMut() -> Result<T, Failure>,
 ) -> Result<T, String> {
     rerun_until_network_holds_on(&mut { net }, "t", CONTROL, hole, scenario)
 }
@@ -342,7 +357,7 @@ fn a_scenario_that_failed_while_the_network_was_down_is_rerun_until_it_holds() {
         if net.step() {
             Ok("held")
         } else {
-            Err("the permit probe failed".to_string())
+            Err(failed("the permit probe failed"))
         }
     })
     .unwrap();
@@ -357,9 +372,9 @@ fn a_scenario_that_left_a_cover_behind_is_a_defect_even_with_the_network_down() 
     let err = scenario_result(
         &net,
         &|| cover.get().then(|| "the transient cover".to_string()),
-        || -> Result<(), String> {
+        || -> Result<(), Failure> {
             cover.set(true);
-            Err("the permit probe failed".to_string())
+            Err(failed("the permit probe failed"))
         },
     )
     .unwrap_err();
@@ -374,7 +389,7 @@ fn open<'a>(net: &Net, hole: HoleState<'a>) -> Result<Window<'a>, String> {
 }
 
 fn judge(net: &Net, window: Window<'_>, why: &str) -> Result<(), String> {
-    judge_on(&mut { net }, window, why.to_string())
+    judge_on(&mut { net }, window, failed(why))
 }
 
 #[skuld::test]
@@ -410,7 +425,7 @@ fn a_failed_run_with_the_control_answering_on_both_sides_is_a_defect() {
     let window = open(&net, &clean).unwrap();
     let err = judge(&net, window, "the permit probe failed").unwrap_err();
     assert!(err.contains("the permit probe failed"), "{err}");
-    assert!(err.contains("before and after"), "{err}");
+    assert!(err.contains("answer outside the cover"), "{err}");
 }
 
 #[skuld::test]
@@ -450,7 +465,7 @@ fn an_outage_before_the_window_is_not_charged_to_the_run() {
     let started = net.tick.get();
     assert!(started >= 3, "the window opened inside the outage");
     let err = judge(&net, window, "the permit probe failed").unwrap_err();
-    assert!(err.contains("before and after"), "{err}");
+    assert!(err.contains("answer outside the cover"), "{err}");
 }
 
 #[skuld::test]
@@ -461,7 +476,7 @@ fn every_rerun_is_preceded_by_a_control_probe_that_answered() {
     let out = scenario_result(&net, &clean, || {
         starts.borrow_mut().push((net.probed.borrow().len(), net.tick.get()));
         if starts.borrow().len() == 1 {
-            Err("the permit probe failed".to_string())
+            Err(failed("the permit probe failed"))
         } else {
             Ok("held")
         }
@@ -483,13 +498,13 @@ fn every_rerun_is_preceded_by_a_control_probe_that_answered() {
 fn a_scenario_that_fails_with_the_control_answering_on_both_sides_is_not_rerun() {
     let net = Net::new(0..0, &[]);
     let runs = Cell::new(0);
-    let err = scenario_result(&net, &clean, || -> Result<(), String> {
+    let err = scenario_result(&net, &clean, || -> Result<(), Failure> {
         runs.set(runs.get() + 1);
-        Err("the permit probe failed".to_string())
+        Err(failed("the permit probe failed"))
     })
     .unwrap_err();
     assert!(err.contains("the permit probe failed"), "{err}");
-    assert!(err.contains("before and after"), "{err}");
+    assert!(err.contains("answer outside the cover"), "{err}");
     assert_eq!(runs.get(), 1);
 }
 
@@ -511,6 +526,22 @@ fn a_connection_lost_between_the_wait_and_the_connect_is_opened_on_the_next_roun
 }
 
 #[skuld::test]
+fn a_connection_that_keeps_failing_after_an_answered_probe_is_paced_not_spun() {
+    let net = Net::new(0..0, &[]);
+    let tries = Cell::new(0);
+    connect_when_reachable_on(&mut { &net }, "t", TARGET, &clean, |_| {
+        tries.set(tries.get() + 1);
+        if tries.get() < 3 {
+            Err(io::ErrorKind::ConnectionRefused.into())
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(net.pauses.get(), 2);
+}
+
+#[skuld::test]
 fn a_connection_is_not_awaited_while_hole_holds_a_cover() {
     let net = Net::new(0..0, &[TARGET]);
     let err = connect_when_reachable_on(&mut { &net }, "t", TARGET, &|| Some("a cover".to_string()), |_| {
@@ -522,3 +553,6 @@ fn a_connection_is_not_awaited_while_hole_holds_a_cover() {
 
 #[path = "egress_matrix_tests.rs"]
 mod matrix;
+
+#[path = "egress_in_cover_tests.rs"]
+mod in_cover;

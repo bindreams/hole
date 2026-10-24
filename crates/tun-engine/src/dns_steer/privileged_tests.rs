@@ -101,15 +101,23 @@ fn resolver_set(what: &str) -> (String, Vec<String>) {
         NETWORK_CONTROL,
         &|| crate::test_utils::held_covers(no_cover_dir.path()),
         || {
-            let dns = scutil_dns();
+            let dns = scutil_dns_checked()?;
             let servers = nameservers(&dns);
-            (dns, servers)
+            Ok::<_, String>((dns, servers))
         },
     )
 }
 
 fn scutil_dns() -> String {
     run("scutil", &["--dns"]).1
+}
+
+/// `scutil --dns`, or why it could not be read: a failed read is taken again, not compared.
+fn scutil_dns_checked() -> Result<String, String> {
+    match run("scutil", &["--dns"]) {
+        (true, dns) => Ok(dns),
+        (false, why) => Err(why),
+    }
 }
 
 /// Every `nameserver[N] : ADDR` line, sorted and deduped — the structural
