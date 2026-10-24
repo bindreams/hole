@@ -985,14 +985,14 @@ fn sweep_with_witness(
     owner: Option<(u32, u32)>,
     sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
-    let witness = boottime_witness::load(state_dir);
-    let SweepOutcome { clearance, failure } = sweep(witness);
+    let snapshot = boottime_witness::snapshot(state_dir);
+    let SweepOutcome { clearance, failure } = sweep(snapshot.witness);
     // The record is written from what the sweep OBSERVED, before its failure
     // reaches the caller. A failing sweep is not an unobservant one: this
     // codebase's own sweeps issue every delete before inspecting any code, so
     // `Err` arrives after the sibling's delete already succeeded — see
     // [`SweepOutcome`].
-    boottime_witness::apply(state_dir, witness, clearance.witness_update(), owner);
+    boottime_witness::apply(state_dir, snapshot, clearance.witness_update(), owner);
     match failure {
         Some(e) => Err(e),
         None => Ok(clearance),

@@ -351,8 +351,149 @@ fn every_update_and_record_pair_has_one_write_answer() {
         (ArmingWitness::Unreadable, WitnessUpdate::Disarm, Some(false)),
     ];
     for (current, update, want) in table {
-        assert_eq!(next_record(current, update), want, "{current:?} + {update:?}");
+        assert_eq!(next_record(current, update, false), want, "{current:?} + {update:?}");
     }
+}
+
+#[skuld::test]
+fn an_engage_during_the_sweep_vetoes_only_the_disarm() {
+    // `epoch_moved` is "an engage recorded a twin since this sweep's snapshot".
+    // The sweep's `Disarm` speaks for the twins it deleted, not for the one
+    // that engage just armed, so it is dropped whatever the record holds. `Arm`
+    // and `Leave` are unaffected: neither retracts anything.
+    for current in [
+        ArmingWitness::Armed,
+        ArmingWitness::Disarmed,
+        ArmingWitness::Unset,
+        ArmingWitness::Unreadable,
+    ] {
+        assert_eq!(next_record(current, WitnessUpdate::Disarm, true), None, "{current:?}");
+        for update in [WitnessUpdate::Arm, WitnessUpdate::Leave] {
+            assert_eq!(
+                next_record(current, update, true),
+                next_record(current, update, false),
+                "{current:?} + {update:?}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn apply_holds_the_witness_lock_while_deciding() {
+    let state = dir();
+    let snapshot = super::snapshot(state.path());
+    let mut held_inside = false;
+    super::apply_with(state.path(), snapshot, WitnessUpdate::Arm, None, || {
+        held_inside = super::STATE.try_acquire().is_none();
+    });
+    assert!(held_inside, "the re-read and the write must be one critical section");
+    assert!(
+        super::STATE.try_acquire().is_some(),
+        "and the lock is released on return"
+    );
+    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
+}
+
+#[skuld::test]
+fn every_recorded_engage_moves_the_epoch() {
+    let state = dir();
+    let before = super::snapshot(state.path());
+    super::record_armed(state.path(), None);
+    let after = super::snapshot(state.path());
+    assert_ne!(before.epoch, after.epoch);
+    assert_eq!(after.witness, ArmingWitness::Armed);
+}
+
+#[skuld::test]
+fn an_engage_that_commits_during_a_disarming_sweep_stays_recorded() {
+    // The sweep read `Armed`, deleted the old twin (`Removed`, so it will
+    // `Disarm`), and a concurrent engage committed a NEW twin and recorded it
+    // in between. `Armed` -> `Armed` is invisible to a value comparison, which
+    // is why the epoch exists: without it the sweep's `armed: false` lands over
+    // the new twin and the next sweep reads "nothing outstanding".
+    let state = dir();
+    super::record_armed(state.path(), None);
+
+    let c = super::super::sweep_with_witness(state.path(), None, |witness| {
+        super::record_armed(state.path(), None);
+        SweepOutcome::completed(Clearance::from_observations(
+            &[sibling(KeyOutcome::Removed), twin_removed()],
+            witness,
+        ))
+    })
+    .expect("the sweep body cannot fail");
+
+    assert!(
+        c.leftover_keys().is_empty(),
+        "the sweep itself proved its own twins gone"
+    );
+    assert_eq!(
+        super::load(state.path()),
+        ArmingWitness::Armed,
+        "the twin the engage armed during the sweep was not deleted by it"
+    );
+}
+
+#[skuld::test]
+fn a_disarm_dropped_for_a_concurrent_engage_is_made_by_the_next_sweep() {
+    // The cost of the veto is one over-report, not a record that can never
+    // clear: the next sweep snapshots the moved epoch and disarms normally.
+    let state = dir();
+    super::record_armed(state.path(), None);
+    let _ = super::super::sweep_with_witness(state.path(), None, |witness| {
+        super::record_armed(state.path(), None);
+        SweepOutcome::completed(Clearance::from_observations(
+            &[sibling(KeyOutcome::Removed), twin_removed()],
+            witness,
+        ))
+    })
+    .expect("the sweep body cannot fail");
+    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
+
+    let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
+    assert!(c.is_proven());
+    assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
+}
+
+#[skuld::test]
+fn a_disarming_sweep_with_no_concurrent_engage_still_disarms() {
+    let state = dir();
+    super::record_armed(state.path(), None);
+    let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
+    assert!(c.is_proven());
+    assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
+}
+
+#[skuld::test]
+fn a_failing_sweep_with_a_concurrent_engage_stays_armed() {
+    // A sweep that ends in `Err` has still deleted what it deleted, and its
+    // witness update is epoch-checked like any other.
+    let state = dir();
+    super::record_armed(state.path(), None);
+    super::super::sweep_with_witness(state.path(), None, |witness| {
+        super::record_armed(state.path(), None);
+        SweepOutcome::failed(
+            Clearance::from_observations(&[sibling(KeyOutcome::Removed), twin_removed()], witness),
+            RoutingError::RouteSetup("the firewall refused one of the deletes".into()),
+        )
+    })
+    .expect_err("the sweep body failed");
+    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
+}
+
+#[skuld::test]
+fn an_engage_during_an_arming_sweep_changes_nothing() {
+    let state = dir();
+    let c = super::super::sweep_with_witness(state.path(), None, |witness| {
+        super::record_armed(state.path(), None);
+        SweepOutcome::completed(Clearance::from_observations(
+            &[sibling(KeyOutcome::Removed), twin_not_found()],
+            witness,
+        ))
+    })
+    .expect("the sweep body cannot fail");
+    assert_eq!(c.leftover_keys(), [TWIN]);
+    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
 }
 
 #[skuld::test]
