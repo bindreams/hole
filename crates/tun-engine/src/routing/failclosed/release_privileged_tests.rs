@@ -29,6 +29,8 @@
 //! matches on both. Renaming a test WITHOUT updating that filter silently
 //! drops it from the group.
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use super::cover_oracle::held_covers;
 use crate::device::TunIdentity;
 use crate::routing::{CoverGuard, Routing, SystemRouting};
 
@@ -88,17 +90,28 @@ fn connect(addr: &str) -> std::io::Result<std::net::TcpStream> {
     std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), std::time::Duration::from_secs(5))
 }
 
+/// The precondition every test starts from: egress is open and no cover is installed. A cover left by
+/// an earlier test fails here at once instead of reading as a lost network.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn assert_baseline_reachable() {
-    let base_permitted = connect(PERMITTED);
-    let base_non = connect(NON_PERMITTED);
-    assert!(
-        base_permitted.is_ok() && base_non.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        base_permitted.err().map(|e| e.kind()),
-        base_non.err().map(|e| e.kind()),
-    );
+fn assert_baseline_reachable(state_dir: &std::path::Path) {
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED], &|| {
+        held_covers(state_dir)
+    });
+}
+
+/// `targets` answer again: a lost network is waited out, a cover that is still installed (or a block
+/// with the network up) fails at once.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[track_caller]
+fn assert_restored(what: &str, targets: &[&str], state_dir: &std::path::Path) {
+    if let Err(why) = check_restored(what, targets, state_dir) {
+        panic!("{why}");
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn check_restored(what: &str, targets: &[&str], state_dir: &std::path::Path) -> Result<(), String> {
+    hole_test_observability::egress::check_egress_restored(what, targets, PERMITTED, &|| held_covers(state_dir))
 }
 
 // windows_release_all_clears_a_stranded_lockdown_cover / macos counterpart ============================================
@@ -111,7 +124,7 @@ fn windows_release_all_clears_a_stranded_lockdown_cover() {
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     let cover = routing
         .install_lockdown(
@@ -131,11 +144,7 @@ fn windows_release_all_clears_a_stranded_lockdown_cover() {
         .release_all_covers()
         .expect("release_all_covers must clear the stranded lockdown cover");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
-    );
+    assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
 }
 
 #[cfg(target_os = "macos")]
@@ -146,7 +155,7 @@ fn macos_release_all_clears_a_stranded_lockdown_cover() {
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     let cover = routing
         .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
@@ -162,11 +171,7 @@ fn macos_release_all_clears_a_stranded_lockdown_cover() {
         .release_all_covers()
         .expect("release_all_covers must clear the stranded lockdown cover");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
-    );
+    assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
     let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
     assert!(
         !String::from_utf8_lossy(&sr.stdout).contains("block drop out quick all"),
@@ -188,7 +193,7 @@ fn windows_release_all_clears_a_stranded_transient_cover() {
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     let cover = routing
         .install_failclosed_cover(server_ip, None)
@@ -204,11 +209,7 @@ fn windows_release_all_clears_a_stranded_transient_cover() {
         .release_all_covers()
         .expect("release_all_covers must clear the stranded transient cover");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
-    );
+    assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
 }
 
 #[cfg(target_os = "macos")]
@@ -219,7 +220,7 @@ fn macos_release_all_clears_a_stranded_transient_cover() {
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     let cover = routing
         .install_failclosed_cover(server_ip, None)
@@ -235,11 +236,7 @@ fn macos_release_all_clears_a_stranded_transient_cover() {
         .release_all_covers()
         .expect("release_all_covers must clear the stranded transient cover");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
-    );
+    assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
     assert!(
         !dir.path().join(super::failclosed_state::STATE_FILE_NAME).exists(),
         "the transient state file must be cleared on a confirmed release"
@@ -256,7 +253,7 @@ fn windows_release_all_clears_both_stranded_covers() {
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     let lockdown = routing
         .install_lockdown(
@@ -280,11 +277,7 @@ fn windows_release_all_clears_both_stranded_covers() {
         .release_all_covers()
         .expect("release_all_covers must clear both stranded covers in one call");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
-    );
+    assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
 }
 
 #[cfg(target_os = "macos")]
@@ -295,7 +288,7 @@ fn macos_release_all_clears_both_stranded_covers() {
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     let lockdown = routing
         .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
@@ -315,11 +308,7 @@ fn macos_release_all_clears_both_stranded_covers() {
         .release_all_covers()
         .expect("release_all_covers must clear both stranded covers in one call");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
-    );
+    assert_restored("release_all_covers must restore egress", &[NON_PERMITTED], dir.path());
     assert!(!dir.path().join(super::lockdown_pf_state::STATE_FILE_NAME).exists());
     assert!(!dir.path().join(super::failclosed_state::STATE_FILE_NAME).exists());
 }
@@ -332,16 +321,16 @@ fn windows_release_all_on_a_clean_host_is_ok() {
     let dir = tempfile::tempdir().unwrap();
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     // Windows has no host-wide ruleset to compare (fixed compiled-in GUIDs, no
     // ambient policy): reachability is the only local signal available.
     routing.release_all_covers().expect("a clean host must return Ok");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "a clean host's reachability must be unaffected: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    assert_restored(
+        "a clean host's reachability must be unaffected",
+        &[NON_PERMITTED],
+        dir.path(),
     );
     assert_eq!(
         super::lockdown_cover_presence(dir.path()),
@@ -356,7 +345,7 @@ fn macos_release_all_on_a_clean_host_is_ok() {
     let dir = tempfile::tempdir().unwrap();
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     // Compare only -sr / -sn (the RULES) and the enabled flag — `-s info`'s
     // counters move on their own and would make this test flaky for reasons
@@ -426,10 +415,10 @@ fn macos_release_all_on_a_clean_host_is_ok() {
         enabled_before, enabled_after,
         "a clean host's pf-enabled flag must be unaffected"
     );
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "a clean host's reachability must be unaffected: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    assert_restored(
+        "a clean host's reachability must be unaffected",
+        &[NON_PERMITTED],
+        dir.path(),
     );
 }
 
@@ -443,7 +432,7 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     let cover = routing
         .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
@@ -458,10 +447,10 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
         .release_all_covers()
         .expect("an unreadable state file must still be treated as a cover to clear");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress even with an unreadable state file: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    assert_restored(
+        "release_all_covers must restore egress even with an unreadable state file",
+        &[NON_PERMITTED],
+        dir.path(),
     );
 }
 
@@ -488,7 +477,7 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     // The TRANSIENT cover — `recover_cover`'s subject.
     let cover = routing
@@ -522,7 +511,11 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
 
     crate::routing::failclosed::recover_cover(dir.path(), false);
 
-    let restored = connect(NON_PERMITTED);
+    let restored = check_restored(
+        "recover_cover must restore egress even with an unreadable state file",
+        &[NON_PERMITTED],
+        dir.path(),
+    );
 
     // Safety net, not the balance: the sweep salvages the `pf_token` out of
     // the unusable record itself (`StateFile::unusable`) and drops it, so this
@@ -532,11 +525,9 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     // the measurement, so it can neither mask nor cause the verdict.
     let _ = SystemTool::Pfctl.command().unwrap().args(["-X", &token]).output();
 
-    assert!(
-        restored.is_ok(),
-        "recover_cover must restore egress even with an unreadable state file: {NON_PERMITTED}={:?}",
-        restored.err().map(|e| e.kind()),
-    );
+    if let Err(why) = restored {
+        panic!("{why}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -547,7 +538,7 @@ fn macos_release_all_falls_back_when_the_snapshot_will_not_load() {
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    assert_baseline_reachable();
+    assert_baseline_reachable(dir.path());
 
     let cover = routing
         .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
@@ -568,9 +559,9 @@ fn macos_release_all_falls_back_when_the_snapshot_will_not_load() {
         .release_all_covers()
         .expect("a snapshot that will not load must fall back to the default ruleset");
 
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "release_all_covers must restore egress via the fallback: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    assert_restored(
+        "release_all_covers must restore egress via the fallback",
+        &[NON_PERMITTED],
+        dir.path(),
     );
 }

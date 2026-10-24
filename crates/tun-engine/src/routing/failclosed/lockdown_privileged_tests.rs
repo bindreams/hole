@@ -45,6 +45,8 @@
 //! instant so a failure here is not blindly reported as "the permit failed"
 //! when it could be a general outage instead.
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use super::cover_oracle::{held_covers, permit_scenario};
 use super::*;
 use crate::{GLOBAL_NET_STATE, TUN};
 #[cfg(target_os = "macos")]
@@ -81,6 +83,21 @@ const RESOLVER_OTHER_PORT: &str = "1.0.0.1:853";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const NON_PERMITTED: &str = "8.8.8.8:443";
 
+/// The precondition every test starts from: the targets answer and no cover is installed. A cover left
+/// by an earlier test fails here at once instead of reading as a lost network.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn wait_for_baseline(state_dir: &std::path::Path, targets: &[&str]) {
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", targets, &|| held_covers(state_dir));
+}
+
+/// The lifted cover let egress back out: a lost network is waited out, a cover still installed (or a
+/// block with the network up) fails at once.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[track_caller]
+fn assert_restored(what: &str, targets: &[&str], state_dir: &std::path::Path) {
+    hole_test_observability::egress::assert_egress_restored(what, targets, PERMITTED, &|| held_covers(state_dir));
+}
+
 /// Windows real-engage verification. Engages the REAL WFP lockdown cover with
 /// `server_ip = 1.1.1.1` and proves it is SELECTIVE: egress to the permitted
 /// server IP stays Ok (the permit beats block-all — the assertion that catches
@@ -114,15 +131,7 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
     // Baseline (PRE-cover): both hosts must be reachable. A failure here is a
     // network/reachability problem, not the cover — fail loud and self-validate the
     // probe so a network blip is never a false pass.
-    let base_permitted = connect(PERMITTED);
-    let base_non = connect(NON_PERMITTED);
-    assert!(
-        base_permitted.is_ok() && base_non.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        base_permitted.err().map(|e| e.kind()),
-        base_non.err().map(|e| e.kind()),
-    );
+    wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
     // Pre-engage, the OS must report a clean host. This is the assertion that
     // would have caught `lockdown_cover_present`'s hardcoded `true` — the value
@@ -133,47 +142,53 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         "pre-engage the firewall must report no lockdown cover"
     );
 
-    // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
-    // source to exercise the real resolve + `LocalInterface` filter path.
-    let cover = engage_lockdown(
-        server_ip,
-        "Loopback Pseudo-Interface 1",
-        &resolver,
-        &[],
+    // The cover blocks every control host, so a failed permit probe drops the cover and asks the control
+    // outside it: a lost network re-runs the engage, a live control means the permit really failed.
+    permit_scenario("lockdown permit", dir.path(), PERMITTED, || {
+        // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
+        // source to exercise the real resolve + `LocalInterface` filter path.
+        let cover = engage_lockdown(
+            server_ip,
+            "Loopback Pseudo-Interface 1",
+            &resolver,
+            &[],
+            dir.path(),
+            None,
+        )
+        .expect("engage real WFP lockdown cover");
+
+        assert_eq!(
+            super::lockdown_cover_presence(dir.path()),
+            crate::routing::CoverPresence::Live,
+            "while the cover is held the firewall must report it present"
+        );
+
+        let permitted = connect(PERMITTED);
+        let non = connect(NON_PERMITTED);
+
+        // Permit beats block-all: the server IP stays reachable (catches block-everything).
+        if let Err(e) = permitted {
+            return Err(format!(
+                "server-IP permit must beat block-all (else the cover blocks everything): \
+                 {PERMITTED}={:?}; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
+                e.kind(),
+            ));
+        }
+        // No leak: egress to a non-permitted host is blocked at ALE_AUTH_CONNECT.
+        assert!(
+            non.is_err(),
+            "lockdown must block egress to a non-permitted host (leak!): \
+             {NON_PERMITTED} connected; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
+        );
+
+        // Drop sweeps the lockdown filters (kind-aware Cover Drop).
+        drop(cover);
+        Ok(())
+    });
+    assert_restored(
+        "disengage must restore egress to the previously-blocked host",
+        &[NON_PERMITTED],
         dir.path(),
-        None,
-    )
-    .expect("engage real WFP lockdown cover");
-
-    assert_eq!(
-        super::lockdown_cover_presence(dir.path()),
-        crate::routing::CoverPresence::Live,
-        "while the cover is held the firewall must report it present"
-    );
-
-    let permitted = connect(PERMITTED);
-    let non = connect(NON_PERMITTED);
-
-    // Permit beats block-all: the server IP stays reachable (catches block-everything).
-    assert!(
-        permitted.is_ok(),
-        "server-IP permit must beat block-all (else the cover blocks everything): \
-         {PERMITTED}={:?}; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
-        permitted.err().map(|e| e.kind()),
-    );
-    // No leak: egress to a non-permitted host is blocked at ALE_AUTH_CONNECT.
-    assert!(
-        non.is_err(),
-        "lockdown must block egress to a non-permitted host (leak!): \
-         {NON_PERMITTED} connected; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
-    );
-
-    // Drop sweeps the lockdown filters (kind-aware Cover Drop); egress restored.
-    drop(cover);
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
     );
     assert_eq!(
         super::lockdown_cover_presence(dir.path()),
@@ -217,15 +232,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     // Baseline (PRE-cover): both hosts must be reachable. A failure here is a
     // network/reachability problem, not the cover — fail loud and self-validate the
     // probe so a network blip is never a false pass.
-    let base_permitted = connect(PERMITTED);
-    let base_non = connect(NON_PERMITTED);
-    assert!(
-        base_permitted.is_ok() && base_non.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        base_permitted.err().map(|e| e.kind()),
-        base_non.err().map(|e| e.kind()),
-    );
+    wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
     assert_eq!(
         super::lockdown_cover_presence(dir.path()),
@@ -233,66 +240,68 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         "pre-engage pf must report no lockdown cover"
     );
 
-    let cover = engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path(), None)
-        .expect("engage real pf lockdown cover");
+    permit_scenario("lockdown permit", dir.path(), PERMITTED, || {
+        let cover = engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path(), None)
+            .expect("engage real pf lockdown cover");
 
-    // (a) The live main ruleset carries our authoritative block rule.
-    let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
-    let rules = String::from_utf8_lossy(&sr.stdout);
-    assert!(
-        rules.contains("block drop out quick all"),
-        "main ruleset must carry the lockdown block (else inert):\n{rules}"
-    );
+        // (a) The live main ruleset carries our authoritative block rule.
+        let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
+        let rules = String::from_utf8_lossy(&sr.stdout);
+        assert!(
+            rules.contains("block drop out quick all"),
+            "main ruleset must carry the lockdown block (else inert):\n{rules}"
+        );
 
-    // (a2) The label really loaded, and `pfctl -s labels` really lists it. Every
-    // macOS `Live` in this feature flows through this one measurement, so a
-    // failure here means the intent repair and the self-capture guard are dead
-    // code that still passes its unit tests — fix the ruleset, never relax this.
-    let labels = SystemTool::Pfctl
-        .command()
-        .unwrap()
-        .args(["-s", "labels"])
-        .output()
-        .unwrap();
-    let labels = String::from_utf8_lossy(&labels.stdout);
-    assert!(
-        super::platform::labels_listing_carries_our_label(&labels),
-        "`pfctl -s labels` must list {:?} while the cover is held:\n{labels}",
-        super::platform::LOCKDOWN_PF_LABEL
-    );
-    assert_eq!(
-        super::lockdown_cover_presence(dir.path()),
-        crate::routing::CoverPresence::Live,
-        "while the cover is held pf must report it present"
-    );
+        // (a2) The label really loaded, and `pfctl -s labels` really lists it. Every
+        // macOS `Live` in this feature flows through this one measurement, so a
+        // failure here means the intent repair and the self-capture guard are dead
+        // code that still passes its unit tests — fix the ruleset, never relax this.
+        let labels = SystemTool::Pfctl
+            .command()
+            .unwrap()
+            .args(["-s", "labels"])
+            .output()
+            .unwrap();
+        let labels = String::from_utf8_lossy(&labels.stdout);
+        assert!(
+            super::platform::labels_listing_carries_our_label(&labels),
+            "`pfctl -s labels` must list {:?} while the cover is held:\n{labels}",
+            super::platform::LOCKDOWN_PF_LABEL
+        );
+        assert_eq!(
+            super::lockdown_cover_presence(dir.path()),
+            crate::routing::CoverPresence::Live,
+            "while the cover is held pf must report it present"
+        );
 
-    let permitted = connect(PERMITTED);
-    let non = connect(NON_PERMITTED);
+        let permitted = connect(PERMITTED);
+        let non = connect(NON_PERMITTED);
 
-    // (b) Selective: permit beats block (server IP reachable), non-permitted blocked.
-    assert!(
-        permitted.is_ok(),
-        "server-IP permit must beat block-all (else the cover blocks everything): \
-         {PERMITTED}={:?}; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
-        permitted.err().map(|e| e.kind()),
-    );
-    assert!(
-        non.is_err(),
-        "lockdown must block egress to a non-permitted host (leak!): \
-         {NON_PERMITTED} connected; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
-    );
+        // (b) Selective: permit beats block (server IP reachable), non-permitted blocked.
+        if let Err(e) = permitted {
+            return Err(format!(
+                "server-IP permit must beat block-all (else the cover blocks everything): {PERMITTED}={:?}; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
+                e.kind(),
+            ));
+        }
+        assert!(
+            non.is_err(),
+            "lockdown must block egress to a non-permitted host (leak!): {NON_PERMITTED} connected; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
+        );
 
-    // (c) Drop restores the pre-lockdown snapshot: block rule gone, egress restored.
-    drop(cover);
-    let after = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
-    assert!(
-        !String::from_utf8_lossy(&after.stdout).contains("block drop out quick all"),
-        "snapshot restore must remove our lockdown block rule"
-    );
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
+        // (c) Drop restores the pre-lockdown snapshot: block rule gone.
+        drop(cover);
+        let after = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&after.stdout).contains("block drop out quick all"),
+            "snapshot restore must remove our lockdown block rule"
+        );
+        Ok(())
+    });
+    assert_restored(
+        "disengage must restore egress to the previously-blocked host",
+        &[NON_PERMITTED],
+        dir.path(),
     );
     // Exercises BOTH halves of the fold: the label is gone from pf AND
     // `disengage_lockdown` cleared the state file.
@@ -336,103 +345,113 @@ fn a_simulated_reboot_rearms_the_cover() {
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    let base_permitted = connect(PERMITTED);
-    let base_non = connect(NON_PERMITTED);
-    assert!(
-        base_permitted.is_ok() && base_non.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        base_permitted.err().map(|e| e.kind()),
-        base_non.err().map(|e| e.kind()),
-    );
+    wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
-    // First engage: FreshEnable (no persisted state yet).
-    let cover = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
-        .expect("engage real pf lockdown cover");
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "sanity: the cover must actually be blocking before the reboot is simulated"
-    );
+    permit_scenario("rearm", dir.path(), PERMITTED, || {
+        // First engage: FreshEnable (no persisted state yet).
+        let cover = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
+            .expect("engage real pf lockdown cover");
+        assert!(
+            connect(NON_PERMITTED).is_err(),
+            "sanity: the cover must actually be blocking before the reboot is simulated"
+        );
 
-    // Simulate the reboot's effect on pf: flush every loaded rule/state, then
-    // disable pf and drop its refcount to 0 — the two things a reboot resets.
-    // `bridge-lockdown-pf.json` is untouched, exactly like a real reboot: the
-    // OS state is gone, the filesystem is not.
-    SystemTool::Pfctl
-        .command()
-        .unwrap()
-        .args(["-F", "all"])
-        .output()
-        .expect("pfctl -F all");
-    SystemTool::Pfctl
-        .command()
-        .unwrap()
-        .args(["-d"])
-        .output()
-        .expect("pfctl -d");
-    // std::mem::forget was not used: `cover`'s Drop would call
-    // `disengage_lockdown`, which would (correctly) no-op against the
-    // already-torn-down pf state below and clear the state file this test
-    // needs to survive — so the simulated reboot must happen, and be
-    // confirmed, before `cover` is allowed to drop. Confirmed here rather than
-    // assumed: a failure to actually reset pf would make every assertion below
-    // vacuous.
-    let info = SystemTool::Pfctl
-        .command()
-        .unwrap()
-        .args(["-s", "info"])
-        .output()
-        .expect("pfctl -s info");
-    assert!(
-        !super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info.stdout)),
-        "the simulated reboot must actually leave pf disabled"
-    );
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "the simulated reboot must actually reopen egress, else re-blocking it below proves nothing new"
-    );
+        // Simulate the reboot's effect on pf: flush every loaded rule/state, then
+        // disable pf and drop its refcount to 0 — the two things a reboot resets.
+        // `bridge-lockdown-pf.json` is untouched, exactly like a real reboot: the
+        // OS state is gone, the filesystem is not.
+        SystemTool::Pfctl
+            .command()
+            .unwrap()
+            .args(["-F", "all"])
+            .output()
+            .expect("pfctl -F all");
+        SystemTool::Pfctl
+            .command()
+            .unwrap()
+            .args(["-d"])
+            .output()
+            .expect("pfctl -d");
+        // std::mem::forget was not used: `cover`'s Drop would call
+        // `disengage_lockdown`, which would (correctly) no-op against the
+        // already-torn-down pf state below and clear the state file this test
+        // needs to survive — so the simulated reboot must happen, and be
+        // confirmed, before `cover` is allowed to drop. Confirmed here rather than
+        // assumed: a failure to actually reset pf would make every assertion below
+        // vacuous.
+        let info = SystemTool::Pfctl
+            .command()
+            .unwrap()
+            .args(["-s", "info"])
+            .output()
+            .expect("pfctl -s info");
+        assert!(
+            !super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info.stdout)),
+            "the simulated reboot must actually leave pf disabled"
+        );
+        // The record deliberately survives the simulated reboot, so the oracle is pf's live ruleset alone.
+        hole_test_observability::egress::assert_egress_restored(
+            "the simulated reboot must actually reopen egress, else re-blocking it below proves nothing new",
+            &[NON_PERMITTED],
+            PERMITTED,
+            &|| {
+                let labels = SystemTool::Pfctl
+                    .command()
+                    .unwrap()
+                    .args(["-s", "labels"])
+                    .output()
+                    .unwrap();
+                super::platform::labels_listing_carries_our_label(&String::from_utf8_lossy(&labels.stdout))
+                    .then(|| "the lockdown label in pf's live ruleset".to_string())
+            },
+        );
 
-    // The production sequence startup takes: recovery measures presence and
-    // decides, then reconciliation re-engages.
-    let presence = super::lockdown_cover_presence(dir.path());
-    assert_eq!(
-        presence,
-        crate::routing::CoverPresence::Recorded,
-        "post-reboot the label is gone from a disabled pf — only the state file's record survives"
-    );
-    let decision = crate::routing::decide_cover_recovery(lockdown_state::Intent::On, presence);
-    assert_eq!(
-        decision.action,
-        crate::routing::CoverRecovery::Adopt,
-        "an On intent with a recorded-but-unconfirmed cover must adopt, not sweep, across the simulated reboot"
-    );
-    recover_lockdown(decision.action, dir.path(), None);
+        // The production sequence startup takes: recovery measures presence and
+        // decides, then reconciliation re-engages.
+        let presence = super::lockdown_cover_presence(dir.path());
+        assert_eq!(
+            presence,
+            crate::routing::CoverPresence::Recorded,
+            "post-reboot the label is gone from a disabled pf — only the state file's record survives"
+        );
+        let decision = crate::routing::decide_cover_recovery(lockdown_state::Intent::On, presence);
+        assert_eq!(
+            decision.action,
+            crate::routing::CoverRecovery::Adopt,
+            "an On intent with a recorded-but-unconfirmed cover must adopt, not sweep, across the simulated reboot"
+        );
+        recover_lockdown(decision.action, dir.path(), None);
 
-    // The rearm itself: same call `start_cancellable`'s `standing_cover_expected`
-    // gate makes on a persisted `Connected` target, driven directly here.
-    let rearmed = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
-        .expect("re-engage after simulated reboot");
+        // The rearm itself: same call `start_cancellable`'s `standing_cover_expected`
+        // gate makes on a persisted `Connected` target, driven directly here.
+        let rearmed = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
+            .expect("re-engage after simulated reboot");
 
-    assert!(
-        connect(PERMITTED).is_ok(),
-        "the server-IP permit must still beat block-all after the rearm"
-    );
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "a post-reboot reconciliation must rearm the block, not leave the host fail-open"
-    );
+        if let Err(e) = connect(PERMITTED) {
+            return Err(format!(
+                "the server-IP permit must still beat block-all after the rearm: {PERMITTED}={:?}",
+                e.kind()
+            ));
+        }
+        assert!(
+            connect(NON_PERMITTED).is_err(),
+            "a post-reboot reconciliation must rearm the block, not leave the host fail-open"
+        );
 
-    // Both guards disengage on drop via `lockdown_disengage(state_dir)`, which
-    // reads the state file rather than the guard's own (stale, pre-reboot for
-    // `cover`) token — `rearmed` drops first (reverse declaration order),
-    // clearing the state file and restoring the host; `cover`'s later drop
-    // then sees an absent cover and is a no-op, per `lockdown_disengage`'s own
-    // doc. No manual cleanup is needed.
-    drop(rearmed);
-    drop(cover);
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "the final disengage must restore egress to the previously-blocked host"
+        // Both guards disengage on drop via `lockdown_disengage(state_dir)`, which
+        // reads the state file rather than the guard's own (stale, pre-reboot for
+        // `cover`) token — `rearmed` drops first (reverse declaration order),
+        // clearing the state file and restoring the host; `cover`'s later drop
+        // then sees an absent cover and is a no-op, per `lockdown_disengage`'s own
+        // doc. No manual cleanup is needed.
+        drop(rearmed);
+        drop(cover);
+        Ok(())
+    });
+    assert_restored(
+        "the final disengage must restore egress to the previously-blocked host",
+        &[NON_PERMITTED],
+        dir.path(),
     );
 }
 
@@ -456,34 +475,27 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
 
     // Baseline (PRE-cover): both hosts reachable — self-validates the probe so a
     // network blip is never a false pass.
-    let (bp, bn) = (connect(PERMITTED), connect(NON_PERMITTED));
-    assert!(
-        bp.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        bp.err().map(|e| e.kind()),
-        bn.err().map(|e| e.kind()),
-    );
+    wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
-    let cover = engage(server_ip, None, dir.path(), None).expect("engage real WFP transient cover");
+    permit_scenario("transient permit", dir.path(), PERMITTED, || {
+        let cover = engage(server_ip, None, dir.path(), None).expect("engage real WFP transient cover");
 
-    let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
-    assert!(
-        p.is_ok(),
-        "server-IP permit must beat block-all: {PERMITTED}={:?}",
-        p.err().map(|e| e.kind())
-    );
-    assert!(
-        n.is_err(),
-        "transient cover must block a non-permitted host (leak!): {NON_PERMITTED} connected"
-    );
+        let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
+        if let Err(e) = p {
+            return Err(format!(
+                "server-IP permit must beat block-all: {PERMITTED}={:?}",
+                e.kind()
+            ));
+        }
+        assert!(
+            n.is_err(),
+            "transient cover must block a non-permitted host (leak!): {NON_PERMITTED} connected"
+        );
 
-    drop(cover);
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "disengage must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
-    );
+        drop(cover);
+        Ok(())
+    });
+    assert_restored("disengage must restore egress", &[NON_PERMITTED], dir.path());
 }
 
 /// Real-engage verification that the OPTIONAL resolver permit is
@@ -504,61 +516,47 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    let (bp, br, bpo, bn) = (
-        connect(PERMITTED),
-        connect(RESOLVER),
-        connect(RESOLVER_OTHER_PORT),
-        connect(NON_PERMITTED),
-    );
-    assert!(
-        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
-         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
-        bp.err().map(|e| e.kind()),
-        br.err().map(|e| e.kind()),
-        bpo.err().map(|e| e.kind()),
-        bn.err().map(|e| e.kind()),
-    );
+    wait_for_baseline(dir.path(), &[PERMITTED, RESOLVER, RESOLVER_OTHER_PORT, NON_PERMITTED]);
 
-    let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
-        .expect("engage real WFP transient cover with a resolver permit");
+    permit_scenario("transient resolver permit", dir.path(), PERMITTED, || {
+        let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
+            .expect("engage real WFP transient cover with a resolver permit");
 
-    let (p, r, po, n) = (
-        connect(PERMITTED),
-        connect(RESOLVER),
-        connect(RESOLVER_OTHER_PORT),
-        connect(NON_PERMITTED),
-    );
-    assert!(
-        p.is_ok(),
-        "server-IP permit must beat block-all: {PERMITTED}={:?}",
-        p.err().map(|e| e.kind())
-    );
-    assert!(
-        r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the \
-         same instant, so if it was reachable this is very unlikely to be a general network outage rather \
-         than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
-        r.err().map(|e| e.kind()),
-        if p.is_ok() { "reachable" } else { "ALSO unreachable" },
-    );
-    assert!(
-        po.is_err(),
-        "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
-         {RESOLVER_OTHER_PORT} connected"
-    );
-    assert!(
-        n.is_err(),
-        "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
-    );
+        let (p, r, po, n) = (
+            connect(PERMITTED),
+            connect(RESOLVER),
+            connect(RESOLVER_OTHER_PORT),
+            connect(NON_PERMITTED),
+        );
+        if let Err(e) = p {
+            return Err(format!(
+                "server-IP permit must beat block-all: {PERMITTED}={:?}",
+                e.kind()
+            ));
+        }
+        if let Err(e) = r {
+            return Err(format!(
+                "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
+                e.kind()
+            ));
+        }
+        assert!(
+            po.is_err(),
+            "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
+             {RESOLVER_OTHER_PORT} connected"
+        );
+        assert!(
+            n.is_err(),
+            "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
+        );
 
-    drop(cover);
-    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
-    assert!(
-        rn.is_ok() && rpo.is_ok(),
-        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
-        rn.err().map(|e| e.kind()),
-        rpo.err().map(|e| e.kind()),
+        drop(cover);
+        Ok(())
+    });
+    assert_restored(
+        "disengage must restore egress",
+        &[NON_PERMITTED, RESOLVER_OTHER_PORT],
+        dir.path(),
     );
 }
 
@@ -577,43 +575,36 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    let (bp, bn) = (connect(PERMITTED), connect(NON_PERMITTED));
-    assert!(
-        bp.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach both hosts; \
-         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
-        bp.err().map(|e| e.kind()),
-        bn.err().map(|e| e.kind()),
-    );
+    wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
-    let cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
+    permit_scenario("transient permit", dir.path(), PERMITTED, || {
+        let cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
 
-    // (a) The live ruleset carries our block-all.
-    let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
-    let rules = String::from_utf8_lossy(&sr.stdout);
-    assert!(
-        rules.contains("block") && rules.contains("all"),
-        "ruleset must carry the block:\n{rules}"
-    );
+        // (a) The live ruleset carries our block-all.
+        let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
+        let rules = String::from_utf8_lossy(&sr.stdout);
+        assert!(
+            rules.contains("block") && rules.contains("all"),
+            "ruleset must carry the block:\n{rules}"
+        );
 
-    let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
-    assert!(
-        p.is_ok(),
-        "server-IP permit must beat block-all: {PERMITTED}={:?}",
-        p.err().map(|e| e.kind())
-    );
-    assert!(
-        n.is_err(),
-        "transient cover must block a non-permitted host (leak!): {NON_PERMITTED} connected"
-    );
+        let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
+        if let Err(e) = p {
+            return Err(format!(
+                "server-IP permit must beat block-all: {PERMITTED}={:?}",
+                e.kind()
+            ));
+        }
+        assert!(
+            n.is_err(),
+            "transient cover must block a non-permitted host (leak!): {NON_PERMITTED} connected"
+        );
 
-    // (c) Drop restores /etc/pf.conf: egress restored.
-    drop(cover);
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "disengage must restore egress: {NON_PERMITTED}={:?}",
-        connect(NON_PERMITTED).err().map(|e| e.kind()),
-    );
+        // (c) Drop restores /etc/pf.conf: egress restored.
+        drop(cover);
+        Ok(())
+    });
+    assert_restored("disengage must restore egress", &[NON_PERMITTED], dir.path());
 }
 
 /// macOS counterpart of `windows_failclosed_permits_resolver_blocks_other_egress`.
@@ -631,67 +622,53 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    let (bp, br, bpo, bn) = (
-        connect(PERMITTED),
-        connect(RESOLVER),
-        connect(RESOLVER_OTHER_PORT),
-        connect(NON_PERMITTED),
-    );
-    assert!(
-        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
-         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
-        bp.err().map(|e| e.kind()),
-        br.err().map(|e| e.kind()),
-        bpo.err().map(|e| e.kind()),
-        bn.err().map(|e| e.kind()),
-    );
+    wait_for_baseline(dir.path(), &[PERMITTED, RESOLVER, RESOLVER_OTHER_PORT, NON_PERMITTED]);
 
-    let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
-        .expect("engage real pf transient cover with a resolver permit");
+    permit_scenario("transient resolver permit", dir.path(), PERMITTED, || {
+        let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
+            .expect("engage real pf transient cover with a resolver permit");
 
-    let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
-    let rules = String::from_utf8_lossy(&sr.stdout);
-    assert!(
-        rules.contains("1.0.0.1"),
-        "live ruleset must carry the resolver permit:\n{rules}"
-    );
+        let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
+        let rules = String::from_utf8_lossy(&sr.stdout);
+        assert!(
+            rules.contains("1.0.0.1"),
+            "live ruleset must carry the resolver permit:\n{rules}"
+        );
 
-    let (p, r, po, n) = (
-        connect(PERMITTED),
-        connect(RESOLVER),
-        connect(RESOLVER_OTHER_PORT),
-        connect(NON_PERMITTED),
-    );
-    assert!(
-        p.is_ok(),
-        "server-IP permit must beat block-all: {PERMITTED}={:?}",
-        p.err().map(|e| e.kind())
-    );
-    assert!(
-        r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the \
-         same instant, so if it was reachable this is very unlikely to be a general network outage rather \
-         than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
-        r.err().map(|e| e.kind()),
-        if p.is_ok() { "reachable" } else { "ALSO unreachable" },
-    );
-    assert!(
-        po.is_err(),
-        "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
-         {RESOLVER_OTHER_PORT} connected"
-    );
-    assert!(
-        n.is_err(),
-        "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
-    );
+        let (p, r, po, n) = (
+            connect(PERMITTED),
+            connect(RESOLVER),
+            connect(RESOLVER_OTHER_PORT),
+            connect(NON_PERMITTED),
+        );
+        if let Err(e) = p {
+            return Err(format!(
+                "server-IP permit must beat block-all: {PERMITTED}={:?}",
+                e.kind()
+            ));
+        }
+        if let Err(e) = r {
+            return Err(format!(
+                "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
+                e.kind()
+            ));
+        }
+        assert!(
+            po.is_err(),
+            "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
+             {RESOLVER_OTHER_PORT} connected"
+        );
+        assert!(
+            n.is_err(),
+            "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
+        );
 
-    drop(cover);
-    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
-    assert!(
-        rn.is_ok() && rpo.is_ok(),
-        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
-        rn.err().map(|e| e.kind()),
-        rpo.err().map(|e| e.kind()),
+        drop(cover);
+        Ok(())
+    });
+    assert_restored(
+        "disengage must restore egress",
+        &[NON_PERMITTED, RESOLVER_OTHER_PORT],
+        dir.path(),
     );
 }

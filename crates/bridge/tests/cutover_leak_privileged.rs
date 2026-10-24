@@ -108,48 +108,67 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
     let server_ip: std::net::IpAddr = SERVER_IP.parse().unwrap();
 
     // Baseline (PRE-cover): both hosts reachable. A failure here is a network/
-    // environment problem, not the cover -- fail loud and self-validate the probe.
-    assert!(
-        connect(PERMITTED).is_ok() && connect(NON_PERMITTED).is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts"
-    );
+    // environment problem, not the cover -- wait for the network to answer. A cover left by an
+    // earlier test fails at once instead.
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED], &|| {
+        tun_engine::test_utils::held_lockdown(dir.path())
+    });
 
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-    let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path(), None)
-        .expect("engage the real standing lockdown cover");
+    // The cover blocks every control host, so a failed permit probe tears the cover down and asks the
+    // control outside it: a lost network runs the scenario again, a live control means the permit failed.
+    let held_hole = || tun_engine::test_utils::held_lockdown(dir.path());
+    let verdict = hole_test_observability::egress::rerun_until_network_holds(
+        "the standing cover's permit",
+        PERMITTED,
+        &held_hole,
+        || {
+            lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+            let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path(), None)
+                .expect("engage the real standing lockdown cover");
 
-    // Engaged: server permitted (permit beats block-all), others blocked (no leak).
-    assert!(
-        connect(PERMITTED).is_ok(),
-        "server-IP permit must hold while engaged: {PERMITTED}"
-    );
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "non-permitted egress must be blocked: {NON_PERMITTED}"
-    );
+            // Engaged: server permitted (permit beats block-all), others blocked (no leak).
+            if let Err(e) = connect(PERMITTED) {
+                return Err(format!(
+                    "server-IP permit must hold while engaged: {PERMITTED}={:?}",
+                    e.kind()
+                ));
+            }
+            assert!(
+                connect(NON_PERMITTED).is_err(),
+                "non-permitted egress must be blocked: {NON_PERMITTED}"
+            );
 
-    // The cutover-shutdown action: disarm (persist-without-disengage), NOT drop.
-    cover.disarm();
+            // The cutover-shutdown action: disarm (persist-without-disengage), NOT drop.
+            cover.disarm();
 
-    // THE INVARIANT: the block survives disarm -- the filters persist across the
-    // restart gap (server still permitted, others still blocked). A disarm that
-    // disengaged would let NON_PERMITTED through here (the leak this guards).
-    assert!(
-        connect(PERMITTED).is_ok(),
-        "server-IP permit must survive disarm: {PERMITTED}"
-    );
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "disarm must NOT disengage the cover (leak!): {NON_PERMITTED} connected after disarm"
-    );
+            // THE INVARIANT: the block survives disarm -- the filters persist across the
+            // restart gap (server still permitted, others still blocked). A disarm that
+            // disengaged would let NON_PERMITTED through here (the leak this guards).
+            let permit_after_disarm = connect(PERMITTED);
+            let leak_after_disarm = connect(NON_PERMITTED);
 
-    // Cleanup: fully disengage via the persisted state (no live guard remains
-    // after disarm), restoring egress so the box is left open.
-    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
-    let _clearance_has_no_reader_in_cleanup =
-        disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "cleanup disengage must restore egress: {NON_PERMITTED}"
+            // Cleanup before any verdict: no live guard remains after disarm, so fully disengage via the
+            // persisted state, restoring egress so the box is left open whatever the verdict.
+            lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+            let _clearance_has_no_reader_in_cleanup =
+                disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
+
+            assert!(
+                leak_after_disarm.is_err(),
+                "disarm must NOT disengage the cover (leak!): {NON_PERMITTED} connected after disarm"
+            );
+            permit_after_disarm
+                .map(drop)
+                .map_err(|e| format!("server-IP permit must survive disarm: {PERMITTED}={:?}", e.kind()))
+        },
+    );
+    if let Err(why) = verdict {
+        panic!("{why}");
+    }
+    hole_test_observability::egress::assert_egress_restored(
+        "cleanup disengage must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
+        &held_hole,
     );
 }
