@@ -2994,6 +2994,40 @@ and a rerun repeats the platform's whole job.
   been seen there.
   `xtask/src/command.rs` names the command and the status in a failed child's
   error.
+- **A test that needs egress tells a network loss from a Hole defect.** The
+  oracle is Hole's own state, not a remote host
+  (`tun_engine::test_utils::held_covers`): a failed probe while Hole holds a
+  cover fails at once as a defect, and with no cover and the control host down
+  the test waits for the network, uncapped. A probe made while a cover is engaged
+  cannot use a control host, so the scenario vouches for the network from inside
+  the cover: it probes a host the cover permits before and after each probe whose
+  result it reports (`egress::InCover`), and the egress window judges the readings
+  after the teardown. A scenario hands the window the hosts it claims the cover
+  blocks, and every run (a rerun's too) opens only once they answer outside any
+  cover, and a run that held is repeated when one of them is down outside the cover afterwards, so a block is never read off a host that is down on its own. A failure is a defect only when the permit answered on both
+  sides and the failing targets, probed outside the cover, answer there with the
+  control answering around them; a target that is down outside any cover is
+  waited for (`check_egress_restored` does the same for a restored-egress
+  target, so only a cover Hole still holds fails it). A rerun needs a probe
+  outside any cover to have failed, because rerunning a defect that shows only
+  sometimes would be an uncapped wait on no external event: a reading missing
+  inside a cover, whether within one engage or across reloads, is judged by the
+  control around the teardown, down being a rerun and answering a defect. A read
+  of runner state goes through
+  `read_with_network_up`, which retakes a read the control did not bracket; a
+  read that fails with the control answering on both sides is a defect. A
+  reading of a marker in a NIC capture is `Failure::captured`: the scenario
+  probes the permit over TCP on both sides of its markers, and a missing marker
+  is judged by the control around the teardown like any other miss. What no
+  probe can rule out is an outage that falls entirely between two adjacent
+  probes of one engage, and one that covers an in-cover reading and has ended
+  by the teardown probe: neither can be told from a cover that breaks its
+  permit (including one that blocks it outright), so both are defects.
+  A scenario with no permitted host to
+  vouch with (the live-TUN e2e, whose cover permits only a loopback server) is
+  judged by the control outside the run alone (`Failure::Unvouched`). The
+  mechanism is in `hole_test_observability::egress` and
+  `routing/failclosed/cover_oracle.rs`.
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 
@@ -3089,6 +3123,8 @@ Spotlight "Hole" must reveal it.
   is the bound. Only a lost network is waited out (`PrimaryIpv4Error::NetworkLoss`:
   network or host unreachable, network down, a link-local source address); any
   other error, such as a refused socket, fails at once with its cause.
+  See [CI layout](#ci-layout) for how a test that probes real egress tells a
+  network loss from a Hole defect.
 - **Every crate runs in CI** — the `every_workspace_crate_runs_in_ci` conformance
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test
