@@ -416,7 +416,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
             )
             .blocked(
                 NON_PERMITTED,
-                "a cold engage that returned Ok must already block the host — the cover is INERT: reported armed                  while egress runs in the clear (pf never enabled, or enabled under a ruleset that is not ours)",
+                "a cold engage that returned Ok must already block the host — the cover is INERT: reported armed while egress runs in the clear (pf never enabled, or enabled under a ruleset that is not ours)",
             )
             .run()?;
 

@@ -274,7 +274,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
             if head_seen && tail_seen {
                 return Ok(());
             }
-            Err(Failure::covered(
+            Err(Failure::captured(
                 format!(
                     "permitted markers (→ server IP {server_ip}) must egress the NIC: the server permit must beat \
                      block-all AND the capture must have been live for the leak marker's decision \

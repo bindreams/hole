@@ -135,23 +135,14 @@ mod macos_impl {
             Ok(out) => (
                 out.status.success(),
                 format!(
-                    "$ {cmd} {}
-[{}]
-{}{}",
+                    "$ {cmd} {}\n[{}]\n{}{}",
                     args.join(" "),
                     out.status,
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr),
                 ),
             ),
-            Err(e) => (
-                false,
-                format!(
-                    "$ {cmd} {}
-[spawn failed] {e}",
-                    args.join(" ")
-                ),
-            ),
+            Err(e) => (false, format!("$ {cmd} {}\n[spawn failed] {e}", args.join(" "))),
         }
     }
 

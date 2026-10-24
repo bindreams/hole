@@ -169,6 +169,31 @@ fn a_permitted_host_that_is_down_on_its_own_is_waited_for_not_charged_to_the_cov
     );
 }
 
+/// The scenario's readings come off the wire, not the network: the permitted head datagram is never
+/// captured while the tail is, whatever the network does.
+fn wire_run(net: &Net) -> Result<(), String> {
+    let hole = || net.cover.get().then(|| "a cover".to_string());
+    let scenario = || {
+        net.engage(&[PERMIT]);
+        net.release();
+        Err::<(), _>(Failure::captured(
+            "head not captured".to_string(),
+            CONTROL,
+            &[false, true],
+        ))
+    };
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)
+}
+
+#[skuld::test]
+fn a_head_only_wire_drop_with_the_control_answering_is_a_defect_under_every_placement() {
+    let passed: Vec<_> = placements()
+        .into_iter()
+        .filter(|down| wire_run(&Net::new(down.clone(), &[])).is_ok())
+        .collect();
+    assert!(passed.is_empty(), "a wire drop was excused under {passed:?}");
+}
+
 // read_with_network_up ================================================================================================
 
 /// A read the network can fail: Err while the network is down at the tick it runs.
@@ -180,17 +205,29 @@ fn gateway(net: &Net) -> Result<u32, &'static str> {
     }
 }
 
+/// An outage over the read alone, between two answering control probes: the read fails with the
+/// network up on both sides, so it is the verdict.
+const OVER_THE_READ_ALONE: Range<u32> = 1..2;
+
 #[skuld::test]
 fn no_outage_placement_returns_a_failed_reading() {
     let bad: Vec<_> = placements()
         .into_iter()
+        .filter(|down| *down != OVER_THE_READ_ALONE)
         .filter_map(|down| {
             let net = Net::new(down.clone(), &[]);
-            let got = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || gateway(&net)).unwrap();
-            (got != 7).then_some((down, got))
+            let got = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || gateway(&net));
+            (got != Ok(7)).then_some((down, got))
         })
         .collect();
     assert!(bad.is_empty(), "a reading taken during an outage was returned: {bad:?}");
+}
+
+#[skuld::test]
+fn an_outage_over_the_read_alone_is_the_verdict_on_the_read() {
+    let net = Net::new(OVER_THE_READ_ALONE, &[]);
+    let err = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || gateway(&net)).unwrap_err();
+    assert!(err.contains("no default route"), "{err}");
 }
 
 #[skuld::test]
@@ -208,5 +245,24 @@ fn a_cover_blocking_the_control_fails_a_reading_under_every_placement() {
     assert!(
         waited.is_empty(),
         "a reading was returned over a cover under {waited:?}"
+    );
+}
+
+#[skuld::test]
+fn a_read_that_fails_with_the_control_answering_is_the_verdict_under_every_placement() {
+    let returned: Vec<_> = placements()
+        .into_iter()
+        .filter_map(|down| {
+            let net = Net::new(down.clone(), &[]);
+            let got = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+                net.step();
+                Err::<u32, _>("no default route")
+            });
+            got.is_ok().then_some(down)
+        })
+        .collect();
+    assert!(
+        returned.is_empty(),
+        "a failing read was returned as a value under {returned:?}"
     );
 }

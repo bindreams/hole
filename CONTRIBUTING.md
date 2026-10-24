@@ -3004,7 +3004,10 @@ and a rerun repeats the platform's whole job.
   control answering around them; a target that is down outside any cover is
   waited for, and a permit that answered at some readings and not others is a
   wavering network, rerun. A read of runner state goes through
-  `read_with_network_up`, which retakes a read that fails. What no probe can rule
+  `read_with_network_up`, which retakes a read the control did not bracket; a
+  read that fails with the control answering on both sides is a defect. A reading
+  of a marker in a NIC capture is `Failure::captured`: a missing marker never
+  reads as a wavering network. What no probe can rule
   out is an outage that falls entirely between two adjacent probes of one
   engage; a cover that blocks its own permit looks like an outage over every
   in-cover probe, so that is a defect. A scenario with no permitted host to

@@ -320,20 +320,17 @@ fn a_cover_found_while_waiting_out_a_network_loss_fails_the_reading() {
 }
 
 #[skuld::test]
-fn a_reading_that_keeps_failing_with_the_network_up_is_paced_not_spun() {
+fn a_reading_that_fails_with_the_network_up_is_the_verdict_not_retaken() {
     let net = Net::new(0..0, &[]);
     let tries = Cell::new(0);
-    let got = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+    let err = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
         tries.set(tries.get() + 1);
-        if tries.get() < 4 {
-            Err("no default route")
-        } else {
-            Ok(7)
-        }
+        Err::<u32, _>("no default route")
     })
-    .unwrap();
-    assert_eq!(got, 7);
-    assert_eq!(net.pauses.get(), 3);
+    .unwrap_err();
+    assert!(err.contains("no default route"), "{err}");
+    assert_eq!(tries.get(), 1);
+    assert_eq!(net.pauses.get(), 0);
 }
 
 // rerun_until_network_holds ===========================================================================================

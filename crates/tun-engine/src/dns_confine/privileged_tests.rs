@@ -169,7 +169,7 @@ fn head_leak_tail_verdict(
     if head_seen && tail_seen {
         return Ok(());
     }
-    Err(Failure::covered(
+    Err(Failure::captured(
         format!(
             "{missing} (head: sent {:?}, seen {head_seen}; tail: sent {:?}, seen {tail_seen})",
             sent.0, sent.1

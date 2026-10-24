@@ -31,8 +31,7 @@ impl Failure {
     /// A run inside a cover whose permit readings were taken in order across it: all answered, the
     /// failure stands (`Failed`, the control decides); some answered, the network wavered; none
     /// answered, the permit itself failed and `outside` (a host that answers outside the cover) is the
-    /// target the judge probes. For a failure the scenario observed that is not a TCP probe (a marker
-    /// missing from a capture).
+    /// target the judge probes. For readings that are reachability probes.
     pub fn covered(why: String, outside: &str, readings: &[bool]) -> Failure {
         let answered = readings.iter().filter(|a| **a).count();
         if answered == readings.len() {
@@ -48,6 +47,19 @@ impl Failure {
                 targets: vec![outside.to_string()],
             }
         }
+    }
+
+    /// Like [`covered`](Failure::covered), for readings of a marker in a local capture of the NIC. Whether
+    /// a datagram leaves the NIC does not depend on the network upstream, so a mixed reading is no
+    /// evidence of a wavering network: any missing marker is `Failed`, and the control around the
+    /// teardown decides.
+    pub fn captured(why: String, outside: &str, readings: &[bool]) -> Failure {
+        let targets = if readings.iter().any(|a| *a) {
+            Vec::new()
+        } else {
+            vec![outside.to_string()]
+        };
+        Failure::Failed { why, targets }
     }
 
     /// A run in which nothing blocks the control host: any reading that failed is the network's.

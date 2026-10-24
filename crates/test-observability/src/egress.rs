@@ -23,8 +23,10 @@
 //!   answered on both sides and the failing targets, probed outside the cover
 //!   after teardown, answer there with the control answering around them.
 //!
-//! A reading of runner state is vouched for by its own validity: a read that
-//! fails is taken again ([`read_with_network_up`]).
+//! A reading of runner state is vouched for by the control around it: a read
+//! that fails, or is not bracketed by an answering control, is taken again; a
+//! read that fails with the control answering on both sides is a defect
+//! ([`read_with_network_up`]).
 //!
 //! What no probe can rule out is an outage that falls entirely between two
 //! adjacent probes of one engage: a probe cannot show the network up at an
@@ -113,13 +115,13 @@ pub fn check_egress_restored(
 ///
 /// For a reading of the runner's own state (its default gateway, its resolver set): the network going
 /// away takes that state with it, so a reading taken while it was away is not evidence about Hole. A
-/// read that fails (`Err`) is taken again, and so is one with a control probe that failed before or
-/// after it; a cover Hole holds while it waits panics at once ([`wait_for_egress`]), since a cover that
-/// blocks `control` is no network loss. A reading that disagrees with the network up on both sides is
-/// the caller's to assert on.
+/// read, failed or not, with a control probe that failed before or after it is taken again; a cover
+/// Hole holds while it waits panics at once ([`wait_for_egress`]), since a cover that blocks `control`
+/// is no network loss. A reading that disagrees with the network up on both sides is the caller's to
+/// assert on.
 ///
-/// A read that keeps failing with the network up is retaken without end, once a pause, each failure
-/// logged: the test's own timeout bounds it.
+/// A read that fails with `control` answering on both sides is the verdict, not an outage: it panics
+/// with the read's error.
 #[track_caller]
 pub fn read_with_network_up<T, E: std::fmt::Display>(
     what: &str,
@@ -328,13 +330,12 @@ pub(crate) fn read_with_network_up_on<T, E: std::fmt::Display>(
             Ok(_) => tracing::warn!(
                 "{what}: {control} did not answer around the reading; waiting for the network and reading again"
             ),
-            Err(e) => tracing::warn!("{what}: the reading failed ({e}); reading again"),
+            Err(e) if before && after => return Err(format!("{what}: the reading failed with {control} answering around it: {e}")),
+            Err(e) => tracing::warn!(
+                "{what}: the reading failed ({e}) and {control} did not answer around it; waiting for the network and reading again"
+            ),
         }
         wait_for_egress_on(host, what, &[control], hole_state)?;
-        if before && after {
-            // The network answered throughout, so the wait returned at once; pace the next read.
-            host.pause();
-        }
     }
 }
 

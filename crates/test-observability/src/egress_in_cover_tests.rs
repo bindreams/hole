@@ -138,6 +138,28 @@ fn covered_readings_decide_between_failed_and_wavered() {
 }
 
 #[skuld::test]
+fn captured_readings_are_never_wavered() {
+    let why = || "x".to_string();
+    for readings in [[true, true], [true, false], [false, true]] {
+        assert_eq!(
+            Failure::captured(why(), CONTROL, &readings),
+            Failure::Failed {
+                why: why(),
+                targets: vec![]
+            },
+            "{readings:?}"
+        );
+    }
+    assert_eq!(
+        Failure::captured(why(), CONTROL, &[false, false]),
+        Failure::Failed {
+            why: why(),
+            targets: vec![CONTROL.to_string()]
+        }
+    );
+}
+
+#[skuld::test]
 fn uncovered_readings_excuse_any_miss() {
     let why = || "x".to_string();
     assert_eq!(
