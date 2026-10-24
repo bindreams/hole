@@ -1,6 +1,6 @@
 use std::io;
 
-use super::{publish, rename_noreplace};
+use super::{publish, read, rename_noreplace};
 use crate::versioned_file::fixtures::{dir, names, put};
 
 #[skuld::test]
@@ -370,4 +370,35 @@ mod windows_long_paths {
 
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
     }
+}
+
+// A failed open names its NTSTATUS ------------------------------------------------------------------------------------
+
+/// `STATUS_OBJECT_NAME_NOT_FOUND`, `STATUS_SHARING_VIOLATION`: winternl/ntstatus.h.
+#[cfg(windows)]
+#[skuld::test]
+fn read_of_a_missing_file_names_the_ntstatus_of_the_open() {
+    let dir = dir();
+    let err = read(&dir.path().join("absent")).unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
+    assert!(err.to_string().contains("NTSTATUS 0xC0000034"), "{err}");
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn read_of_a_file_held_without_sharing_names_the_ntstatus_of_the_open() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = dir();
+    let path = put(&dir, "held", b"bytes");
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+
+    let err = read(&path).unwrap_err();
+
+    assert!(err.to_string().contains("NTSTATUS 0xC0000043"), "{err}");
 }
