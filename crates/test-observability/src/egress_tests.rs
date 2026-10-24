@@ -15,6 +15,11 @@ struct Net {
     tick: Cell<u32>,
     down: Range<u32>,
     blocked: &'static [&'static str],
+    /// A cover engaged on this host: while `cover` is set, only the addresses in `permits` answer.
+    cover: Cell<bool>,
+    permits: Cell<&'static [&'static str]>,
+    /// One remote host down for a stretch of ticks, whatever else the network is doing.
+    host_down: Option<(&'static str, Range<u32>)>,
     probed: RefCell<Vec<String>>,
     /// Whether each probe in `probed` answered, in the same order.
     answered: RefCell<Vec<bool>>,
@@ -28,6 +33,9 @@ impl Net {
             tick: Cell::new(0),
             down,
             blocked,
+            cover: Cell::new(false),
+            permits: Cell::new(&[]),
+            host_down: None,
             probed: RefCell::new(Vec::new()),
             answered: RefCell::new(Vec::new()),
             dumps: Cell::new(0),
@@ -38,8 +46,24 @@ impl Net {
     /// Advance the clock and say whether the network is up at the tick that just ran.
     fn step(&self) -> bool {
         let t = self.tick.get();
+        // A harness bound, not a product one: a verdict that never settles is a failed test, not a hang.
+        assert!(t < 100_000, "the scripted run never settled (a spin)");
         self.tick.set(t + 1);
         !self.down.contains(&t)
+    }
+
+    fn engage(&self, permits: &'static [&'static str]) {
+        self.permits.set(permits);
+        self.cover.set(true);
+    }
+
+    fn release(&self) {
+        self.cover.set(false);
+    }
+
+    fn with_host_down(mut self, addr: &'static str, ticks: Range<u32>) -> Self {
+        self.host_down = Some((addr, ticks));
+        self
     }
 
     fn probes_of(&self, addr: &str) -> usize {
@@ -50,9 +74,16 @@ impl Net {
 impl Host for &Net {
     fn probe(&mut self, addr: &str) -> io::Result<()> {
         self.probed.borrow_mut().push(addr.to_string());
-        let result = if !self.step() {
+        let tick = self.tick.get();
+        let up = self.step();
+        let host_down = self
+            .host_down
+            .as_ref()
+            .is_some_and(|(a, r)| *a == addr && r.contains(&tick));
+        let covered = self.cover.get() && !self.permits.get().contains(&addr);
+        let result = if !up {
             Err(io::ErrorKind::NetworkUnreachable.into())
-        } else if self.blocked.contains(&addr) {
+        } else if host_down || covered || self.blocked.contains(&addr) {
             Err(io::ErrorKind::TimedOut.into())
         } else {
             Ok(())
@@ -488,3 +519,6 @@ fn a_connection_is_not_awaited_while_hole_holds_a_cover() {
     .unwrap_err();
     assert!(err.contains("a cover"), "{err}");
 }
+
+#[path = "egress_matrix_tests.rs"]
+mod matrix;
