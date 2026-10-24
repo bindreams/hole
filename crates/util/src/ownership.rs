@@ -70,6 +70,26 @@ pub fn chown_if_some(path: &Path, owner: Option<(u32, u32)>) {
     }
 }
 
+/// The ownership a state-file rewrite reads and sets, behind a seam so a test can
+/// see what a rewrite asked for on a host where it cannot observe a chown.
+pub trait Ownership {
+    fn owner_of(&self, path: &Path) -> Option<(u32, u32)>;
+    fn chown(&self, path: &Path, owner: Option<(u32, u32)>);
+}
+
+/// [`Ownership`] over [`owner_of`] and [`chown_if_some`].
+pub struct RealOwnership;
+
+impl Ownership for RealOwnership {
+    fn owner_of(&self, path: &Path) -> Option<(u32, u32)> {
+        owner_of(path)
+    }
+
+    fn chown(&self, path: &Path, owner: Option<(u32, u32)>) {
+        chown_if_some(path, owner);
+    }
+}
+
 #[cfg(test)]
 #[path = "ownership_tests.rs"]
 mod ownership_tests;

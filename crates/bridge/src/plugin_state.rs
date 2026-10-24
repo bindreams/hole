@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tun_engine::exclusive::RecordLock;
+use util::ownership::{Ownership, RealOwnership};
 
 // Types ===============================================================================================================
 
@@ -67,27 +68,6 @@ pub(crate) fn lock_is_held() -> bool {
 
 fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
-}
-
-// Ownership ===========================================================================================================
-
-/// The file ownership a rewrite reads and sets, split out so a test can see
-/// what a rewrite asked for on a host where it cannot observe a chown.
-trait Ownership {
-    fn owner_of(&self, path: &Path) -> Option<(u32, u32)>;
-    fn chown(&self, path: &Path, owner: Option<(u32, u32)>);
-}
-
-struct RealOwnership;
-
-impl Ownership for RealOwnership {
-    fn owner_of(&self, path: &Path) -> Option<(u32, u32)> {
-        util::ownership::owner_of(path)
-    }
-
-    fn chown(&self, path: &Path, owner: Option<(u32, u32)>) {
-        util::ownership::chown_if_some(path, owner);
-    }
 }
 
 // I/O =================================================================================================================

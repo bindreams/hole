@@ -139,6 +139,9 @@ pub mod boottime_witness;
 pub mod release_epoch;
 pub use release_epoch::{begin_release, watch_releases, ReleaseInFlight, ReleaseWatch};
 
+#[cfg(test)]
+mod ownership_double;
+
 // Compiled out of a macOS PRODUCTION build — Windows' boot-time twin read-back
 // is its only caller — but kept for every lane's TESTS, because the rule it
 // encodes is platform-free and a rule proved only where the hazard lives is

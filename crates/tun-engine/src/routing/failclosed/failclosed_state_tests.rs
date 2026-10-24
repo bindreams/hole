@@ -1,3 +1,4 @@
+use super::super::ownership_double::Recording;
 use super::*;
 
 #[skuld::test]
@@ -278,7 +279,7 @@ fn a_file_without_the_flag_reads_as_live() {
     assert_eq!(load(tmp.path()), Some(with_token("5")));
 }
 
-fn failing_write(_: &Path, _: &FailClosedState, _: Option<(u32, u32)>) -> std::io::Result<()> {
+fn failing_write(_: &Path, _: &FailClosedState) -> std::io::Result<()> {
     Err(std::io::Error::other("injected write failure"))
 }
 
@@ -319,13 +320,70 @@ fn a_claim_of_nothing_or_of_a_tombstone_or_of_an_unusable_file_writes_nothing() 
 }
 
 #[skuld::test]
+fn a_claim_hands_the_files_owner_to_the_file_and_leaves_the_state_dirs_owner_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("5"), None).unwrap();
+    let rec = Recording::new(Some((501, 20)));
+
+    claim_with(tmp.path(), None, &rec, write_record);
+
+    assert_eq!(
+        rec.chowns_of(&tmp.path().join(STATE_FILE_NAME)),
+        vec![Some((501, 20))],
+        "the rewritten file keeps the owner of the one it replaced"
+    );
+    assert!(
+        rec.chowns_of(tmp.path()).is_empty(),
+        "a claim never hands the directory to the file's owner"
+    );
+}
+
+#[skuld::test]
+fn a_requested_owner_wins_the_file_in_a_claim_but_never_the_state_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("5"), None).unwrap();
+    let rec = Recording::new(Some((501, 20)));
+
+    claim_with(tmp.path(), Some((7, 8)), &rec, write_record);
+
+    assert_eq!(rec.chowns_of(&tmp.path().join(STATE_FILE_NAME)), vec![Some((7, 8))]);
+    assert!(rec.chowns_of(tmp.path()).is_empty());
+}
+
+#[skuld::test]
+fn the_files_owner_is_read_before_a_claim_replaces_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("5"), None).unwrap();
+    let before = std::fs::read(tmp.path().join(STATE_FILE_NAME)).unwrap();
+    let rec = Recording::new(Some((501, 20)));
+
+    claim_with(tmp.path(), None, &rec, write_record);
+
+    assert_eq!(rec.bytes_when_read().as_deref(), Some(before.as_slice()));
+}
+
+#[skuld::test]
+fn a_claim_that_writes_nothing_chowns_nothing_and_asks_nobody() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = Recording::new(Some((501, 20)));
+
+    claim_with(tmp.path(), None, &rec, write_record);
+
+    assert!(rec.chowns_of(&tmp.path().join(STATE_FILE_NAME)).is_empty());
+    assert!(
+        rec.bytes_when_read().is_none(),
+        "nothing to claim, so no owner to look up"
+    );
+}
+
+#[skuld::test]
 fn a_claim_whose_write_fails_hands_back_the_record_unclaimed() {
     // The restore matters more than the bookkeeping: the release goes on, and
     // the record it hands back says it holds no claim.
     let tmp = tempfile::tempdir().unwrap();
     save(tmp.path(), &with_token("5"), None).unwrap();
 
-    let claimed = claim_with(tmp.path(), None, failing_write);
+    let claimed = claim_with(tmp.path(), None, &Recording::new(None), failing_write);
 
     assert_eq!(claimed, StateFile::Present(with_token("5")));
     assert_eq!(load(tmp.path()), Some(with_token("5")), "the record is untouched");
@@ -336,9 +394,9 @@ fn a_claim_reads_and_writes_in_one_critical_section() {
     let tmp = tempfile::tempdir().unwrap();
     save(tmp.path(), &with_token("5"), None).unwrap();
     let mut held_inside = false;
-    claim_with(tmp.path(), None, |dir, record, owner| {
+    claim_with(tmp.path(), None, &Recording::new(None), |dir, record| {
         held_inside = LOCK.try_acquire().is_none();
-        save(dir, record, owner)
+        write_record(dir, record)
     });
     assert!(held_inside);
 }

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use util::ownership::{Ownership, RealOwnership};
+
 use super::pf_claim::{self, Cleared, Held};
 use super::{PfRecord, StateFile, Swap};
 use crate::exclusive::RecordLock;
@@ -90,13 +92,18 @@ fn state_file(state_dir: &Path) -> PathBuf {
 fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     util::ownership::chown_if_some(state_dir, owner);
+    write_record(state_dir, state)?;
+    util::ownership::chown_if_some(&state_file(state_dir), owner);
+    Ok(())
+}
+
+/// Replace the record file atomically, leaving its owner to the caller.
+fn write_record(state_dir: &Path, state: &LockdownPfState) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let path = state_file(state_dir);
     let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
     tmp.write_all(&json)?;
     tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
+    tmp.persist(state_file(state_dir)).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -237,23 +244,33 @@ pub fn clear_if_holds(state_dir: &Path, token: &str) -> std::io::Result<bool> {
 /// is one whose write failed: the release goes on unclaimed, because the restore
 /// matters more than the bookkeeping.
 pub fn claim_for_release(state_dir: &Path, owner: Option<(u32, u32)>) -> StateFile<LockdownPfState> {
-    claim_with(state_dir, owner, save)
+    claim_with(state_dir, owner, &RealOwnership, write_record)
 }
 
-/// [`claim_for_release`] over an injected write.
+/// [`claim_for_release`] over an injected [`Ownership`] and write.
+///
+/// The tombstone replaces a file this process did not necessarily create, so it
+/// keeps that file's owner (read before the replace) unless a caller asked for
+/// one. The state directory is never touched: a rewrite of a record is not a
+/// reason to hand its directory to whoever owns the record.
 fn claim_with(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
-    write: impl FnOnce(&Path, &LockdownPfState, Option<(u32, u32)>) -> std::io::Result<()>,
+    ownership: &impl Ownership,
+    write: impl FnOnce(&Path, &LockdownPfState) -> std::io::Result<()>,
 ) -> StateFile<LockdownPfState> {
     let _guard = LOCK.acquire();
     let current = load_presence(state_dir);
     let Some(claimed) = pf_claim::tombstone(&current) else {
         return current;
     };
-    let owner = owner.or_else(|| util::ownership::owner_of(&state_file(state_dir)));
-    match write(state_dir, &claimed, owner) {
-        Ok(()) => StateFile::Present(claimed),
+    let file = state_file(state_dir);
+    let file_owner = owner.or_else(|| ownership.owner_of(&file));
+    match write(state_dir, &claimed) {
+        Ok(()) => {
+            ownership.chown(&file, file_owner);
+            StateFile::Present(claimed)
+        }
         Err(e) => {
             tracing::warn!(
                 error = %util::error_chain::error_chain(&e),
