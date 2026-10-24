@@ -283,6 +283,60 @@ fn load_maps_io_failure_to_unreadable_never_corrupt() {
     }
 }
 
+/// What the next CI hit shows: the text of the error that failed the read,
+/// not only its kind.
+#[skuld::test]
+fn a_failed_read_logs_the_error_text() {
+    struct Fails;
+    impl Fs for Fails {
+        fn read(&self, _path: &std::path::Path) -> io::Result<Vec<u8>> {
+            Err(io::Error::other("disk on fire"))
+        }
+    }
+    let (subscriber, log) = capture();
+    let _guard = set_default_in_current_thread(subscriber);
+    let dir = dir();
+
+    let loaded = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(Fails)).load();
+
+    assert!(matches!(loaded, Loaded::Unreadable(_)), "{loaded:?}");
+    let log = log.snapshot();
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(log.contains("disk on fire"), "{log}");
+}
+
+/// The real `Fs::read` default through `VersionedFile::load`: the status of the
+/// failed open reaches both the `Unreadable` error and the warn.
+#[cfg(windows)]
+#[skuld::test]
+fn load_of_a_held_file_carries_the_ntstatus_in_the_error_and_the_log() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (subscriber, log) = capture();
+    let _guard = set_default_in_current_thread(subscriber);
+    let dir = dir();
+    let path = put(
+        &dir,
+        "note.json",
+        br#"{"version":3,"title":"t","tags":[],"pinned":false}"#,
+    );
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+
+    let loaded = VersionedFile::<NoteV3>::new(dir.path()).load();
+
+    // STATUS_SHARING_VIOLATION
+    match loaded {
+        Loaded::Unreadable(e) => assert!(e.to_string().contains("NTSTATUS 0xC0000043"), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    let log = log.snapshot();
+    assert!(log.contains("NTSTATUS 0xC0000043"), "{log}");
+}
+
 #[skuld::test]
 fn io_failed_read_is_not_cannot_read() {
     let dir = dir();

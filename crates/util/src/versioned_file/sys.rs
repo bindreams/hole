@@ -30,8 +30,10 @@ pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// Reads the whole file at `path`, like `std::fs::read`. On Windows a failure
-/// from the kernel also names its NTSTATUS in the error text (the kind is
-/// unchanged), which tells apart the causes a Win32 code folds together.
+/// from the kernel also names its NTSTATUS in the error text, which tells apart
+/// the causes a Win32 code folds together. The kind is unchanged; the OS code
+/// moves to the error's `source()`, so read it with
+/// [`crate::error_chain::raw_os_error`].
 pub(super) fn read(path: &Path) -> io::Result<Vec<u8>> {
     #[cfg(windows)]
     return windows_impl::read(path);
@@ -137,16 +139,20 @@ mod windows_impl {
     const REPLACE_POSIX: u32 = 0x1 | 0x2;
 
     unsafe extern "system" {
-        /// The status of this thread's last failed system call: the TEB's
-        /// `LastStatusValue`, which the `NtCreateFile` behind `CreateFileW`
-        /// sets and which `CreateFileW` then maps to the Win32 code.
+        /// This thread's last NTSTATUS: the TEB's `LastStatusValue`.
         #[link_name = "RtlGetLastNtStatus"]
         fn rtl_get_last_nt_status() -> i32;
+
+        /// Stores `status`, and its Win32 mapping, as this thread's last
+        /// NTSTATUS and last error.
+        #[link_name = "RtlSetLastWin32ErrorAndNtStatusFromNtStatus"]
+        fn rtl_set_last_win32_error_and_nt_status_from_nt_status(status: i32);
     }
 
-    /// A failed call's error with the NTSTATUS behind it. Its text is the
-    /// original's plus the status; `source()` is the original, so its raw OS
-    /// code stays reachable.
+    const STATUS_SUCCESS: i32 = 0;
+
+    /// A failed call's error with the NTSTATUS behind it. `source()` is the
+    /// original, so its raw OS code stays reachable.
     struct WithNtStatus {
         original: io::Error,
         status: u32,
@@ -158,7 +164,6 @@ mod windows_impl {
         }
     }
 
-    // The status in hex, as in `Display` and in ntstatus.h.
     impl std::fmt::Debug for WithNtStatus {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("WithNtStatus")
@@ -174,26 +179,34 @@ mod windows_impl {
         }
     }
 
-    /// `std::fs::read`, and a failure that came from the kernel also names the
-    /// NTSTATUS of the failed call (the kind is unchanged). The success path is
-    /// `std`'s alone.
+    /// Windows body of [`super::read`].
+    ///
+    /// `RtlNtStatusToDosError` stores the status it is given as the thread's
+    /// last: kernel32 calls it when `CreateFileW` fails, `std` when
+    /// `NtReadFile` fails. A failure that never passes one (`std` rejecting a
+    /// NUL path, `CreateFileW` failing an empty one) leaves an earlier call's,
+    /// so the status is cleared first and a failure that leaves it clear
+    /// carries none. After the failure `std` only closes the handle and frees
+    /// its buffer, and neither stores a status.
     pub(super) fn read(path: &Path) -> io::Result<Vec<u8>> {
+        // SAFETY: takes a status by value and writes only this thread's TEB.
+        unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_SUCCESS) };
         let original = match std::fs::read(path) {
             Ok(bytes) => return Ok(bytes),
             Err(original) => original,
         };
-        // `std` raises these before any system call, so the thread's last
-        // status would be an earlier call's. An empty path reaches
-        // `CreateFileW`, which fails with a Win32 code without a status.
-        if original.raw_os_error().is_none() || path.as_os_str().is_empty() {
+        // SAFETY: takes no arguments and only reads this thread's TEB.
+        let status = unsafe { rtl_get_last_nt_status() };
+        if status == STATUS_SUCCESS {
             return Err(original);
         }
-        // Must stay the first call after the failure: `std::fs::read` returns
-        // right after it, and nothing in between sets a status (`GetLastError`
-        // only reads the Win32 code).
-        // SAFETY: takes no arguments and only reads this thread's TEB.
-        let status = unsafe { rtl_get_last_nt_status() } as u32;
-        Err(io::Error::new(original.kind(), WithNtStatus { original, status }))
+        Err(io::Error::new(
+            original.kind(),
+            WithNtStatus {
+                original,
+                status: status as u32,
+            },
+        ))
     }
 
     /// A `windows` error as the `io::Error` of the Win32 code inside it.

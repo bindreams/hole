@@ -172,6 +172,14 @@ fn is_file_contention_sharing_violation_windows() {
     assert!(is_file_contention(&io::Error::from_raw_os_error(32)));
 }
 
+#[cfg(windows)]
+#[skuld::test]
+fn is_file_contention_wrapped_sharing_violation_windows() {
+    let wrapped = io::Error::other(io::Error::from_raw_os_error(32));
+    assert_eq!(wrapped.raw_os_error(), None, "guard: the outer error has no code");
+    assert!(is_file_contention(&wrapped));
+}
+
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn is_file_contention_etxtbsy_macos() {

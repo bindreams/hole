@@ -376,85 +376,178 @@ mod windows_long_paths {
     }
 }
 
-// A failed open names its NTSTATUS ------------------------------------------------------------------------------------
-
-/// `STATUS_OBJECT_NAME_NOT_FOUND`, `STATUS_SHARING_VIOLATION`: winternl/ntstatus.h.
-#[cfg(windows)]
-#[skuld::test]
-fn read_of_a_missing_file_names_the_ntstatus_of_the_open() {
-    let dir = dir();
-    let err = read(&dir.path().join("absent")).unwrap_err();
-
-    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
-    assert!(err.to_string().contains("NTSTATUS 0xC0000034"), "{err}");
-}
+// A failed read names its NTSTATUS ------------------------------------------------------------------------------------
 
 #[cfg(windows)]
-#[skuld::test]
-fn read_of_a_file_held_without_sharing_names_the_ntstatus_of_the_open() {
+mod windows_read_status {
+    use std::ffi::OsString;
+    use std::fs::File;
+    use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
 
-    let dir = dir();
-    let path = put(&dir, "held", b"bytes");
-    let _held = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(0)
-        .open(&path)
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FileDispositionInfo, LockFileEx, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows::Win32::System::IO::OVERLAPPED;
+
+    use super::*;
+    use crate::retry::is_file_contention;
+
+    /// The Win32 code of the call that failed, behind the status wrapper.
+    fn original_code(err: &io::Error) -> Option<i32> {
+        let original = err.get_ref()?.source()?.downcast_ref::<io::Error>()?;
+        original.raw_os_error()
+    }
+
+    fn held_without_sharing(path: &Path) -> File {
+        std::fs::OpenOptions::new().read(true).share_mode(0).open(path).unwrap()
+    }
+
+    #[skuld::test]
+    fn read_of_a_missing_file_names_the_ntstatus_of_the_open() {
+        let dir = dir();
+        let err = read(&dir.path().join("absent")).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
+        // STATUS_OBJECT_NAME_NOT_FOUND
+        assert!(err.to_string().contains("NTSTATUS 0xC0000034"), "{err}");
+    }
+
+    #[skuld::test]
+    fn read_of_a_file_held_without_sharing_names_the_ntstatus_of_the_open() {
+        let dir = dir();
+        let path = put(&dir, "held", b"bytes");
+        let _held = held_without_sharing(&path);
+
+        let err = read(&path).unwrap_err();
+
+        assert_eq!(err.kind(), std::fs::read(&path).unwrap_err().kind(), "{err:?}");
+        // STATUS_SHARING_VIOLATION
+        assert!(err.to_string().contains("NTSTATUS 0xC0000043"), "{err}");
+    }
+
+    /// The outer error carries no OS code of its own: the code is the source's.
+    /// Every reader of a code sees through the wrapper (`raw_os_error` of
+    /// `error_chain`), `is_file_contention` among them.
+    #[skuld::test]
+    fn the_os_code_of_a_status_error_is_in_its_source_and_readers_see_through_the_wrapper() {
+        let dir = dir();
+        let path = put(&dir, "held", b"bytes");
+        let _held = held_without_sharing(&path);
+
+        let err = read(&path).unwrap_err();
+
+        assert_eq!(err.raw_os_error(), None, "{err:?}");
+        assert_eq!(original_code(&err), Some(32), "ERROR_SHARING_VIOLATION: {err:?}");
+        assert_eq!(crate::error_chain::raw_os_error(&err), Some(32), "{err:?}");
+        assert!(is_file_contention(&err), "{err:?}");
+    }
+
+    /// A file marked for deletion while a handle to it is open stays at its
+    /// name until that handle closes, and `CreateFileW` answers `Access is
+    /// denied` for it: the case the Win32 code alone cannot tell from a real
+    /// denial. The plain delete calls remove the name at once on current
+    /// Windows, so the mark is set through the handle.
+    #[skuld::test]
+    fn read_of_a_delete_pending_file_names_its_status() {
+        let dir = dir();
+        let path = put(&dir, "pending", b"bytes");
+        let marked = std::fs::OpenOptions::new().access_mode(DELETE.0).open(&path).unwrap();
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: `info` is a valid `FILE_DISPOSITION_INFO` of the size passed.
+        unsafe {
+            SetFileInformationByHandle(
+                HANDLE(marked.as_raw_handle()),
+                FileDispositionInfo,
+                (&raw const info).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        }
         .unwrap();
 
-    let err = read(&path).unwrap_err();
-
-    assert!(err.to_string().contains("NTSTATUS 0xC0000043"), "{err}");
-}
-
-#[cfg(windows)]
-#[skuld::test]
-fn read_of_a_file_returns_its_bytes() {
-    let dir = dir();
-    let path = put(&dir, "f", b"bytes");
-    assert_eq!(read(&path).unwrap(), b"bytes");
-}
-
-/// The error's `source()` is the `io::Error` of the failed call, raw code included.
-#[cfg(windows)]
-#[skuld::test]
-fn the_source_of_a_status_error_is_the_original_io_error_with_its_code() {
-    let dir = dir();
-    let err = read(&dir.path().join("absent")).unwrap_err();
-
-    let source = err.get_ref().and_then(|inner| inner.source()).expect("a source");
-    let original = source.downcast_ref::<io::Error>().expect("an io::Error");
-    assert_eq!(original.raw_os_error(), Some(2), "ERROR_FILE_NOT_FOUND: {err:?}");
-}
-
-/// The test harness panics with `{:?}`, so that is what the CI log of a hit shows.
-#[cfg(windows)]
-#[skuld::test]
-fn debug_shows_the_status_in_hex() {
-    let dir = dir();
-    let err = read(&dir.path().join("absent")).unwrap_err();
-
-    assert!(format!("{err:?}").contains("0xC0000034"), "{err:?}");
-}
-
-/// `std` refuses these before any system call, so the thread's last status is
-/// an earlier call's: the primed open leaves 0xC0000034 there.
-#[cfg(windows)]
-#[skuld::test]
-fn a_path_std_rejects_before_the_kernel_is_returned_unchanged() {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-
-    let dir = dir();
-    let nul = PathBuf::from(OsString::from_wide(&[u16::from(b'a'), 0, u16::from(b'b')]));
-    for path in [nul, PathBuf::new()] {
-        let _ = read(&dir.path().join("absent"));
         let err = read(&path).unwrap_err();
-        let expected = std::fs::read(&path).unwrap_err();
 
-        assert_eq!(err.kind(), expected.kind(), "{path:?}: {err:?}");
-        assert_eq!(err.raw_os_error(), expected.raw_os_error(), "{path:?}: {err:?}");
-        assert_eq!(err.to_string(), expected.to_string(), "{path:?}");
-        assert!(!err.to_string().contains("NTSTATUS"), "{path:?}: {err}");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err:?}");
+        // STATUS_DELETE_PENDING
+        assert!(err.to_string().contains("NTSTATUS 0xC0000056"), "{err}");
+        assert_eq!(original_code(&err), Some(5), "ERROR_ACCESS_DENIED: {err:?}");
+        assert!(is_file_contention(&err), "{err:?}");
+    }
+
+    /// The open succeeds and the read fails: the status is the read's, not a
+    /// leftover of the missing-file open that primes the thread here.
+    #[skuld::test]
+    fn a_read_that_fails_after_a_good_open_names_the_status_of_the_read() {
+        let dir = dir();
+        let path = put(&dir, "locked", b"bytes");
+        let holder = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: the handle is open for reading and `overlapped` outlives the call.
+        unsafe {
+            LockFileEx(
+                HANDLE(holder.as_raw_handle()),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                None,
+                5,
+                0,
+                &mut overlapped,
+            )
+        }
+        .unwrap();
+        let _ = read(&dir.path().join("absent"));
+
+        let err = read(&path).unwrap_err();
+
+        // STATUS_FILE_LOCK_CONFLICT
+        assert!(err.to_string().contains("NTSTATUS 0xC0000054"), "{err}");
+        assert_eq!(original_code(&err), Some(33), "ERROR_LOCK_VIOLATION: {err:?}");
+    }
+
+    #[skuld::test]
+    fn read_of_a_file_returns_its_bytes() {
+        let dir = dir();
+        let path = put(&dir, "f", b"bytes");
+        assert_eq!(read(&path).unwrap(), b"bytes");
+    }
+
+    #[skuld::test]
+    fn the_source_of_a_status_error_is_the_original_io_error_with_its_code() {
+        let dir = dir();
+        let err = read(&dir.path().join("absent")).unwrap_err();
+
+        assert_eq!(original_code(&err), Some(2), "ERROR_FILE_NOT_FOUND: {err:?}");
+    }
+
+    /// The test harness panics with `{:?}`, so that is what the CI log of a hit shows.
+    #[skuld::test]
+    fn debug_shows_the_status_in_hex() {
+        let dir = dir();
+        let err = read(&dir.path().join("absent")).unwrap_err();
+
+        assert!(format!("{err:?}").contains("0xC0000034"), "{err:?}");
+    }
+
+    /// `std` refuses a NUL path before any system call, and `CreateFileW` fails
+    /// an empty one with a Win32 code and no status. Neither sets a status, so
+    /// the thread's last one is an earlier call's: the primed open leaves
+    /// 0xC0000034 there, and it must not be attached.
+    #[skuld::test]
+    fn a_path_that_fails_without_a_status_is_returned_unchanged() {
+        let dir = dir();
+        let nul = PathBuf::from(OsString::from_wide(&[u16::from(b'a'), 0, u16::from(b'b')]));
+        for path in [nul, PathBuf::new()] {
+            let _ = read(&dir.path().join("absent"));
+            let err = read(&path).unwrap_err();
+            let expected = std::fs::read(&path).unwrap_err();
+
+            assert_eq!(err.kind(), expected.kind(), "{path:?}: {err:?}");
+            assert_eq!(err.raw_os_error(), expected.raw_os_error(), "{path:?}: {err:?}");
+            assert_eq!(err.to_string(), expected.to_string(), "{path:?}");
+            assert!(!err.to_string().contains("NTSTATUS"), "{path:?}: {err}");
+        }
     }
 }
