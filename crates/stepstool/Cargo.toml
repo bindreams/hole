@@ -16,7 +16,7 @@ harness = false
 thiserror = "2"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
