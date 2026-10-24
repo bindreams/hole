@@ -2669,12 +2669,12 @@ cargo xtask run hole-tests   # canonical local nextest invocation
 cargo xtask run doc-hole     # rustdoc, warnings denied (`doc-ex-galoshes` on Linux and Windows/arm64)
 ```
 
-A fresh clone or git worktree has none of the generated inputs, and the pre-commit
-hook runs `cargo clippy --workspace`, which builds `hole` with default features and so
-needs `ui/dist/` (see [Tauri dev/prod feature toggle](#tauri-devprod-feature-toggle)).
-Before the first commit there, run `npm install`, `cargo xtask deps` and
-`cargo xtask build frontend-build`; an empty `ui/dist/` (gitignored) also satisfies the
-build script when no bundled frontend is needed.
+In a fresh clone or git worktree, `cargo clippy --workspace` and `cargo build -p hole`
+build `hole` with default features and fail until `ui/dist/` exists (see
+[Tauri dev/prod feature toggle](#tauri-devprod-feature-toggle)): run
+`cargo xtask build frontend-build`, or create an empty `ui/dist/` (gitignored) when no
+bundled frontend is needed. The pre-commit hook lints with `--no-default-features` and
+needs neither.
 
 CI runs the doc targets on every leg after clippy. Unpublished crates (every
 workspace crate except `garter`) are documented with `--document-private-items`
