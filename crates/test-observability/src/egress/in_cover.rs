@@ -58,7 +58,9 @@ impl Failure {
         Failure::Failed { why, targets }
     }
 
-    /// A run in which nothing blocks the control host: any reading that failed is the network's.
+    /// Readings taken while Hole holds no block at all, cover or confinement (the oracle reads covers
+    /// only): a failed one is the network's, so the run is rerun. Handed a reading from inside a
+    /// block, a defect that blocks the control is rerun without end; use [`Failure::captured`].
     pub fn uncovered(why: String, readings: &[bool]) -> Failure {
         if readings.iter().all(|a| *a) {
             Failure::Failed {

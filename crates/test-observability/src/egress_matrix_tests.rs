@@ -255,6 +255,44 @@ fn a_head_only_wire_drop_with_the_control_answering_is_a_defect_under_every_plac
     assert!(passed.is_empty(), "a wire drop was excused under {passed:?}");
 }
 
+/// A run inside a block the oracle cannot read (a process-scoped confinement, not a cover on disk) that
+/// blocks everything, the control included. The control is probed on both sides of the marker and the
+/// marker never arrives; `readings` turns what the run saw into its failure.
+fn confined_run(net: &Net, readings: fn(&[bool], &[bool]) -> Failure) -> Result<(), String> {
+    let scenario = || {
+        net.engage(&[]);
+        let before = net.reachable(CONTROL);
+        net.step(); // the marker: the block drops it
+        let after = net.reachable(CONTROL);
+        net.release();
+        Err::<(), _>(readings(&[before, after], &[false]))
+    };
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &clean, scenario)
+}
+
+#[skuld::test]
+fn a_block_that_also_blocks_the_control_is_a_defect_under_every_placement() {
+    // The control answers once the block is released, so the miss inside it was the block's.
+    let excused: Vec<_> = placements()
+        .into_iter()
+        .filter(|down| confined_run(&Net::new(down.clone(), &[]), wire_failure).is_ok())
+        .collect();
+    assert!(
+        excused.is_empty(),
+        "an over-blocking confinement was excused under {excused:?}"
+    );
+}
+
+#[skuld::test]
+#[should_panic(expected = "never settled")]
+fn a_miss_inside_a_block_handed_to_uncovered_is_rerun_without_end() {
+    // Why `Failure::uncovered` is for readings taken with Hole holding nothing: handed these, the same
+    // run is rerun for ever.
+    let _ = confined_run(&Net::new(0..0, &[]), |readings, _| {
+        Failure::uncovered("a marker was not captured".to_string(), readings)
+    });
+}
+
 /// A permit reading that breaks only after the cover was reloaded, with the control answering.
 fn reload_run(net: &Net) -> Result<(), String> {
     let hole = || net.cover.get().then(|| "a cover".to_string());

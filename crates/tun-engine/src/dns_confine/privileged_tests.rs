@@ -205,7 +205,8 @@ fn head_leak_tail_verdict(
 }
 
 /// Run `step` with the control probed on both sides, and report its failure as the run's: a miss on either
-/// side is the network's.
+/// side is the network's. Only for a step taken after the confinement is dropped: inside it, a miss is the
+/// confinement's to answer for.
 fn bracketed(step: impl FnOnce() -> Result<(), String>) -> Result<(), Failure> {
     let before = hole_test_observability::egress::probe(&control()).is_ok();
     let result = step();
@@ -449,25 +450,34 @@ fn dns_confine_global_net_state_permits_the_server_on_port_53() {
     judged_off_box("dns_confine: the server on port 53", || {
         let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
 
-        let verdict = bracketed(|| {
-            let (rt, socket) = probe_socket();
-            let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
-            let marker = nonce();
-            let mut sent = Ok(());
-            let pcap = capture_udp_window(dir.path(), "permits-server-53", || {
-                sent = send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), marker);
-            });
-
-            sent.map_err(|e| format!("the server IP must be accepted for send on port 53: {e:?}"))?;
-            capture_contains_nonce(&pcap, marker).then_some(()).ok_or_else(|| {
-                "the server IP must stay reachable on port 53 even though it is not the tunnel LUID: marker not \
-                 found in the capture"
-                    .to_string()
-            })
+        // The control (the server on 443) is outside the confinement, so it vouches for the network on both
+        // sides of the marker. A miss is judged by the control around the teardown, not rerun: the
+        // confinement is a block, and the oracle does not read it.
+        let control = control();
+        let (rt, socket) = probe_socket();
+        let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+        let marker = nonce();
+        let before = hole_test_observability::egress::probe(&control).is_ok();
+        let mut sent = Ok(());
+        let pcap = capture_udp_window(dir.path(), "permits-server-53", || {
+            sent = send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), marker);
         });
+        let after = hole_test_observability::egress::probe(&control).is_ok();
+        let seen = sent.is_ok() && capture_contains_nonce(&pcap, marker);
 
         drop(confinement);
-        verdict
+        if seen {
+            return Ok(());
+        }
+        Err(Failure::captured(
+            format!(
+                "the server IP must stay reachable on port 53 even though it is not the tunnel LUID: marker not \
+                 captured (send: {sent:?})"
+            ),
+            &control,
+            &[before, after],
+            &[seen],
+        ))
     });
 }
 
