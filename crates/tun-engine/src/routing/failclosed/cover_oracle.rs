@@ -3,9 +3,14 @@
 //! The egress waits in `hole_test_observability::egress` take this as their `HoleState`: an unreachable
 //! target while a cover is installed is Hole's, never the runner's network. The reads are the ones the
 //! production code already makes for the same question, so a test cannot disagree with the sweep about
-//! what is installed.
+//! what is installed. The state directory a cover was engaged with is never what answers alone: a cover
+//! an earlier test left under another directory, or one whose record a release cleared while the firewall
+//! still blocks, reads as held.
 
 use std::path::Path;
+
+#[cfg(test)]
+pub(crate) use super::permit_scenario::permit_scenario;
 
 /// A description of every cover Hole holds, or `None` when it holds none. `state_dir` is the directory
 /// the test engaged its covers with.
@@ -14,7 +19,7 @@ use std::path::Path;
 /// not be asked has not shown the cover gone.
 pub(crate) fn held_covers(state_dir: &Path) -> Option<String> {
     let mut held = Vec::new();
-    if let Some(lockdown) = crate::test_utils::held_lockdown(state_dir) {
+    if let Some(lockdown) = lockdown_held(state_dir) {
         held.push(lockdown);
     }
     if let Some(transient) = transient_held(state_dir) {
@@ -23,46 +28,61 @@ pub(crate) fn held_covers(state_dir: &Path) -> Option<String> {
     (!held.is_empty()).then(|| held.join(" and "))
 }
 
-/// Windows: the transient cover's twelve fixed filter keys, folded by the same `classify_presence` the
-/// lockdown probe uses.
+/// The standing lockdown cover: the read the production sweep makes (WFP filters; pf label and state file).
+fn lockdown_held(state_dir: &Path) -> Option<String> {
+    let presence = super::lockdown_cover_presence(state_dir);
+    presence
+        .is_present()
+        .then(|| format!("a standing lockdown cover (OS says {presence:?})"))
+}
+
+/// Windows: the transient cover's twelve fixed filter keys, read the way the lockdown probe reads its own.
 #[cfg(target_os = "windows")]
 fn transient_held(_state_dir: &Path) -> Option<String> {
-    use super::platform::{boottime_probe, classify_presence, FILTER_GUIDS};
-
-    let mut engine_opened = true;
-    let mut codes = Vec::new();
-    for guid in FILTER_GUIDS {
-        match boottime_probe::get_by_key(guid) {
-            Ok((code, _)) => codes.push(code),
-            Err(_) => engine_opened = false,
-        }
-    }
-    let presence = classify_presence(engine_opened, &codes);
+    let presence = super::platform::transient_cover_presence();
     presence
         .is_present()
         .then(|| format!("a transient cover (OS says {presence:?})"))
 }
 
-/// macOS: pf keeps no label for the transient ruleset, so the only record of it is Hole's own state
-/// file, which an engage writes before it touches pf and a confirmed release is the only thing to clear.
+/// macOS: the transient ruleset carries no pf label, so it is read two ways. Hole's state file, which an
+/// engage writes before it touches pf and a confirmed release is the only thing to clear, lives under the
+/// engaging test's directory only. The live main ruleset is global: a clean host's has no `block` rule,
+/// so one is a cover, whichever test engaged it and whether or not its record survived.
 #[cfg(target_os = "macos")]
 fn transient_held(state_dir: &Path) -> Option<String> {
-    let record = super::failclosed_state::load_presence(state_dir);
-    (!matches!(record, super::StateFile::Absent)).then(|| "a transient cover (its state record exists)".to_string())
+    let mut sources = Vec::new();
+    if !matches!(
+        super::failclosed_state::load_presence(state_dir),
+        super::StateFile::Absent
+    ) {
+        sources.push("its state record exists");
+    }
+    match live_main_ruleset_blocks() {
+        Some(false) => {}
+        Some(true) => sources.push("the live pf ruleset has a block rule"),
+        None => sources.push("pf could not be asked"),
+    }
+    (!sources.is_empty()).then(|| format!("a transient cover ({})", sources.join(" and ")))
 }
 
-/// Run `scenario` (engage a cover, probe while it is engaged, drop the cover) until it holds. It returns
-/// `Err(why)` AFTER dropping its cover when a permit probe failed; whether that is the network or the
-/// cover is decided by [`hole_test_observability::egress::rerun_until_network_holds`], with `control`
-/// probed outside the cover. Panics with `why` when the permit really failed.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-#[track_caller]
-pub(crate) fn permit_scenario<T>(
-    what: &str,
-    state_dir: &Path,
-    control: &str,
-    scenario: impl FnMut() -> Result<T, String>,
-) -> T {
-    hole_test_observability::egress::rerun_until_network_holds(what, control, &|| held_covers(state_dir), scenario)
-        .unwrap_or_else(|why| panic!("{why}"))
+/// Whether `pfctl -sr` lists a block rule; `None` when pf could not be asked.
+#[cfg(target_os = "macos")]
+fn live_main_ruleset_blocks() -> Option<bool> {
+    use crate::routing::{run_capturing, BestEffortPhase};
+    use util::system_tool::SystemTool;
+
+    let out = run_capturing(SystemTool::Pfctl, &["-sr"], None, BestEffortPhase::RecoverCover).ok()?;
+    out.status
+        .success()
+        .then(|| ruleset_has_block_rule(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Whether a `pfctl -sr` listing has a block rule: a rule line whose first word is `block`. A clean
+/// runner lists only `scrub-anchor` and `anchor` lines for Apple's own anchors.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn ruleset_has_block_rule(listing: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("block"))
 }

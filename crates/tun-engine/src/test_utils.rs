@@ -28,7 +28,7 @@ pub mod probe;
 pub mod route;
 
 pub use command::{describe_output, ps_capture, ps_output};
-pub use cover::held_lockdown;
+pub use cover::held_covers;
 pub use escape::{recovery_command, write_recovery_record, EscapeGuard, RecordSpec};
 #[cfg(target_os = "windows")]
 pub use pktmon::{capture_contains_nonce, nonce, pktmon, send_marker, PktmonGuard};

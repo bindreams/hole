@@ -313,6 +313,100 @@ fn macos_release_all_clears_both_stranded_covers() {
     assert!(!dir.path().join(super::failclosed_state::STATE_FILE_NAME).exists());
 }
 
+// release_all_leaves_nothing_the_oracle_can_see =======================================================================
+
+/// The TUN the lockdown cover is engaged against: absent from the host, so the cover blocks everything
+/// but its server permit.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const COVER_TUN: &str = if cfg!(windows) {
+    "Loopback Pseudo-Interface 1"
+} else {
+    "utun-absent"
+};
+
+/// The oracle the egress waits take as `HoleState` reads the OS, not the engaging test's records: a
+/// cover stranded under one state directory is seen from another, and a confirmed release leaves
+/// nothing to see. Without this, a leaked cover from an earlier test reads as a lost network.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn release_all_leaves_nothing_the_oracle_can_see() {
+    let dir = tempfile::tempdir().unwrap();
+    let stranger = tempfile::tempdir().unwrap();
+    let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
+    let routing = SystemRouting::new(dir.path().to_path_buf(), None);
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    assert_baseline_reachable(stranger.path());
+
+    let lockdown = routing
+        .install_lockdown(server_ip, &TunIdentity::synthetic(0, COVER_TUN), &[])
+        .expect("engage the real lockdown cover");
+    lockdown.disarm();
+    assert!(
+        held_covers(stranger.path()).is_some(),
+        "a stranded lockdown cover must be visible from a state directory that never engaged it"
+    );
+    routing
+        .release_all_covers()
+        .expect("release_all_covers must clear the stranded lockdown cover");
+    assert_eq!(
+        held_covers(stranger.path()),
+        None,
+        "nothing may be left after the lockdown cover is released"
+    );
+
+    let transient = routing
+        .install_failclosed_cover(server_ip, None)
+        .expect("engage the real transient cover");
+    transient.disarm();
+    assert!(
+        held_covers(stranger.path()).is_some(),
+        "a stranded transient cover must be visible from a state directory that never engaged it"
+    );
+    routing
+        .release_all_covers()
+        .expect("release_all_covers must clear the stranded transient cover");
+    assert_eq!(
+        held_covers(stranger.path()),
+        None,
+        "nothing may be left after the transient cover is released"
+    );
+}
+
+/// A release that cleared the record but left pf blocking: the record is the only thing the engaging
+/// directory can show, so the oracle must read the live ruleset.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn macos_release_all_sees_a_transient_cover_whose_record_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
+    let routing = SystemRouting::new(dir.path().to_path_buf(), None);
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    assert_baseline_reachable(dir.path());
+
+    let cover = routing
+        .install_failclosed_cover(server_ip, None)
+        .expect("engage the real pf transient cover");
+    cover.disarm();
+    let record_path = dir.path().join(super::failclosed_state::STATE_FILE_NAME);
+    let record = std::fs::read(&record_path).expect("the engage must have written its record");
+    std::fs::remove_file(&record_path).unwrap();
+
+    let held = held_covers(dir.path());
+
+    // Put the record back first: the release reads it for the pf enable token it must drop.
+    std::fs::write(&record_path, record).unwrap();
+    routing
+        .release_all_covers()
+        .expect("release_all_covers must clear the stranded transient cover");
+
+    assert!(
+        held.is_some(),
+        "pf still blocks with the record gone, so the oracle must still report the cover"
+    );
+}
+
 // windows_release_all_on_a_clean_host_is_ok / macos counterpart =======================================================
 
 #[cfg(target_os = "windows")]

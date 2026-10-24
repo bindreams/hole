@@ -395,7 +395,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     hole_test_observability::egress::wait_for_egress(
         "HARNESS/CONTROL: baseline reachability over the bypass route",
         &[&no_leak_target_addr().to_string()],
-        &|| tun_engine::test_utils::held_lockdown(harness.state_dir.path()),
+        &|| tun_engine::test_utils::held_covers(harness.state_dir.path()),
     );
 
     let resp = harness
@@ -413,7 +413,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // cover); a run whose probes failed is judged only after the cover is released.
     let control = no_leak_target_addr().to_string();
     let state_dir = harness.state_dir.path().to_path_buf();
-    let held = || tun_engine::test_utils::held_lockdown(&state_dir);
+    let held = || tun_engine::test_utils::held_covers(&state_dir);
     let (
         arm,
         armed,

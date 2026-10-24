@@ -2122,23 +2122,37 @@ pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::ro
 /// `windows_lockdown_permits_server_ip_and_blocks_other_egress`' `Absent`
 /// before engage and `Live` while held, both taken with these GUIDs in the
 /// probe list.
-#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresence {
+    let guids: Vec<GUID> = swept_lockdown_keys().into_iter().map(|k| k.guid).collect();
+    presence_of_keys("lockdown", &guids)
+}
+
+/// [`lockdown_cover_presence`] for the transient cover's [`FILTER_GUIDS`], for the privileged tests'
+/// Hole-state oracle (`test_utils::held_covers`).
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn transient_cover_presence() -> crate::routing::CoverPresence {
+    presence_of_keys("transient", &FILTER_GUIDS)
+}
+
+/// The by-key presence read both covers share: `FwpmFilterGetByKey0` for every key in `guids`, folded
+/// by [`classify_presence`]. `what` names the cover in the log.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence {
     unsafe {
         let mut engine = HANDLE::default();
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
             tracing::warn!(
                 code = format!("0x{rc:08x}"),
-                "FwpmEngineOpen0 failed: the firewall could not be asked whether a lockdown cover is present"
+                "FwpmEngineOpen0 failed: the firewall could not be asked whether a {what} cover is present"
             );
             return classify_presence(false, &[]);
         }
 
         let mut codes: Vec<u32> = Vec::new();
-        for k in swept_lockdown_keys() {
+        for guid in guids {
             let mut out: *mut FWPM_FILTER0 = std::ptr::null_mut();
-            codes.push(FwpmFilterGetByKey0(engine, &k.guid, &mut out));
+            codes.push(FwpmFilterGetByKey0(engine, guid, &mut out));
             if !out.is_null() {
                 let mut p = out as *mut core::ffi::c_void;
                 FwpmFreeMemory0(&mut p);
@@ -2150,7 +2164,7 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
         if presence == crate::routing::CoverPresence::Indeterminate {
             tracing::warn!(
                 codes = ?codes.iter().map(|c| format!("0x{c:08x}")).collect::<Vec<_>>(),
-                "lockdown presence probe returned an unusable answer"
+                "{what} presence probe returned an unusable answer"
             );
         }
         presence

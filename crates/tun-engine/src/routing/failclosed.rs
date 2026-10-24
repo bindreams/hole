@@ -1105,11 +1105,20 @@ mod boot_time_tripwire_tests;
 #[path = "failclosed/stale_key_policy_tests.rs"]
 mod stale_key_policy_tests;
 
-// Reads back what the privileged tests' covers hold, for their egress waits. Windows and macOS only: the
-// covers exist nowhere else.
-#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+// Reads back what Hole's covers hold, for the privileged tests' egress waits (this crate's and the bridge's, through
+// `test_utils`). Windows and macOS only: the covers exist nowhere else.
+#[cfg(all(any(test, feature = "test-utils"), any(target_os = "windows", target_os = "macos")))]
 #[path = "failclosed/cover_oracle.rs"]
 pub(crate) mod cover_oracle;
+
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[path = "failclosed/cover_oracle_tests.rs"]
+mod cover_oracle_tests;
+
+// Names `hole_test_observability`, a dev-dependency: `cfg(test)` only, unlike the oracle it wraps.
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[path = "failclosed/permit_scenario.rs"]
+mod permit_scenario;
 
 // Privileged-lane real-engage verification (#527): engages the REAL OS cover and
 // asserts it blocks egress. Gated to the elevated `hole-tests` TUN lane by the

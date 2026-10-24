@@ -111,12 +111,12 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
     // environment problem, not the cover -- wait for the network to answer. A cover left by an
     // earlier test fails at once instead.
     hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED], &|| {
-        tun_engine::test_utils::held_lockdown(dir.path())
+        tun_engine::test_utils::held_covers(dir.path())
     });
 
     // The cover blocks every control host, so a failed permit probe tears the cover down and asks the
     // control outside it: a lost network runs the scenario again, a live control means the permit failed.
-    let held_hole = || tun_engine::test_utils::held_lockdown(dir.path());
+    let held_hole = || tun_engine::test_utils::held_covers(dir.path());
     let verdict = hole_test_observability::egress::rerun_until_network_holds(
         "the standing cover's permit",
         PERMITTED,
