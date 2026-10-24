@@ -2401,37 +2401,46 @@ write is ordered by something that is not that mutex:
   checks it after: the facade's `engage` / `engage_lockdown` on both platforms
   (the cover is dropped, `SupersededByRelease`), and `start_cancellable` after
   every `install_failclosed_cover` and `install_lockdown` (the cover is dropped,
-  the start is `Cancelled`). The epoch is a leaf lock over two integers per
-  `state_dir`; a release never waits for an install, which is what keeps Unblock
-  working while a start wedges. `Cover::drop` does not begin a release, so a
-  start's own teardown cannot cancel that start.
+  the start is `Cancelled`). The epoch is two atomics per `state_dir`; a release
+  never waits for an install, which is what keeps Unblock working while a start
+  wedges. `Cover::drop` does not begin a release, so a start's own teardown cannot
+  cancel that start.
 - macOS `bridge-failclosed.json` and `bridge-lockdown-pf.json`: a `pfctl` call
   cannot run under a lock, so these are claimed rather than locked
   ([`pf_claim`](crates/tun-engine/src/routing/failclosed/pf_claim.rs)). A release
   rewrites each live record as a tombstone (`releasing: true`, absent from every
   ordinary record) before any pf call, restores, drops the token, and only then
   clears the tombstone: a restore that fails keeps the token, a `pfctl -X` that
-  fails keeps the record, and a retry finishes either. One party settles a token
-  at a time ([`drop_right`](crates/tun-engine/src/routing/failclosed/drop_right.rs)):
-  a try-lock that never waits and is held across the `pfctl -X`, so a second party
-  leaves the token to the holder, and a party that finds the record already gone
-  leaves it alone, so a token is dropped once. An engage reads the record at entry,
-  writes with `swap` (a compare against that view), and checks `holds` after its
-  ruleset loads: a tombstone, a missing record or another token is
-  `SupersededByRelease` (the start is cancelled, also for the transient cover); a
-  record that cannot be read is a failure, not a release. A back-out restores the
-  baseline the engage holds in memory, then, holding the right and over a live
-  record that is its own, drops the token and clears the record naming it. If the
+  fails keeps the record, and a retry finishes either. An engage reads the record
+  at entry and writes with `swap`, a compare against that view that the epoch also
+  gates: **no engage writes once a release has begun since its watch opened**,
+  whatever the record reads, so a release's tombstone, or the unusable file it
+  could not claim, is never written over. After its ruleset loads the engage checks
+  `holds`: a tombstone, a missing record or another token is `SupersededByRelease`
+  (the start is cancelled, also for the transient cover); a record that cannot be
+  read is a failure, not a release. A token is dropped once however many parties
+  ask ([`dropped_tokens`](crates/tun-engine/src/routing/failclosed/dropped_tokens.rs)),
+  so nobody negotiates who owns it: a release, a back-out and a cover's drop each
+  drop theirs whatever became of its record, and a second ask finds it dropped.
+  The ledger is a mutex held across the `pfctl -X`, so an Unblock can wait for one
+  drop in flight. An engage whose write replaces a record that named another token
+  drops that token once the write lands: the leftover of a release that did not
+  finish, or the token salvaged from an unusable file, which nothing else names. A
+  back-out restores the baseline the engage holds in memory, then drops the
+  engage's token and clears every record naming it, a tombstone included. If the
   restore fails it puts its record back over nothing or over the tombstone, which
   the release then refuses to clear (the Unblock reports an error); that record
   can name a token a release already dropped. A failed restore therefore always
   leaves a record. A tombstone left by a failed or crashed release reads to an
   older binary as an unusable record with its token salvaged, and an engage adopts
-  it like any leftover cover.
+  it like any leftover cover. Every pair of these parties, from every state of the
+  records, over every order of their steps, is checked by `macos_interleaving_tests`
+  (a dynamic partial-order search over the production sequencers; only pf is
+  modelled), on every host.
 
 The leaf rule: while one of these locks is held nothing else is acquired, and no
-`.await`, firewall, `pfctl` or process call runs. The drop right is not one of
-these locks: it is held across `pfctl -X`, and nobody waits for it.
+`.await`, firewall, `pfctl` or process call runs. The dropped-token ledger is not
+one of these locks: it is held across `pfctl -X`, and nothing is acquired under it.
 
 These orderings are in-process. A second bridge, or `hole bridge unlock` run from
 a shell while a bridge is up, is not ordered by them

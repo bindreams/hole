@@ -90,7 +90,7 @@ impl Op {
     }
 
     /// Whether the order of `self` and `other` can matter.
-    fn conflicts(&self, other: &Op) -> bool {
+    pub fn conflicts(&self, other: &Op) -> bool {
         self.touches.iter().any(|(res, mine)| {
             other
                 .touches
@@ -170,14 +170,18 @@ struct Executed {
     parked: Vec<(usize, Op)>,
 }
 
-/// Run the interleavings of `parties` that are not equivalent by swapping
+/// Run the interleavings of two parties that are not equivalent by swapping
 /// commuting operations, a fresh world per run from `fresh`, handing each
 /// finished run to `observe`.
+///
+/// Exactly two parties: with three, the search below misses classes of
+/// interleavings (the check in `macos_interleaving_tests` finds it), so it refuses.
 pub fn explore<W: Sync, T: Send + 'static>(
     parties: &[PartyFn<'_, W, T>],
     mut fresh: impl FnMut() -> W,
     mut observe: impl FnMut(&W, Run<T>),
 ) -> Stats {
+    assert_eq!(parties.len(), 2, "the search is only proved for two parties");
     let mut stats = Stats::default();
     let mut path: Vec<Node> = Vec::new();
     loop {

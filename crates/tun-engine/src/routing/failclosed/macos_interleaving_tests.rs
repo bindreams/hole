@@ -7,7 +7,7 @@
 //! order of their steps. A step is one operation on shared state: a record read,
 //! write or clear, a pf call, the release epoch. The records are real files and
 //! every record step is the production one; only pf is modelled
-//! (`macos_interleaving_world.rs`), and the search is `macos_interleaving_explore.rs`.
+//! (`macos_interleaving_world_tests.rs`), and the search is `macos_interleaving_explore_tests.rs`.
 //!
 //! After each run the world must satisfy, for any order:
 //!
@@ -31,12 +31,12 @@
 
 use super::*;
 
-#[path = "macos_interleaving_explore.rs"]
+#[path = "macos_interleaving_explore_tests.rs"]
 mod explore;
-#[path = "macos_interleaving_world.rs"]
+#[path = "macos_interleaving_world_tests.rs"]
 mod world;
 
-use explore::{explore, Run, Stats};
+use explore::{explore, Op, Res, Run, Stats};
 use world::{run_party, Entry, Final, Kind, Outcome, Rules, World};
 
 /// What a cell found.
@@ -283,4 +283,130 @@ fn no_order_of_a_transient_and_a_standing_engage_breaks_a_pf_record_invariant() 
 #[skuld::test]
 fn no_order_of_two_standing_engages_breaks_a_pf_record_invariant() {
     explore_pair(Kind::StandingEngage, Kind::StandingEngage);
+}
+
+// The search itself ===================================================================================================
+
+/// A party of the search's own check: it steps through its operations.
+type ToyParty = Box<dyn Fn(&(), &explore::Gate) + Sync>;
+
+/// A small deterministic generator, so a failing case names its seed.
+struct Lcg(u64);
+
+impl Lcg {
+    fn below(&mut self, n: u64) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 33) % n) as usize
+    }
+}
+
+fn random_op(rng: &mut Lcg) -> Op {
+    let res = [Res::Transient, Res::Standing, Res::Ruleset][rng.below(3)].clone();
+    let op = Op::new("op");
+    match rng.below(3) {
+        0 => op.reads(res),
+        1 => op.writes(res),
+        _ => op.commutes(res),
+    }
+}
+
+/// Which way each pair of conflicting operations of different parties went: what
+/// separates one class of interleavings from another.
+fn class_of(order: &[(usize, usize)], parties: &[Vec<Op>]) -> Vec<((usize, usize), (usize, usize))> {
+    let mut pairs = Vec::new();
+    for (i, &(p, a)) in order.iter().enumerate() {
+        for &(q, b) in &order[i + 1..] {
+            if p != q && parties[p][a].conflicts(&parties[q][b]) {
+                pairs.push(((p, a), (q, b)));
+            }
+        }
+    }
+    pairs.sort();
+    pairs
+}
+
+fn all_interleavings(parties: &[Vec<Op>]) -> Vec<Vec<(usize, usize)>> {
+    fn go(
+        parties: &[Vec<Op>],
+        next: &mut Vec<usize>,
+        order: &mut Vec<(usize, usize)>,
+        out: &mut Vec<Vec<(usize, usize)>>,
+    ) {
+        if next.iter().zip(parties).all(|(n, p)| *n == p.len()) {
+            out.push(order.clone());
+            return;
+        }
+        for p in 0..parties.len() {
+            if next[p] < parties[p].len() {
+                order.push((p, next[p]));
+                next[p] += 1;
+                go(parties, next, order, out);
+                next[p] -= 1;
+                order.pop();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(parties, &mut vec![0; parties.len()], &mut Vec::new(), &mut out);
+    out
+}
+
+#[skuld::test]
+fn the_search_reaches_every_class_of_interleaving_a_full_enumeration_does() {
+    let mut reduced_somewhere = false;
+    for seed in 0..1500u64 {
+        let mut rng = Lcg(seed);
+        let parties: Vec<Vec<Op>> = (0..2)
+            .map(|_| (0..1 + rng.below(5)).map(|_| random_op(&mut rng)).collect())
+            .collect();
+
+        let full = all_interleavings(&parties);
+        let expected: std::collections::BTreeSet<_> = full.iter().map(|o| class_of(o, &parties)).collect();
+
+        let mut reached = std::collections::BTreeSet::new();
+        let fns: Vec<ToyParty> = parties
+            .iter()
+            .map(|ops| {
+                let ops = ops.clone();
+                Box::new(move |_: &(), gate: &explore::Gate| {
+                    for op in &ops {
+                        gate.step(op.clone());
+                    }
+                }) as ToyParty
+            })
+            .collect();
+        let refs: Vec<explore::PartyFn<'_, (), ()>> = fns.iter().map(|f| &**f).collect();
+        let stats = explore(
+            &refs,
+            || (),
+            |_, run| {
+                let mut seen = vec![0; parties.len()];
+                let order: Vec<(usize, usize)> = run
+                    .trace
+                    .iter()
+                    .map(|&(p, _)| {
+                        seen[p] += 1;
+                        (p, seen[p] - 1)
+                    })
+                    .collect();
+                reached.insert(class_of(&order, &parties));
+            },
+        );
+
+        let missed: Vec<_> = expected.difference(&reached).collect();
+        assert!(
+            missed.is_empty(),
+            "seed {seed}: classes never run: {missed:?}
+parties: {parties:?}"
+        );
+        assert!(
+            stats.runs + stats.abandoned <= full.len(),
+            "seed {seed}: more runs than interleavings"
+        );
+        reduced_somewhere |= stats.runs + stats.abandoned < full.len();
+    }
+    assert!(reduced_somewhere, "and the search must actually skip some");
 }

@@ -1,4 +1,4 @@
-//! Who owns a pf cover record, and so who may drop its pf enable token.
+//! Who owns a pf cover record, and what each party does to the token it names.
 //!
 //! An engage and a release are two parties over one record and one refcount.
 //! The rules, as pure decisions over what the record reads (the record modules
@@ -7,10 +7,10 @@
 //! - A release **claims** the record before any pf call by rewriting it as a
 //!   *tombstone*: the same record plus `releasing`. A tombstone still names the
 //!   token, so a crash or a failed restore leaves what recovery already acts on.
-//! - A token is **dropped before** the record that names it is cleared, and by
-//!   one party at a time ([`super::drop_right`]): a drop that fails leaves the
-//!   record for a retry, and nobody drops a token whose record somebody else
-//!   already removed, so no token is dropped twice.
+//! - A token is **dropped before** the record that names it is cleared, so a
+//!   drop that fails leaves the record for a retry. Who got there first is not
+//!   the record's to say: a token is dropped once however many parties ask
+//!   ([`super::dropped_tokens`]).
 //! - An engage whose own restore failed **re-asserts** its record over a
 //!   tombstone (or over nothing), so the release that restored earlier cannot
 //!   clear the only evidence of a host the engage then re-blocked.
@@ -65,10 +65,10 @@ impl Held {
 /// What a clear of the record a token is settled under finds, or would find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cleared {
-    /// The record is the caller's to settle: the token is the caller's to drop,
-    /// and the record goes once it is dropped.
+    /// The record is the caller's to clear, once the token it names is dropped.
     Removed,
-    /// Nothing there: whoever removed the record dropped the token.
+    /// Nothing there, or, for a caller without a claim, a record that names
+    /// another token: nothing of the caller's to clear.
     Gone,
     /// A record the release did not claim stands there, typically one an engage
     /// re-asserted after its own restore failed. Left alone.

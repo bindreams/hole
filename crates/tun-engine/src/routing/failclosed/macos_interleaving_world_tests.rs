@@ -1,7 +1,7 @@
 //! The world the interleaving search runs in, and the four parties in it.
 //!
 //! The records are real files in a temp dir and every record step is the
-//! production one (claim, compare-and-set, clear, peek, drop right). Only pf is
+//! production one (claim, compare-and-set, clear, peek). Only pf is
 //! modelled: an enable-token set, the ruleset that is loaded, and a log of
 //! violations the model itself can see (`pfctl -X` of a token that is not live,
 //! which the production `dropped_tokens` ledger is there to keep from happening).

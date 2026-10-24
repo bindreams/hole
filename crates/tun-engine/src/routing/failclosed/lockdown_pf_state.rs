@@ -103,6 +103,8 @@ fn write_record(state_dir: &Path, state: &LockdownPfState) -> std::io::Result<()
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
     tmp.write_all(&json)?;
+    // A unit test cannot observe a power cut, and the interleaving matrix writes
+    // records thousands of times: the flush would be most of its run time.
     #[cfg(not(test))]
     tmp.as_file().sync_all()?;
     tmp.persist(state_file(state_dir)).map_err(|e| e.error)?;

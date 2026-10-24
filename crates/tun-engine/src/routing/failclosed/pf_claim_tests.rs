@@ -136,7 +136,7 @@ fn an_unclaimed_clear_would_remove_any_record_naming_the_token_and_nothing_else(
     assert_eq!(
         would_clear(&tombstone_of(MINE), Some(MINE), false),
         Cleared::Removed,
-        "a tombstone nobody holds the right to settle is leftover"
+        "a tombstone nobody claimed in this run is leftover"
     );
     assert_eq!(would_clear(&unusable(Some(MINE)), Some(MINE), false), Cleared::Removed);
     assert_eq!(would_clear(&unusable(None), None, false), Cleared::Removed);

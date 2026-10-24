@@ -934,9 +934,9 @@ fn capture_and_persist(
     persist_baseline(token, site, expected, presence, main_snapshot, nat_snapshot)
 }
 
-/// Where an engage writes its records, as whom, and the watch that ends its right
-/// to: a write is refused ([`RoutingError::SupersededByRelease`]) once a release has
-/// begun since the watch opened.
+/// Where an engage writes its records, as whom, and the watch that ends its
+/// writes: a write is refused ([`RoutingError::SupersededByRelease`]) once a
+/// release has begun since the watch opened.
 #[derive(Clone, Copy)]
 pub(crate) struct RecordSite<'a> {
     pub state_dir: &'a Path,
