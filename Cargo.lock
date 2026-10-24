@@ -8545,6 +8545,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tun",
+ "tun-engine",
  "tun-engine-macros",
  "util",
  "uuid",

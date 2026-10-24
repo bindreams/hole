@@ -49,6 +49,7 @@ use std::sync::Once;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
 
+pub mod egress;
 pub mod panic_dump;
 
 /// Re-exported `ctor` crate so consumer crates don't need to add

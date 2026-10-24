@@ -23,14 +23,17 @@
 //! `com.apple.system.SystemConfiguration.dns_configuration` notification
 //! before the mutating call (`Start`, then `Stop`) and block on it before
 //! reading `scutil --dns`** — a bare read races configd's own
-//! recomputation and can pass vacuously in either direction. The harness is
-//! copied from `tun_engine::dns_steer::privileged_tests` — the original —
-//! because this crate cannot reach that module's private items. It now
-//! exists three times: there, here, and
-//! `tun-engine/tests/macos_session_key_lifetime_probe.rs`, each carrying its
-//! own `unsafe` `notify_register_file_descriptor` declarations.
-//! `tun_engine::test_utils` is the natural home for one shared copy;
-//! tracked separately rather than done here.
+//! recomputation and can pass vacuously in either direction. The notification
+//! and the resolver reads are shared with the tun-engine DNS tests
+//! (`tun_engine::test_utils::{DnsConfigNotify, resolver_set}`).
+//!
+//! **The runner's own network is not under test.** The before and after resolver sets are read with
+//! a control host answering around them (`tun_engine::test_utils::resolver_set`), and a Start that
+//! fails is run through `egress::rerun_uncovered` with the same control: a lost network is waited out,
+//! a failure with the network up is a defect. The control has no bypass route, so a failed Start that
+//! leaves its split routes behind would starve it: the Hole-state read ([`held_state`]) counts those
+//! routes as held, and a route it cannot read as held too, which makes that failure a defect at once
+//! and never a wait.
 //!
 //! `DnsConfig::default()` (real Cloudflare resolvers, DoH) is used rather
 //! than a synthetic/unreachable address: the bridge's own start-time
@@ -61,8 +64,6 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
-use std::ffi::CString;
-use std::io;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -75,94 +76,9 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use hole_common::config::{DnsConfig, ServerEntry};
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
+use hole_test_observability::egress;
+use tun_engine::test_utils::{held_covers, nameservers, resolver_set, DnsConfigNotify, NETWORK_CONTROL};
 use util::port_alloc::Protocols;
-
-// configd change notification (duplicated from
-// `tun_engine::dns_steer::privileged_tests` — private to that crate, see
-// module doc) =========================================================================================================
-
-const DNS_CONFIG_NOTIFY_KEY: &str = "com.apple.system.SystemConfiguration.dns_configuration";
-
-extern "C" {
-    fn notify_register_file_descriptor(
-        name: *const libc::c_char,
-        notify_fd: *mut libc::c_int,
-        flags: libc::c_int,
-        out_token: *mut libc::c_int,
-    ) -> u32;
-    fn notify_cancel(token: libc::c_int) -> u32;
-}
-
-/// A live registration for configd's DNS-configuration-changed notification.
-/// Every wait below rendezvous on this rather than on elapsed time; the
-/// `deadline` passed to `wait`/`settle` is the failure bound surfaced to a
-/// human when configd never posts, not a sync sleep.
-struct DnsConfigNotify {
-    fd: libc::c_int,
-    token: libc::c_int,
-}
-
-impl DnsConfigNotify {
-    fn register() -> Option<Self> {
-        let name = CString::new(DNS_CONFIG_NOTIFY_KEY).expect("notify key has no interior NUL");
-        let mut fd: libc::c_int = -1;
-        let mut token: libc::c_int = 0;
-        // SAFETY: `name` is a valid NUL-terminated string that outlives the
-        // call; `fd`/`token` are live out-params.
-        let status = unsafe { notify_register_file_descriptor(name.as_ptr(), &mut fd, 0, &mut token) };
-        (status == 0).then_some(Self { fd, token })
-    }
-
-    fn wait(&self, deadline: Instant) -> bool {
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            let millis = libc::c_int::try_from(remaining.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
-            let mut pfd = libc::pollfd {
-                fd: self.fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: single live pollfd, count matches.
-            match unsafe { libc::poll(&mut pfd, 1, millis) } {
-                -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
-                -1 => return false,
-                0 => return false,
-                _ => {
-                    let mut token_be = [0u8; 4];
-                    // SAFETY: reading 4 bytes into a 4-byte buffer.
-                    let n = unsafe { libc::read(self.fd, token_be.as_mut_ptr().cast(), 4) };
-                    return n == 4;
-                }
-            }
-        }
-    }
-
-    /// Block until `scutil --dns` mentioning `needle` equals `want`, driven
-    /// by configd's own change posts. Checks the predicate first so an
-    /// already-satisfied state needs no event at all.
-    fn settle(&self, deadline: Instant, needle: &str, want: bool) -> bool {
-        loop {
-            if scutil_dns().contains(needle) == want {
-                return true;
-            }
-            if !self.wait(deadline) {
-                return scutil_dns().contains(needle) == want;
-            }
-        }
-    }
-}
-
-impl Drop for DnsConfigNotify {
-    fn drop(&mut self) {
-        // SAFETY: token was produced by a successful registration.
-        unsafe {
-            notify_cancel(self.token);
-        }
-    }
-}
 
 fn budget(secs: u64) -> Instant {
     Instant::now() + Duration::from_secs(secs)
@@ -178,32 +94,57 @@ fn scutil_dns() -> String {
         .unwrap_or_else(|e| format!("HARNESS: failed to spawn scutil --dns: {e}"))
 }
 
-/// Every `nameserver[N] : ADDR` line, sorted and deduped — the structural
-/// shape of "which resolvers does this machine use", stable enough to
-/// compare before against after. Same technique as
-/// `tun_engine::dns_steer::privileged_tests::nameservers`.
-fn nameservers(scutil_dns_output: &str) -> Vec<String> {
-    let mut out: Vec<String> = scutil_dns_output
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("nameserver["))
-        .map(str::to_owned)
-        .collect();
-    out.sort();
-    out.dedup();
-    out
+/// What Hole holds right now: a cover, or its split routes through its own TUN. The routes are read
+/// from the kernel's lookup and attributed to Hole by the `utun` carrying `TUN_SUBNET`'s address.
+fn held_state(state_dir: &Path) -> Option<String> {
+    held_covers(state_dir).or_else(split_routes_held)
 }
 
-/// Whether `iface` currently holds `addr`, per `ifconfig <iface>`.
-fn utun_holds_address(iface: &str, addr: &str) -> bool {
-    let Ok(output) = Command::new("ifconfig").arg(iface).output() else {
-        return false;
+/// A split route that cannot be read counts as held, with the cause: left-behind routes starve the
+/// control, so reading "nothing held" off a failed read would wait out a defect as a network loss.
+fn split_routes_held() -> Option<String> {
+    [SPLIT_LOW_PROBE, SPLIT_HIGH_PROBE].into_iter().find_map(|dest| {
+        split_route_held(dest)
+            .unwrap_or_else(|why| Some(format!("the split route covering {dest} could not be read: {why}")))
+    })
+}
+
+fn split_route_held(dest: &str) -> Result<Option<String>, String> {
+    let tun_addr = TUN_SUBNET.split('/').next().expect("TUN_SUBNET has an address part");
+    let Some(iface) = route_lookup(dest)? else {
+        return Ok(None);
     };
-    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-        // `ifconfig` prints e.g. "\tinet 10.255.0.1 netmask 0xffffff00 ..."
+    if !iface.starts_with("utun") || !utun_address_held(&iface, tun_addr)? {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "the split route covering {dest}, through Hole's TUN {iface}"
+    )))
+}
+
+/// Whether `iface` currently holds `addr`, per `ifconfig <iface>`; `Err` when `ifconfig` could not answer.
+fn utun_address_held(iface: &str, addr: &str) -> Result<bool, String> {
+    let output = Command::new("ifconfig")
+        .arg(iface)
+        .output()
+        .map_err(|e| format!("ifconfig {iface} could not be spawned: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ifconfig {iface} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        // `ifconfig` prints e.g. "	inet 10.255.0.1 netmask 0xffffff00 ..."
         let mut fields = line.split_whitespace();
         fields.next() == Some("inet") && fields.next() == Some(addr)
-    })
+    }))
+}
+
+/// [`utun_address_held`] for a caller with no way to continue without the answer.
+fn utun_holds_address(iface: &str, addr: &str) -> bool {
+    utun_address_held(iface, addr).unwrap_or_else(|why| panic!("HARNESS: {why}"))
 }
 
 /// Every interface name `ifconfig -l` currently lists, in the order given.
@@ -270,14 +211,32 @@ const SPLIT_HIGH_PROBE: &str = "200.1.2.3";
 /// (typically the default), which the caller asserts differs from the TUN
 /// interface.
 fn route_get_interface(dest: &str) -> Option<String> {
+    route_lookup(dest).unwrap_or_else(|why| panic!("HARNESS: {why}"))
+}
+
+/// [`route_get_interface`], with `Err` when `route(8)` could not answer. It exits 0 for a present and an
+/// absent destination alike, so presence is its stdout's `interface:` line and absence its stderr's
+/// `not in table` (as `tun_engine`'s own `prefix_route` reads it); anything else is no answer.
+fn route_lookup(dest: &str) -> Result<Option<String>, String> {
     let output = Command::new("route")
         .args(["-n", "get", dest])
         .output()
-        .unwrap_or_else(|e| panic!("HARNESS: failed to spawn route -n get {dest}: {e}"));
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
+        .map_err(|e| format!("route -n get {dest} could not be spawned: {e}"))?;
+    if let Some(iface) = String::from_utf8_lossy(&output.stdout)
+        .lines()
         .find_map(|l| l.trim().strip_prefix("interface: "))
-        .map(str::to_owned)
+    {
+        return Ok(Some(iface.to_owned()));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not in table") {
+        return Ok(None);
+    }
+    Err(format!(
+        "route -n get {dest} reported neither an interface nor a confirmed absence (exit {}): {}",
+        output.status,
+        stderr.trim()
+    ))
 }
 
 // Config ==============================================================================================================
@@ -316,8 +275,12 @@ fn e2e_macos_full_tunnel_installs_the_os_state_it_claims(
 
 async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     let before_ifaces = ifconfig_list();
-    let before_dns = scutil_dns();
-    let before_nameservers = nameservers(&before_dns);
+    // The harness's state directory does not exist yet; the oracle reads the OS (the live pf ruleset),
+    // so a directory of its own names nothing.
+    let early_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
+    let (before_dns, before_nameservers) = resolver_set("macos full tunnel: the resolver set before", &|| {
+        held_state(early_dir.path())
+    });
     println!("[macos_full_tunnel] before ifconfig -l: {before_ifaces:?}");
     println!("[macos_full_tunnel] before scutil --dns:\n{before_dns}");
 
@@ -336,23 +299,31 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     let configured_servers: Vec<String> = config.dns.servers.iter().map(ToString::to_string).collect();
 
     let mut harness = DistHarness::spawn(dist).await.expect("HARNESS: spawn DistHarness");
+    let state_dir = harness.state_dir.path().to_path_buf();
+    let held = || held_state(&state_dir);
 
     // Register for configd's change post BEFORE the mutating call, so the
     // settle below cannot miss the post it causes.
     let start_notify = DnsConfigNotify::register().expect("register for configd's dns_configuration notification");
 
-    let resp = harness
-        .send(BridgeRequest::Start {
-            config,
-            attempt_id: "macos-full-tunnel-os-state-e2e".into(),
-            on_startup: Some(hole_common::config::StartupBehavior::default()),
-        })
-        .await
-        .expect("send Start");
-    assert!(
-        matches!(resp, BridgeResponse::Ack),
-        "expected Ack from Start, got {resp:?}"
-    );
+    // A Full-mode Start needs the default route and an upstream, so it fails when the runner loses its
+    // network.
+    egress::rerun_uncovered("macos full tunnel: Start", NETWORK_CONTROL, &held, async || {
+        let resp = harness
+            .send(BridgeRequest::Start {
+                config: config.clone(),
+                attempt_id: "macos-full-tunnel-os-state-e2e".into(),
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
+            })
+            .await
+            .expect("send Start");
+        match resp {
+            BridgeResponse::Ack => Ok(()),
+            other => Err(format!("expected Ack from Start, got {other:?}")),
+        }
+    })
+    .await
+    .unwrap_or_else(|why| panic!("{why}"));
 
     // (a) a live utun the OS did not have before.
     let after_start_ifaces = ifconfig_list();
@@ -462,8 +433,7 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     );
 
     let unmerged = stop_notify.settle(budget(30), &configured_servers[0], false);
-    let dns_after_stop = scutil_dns();
-    let after_nameservers = nameservers(&dns_after_stop);
+    let (dns_after_stop, after_nameservers) = resolver_set("macos full tunnel: the resolver set after Stop", &held);
     println!(
         "[macos_full_tunnel] configd's DNS configuration no longer lists the configured resolver: {unmerged}\n{dns_after_stop}"
     );

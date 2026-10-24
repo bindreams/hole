@@ -86,6 +86,9 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use tun::AbstractDevice;
 
+use hole_test_observability::egress::{rerun_until_network_holds_async, InCover};
+
+use super::cover_oracle::held_covers;
 use super::{engage_lockdown, SystemLuidResolver};
 use crate::test_utils::{classify, classify_send, EscapeGuard, OwnedRoute, RecordSpec};
 use crate::{GLOBAL_NET_STATE, TUN};
@@ -639,31 +642,53 @@ fn run_live_tun_permit_core(
         );
 
         // Phase 2 — positive: engage naming device 1 (the one carrying the route).
-        let cover = engage_lockdown(server_ip(), dev1.tun_name(), &resolver, &[], guard.state_dir(), None)
-            .expect("engage real standing lockdown cover naming device 1");
+        //
+        // The cover blocks every control host, so the block probe is bracketed by the server permit
+        // (permit, block, permit) in ONE engage, before anything is sent; a failure drops the cover and
+        // is judged outside it, leaving no nonce or SYN of the failed attempt for the next to capture.
+        let server = format!("{SERVER_IP}:443");
+        let held = || held_covers(guard.state_dir());
+        let (send2, seen2_udp, permit_seen, tcp2, seen2_tcp, permit_seen_tcp) = rerun_until_network_holds_async(
+            "live-tun-permit phase 2",
+            &server,
+            &[NON_PERMITTED],
+            &held,
+            async || {
+                // Released when this closure returns, so on every exit and before the judge probes outside it.
+                let _cover = engage_lockdown(server_ip(), dev1.tun_name(), &resolver, &[], guard.state_dir(), None)
+                    .expect("engage real standing lockdown cover naming device 1");
 
-        let send2 = send_udp_probe(2);
-        let mut seen2_udp = Vec::new();
-        let permit_seen = dev1.capture(Duration::from_secs(5), &mut seen2_udp, udp_matches(2)).await;
+                InCover::new(&server, "with the cover engaged, the server IP must stay reachable")
+                    .blocked(
+                        NON_PERMITTED,
+                        "with the cover engaged, the block must hold (if it is inert nothing else means anything)",
+                    )
+                    .run()?;
 
-        let tcp2 = TcpStream::connect_timeout(
-            &SocketAddr::from((PROBE_TCP_IP, TCP_PROBE_PORT_PHASE2)),
-            Duration::from_secs(1),
-        );
-        let mut seen2_tcp = Vec::new();
-        let permit_seen_tcp = dev1
-            .capture(
-                Duration::from_secs(5),
-                &mut seen2_tcp,
-                tcp_syn_matches(PROBE_TCP_IP, TCP_PROBE_PORT_PHASE2),
-            )
-            .await;
+                let send2 = send_udp_probe(2);
+                let mut seen2_udp = Vec::new();
+                let permit_seen = dev1
+                    .capture(Duration::from_secs(5), &mut seen2_udp, udp_matches(2))
+                    .await;
 
-        let cover_blocking = TcpStream::connect_timeout(&NON_PERMITTED.parse().unwrap(), Duration::from_secs(5)).is_err();
-        let server_permit_ok =
-            TcpStream::connect_timeout(&format!("{SERVER_IP}:443").parse().unwrap(), Duration::from_secs(5)).is_ok();
+                let tcp2 = TcpStream::connect_timeout(
+                    &SocketAddr::from((PROBE_TCP_IP, TCP_PROBE_PORT_PHASE2)),
+                    Duration::from_secs(1),
+                );
+                let mut seen2_tcp = Vec::new();
+                let permit_seen_tcp = dev1
+                    .capture(
+                        Duration::from_secs(5),
+                        &mut seen2_tcp,
+                        tcp_syn_matches(PROBE_TCP_IP, TCP_PROBE_PORT_PHASE2),
+                    )
+                    .await;
 
-        drop(cover);
+                Ok((send2, seen2_udp, permit_seen, tcp2, seen2_tcp, permit_seen_tcp))
+            },
+        )
+        .await
+        .unwrap_or_else(|why| panic!("{why}"));
 
         // Assert only after the cover is released, in the mandated order.
         // The harness gate asks ONLY whether each probe reached the network
@@ -683,15 +708,6 @@ fn run_live_tun_permit_core(
             send2_fate.is_verdict() && tcp2_fate.is_verdict(),
             "HARNESS: a phase-2 probe never reached the network stack (send2={send2_fate:?}, tcp2={tcp2_fate:?}) \
              — this says nothing about the cover, fix the harness first",
-        );
-        assert!(
-            cover_blocking,
-            "with the cover engaged, {NON_PERMITTED} must be blocked (if the block is inert nothing else means anything)"
-        );
-        assert!(
-            server_permit_ok,
-            "with the cover engaged, the server IP ({SERVER_IP}:443) must stay reachable — distinguishes a \
-             broken cover from a general network outage"
         );
         assert!(
             permit_seen && permit_seen_tcp,
@@ -753,10 +769,15 @@ fn run_live_tun_permit_core(
         send_udp_probe(5).expect("HARNESS: restore probe (nonce 5) failed to leave the process");
         let mut seen4 = Vec::new();
         let restored = dev1.capture(Duration::from_secs(5), &mut seen4, udp_matches(5)).await;
-        assert!(restored, "restore: probe must surface with no cover engaged; seen={seen4:?}");
         assert!(
-            TcpStream::connect_timeout(&NON_PERMITTED.parse().unwrap(), Duration::from_secs(5)).is_ok(),
-            "restore: {NON_PERMITTED} must be reachable again — the box was left open"
+            restored,
+            "restore: probe must surface with no cover engaged; seen={seen4:?}"
+        );
+        hole_test_observability::egress::assert_egress_restored(
+            "restore: the box must be left open",
+            &[NON_PERMITTED],
+            &server,
+            &|| held_covers(guard.state_dir()),
         );
 
         platform_pin(guard.state_dir());
