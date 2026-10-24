@@ -48,6 +48,18 @@ impl RoutingError {
             RoutingError::SupersededByRelease => self.to_string(),
         }
     }
+
+    /// Whether this error means the user's release ended the engage, so the
+    /// start that made it is cancelled: never run uncovered, never retried with
+    /// another engage. One exhaustive match, so a new variant must choose.
+    pub fn cancels_the_start(&self) -> bool {
+        match self {
+            RoutingError::Gateway(_) => false,
+            RoutingError::RouteSetup(_) => false,
+            RoutingError::StateUnreadable { .. } => false,
+            RoutingError::SupersededByRelease => true,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

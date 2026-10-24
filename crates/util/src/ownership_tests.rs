@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-use crate::ownership::{chown_if_some, chown_path};
+use crate::ownership::{chown_if_some, chown_path, owner_of};
 use skuld::temp_dir;
 use std::os::unix::fs::MetadataExt;
 
@@ -38,4 +38,16 @@ fn chown_if_some_none_is_noop(#[fixture(temp_dir)] dir: &std::path::Path) {
     let before = std::fs::metadata(&f).unwrap().uid();
     chown_if_some(&f, None);
     assert_eq!(std::fs::metadata(&f).unwrap().uid(), before);
+}
+
+#[skuld::test]
+fn owner_of_reports_the_owner_of_a_file(#[fixture(temp_dir)] dir: &std::path::Path) {
+    let f = dir.join("f");
+    std::fs::write(&f, b"x").unwrap();
+    assert_eq!(owner_of(&f), Some(me()));
+}
+
+#[skuld::test]
+fn owner_of_a_missing_path_is_none(#[fixture(temp_dir)] dir: &std::path::Path) {
+    assert_eq!(owner_of(&dir.join("missing")), None);
 }

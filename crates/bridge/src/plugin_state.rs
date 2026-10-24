@@ -6,8 +6,8 @@
 //! pattern. `plugin_recovery` owns the reap and is the only component allowed
 //! to remove records from the file.
 //!
-//! Every read-modify-write of the file runs under [`LOCK`], an in-process leaf
-//! lock. Appends come from plugin spawns on tokio workers (a sink from an
+//! Every read-modify-write of the file, and every [`load`], runs under [`LOCK`],
+//! an in-process leaf lock. Appends come from plugin spawns on tokio workers (a sink from an
 //! aborted attempt can outlive the attempt), the reap from the stop path; an
 //! unordered load/modify/save would lose a record or resurrect a reaped one.
 //!
@@ -69,23 +69,57 @@ fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
 }
 
+// Ownership ===========================================================================================================
+
+/// The file ownership a rewrite reads and sets, split out so a test can see
+/// what a rewrite asked for on a host where it cannot observe a chown.
+trait Ownership {
+    fn owner_of(&self, path: &Path) -> Option<(u32, u32)>;
+    fn chown(&self, path: &Path, owner: Option<(u32, u32)>);
+}
+
+struct RealOwnership;
+
+impl Ownership for RealOwnership {
+    fn owner_of(&self, path: &Path) -> Option<(u32, u32)> {
+        util::ownership::owner_of(path)
+    }
+
+    fn chown(&self, path: &Path, owner: Option<(u32, u32)>) {
+        util::ownership::chown_if_some(path, owner);
+    }
+}
+
 // I/O =================================================================================================================
 
 /// Write `state` to `<state_dir>/bridge-plugins.json` atomically.
 /// Same atomic-write pattern as `routing::state::write`. Private: a write
 /// outside [`LOCK`] could lose a concurrent append.
 fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+    save_with(state_dir, state, owner, &RealOwnership)
+}
+
+/// [`save`] over an injected [`Ownership`]. The replacement file takes `owner`;
+/// with none requested it takes the owner of the file it replaces, because a
+/// rename-replace otherwise hands a user-owned file to whoever rewrites it.
+fn save_with(
+    state_dir: &Path,
+    state: &PluginState,
+    owner: Option<(u32, u32)>,
+    ownership: &impl Ownership,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
-    util::ownership::chown_if_some(state_dir, owner);
+    ownership.chown(state_dir, owner);
 
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let path = state_file(state_dir);
+    let file_owner = owner.or_else(|| ownership.owner_of(&path));
     let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
     tmp.write_all(&json)?;
     tmp.as_file().sync_all()?;
     tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
+    ownership.chown(&path, file_owner);
     Ok(())
 }
 
@@ -109,7 +143,7 @@ fn append_record_with(
     in_section: impl FnOnce(),
 ) -> std::io::Result<()> {
     let _guard = LOCK.acquire();
-    let loaded = load(state_dir);
+    let loaded = read(state_dir);
     in_section();
     append_loaded(loaded, state_dir, record, owner)
 }
@@ -145,7 +179,23 @@ pub(crate) fn append_loaded(
 /// read" from "recorded but worthless". Logs the schema/JSON detail where it
 /// is detected; a failed read is reported to the caller instead, because the
 /// caller is the one that knows the consequence.
+///
+/// Runs under [`LOCK`]: an append's rename-replace can fail a concurrent read
+/// on Windows, and a failed read keeps the whole file unreaped.
 pub fn load(state_dir: &Path) -> Loaded {
+    load_with(state_dir, || {})
+}
+
+/// [`load`] with a hook that runs inside the critical section, after the read.
+fn load_with(state_dir: &Path, in_section: impl FnOnce()) -> Loaded {
+    let _guard = LOCK.acquire();
+    let loaded = read(state_dir);
+    in_section();
+    loaded
+}
+
+/// The read itself. Callers already inside [`LOCK`] use this, never [`load`].
+fn read(state_dir: &Path) -> Loaded {
     let path = state_file(state_dir);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -180,7 +230,7 @@ pub(crate) fn remove_accounted(
     accounted: &[cosca::identity::ProcessIdRecord],
     owner: Option<(u32, u32)>,
 ) -> std::io::Result<()> {
-    remove_accounted_with(state_dir, accounted, owner, || {})
+    remove_accounted_with(state_dir, accounted, owner, &RealOwnership, || {})
 }
 
 /// [`remove_accounted`] with a hook that runs inside the critical section,
@@ -189,10 +239,11 @@ fn remove_accounted_with(
     state_dir: &Path,
     accounted: &[cosca::identity::ProcessIdRecord],
     owner: Option<(u32, u32)>,
+    ownership: &impl Ownership,
     in_section: impl FnOnce(),
 ) -> std::io::Result<()> {
     let _guard = LOCK.acquire();
-    let loaded = load(state_dir);
+    let loaded = read(state_dir);
     in_section();
     let mut state = match loaded {
         Loaded::State(state) => state,
@@ -207,14 +258,14 @@ fn remove_accounted_with(
     if state.plugins.len() == before {
         return Ok(());
     }
-    save(state_dir, &state, owner)
+    save_with(state_dir, &state, owner, ownership)
 }
 
 /// Delete the state file iff it is still unusable. The caller classified it
 /// earlier; an append may have rewritten it with live records since.
 pub(crate) fn clear_if_unusable(state_dir: &Path) -> std::io::Result<()> {
     let _guard = LOCK.acquire();
-    match load(state_dir) {
+    match read(state_dir) {
         Loaded::Unusable => remove_file(state_dir),
         Loaded::Absent | Loaded::Unreadable(_) | Loaded::State(_) => Ok(()),
     }

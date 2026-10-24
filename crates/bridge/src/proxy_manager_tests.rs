@@ -228,6 +228,10 @@ pub(crate) struct MockRoutingState {
     /// (a set containing both values) for the double-failure fail-open path.
     /// `fail_cover` (always-fail) is unaffected and takes priority.
     fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
+    /// Like `fail_cover_for_resolvers`, but the engage fails with
+    /// `RoutingError::SupersededByRelease` — a release took the cover's record
+    /// while it was being engaged. Checked before `fail_cover_for_resolvers`.
+    supersede_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
     /// `install` excludes any [`RouteId`] in this set from the persisted
     /// `installed` list — simulates a route whose `add` failed (e.g. another
     /// VPN already holds that prefix), analogous to `fail_cover_for_resolvers`.
@@ -266,6 +270,7 @@ impl Default for MockRoutingState {
             last_cover_server_ip: std::sync::Mutex::new(None),
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            supersede_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_teardown_installed: std::sync::Mutex::new(None),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
@@ -452,6 +457,15 @@ impl Routing for MockRouting {
     ) -> Result<MockCover, RoutingError> {
         if self.state.fail_cover.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock cover failure".into()));
+        }
+        if self
+            .state
+            .supersede_cover_for_resolvers
+            .lock()
+            .unwrap()
+            .contains(&resolver_ip)
+        {
+            return Err(RoutingError::SupersededByRelease);
         }
         if self
             .state
@@ -3654,6 +3668,24 @@ mod self_test {
     }
 
     #[skuld::test]
+    fn a_covered_start_whose_cover_is_superseded_by_a_release_is_cancelled() {
+        rt().block_on(async {
+            // An Unblock released the cover this start was engaging: the user asked
+            // to be let out, so the start is cancelled, not run uncovered.
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            st.supersede_cover_for_resolvers.lock().unwrap().insert(None);
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert_eq!(pm.last_error(), None, "a cancelled start records no failure");
+            assert!(!pm.blocked_until_connected());
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[skuld::test]
     fn covered_start_cover_permits_the_doh_resolved_ip_not_the_hostname() {
         rt().block_on(async {
             // The cover must permit the DoH-RESOLVED IP, not the server hostname —
@@ -4272,6 +4304,94 @@ mod self_test {
                 None,
                 "the restored cover permits the OLD value, not the corrected one that failed to engage"
             );
+        });
+    }
+
+    /// Attempt 1 (no plugin, permit `None`) engages and fails at the self-test;
+    /// attempt 2 adds an ECH-capable plugin, so its corrected permit is
+    /// `Some(answering_resolver)`. Returns the manager parked between them.
+    async fn repair_setup() -> (
+        ProxyManager<MockProxy, MockRouting>,
+        ProxyConfig,
+        Arc<MockRoutingState>,
+        IpAddr,
+        tempfile::TempDir,
+    ) {
+        let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = probe_l.local_addr().unwrap();
+        drop(probe_l);
+        let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+        let querier = Arc::new(CountingQuerier {
+            host: "proxy.example".into(),
+            ip: closed.ip(),
+            queries: AtomicU32::new(0),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+        pm.set_bootstrap_querier_for_test(querier);
+        let mut cfg = test_config();
+        cfg.server.server = "proxy.example".into();
+        cfg.server.server_port = closed.port();
+        cfg.server.plugin = None;
+        cfg.dns.enabled = true;
+        cfg.dns.servers = vec![answering_resolver];
+        pm.start_cancellable(&cfg, true, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+        cfg.server.plugin = Some("ex-ray".into());
+        cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+        (pm, cfg, st, answering_resolver, dir)
+    }
+
+    #[skuld::test]
+    fn a_repair_whose_corrected_engage_is_superseded_is_cancelled_without_a_re_engage() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, resolver, _dir) = repair_setup().await;
+            st.supersede_cover_for_resolvers.lock().unwrap().insert(Some(resolver));
+            let earlier_error = pm.last_error().map(str::to_owned);
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert_eq!(
+                pm.last_error().map(str::to_owned),
+                earlier_error,
+                "a cancelled start records no failure of its own"
+            );
+            assert!(
+                !pm.blocked_until_connected(),
+                "the release stands: no cover is re-engaged"
+            );
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "no restore engage after a release"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn a_repair_whose_restore_engage_is_superseded_is_cancelled() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, resolver, _dir) = repair_setup().await;
+            st.fail_cover_for_resolvers.lock().unwrap().insert(Some(resolver));
+            st.supersede_cover_for_resolvers.lock().unwrap().insert(None);
+            let earlier_error = pm.last_error().map(str::to_owned);
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert_eq!(
+                pm.last_error().map(str::to_owned),
+                earlier_error,
+                "a cancelled start records no failure of its own"
+            );
+            assert!(!pm.blocked_until_connected());
         });
     }
 

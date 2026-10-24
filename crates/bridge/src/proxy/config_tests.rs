@@ -439,6 +439,24 @@ fn a_cover_released_while_engaging_cancels_the_start() {
     );
 }
 
+/// `cancels_the_start` (what `start_inner` consults on an engage error whose
+/// text it keeps) and the `From` conversion (what the other call sites use)
+/// must agree.
+#[skuld::test]
+fn cancels_the_start_agrees_with_the_conversion() {
+    let path = std::path::PathBuf::from("bridge-routes.json");
+    let errors = [
+        tun_engine::RoutingError::RouteSetup("x".into()),
+        tun_engine::RoutingError::StateUnreadable { path },
+        tun_engine::RoutingError::SupersededByRelease,
+    ];
+    for e in errors {
+        let cancels = e.cancels_the_start();
+        let converted = ProxyError::from(e);
+        assert_eq!(cancels, matches!(converted, ProxyError::Cancelled), "{converted:?}");
+    }
+}
+
 // Key-material classification -----------------------------------------------------------------------------------------
 //
 // The 2022-blake3 ciphers take the password as base64 key material, so

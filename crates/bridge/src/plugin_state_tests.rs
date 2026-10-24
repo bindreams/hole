@@ -264,7 +264,7 @@ fn remove_accounted_holds_the_plugin_lock_while_rewriting() {
     let dir = tempfile::tempdir().unwrap();
     append_record(dir.path(), synthetic(1, 1), None).unwrap();
     let mut held_inside = false;
-    remove_accounted_with(dir.path(), &[synthetic(1, 1)], None, || {
+    remove_accounted_with(dir.path(), &[synthetic(1, 1)], None, &RealOwnership, || {
         held_inside = lock_is_held();
     })
     .unwrap();
@@ -343,4 +343,125 @@ fn clear_if_unusable_clears_only_an_unusable_file() {
 
     let absent = tempfile::tempdir().unwrap();
     clear_if_unusable(absent.path()).unwrap();
+}
+
+#[skuld::test]
+fn load_holds_the_plugin_lock_while_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut held_inside = false;
+    let _ = load_with(dir.path(), || {
+        held_inside = lock_is_held();
+    });
+    assert!(
+        held_inside,
+        "a read must not interleave with an append's rename-replace"
+    );
+    assert!(!lock_is_held(), "the lock is released on return");
+}
+
+// Rewrite ownership ===================================================================================================
+
+type Owner = Option<(u32, u32)>;
+
+/// Answers `existing` for the state file's owner and records every chown, plus
+/// the file's bytes at the moment its owner was read.
+struct Recording {
+    existing: Option<(u32, u32)>,
+    chowns: std::cell::RefCell<Vec<(std::path::PathBuf, Owner)>>,
+    bytes_when_read: std::cell::RefCell<Option<Vec<u8>>>,
+}
+
+impl Recording {
+    fn new(existing: Option<(u32, u32)>) -> Self {
+        Self {
+            existing,
+            chowns: Default::default(),
+            bytes_when_read: Default::default(),
+        }
+    }
+
+    fn state_file_chowns(&self, dir: &std::path::Path) -> Vec<Option<(u32, u32)>> {
+        let file = dir.join(STATE_FILE_NAME);
+        self.chowns
+            .borrow()
+            .iter()
+            .filter(|(p, _)| *p == file)
+            .map(|(_, o)| *o)
+            .collect()
+    }
+}
+
+impl Ownership for Recording {
+    fn owner_of(&self, path: &std::path::Path) -> Option<(u32, u32)> {
+        *self.bytes_when_read.borrow_mut() = std::fs::read(path).ok();
+        self.existing
+    }
+
+    fn chown(&self, path: &std::path::Path, owner: Option<(u32, u32)>) {
+        self.chowns.borrow_mut().push((path.to_path_buf(), owner));
+    }
+}
+
+fn two_records(dir: &std::path::Path) -> (ProcessIdRecord, ProcessIdRecord) {
+    let (r1, r2) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir, r1.clone(), None).unwrap();
+    append_record(dir, r2.clone(), None).unwrap();
+    (r1, r2)
+}
+
+#[skuld::test]
+fn a_rewrite_without_a_requested_owner_keeps_the_files_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let rec = Recording::new(Some((501, 20)));
+    remove_accounted_with(dir.path(), &[r1], None, &rec, || {}).unwrap();
+    assert_eq!(rec.state_file_chowns(dir.path()), vec![Some((501, 20))]);
+}
+
+#[skuld::test]
+fn the_files_owner_is_read_before_the_rewrite_replaces_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let before = std::fs::read(dir.path().join(STATE_FILE_NAME)).unwrap();
+    let rec = Recording::new(Some((501, 20)));
+    remove_accounted_with(dir.path(), &[r1], None, &rec, || {}).unwrap();
+    assert_eq!(rec.bytes_when_read.borrow().as_deref(), Some(before.as_slice()));
+}
+
+#[skuld::test]
+fn a_requested_owner_wins_over_the_files_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let rec = Recording::new(Some((501, 20)));
+    remove_accounted_with(dir.path(), &[r1], Some((7, 8)), &rec, || {}).unwrap();
+    assert_eq!(rec.state_file_chowns(dir.path()), vec![Some((7, 8))]);
+}
+
+#[skuld::test]
+fn a_file_with_no_known_owner_and_no_request_is_not_chowned_to_anyone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let rec = Recording::new(None);
+    remove_accounted_with(dir.path(), &[r1], None, &rec, || {}).unwrap();
+    assert_eq!(rec.state_file_chowns(dir.path()), vec![None]);
+}
+
+#[skuld::test]
+fn only_the_requested_owner_reaches_the_state_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let rec = Recording::new(Some((501, 20)));
+    remove_accounted_with(dir.path(), &[r1], None, &rec, || {}).unwrap();
+    let dir_chowns: Vec<_> = rec
+        .chowns
+        .borrow()
+        .iter()
+        .filter(|(p, _)| p == dir.path())
+        .map(|(_, o)| *o)
+        .collect();
+    assert_eq!(
+        dir_chowns,
+        vec![None],
+        "the directory is not handed to the file's owner"
+    );
 }

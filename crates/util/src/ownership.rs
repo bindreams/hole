@@ -28,6 +28,21 @@ pub fn chown_path(_path: &Path, _uid: u32, _gid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The `(uid, gid)` that owns `path` itself (a symlink is not followed, matching
+/// [`chown_path`]); `None` where ownership is not managed, or if `path` cannot
+/// be examined.
+#[cfg(target_os = "macos")]
+pub fn owner_of(path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some((m.uid(), m.gid()))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn owner_of(_path: &Path) -> Option<(u32, u32)> {
+    None
+}
+
 /// Best-effort `chown` when an owner is set; a failure is logged and swallowed.
 pub fn chown_if_some(path: &Path, owner: Option<(u32, u32)>) {
     if let Some((uid, gid)) = owner {

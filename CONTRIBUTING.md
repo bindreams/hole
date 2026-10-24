@@ -2087,8 +2087,8 @@ service's own state dir. Its records are not the release's to take:
 `scripts/network-reset.py`, the out-of-band escape for a host with no working
 bridge, reads `bridge-routes.json` and `bridge-dns{,.superseded}.json` out of
 `service_state_dir()` to undo a leaked bypass route or a rewritten adapter's
-DNS, and `bridge-plugins.json` may be deleted only by something that has
-accounted for every plugin in it. An uninstall is the moment those become the
+DNS, and `bridge-plugins.json` may lose a record only to something that has
+accounted for that plugin. An uninstall is the moment those become the
 *only* escape — deleting them there would leave the leak on the host with the
 record of how to undo it destroyed by the uninstall itself, which is #1003's own
 end state one layer down. Nor is the directory itself the release's:
@@ -2389,15 +2389,18 @@ write is therefore ordered by something that is not that mutex:
   `Armed` to `Armed` is invisible to a value comparison. A dropped disarm is an
   over-report, and the next sweep makes it.
 - `bridge-plugins.json`: append, `remove_accounted` and `clear_if_unusable` run
-  under one lock, kills outside it. A reap removes only the records it accounted
-  for; the file goes when none remain.
+  under one lock, kills outside it, and so does the reap's first read (a
+  concurrent rename-replace can fail a read on Windows). A reap removes only the
+  records it accounted for; the file goes when none remain. A rewrite keeps the
+  owner of the file it replaces unless the caller names one.
 - macOS `bridge-failclosed.json` and `bridge-lockdown-pf.json`: a `pfctl` call
   cannot run under a lock, so these are optimistic. An engage reads the record at
   entry, writes with `swap` (a compare against that view), and checks `holds`
   after its ruleset loads; a release clears with `clear_if_token`, only the record
   it acted on. A lost compare or a failed check is
   `RoutingError::SupersededByRelease`: the engage drops what it took, restores the
-  host, and the start reports cancelled.
+  host, and the start reports cancelled. That holds for the transient cover too:
+  the start is cancelled, not run uncovered and not retried with another engage.
 
 The leaf rule: while one of these locks is held nothing else is acquired, and no
 `.await`, firewall, `pfctl` or process call runs. That is what lets Unblock take
