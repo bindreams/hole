@@ -336,6 +336,23 @@ impl Drop for MacosGatewayRoute {
 
 // The session-level test ==============================================================================================
 
+/// What a release that did not take looks like, read off the bridge before the escape guard sweeps:
+/// a step that did not Ack, or a cover still held after all of them.
+fn release_defect(
+    steps: &[(&str, &Result<BridgeResponse, impl std::fmt::Debug>)],
+    held: Option<String>,
+) -> Option<String> {
+    let mut problems: Vec<String> = steps
+        .iter()
+        .filter(|(_, resp)| !matches!(resp, Ok(BridgeResponse::Ack)))
+        .map(|(step, resp)| format!("{step} did not Ack: {resp:?}"))
+        .collect();
+    if let Some(held) = held {
+        problems.push(format!("Hole still holds {held}"));
+    }
+    (!problems.is_empty()).then(|| format!("phase B ended without the release taking: {}", problems.join("; ")))
+}
+
 async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // Every step below that needs a route off the box is judged against this control host, outside any
     // cover: a runner network loss is waited out, a leftover cover or a step that fails with the network
@@ -383,12 +400,8 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // provably cannot manufacture, so this is the baseline phase B is judged
     // against, not merely a smoke test.
     //
-    // A Full-mode Start installs routes through the default gateway, so it fails with no default route. No
-    // cover blocks the control in this phase, so it is probed on both sides of the Start.
-    loop {
-        let window = hole_test_observability::egress::Window::open("live-tun-permit phase A", &control, &[], &held)
-            .unwrap_or_else(|why| panic!("HARNESS: {why}"));
-        let control_before = hole_test_observability::egress::probe(&control).is_ok();
+    // A Full-mode Start installs routes through the default gateway, so it fails with no default route.
+    hole_test_observability::egress::rerun_uncovered("live-tun-permit phase A", &control, &held, async || {
         let resp = harness
             .send(BridgeRequest::Start {
                 config: config.clone(),
@@ -397,18 +410,13 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
             })
             .await
             .expect("HARNESS: send Start (phase A)");
-        if matches!(resp, BridgeResponse::Ack) {
-            break;
+        match resp {
+            BridgeResponse::Ack => Ok(()),
+            other => Err(format!("HARNESS/CONTROL FAILED: phase A Start did not Ack: {other:?}")),
         }
-        let control_after = hole_test_observability::egress::probe(&control).is_ok();
-        let failure = Failure::uncovered(
-            format!("HARNESS/CONTROL FAILED: phase A Start did not Ack: {resp:?}"),
-            &[control_before, control_after],
-        );
-        if let Err(why) = window.judge(failure) {
-            panic!("{why}");
-        }
-    }
+    })
+    .await
+    .unwrap_or_else(|why| panic!("{why}"));
 
     let control_outcome = probe_tunnel();
     assert_eq!(
@@ -440,131 +448,127 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     );
 
     // Phase B reruns if the runner's network dropped mid-run: a lockdown cover blocks every control host, so
-    // each run is bracketed by a `Window` and judged only after the cover is released. The cover permits
-    // only the session's own server, a loopback fixture here, so nothing off the box can vouch for the
-    // network inside it (`Failure::Unvouched`). Residual: an outage that starts and ends inside a run
-    // reads as a defect.
-    let (cover_presence, tun_outcome, no_leak, permitted_reachable, path_to_no_leak) = loop {
-        let window = hole_test_observability::egress::Window::open("live-tun-permit phase B", &control, &[], &held)
-            .unwrap_or_else(|why| panic!("HARNESS: {why}"));
-        // Recovery record + escape guard BEFORE anything is armed — written once
-        // the harness's state directory exists, well before the SetLockdown{true}
-        // call below. From here on the function is unwind-safe even though Phase
-        // B additionally defers its own asserts.
-        //
-        // The guard must be dropped (or still be alive) only while `harness` —
-        // and its `TempDir` — has not yet been removed; a directory already
-        // deleted would make `release_all` read a clean host over a possibly-live
-        // cover, a manufactured lockout. Declaring it after `harness` and
-        // dropping it explicitly before `harness` goes out of scope satisfies
-        // that. It is a second, redundant layer under the "no assertion while
-        // covered" discipline below, not a substitute for it: deferring every
-        // assert until after release means the guard's unwind path is normally
-        // never exercised at all.
-        let guard = EscapeGuard::over(&RECORD, harness.state_dir.path());
-        // Phase B — cover ON. From here until the explicit `drop(guard)` below,
-        // NO assertion/expect/unwrap that could plausibly fail runs: every
-        // outcome — including a failed arm, a failed Start, or a failed IPC call
-        // — is folded into a local `Option`/`bool` and judged only after release.
-        let arm = harness.send(BridgeRequest::SetLockdown { enabled: true }).await;
-        let armed = matches!(arm, Ok(BridgeResponse::Ack));
+    // each run is judged only after the cover is released. The cover permits only a loopback fixture, so
+    // nothing inside it can vouch for the network (`Failure::Unvouched`).
+    let (cover_presence, tun_outcome, no_leak, permitted_reachable, path_to_no_leak) =
+        hole_test_observability::egress::rerun_until_network_holds_async(
+            "live-tun-permit phase B",
+            &control,
+            &[],
+            &held,
+            async || {
+                // Recovery record + escape guard BEFORE anything is armed — written once
+                // the harness's state directory exists, well before the SetLockdown{true}
+                // call below. From here on the function is unwind-safe even though Phase
+                // B additionally defers its own asserts.
+                //
+                // The guard must be dropped (or still be alive) only while `harness` —
+                // and its `TempDir` — has not yet been removed; a directory already
+                // deleted would make `release_all` read a clean host over a possibly-live
+                // cover, a manufactured lockout. Dropping it explicitly below, inside
+                // this closure, satisfies that. It is a second, redundant layer under the
+                // "no assertion while covered" discipline below, not a substitute for it:
+                // deferring every assert until after release means the guard's unwind path
+                // is normally never exercised at all.
+                let guard = EscapeGuard::over(&RECORD, harness.state_dir.path());
+                // Phase B — cover ON. From here until the explicit `drop(guard)` below,
+                // NO assertion/expect/unwrap that could plausibly fail runs: every
+                // outcome — including a failed arm, a failed Start, or a failed IPC call
+                // — is folded into a local `Option`/`bool` and judged only after release.
+                let arm = harness.send(BridgeRequest::SetLockdown { enabled: true }).await;
+                let armed = matches!(arm, Ok(BridgeResponse::Ack));
 
-        let start_b = harness
-            .send(BridgeRequest::Start {
-                config: config.clone(),
-                attempt_id: "live-tun-permit-e2e-b".into(),
-                on_startup: Some(hole_common::config::StartupBehavior::default()),
-            })
-            .await;
-        let start_b_acked = matches!(start_b, Ok(BridgeResponse::Ack));
+                let start_b = harness
+                    .send(BridgeRequest::Start {
+                        config: config.clone(),
+                        attempt_id: "live-tun-permit-e2e-b".into(),
+                        on_startup: Some(hole_common::config::StartupBehavior::default()),
+                    })
+                    .await;
+                let start_b_acked = matches!(start_b, Ok(BridgeResponse::Ack));
 
-        let cover_presence = if start_b_acked {
-            match harness.send(BridgeRequest::Status).await {
-                Ok(BridgeResponse::Status { cover_presence, .. }) => Some(cover_presence),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let tun_outcome = start_b_acked.then(probe_tunnel);
-        // The no-leak probe and its two same-instant cross-checks. Taken here,
-        // together, because a `cover_blocking` read on its own is vacuous: a
-        // transient blip on the way to the no-leak target also reads as
-        // "blocked", and the test would then PASS over a leaking kill switch.
-        // `tun_outcome` cannot serve as the cross-check — it targets a TEST-NET
-        // host smoltcp answers locally, so it says nothing about the real path.
-        //
-        // - `no_leak` classifies rather than collapsing to `is_err()`, so a
-        //   vanished route (`NeverLeft`) is a harness failure, not a block.
-        // - `permitted_reachable` connects to the one destination the cover must
-        //   NOT block, the session's own server IP: a cover that blocks
-        //   everything, or a dead stack, fails here too.
-        // - `path_to_no_leak` asks the kernel whether the bypass route still
-        //   wins for the no-leak target, so an interface that went down during
-        //   the window is named rather than mistaken for the cover working.
-        let no_leak = start_b_acked.then(|| connect(no_leak_target_addr()));
-        let permitted_reachable = start_b_acked.then(|| connect(ss.addr));
-        let path_to_no_leak = start_b_acked.then(|| bypass.winner_for(no_leak_target_ip()));
+                let cover_presence = if start_b_acked {
+                    match harness.send(BridgeRequest::Status).await {
+                        Ok(BridgeResponse::Status { cover_presence, .. }) => Some(cover_presence),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let tun_outcome = start_b_acked.then(probe_tunnel);
+                // The no-leak probe and its two same-instant cross-checks. Taken here,
+                // together, because a `cover_blocking` read on its own is vacuous: a
+                // transient blip on the way to the no-leak target also reads as
+                // "blocked", and the test would then PASS over a leaking kill switch.
+                // `tun_outcome` cannot serve as the cross-check — it targets a TEST-NET
+                // host smoltcp answers locally, so it says nothing about the real path.
+                //
+                // - `no_leak` classifies rather than collapsing to `is_err()`, so a
+                //   vanished route (`NeverLeft`) is a harness failure, not a block.
+                // - `permitted_reachable` connects to the one destination the cover must
+                //   NOT block, the session's own server IP: a cover that blocks
+                //   everything, or a dead stack, fails here too.
+                // - `path_to_no_leak` asks the kernel whether the bypass route still
+                //   wins for the no-leak target, so an interface that went down during
+                //   the window is named rather than mistaken for the cover working.
+                let no_leak = start_b_acked.then(|| connect(no_leak_target_addr()));
+                let permitted_reachable = start_b_acked.then(|| connect(ss.addr));
+                let path_to_no_leak = start_b_acked.then(|| bypass.winner_for(no_leak_target_ip()));
 
-        // Release, THEN assert. A release that did not Ack is logged; the guard below is the backstop, and
-        // the oracle read after it is the verdict on whether the cover is gone.
-        let stop = harness.send(BridgeRequest::Stop).await;
-        let unlock = harness.send(BridgeRequest::SetLockdown { enabled: false }).await;
-        for (step, resp) in [("Stop", &stop), ("SetLockdown(false)", &unlock)] {
-            if !matches!(resp, Ok(BridgeResponse::Ack)) {
-                tracing::warn!("live-tun-permit phase B: {step} did not Ack: {resp:?}");
-            }
-        }
-        // Explicit drop (not scope-end): must run while `harness` — and its
-        // TempDir — is still alive. `harness`'s own Drop (later, at function
-        // end) kills the child if it hasn't already exited; a killed bridge
-        // leaves the cover engaged by design, which is exactly what this guard
-        // is the escape from.
-        drop(guard);
-        assert_eq!(
-            held(),
-            None,
-            "phase B ended with Hole still holding a cover: the release did not take"
-        );
+                // Release, THEN assert. The bridge's release is read BEFORE the guard below sweeps: the
+                // sweep removes every cover in the state directory and would hide a release that did not
+                // take.
+                let stop = harness.send(BridgeRequest::Stop).await;
+                let unlock = harness.send(BridgeRequest::SetLockdown { enabled: false }).await;
+                let release_defect = release_defect(&[("Stop", &stop), ("SetLockdown(false)", &unlock)], held());
+                // Explicit drop (not scope-end): must run while `harness` — and its
+                // TempDir — is still alive. `harness`'s own Drop (later, at function
+                // end) kills the child if it hasn't already exited; a killed bridge
+                // leaves the cover engaged by design, which is exactly what this guard
+                // is the escape from.
+                drop(guard);
+                if let Some(why) = release_defect {
+                    return Err(Failure::Defect(why));
+                }
 
-        // A refused arm or Start counts like a failed probe: Start needs the default route (see phase A),
-        // and an outage that begins mid-iteration is what the window brackets.
-        let failed_step = if !armed {
-            Some(format!(
-                "SetLockdown(true) did not Ack, so the kill switch was never armed and nothing below is a verdict \
-                 about a cover: {arm:?}"
-            ))
-        } else if !start_b_acked {
-            Some(format!(
-                "phase B Start did not Ack (with the kill switch armed): {start_b:?}"
-            ))
-        } else if !no_leak.is_some_and(|fate| fate.is_verdict())
-            || !matches!(&path_to_no_leak, Some(Ok(iface)) if iface == bypass.interface())
-            || permitted_reachable != Some(ProbeFate::Delivered)
-        {
-            Some(format!(
-                "the probes of phase B never reached the stack: no_leak={no_leak:?}, \
-                 path_to_no_leak={path_to_no_leak:?} (expected the bypass interface '{}'), \
-                 permitted_reachable={permitted_reachable:?}",
-                bypass.interface()
-            ))
-        } else {
-            None
-        };
-        if let Some(why) = failed_step {
-            if let Err(why) = window.judge(Failure::Unvouched(why)) {
-                panic!("HARNESS: {why}");
-            }
-            continue;
-        }
-        break (
-            cover_presence,
-            tun_outcome,
-            no_leak,
-            permitted_reachable,
-            path_to_no_leak,
-        );
-    };
+                // A refused arm or Start counts like a failed probe: Start needs the default route (see phase A),
+                // and an outage that begins mid-iteration is what the window brackets.
+                let failed_step = if !armed {
+                    Some(format!(
+                        "SetLockdown(true) did not Ack, so the kill switch was never armed and nothing below is a verdict \
+                         about a cover: {arm:?}"
+                    ))
+                } else if !start_b_acked {
+                    Some(format!(
+                        "phase B Start did not Ack (with the kill switch armed): {start_b:?}"
+                    ))
+                } else if !no_leak.is_some_and(|fate| fate.is_verdict())
+                    || !matches!(&path_to_no_leak, Some(Ok(iface)) if iface == bypass.interface())
+                    || permitted_reachable != Some(ProbeFate::Delivered)
+                {
+                    Some(format!(
+                        "the probes of phase B never reached the stack: no_leak={no_leak:?}, \
+                         path_to_no_leak={path_to_no_leak:?} (expected the bypass interface '{}'), \
+                         permitted_reachable={permitted_reachable:?}",
+                        bypass.interface()
+                    ))
+                } else {
+                    None
+                };
+                if let Some(why) = failed_step {
+                    return Err(Failure::Unvouched(why));
+                }
+                Ok((
+                    cover_presence,
+                    tun_outcome,
+                    no_leak,
+                    permitted_reachable,
+                    path_to_no_leak,
+                ))
+            },
+        )
+        .await
+        .unwrap_or_else(|why| panic!("HARNESS: {why}"));
 
     assert_eq!(
         permitted_reachable,

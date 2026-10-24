@@ -3001,7 +3001,7 @@ and a rerun repeats the platform's whole job.
   the test waits for the network, uncapped. A probe made while a cover is engaged
   cannot use a control host, so the scenario vouches for the network from inside
   the cover: it probes a host the cover permits before and after each probe whose
-  result it reports (`egress::InCover`), and `egress::Window` judges the readings
+  result it reports (`egress::InCover`), and the egress window judges the readings
   after the teardown. A scenario hands the window the hosts it claims the cover
   blocks, and every run (a rerun's too) opens only once they answer outside any
   cover, so a block is never read off a host that is down on its own. A failure is a defect only when the permit answered on both

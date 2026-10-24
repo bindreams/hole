@@ -1,4 +1,4 @@
-//! What a scenario that probes while a cover is engaged reports to the [`Window`](super::Window).
+//! What a scenario that probes while a cover is engaged reports to the judge.
 //!
 //! A cover blocks every host but its own permits, so nothing outside it can be probed from inside. The
 //! scenario vouches for the network itself: it probes a host the cover permits immediately before and

@@ -401,6 +401,151 @@ fn a_scenario_that_left_a_cover_behind_is_a_defect_even_with_the_network_down() 
     assert!(err.contains("the transient cover"), "{err}");
 }
 
+// The async entry points ==============================================================================================
+
+/// Run a future that never pends on the scripted host.
+fn ready<F: std::future::Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(out) => out,
+        std::task::Poll::Pending => panic!("the scripted run pended"),
+    }
+}
+
+fn async_scenario_result<T>(
+    net: &Net,
+    hole: HoleState<'_>,
+    scenario: impl AsyncFnMut() -> Result<T, Failure>,
+) -> Result<T, String> {
+    ready(rerun_until_network_holds_async_on(
+        &mut { net },
+        "t",
+        CONTROL,
+        &[],
+        hole,
+        scenario,
+    ))
+}
+
+fn uncovered_result<T>(
+    net: &Net,
+    hole: HoleState<'_>,
+    step: impl AsyncFnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    ready(rerun_uncovered_on(&mut { net }, "t", CONTROL, hole, step))
+}
+
+#[skuld::test]
+fn an_async_scenario_that_failed_while_the_network_was_down_is_rerun_until_it_holds() {
+    let net = Net::new(1..6, &[]);
+    let runs = Cell::new(0);
+    let out = async_scenario_result(&net, &clean, async || {
+        runs.set(runs.get() + 1);
+        if net.step() {
+            Ok("held")
+        } else {
+            Err(failed("the permit probe failed"))
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(runs.get(), 2);
+}
+
+#[skuld::test]
+fn an_async_scenario_that_fails_with_the_control_answering_on_both_sides_is_not_rerun() {
+    let net = Net::new(0..0, &[]);
+    let runs = Cell::new(0);
+    let err = async_scenario_result(&net, &clean, async || -> Result<(), Failure> {
+        runs.set(runs.get() + 1);
+        Err(failed("the permit probe failed"))
+    })
+    .unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("answer outside the cover"), "{err}");
+    assert_eq!(runs.get(), 1);
+}
+
+#[skuld::test]
+fn an_async_scenario_that_left_a_cover_behind_is_a_defect_even_with_the_network_down() {
+    let cover = Cell::new(false);
+    let net = Net::new(1..u32::MAX, &[]);
+    let err = async_scenario_result(
+        &net,
+        &|| cover.get().then(|| "the transient cover".to_string()),
+        async || -> Result<(), Failure> {
+            cover.set(true);
+            Err(failed("the permit probe failed"))
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("the transient cover"), "{err}");
+}
+
+#[skuld::test]
+fn an_uncovered_step_is_bracketed_by_the_control_and_returned_when_it_holds() {
+    let net = Net::new(0..0, &[]);
+    let out = uncovered_result(&net, &clean, async || {
+        // The control was probed once at open and once just before the step.
+        assert_eq!(net.probes_of(CONTROL), 2);
+        Ok::<_, String>("held")
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(net.probes_of(CONTROL), 2, "a step that holds is not probed after");
+}
+
+#[skuld::test]
+fn an_uncovered_step_that_failed_during_an_outage_is_rerun_after_it() {
+    // Open answers (tick 0); the outage then covers the before-probe and the after-probe.
+    let net = Net::new(1..5, &[]);
+    let runs = Cell::new(0);
+    let out = uncovered_result(&net, &clean, async || {
+        runs.set(runs.get() + 1);
+        if runs.get() == 1 {
+            Err("Start did not Ack".to_string())
+        } else {
+            Ok("held")
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(runs.get(), 2);
+}
+
+#[skuld::test]
+fn an_uncovered_step_that_failed_after_the_control_went_down_during_it_is_rerun() {
+    // The control answers at open and before the step (ticks 0, 1) and is down only after it (tick 2..4).
+    let net = Net::new(2..4, &[]);
+    let runs = Cell::new(0);
+    let out = uncovered_result(&net, &clean, async || {
+        runs.set(runs.get() + 1);
+        if runs.get() == 1 {
+            Err("Start did not Ack".to_string())
+        } else {
+            Ok("held")
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(runs.get(), 2);
+}
+
+#[skuld::test]
+fn an_uncovered_step_that_failed_with_the_control_answering_around_it_is_a_defect() {
+    let net = Net::new(0..0, &[]);
+    let runs = Cell::new(0);
+    let err = uncovered_result(&net, &clean, async || -> Result<(), String> {
+        runs.set(runs.get() + 1);
+        Err("Start did not Ack".to_string())
+    })
+    .unwrap_err();
+    assert!(err.contains("Start did not Ack"), "{err}");
+    assert_eq!(runs.get(), 1);
+}
+
 // Window ==============================================================================================================
 
 fn open<'a>(net: &Net, hole: HoleState<'a>) -> Result<Window<'a>, String> {

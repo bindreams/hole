@@ -15,32 +15,22 @@
 //! * **A control host** the lifted cover never blocks. It tells a lost network
 //!   from a target that is unreachable for another reason, and it is probed on
 //!   both sides of whatever it vouches for.
-//! * **A [`Window`]** around a scenario that probes while a cover is engaged. A
+//! * **A `Window`** around a scenario that probes while a cover is engaged. A
 //!   cover blocks every host but its own permits, so the control cannot be probed
 //!   inside it: the scenario probes a host the cover permits, before and after
 //!   each probe whose result it reports ([`InCover`]), and hands the readings to
-//!   the judge as a [`Failure`]. Every run opens only once the hosts it claims the cover
-//!   blocks answer outside any cover, a rerun's included. A failure is a defect only when the permit
-//!   answered on both sides and the failing targets, probed outside the cover
-//!   after teardown, answer there with the control answering around them. A
-//!   scenario that reads a capture of the NIC probes the permit over TCP on both
-//!   sides of its markers the same way ([`Failure::captured`]).
-//!   A rerun needs a probe outside any cover to have failed: a reading missing
-//!   inside a cover, whether within one engage or across reloads, is judged by
-//!   the control around the teardown, down being a rerun and answering a defect.
+//!   the judge as a [`Failure`]. Every run opens only once the hosts it claims the
+//!   cover blocks answer outside any cover, a rerun's included. A scenario that
+//!   reads a capture of the NIC probes the permit over TCP on both sides of its
+//!   markers the same way ([`Failure::captured`]).
 //!
 //! A reading of runner state is vouched for by the control around it: a read
 //! that fails, or is not bracketed by an answering control, is taken again; a
 //! read that fails with the control answering on both sides is a defect
 //! ([`read_with_network_up`]).
 //!
-//! What no probe can rule out is an outage that falls entirely between two
-//! adjacent probes of one engage: a probe cannot show the network up at an
-//! instant. A cover that blocks its own permit looks the same as an outage over
-//! every in-cover probe, so that case is a defect, and so is an outage that
-//! covers some in-cover reading and has ended by the teardown probe: it cannot be
-//! told from a permit that breaks only sometimes, and rerunning that would be an
-//! uncapped wait on no external event.
+//! The residuals (an outage between two adjacent probes of one engage, or over an in-cover reading and
+//! gone by the teardown probe) read as defects; see [`InCover`].
 //!
 //! No wait here has a cap: each round re-probes the real condition, the CI job's
 //! wall clock is the only bound, and every change of state is logged.
@@ -146,7 +136,7 @@ pub fn read_with_network_up<T, E: std::fmt::Display>(
 /// return its value.
 ///
 /// A scenario that fails reports a [`Failure`] AFTER dropping its cover, built from the readings it
-/// took inside the cover ([`InCover`]); each run is bracketed by a [`Window`]. `blocked` lists every
+/// took inside the cover ([`InCover`]); each run is bracketed by a `Window`. `blocked` lists every
 /// host the scenario claims the cover blocks.
 pub fn rerun_until_network_holds<T>(
     what: &str,
@@ -158,11 +148,38 @@ pub fn rerun_until_network_holds<T>(
     rerun_until_network_holds_on(&mut System, what, control, blocked, hole_state, scenario)
 }
 
+/// [`rerun_until_network_holds`] for a scenario that awaits (an IPC call to the bridge, a capture of a
+/// TUN device); the closure may borrow what it needs mutably across runs.
+pub async fn rerun_until_network_holds_async<T>(
+    what: &str,
+    control: &str,
+    blocked: &[&str],
+    hole_state: HoleState<'_>,
+    scenario: impl AsyncFnMut() -> Result<T, Failure>,
+) -> Result<T, String> {
+    rerun_until_network_holds_async_on(&mut System, what, control, blocked, hole_state, scenario).await
+}
+
+/// Run `step` until it holds, for a step that needs the network while Hole holds no block at all (a
+/// Full-mode Start needs the default route and an upstream). `Err(why)` is a step that failed.
+///
+/// `control` is probed on both sides of the step and the failure is judged as [`Failure::uncovered`]:
+/// a step that fails with `control` answering on both sides is a defect, otherwise it is run again
+/// once `control` answers. Each run is bracketed by a `Window`.
+pub async fn rerun_uncovered<T>(
+    what: &str,
+    control: &str,
+    hole_state: HoleState<'_>,
+    step: impl AsyncFnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    rerun_uncovered_on(&mut System, what, control, hole_state, step).await
+}
+
 /// The control probes that bracket one run of a scenario that probes while a cover is engaged.
 ///
-/// [`Window::open`] waits (uncapped) until `control` and every `blocked` host answer and Hole holds
+/// [`open_window_on`] waits (uncapped) until `control` and every `blocked` host answer and Hole holds
 /// nothing: a block verdict is only evidence if the host would have answered without the cover. After the
-/// scenario tore its cover down, [`Window::judge`] decides what a [`Failure`] was:
+/// scenario tore its cover down, [`judge_on`] decides what a [`Failure`] was:
 ///
 /// * Hole holds a cover: the scenario left one behind, a defect;
 /// * [`Failure::Defect`]: a defect;
@@ -172,34 +189,11 @@ pub fn rerun_until_network_holds<T>(
 ///   targets are probed outside the cover. `control` failing means the network is down: wait, run
 ///   again. A target failing while `control` answers means the target is down outside any cover: wait
 ///   for it, run again. Both answering is a defect.
-///
-/// For a caller whose scenario cannot be a sync closure (it awaits); the rest use
-/// [`rerun_until_network_holds`].
-pub struct Window<'a> {
+pub(crate) struct Window<'a> {
     what: &'a str,
     control: &'a str,
     hole_state: HoleState<'a>,
     opened: Instant,
-}
-
-impl<'a> Window<'a> {
-    /// Wait until `control` and every host in `blocked` (the ones the scenario claims its cover blocks)
-    /// answer and `hole_state` reports nothing, then open the window. `Err` when Hole holds a cover
-    /// before the run: waiting would never end it, and the run would start dirty.
-    pub fn open(
-        what: &'a str,
-        control: &'a str,
-        blocked: &[&str],
-        hole_state: HoleState<'a>,
-    ) -> Result<Window<'a>, String> {
-        open_window_on(&mut System, what, control, blocked, hole_state)
-    }
-
-    /// The verdict on one failed run, after its cover is torn down: `Ok(())` is to run the scenario
-    /// again, `Err` is a defect.
-    pub fn judge(self, failure: Failure) -> Result<(), String> {
-        judge_on(&mut System, self, failure)
-    }
 }
 
 /// Open a TCP connection to `addr` once the network answers, and return it. For a precondition that
@@ -374,6 +368,43 @@ pub(crate) fn rerun_until_network_holds_on<T>(
         match scenario() {
             Ok(value) => return Ok(value),
             Err(failure) => judge_on(host, window, failure)?,
+        }
+    }
+}
+
+pub(crate) async fn rerun_until_network_holds_async_on<T>(
+    host: &mut impl Host,
+    what: &str,
+    control: &str,
+    blocked: &[&str],
+    hole_state: HoleState<'_>,
+    mut scenario: impl AsyncFnMut() -> Result<T, Failure>,
+) -> Result<T, String> {
+    loop {
+        let window = open_window_on(host, what, control, blocked, hole_state)?;
+        match scenario().await {
+            Ok(value) => return Ok(value),
+            Err(failure) => judge_on(host, window, failure)?,
+        }
+    }
+}
+
+pub(crate) async fn rerun_uncovered_on<T>(
+    host: &mut impl Host,
+    what: &str,
+    control: &str,
+    hole_state: HoleState<'_>,
+    mut step: impl AsyncFnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    loop {
+        let window = open_window_on(host, what, control, &[], hole_state)?;
+        let before = host.probe(control).is_ok();
+        match step().await {
+            Ok(value) => return Ok(value),
+            Err(why) => {
+                let after = host.probe(control).is_ok();
+                judge_on(host, window, Failure::uncovered(why, &[before, after]))?;
+            }
         }
     }
 }
