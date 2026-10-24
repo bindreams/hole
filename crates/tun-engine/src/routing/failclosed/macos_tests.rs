@@ -2003,7 +2003,7 @@ fn self_capture_persists_no_baseline_but_keeps_the_nat_rules() {
     .expect("the persist must succeed");
 
     assert_eq!(
-        returned, nat,
+        returned.nat_snapshot, nat,
         "the nat snapshot must reach the ruleset builder unchanged"
     );
     let st = lockdown_state::load(tmp.path()).expect("state must be persisted");

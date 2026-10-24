@@ -2401,6 +2401,9 @@ write is therefore ordered by something that is not that mutex:
   `RoutingError::SupersededByRelease`: the engage drops what it took, restores the
   host, and the start reports cancelled. That holds for the transient cover too:
   the start is cancelled, not run uncovered and not retried with another engage.
+  A standing engage whose check fails after its load restores the baseline it
+  holds in memory, not the record on disk (the release removed that), and drops
+  no token (the release took it).
 
 The leaf rule: while one of these locks is held nothing else is acquired, and no
 `.await`, firewall, `pfctl` or process call runs. That is what lets Unblock take

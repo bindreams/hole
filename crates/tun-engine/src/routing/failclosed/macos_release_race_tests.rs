@@ -15,6 +15,13 @@ use std::path::Path;
 /// A step to run at an interleaving point, given the state dir.
 type Hook<'a> = Box<dyn FnOnce(&Path) + 'a>;
 
+/// A ruleset change an engage or a release made to pf, in order.
+#[derive(Debug, PartialEq, Eq)]
+enum PfAction {
+    Load(String),
+    ReloadDefault,
+}
+
 const OLD: &str = "100";
 const MINE: &str = "424242";
 
@@ -52,6 +59,7 @@ fn record_exists(dir: &Path, file: &str) -> bool {
 struct ReleasePf<'a> {
     dir: &'a Path,
     dropped: Vec<String>,
+    actions: Vec<PfAction>,
     on_reload: Option<Hook<'a>>,
 }
 
@@ -60,6 +68,7 @@ impl<'a> ReleasePf<'a> {
         Self {
             dir,
             dropped: Vec::new(),
+            actions: Vec::new(),
             on_reload: None,
         }
     }
@@ -67,13 +76,15 @@ impl<'a> ReleasePf<'a> {
 
 impl PfOps for ReleasePf<'_> {
     fn reload_default(&mut self) -> Result<(), RoutingError> {
+        self.actions.push(PfAction::ReloadDefault);
         if let Some(hook) = self.on_reload.take() {
             hook(self.dir);
         }
         Ok(())
     }
 
-    fn load_ruleset(&mut self, _text: &str) -> Result<(), RoutingError> {
+    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
+        self.actions.push(PfAction::Load(text.to_owned()));
         if let Some(hook) = self.on_reload.take() {
             hook(self.dir);
         }
@@ -332,6 +343,8 @@ struct StandingEngage<'a> {
     pf_enabled: bool,
     log: Vec<&'static str>,
     dropped: Vec<String>,
+    /// What the engage did to pf, including the restore a disengage ran.
+    actions: Vec<PfAction>,
     after: Option<(&'static str, Hook<'a>)>,
 }
 
@@ -345,6 +358,7 @@ impl<'a> StandingEngage<'a> {
             pf_enabled,
             log: Vec::new(),
             dropped: Vec::new(),
+            actions: Vec::new(),
             after: None,
         }
     }
@@ -364,7 +378,8 @@ impl<'a> StandingEngage<'a> {
 }
 
 impl CoverRulesetOps for StandingEngage<'_> {
-    fn load_ruleset(&mut self, _text: &str) -> Result<(), RoutingError> {
+    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
+        self.actions.push(PfAction::Load(text.to_owned()));
         self.step("load_ruleset");
         Ok(())
     }
@@ -396,7 +411,7 @@ impl LockdownEngageOps for StandingEngage<'_> {
         &mut self,
         token: &str,
         expected: &StateFile<lockdown_state::LockdownPfState>,
-    ) -> Result<String, RoutingError> {
+    ) -> Result<lockdown_state::LockdownPfState, RoutingError> {
         // The production persist, fed a clean-host capture instead of `pfctl -sr`.
         let persisted = persist_baseline(
             token,
@@ -435,6 +450,18 @@ impl LockdownEngageOps for StandingEngage<'_> {
 
     fn disengage(&mut self) {
         self.log.push("disengage");
+        // The production restore, over the record as it reads now.
+        let dir = self.real.state_dir;
+        let mut pf = ReleasePf::new(dir);
+        disengage_lockdown_with(CoverPresence::Live, lockdown_state::load_presence(dir), &mut pf)
+            .expect("the restore succeeds");
+        self.dropped.extend(pf.dropped);
+        self.actions.extend(pf.actions);
+    }
+
+    fn reload_default(&mut self) -> Result<(), RoutingError> {
+        self.actions.push(PfAction::ReloadDefault);
+        Ok(())
     }
 }
 
@@ -524,8 +551,8 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_when_the_token_is_reus
     assert_eq!(*released.borrow(), vec![OLD.to_string()]);
     assert_eq!(
         ops.log,
-        vec!["pf_enabled", "read_record", "load_ruleset", "holds", "disengage"],
-        "no new refcount is taken, and the block-all just loaded is undone"
+        vec!["pf_enabled", "read_record", "load_ruleset", "holds", "load_ruleset"],
+        "no new refcount is taken, and the block-all just loaded is replaced by the restore"
     );
     assert!(ops.dropped.is_empty());
 }
@@ -541,10 +568,142 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_on_a_fresh_engage() {
 
     assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
     assert_eq!(*released.borrow(), vec![MINE.to_string()]);
-    assert_eq!(ops.log.last(), Some(&"disengage"), "{:?}", ops.log);
+    assert_eq!(
+        ops.log.last(),
+        Some(&"load_ruleset"),
+        "the restore follows the commit check: {:?}",
+        ops.log
+    );
+    assert!(!ops.log.contains(&"disengage"), "{:?}", ops.log);
     assert!(
         ops.dropped.is_empty(),
         "the release dropped the token with the record; the engage must not drop it again"
     );
     assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
+}
+
+// The back-out restores the engage's own baseline =====================================================================
+
+/// A host baseline unlike `/etc/pf.conf`, so a restore from it cannot be mistaken for the default.
+const HOST_FILTER: &str = "pass in quick on lo0 all label \"host-policy\"\n";
+const HOST_NAT: &str = "nat on en0 from 10.0.0.0/8 to any -> (en0)\n";
+
+fn host_baseline_record(token: &str, captured: bool) -> lockdown_state::LockdownPfState {
+    lockdown_state::LockdownPfState {
+        version: lockdown_state::SCHEMA_VERSION,
+        pf_token: token.into(),
+        main_snapshot: if captured { HOST_FILTER.into() } else { String::new() },
+        nat_snapshot: HOST_NAT.into(),
+        main_snapshot_captured: captured,
+    }
+}
+
+/// The last ruleset change the engage made, which is the back-out when the commit check failed.
+fn restored_ruleset(ops: &StandingEngage<'_>) -> String {
+    match ops.actions.last() {
+        Some(PfAction::Load(text)) => text.clone(),
+        other => panic!("expected the engage to end by loading a ruleset, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn a_release_after_the_load_leaves_the_reused_baseline_restored_not_the_default_ruleset() {
+    // `ReuseToken`: the baseline is the persisted record's. The release restores
+    // it and clears the record; the engage's back-out must not reload the default
+    // because the record it would read is gone.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &host_baseline_record(OLD, true));
+    let mut ops = StandingEngage::new(dir.path(), true).after("load_ruleset", |d| {
+        release(d);
+    });
+
+    engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the release removed the record");
+
+    assert!(
+        !ops.actions.contains(&PfAction::ReloadDefault),
+        "the default ruleset replaced the host's baseline: {:?}",
+        ops.actions
+    );
+    let restored = restored_ruleset(&ops);
+    assert!(
+        restored.contains(HOST_FILTER) && restored.contains(HOST_NAT),
+        "{restored}"
+    );
+}
+
+#[skuld::test]
+fn a_release_after_the_load_leaves_the_reenabled_baseline_restored_not_the_default_ruleset() {
+    // `Reenable`: pf was reset, so the record is re-persisted under a fresh token
+    // and the engage's baseline is the old record's.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &host_baseline_record(OLD, true));
+    let mut ops = StandingEngage::new(dir.path(), false).after("load_ruleset", |d| {
+        release(d);
+    });
+
+    engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the release removed the record");
+
+    assert!(!ops.actions.contains(&PfAction::ReloadDefault), "{:?}", ops.actions);
+    let restored = restored_ruleset(&ops);
+    assert!(
+        restored.contains(HOST_FILTER) && restored.contains(HOST_NAT),
+        "{restored}"
+    );
+}
+
+#[skuld::test]
+fn a_release_after_a_fresh_engages_load_leaves_its_captured_baseline_restored() {
+    // `FreshEnable`: the baseline is what this engage captured and persisted.
+    let dir = tempfile::tempdir().unwrap();
+    let mut ops = StandingEngage::new(dir.path(), false).after("load_ruleset", |d| {
+        release(d);
+    });
+
+    engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the release removed the record");
+
+    assert!(!ops.actions.contains(&PfAction::ReloadDefault), "{:?}", ops.actions);
+    let restored = restored_ruleset(&ops);
+    assert!(
+        restored.contains("scrub-anchor \"com.apple/*\" all fragment reassemble")
+            && restored.contains("nat-anchor \"com.apple/*\" all"),
+        "{restored}"
+    );
+}
+
+#[skuld::test]
+fn a_release_after_the_load_reloads_the_default_when_the_engage_held_no_captured_baseline() {
+    // A baseline the engage never captured has `/etc/pf.conf` as its restore
+    // target: that is the baseline, not a fallback.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &host_baseline_record(OLD, false));
+    let mut ops = StandingEngage::new(dir.path(), true).after("load_ruleset", |d| {
+        release(d);
+    });
+
+    engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the release removed the record");
+
+    assert_eq!(ops.actions.last(), Some(&PfAction::ReloadDefault), "{:?}", ops.actions);
+}
+
+#[skuld::test]
+fn a_back_out_leaves_a_record_that_is_not_the_engages_alone() {
+    // Another record now stands in the release's place. It is not this engage's
+    // to drop the token of or to clear, but the host still gets the engage's own
+    // baseline rather than the other record's.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &host_baseline_record(OLD, true));
+    let mut ops = StandingEngage::new(dir.path(), true).after("load_ruleset", |d| {
+        release(d);
+        lockdown_state::seed(d, &standing_record("newer"));
+    });
+
+    engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the record is no longer this engage's");
+
+    assert_eq!(
+        lockdown_state::load(dir.path()).map(|r| r.pf_token),
+        Some("newer".to_string())
+    );
+    assert!(ops.dropped.is_empty(), "{:?}", ops.dropped);
+    let restored = restored_ruleset(&ops);
+    assert!(restored.contains(HOST_FILTER), "{restored}");
 }

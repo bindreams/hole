@@ -336,6 +336,14 @@ pub fn build_lockdown_restore_ruleset(nat_snapshot: &str, main_snapshot: &str) -
     )
 }
 
+/// The ruleset that restores the host to `st`'s baseline, or `None` when it has
+/// no captured baseline and `/etc/pf.conf` is the restore target — see
+/// `LockdownPfState::main_snapshot_captured`.
+fn baseline_restore_ruleset(st: &lockdown_state::LockdownPfState) -> Option<String> {
+    st.main_snapshot_captured
+        .then(|| build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot))
+}
+
 /// Parse the enable token from `pfctl -E` output (it prints `Token : <n>`).
 pub fn parse_enable_token(output: &str) -> Option<String> {
     output
@@ -892,7 +900,7 @@ fn capture_and_persist(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
     expected: &StateFile<lockdown_state::LockdownPfState>,
-) -> Result<String, RoutingError> {
+) -> Result<lockdown_state::LockdownPfState, RoutingError> {
     let presence = lockdown_cover_presence(state_dir);
     let main_snapshot = pfctl_stdout(pfctl(&["-sr"], None, FatalPhase::CoverEngage), "pfctl -sr")?;
     let nat_snapshot = pfctl_stdout(pfctl(&["-sn"], None, FatalPhase::CoverEngage), "pfctl -sn")?;
@@ -901,14 +909,14 @@ fn capture_and_persist(
 
 /// Persist the engage-time baseline. Pure over its inputs — the snapshots and
 /// the measured `presence` come from the caller — so the self-capture guard is
-/// table-tested without touching pf. Returns the nat snapshot for the engage
-/// ruleset.
+/// table-tested without touching pf. Returns the record it wrote: the engage
+/// takes its ruleset's nat rules from it and keeps it as the baseline to restore.
 ///
 /// When `presence` is [`CoverPresence::Live`](crate::routing::CoverPresence::Live)
 /// this does exactly three things differently: it persists `main_snapshot`
 /// empty, it persists `main_snapshot_captured: false`, and it warns. It
-/// persists `nat_snapshot` exactly as `pfctl -sn` returned it and returns that
-/// same value — those are the HOST's translation rules, carried forward
+/// persists `nat_snapshot` exactly as `pfctl -sn` returned it and returns it in
+/// the record — those are the HOST's translation rules, carried forward
 /// verbatim into the ruleset engage loads, so zeroing them would flush a live
 /// host NAT the moment the cover engages, with nothing on disk to restore from.
 ///
@@ -924,7 +932,7 @@ fn persist_baseline(
     presence: crate::routing::CoverPresence,
     main_snapshot: String,
     nat_snapshot: String,
-) -> Result<String, RoutingError> {
+) -> Result<lockdown_state::LockdownPfState, RoutingError> {
     let captured = presence != crate::routing::CoverPresence::Live;
     if !captured {
         tracing::warn!(
@@ -932,19 +940,15 @@ fn persist_baseline(
              recording no baseline (a restore will reload /etc/pf.conf)"
         );
     }
-    swap_lockdown_record(
-        state_dir,
-        expected,
-        &lockdown_state::LockdownPfState {
-            version: lockdown_state::SCHEMA_VERSION,
-            pf_token: token.to_owned(),
-            main_snapshot: if captured { main_snapshot } else { String::new() },
-            nat_snapshot: nat_snapshot.clone(),
-            main_snapshot_captured: captured,
-        },
-        owner,
-    )?;
-    Ok(nat_snapshot)
+    let record = lockdown_state::LockdownPfState {
+        version: lockdown_state::SCHEMA_VERSION,
+        pf_token: token.to_owned(),
+        main_snapshot: if captured { main_snapshot } else { String::new() },
+        nat_snapshot,
+        main_snapshot_captured: captured,
+    };
+    swap_lockdown_record(state_dir, expected, &record, owner)?;
+    Ok(record)
 }
 
 /// [`lockdown_state::swap`], with its two failures as the [`RoutingError`]s an
@@ -1008,13 +1012,13 @@ pub(crate) trait LockdownEngageOps: CoverRulesetOps {
     /// `pfctl -E` (refcounted enable) + capture the enable token.
     fn enable_capture_token(&mut self) -> Result<String, RoutingError>;
     /// Snapshot the host's filter and translation rules and persist them with
-    /// `token`, as a compare-and-set against `expected`. Returns the nat
-    /// snapshot for the engage ruleset.
+    /// `token`, as a compare-and-set against `expected`. Returns the record
+    /// written: the engage's baseline.
     fn capture_and_persist(
         &mut self,
         token: &str,
         expected: &StateFile<lockdown_state::LockdownPfState>,
-    ) -> Result<String, RoutingError>;
+    ) -> Result<lockdown_state::LockdownPfState, RoutingError>;
     /// Persist `fresh` (the same baseline under a fresh token) as a
     /// compare-and-set against `expected`.
     fn persist(
@@ -1027,14 +1031,36 @@ pub(crate) trait LockdownEngageOps: CoverRulesetOps {
     /// Whether the record still names `token` ([`lockdown_state::holds`]): the
     /// commit check after the ruleset loads.
     fn holds(&mut self, token: &str) -> bool;
-    /// [`lockdown_disengage`]: restore the host and clear what this engage holds.
+    /// [`lockdown_disengage`]: restore the host from the record on disk and
+    /// clear what this engage holds. Only for an engage whose record is still
+    /// its own; once a release removed it there is nothing on disk to read.
     fn disengage(&mut self);
+    /// `pfctl -f /etc/pf.conf`.
+    fn reload_default(&mut self) -> Result<(), RoutingError>;
 }
 
 /// Drop the refcount an engage took when the engage itself is backing out.
 fn unwind_refcount(ops: &mut dyn LockdownEngageOps, token: &str, message: &str) {
     if let Err(e) = ops.drop_token(token) {
         tracing::warn!(error = %util::error_chain::error_chain(&e), "{message}");
+    }
+}
+
+/// Put the host back to `baseline`, the baseline this engage itself holds, for
+/// an engage whose record a release removed. The release restored the host and
+/// took the record and its token with it, so nothing on disk names the
+/// baseline any more and nothing here drops a refcount. Best-effort: the engage
+/// is failing with [`RoutingError::SupersededByRelease`] either way.
+fn restore_held_baseline(ops: &mut dyn LockdownEngageOps, baseline: &lockdown_state::LockdownPfState) {
+    let restored = match baseline_restore_ruleset(baseline) {
+        Some(ruleset) => ops.load_ruleset(&ruleset),
+        None => ops.reload_default(),
+    };
+    if let Err(e) = restored {
+        tracing::warn!(
+            error = %util::error_chain::error_chain(&e),
+            "restoring the host baseline failed backing out a superseded lockdown engage"
+        );
     }
 }
 
@@ -1046,7 +1072,9 @@ fn unwind_refcount(ops: &mut dyn LockdownEngageOps, token: &str, message: &str) 
 /// as it read at entry, and the final ruleset load is followed by a commit check
 /// that the record still names this engage's token. Either failing is
 /// [`RoutingError::SupersededByRelease`]: the engage backs out whatever it took
-/// and leaves the host as the release left it.
+/// and leaves the host as the release left it. After the load that means
+/// restoring the baseline the engage holds in memory, because the release
+/// removed the record a disk-driven restore would read.
 fn engage_lockdown_with(
     server_ip: IpAddr,
     tun_name: &str,
@@ -1064,13 +1092,13 @@ fn engage_lockdown_with(
         StateFile::Absent | StateFile::Unusable { .. } => None,
     };
 
-    let (token, nat_snapshot) = match (engage_pf_action(pf_enabled, persisted.is_some()), persisted) {
+    let (token, baseline) = match (engage_pf_action(pf_enabled, persisted.is_some()), persisted) {
         // Live Adopt re-engage within one boot: pf still enabled and we hold the
         // token+snapshot. Reuse both so the real host policy is preserved for the
         // eventual restore. ReuseToken assumes our refcount is still live (the
         // reboot case is `Reenable`); do not double `-E`. It writes nothing, so
         // the commit check below is its only protection against a release.
-        (PfEngageAction::ReuseToken, Some(st)) => (st.pf_token.clone(), st.nat_snapshot.clone()),
+        (PfEngageAction::ReuseToken, Some(st)) => (st.pf_token.clone(), st.clone()),
         // Persisted state survived but pf was disabled (reboot reset pf and its
         // refcount). Enable afresh and re-persist the SAME host snapshot under the
         // fresh token — never re-snapshot the live lockdown ruleset. The single
@@ -1091,7 +1119,7 @@ fn engage_lockdown_with(
                 unwind_refcount(ops, &token, "pfctl -X failed unwinding a failed lockdown re-enable");
                 return Err(e);
             }
-            (token, st.nat_snapshot.clone())
+            (token, fresh)
         }
         // First engage: enable + snapshot the host.
         (PfEngageAction::FreshEnable, _) => {
@@ -1100,7 +1128,7 @@ fn engage_lockdown_with(
             // `-E` on any error before propagating — else the refcount leaks with
             // no state file to recover it from.
             match ops.capture_and_persist(&token, &entry) {
-                Ok(nat_snapshot) => (token, nat_snapshot),
+                Ok(baseline) => (token, baseline),
                 Err(e) => {
                     unwind_refcount(ops, &token, "pfctl -X failed unwinding a failed lockdown engage");
                     return Err(e);
@@ -1112,7 +1140,7 @@ fn engage_lockdown_with(
         }
     };
 
-    let main = build_lockdown_main_ruleset(tun_name, server_ip, &nat_snapshot);
+    let main = build_lockdown_main_ruleset(tun_name, server_ip, &baseline.nat_snapshot);
     // Through the shared loader, so this path's "no state purge" is
     // [`purges_state`]'s decision rather than the absence of a call here.
     if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, ops) {
@@ -1124,13 +1152,15 @@ fn engage_lockdown_with(
 
     // Commit check: the ruleset is live. If the record no longer names this
     // engage's token, a release removed or replaced it while this engage ran —
-    // and restored the host, which the load above then re-blocked. Back out.
+    // and restored the host, which the load above then re-blocked. Back out to
+    // the baseline held here: the record on disk is gone or is not this
+    // engage's, so neither it nor its token is this engage's to restore or drop.
     if !ops.holds(&token) {
         tracing::warn!(
             "a release removed the standing cover's record while it was being engaged; backing the \
              engage out"
         );
-        ops.disengage();
+        restore_held_baseline(ops, &baseline);
         return Err(RoutingError::SupersededByRelease);
     }
 
@@ -1207,11 +1237,13 @@ fn disengage_lockdown_with(
     // pf's label alone) means there is no snapshot to restore from, so
     // `/etc/pf.conf` IS the restore target — see
     // `LockdownPfState::main_snapshot_captured`.
-    match &st {
-        StateFile::Present(st) if st.main_snapshot_captured => {
-            ops.load_ruleset(&build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot))?
-        }
-        _ => ops.reload_default()?,
+    let restore = match &st {
+        StateFile::Present(st) => baseline_restore_ruleset(st),
+        _ => None,
+    };
+    match restore {
+        Some(ruleset) => ops.load_ruleset(&ruleset)?,
+        None => ops.reload_default()?,
     }
 
     // Only release a pf refcount token we actually hold on record — but an
@@ -1651,7 +1683,7 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
         &mut self,
         token: &str,
         expected: &StateFile<lockdown_state::LockdownPfState>,
-    ) -> Result<String, RoutingError> {
+    ) -> Result<lockdown_state::LockdownPfState, RoutingError> {
         capture_and_persist(token, self.state_dir, self.owner, expected)
     }
 
@@ -1673,6 +1705,13 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
 
     fn disengage(&mut self) {
         lockdown_disengage(self.state_dir);
+    }
+
+    fn reload_default(&mut self) -> Result<(), RoutingError> {
+        pfctl_status(
+            pfctl(&["-f", PFCONF], None, FatalPhase::CoverEngage),
+            "pf default-ruleset reload",
+        )
     }
 }
 
