@@ -448,6 +448,19 @@ fn an_engage_in_another_state_dir_does_not_veto_a_sweeps_disarm() {
 }
 
 #[skuld::test]
+fn an_engage_in_another_state_dir_before_the_sweep_does_not_veto_its_disarm() {
+    // The snapshot's epoch is this `state_dir`'s own, not a count over all of them.
+    let (a, b) = (dir(), dir());
+    super::record_armed(b.path(), None);
+    super::record_armed(a.path(), None);
+
+    let c = sweep(a.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
+
+    assert!(c.is_proven());
+    assert_eq!(super::load(a.path()), ArmingWitness::Disarmed);
+}
+
+#[skuld::test]
 fn a_disarm_dropped_for_a_concurrent_engage_is_made_by_the_next_sweep() {
     // The cost of the veto is one over-report, not a record that can never
     // clear: the next sweep snapshots the moved epoch and disarms normally.
