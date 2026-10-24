@@ -899,7 +899,10 @@ leaves working DNS + broken routes, not the inverse):
   `plugin_recovery::reap_recorded_plugins` kills survivors by exact identity —
   no tolerance window — and deletes the file only after accounting for every
   record it named. The same reap runs at bridge start, at chain stop, and in the
-  test harness's teardown.
+  test harness's teardown. At bridge start it runs before the boot reconcile
+  (`boot::recover_then_reconcile`: route recovery, reap, reconcile): the reap
+  kills every recorded plugin, so running it after would kill the auto-connect's
+  own. IPC is not served until the boot returns.
 - **`bridge-dns.json`** — read-only now. The bridge stopped writing this file
   (DNS confinement is process-scoped WFP state, not a file — see
   [DNS forwarder](#dns-forwarder)); what's left is the evidence-gated upgrade
