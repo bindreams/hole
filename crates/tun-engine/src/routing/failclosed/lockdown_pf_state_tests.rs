@@ -57,9 +57,9 @@ fn clear_removes_file_and_tolerates_absence() {
     let tmp = tempfile::tempdir().unwrap();
     save(tmp.path(), &sample(), None).unwrap();
     assert!(tmp.path().join(STATE_FILE_NAME).exists());
-    clear(tmp.path()).unwrap();
+    remove_file(tmp.path()).unwrap();
     assert!(!tmp.path().join(STATE_FILE_NAME).exists());
-    clear(tmp.path()).unwrap(); // second clear is a no-op, not an error
+    remove_file(tmp.path()).unwrap(); // second clear is a no-op, not an error
 }
 
 // main_snapshot_captured ==============================================================================================
@@ -137,5 +137,162 @@ fn a_corrupt_pf_state_never_echoes_its_contents_into_the_log() {
     assert!(
         logs.contains("line 1"),
         "position must survive so the warning stays actionable: {logs}"
+    );
+}
+
+// Concurrent release: swap / clear_if_token / holds ===================================================================
+
+fn with_token(token: &str) -> LockdownPfState {
+    LockdownPfState {
+        pf_token: token.into(),
+        ..sample()
+    }
+}
+
+#[skuld::test]
+fn swap_applies_over_an_absent_record_when_absence_was_expected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let swap = swap(tmp.path(), &StateFile::Absent, &with_token("1"), None).unwrap();
+    assert_eq!(swap, Swap::Applied);
+    assert_eq!(load(tmp.path()), Some(with_token("1")));
+}
+
+#[skuld::test]
+fn swap_is_superseded_by_a_changed_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("old"), None).unwrap();
+    let expected = load_presence(tmp.path());
+    // A release cleared the record and a later engage wrote another one.
+    save(tmp.path(), &with_token("newer"), None).unwrap();
+
+    let swap = swap(tmp.path(), &expected, &with_token("mine"), None).unwrap();
+
+    assert_eq!(swap, Swap::Superseded);
+    assert_eq!(
+        load(tmp.path()),
+        Some(with_token("newer")),
+        "a superseded swap writes nothing"
+    );
+}
+
+#[skuld::test]
+fn swap_is_superseded_when_the_expected_record_was_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("old"), None).unwrap();
+    let expected = load_presence(tmp.path());
+    clear_if_token(tmp.path(), Some("old")).unwrap();
+
+    let swap = swap(tmp.path(), &expected, &with_token("mine"), None).unwrap();
+
+    assert_eq!(swap, Swap::Superseded);
+    assert!(
+        !tmp.path().join(STATE_FILE_NAME).exists(),
+        "a release that cleared the record is not undone"
+    );
+}
+
+#[skuld::test]
+fn swap_is_superseded_when_a_record_appeared_where_none_was_expected() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("appeared"), None).unwrap();
+    let swap = swap(tmp.path(), &StateFile::Absent, &with_token("mine"), None).unwrap();
+    assert_eq!(swap, Swap::Superseded);
+    assert_eq!(load(tmp.path()), Some(with_token("appeared")));
+}
+
+#[skuld::test]
+fn swap_applies_over_an_equal_unusable_file() {
+    // The engage's expectation for an `Unusable` record is what `load_presence`
+    // read, not `None`: collapsing it to "no record" would compare unequal to
+    // the very file it read.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join(STATE_FILE_NAME),
+        br#"{"version":99,"pf_token":"salvaged","main_snapshot":"","nat_snapshot":""}"#,
+    )
+    .unwrap();
+    let expected = load_presence(tmp.path());
+    assert!(matches!(&expected, StateFile::Unusable { pf_token: Some(t) } if t == "salvaged"));
+
+    assert_eq!(
+        swap(tmp.path(), &expected, &with_token("mine"), None).unwrap(),
+        Swap::Applied
+    );
+    assert_eq!(load(tmp.path()), Some(with_token("mine")));
+}
+
+#[skuld::test]
+fn swap_holds_the_record_lock_while_comparing_and_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut held_inside = false;
+    swap_with(tmp.path(), &StateFile::Absent, &with_token("1"), None, || {
+        held_inside = LOCK.try_acquire().is_none();
+    })
+    .unwrap();
+    assert!(held_inside, "the compare and the write must be one critical section");
+    assert!(LOCK.try_acquire().is_some());
+}
+
+#[skuld::test]
+fn clear_if_token_clears_the_record_that_carries_the_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("7"), None).unwrap();
+    clear_if_token(tmp.path(), Some("7")).unwrap();
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+
+    // An unusable record that still names the token is the same record.
+    std::fs::write(
+        tmp.path().join(STATE_FILE_NAME),
+        br#"{"version":99,"pf_token":"7","main_snapshot":"","nat_snapshot":""}"#,
+    )
+    .unwrap();
+    clear_if_token(tmp.path(), Some("7")).unwrap();
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+
+    // Absence is not an error.
+    clear_if_token(tmp.path(), Some("7")).unwrap();
+}
+
+#[skuld::test]
+fn clear_if_token_leaves_a_newer_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("newer"), None).unwrap();
+    clear_if_token(tmp.path(), Some("old")).unwrap();
+    assert_eq!(load(tmp.path()), Some(with_token("newer")));
+}
+
+#[skuld::test]
+fn clear_if_token_none_clears_only_a_record_that_names_no_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("7"), None).unwrap();
+    clear_if_token(tmp.path(), None).unwrap();
+    assert_eq!(
+        load(tmp.path()),
+        Some(with_token("7")),
+        "a record that names a token is not token-less"
+    );
+
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), b"not json").unwrap();
+    clear_if_token(tmp.path(), None).unwrap();
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
+fn holds_is_true_only_for_a_present_record_carrying_the_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(!holds(tmp.path(), "1"), "no record holds nothing");
+
+    save(tmp.path(), &with_token("1"), None).unwrap();
+    assert!(holds(tmp.path(), "1"));
+    assert!(!holds(tmp.path(), "2"));
+
+    std::fs::write(
+        tmp.path().join(STATE_FILE_NAME),
+        br#"{"version":99,"pf_token":"1","main_snapshot":"","nat_snapshot":""}"#,
+    )
+    .unwrap();
+    assert!(
+        !holds(tmp.path(), "1"),
+        "an unusable record is not the one this engage wrote"
     );
 }

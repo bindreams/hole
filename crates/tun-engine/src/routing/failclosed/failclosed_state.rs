@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::{PfRecord, StateFile, Swap};
+use crate::exclusive::RecordLock;
+
 /// Schema version for [`FailClosedState`]. Bumped on backwards-incompatible
 /// changes; [`load`] discards a mismatched file rather than risk a corrupt
 /// recovery.
@@ -42,13 +45,24 @@ pub struct FailClosedState {
     pub pf_was_enabled: bool,
 }
 
+/// Serializes every read-modify-write of this record in this process, so an
+/// engage's compare-and-set and a release's clear cannot interleave. A leaf
+/// lock ([`RecordLock`]): only file I/O runs under it, never a `pfctl` call.
+static LOCK: RecordLock = RecordLock::new(());
+
+impl PfRecord for FailClosedState {
+    fn pf_token(&self) -> &str {
+        &self.pf_token
+    }
+}
+
 fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
 }
 
 /// Atomically persist `state` to `<state_dir>/bridge-failclosed.json` (temp
 /// file + same-dir rename, `sync_all` before persist). Creates `state_dir`.
-pub fn save(state_dir: &Path, state: &FailClosedState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+fn save(state_dir: &Path, state: &FailClosedState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     util::ownership::chown_if_some(state_dir, owner);
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -107,13 +121,78 @@ pub fn load(state_dir: &Path) -> Option<FailClosedState> {
     }
 }
 
-/// Delete the state file; tolerates absence (`Ok`). `Err` only on real I/O error.
-pub fn clear(state_dir: &Path) -> std::io::Result<()> {
+/// Unconditional delete, tolerating absence. Callers hold [`LOCK`].
+fn remove_file(state_dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(state_file(state_dir)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Persist `new` iff the record still reads as `expected` (what the caller read
+/// when it started), as one critical section. [`Swap::Superseded`] writes
+/// nothing: a release cleared or replaced the record since, and writing from the
+/// caller's older view would resurrect it or stack a second record on a host the
+/// release already restored.
+///
+/// `expected` is the [`StateFile`] as [`load_presence`] returned it, not a
+/// collapsed `Option`: an `Unusable` record compares by its salvaged token, so
+/// an engage that found one overwrites exactly that file and no other.
+pub fn swap(
+    state_dir: &Path,
+    expected: &StateFile<FailClosedState>,
+    new: &FailClosedState,
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<Swap> {
+    swap_with(state_dir, expected, new, owner, || {})
+}
+
+/// [`swap`] with a hook that runs inside the critical section, between the
+/// compare and the write: the one place a test can observe the lock held.
+fn swap_with(
+    state_dir: &Path,
+    expected: &StateFile<FailClosedState>,
+    new: &FailClosedState,
+    owner: Option<(u32, u32)>,
+    in_section: impl FnOnce(),
+) -> std::io::Result<Swap> {
+    let _guard = LOCK.acquire();
+    let current = load_presence(state_dir);
+    in_section();
+    if current != *expected {
+        return Ok(Swap::Superseded);
+    }
+    save(state_dir, new, owner)?;
+    Ok(Swap::Applied)
+}
+
+/// Delete the record iff it still names `token` (`None`: iff it is a record that
+/// names none), tolerating absence. For a caller that settled the cover under
+/// `token` and must not take down a record a later engage wrote under another.
+pub fn clear_if_token(state_dir: &Path, token: Option<&str>) -> std::io::Result<()> {
+    let _guard = LOCK.acquire();
+    let current = load_presence(state_dir);
+    if current == StateFile::Absent || current.pf_token() != token {
+        return Ok(());
+    }
+    remove_file(state_dir)
+}
+
+/// Whether the record is a readable one naming `token`: the check an engage
+/// makes after its ruleset loads, to learn that no release removed or replaced
+/// the record it wrote (or reused) while it ran.
+pub fn holds(state_dir: &Path, token: &str) -> bool {
+    matches!(load_presence(state_dir), StateFile::Present(r) if r.pf_token == token)
+}
+
+/// Test-only unconditional write, for fixtures that need a record the engage
+/// paths would never produce (a deliberately broken one). Production writers
+/// go through [`swap`].
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn seed(state_dir: &Path, state: &FailClosedState) {
+    let _guard = LOCK.acquire();
+    save(state_dir, state, None).expect("seed the record");
 }
 
 #[cfg(test)]

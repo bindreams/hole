@@ -121,14 +121,27 @@ impl<I: EngageOps> EngageOps for PublishOnCommit<'_, I> {
     fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
         self.inner.enable_capture_token()
     }
-    fn save_transient(&mut self, st: &state::FailClosedState) -> Result<(), RoutingError> {
-        self.inner.save_transient(st)
+    fn read_transient(&mut self) -> StateFile<state::FailClosedState> {
+        self.inner.read_transient()
+    }
+    fn save_transient(
+        &mut self,
+        expected: &StateFile<state::FailClosedState>,
+        st: &state::FailClosedState,
+    ) -> Result<(), RoutingError> {
+        self.inner.save_transient(expected, st)
+    }
+    fn transient_held(&mut self, token: &str) -> bool {
+        self.inner.transient_held(token)
     }
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
         self.inner.drop_token(token)
     }
     fn transient_restore(&mut self, token: &str) {
         self.inner.transient_restore(token)
+    }
+    fn reload_default(&mut self) {
+        self.inner.reload_default()
     }
 }
 

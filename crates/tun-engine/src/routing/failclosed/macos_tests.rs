@@ -989,7 +989,16 @@ impl EngageOps for RecordingEngageOps {
         }
     }
 
-    fn save_transient(&mut self, st: &state::FailClosedState) -> Result<(), RoutingError> {
+    fn read_transient(&mut self) -> StateFile<state::FailClosedState> {
+        self.log.push("read_transient");
+        StateFile::Absent
+    }
+
+    fn save_transient(
+        &mut self,
+        _expected: &StateFile<state::FailClosedState>,
+        st: &state::FailClosedState,
+    ) -> Result<(), RoutingError> {
         self.log.push("save_transient");
         self.saved.push(st.clone());
         if self.fail_save_transient {
@@ -1009,9 +1018,18 @@ impl EngageOps for RecordingEngageOps {
         }
     }
 
+    fn transient_held(&mut self, _token: &str) -> bool {
+        self.log.push("transient_held");
+        true
+    }
+
     fn transient_restore(&mut self, token: &str) {
         self.log.push("transient_restore");
         self.restored.push(token.to_owned());
+    }
+
+    fn reload_default(&mut self) {
+        self.log.push("reload_default");
     }
 }
 
@@ -1052,13 +1070,15 @@ fn a_transient_engage_purges_pf_state_after_loading_its_ruleset() {
     assert_eq!(
         ops.log,
         vec![
+            "read_transient",
             "pf_enabled",
             "enable_capture_token",
             "save_transient",
             "load_ruleset",
             "flush_states",
+            "transient_held",
         ],
-        "the transient engage must read, enable, persist, load, THEN purge: {:?}",
+        "the transient engage must read, enable, persist, load, purge, THEN check its commit: {:?}",
         ops.log
     );
 }
@@ -1260,11 +1280,13 @@ fn a_failed_pf_enabled_read_records_not_enabled_and_still_engages() {
     assert_eq!(
         ops.log,
         vec![
+            "read_transient",
             "pf_enabled",
             "enable_capture_token",
             "save_transient",
             "load_ruleset",
             "flush_states",
+            "transient_held",
         ],
         "a failed diagnostic read must not stop the engage sequence: {:?}",
         ops.log
@@ -1314,7 +1336,7 @@ fn what_an_engage_persists_parses_under_the_previous_releases_schema() {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        state::save(dir.path(), saved, None).expect("persist");
+        state::seed(dir.path(), saved);
         let bytes = std::fs::read(dir.path().join(state::STATE_FILE_NAME)).unwrap();
         let parsed = serde_json::from_slice::<PreviousReleaseFailClosedState>(&bytes);
         assert!(
@@ -1358,7 +1380,7 @@ fn a_failed_enable_capture_token_fails_the_engage_without_a_spurious_unwind() {
     assert!(err.to_string().contains("enable_capture_token"), "{err}");
     assert_eq!(
         ops.log,
-        vec!["pf_enabled", "enable_capture_token"],
+        vec!["read_transient", "pf_enabled", "enable_capture_token"],
         "step 2 failing must stop the sequence before step 3 (`save_transient`) ever runs: {:?}",
         ops.log
     );
@@ -1433,6 +1455,9 @@ struct RecordingPfOps {
     /// Every token handed to `drop_token`, so WHICH refcount was released is
     /// assertable and not merely that one was.
     dropped: Vec<String>,
+    /// Every token handed to `clear_transient` / `clear_standing`, so WHICH
+    /// record a clear was keyed to is assertable.
+    cleared: Vec<Option<String>>,
     fail_reload_default: bool,
     fail_load_ruleset: bool,
     fail_clear_transient: bool,
@@ -1469,8 +1494,9 @@ impl PfOps for RecordingPfOps {
         }
     }
 
-    fn clear_transient(&mut self) -> Result<(), RoutingError> {
+    fn clear_transient(&mut self, token: Option<&str>) -> Result<(), RoutingError> {
         self.log.push("clear_transient");
+        self.cleared.push(token.map(str::to_owned));
         if self.fail_clear_transient {
             Err(RoutingError::RouteSetup("mock clear_transient failure".into()))
         } else {
@@ -1478,8 +1504,9 @@ impl PfOps for RecordingPfOps {
         }
     }
 
-    fn clear_standing(&mut self) -> Result<(), RoutingError> {
+    fn clear_standing(&mut self, token: Option<&str>) -> Result<(), RoutingError> {
         self.log.push("clear_standing");
+        self.cleared.push(token.map(str::to_owned));
         if self.fail_clear_standing {
             Err(RoutingError::RouteSetup("mock clear_standing failure".into()))
         } else {
@@ -1968,6 +1995,7 @@ fn self_capture_persists_no_baseline_but_keeps_the_nat_rules() {
         "tok",
         tmp.path(),
         None,
+        &StateFile::Absent,
         CoverPresence::Live,
         "block drop out quick all label \"hole-lockdown\"\n".into(),
         nat.into(),
@@ -1989,7 +2017,16 @@ fn a_measured_clean_host_captures_its_baseline() {
     let tmp = tempfile::tempdir().unwrap();
     let main = "scrub-anchor \"com.apple/*\" all fragment reassemble\n";
     let nat = "nat-anchor \"com.apple/*\" all\n";
-    persist_baseline("tok", tmp.path(), None, CoverPresence::Absent, main.into(), nat.into()).unwrap();
+    persist_baseline(
+        "tok",
+        tmp.path(),
+        None,
+        &StateFile::Absent,
+        CoverPresence::Absent,
+        main.into(),
+        nat.into(),
+    )
+    .unwrap();
 
     let st = lockdown_state::load(tmp.path()).unwrap();
     assert!(st.main_snapshot_captured);

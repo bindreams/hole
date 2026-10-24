@@ -31,7 +31,7 @@ pub const RESOLVER_PERMIT_PORT: u16 = 443;
 /// `release_all`'s doc for why that distinction is load-bearing. Generic and
 /// declared here (not per-platform) so both macOS state modules share one
 /// reader shape.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum StateFile<T> {
     /// No file — no cover of this kind was ever engaged (or a prior release
     /// already cleared it).
@@ -76,12 +76,46 @@ impl<T> StateFile<T> {
     }
 }
 
+/// A persisted pf cover record, which names the `pfctl -E` token it holds.
+#[cfg(any(target_os = "macos", test))]
+pub trait PfRecord {
+    fn pf_token(&self) -> &str;
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl<T: PfRecord> StateFile<T> {
+    /// The token the record names: a `Present` record's, or what an `Unusable`
+    /// one could still be read for. `None` for `Absent` and for a record that
+    /// yielded no token.
+    pub fn pf_token(&self) -> Option<&str> {
+        match self {
+            StateFile::Absent => None,
+            StateFile::Present(record) => Some(record.pf_token()),
+            StateFile::Unusable { pf_token } => pf_token.as_deref(),
+        }
+    }
+}
+
+/// What `failclosed_state::swap` and `lockdown_pf_state::swap` did.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swap {
+    /// The record still held what the caller read, and now holds the new value.
+    Applied,
+    /// The record changed since the caller read it, so nothing was written. The
+    /// only writers are an engage and a release: this one lost to a release (or
+    /// a later engage), and the caller backs out.
+    Superseded,
+}
+
 // macOS persists its pf enable token; Windows recovers WFP filters by fixed
-// GUID and needs no state.
-#[cfg(target_os = "macos")]
+// GUID and needs no state. Compiled for every platform's TESTS, because the
+// compare-and-set the two records implement is platform-free and a rule proved
+// only where the hazard lives is proved nowhere else.
+#[cfg(any(target_os = "macos", test))]
 pub mod failclosed_state;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod lockdown_pf_state;
 
 pub mod luid;

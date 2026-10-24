@@ -21,6 +21,12 @@ pub enum RoutingError {
     /// the log, not a toast; use [`RoutingError::redacted`] for a toast.
     #[error("{}", state_unreadable(&path.display()))]
     StateUnreadable { path: PathBuf },
+    /// A release (the tray's Unblock, `bridge unlock`, a cover sweep) removed a
+    /// cover's record while an engage was installing that cover, so the engage
+    /// backed out and the host is as the release left it. Not a failure of the
+    /// cover: the user asked to be let out.
+    #[error("the fail-closed cover was released while it was being engaged, and was backed out")]
+    SupersededByRelease,
 }
 
 fn state_unreadable(record: &dyn std::fmt::Display) -> String {
@@ -39,6 +45,7 @@ impl RoutingError {
             RoutingError::Gateway(_) => self.to_string(),
             RoutingError::RouteSetup(_) => self.to_string(),
             RoutingError::StateUnreadable { .. } => state_unreadable(&crate::routing::state::STATE_FILE_NAME),
+            RoutingError::SupersededByRelease => self.to_string(),
         }
     }
 }
