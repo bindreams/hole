@@ -62,7 +62,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
 hole-test-observability = { path = "../test-observability", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 # DNS steering (`dns_steer`) publishes a supplemental resolver at
 # a synthetic `SCDynamicStore` key. `system-configuration` 0.7 is built
 # against `core-foundation` 0.9, so this crate uses 0.9 too or the CF types

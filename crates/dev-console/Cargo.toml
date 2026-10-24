@@ -30,7 +30,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "si
 which = "8" # 8.0.3 current; performs Windows PATHEXT resolution (the npm.cmd trap)
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
 skuld = { workspace = true }

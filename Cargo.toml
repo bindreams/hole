@@ -16,7 +16,10 @@ skuld = { version = "0.2", features = ["tokio"] }
 # Process identity: `(pid, raw kernel start token)` compared exactly, plus the
 # versioned `ProcessIdRecord` the bridge persists across a restart; and, with the
 # `tokio` feature, process-tree containment and the graceful teardown signals.
-cosca = { version = "0.3", features = ["serde"] }
+cosca = { version = "0.5", features = ["serde"] }
+# Capped below 0.2.190: that release removed `libc::NOTE_REAP`, which cosca 0.5.0
+# uses on macOS. Lift the cap once a cosca release spells the constant locally.
+libc = ">=0.2.189, <0.2.190"
 # Pre-main init for the test-observability subscriber install. See
 # crates/test-observability and bindreams/hole#301.
 #

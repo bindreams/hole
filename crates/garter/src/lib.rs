@@ -37,6 +37,8 @@ mod backoff_tests;
 mod binary_probe_tests;
 #[cfg(all(test, unix))]
 mod binary_real_child_tests;
+#[cfg(all(test, unix))]
+mod binary_spawn_failure_tests;
 #[cfg(test)]
 mod binary_tests;
 #[cfg(test)]

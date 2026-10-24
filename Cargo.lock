@@ -1102,16 +1102,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "command-fds"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b60b5124979fccd9addd89d8b97a1d6eebb4950694520c75ddd722535ea443f"
-dependencies = [
- "nix 0.31.3",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1239,19 +1229,19 @@ dependencies = [
 
 [[package]]
 name = "cosca"
-version = "0.3.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "437af5a5e9e0cf2ad0919adfcc8d316cde02e9f83e493b21222e1c1a80359986"
+checksum = "b46c6ce2f01276420fe816a6ffc968690ea84c99aef6cc186f5da79916e447f1"
 dependencies = [
- "command-fds",
- "crossbeam-channel",
+ "event-listener",
+ "exacl",
  "getrandom 0.4.2",
  "libc",
  "log",
+ "mach2 0.7.0",
  "nix 0.31.3",
  "rustix",
  "serde",
- "shared_child",
  "thiserror 2.0.18",
  "tokio",
  "windows 0.62.2",
@@ -1284,7 +1274,7 @@ checksum = "031ed29858d90cfdf27fe49fae28028a1f20466db97962fa2f4ea34809aeebf3"
 dependencies = [
  "cfg-if",
  "libc",
- "mach2",
+ "mach2 0.4.3",
 ]
 
 [[package]]
@@ -1296,7 +1286,7 @@ dependencies = [
  "cfg-if",
  "crash-context",
  "libc",
- "mach2",
+ "mach2 0.4.3",
  "parking_lot",
 ]
 
@@ -2047,6 +2037,18 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
+]
+
+[[package]]
+name = "exacl"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8de9e551ced9d700a31dacb8b168129640240fcd7a279a3fa4d59608b84ebcae"
+dependencies = [
+ "bitflags 2.13.0",
+ "log",
+ "scopeguard",
+ "uuid",
 ]
 
 [[package]]
@@ -4200,9 +4202,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libdbus-sys"
@@ -4376,6 +4378,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mach2"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0d28e293f2b8c9d2b2d1c0193bd3c1cbdc0d2cf396888dc01162f7cf9d6c3f3"
+
+[[package]]
 name = "managed"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4483,7 +4491,7 @@ dependencies = [
  "goblin",
  "libc",
  "log",
- "mach2",
+ "mach2 0.4.3",
  "memmap2",
  "minidump-common",
  "nix 0.30.1",
@@ -6982,42 +6990,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "shared_child"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e362d9935bc50f019969e2f9ecd66786612daae13e8f277be7bfb66e8bed3f7"
-dependencies = [
- "libc",
- "sigchld",
- "windows-sys 0.60.2",
-]
-
-[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
-
-[[package]]
-name = "sigchld"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47106eded3c154e70176fc83df9737335c94ce22f821c32d17ed1db1f83badb1"
-dependencies = [
- "libc",
- "os_pipe",
- "signal-hook",
-]
-
-[[package]]
-name = "signal-hook"
-version = "0.3.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
-dependencies = [
- "libc",
- "signal-hook-registry",
-]
 
 [[package]]
 name = "signal-hook-registry"
