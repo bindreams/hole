@@ -287,7 +287,9 @@ fn recorded(dir: &Path) -> Vec<cosca::identity::ProcessIdRecord> {
     }
 }
 
-#[skuld::test]
+// `serial`: the kill closure asserts the lock is free, which another test's critical
+// section in the same process would falsify.
+#[skuld::test(serial)]
 fn a_record_appended_while_the_reap_kills_survives_the_clear() {
     // A plugin attempt that was aborted can still be appending its record while
     // the next stop reaps. The append lands between the reap's load and its

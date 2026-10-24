@@ -256,7 +256,6 @@ fn append_holds_the_plugin_lock_across_load_and_save() {
         held_inside,
         "the load, the push and the save must be one critical section"
     );
-    assert!(!lock_is_held(), "the lock is released on return");
 }
 
 #[skuld::test]
@@ -269,7 +268,6 @@ fn remove_accounted_holds_the_plugin_lock_while_rewriting() {
     })
     .unwrap();
     assert!(held_inside);
-    assert!(!lock_is_held());
 }
 
 #[skuld::test]
@@ -356,7 +354,6 @@ fn load_holds_the_plugin_lock_while_reading() {
         held_inside,
         "a read must not interleave with an append's rename-replace"
     );
-    assert!(!lock_is_held(), "the lock is released on return");
 }
 
 // Rewrite ownership ===================================================================================================
@@ -477,4 +474,52 @@ fn only_the_requested_owner_reaches_the_state_dir() {
         vec![None],
         "the directory is not handed to the file's owner"
     );
+}
+
+// Swallowed outcomes are logged =======================================================================================
+
+/// Capture this crate's log at `DEBUG` and above while `body` runs.
+fn captured(body: impl FnOnce()) -> String {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = crate::test_support::log_capture::VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        body();
+    }
+    writer.snapshot_string()
+}
+
+#[skuld::test]
+fn clear_if_unusable_reports_a_file_it_could_not_read_and_keeps_it() {
+    // A directory where the file belongs: the read fails with something other
+    // than "not found", so the file is neither classified nor discarded.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(STATE_FILE_NAME)).unwrap();
+
+    let log = captured(|| clear_if_unusable(dir.path()).unwrap());
+
+    assert!(dir.path().join(STATE_FILE_NAME).exists(), "an unreadable file is kept");
+    assert!(
+        log.contains("WARN") && log.contains("could not be read"),
+        "the read failure must not vanish: {log}"
+    );
+}
+
+#[skuld::test]
+fn remove_accounted_says_why_it_removed_nothing_from_a_file_that_is_gone_or_unusable() {
+    let absent = tempfile::tempdir().unwrap();
+    let log = captured(|| remove_accounted(absent.path(), &[synthetic(1, 1)], None).unwrap());
+    assert!(log.contains("DEBUG") && log.contains("no plugin state file"), "{log}");
+
+    let unusable = tempfile::tempdir().unwrap();
+    std::fs::write(unusable.path().join(STATE_FILE_NAME), b"{not json").unwrap();
+    let log = captured(|| remove_accounted(unusable.path(), &[synthetic(1, 1)], None).unwrap());
+    assert!(log.contains("DEBUG") && log.contains("unusable"), "{log}");
 }

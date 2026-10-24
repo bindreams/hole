@@ -34,8 +34,26 @@ pub fn chown_path(_path: &Path, _uid: u32, _gid: u32) -> std::io::Result<()> {
 #[cfg(target_os = "macos")]
 pub fn owner_of(path: &Path) -> Option<(u32, u32)> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::symlink_metadata(path).ok()?;
-    Some((m.uid(), m.gid()))
+    owner_from_stat(path, std::fs::symlink_metadata(path).map(|m| (m.uid(), m.gid())))
+}
+
+/// The owner a stat reported. A path that does not exist yet has no owner to keep;
+/// any other failure is logged, because the caller meant to preserve an ownership
+/// and is about to lose it.
+#[cfg(any(target_os = "macos", test))]
+fn owner_from_stat(path: &Path, stat: std::io::Result<(u32, u32)>) -> Option<(u32, u32)> {
+    match stat {
+        Ok(owner) => Some(owner),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(
+                error = %crate::error_chain::error_chain(&e),
+                path = %path.display(),
+                "could not read the owner of a path, so its ownership is not preserved"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -55,3 +73,7 @@ pub fn chown_if_some(path: &Path, owner: Option<(u32, u32)>) {
 #[cfg(test)]
 #[path = "ownership_tests.rs"]
 mod ownership_tests;
+
+#[cfg(test)]
+#[path = "ownership_stat_tests.rs"]
+mod ownership_stat_tests;

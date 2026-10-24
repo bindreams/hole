@@ -177,6 +177,9 @@ impl Drop for MockRunning {
 
 // MockRouting =========================================================================================================
 
+/// What a test runs when a cover install begins.
+type InstallHook = Box<dyn FnOnce() + Send>;
+
 pub(crate) struct MockRoutingState {
     install_calls: AtomicU32,
     teardown_calls: AtomicU32,
@@ -239,7 +242,7 @@ pub(crate) struct MockRoutingState {
     /// Runs once, at the entry of the next `install_failclosed_cover` or
     /// `install_lockdown`: a release (the tray's Unblock) landing during the
     /// install.
-    on_install: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    on_install: std::sync::Mutex<Option<(u32, InstallHook)>>,
     /// Releases a test left in flight (guards held until the test ends).
     releases_in_flight: std::sync::Mutex<Vec<tun_engine::routing::failclosed::ReleaseInFlight>>,
     /// `install` excludes any [`RouteId`] in this set from the persisted
@@ -293,7 +296,17 @@ impl Default for MockRoutingState {
 
 impl MockRoutingState {
     fn run_on_install(&self) {
-        let hook = self.on_install.lock().unwrap().take();
+        let hook = {
+            let mut armed = self.on_install.lock().unwrap();
+            match armed.as_mut() {
+                Some((skip, _)) if *skip > 0 => {
+                    *skip -= 1;
+                    None
+                }
+                Some(_) => armed.take().map(|(_, hook)| hook),
+                None => None,
+            }
+        };
         if let Some(hook) = hook {
             hook();
         }
@@ -303,14 +316,23 @@ impl MockRoutingState {
     /// tray's Unblock does. `in_flight` keeps it running past the install; else
     /// it has ended by the time the install returns.
     fn release_during_next_install(self: &Arc<Self>, state_dir: &std::path::Path, in_flight: bool) {
+        self.release_during_install(state_dir, in_flight, 0);
+    }
+
+    /// As [`Self::release_during_next_install`], but on the install after `skip`
+    /// more installs have gone through.
+    fn release_during_install(self: &Arc<Self>, state_dir: &std::path::Path, in_flight: bool, skip: u32) {
         let state = Arc::clone(self);
         let dir = state_dir.to_path_buf();
-        *self.on_install.lock().unwrap() = Some(Box::new(move || {
-            let release = tun_engine::routing::failclosed::begin_release(&dir);
-            if in_flight {
-                state.releases_in_flight.lock().unwrap().push(release);
-            }
-        }));
+        *self.on_install.lock().unwrap() = Some((
+            skip,
+            Box::new(move || {
+                let release = tun_engine::routing::failclosed::begin_release(&dir);
+                if in_flight {
+                    state.releases_in_flight.lock().unwrap().push(release);
+                }
+            }),
+        ));
     }
 
     /// End every release a test left in flight.
@@ -3875,6 +3897,37 @@ mod self_test {
                 st.cover_engage_attempts.load(Ordering::SeqCst) - before,
                 1,
                 "the corrected engage only: a start the release overtook does not restore the old cover"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn an_unblock_that_lands_during_a_repairs_restore_engage_cancels_the_start_and_drops_that_cover() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, resolver, dir) = repair_setup().await;
+            // The corrected engage fails, so the old permit is restored, and the
+            // Unblock lands during THAT second install.
+            st.fail_cover_for_resolvers.lock().unwrap().insert(Some(resolver));
+            st.release_during_install(dir.path(), false, 1);
+            let before = st.cover_engage_attempts.load(Ordering::SeqCst);
+            let disengaged = st.cover_disengage_calls.load(Ordering::SeqCst);
+
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert!(
+                !pm.blocked_until_connected(),
+                "the restored cover the release overtook is not held"
+            );
+            assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst) - before, 2);
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst) - disengaged,
+                // The held cover the repair released, and the restored one the release overtook.
+                2,
+                "both covers are gone"
             );
         });
     }

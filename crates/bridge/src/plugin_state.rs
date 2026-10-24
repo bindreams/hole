@@ -255,7 +255,14 @@ fn remove_accounted_with(
     let mut state = match loaded {
         Loaded::State(state) => state,
         Loaded::Unreadable(e) => return Err(e),
-        Loaded::Absent | Loaded::Unusable => return Ok(()),
+        Loaded::Absent => {
+            tracing::debug!("no plugin state file: nothing to remove");
+            return Ok(());
+        }
+        Loaded::Unusable => {
+            tracing::debug!("the plugin state file is unusable: nothing to remove");
+            return Ok(());
+        }
     };
     let before = state.plugins.len();
     state.plugins.retain(|r| !accounted.contains(r));
@@ -277,7 +284,14 @@ pub(crate) fn clear_if_unusable(state_dir: &Path) -> std::io::Result<()> {
     let _guard = LOCK.acquire();
     match read(state_dir) {
         Loaded::Unusable => remove_file(state_dir),
-        Loaded::Absent | Loaded::Unreadable(_) | Loaded::State(_) => Ok(()),
+        Loaded::Unreadable(e) => {
+            tracing::warn!(
+                error = %util::error_chain::error_chain(&e),
+                "the plugin state file could not be read, so it is kept rather than discarded"
+            );
+            Ok(())
+        }
+        Loaded::Absent | Loaded::State(_) => Ok(()),
     }
 }
 

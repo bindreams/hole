@@ -159,7 +159,6 @@ fn update_holds_the_record_lock_while_deciding() {
         held_inside,
         "the read, the decision and the write must be one critical section"
     );
-    assert!(LOCK.try_acquire().is_some(), "the lock must be released on return");
 }
 
 #[skuld::test]

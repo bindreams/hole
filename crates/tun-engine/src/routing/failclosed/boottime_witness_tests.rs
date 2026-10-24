@@ -387,10 +387,6 @@ fn apply_holds_the_witness_lock_while_deciding() {
         held_inside = super::STATE.try_acquire().is_none();
     });
     assert!(held_inside, "the re-read and the write must be one critical section");
-    assert!(
-        super::STATE.try_acquire().is_some(),
-        "and the lock is released on return"
-    );
     assert_eq!(super::load(state.path()), ArmingWitness::Armed);
 }
 
@@ -432,6 +428,27 @@ fn an_engage_that_commits_during_a_disarming_sweep_stays_recorded() {
         ArmingWitness::Armed,
         "the twin the engage armed during the sweep was not deleted by it"
     );
+}
+
+#[skuld::test]
+fn an_engage_in_another_state_dir_does_not_veto_a_sweeps_disarm() {
+    // The epoch is per `state_dir`: an engage recorded under B during A's sweep
+    // says nothing about the twins A's sweep deleted.
+    let (a, b) = (dir(), dir());
+    super::record_armed(a.path(), None);
+
+    let c = super::super::sweep_with_witness(a.path(), None, |witness| {
+        super::record_armed(b.path(), None);
+        SweepOutcome::completed(Clearance::from_observations(
+            &[sibling(KeyOutcome::Removed), twin_removed()],
+            witness,
+        ))
+    })
+    .expect("the sweep body cannot fail");
+
+    assert!(c.is_proven());
+    assert_eq!(super::load(a.path()), ArmingWitness::Disarmed);
+    assert_eq!(super::load(b.path()), ArmingWitness::Armed, "and B's record is B's");
 }
 
 #[skuld::test]
