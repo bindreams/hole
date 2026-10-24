@@ -23,7 +23,7 @@ fn save_load_roundtrip() {
         version: SCHEMA_VERSION,
         plugins: vec![synthetic(1234, 1000), synthetic(5678, 2000)],
     };
-    save(dir.path(), &state, None).unwrap();
+    save_with(dir.path(), &state, None, None, &RealOwnership).unwrap();
     let Loaded::State(loaded) = load(dir.path()) else {
         panic!("saved state must load as State");
     };
@@ -152,7 +152,7 @@ fn remove_file_removes_the_file() {
         version: SCHEMA_VERSION,
         plugins: vec![synthetic(1, 1)],
     };
-    save(dir.path(), &state, None).unwrap();
+    save_with(dir.path(), &state, None, None, &RealOwnership).unwrap();
     assert!(dir.path().join(STATE_FILE_NAME).exists());
     remove_file(dir.path()).unwrap();
     assert!(!dir.path().join(STATE_FILE_NAME).exists());
@@ -172,7 +172,7 @@ fn save_creates_missing_dir() {
         version: SCHEMA_VERSION,
         plugins: vec![],
     };
-    save(&nested, &state, None).unwrap();
+    save_with(&nested, &state, None, None, &RealOwnership).unwrap();
     assert!(nested.join(STATE_FILE_NAME).exists());
 }
 
@@ -416,6 +416,19 @@ fn a_rewrite_without_a_requested_owner_keeps_the_files_owner() {
     let rec = Recording::new(Some((501, 20)));
     remove_accounted_with(dir.path(), &[r1], None, &rec, || {}).unwrap();
     assert_eq!(rec.state_file_chowns(dir.path()), vec![Some((501, 20))]);
+}
+
+#[skuld::test]
+fn an_append_with_no_requested_owner_leaves_the_file_owned_by_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _) = two_records(dir.path());
+    let rec = Recording::new(Some((501, 20)));
+    append_loaded_with(load(dir.path()), dir.path(), synthetic(3, 3), None, &rec).unwrap();
+    assert_eq!(rec.state_file_chowns(dir.path()), vec![None]);
+    assert!(
+        rec.bytes_when_read.borrow().is_none(),
+        "an append must not look up the replaced file's owner"
+    );
 }
 
 #[skuld::test]

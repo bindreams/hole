@@ -2391,8 +2391,8 @@ write is therefore ordered by something that is not that mutex:
 - `bridge-plugins.json`: append, `remove_accounted` and `clear_if_unusable` run
   under one lock, kills outside it, and so does the reap's first read (a
   concurrent rename-replace can fail a read on Windows). A reap removes only the
-  records it accounted for; the file goes when none remain. A rewrite keeps the
-  owner of the file it replaces unless the caller names one.
+  records it accounted for; the file goes when none remain. That rewrite keeps
+  the owner of the file it replaces unless the caller names one; an append does not.
 - macOS `bridge-failclosed.json` and `bridge-lockdown-pf.json`: a `pfctl` call
   cannot run under a lock, so these are optimistic. An engage reads the record at
   entry, writes with `swap` (a compare against that view), and checks `holds`

@@ -95,26 +95,22 @@ impl Ownership for RealOwnership {
 /// Write `state` to `<state_dir>/bridge-plugins.json` atomically.
 /// Same atomic-write pattern as `routing::state::write`. Private: a write
 /// outside [`LOCK`] could lose a concurrent append.
-fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    save_with(state_dir, state, owner, &RealOwnership)
-}
-
-/// [`save`] over an injected [`Ownership`]. The replacement file takes `owner`;
-/// with none requested it takes the owner of the file it replaces, because a
-/// rename-replace otherwise hands a user-owned file to whoever rewrites it.
+///
+/// The directory takes `dir_owner` and the replacement file `file_owner`; with
+/// none, they belong to the writing process.
 fn save_with(
     state_dir: &Path,
     state: &PluginState,
-    owner: Option<(u32, u32)>,
+    dir_owner: Option<(u32, u32)>,
+    file_owner: Option<(u32, u32)>,
     ownership: &impl Ownership,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
-    ownership.chown(state_dir, owner);
+    ownership.chown(state_dir, dir_owner);
 
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let path = state_file(state_dir);
-    let file_owner = owner.or_else(|| ownership.owner_of(&path));
     let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
     tmp.write_all(&json)?;
     tmp.as_file().sync_all()?;
@@ -163,6 +159,17 @@ pub(crate) fn append_loaded(
     record: cosca::identity::ProcessIdRecord,
     owner: Option<(u32, u32)>,
 ) -> std::io::Result<()> {
+    append_loaded_with(loaded, state_dir, record, owner, &RealOwnership)
+}
+
+/// [`append_loaded`] over an injected [`Ownership`].
+fn append_loaded_with(
+    loaded: Loaded,
+    state_dir: &Path,
+    record: cosca::identity::ProcessIdRecord,
+    owner: Option<(u32, u32)>,
+    ownership: &impl Ownership,
+) -> std::io::Result<()> {
     let mut state = match loaded {
         Loaded::State(state) => state,
         Loaded::Unreadable(e) => return Err(e),
@@ -172,7 +179,7 @@ pub(crate) fn append_loaded(
         },
     };
     state.plugins.push(record);
-    save(state_dir, &state, owner)
+    save_with(state_dir, &state, owner, owner, ownership)
 }
 
 /// Load the state file, distinguishing "nothing recorded" from "could not be
@@ -258,7 +265,10 @@ fn remove_accounted_with(
     if state.plugins.len() == before {
         return Ok(());
     }
-    save_with(state_dir, &state, owner, ownership)
+    // The reap rewrites a file it did not create; a rename-replace would hand a
+    // user-owned file to the privileged process. Read before the replace.
+    let file_owner = owner.or_else(|| ownership.owner_of(&state_file(state_dir)));
+    save_with(state_dir, &state, owner, file_owner, ownership)
 }
 
 /// Delete the state file iff it is still unusable. The caller classified it
