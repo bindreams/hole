@@ -169,17 +169,29 @@ impl PfOps for ReleasePf<'_> {
     fn peek(&mut self, record: pf_claim::Record, token: Option<&str>, claimed: bool) -> Cleared {
         peek_record(self.dir, record, token, claimed)
     }
+
+    fn claim_transient(&mut self) -> StateFile<state::FailClosedState> {
+        state::claim_for_release(self.dir, None)
+    }
+
+    fn claim_standing(&mut self) -> StateFile<lockdown_state::LockdownPfState> {
+        lockdown_state::claim_for_release(self.dir, None)
+    }
+
+    fn lockdown_label(&mut self) -> Option<bool> {
+        Some(lockdown_state::load_presence(self.dir) != StateFile::Absent)
+    }
 }
 
 /// `release_all` over the records as they stand, with `pf` in place of `pfctl`.
-fn release_over(dir: &Path, pf: &mut ReleasePf<'_>) -> Result<(), RoutingError> {
-    release_all_over(dir, None, pf)
+fn release_over(pf: &mut ReleasePf<'_>) -> Result<(), RoutingError> {
+    release_all_over(pf)
 }
 
 /// A whole release that succeeds. Returns the tokens it dropped.
 fn release(dir: &Path) -> Vec<String> {
     let mut pf = ReleasePf::new(dir);
-    release_over(dir, &mut pf).expect("the release succeeds");
+    release_over(&mut pf).expect("the release succeeds");
     pf.dropped
 }
 
@@ -203,7 +215,7 @@ fn a_release_claims_both_records_before_its_first_pf_call() {
     lockdown_state::seed(dir.path(), &standing_record(OLD));
     let mut pf = ReleasePf::new(dir.path());
 
-    release_over(dir.path(), &mut pf).unwrap();
+    release_over(&mut pf).unwrap();
 
     let (transient, standing) = pf.at_first_pf_call.expect("the release restored something");
     assert_eq!(transient, StateFile::Present(transient_tombstone_of(OLD)));
@@ -218,7 +230,7 @@ fn a_release_whose_restore_fails_leaves_its_tombstone_and_its_token_for_recovery
     // The transient restore, then the standing snapshot load and its fallback.
     let mut pf = ReleasePf::new(dir.path()).fail_restores(3);
 
-    let result = release_over(dir.path(), &mut pf);
+    let result = release_over(&mut pf);
 
     assert!(result.is_err(), "a failed restore is never reported as a release");
     assert!(pf.dropped.is_empty(), "nothing was restored, so no token is let go");
@@ -242,7 +254,7 @@ fn a_record_a_release_did_not_read_is_not_its_to_clear() {
     let mut pf = ReleasePf::new(dir.path());
     pf.on_restore = Some(Box::new(|d: &Path| lockdown_state::seed(d, &standing_record("newer"))));
 
-    let result = release_over(dir.path(), &mut pf);
+    let result = release_over(&mut pf);
 
     assert!(result.is_err(), "a live record stands: the host may be blocked");
     assert!(pf.dropped.is_empty());
@@ -262,7 +274,7 @@ fn a_release_that_finds_its_record_removed_by_another_drops_nothing() {
     let mut pf = ReleasePf::new(dir.path());
     pf.on_restore = Some(Box::new(|d: &Path| other.borrow_mut().extend(release(d))));
 
-    release_over(dir.path(), &mut pf).expect("the record is gone, which is what a release wants");
+    release_over(&mut pf).expect("the record is gone, which is what a release wants");
 
     assert_eq!(*other.borrow(), vec![OLD.to_string()], "the second release cleared it");
     assert!(
@@ -283,7 +295,7 @@ fn an_engage_that_re_asserts_over_a_release_in_flight_is_not_cleared_by_it() {
         assert!(lockdown_state::reassert(d, &standing_record(OLD), None).unwrap());
     }));
 
-    let result = release_over(dir.path(), &mut pf);
+    let result = release_over(&mut pf);
 
     assert!(result.is_err());
     assert!(pf.dropped.is_empty());

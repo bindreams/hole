@@ -47,9 +47,40 @@ impl DropRight {
 impl Drop for DropRight {
     fn drop(&mut self) {
         if let Some(key) = self.key.take() {
+            #[cfg(test)]
+            before_release(&key);
             HELD.acquire().remove(&key);
         }
     }
+}
+
+#[cfg(test)]
+type ReleaseHook = Box<dyn Fn(&Path, Record, &str)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_RELEASE: std::cell::RefCell<Option<ReleaseHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run this thread's hook just before a right is released: the step boundary an
+/// interleaving test schedules around. Not while unwinding, when the scheduler
+/// is gone.
+#[cfg(test)]
+fn before_release((dir, record, token): &Key) {
+    if std::thread::panicking() {
+        return;
+    }
+    BEFORE_RELEASE.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(dir, *record, token);
+        }
+    });
+}
+
+/// Install (or clear) the calling thread's [`before_release`] hook.
+#[cfg(test)]
+pub(crate) fn set_before_release(hook: Option<ReleaseHook>) {
+    BEFORE_RELEASE.with(|slot| *slot.borrow_mut() = hook);
 }
 
 #[cfg(test)]

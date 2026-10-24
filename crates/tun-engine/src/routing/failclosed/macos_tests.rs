@@ -1504,6 +1504,18 @@ impl PfOps for RecordingPfOps {
     fn peek(&mut self, _record: Record, _token: Option<&str>, _claimed: bool) -> Cleared {
         self.cleared_as.unwrap_or(Cleared::Removed)
     }
+
+    fn claim_transient(&mut self) -> StateFile<state::FailClosedState> {
+        StateFile::Absent
+    }
+
+    fn claim_standing(&mut self) -> StateFile<lockdown_state::LockdownPfState> {
+        StateFile::Absent
+    }
+
+    fn lockdown_label(&mut self) -> Option<bool> {
+        Some(false)
+    }
 }
 
 fn transient_state() -> state::FailClosedState {

@@ -1246,16 +1246,25 @@ pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> S
     // dropped by `sweep_with_witness` in any case — only its
     // `witness_update` is read, and that is `Leave` here.
     //
-    // Presence and the state file come from ONE read
-    // ([`lockdown_presence_and_state`]), and the file is passed on as a
+    // Presence and the record come from ONE read
+    // ([`disengage_lockdown_over`]), and the record is passed on as a
     // `StateFile` rather than through `lockdown_state::load`: collapsing
     // `Unusable` to `None` here would hide the salvaged `pf_token` that
     // [`disengage_lockdown_with`] hands `pfctl -X`.
-    let (presence, file) = lockdown_presence_and_claim(state_dir);
-    match disengage_lockdown_with(presence, file, &mut RealPfOps { state_dir }) {
+    match disengage_lockdown_over(&mut RealPfOps { state_dir }) {
         Ok(()) => SweepOutcome::completed(Clearance::proven()),
         Err(e) => SweepOutcome::failed(Clearance::proven(), e),
     }
+}
+
+/// `disengage_lockdown`'s whole sequence over a [`PfOps`]: pf's label answer,
+/// then the claim on the record, then [`disengage_lockdown_with`]. The claim
+/// leads every restore, and a presence that could not be established implies an
+/// absent record, so nothing is claimed that the disengage then refuses to release.
+fn disengage_lockdown_over(ops: &mut dyn PfOps) -> Result<(), RoutingError> {
+    let pf_label = ops.lockdown_label();
+    let file = ops.claim_standing();
+    disengage_lockdown_with(fold_presence(pf_label, &file), file, ops)
 }
 
 /// `disengage_lockdown`'s sequencing, with presence and the [`PfOps`] seam
@@ -1341,40 +1350,15 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 }
 
 /// [`lockdown_cover_presence`] and the record it was folded from, in ONE read.
-/// `disengage_lockdown` needs both, and taking them separately would let the
-/// gate and the token come from two different reads of the same file — a
-/// `Recorded` presence paired with a record that vanished in between skips
-/// `pfctl -X` for a cover it just confirmed.
+/// ([`disengage_lockdown_over`] reads the same two, claiming the record as it goes.)
 fn lockdown_presence_and_state(
     state_dir: &Path,
 ) -> (
     crate::routing::CoverPresence,
     StateFile<lockdown_state::LockdownPfState>,
 ) {
-    presence_and_record(state_dir, lockdown_state::load_presence)
-}
-
-/// [`lockdown_presence_and_state`] for a disengage, which claims the record in
-/// the same read: a presence that could not be established implies an absent
-/// record, so nothing is claimed that the disengage then refuses to release.
-fn lockdown_presence_and_claim(
-    state_dir: &Path,
-) -> (
-    crate::routing::CoverPresence,
-    StateFile<lockdown_state::LockdownPfState>,
-) {
-    presence_and_record(state_dir, |dir| lockdown_state::claim_for_release(dir, None))
-}
-
-fn presence_and_record(
-    state_dir: &Path,
-    read: impl FnOnce(&Path) -> StateFile<lockdown_state::LockdownPfState>,
-) -> (
-    crate::routing::CoverPresence,
-    StateFile<lockdown_state::LockdownPfState>,
-) {
     let pf_label = pf_label_answer(pfctl(&["-s", "labels"], None, BestEffortPhase::RecoverCover));
-    let file = read(state_dir);
+    let file = lockdown_state::load_presence(state_dir);
     (fold_presence(pf_label, &file), file)
 }
 
@@ -1421,6 +1405,13 @@ pub(crate) trait PfOps {
     /// What clearing `record` under `token` would find, without clearing it
     /// ([`pf_claim::would_clear`]).
     fn peek(&mut self, record: Record, token: Option<&str>, claimed: bool) -> Cleared;
+    /// Claim the transient record for a release ([`state::claim_for_release`]).
+    fn claim_transient(&mut self) -> StateFile<state::FailClosedState>;
+    /// The same for the standing record ([`lockdown_state::claim_for_release`]).
+    fn claim_standing(&mut self) -> StateFile<lockdown_state::LockdownPfState>;
+    /// `pfctl -s labels`, folded: does pf say our lockdown rule label is loaded
+    /// ([`pf_label_answer`])?
+    fn lockdown_label(&mut self) -> Option<bool>;
 }
 
 /// The disclosure for an unusable record that yielded no token at all — the
@@ -1638,9 +1629,9 @@ pub(crate) fn release_all_with(
 
 /// `release_all`'s whole sequence over a [`PfOps`]: claim each record (before any
 /// pf call), then settle them with [`release_all_with`].
-fn release_all_over(state_dir: &Path, owner: Option<(u32, u32)>, ops: &mut dyn PfOps) -> Result<(), RoutingError> {
-    let transient = state::claim_for_release(state_dir, owner);
-    let standing = lockdown_state::claim_for_release(state_dir, owner);
+fn release_all_over(ops: &mut dyn PfOps) -> Result<(), RoutingError> {
+    let transient = ops.claim_transient();
+    let standing = ops.claim_standing();
     release_all_with(transient, standing, ops)
 }
 
@@ -1939,6 +1930,18 @@ impl PfOps for RealPfOps<'_> {
     fn peek(&mut self, record: Record, token: Option<&str>, claimed: bool) -> Cleared {
         peek_record(self.state_dir, record, token, claimed)
     }
+
+    fn claim_transient(&mut self) -> StateFile<state::FailClosedState> {
+        state::claim_for_release(self.state_dir, None)
+    }
+
+    fn claim_standing(&mut self) -> StateFile<lockdown_state::LockdownPfState> {
+        lockdown_state::claim_for_release(self.state_dir, None)
+    }
+
+    fn lockdown_label(&mut self) -> Option<bool> {
+        pf_label_answer(pfctl(&["-s", "labels"], None, BestEffortPhase::RecoverCover))
+    }
 }
 
 /// Clear every fail-closed cover macOS can install — both the transient
@@ -1957,7 +1960,7 @@ pub fn release_all(state_dir: &Path, _witness: super::ArmingWitness) -> SweepOut
     // Both arms `Clearance::proven`, for the reason `disengage_lockdown`
     // gives: no boot-time key class here, so nothing a failure could have
     // observed and withheld.
-    match release_all_over(state_dir, None, &mut RealPfOps { state_dir }) {
+    match release_all_over(&mut RealPfOps { state_dir }) {
         Ok(()) => SweepOutcome::completed(Clearance::proven()),
         Err(e) => SweepOutcome::failed(Clearance::proven(), e),
     }
@@ -1972,6 +1975,11 @@ mod macos_tests;
 #[cfg(test)]
 #[path = "macos_release_race_tests.rs"]
 mod macos_release_race_tests;
+
+/// Every interleaving of two cover parties over the pf records.
+#[cfg(test)]
+#[path = "macos_interleaving_tests.rs"]
+mod macos_interleaving_tests;
 
 /// Privileged-lane real-engage tests. A DESCENDANT of this module, not a
 /// sibling of the other `*_privileged_tests.rs` files under `failclosed`,

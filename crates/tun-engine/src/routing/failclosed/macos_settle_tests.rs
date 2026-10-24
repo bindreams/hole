@@ -22,7 +22,7 @@ fn a_release_whose_pfctl_x_fails_keeps_the_tombstone_and_a_retry_drops_each_toke
     lockdown_state::seed(dir.path(), &standing_record(OLD));
     let mut failing = ReleasePf::new(dir.path()).fail_drops(2);
 
-    release_over(dir.path(), &mut failing).expect("the host is restored; a refcount that would not drop is logged");
+    release_over(&mut failing).expect("the host is restored; a refcount that would not drop is logged");
 
     assert!(failing.dropped.is_empty());
     assert_eq!(
@@ -54,7 +54,7 @@ fn a_release_drops_the_token_before_it_clears_the_record() {
         );
     }));
 
-    release_over(dir.path(), &mut pf).unwrap();
+    release_over(&mut pf).unwrap();
 
     assert_eq!(pf.dropped, vec![OLD.to_string()]);
 }
@@ -113,7 +113,7 @@ fn a_release_whose_restore_fails_keeps_the_token_and_a_retry_drops_it_once() {
     // The transient restore, then the standing snapshot load and its fallback.
     let mut failing = ReleasePf::new(dir.path()).fail_restores(3);
 
-    assert!(release_over(dir.path(), &mut failing).is_err());
+    assert!(release_over(&mut failing).is_err());
     assert!(
         failing.drop_attempts.is_empty(),
         "nothing was restored: no token is let go"
@@ -147,11 +147,11 @@ fn a_party_that_settles_a_token_while_a_release_is_dropping_it_neither_drops_nor
     let mut pf = ReleasePf::new(dir.path());
     pf.on_drop = Some(Box::new(|d: &Path| {
         let mut second = ReleasePf::new(d);
-        release_over(d, &mut second).expect("another release may not complete a drop it does not own");
+        release_over(&mut second).expect("another release may not complete a drop it does not own");
         *other.borrow_mut() = Some((second.drop_attempts, record_exists(d, state::STATE_FILE_NAME)));
     }));
 
-    release_over(dir.path(), &mut pf).unwrap();
+    release_over(&mut pf).unwrap();
 
     let (attempts, record_stood) = other.borrow_mut().take().expect("the hook ran");
     assert!(attempts.is_empty(), "{attempts:?}");
