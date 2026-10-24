@@ -551,13 +551,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [
-        Kind::Release,
-        Kind::Disengage,
-        Kind::TransientEngage,
-        Kind::StandingEngage,
-    ];
-
     pub fn is_engage(self) -> bool {
         match self {
             Kind::TransientEngage | Kind::StandingEngage => true,
@@ -596,8 +589,6 @@ pub struct Outcome {
     pub kind: Kind,
     /// `None`: it returned `Ok`. Otherwise the error, and whether it was `SupersededByRelease`.
     pub failure: Option<(bool, String)>,
-    /// An engage's token.
-    pub token: Option<String>,
     /// An engage that returned `Ok`: its record was the live one naming its token, and pf held it.
     pub held_on_return: bool,
 }
@@ -609,7 +600,6 @@ impl Outcome {
             failure: result
                 .err()
                 .map(|e| (matches!(e, RoutingError::SupersededByRelease), e.to_string())),
-            token: None,
             held_on_return: false,
         }
     }
@@ -690,7 +680,6 @@ fn engage(
             kind,
             failure: None,
             held_on_return: world.held_on_return(kind, &token),
-            token: Some(token),
         },
         Err(e) => {
             let mut pf = PfParty::new(world, gate, "the overtaken cover");

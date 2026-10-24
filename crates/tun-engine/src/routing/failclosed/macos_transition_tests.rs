@@ -28,6 +28,12 @@ use std::net::IpAddr;
 
 use crate::{GLOBAL_NET_STATE, TUN};
 
+/// [`engage`] under a watch of its own, as the facade runs it.
+fn engage_watched(server_ip: IpAddr, state_dir: &std::path::Path) -> Result<Cover, RoutingError> {
+    let watch = crate::routing::failclosed::watch_releases(state_dir)?;
+    engage(server_ip, None, state_dir, None, &watch)
+}
+
 /// Engage a transient cover exactly like the public [`engage`], except that
 /// `permitted_idx` and `commit_gen` are published from INSIDE the engage path,
 /// around the `pfctl -f -` that makes them true, rather than after
@@ -71,7 +77,7 @@ fn engage_publishing(
         inner: RealEngageOps {
             state_dir,
             owner: None,
-            watch,
+            watch: &watch,
         },
         permitted_idx,
         commit_gen,
@@ -425,7 +431,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
             // after it: the host is KNOWN blocked from this point on, so the prober
             // pool spawned below needs no phase carve-out.
             let mut held: Option<Cover> = Some(
-                engage(addrs[0].parse().unwrap(), None, dir.path(), None).expect("cold engage real pf transient cover"),
+                engage_watched(addrs[0].parse().unwrap(), dir.path()).expect("cold engage real pf transient cover"),
             );
             // The permitted server answers on both sides of the block probe, so a network loss cannot
             // pass for a block. The cover is released by `held` on an early return.
@@ -836,7 +842,7 @@ fn macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage() {
 
     // 3. Engage the transient cover over that live flow, and read the state
     //    table back while the cover is still the loaded ruleset.
-    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let cover = engage_watched(PERMITTED.parse().unwrap(), dir.path()).expect("engage the transient cover");
     let after = states();
     // Restore before asserting: a failure must not leave the machine behind a
     // block-all cover while the panic unwinds.
@@ -998,7 +1004,7 @@ fn macos_failclosed_cover_load_never_drops_a_loopback_datagram() {
     // A real cover: pf enabled, a blocking ruleset live, state file written.
     // RAII, so every exit path restores `/etc/pf.conf` — the guarded leg below
     // consumes it deliberately, inside the probe.
-    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let cover = engage_watched(PERMITTED.parse().unwrap(), dir.path()).expect("engage the transient cover");
 
     // The pre-fix ruleset shape: `set skip on lo0` and nothing else exempting
     // loopback.
@@ -1119,7 +1125,7 @@ fn macos_failclosed_cover_engage_does_not_sever_established_loopback_flows() {
         .expect("NETWORK/ENVIRONMENT problem (not the cover): a pre-cover loopback byte must arrive");
 
     let dir = tempfile::tempdir().unwrap();
-    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let cover = engage_watched(PERMITTED.parse().unwrap(), dir.path()).expect("engage the transient cover");
 
     // The actual assertion: a MID-STREAM segment, the exact packet a
     // `flags S/SA` pass rule could not match after the purge. Write and read
