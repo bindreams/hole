@@ -245,8 +245,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
             // marker's ALE decision already resolved (same egress FIFO), so its
             // absence is a DROP, not a pending send. The head and the tail on the wire
             // are the permit readings on both sides of the leak marker: a send that
-            // failed for want of a route would read as "no leak" without them. No
-            // sleep, no poll.
+            // failed for want of a route would read as "no leak" without them.
             //
             // The leak send is allowed to FAIL: a WFP block at ALE_AUTH_CONNECT can
             // surface as a synchronous `send_to` error (WSAEACCES), which is itself

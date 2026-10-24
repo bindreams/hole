@@ -153,11 +153,8 @@ impl Default for Sent {
     }
 }
 
-/// Send the head, the leak and the tail, in that order from `socket`. The leak send is allowed to fail:
-/// a WFP block at ALE_AUTH_CONNECT can surface as a synchronous `send_to` error, itself no-leak
-/// evidence, but the capture is the authority. The permitted head and tail are the readings on both sides
-/// of the leak marker. The confinement blocks port 53 only, so the control on 443 vouches for the
-/// network from inside the run; it is TCP, which the UDP capture does not see.
+/// Send the head, the leak and the tail in order from `socket`; the leak send's own result is ignored (a WFP
+/// block can surface as a `send_to` error), the capture decides.
 fn send_head_leak_tail(
     rt: &tokio::runtime::Runtime,
     socket: &tokio::net::UdpSocket,
