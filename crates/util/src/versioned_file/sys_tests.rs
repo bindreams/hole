@@ -1,6 +1,10 @@
 use std::io;
+#[cfg(windows)]
+use std::path::PathBuf;
 
-use super::{publish, read, rename_noreplace};
+#[cfg(windows)]
+use super::read;
+use super::{publish, rename_noreplace};
 use crate::versioned_file::fixtures::{dir, names, put};
 
 #[skuld::test]
@@ -401,4 +405,56 @@ fn read_of_a_file_held_without_sharing_names_the_ntstatus_of_the_open() {
     let err = read(&path).unwrap_err();
 
     assert!(err.to_string().contains("NTSTATUS 0xC0000043"), "{err}");
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn read_of_a_file_returns_its_bytes() {
+    let dir = dir();
+    let path = put(&dir, "f", b"bytes");
+    assert_eq!(read(&path).unwrap(), b"bytes");
+}
+
+/// The error's `source()` is the `io::Error` of the failed call, raw code included.
+#[cfg(windows)]
+#[skuld::test]
+fn the_source_of_a_status_error_is_the_original_io_error_with_its_code() {
+    let dir = dir();
+    let err = read(&dir.path().join("absent")).unwrap_err();
+
+    let source = err.get_ref().and_then(|inner| inner.source()).expect("a source");
+    let original = source.downcast_ref::<io::Error>().expect("an io::Error");
+    assert_eq!(original.raw_os_error(), Some(2), "ERROR_FILE_NOT_FOUND: {err:?}");
+}
+
+/// The test harness panics with `{:?}`, so that is what the CI log of a hit shows.
+#[cfg(windows)]
+#[skuld::test]
+fn debug_shows_the_status_in_hex() {
+    let dir = dir();
+    let err = read(&dir.path().join("absent")).unwrap_err();
+
+    assert!(format!("{err:?}").contains("0xC0000034"), "{err:?}");
+}
+
+/// `std` refuses these before any system call, so the thread's last status is
+/// an earlier call's: the primed open leaves 0xC0000034 there.
+#[cfg(windows)]
+#[skuld::test]
+fn a_path_std_rejects_before_the_kernel_is_returned_unchanged() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let dir = dir();
+    let nul = PathBuf::from(OsString::from_wide(&[u16::from(b'a'), 0, u16::from(b'b')]));
+    for path in [nul, PathBuf::new()] {
+        let _ = read(&dir.path().join("absent"));
+        let err = read(&path).unwrap_err();
+        let expected = std::fs::read(&path).unwrap_err();
+
+        assert_eq!(err.kind(), expected.kind(), "{path:?}: {err:?}");
+        assert_eq!(err.raw_os_error(), expected.raw_os_error(), "{path:?}: {err:?}");
+        assert_eq!(err.to_string(), expected.to_string(), "{path:?}");
+        assert!(!err.to_string().contains("NTSTATUS"), "{path:?}: {err}");
+    }
 }

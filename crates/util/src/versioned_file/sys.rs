@@ -29,9 +29,9 @@ pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     return unix_impl::rename_noreplace(from, to);
 }
 
-/// Reads the whole file at `path`, like `std::fs::read`. On Windows a failed
-/// open also names its NTSTATUS in the error text (the kind is unchanged),
-/// which tells apart the causes a Win32 code folds together.
+/// Reads the whole file at `path`, like `std::fs::read`. On Windows a failure
+/// from the kernel also names its NTSTATUS in the error text (the kind is
+/// unchanged), which tells apart the causes a Win32 code folds together.
 pub(super) fn read(path: &Path) -> io::Result<Vec<u8>> {
     #[cfg(windows)]
     return windows_impl::read(path);
@@ -113,7 +113,7 @@ mod unix_impl {
 #[cfg(windows)]
 mod windows_impl {
     use std::fs::OpenOptions;
-    use std::io::{self, Read as _};
+    use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -144,36 +144,56 @@ mod windows_impl {
         fn rtl_get_last_nt_status() -> i32;
     }
 
-    /// A failed open's error with the NTSTATUS behind it. Its text is the
-    /// original's plus the status; `source()` is empty so a chain does not
-    /// print the original twice.
-    #[derive(Debug, thiserror::Error)]
-    #[error("{original} (NTSTATUS {status:#010X})")]
-    struct OpenFailed {
+    /// A failed call's error with the NTSTATUS behind it. Its text is the
+    /// original's plus the status; `source()` is the original, so its raw OS
+    /// code stays reachable.
+    struct WithNtStatus {
         original: io::Error,
         status: u32,
     }
 
-    /// Same as `std::fs::read`, split so the status belongs to the open.
-    pub(super) fn read(path: &Path) -> io::Result<Vec<u8>> {
-        let mut file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(original) => {
-                // Must stay the first call after the failed open: `File::open`
-                // returns right after `CreateFileW` fails, and nothing in
-                // between sets a status (`GetLastError` only reads the Win32 code).
-                // SAFETY: takes no arguments and only reads this thread's TEB.
-                let status = unsafe { rtl_get_last_nt_status() } as u32;
-                return Err(io::Error::new(original.kind(), OpenFailed { original, status }));
-            }
-        };
-        let mut bytes = Vec::new();
-        // The size hint `std::fs::read` takes, so a success allocates the same.
-        if let Ok(len) = file.metadata().map(|m| m.len() as usize) {
-            bytes.try_reserve_exact(len).ok();
+    impl std::fmt::Display for WithNtStatus {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} (NTSTATUS {:#010X})", self.original, self.status)
         }
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
+    }
+
+    // The status in hex, as in `Display` and in ntstatus.h.
+    impl std::fmt::Debug for WithNtStatus {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("WithNtStatus")
+                .field("original", &self.original)
+                .field("status", &format_args!("{:#010X}", self.status))
+                .finish()
+        }
+    }
+
+    impl std::error::Error for WithNtStatus {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.original)
+        }
+    }
+
+    /// `std::fs::read`, and a failure that came from the kernel also names the
+    /// NTSTATUS of the failed call (the kind is unchanged). The success path is
+    /// `std`'s alone.
+    pub(super) fn read(path: &Path) -> io::Result<Vec<u8>> {
+        let original = match std::fs::read(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(original) => original,
+        };
+        // `std` raises these before any system call, so the thread's last
+        // status would be an earlier call's. An empty path reaches
+        // `CreateFileW`, which fails with a Win32 code without a status.
+        if original.raw_os_error().is_none() || path.as_os_str().is_empty() {
+            return Err(original);
+        }
+        // Must stay the first call after the failure: `std::fs::read` returns
+        // right after it, and nothing in between sets a status (`GetLastError`
+        // only reads the Win32 code).
+        // SAFETY: takes no arguments and only reads this thread's TEB.
+        let status = unsafe { rtl_get_last_nt_status() } as u32;
+        Err(io::Error::new(original.kind(), WithNtStatus { original, status }))
     }
 
     /// A `windows` error as the `io::Error` of the Win32 code inside it.
