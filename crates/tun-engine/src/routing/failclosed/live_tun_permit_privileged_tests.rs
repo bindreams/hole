@@ -1204,7 +1204,7 @@ fn frame_parse_identifies_a_bare_syn_and_not_a_syn_ack() {
 /// The property needs the real cover and a network that fails on cue, so no scripted host reaches it;
 /// this pins the structure instead.
 #[skuld::test]
-fn live_tun_permit_phase2_probes_block_and_permit_under_one_engage() {
+fn the_live_cover_test_probes_block_and_server_permit_under_one_engage() {
     let source = include_str!("live_tun_permit_privileged_tests.rs");
     let core = &source[source
         .find("fn run_live_tun_permit_core(")
