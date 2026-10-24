@@ -129,6 +129,9 @@ pub mod lockdown_pf_state;
 #[cfg(any(target_os = "macos", test))]
 pub mod pf_claim;
 
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod drop_right;
+
 pub mod luid;
 pub use luid::{LuidResolver, SystemLuidResolver};
 

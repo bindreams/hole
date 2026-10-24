@@ -110,21 +110,53 @@ fn an_engage_takes_back_only_a_tombstone() {
     assert!(unclaimed(&unusable(Some(MINE))).is_none());
 }
 
+// What a clear would find =============================================================================================
+
+#[skuld::test]
+fn a_claimed_clear_would_find_what_the_release_clear_finds() {
+    for current in [
+        absent(),
+        live(MINE),
+        tombstone_of(MINE),
+        tombstone_of(OTHER),
+        unusable(Some(MINE)),
+        unusable(None),
+    ] {
+        assert_eq!(
+            would_clear(&current, Some(MINE), true),
+            release_clear(&current, Some(MINE)),
+            "{current:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_unclaimed_clear_would_remove_any_record_naming_the_token_and_nothing_else() {
+    assert_eq!(would_clear(&live(MINE), Some(MINE), false), Cleared::Removed);
+    assert_eq!(
+        would_clear(&tombstone_of(MINE), Some(MINE), false),
+        Cleared::Removed,
+        "a tombstone nobody holds the right to settle is leftover"
+    );
+    assert_eq!(would_clear(&unusable(Some(MINE)), Some(MINE), false), Cleared::Removed);
+    assert_eq!(would_clear(&unusable(None), None, false), Cleared::Removed);
+    assert_eq!(would_clear(&live(OTHER), Some(MINE), false), Cleared::Gone);
+    assert_eq!(would_clear(&absent(), Some(MINE), false), Cleared::Gone);
+}
+
 // A release's clear ===================================================================================================
 
 #[skuld::test]
-fn a_release_clears_its_own_tombstone_and_so_owns_the_drop() {
+fn a_release_clears_its_own_tombstone() {
     let cleared = release_clear(&tombstone_of(MINE), Some(MINE));
     assert_eq!(cleared, Cleared::Removed);
-    assert!(cleared.drops_the_token());
     assert!(cleared.refusal().is_none());
 }
 
 #[skuld::test]
-fn a_release_finds_its_record_already_gone_and_drops_nothing() {
+fn a_release_finds_its_record_already_gone_and_that_is_not_a_failure() {
     let cleared = release_clear(&absent(), Some(MINE));
     assert_eq!(cleared, Cleared::Gone);
-    assert!(!cleared.drops_the_token(), "whoever removed it owns the token");
     assert!(cleared.refusal().is_none());
 }
 
@@ -134,7 +166,6 @@ fn a_release_never_clears_a_record_an_engage_re_asserted() {
     // its own live record back. The host may be blocked: not a clean release.
     let cleared = release_clear(&live(MINE), Some(MINE));
     assert_eq!(cleared, Cleared::Replaced);
-    assert!(!cleared.drops_the_token());
     assert!(matches!(cleared.refusal(), Some(RoutingError::RouteSetup(_))));
 }
 

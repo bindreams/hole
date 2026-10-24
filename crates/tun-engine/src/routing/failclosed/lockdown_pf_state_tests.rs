@@ -279,29 +279,6 @@ fn clear_if_token_none_clears_only_a_record_that_names_no_token() {
 }
 
 #[skuld::test]
-fn clear_if_holds_reports_whether_it_removed_the_record() {
-    let tmp = tempfile::tempdir().unwrap();
-    assert!(!clear_if_holds(tmp.path(), "7").unwrap(), "no record: nothing removed");
-
-    save(tmp.path(), &with_token("newer"), None).unwrap();
-    assert!(!clear_if_holds(tmp.path(), "old").unwrap(), "another token: not ours");
-    assert_eq!(load(tmp.path()), Some(with_token("newer")));
-
-    save(tmp.path(), &with_token("7"), None).unwrap();
-    assert!(clear_if_holds(tmp.path(), "7").unwrap());
-    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
-
-    // An unusable record that still names the token is the same record.
-    std::fs::write(
-        tmp.path().join(STATE_FILE_NAME),
-        br#"{"version":99,"pf_token":"7","main_snapshot":"","nat_snapshot":""}"#,
-    )
-    .unwrap();
-    assert!(clear_if_holds(tmp.path(), "7").unwrap());
-    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
-}
-
-#[skuld::test]
 fn holds_tells_a_release_from_an_unreadable_record() {
     let tmp = tempfile::tempdir().unwrap();
     assert_eq!(
@@ -591,15 +568,4 @@ fn a_failed_back_out_leaves_a_record_that_is_not_its_own() {
 
     save(tmp.path(), &with_token("5"), None).unwrap();
     assert!(!reassert(tmp.path(), &with_token("5"), None).unwrap(), "already live");
-}
-
-#[skuld::test]
-fn clear_if_holds_never_removes_a_tombstone() {
-    let tmp = tempfile::tempdir().unwrap();
-    save(tmp.path(), &with_token("7").claimed(), None).unwrap();
-    assert!(
-        !clear_if_holds(tmp.path(), "7").unwrap(),
-        "a claimed record is the release's to clear"
-    );
-    assert_eq!(load(tmp.path()), Some(with_token("7").claimed()));
 }

@@ -2409,22 +2409,29 @@ write is ordered by something that is not that mutex:
   cannot run under a lock, so these are claimed rather than locked
   ([`pf_claim`](crates/tun-engine/src/routing/failclosed/pf_claim.rs)). A release
   rewrites each live record as a tombstone (`releasing: true`, absent from every
-  ordinary record) before any pf call, restores, clears the tombstone, and drops
-  the token only if its own clear removed it. An engage reads the record at entry,
+  ordinary record) before any pf call, restores, drops the token, and only then
+  clears the tombstone: a restore that fails keeps the token, a `pfctl -X` that
+  fails keeps the record, and a retry finishes either. One party settles a token
+  at a time ([`drop_right`](crates/tun-engine/src/routing/failclosed/drop_right.rs)):
+  a try-lock that never waits and is held across the `pfctl -X`, so a second party
+  leaves the token to the holder, and a party that finds the record already gone
+  leaves it alone, so a token is dropped once. An engage reads the record at entry,
   writes with `swap` (a compare against that view), and checks `holds` after its
   ruleset loads: a tombstone, a missing record or another token is
   `SupersededByRelease` (the start is cancelled, also for the transient cover); a
   record that cannot be read is a failure, not a release. A back-out restores the
-  baseline the engage holds in memory, clears and drops only a live record that is
-  its own, and, if the restore fails, puts its record back over nothing or over the
-  tombstone, which the release then refuses to clear (the Unblock reports an
-  error). A failed restore therefore always leaves a record, and a token is dropped
-  by exactly the party whose clear removed its record. A tombstone left by a failed
-  or crashed release reads to an older binary as an unusable record with its token
-  salvaged, and an engage adopts it like any leftover cover.
+  baseline the engage holds in memory, then, holding the right and over a live
+  record that is its own, drops the token and clears the record naming it. If the
+  restore fails it puts its record back over nothing or over the tombstone, which
+  the release then refuses to clear (the Unblock reports an error); that record
+  can name a token a release already dropped. A failed restore therefore always
+  leaves a record. A tombstone left by a failed or crashed release reads to an
+  older binary as an unusable record with its token salvaged, and an engage adopts
+  it like any leftover cover.
 
 The leaf rule: while one of these locks is held nothing else is acquired, and no
-`.await`, firewall, `pfctl` or process call runs.
+`.await`, firewall, `pfctl` or process call runs. The drop right is not one of
+these locks: it is held across `pfctl -X`, and nobody waits for it.
 
 These orderings are in-process. A second bridge, or `hole bridge unlock` run from
 a shell while a bridge is up, is not ordered by them

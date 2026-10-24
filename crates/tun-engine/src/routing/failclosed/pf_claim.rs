@@ -7,14 +7,23 @@
 //! - A release **claims** the record before any pf call by rewriting it as a
 //!   *tombstone*: the same record plus `releasing`. A tombstone still names the
 //!   token, so a crash or a failed restore leaves what recovery already acts on.
-//! - Whoever's **clear** removes the record drops the token. Nobody drops a
-//!   token whose record somebody else removed, so no token is dropped twice.
+//! - A token is **dropped before** the record that names it is cleared, and by
+//!   one party at a time ([`super::drop_right`]): a drop that fails leaves the
+//!   record for a retry, and nobody drops a token whose record somebody else
+//!   already removed, so no token is dropped twice.
 //! - An engage whose own restore failed **re-asserts** its record over a
 //!   tombstone (or over nothing), so the release that restored earlier cannot
 //!   clear the only evidence of a host the engage then re-blocked.
 
 use super::{PfRecord, StateFile};
 use crate::error::RoutingError;
+
+/// Which cover's record a token is settled under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Record {
+    Transient,
+    Standing,
+}
 
 /// What an engage's commit check found when it re-read its record after the
 /// ruleset loaded.
@@ -53,12 +62,13 @@ impl Held {
     }
 }
 
-/// What a release's final clear found.
+/// What a clear of the record a token is settled under finds, or would find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cleared {
-    /// This clear removed the record: the token is the release's to drop.
+    /// The record is the caller's to settle: the token is the caller's to drop,
+    /// and the record goes once it is dropped.
     Removed,
-    /// Nothing there: whoever removed the record owns the token.
+    /// Nothing there: whoever removed the record dropped the token.
     Gone,
     /// A record the release did not claim stands there, typically one an engage
     /// re-asserted after its own restore failed. Left alone.
@@ -66,15 +76,6 @@ pub enum Cleared {
 }
 
 impl Cleared {
-    /// Whether the release drops the token. One exhaustive match.
-    pub fn drops_the_token(self) -> bool {
-        match self {
-            Cleared::Removed => true,
-            Cleared::Gone => false,
-            Cleared::Replaced => false,
-        }
-    }
-
     /// The release is not clean when a record it did not claim stands: the host
     /// may be blocked, and a false success is the one wrong answer.
     pub fn refusal(self) -> Option<RoutingError> {
@@ -116,6 +117,22 @@ pub fn release_clear<R: PfRecord>(current: &StateFile<R>, token: Option<&str>) -
         StateFile::Present(_) => Cleared::Replaced,
         StateFile::Unusable { pf_token } if pf_token.as_deref() == token => Cleared::Removed,
         StateFile::Unusable { .. } => Cleared::Replaced,
+    }
+}
+
+/// What clearing the record that `token` was settled under would find, without
+/// clearing it: the check that precedes the token's drop, so a token whose
+/// record somebody else removed is not dropped again. `claimed`: the caller wrote
+/// the tombstone ([`release_clear`]); otherwise any record naming `token` is its
+/// to settle ([`names`]).
+pub fn would_clear<R: PfRecord>(current: &StateFile<R>, token: Option<&str>, claimed: bool) -> Cleared {
+    if claimed {
+        return release_clear(current, token);
+    }
+    if names(current, token) {
+        Cleared::Removed
+    } else {
+        Cleared::Gone
     }
 }
 

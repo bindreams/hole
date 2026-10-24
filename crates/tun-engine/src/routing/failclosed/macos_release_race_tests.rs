@@ -4,8 +4,9 @@
 //! claim / `swap` / clear; only `pfctl` is doubled. A hook runs a real release
 //! at a named step of the engage, so each test is one interleaving. What these
 //! pin is the ownership rule in [`super::pf_claim`]: a release claims a record
-//! before any pf call, whoever's clear removes a record drops its token, and an
-//! engage whose own restore failed puts its record back.
+//! before any pf call, a token is dropped before the record naming it is cleared
+//! and by one party at a time, and an engage whose own restore failed puts its
+//! record back.
 
 use super::*;
 use crate::routing::failclosed::pf_claim::{Cleared, Held};
@@ -72,11 +73,18 @@ fn transient_tombstone_of(token: &str) -> state::FailClosedState {
 /// clear: the window an engage writes into.
 struct ReleasePf<'a> {
     dir: &'a Path,
+    /// The tokens `pfctl -X` released.
     dropped: Vec<String>,
+    /// Every `pfctl -X`, the failed ones too.
+    drop_attempts: Vec<String>,
     actions: Vec<PfAction>,
     /// How many restores still fail, counted from the next one.
     restores_to_fail: u32,
+    /// How many `pfctl -X` still fail, counted from the next one.
+    drops_to_fail: u32,
     on_restore: Option<Hook<'a>>,
+    /// Runs as the release drops a token, which is when it holds the right to.
+    on_drop: Option<Hook<'a>>,
     /// The record files as they read at the first pf call.
     at_first_pf_call: Option<(
         StateFile<state::FailClosedState>,
@@ -89,15 +97,23 @@ impl<'a> ReleasePf<'a> {
         Self {
             dir,
             dropped: Vec::new(),
+            drop_attempts: Vec::new(),
             actions: Vec::new(),
             restores_to_fail: 0,
+            drops_to_fail: 0,
             on_restore: None,
+            on_drop: None,
             at_first_pf_call: None,
         }
     }
 
     fn fail_restores(mut self, n: u32) -> Self {
         self.restores_to_fail = n;
+        self
+    }
+
+    fn fail_drops(mut self, n: u32) -> Self {
+        self.drops_to_fail = n;
         self
     }
 
@@ -126,6 +142,14 @@ impl PfOps for ReleasePf<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        if let Some(hook) = self.on_drop.take() {
+            hook(self.dir);
+        }
+        self.drop_attempts.push(token.to_owned());
+        if self.drops_to_fail > 0 {
+            self.drops_to_fail -= 1;
+            return Err(RoutingError::RouteSetup("injected pfctl -X failure".into()));
+        }
         self.dropped.push(token.to_owned());
         Ok(())
     }
@@ -136,6 +160,14 @@ impl PfOps for ReleasePf<'_> {
 
     fn clear_standing(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError> {
         clear_standing_record(self.dir, token, claimed)
+    }
+
+    fn drop_right(&mut self, record: pf_claim::Record, token: &str) -> Option<DropRight> {
+        drop_right::take(self.dir, record, token)
+    }
+
+    fn peek(&mut self, record: pf_claim::Record, token: Option<&str>, claimed: bool) -> Cleared {
+        peek_record(self.dir, record, token, claimed)
     }
 }
 
@@ -261,6 +293,10 @@ fn an_engage_that_re_asserts_over_a_release_in_flight_is_not_cleared_by_it() {
         "the engage's record stays for recovery"
     );
 }
+
+#[cfg(test)]
+#[path = "macos_settle_tests.rs"]
+mod macos_settle_tests;
 
 // The transient engage ================================================================================================
 
@@ -669,6 +705,8 @@ struct StandingEngage<'a> {
     loads_to_fail: u32,
     /// How many `load_ruleset` calls succeed before the failing ones.
     loads_to_pass: u32,
+    /// Whether `pfctl -X` fails.
+    drops_fail: bool,
     /// What `release_began` answers.
     release_began: bool,
     after: Option<(&'static str, Hook<'a>)>,
@@ -693,6 +731,7 @@ impl<'a> StandingEngage<'a> {
             actions: Vec::new(),
             loads_to_fail: 0,
             loads_to_pass: 0,
+            drops_fail: false,
             release_began: false,
             after: None,
         }
@@ -791,8 +830,11 @@ impl LockdownEngageOps for StandingEngage<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        self.log.push("drop_token");
         self.dropped.push(token.to_owned());
+        self.step("drop_token");
+        if self.drops_fail {
+            return Err(RoutingError::RouteSetup("injected pfctl -X failure".into()));
+        }
         Ok(())
     }
 
@@ -802,9 +844,19 @@ impl LockdownEngageOps for StandingEngage<'_> {
         checked
     }
 
-    fn clear_if_held(&mut self, token: &str) -> Result<bool, RoutingError> {
-        self.log.push("clear_if_held");
-        self.real.clear_if_held(token)
+    fn drop_right(&mut self, token: &str) -> Option<DropRight> {
+        self.log.push("drop_right");
+        self.real.drop_right(token)
+    }
+
+    fn holds_to_settle(&mut self, token: &str) -> bool {
+        self.log.push("holds_to_settle");
+        self.real.holds_to_settle(token)
+    }
+
+    fn clear_dropped(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.log.push("clear_dropped");
+        self.real.clear_dropped(token)
     }
 
     fn reassert(&mut self, baseline: &lockdown_state::LockdownPfState) -> Result<bool, RoutingError> {
@@ -910,7 +962,8 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_when_the_token_is_reus
             "load_ruleset",
             "commit_check",
             "load_ruleset",
-            "clear_if_held"
+            "drop_right",
+            "holds_to_settle"
         ],
         "no new refcount is taken, and the block-all just loaded is replaced by the restore"
     );
@@ -929,8 +982,8 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_on_a_fresh_engage() {
     assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
     assert_eq!(*released.borrow(), vec![MINE.to_string()]);
     assert_eq!(
-        &ops.log[ops.log.len() - 3..],
-        ["commit_check", "load_ruleset", "clear_if_held"],
+        &ops.log[ops.log.len() - 4..],
+        ["commit_check", "load_ruleset", "drop_right", "holds_to_settle"],
         "the restore follows the commit check: {:?}",
         ops.log
     );
@@ -1392,6 +1445,12 @@ fn a_back_out_whose_restore_fails_replaces_the_tombstone_a_release_is_yet_to_cle
 }
 
 impl StandingEngage<'_> {
+    /// `pfctl -X` fails.
+    fn fail_drops(mut self) -> Self {
+        self.drops_fail = true;
+        self
+    }
+
     /// Let the next `n` loads succeed, then fail the one after: the engage's
     /// cover load passes and its back-out restore fails.
     fn fail_after_loads(mut self, n: u32) -> Self {

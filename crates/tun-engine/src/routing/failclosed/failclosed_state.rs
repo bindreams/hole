@@ -189,8 +189,8 @@ fn swap_with(
 }
 
 /// Delete the record iff it names `token` (`None`: iff it is an unusable file that
-/// yielded none), and say whether it did. For a caller that settled the cover under
-/// `token` without a claim: it drops the token only if this removed the record.
+/// yielded none), and say whether it did. For a caller that has dropped the token it
+/// settled the cover under: no record may go on naming it, tombstone or not.
 pub fn clear_if_token(state_dir: &Path, token: Option<&str>) -> std::io::Result<bool> {
     let _guard = LOCK.acquire();
     if !pf_claim::names(&load_presence(state_dir), token) {
@@ -246,7 +246,7 @@ fn claim_with(
 
 /// A release's final clear: remove the record only if it is the tombstone the
 /// release claimed (or an unusable file naming `token`), and say what it found
-/// ([`Cleared`]). The token is the release's to drop only on `Removed`.
+/// ([`Cleared`]).
 pub fn clear_released(state_dir: &Path, token: Option<&str>) -> std::io::Result<Cleared> {
     let _guard = LOCK.acquire();
     let cleared = pf_claim::release_clear(&load_presence(state_dir), token);

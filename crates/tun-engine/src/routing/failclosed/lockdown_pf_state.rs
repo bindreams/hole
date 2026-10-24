@@ -212,25 +212,11 @@ fn swap_with(
 }
 
 /// Delete the record iff it names `token` (`None`: iff it is an unusable file that
-/// yielded none), and say whether it did. For a caller that settled the cover under
-/// `token` without a claim: it drops the token only if this removed the record.
+/// yielded none), and say whether it did. For a caller that has dropped the token it
+/// settled the cover under: no record may go on naming it, tombstone or not.
 pub fn clear_if_token(state_dir: &Path, token: Option<&str>) -> std::io::Result<bool> {
     let _guard = LOCK.acquire();
     if !pf_claim::names(&load_presence(state_dir), token) {
-        return Ok(false);
-    }
-    remove_file(state_dir)?;
-    Ok(true)
-}
-
-/// Delete the record iff it is the engage's own (live, or unreadable but naming
-/// `token`), and say whether it did. An engage backing out drops the pf refcount
-/// only when this returned `true`: a record that is gone, claimed or another's
-/// had its token dropped (or never held it) by whoever removed or wrote it. The
-/// compare and the delete are one critical section.
-pub fn clear_if_holds(state_dir: &Path, token: &str) -> std::io::Result<bool> {
-    let _guard = LOCK.acquire();
-    if !pf_claim::holds_clear(&load_presence(state_dir), token) {
         return Ok(false);
     }
     remove_file(state_dir)?;
@@ -283,7 +269,7 @@ fn claim_with(
 
 /// A release's final clear: remove the record only if it is the tombstone the
 /// release claimed (or an unusable file naming `token`), and say what it found
-/// ([`Cleared`]). The token is the release's to drop only on `Removed`.
+/// ([`Cleared`]).
 pub fn clear_released(state_dir: &Path, token: Option<&str>) -> std::io::Result<Cleared> {
     let _guard = LOCK.acquire();
     let cleared = pf_claim::release_clear(&load_presence(state_dir), token);
