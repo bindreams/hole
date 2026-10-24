@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::pf_claim::{self, Cleared, Held};
 use super::{PfRecord, StateFile, Swap};
 use crate::exclusive::RecordLock;
 
@@ -43,6 +44,12 @@ pub struct FailClosedState {
     /// `bool` rejects `null` — `state::load` then reads the file as absent and
     /// leaves `block out all` on the host.
     pub pf_was_enabled: bool,
+    /// Set by a release that has claimed this record and not yet cleared it: a
+    /// tombstone. Absent from every ordinary record, so those serialize as
+    /// before and a rolled-back binary, which denies unknown fields, reads a
+    /// tombstone as `Unusable` with its token salvaged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub releasing: bool,
 }
 
 /// Serializes every read-modify-write of this record in this process, so an
@@ -53,6 +60,17 @@ static LOCK: RecordLock = RecordLock::new(());
 impl PfRecord for FailClosedState {
     fn pf_token(&self) -> &str {
         &self.pf_token
+    }
+
+    fn releasing(&self) -> bool {
+        self.releasing
+    }
+
+    fn with_releasing(&self, releasing: bool) -> Self {
+        Self {
+            releasing,
+            ..self.clone()
+        }
     }
 }
 
@@ -167,23 +185,79 @@ fn swap_with(
     Ok(Swap::Applied)
 }
 
-/// Delete the record iff it still names `token` (`None`: iff it is a record that
-/// names none), tolerating absence. For a caller that settled the cover under
-/// `token` and must not take down a record a later engage wrote under another.
-pub fn clear_if_token(state_dir: &Path, token: Option<&str>) -> std::io::Result<()> {
+/// Delete the record iff it names `token` (`None`: iff it is an unusable file that
+/// yielded none), and say whether it did. For a caller that settled the cover under
+/// `token` without a claim: it drops the token only if this removed the record.
+pub fn clear_if_token(state_dir: &Path, token: Option<&str>) -> std::io::Result<bool> {
     let _guard = LOCK.acquire();
-    let current = load_presence(state_dir);
-    if current == StateFile::Absent || current.pf_token() != token {
-        return Ok(());
+    if !pf_claim::names(&load_presence(state_dir), token) {
+        return Ok(false);
     }
-    remove_file(state_dir)
+    remove_file(state_dir)?;
+    Ok(true)
 }
 
-/// Whether the record is a readable one naming `token`: the check an engage
-/// makes after its ruleset loads, to learn that no release removed or replaced
-/// the record it wrote (or reused) while it ran.
-pub fn holds(state_dir: &Path, token: &str) -> bool {
-    matches!(load_presence(state_dir), StateFile::Present(r) if r.pf_token == token)
+/// Claim the record for a release: rewrite a live one as its tombstone, under the
+/// lock and before any pf call. Returns the record as it now stands, so
+/// `Present(r)` with `r.releasing` is a claim on disk. A record that cannot be
+/// claimed (absent, already a tombstone, unusable) is returned as read, and so
+/// is one whose write failed: the release goes on unclaimed, because the restore
+/// matters more than the bookkeeping.
+pub fn claim_for_release(state_dir: &Path, owner: Option<(u32, u32)>) -> StateFile<FailClosedState> {
+    claim_with(state_dir, owner, save)
+}
+
+/// [`claim_for_release`] over an injected write.
+fn claim_with(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    write: impl FnOnce(&Path, &FailClosedState, Option<(u32, u32)>) -> std::io::Result<()>,
+) -> StateFile<FailClosedState> {
+    let _guard = LOCK.acquire();
+    let current = load_presence(state_dir);
+    let Some(claimed) = pf_claim::tombstone(&current) else {
+        return current;
+    };
+    let owner = owner.or_else(|| util::ownership::owner_of(&state_file(state_dir)));
+    match write(state_dir, &claimed, owner) {
+        Ok(()) => StateFile::Present(claimed),
+        Err(e) => {
+            tracing::warn!(
+                error = %util::error_chain::error_chain(&e),
+                "failclosed-state could not be claimed for release; releasing it unclaimed"
+            );
+            current
+        }
+    }
+}
+
+/// A release's final clear: remove the record only if it is the tombstone the
+/// release claimed (or an unusable file naming `token`), and say what it found
+/// ([`Cleared`]). The token is the release's to drop only on `Removed`.
+pub fn clear_released(state_dir: &Path, token: Option<&str>) -> std::io::Result<Cleared> {
+    let _guard = LOCK.acquire();
+    let cleared = pf_claim::release_clear(&load_presence(state_dir), token);
+    if cleared == Cleared::Removed {
+        remove_file(state_dir)?;
+    }
+    Ok(cleared)
+}
+
+/// Put `record` back after an engage's restore failed, but only over nothing or
+/// over its own tombstone (see [`pf_claim::reasserts`]). Whether it did.
+pub fn reassert(state_dir: &Path, record: &FailClosedState, owner: Option<(u32, u32)>) -> std::io::Result<bool> {
+    let _guard = LOCK.acquire();
+    if !pf_claim::reasserts(&load_presence(state_dir), &record.pf_token) {
+        return Ok(false);
+    }
+    save(state_dir, record, owner)?;
+    Ok(true)
+}
+
+/// What the engage's commit check found: whether the record is still the live
+/// one naming `token` ([`Held`]).
+pub fn holds(state_dir: &Path, token: &str) -> Held {
+    Held::of(&load_presence(state_dir), token)
 }
 
 /// Test-only unconditional write, for fixtures that need a record the engage

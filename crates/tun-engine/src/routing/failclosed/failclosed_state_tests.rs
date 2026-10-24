@@ -7,6 +7,7 @@ fn save_then_load_roundtrips() {
         version: SCHEMA_VERSION,
         pf_token: "1234567890".into(),
         pf_was_enabled: true,
+        releasing: false,
     };
     save(tmp.path(), &st, None).unwrap();
     assert_eq!(load(tmp.path()), Some(st));
@@ -32,6 +33,7 @@ fn load_reads_an_older_files_bare_bool_pf_was_enabled() {
                 version: 1,
                 pf_token: "5".into(),
                 pf_was_enabled: written,
+                releasing: false,
             }),
             "a record already on disk at schema 1 must read unchanged: {older}"
         );
@@ -51,6 +53,7 @@ fn load_rejects_schema_mismatch() {
         version: SCHEMA_VERSION + 1,
         pf_token: "1".into(),
         pf_was_enabled: false,
+        releasing: false,
     };
     // `save` writes whatever version the struct carries, so this fabricates a
     // future-version file on disk.
@@ -65,6 +68,7 @@ fn clear_removes_file_and_tolerates_absence() {
         version: SCHEMA_VERSION,
         pf_token: "9".into(),
         pf_was_enabled: false,
+        releasing: false,
     };
     save(tmp.path(), &st, None).unwrap();
     assert!(tmp.path().join(STATE_FILE_NAME).exists());
@@ -80,6 +84,7 @@ fn with_token(token: &str) -> FailClosedState {
         version: SCHEMA_VERSION,
         pf_token: token.into(),
         pf_was_enabled: false,
+        releasing: false,
     }
 }
 
@@ -151,7 +156,6 @@ fn swap_holds_the_record_lock_while_comparing_and_writing() {
     })
     .unwrap();
     assert!(held_inside, "the compare and the write must be one critical section");
-    assert!(LOCK.try_acquire().is_some());
 }
 
 #[skuld::test]
@@ -183,10 +187,231 @@ fn clear_if_token_none_clears_only_a_record_that_names_no_token() {
 }
 
 #[skuld::test]
-fn holds_is_true_only_for_a_present_record_carrying_the_token() {
+fn holds_tells_a_release_from_an_unreadable_record() {
     let tmp = tempfile::tempdir().unwrap();
-    assert!(!holds(tmp.path(), "1"), "no record holds nothing");
+    assert_eq!(
+        holds(tmp.path(), "1"),
+        Held::Released,
+        "no record: a release cleared it"
+    );
+
     save(tmp.path(), &with_token("1"), None).unwrap();
-    assert!(holds(tmp.path(), "1"));
-    assert!(!holds(tmp.path(), "2"));
+    assert_eq!(holds(tmp.path(), "1"), Held::Held);
+    assert_eq!(holds(tmp.path(), "2"), Held::Released, "another engage's record");
+
+    save(tmp.path(), &with_token("1").claimed(), None).unwrap();
+    assert_eq!(holds(tmp.path(), "1"), Held::Released, "a release claimed it");
+
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), b"not json").unwrap();
+    assert_eq!(
+        holds(tmp.path(), "1"),
+        Held::Unreadable,
+        "a record that cannot be read says nothing about a release"
+    );
+}
+
+// The release claim ===================================================================================================
+
+impl FailClosedState {
+    fn claimed(mut self) -> Self {
+        self.releasing = true;
+        self
+    }
+}
+
+#[skuld::test]
+fn an_ordinary_record_is_written_without_the_flag_and_a_tombstone_with_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("5"), None).unwrap();
+    let ordinary = std::fs::read_to_string(tmp.path().join(STATE_FILE_NAME)).unwrap();
+    assert!(
+        !ordinary.contains("releasing"),
+        "an ordinary record reads as before: {ordinary}"
+    );
+
+    save(tmp.path(), &with_token("5").claimed(), None).unwrap();
+    let tombstone = std::fs::read_to_string(tmp.path().join(STATE_FILE_NAME)).unwrap();
+    assert!(tombstone.contains("\"releasing\": true"), "{tombstone}");
+    assert_eq!(load(tmp.path()), Some(with_token("5").claimed()));
+}
+
+/// The record schema the previous release reads, which denies unknown fields.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct PreviousRelease {
+    version: u32,
+    pf_token: String,
+    pf_was_enabled: bool,
+}
+
+#[skuld::test]
+fn the_previous_release_reads_a_tombstone_as_unusable_and_still_finds_its_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("5"), None).unwrap();
+    let ordinary = std::fs::read(tmp.path().join(STATE_FILE_NAME)).unwrap();
+    assert!(serde_json::from_slice::<PreviousRelease>(&ordinary).is_ok());
+
+    save(tmp.path(), &with_token("5").claimed(), None).unwrap();
+    let tombstone = std::fs::read(tmp.path().join(STATE_FILE_NAME)).unwrap();
+    assert!(
+        serde_json::from_slice::<PreviousRelease>(&tombstone).is_err(),
+        "a downgraded bridge must not mistake a claimed record for a live one"
+    );
+    assert_eq!(
+        StateFile::<FailClosedState>::unusable(&tombstone),
+        StateFile::Unusable {
+            pf_token: Some("5".into())
+        },
+        "and the sweep it falls into still has the token to drop"
+    );
+}
+
+#[skuld::test]
+fn a_file_without_the_flag_reads_as_live() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join(STATE_FILE_NAME),
+        br#"{"version":1,"pf_token":"5","pf_was_enabled":false}"#,
+    )
+    .unwrap();
+    assert_eq!(load(tmp.path()), Some(with_token("5")));
+}
+
+fn failing_write(_: &Path, _: &FailClosedState, _: Option<(u32, u32)>) -> std::io::Result<()> {
+    Err(std::io::Error::other("injected write failure"))
+}
+
+#[skuld::test]
+fn a_release_claims_a_live_record_by_writing_its_tombstone() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("5"), None).unwrap();
+
+    let claimed = claim_for_release(tmp.path(), None);
+
+    assert_eq!(claimed, StateFile::Present(with_token("5").claimed()));
+    assert_eq!(
+        load(tmp.path()),
+        Some(with_token("5").claimed()),
+        "the tombstone is on disk"
+    );
+}
+
+#[skuld::test]
+fn a_claim_of_nothing_or_of_a_tombstone_or_of_an_unusable_file_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(claim_for_release(tmp.path(), None), StateFile::Absent);
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+
+    save(tmp.path(), &with_token("5").claimed(), None).unwrap();
+    assert_eq!(
+        claim_for_release(tmp.path(), None),
+        StateFile::Present(with_token("5").claimed()),
+        "a second release finds the first one's claim and shares it"
+    );
+
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), b"not json").unwrap();
+    assert_eq!(
+        claim_for_release(tmp.path(), None),
+        StateFile::Unusable { pf_token: None }
+    );
+    assert_eq!(std::fs::read(tmp.path().join(STATE_FILE_NAME)).unwrap(), b"not json");
+}
+
+#[skuld::test]
+fn a_claim_whose_write_fails_hands_back_the_record_unclaimed() {
+    // The restore matters more than the bookkeeping: the release goes on, and
+    // the record it hands back says it holds no claim.
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("5"), None).unwrap();
+
+    let claimed = claim_with(tmp.path(), None, failing_write);
+
+    assert_eq!(claimed, StateFile::Present(with_token("5")));
+    assert_eq!(load(tmp.path()), Some(with_token("5")), "the record is untouched");
+}
+
+#[skuld::test]
+fn a_claim_reads_and_writes_in_one_critical_section() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("5"), None).unwrap();
+    let mut held_inside = false;
+    claim_with(tmp.path(), None, |dir, record, owner| {
+        held_inside = LOCK.try_acquire().is_none();
+        save(dir, record, owner)
+    });
+    assert!(held_inside);
+}
+
+#[skuld::test]
+fn a_release_clears_only_its_own_tombstone() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(clear_released(tmp.path(), Some("5")).unwrap(), Cleared::Gone);
+
+    save(tmp.path(), &with_token("5").claimed(), None).unwrap();
+    assert_eq!(clear_released(tmp.path(), Some("5")).unwrap(), Cleared::Removed);
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+
+    // An engage whose restore failed put its live record over the tombstone.
+    save(tmp.path(), &with_token("5"), None).unwrap();
+    assert_eq!(clear_released(tmp.path(), Some("5")).unwrap(), Cleared::Replaced);
+    assert_eq!(
+        load(tmp.path()),
+        Some(with_token("5")),
+        "and the record stays for recovery"
+    );
+
+    save(tmp.path(), &with_token("6").claimed(), None).unwrap();
+    assert_eq!(clear_released(tmp.path(), Some("5")).unwrap(), Cleared::Replaced);
+    assert_eq!(load(tmp.path()), Some(with_token("6").claimed()));
+}
+
+#[skuld::test]
+fn a_release_clears_an_unusable_record_naming_its_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), b"not json").unwrap();
+    assert_eq!(clear_released(tmp.path(), None).unwrap(), Cleared::Removed);
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
+fn clear_if_token_says_whether_it_removed_the_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(!clear_if_token(tmp.path(), Some("5")).unwrap(), "no record");
+    save(tmp.path(), &with_token("6"), None).unwrap();
+    assert!(!clear_if_token(tmp.path(), Some("5")).unwrap(), "another token");
+    save(tmp.path(), &with_token("5").claimed(), None).unwrap();
+    assert!(
+        clear_if_token(tmp.path(), Some("5")).unwrap(),
+        "a tombstone naming it too"
+    );
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
+fn a_failed_back_out_puts_its_record_back_over_nothing_or_its_own_tombstone() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(
+        reassert(tmp.path(), &with_token("5"), None).unwrap(),
+        "the release already cleared"
+    );
+    assert_eq!(load(tmp.path()), Some(with_token("5")));
+
+    save(tmp.path(), &with_token("5").claimed(), None).unwrap();
+    assert!(
+        reassert(tmp.path(), &with_token("5"), None).unwrap(),
+        "the release is yet to clear"
+    );
+    assert_eq!(load(tmp.path()), Some(with_token("5")), "the tombstone is replaced");
+}
+
+#[skuld::test]
+fn a_failed_back_out_leaves_a_record_that_is_not_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    save(tmp.path(), &with_token("6"), None).unwrap();
+    assert!(!reassert(tmp.path(), &with_token("5"), None).unwrap());
+    assert_eq!(load(tmp.path()), Some(with_token("6")));
+
+    save(tmp.path(), &with_token("5"), None).unwrap();
+    assert!(!reassert(tmp.path(), &with_token("5"), None).unwrap(), "already live");
 }

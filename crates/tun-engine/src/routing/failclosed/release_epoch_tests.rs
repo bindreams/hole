@@ -110,7 +110,7 @@ fn the_epoch_is_per_state_dir() {
 fn an_engage_with_no_release_keeps_its_cover() {
     let d = dir();
     let drops = Cell::new(0);
-    let cover = engage_within_watch(d.path(), || Ok(Cover(&drops))).expect("no release ran");
+    let cover = engage_within_watch(d.path(), |_| Ok(Cover(&drops))).expect("no release ran");
     assert_eq!(drops.get(), 0);
     drop(cover);
 }
@@ -120,7 +120,7 @@ fn an_engage_does_not_start_while_a_release_is_in_flight() {
     let d = dir();
     let _release = begin_release(d.path());
     let engaged = Cell::new(false);
-    let result = engage_within_watch(d.path(), || {
+    let result = engage_within_watch(d.path(), |_| {
         engaged.set(true);
         Ok(())
     });
@@ -132,7 +132,7 @@ fn an_engage_does_not_start_while_a_release_is_in_flight() {
 fn a_release_that_begins_during_the_engage_drops_the_cover_and_supersedes_it() {
     let d = dir();
     let drops = Cell::new(0);
-    let result = engage_within_watch(d.path(), || {
+    let result = engage_within_watch(d.path(), |_| {
         drop(begin_release(d.path()));
         Ok(Cover(&drops))
     });
@@ -147,7 +147,7 @@ fn a_release_that_begins_during_the_engage_drops_the_cover_and_supersedes_it() {
 #[skuld::test]
 fn an_engage_that_fails_reports_its_own_error_not_a_supersession() {
     let d = dir();
-    let result: Result<(), _> = engage_within_watch(d.path(), || {
+    let result: Result<(), _> = engage_within_watch(d.path(), |_| {
         drop(begin_release(d.path()));
         Err(RoutingError::RouteSetup("the engage failed".into()))
     });

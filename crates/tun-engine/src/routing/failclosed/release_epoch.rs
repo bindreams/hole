@@ -97,10 +97,10 @@ impl ReleaseWatch {
 /// [`RoutingError::SupersededByRelease`]; an `engage` error is returned as is.
 pub(crate) fn engage_within_watch<C>(
     state_dir: &Path,
-    engage: impl FnOnce() -> Result<C, RoutingError>,
+    engage: impl FnOnce(&ReleaseWatch) -> Result<C, RoutingError>,
 ) -> Result<C, RoutingError> {
     let watch = watch_releases(state_dir)?;
-    let cover = engage()?;
+    let cover = engage(&watch)?;
     watch.check()?;
     Ok(cover)
 }

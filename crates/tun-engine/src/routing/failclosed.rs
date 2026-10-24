@@ -80,6 +80,12 @@ impl<T> StateFile<T> {
 #[cfg(any(target_os = "macos", test))]
 pub trait PfRecord {
     fn pf_token(&self) -> &str;
+    /// Whether a release has claimed the record (see [`pf_claim`]).
+    fn releasing(&self) -> bool;
+    /// The same record, claimed (`true`) or live again (`false`).
+    fn with_releasing(&self, releasing: bool) -> Self
+    where
+        Self: Sized;
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -117,6 +123,9 @@ pub mod failclosed_state;
 
 #[cfg(any(target_os = "macos", test))]
 pub mod lockdown_pf_state;
+
+#[cfg(any(target_os = "macos", test))]
+pub mod pf_claim;
 
 pub mod luid;
 pub use luid::{LuidResolver, SystemLuidResolver};
@@ -198,8 +207,9 @@ pub fn engage(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    let inner =
-        release_epoch::engage_within_watch(state_dir, || platform::engage(server_ip, resolver_ip, state_dir, owner))?;
+    let inner = release_epoch::engage_within_watch(state_dir, |_watch| {
+        platform::engage(server_ip, resolver_ip, state_dir, owner)
+    })?;
     Ok(Cover { _inner: inner })
 }
 
@@ -241,16 +251,17 @@ pub fn engage_lockdown(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    let inner = release_epoch::engage_within_watch(state_dir, || {
+    let inner = release_epoch::engage_within_watch(state_dir, |watch| {
         #[cfg(target_os = "windows")]
         {
+            let _ = watch;
             let luid = resolver.resolve(tun_name)?;
             platform::engage_lockdown(server_ip, luid, app_ids, state_dir, owner)
         }
         #[cfg(target_os = "macos")]
         {
             let _ = (resolver, app_ids);
-            platform::engage_lockdown(server_ip, tun_name, state_dir, owner)
+            platform::engage_lockdown(server_ip, tun_name, state_dir, owner, watch)
         }
     })?;
     Ok(Cover { _inner: inner })

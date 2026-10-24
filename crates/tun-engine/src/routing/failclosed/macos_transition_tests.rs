@@ -131,17 +131,17 @@ impl<I: EngageOps> EngageOps for PublishOnCommit<'_, I> {
     ) -> Result<(), RoutingError> {
         self.inner.save_transient(expected, st)
     }
-    fn transient_held(&mut self, token: &str) -> bool {
-        self.inner.transient_held(token)
+    fn transient_commit_check(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.inner.transient_commit_check(token)
     }
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
         self.inner.drop_token(token)
     }
-    fn transient_restore(&mut self, token: &str) {
+    fn transient_restore(&mut self, token: &str) -> bool {
         self.inner.transient_restore(token)
     }
-    fn reload_default(&mut self) {
-        self.inner.reload_default()
+    fn reassert_transient(&mut self, token: &str) {
+        self.inner.reassert_transient(token)
     }
 }
 

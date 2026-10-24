@@ -1,14 +1,17 @@
 //! A release landing between the steps of an engage.
 //!
-//! The records are real files in a temp dir and the writes are the production
-//! `swap` / `clear_if_token` / `holds`; only `pfctl` is doubled. A hook runs a
-//! real [`release_all_with`] at a named step of the engage, so each test is one
-//! interleaving, not a claim about all of them: the compare-and-set at every
-//! write plus the commit check at the end are what make the set of interleavings
-//! closed, and the hooks sit at every boundary between those.
+//! The records are real files in a temp dir and every write is the production
+//! claim / `swap` / clear; only `pfctl` is doubled. A hook runs a real release
+//! at a named step of the engage, so each test is one interleaving. What these
+//! pin is the ownership rule in [`super::pf_claim`]: a release claims a record
+//! before any pf call, whoever's clear removes a record drops its token, and an
+//! engage whose own restore failed puts its record back.
 
 use super::*;
+use crate::routing::failclosed::pf_claim::{Cleared, Held};
+use crate::routing::failclosed::PfRecord;
 use crate::routing::CoverPresence;
+use std::cell::RefCell;
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -35,6 +38,7 @@ fn transient_record(token: &str) -> state::FailClosedState {
         version: state::SCHEMA_VERSION,
         pf_token: token.into(),
         pf_was_enabled: false,
+        releasing: false,
     }
 }
 
@@ -45,6 +49,7 @@ fn standing_record(token: &str) -> lockdown_state::LockdownPfState {
         main_snapshot: "scrub-anchor \"com.apple/*\" all fragment reassemble\n".into(),
         nat_snapshot: "nat-anchor \"com.apple/*\" all\n".into(),
         main_snapshot_captured: true,
+        releasing: false,
     }
 }
 
@@ -52,16 +57,31 @@ fn record_exists(dir: &Path, file: &str) -> bool {
     dir.join(file).exists()
 }
 
+fn standing_tombstone_of(token: &str) -> lockdown_state::LockdownPfState {
+    standing_record(token).with_releasing(true)
+}
+
+fn transient_tombstone_of(token: &str) -> state::FailClosedState {
+    transient_record(token).with_releasing(true)
+}
+
 // A release ===========================================================================================================
 
 /// [`PfOps`] over the real record files: the pf calls only log, the clears are
-/// the production keyed deletes. `on_reload` runs between the release's read of
-/// the records and its clear — the window a concurrent engage writes into.
+/// the production ones. `on_restore` runs between the release's claim and its
+/// clear: the window an engage writes into.
 struct ReleasePf<'a> {
     dir: &'a Path,
     dropped: Vec<String>,
     actions: Vec<PfAction>,
-    on_reload: Option<Hook<'a>>,
+    /// How many restores still fail, counted from the next one.
+    restores_to_fail: u32,
+    on_restore: Option<Hook<'a>>,
+    /// The record files as they read at the first pf call.
+    at_first_pf_call: Option<(
+        StateFile<state::FailClosedState>,
+        StateFile<lockdown_state::LockdownPfState>,
+    )>,
 }
 
 impl<'a> ReleasePf<'a> {
@@ -70,26 +90,39 @@ impl<'a> ReleasePf<'a> {
             dir,
             dropped: Vec::new(),
             actions: Vec::new(),
-            on_reload: None,
+            restores_to_fail: 0,
+            on_restore: None,
+            at_first_pf_call: None,
         }
+    }
+
+    fn fail_restores(mut self, n: u32) -> Self {
+        self.restores_to_fail = n;
+        self
+    }
+
+    fn restore(&mut self, action: PfAction) -> Result<(), RoutingError> {
+        self.at_first_pf_call
+            .get_or_insert_with(|| (state::load_presence(self.dir), lockdown_state::load_presence(self.dir)));
+        self.actions.push(action);
+        if let Some(hook) = self.on_restore.take() {
+            hook(self.dir);
+        }
+        if self.restores_to_fail > 0 {
+            self.restores_to_fail -= 1;
+            return Err(RoutingError::RouteSetup(INJECTED_LOAD_FAILURE.into()));
+        }
+        Ok(())
     }
 }
 
 impl PfOps for ReleasePf<'_> {
     fn reload_default(&mut self) -> Result<(), RoutingError> {
-        self.actions.push(PfAction::ReloadDefault);
-        if let Some(hook) = self.on_reload.take() {
-            hook(self.dir);
-        }
-        Ok(())
+        self.restore(PfAction::ReloadDefault)
     }
 
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
-        self.actions.push(PfAction::Load(text.to_owned()));
-        if let Some(hook) = self.on_reload.take() {
-            hook(self.dir);
-        }
-        Ok(())
+        self.restore(PfAction::Load(text.to_owned()))
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -97,20 +130,24 @@ impl PfOps for ReleasePf<'_> {
         Ok(())
     }
 
-    fn clear_transient(&mut self, token: Option<&str>) -> Result<(), RoutingError> {
-        state::clear_if_token(self.dir, token).map_err(|e| RoutingError::RouteSetup(e.to_string()))
+    fn clear_transient(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError> {
+        clear_transient_record(self.dir, token, claimed)
     }
 
-    fn clear_standing(&mut self, token: Option<&str>) -> Result<(), RoutingError> {
-        lockdown_state::clear_if_token(self.dir, token).map_err(|e| RoutingError::RouteSetup(e.to_string()))
+    fn clear_standing(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError> {
+        clear_standing_record(self.dir, token, claimed)
     }
 }
 
-/// `release_all` over the records as they read now. Returns the tokens it dropped.
+/// `release_all` over the records as they stand, with `pf` in place of `pfctl`.
+fn release_over(dir: &Path, pf: &mut ReleasePf<'_>) -> Result<(), RoutingError> {
+    release_all_over(dir, None, pf)
+}
+
+/// A whole release that succeeds. Returns the tokens it dropped.
 fn release(dir: &Path) -> Vec<String> {
     let mut pf = ReleasePf::new(dir);
-    release_all_with(state::load_presence(dir), lockdown_state::load_presence(dir), &mut pf)
-        .expect("the release succeeds");
+    release_over(dir, &mut pf).expect("the release succeeds");
     pf.dropped
 }
 
@@ -128,48 +165,120 @@ fn a_release_with_no_concurrent_engage_clears_both_records() {
 }
 
 #[skuld::test]
-fn a_release_never_clears_a_transient_record_it_did_not_read() {
-    // The release read `OLD`; before it clears, an engage replaces the record.
+fn a_release_claims_both_records_before_its_first_pf_call() {
     let dir = tempfile::tempdir().unwrap();
     state::seed(dir.path(), &transient_record(OLD));
+    lockdown_state::seed(dir.path(), &standing_record(OLD));
     let mut pf = ReleasePf::new(dir.path());
-    pf.on_reload = Some(Box::new(|d: &Path| state::seed(d, &transient_record("newer"))));
 
-    release_all_with(state::load_presence(dir.path()), StateFile::Absent, &mut pf).unwrap();
+    release_over(dir.path(), &mut pf).unwrap();
 
+    let (transient, standing) = pf.at_first_pf_call.expect("the release restored something");
+    assert_eq!(transient, StateFile::Present(transient_tombstone_of(OLD)));
+    assert_eq!(standing, StateFile::Present(standing_tombstone_of(OLD)));
+}
+
+#[skuld::test]
+fn a_release_whose_restore_fails_leaves_its_tombstone_and_its_token_for_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    state::seed(dir.path(), &transient_record(OLD));
+    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    // The transient restore, then the standing snapshot load and its fallback.
+    let mut pf = ReleasePf::new(dir.path()).fail_restores(3);
+
+    let result = release_over(dir.path(), &mut pf);
+
+    assert!(result.is_err(), "a failed restore is never reported as a release");
+    assert!(pf.dropped.is_empty(), "nothing was restored, so no token is let go");
     assert_eq!(
-        state::load(dir.path()).map(|r| r.pf_token),
-        Some("newer".to_string()),
-        "the release acted on `{OLD}`; the newer record is not its to delete"
+        state::load_presence(dir.path()),
+        StateFile::Present(transient_tombstone_of(OLD))
+    );
+    assert_eq!(
+        lockdown_state::load_presence(dir.path()),
+        StateFile::Present(standing_tombstone_of(OLD)),
+        "a tombstone is still a record naming the token: the recovery sweep acts on it"
     );
 }
 
 #[skuld::test]
-fn a_release_never_clears_a_standing_record_it_did_not_read() {
+fn a_record_a_release_did_not_read_is_not_its_to_clear() {
+    // The release claimed `OLD`; before it clears, another engage replaces the
+    // record with a live one of its own.
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::seed(dir.path(), &standing_record(OLD));
     let mut pf = ReleasePf::new(dir.path());
-    pf.on_reload = Some(Box::new(|d: &Path| lockdown_state::seed(d, &standing_record("newer"))));
+    pf.on_restore = Some(Box::new(|d: &Path| lockdown_state::seed(d, &standing_record("newer"))));
 
-    release_all_with(StateFile::Absent, lockdown_state::load_presence(dir.path()), &mut pf).unwrap();
+    let result = release_over(dir.path(), &mut pf);
 
+    assert!(result.is_err(), "a live record stands: the host may be blocked");
+    assert!(pf.dropped.is_empty());
     assert_eq!(
         lockdown_state::load(dir.path()).map(|r| r.pf_token),
         Some("newer".to_string())
     );
 }
 
+#[skuld::test]
+fn a_release_that_finds_its_record_removed_by_another_drops_nothing() {
+    // Whoever removed the record owns its token, so a second party to the same
+    // token must not drop it again.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    let other = RefCell::new(Vec::new());
+    let mut pf = ReleasePf::new(dir.path());
+    pf.on_restore = Some(Box::new(|d: &Path| other.borrow_mut().extend(release(d))));
+
+    release_over(dir.path(), &mut pf).expect("the record is gone, which is what a release wants");
+
+    assert_eq!(*other.borrow(), vec![OLD.to_string()], "the second release cleared it");
+    assert!(
+        pf.dropped.is_empty(),
+        "so the first one drops nothing: {:?}",
+        pf.dropped
+    );
+}
+
+#[skuld::test]
+fn an_engage_that_re_asserts_over_a_release_in_flight_is_not_cleared_by_it() {
+    // The release restored; an engage then loaded its cover, failed to back out
+    // and put its own record over the tombstone. The release must not clear it.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    let mut pf = ReleasePf::new(dir.path());
+    pf.on_restore = Some(Box::new(|d: &Path| {
+        assert!(lockdown_state::reassert(d, &standing_record(OLD), None).unwrap());
+    }));
+
+    let result = release_over(dir.path(), &mut pf);
+
+    assert!(result.is_err());
+    assert!(pf.dropped.is_empty());
+    assert_eq!(
+        lockdown_state::load_presence(dir.path()),
+        StateFile::Present(standing_record(OLD)),
+        "the engage's record stays for recovery"
+    );
+}
+
 // The transient engage ================================================================================================
 
-/// [`EngageOps`] over the real transient record: the record steps are
-/// production code ([`RealEngageOps`] with no `pfctl` involved), the pf steps
-/// log. `after` runs a hook once the named step has completed.
+/// [`EngageOps`] over the real transient record. The record steps are
+/// production code; the pf steps log. The restore the engage backs out with is
+/// the production `disengage_with` over a [`ReleasePf`], so what it drops and
+/// clears is observed, not stubbed. `after` runs a hook once the named step has
+/// completed.
 struct TransientEngage<'a> {
     real: RealEngageOps<'a>,
     token: &'static str,
     log: Vec<&'static str>,
     dropped: Vec<String>,
+    /// What the back-out did to pf and the tokens it let go.
+    restore_pf: ReleasePf<'a>,
     after: Option<(&'static str, Hook<'a>)>,
+    /// How many ruleset loads still fail (1: the engage's own).
+    loads_to_fail: u32,
 }
 
 impl<'a> TransientEngage<'a> {
@@ -182,12 +291,25 @@ impl<'a> TransientEngage<'a> {
             token: MINE,
             log: Vec::new(),
             dropped: Vec::new(),
+            restore_pf: ReleasePf::new(dir),
             after: None,
+            loads_to_fail: 0,
         }
     }
 
     fn after(mut self, step: &'static str, hook: impl FnOnce(&Path) + 'a) -> Self {
         self.after = Some((step, Box::new(hook)));
+        self
+    }
+
+    fn fail_loads(mut self, n: u32) -> Self {
+        self.loads_to_fail = n;
+        self
+    }
+
+    /// The back-out's own restore fails.
+    fn fail_restore(mut self) -> Self {
+        self.restore_pf = ReleasePf::new(self.real.state_dir).fail_restores(1);
         self
     }
 
@@ -198,11 +320,20 @@ impl<'a> TransientEngage<'a> {
             hook(self.real.state_dir);
         }
     }
+
+    /// Every token the engage let go, by its own drop or its back-out's.
+    fn all_dropped(&self) -> Vec<String> {
+        self.dropped.iter().chain(&self.restore_pf.dropped).cloned().collect()
+    }
 }
 
 impl CoverRulesetOps for TransientEngage<'_> {
     fn load_ruleset(&mut self, _text: &str) -> Result<(), RoutingError> {
         self.step("load_ruleset");
+        if self.loads_to_fail > 0 {
+            self.loads_to_fail -= 1;
+            return Err(RoutingError::RouteSetup(INJECTED_LOAD_FAILURE.into()));
+        }
         Ok(())
     }
 
@@ -239,10 +370,10 @@ impl EngageOps for TransientEngage<'_> {
         saved
     }
 
-    fn transient_held(&mut self, token: &str) -> bool {
-        let held = self.real.transient_held(token);
-        self.step("transient_held");
-        held
+    fn transient_commit_check(&mut self, token: &str) -> Result<(), RoutingError> {
+        let checked = self.real.transient_commit_check(token);
+        self.step("transient_commit_check");
+        checked
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -251,12 +382,15 @@ impl EngageOps for TransientEngage<'_> {
         Ok(())
     }
 
-    fn transient_restore(&mut self, _token: &str) {
+    fn transient_restore(&mut self, token: &str) -> bool {
         self.log.push("transient_restore");
+        disengage_with(Some(token), false, &mut self.restore_pf)
     }
 
-    fn reload_default(&mut self) {
-        self.log.push("reload_default");
+    fn reassert_transient(&mut self, token: &str) {
+        self.log.push("reassert_transient");
+        let reasserted = transient_record(token);
+        state::reassert(self.real.state_dir, &reasserted, None).expect("reassert");
     }
 }
 
@@ -268,7 +402,7 @@ fn a_transient_engage_with_no_concurrent_release_commits() {
     let token = engage_with(server(), None, &mut ops).expect("no release ran");
 
     assert_eq!(token, MINE);
-    assert!(state::holds(dir.path(), MINE));
+    assert_eq!(state::holds(dir.path(), MINE), Held::Held);
     assert_eq!(
         ops.log,
         vec![
@@ -278,7 +412,7 @@ fn a_transient_engage_with_no_concurrent_release_commits() {
             "save_transient",
             "load_ruleset",
             "flush_states",
-            "transient_held",
+            "transient_commit_check",
         ]
     );
 }
@@ -312,7 +446,7 @@ fn a_release_between_the_entry_read_and_the_save_makes_the_transient_engage_back
 #[skuld::test]
 fn a_release_after_the_ruleset_load_is_caught_by_the_transient_commit_check() {
     let dir = tempfile::tempdir().unwrap();
-    let released = std::cell::RefCell::new(Vec::new());
+    let released = RefCell::new(Vec::new());
     let mut ops = TransientEngage::new(dir.path()).after("flush_states", |d| released.borrow_mut().extend(release(d)));
 
     let err = engage_with(server(), None, &mut ops).expect_err("the release removed the record");
@@ -323,17 +457,202 @@ fn a_release_after_the_ruleset_load_is_caught_by_the_transient_commit_check() {
         vec![MINE.to_string()],
         "the release read this engage's record and dropped its token"
     );
-    assert!(
-        ops.dropped.is_empty(),
-        "the engage must not drop the token a second time: {:?}",
-        ops.dropped
-    );
     assert_eq!(
         &ops.log[ops.log.len() - 2..],
-        ["transient_held", "reload_default"],
-        "and it undoes the block-all it just loaded over the host the release restored"
+        ["transient_commit_check", "transient_restore"],
+        "and the engage undoes the block-all it just loaded over the host the release restored"
+    );
+    assert_eq!(
+        ops.restore_pf.actions,
+        vec![PfAction::ReloadDefault],
+        "the transient cover's restore target is /etc/pf.conf"
+    );
+    assert!(
+        ops.all_dropped().is_empty(),
+        "the token was dropped once, by the release that removed the record: {:?}",
+        ops.all_dropped()
     );
     assert!(!record_exists(dir.path(), state::STATE_FILE_NAME));
+}
+
+#[skuld::test]
+fn a_release_midway_through_its_restore_still_drops_the_token_once() {
+    // The release has claimed the record but not yet restored or cleared when the
+    // engage's commit check runs. The engage backs out and, because ITS clear
+    // removes the tombstone, drops the token; the release then finds the record
+    // gone and drops nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let claimed = RefCell::new(None);
+    let mut ops = TransientEngage::new(dir.path()).after("flush_states", |d| {
+        *claimed.borrow_mut() = Some(state::claim_for_release(d, None));
+    });
+
+    let err = engage_with(server(), None, &mut ops).expect_err("the record is claimed");
+    assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
+    let claim = claimed.borrow_mut().take().expect("the hook ran");
+    assert_eq!(claim, StateFile::Present(transient_tombstone_of(MINE)));
+
+    // The release carries on from the record it claimed.
+    let mut pf = ReleasePf::new(dir.path());
+    release_all_with(claim, StateFile::Absent, &mut pf).expect("the release succeeds");
+
+    assert_eq!(
+        ops.all_dropped(),
+        vec![MINE.to_string()],
+        "the engage's clear removed it"
+    );
+    assert!(
+        pf.dropped.is_empty(),
+        "the release's clear found nothing to remove: {:?}",
+        pf.dropped
+    );
+    assert!(!record_exists(dir.path(), state::STATE_FILE_NAME));
+}
+
+#[skuld::test]
+fn a_record_replaced_by_another_engage_is_left_alone_by_a_transient_back_out() {
+    // After the load the record is no longer this engage's: a release removed it
+    // and another engage wrote its own. The back-out still puts the host back to
+    // /etc/pf.conf, but it neither drops the other engage's token nor clears its
+    // record.
+    let dir = tempfile::tempdir().unwrap();
+    let mut ops = TransientEngage::new(dir.path()).after("flush_states", |d| {
+        release(d);
+        state::seed(d, &transient_record("newer"));
+    });
+
+    let err = engage_with(server(), None, &mut ops).expect_err("the record is another engage's");
+
+    assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
+    assert_eq!(ops.restore_pf.actions, vec![PfAction::ReloadDefault]);
+    assert_eq!(state::load(dir.path()).map(|r| r.pf_token), Some("newer".to_string()));
+    assert!(ops.all_dropped().is_empty(), "{:?}", ops.all_dropped());
+}
+
+#[skuld::test]
+fn a_transient_record_that_cannot_be_read_after_the_load_fails_the_engage_it_does_not_cancel_it() {
+    // A read failure says nothing about a release. Reporting it as one would
+    // turn a real failure into a silent, user-requested cancel.
+    let dir = tempfile::tempdir().unwrap();
+    let mut ops = TransientEngage::new(dir.path()).after("flush_states", |d| {
+        std::fs::write(d.join(state::STATE_FILE_NAME), b"not json").unwrap();
+    });
+
+    let err = engage_with(server(), None, &mut ops).expect_err("the record cannot be read");
+
+    assert!(!err.cancels_the_start(), "{err}");
+    assert!(matches!(err, RoutingError::RouteSetup(_)), "{err}");
+    assert_eq!(
+        ops.restore_pf.actions,
+        vec![PfAction::ReloadDefault],
+        "the engage still undoes its cover"
+    );
+}
+
+#[skuld::test]
+fn a_failed_transient_load_restores_clears_the_record_and_drops_the_token_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ops = TransientEngage::new(dir.path()).fail_loads(1);
+
+    let err = engage_with(server(), None, &mut ops).expect_err("the load fails");
+
+    assert!(
+        matches!(&err, RoutingError::RouteSetup(m) if m == INJECTED_LOAD_FAILURE),
+        "{err}"
+    );
+    assert_eq!(ops.restore_pf.actions, vec![PfAction::ReloadDefault]);
+    assert!(!record_exists(dir.path(), state::STATE_FILE_NAME));
+    assert_eq!(ops.all_dropped(), vec![MINE.to_string()]);
+}
+
+#[skuld::test]
+fn a_release_during_a_failed_transient_load_does_not_make_the_engage_drop_the_token_again() {
+    // The release removes the record, and with it the token, while the engage's
+    // load is failing. The engage's own back-out must not drop that token a
+    // second time: it finds its record gone, so the refcount is not its to drop.
+    let dir = tempfile::tempdir().unwrap();
+    let released = RefCell::new(Vec::new());
+    let mut ops = TransientEngage::new(dir.path())
+        .fail_loads(1)
+        .after("load_ruleset", |d| released.borrow_mut().extend(release(d)));
+
+    let err = engage_with(server(), None, &mut ops).expect_err("the load fails");
+
+    assert!(
+        matches!(&err, RoutingError::RouteSetup(m) if m == INJECTED_LOAD_FAILURE),
+        "{err}"
+    );
+    assert_eq!(*released.borrow(), vec![MINE.to_string()]);
+    assert!(
+        ops.all_dropped().is_empty(),
+        "dropped once in total, by the release: {:?}",
+        ops.all_dropped()
+    );
+    assert_eq!(ops.restore_pf.actions, vec![PfAction::ReloadDefault]);
+    assert!(!record_exists(dir.path(), state::STATE_FILE_NAME));
+}
+
+#[skuld::test]
+fn a_transient_back_out_whose_restore_fails_puts_its_record_back_over_a_cleared_one() {
+    // The release restored and cleared; the engage's load then re-blocked the
+    // host and its own restore failed. Without a record nothing would ever
+    // restore this host.
+    let dir = tempfile::tempdir().unwrap();
+    let mut ops = TransientEngage::new(dir.path())
+        .fail_restore()
+        .after("flush_states", |d| {
+            release(d);
+        });
+
+    let err = engage_with(server(), None, &mut ops).expect_err("the release removed the record");
+
+    assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
+    assert_eq!(state::load(dir.path()), Some(transient_record(MINE)));
+    assert!(ops.log.contains(&"reassert_transient"), "{:?}", ops.log);
+}
+
+#[skuld::test]
+fn a_transient_back_out_whose_restore_fails_replaces_the_tombstone_a_release_is_yet_to_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let claimed = RefCell::new(None);
+    let mut ops = TransientEngage::new(dir.path())
+        .fail_restore()
+        .after("flush_states", |d| {
+            *claimed.borrow_mut() = Some(state::claim_for_release(d, None));
+        });
+    engage_with(server(), None, &mut ops).expect_err("the record is claimed");
+    assert_eq!(
+        state::load(dir.path()),
+        Some(transient_record(MINE)),
+        "the tombstone is replaced"
+    );
+
+    // The release restores, then tries to clear the tombstone it claimed.
+    let mut pf = ReleasePf::new(dir.path());
+    let result = release_all_with(claimed.borrow_mut().take().unwrap(), StateFile::Absent, &mut pf);
+
+    assert!(result.is_err(), "the engage's record stands: the host may be blocked");
+    assert!(pf.dropped.is_empty());
+    assert_eq!(state::load(dir.path()), Some(transient_record(MINE)));
+}
+
+#[skuld::test]
+fn a_transient_back_out_whose_restore_fails_keeps_the_live_record_it_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ops = TransientEngage::new(dir.path()).fail_loads(1).fail_restore();
+
+    engage_with(server(), None, &mut ops).expect_err("the load fails");
+
+    assert_eq!(
+        state::load(dir.path()),
+        Some(transient_record(MINE)),
+        "kept for recovery"
+    );
+    assert!(
+        ops.all_dropped().is_empty(),
+        "and its token with it: {:?}",
+        ops.all_dropped()
+    );
 }
 
 // The standing engage =================================================================================================
@@ -346,23 +665,35 @@ struct StandingEngage<'a> {
     dropped: Vec<String>,
     /// What the engage did to pf, including the restore it backed out with.
     actions: Vec<PfAction>,
-    /// How many `load_ruleset` calls still fail, counted from the next one.
+    /// How many `load_ruleset` calls still fail, counted after `loads_to_pass`.
     loads_to_fail: u32,
+    /// How many `load_ruleset` calls succeed before the failing ones.
+    loads_to_pass: u32,
+    /// What `release_began` answers.
+    release_began: bool,
     after: Option<(&'static str, Hook<'a>)>,
 }
 
 impl<'a> StandingEngage<'a> {
     fn new(dir: &'a Path, pf_enabled: bool) -> Self {
+        // The double answers `release_began` itself; the real ops only need a
+        // watch to exist.
+        let watch: &'static crate::routing::failclosed::ReleaseWatch = Box::leak(Box::new(
+            crate::routing::failclosed::watch_releases(dir).expect("no release in flight"),
+        ));
         Self {
             real: RealLockdownEngageOps {
                 state_dir: dir,
                 owner: None,
+                watch,
             },
             pf_enabled,
             log: Vec::new(),
             dropped: Vec::new(),
             actions: Vec::new(),
             loads_to_fail: 0,
+            loads_to_pass: 0,
+            release_began: false,
             after: None,
         }
     }
@@ -391,6 +722,10 @@ impl CoverRulesetOps for StandingEngage<'_> {
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
         self.actions.push(PfAction::Load(text.to_owned()));
         self.step("load_ruleset");
+        if self.loads_to_pass > 0 {
+            self.loads_to_pass -= 1;
+            return Ok(());
+        }
         if self.loads_to_fail > 0 {
             self.loads_to_fail -= 1;
             return Err(RoutingError::RouteSetup(INJECTED_LOAD_FAILURE.into()));
@@ -414,6 +749,11 @@ impl LockdownEngageOps for StandingEngage<'_> {
         let read = self.real.read_record();
         self.step("read_record");
         read
+    }
+
+    fn release_began(&mut self) -> bool {
+        self.log.push("release_began");
+        self.release_began
     }
 
     fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
@@ -456,15 +796,20 @@ impl LockdownEngageOps for StandingEngage<'_> {
         Ok(())
     }
 
-    fn holds(&mut self, token: &str) -> bool {
-        let held = self.real.holds(token);
-        self.step("holds");
-        held
+    fn commit_check(&mut self, token: &str) -> Result<(), RoutingError> {
+        let checked = self.real.commit_check(token);
+        self.step("commit_check");
+        checked
     }
 
     fn clear_if_held(&mut self, token: &str) -> Result<bool, RoutingError> {
         self.log.push("clear_if_held");
         self.real.clear_if_held(token)
+    }
+
+    fn reassert(&mut self, baseline: &lockdown_state::LockdownPfState) -> Result<bool, RoutingError> {
+        self.log.push("reassert");
+        self.real.reassert(baseline)
     }
 
     fn reload_default(&mut self) -> Result<(), RoutingError> {
@@ -481,7 +826,7 @@ fn a_standing_engage_with_no_concurrent_release_commits() {
     let token = engage_lockdown_with(server(), "utun9", &mut ops).expect("no release ran");
 
     assert_eq!(token, MINE);
-    assert!(lockdown_state::holds(dir.path(), MINE));
+    assert_eq!(lockdown_state::holds(dir.path(), MINE), Held::Held);
     assert_eq!(
         ops.log,
         vec![
@@ -490,7 +835,7 @@ fn a_standing_engage_with_no_concurrent_release_commits() {
             "enable_capture_token",
             "capture_and_persist",
             "load_ruleset",
-            "holds",
+            "commit_check",
         ]
     );
 }
@@ -528,7 +873,7 @@ fn a_release_of_the_unusable_record_a_fresh_engage_expected_makes_it_back_out() 
         br#"{"version":99,"pf_token":"77","main_snapshot":"","nat_snapshot":""}"#,
     )
     .unwrap();
-    let released = std::cell::RefCell::new(Vec::new());
+    let released = RefCell::new(Vec::new());
     let mut ops = StandingEngage::new(dir.path(), false)
         .after("enable_capture_token", |d| released.borrow_mut().extend(release(d)));
 
@@ -549,7 +894,7 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_when_the_token_is_reus
     // `ReuseToken` writes nothing, so the commit check is its only protection.
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::seed(dir.path(), &standing_record(OLD));
-    let released = std::cell::RefCell::new(Vec::new());
+    let released = RefCell::new(Vec::new());
     let mut ops =
         StandingEngage::new(dir.path(), true).after("load_ruleset", |d| released.borrow_mut().extend(release(d)));
 
@@ -563,7 +908,7 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_when_the_token_is_reus
             "pf_enabled",
             "read_record",
             "load_ruleset",
-            "holds",
+            "commit_check",
             "load_ruleset",
             "clear_if_held"
         ],
@@ -575,7 +920,7 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_when_the_token_is_reus
 #[skuld::test]
 fn a_release_after_the_load_is_caught_by_the_commit_check_on_a_fresh_engage() {
     let dir = tempfile::tempdir().unwrap();
-    let released = std::cell::RefCell::new(Vec::new());
+    let released = RefCell::new(Vec::new());
     let mut ops =
         StandingEngage::new(dir.path(), false).after("load_ruleset", |d| released.borrow_mut().extend(release(d)));
 
@@ -585,7 +930,7 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_on_a_fresh_engage() {
     assert_eq!(*released.borrow(), vec![MINE.to_string()]);
     assert_eq!(
         &ops.log[ops.log.len() - 3..],
-        ["holds", "load_ruleset", "clear_if_held"],
+        ["commit_check", "load_ruleset", "clear_if_held"],
         "the restore follows the commit check: {:?}",
         ops.log
     );
@@ -594,6 +939,95 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_on_a_fresh_engage() {
         "the release dropped the token with the record; the engage must not drop it again"
     );
     assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
+}
+
+#[skuld::test]
+fn a_release_that_has_claimed_but_not_yet_restored_supersedes_the_standing_engage_and_keeps_its_drop() {
+    // The commit check runs between the release's claim and its clear. The engage
+    // backs out but does not clear a tombstone, so the release still removes the
+    // record and drops the token: once in total.
+    let dir = tempfile::tempdir().unwrap();
+    let claimed = RefCell::new(None);
+    let mut ops = StandingEngage::new(dir.path(), false).after("load_ruleset", |d| {
+        *claimed.borrow_mut() = Some(lockdown_state::claim_for_release(d, None));
+    });
+
+    let err = engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the record is claimed");
+    assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
+    assert!(ops.dropped.is_empty(), "the engage does not touch a tombstone's token");
+    assert_eq!(
+        lockdown_state::load(dir.path()).map(|r| r.releasing),
+        Some(true),
+        "the claim stands for the release to clear"
+    );
+
+    let mut pf = ReleasePf::new(dir.path());
+    release_all_with(StateFile::Absent, claimed.borrow_mut().take().unwrap(), &mut pf).expect("the release succeeds");
+
+    assert_eq!(pf.dropped, vec![MINE.to_string()]);
+    assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
+}
+
+#[skuld::test]
+fn a_standing_record_that_cannot_be_read_after_the_load_fails_the_engage_it_does_not_cancel_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ops = StandingEngage::new(dir.path(), false).after("load_ruleset", |d| {
+        std::fs::write(
+            d.join(lockdown_state::STATE_FILE_NAME),
+            format!(r#"{{"version":99,"pf_token":"{MINE}","main_snapshot":"","nat_snapshot":""}}"#),
+        )
+        .unwrap();
+    });
+
+    let err = engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the record cannot be read");
+
+    assert!(!err.cancels_the_start(), "{err}");
+    assert!(matches!(err, RoutingError::RouteSetup(_)), "{err}");
+    assert_eq!(
+        ops.dropped,
+        vec![MINE.to_string()],
+        "an unreadable record that still names the token is this engage's own to clear"
+    );
+    assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
+}
+
+// A tombstone found at entry ------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn an_engage_takes_back_a_tombstone_a_failed_release_left_and_adopts_its_cover() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &standing_tombstone_of(OLD));
+    let mut ops = StandingEngage::new(dir.path(), true);
+
+    let token = engage_lockdown_with(server(), "utun9", &mut ops).expect("no release is running");
+
+    assert_eq!(token, OLD, "the leftover cover is adopted as an ordinary one");
+    assert_eq!(lockdown_state::holds(dir.path(), OLD), Held::Held);
+    assert_eq!(
+        lockdown_state::load(dir.path()),
+        Some(standing_record(OLD)),
+        "and the claim is gone from the record"
+    );
+}
+
+#[skuld::test]
+fn an_engage_never_takes_back_a_tombstone_over_a_release_that_began() {
+    // A release that began after the facade's watch wrote the tombstone the
+    // engage just read. Taking it back would steal the release's claim.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &standing_tombstone_of(OLD));
+    let mut ops = StandingEngage::new(dir.path(), true);
+    ops.release_began = true;
+
+    let err = engage_lockdown_with(server(), "utun9", &mut ops).expect_err("a release began");
+
+    assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
+    assert_eq!(
+        lockdown_state::load(dir.path()),
+        Some(standing_tombstone_of(OLD)),
+        "the claim is untouched"
+    );
+    assert!(!ops.log.contains(&"load_ruleset"), "nothing was loaded: {:?}", ops.log);
 }
 
 // The back-out restores the engage's own baseline =====================================================================
@@ -609,6 +1043,7 @@ fn host_baseline_record(token: &str, captured: bool) -> lockdown_state::Lockdown
         main_snapshot: if captured { HOST_FILTER.into() } else { String::new() },
         nat_snapshot: HOST_NAT.into(),
         main_snapshot_captured: captured,
+        releasing: false,
     }
 }
 
@@ -900,6 +1335,70 @@ fn a_back_out_whose_restore_fails_keeps_the_record_and_the_token_for_recovery() 
     let err = engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the load fails");
 
     assert_injected(&err);
-    assert!(lockdown_state::holds(dir.path(), MINE));
+    assert_eq!(lockdown_state::holds(dir.path(), MINE), Held::Held);
     assert!(ops.dropped.is_empty(), "{:?}", ops.dropped);
+}
+
+#[skuld::test]
+fn a_back_out_whose_restore_fails_puts_its_record_back_over_a_record_a_release_cleared() {
+    // The release restored and cleared; the engage's load re-blocked the host
+    // and its own restore failed. The record it puts back is what a recovery
+    // sweep will restore this host from.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &host_baseline_record(OLD, true));
+    let mut ops = StandingEngage::new(dir.path(), true)
+        .fail_after_loads(1)
+        .after("load_ruleset", |d| {
+            release(d);
+        });
+
+    let err = engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the release removed the record");
+
+    assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
+    assert_eq!(
+        lockdown_state::load(dir.path()),
+        Some(host_baseline_record(OLD, true)),
+        "the engage's record is back, with its baseline"
+    );
+    assert!(ops.log.contains(&"reassert"), "{:?}", ops.log);
+    assert!(ops.dropped.is_empty(), "{:?}", ops.dropped);
+}
+
+#[skuld::test]
+fn a_back_out_whose_restore_fails_replaces_the_tombstone_a_release_is_yet_to_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &host_baseline_record(OLD, true));
+    let claimed = RefCell::new(None);
+    let mut ops = StandingEngage::new(dir.path(), true)
+        .fail_after_loads(1)
+        .after("load_ruleset", |d| {
+            *claimed.borrow_mut() = Some(lockdown_state::claim_for_release(d, None));
+        });
+
+    engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the record is claimed");
+
+    assert_eq!(
+        lockdown_state::load(dir.path()),
+        Some(host_baseline_record(OLD, true)),
+        "the tombstone is replaced by the engage's live record"
+    );
+    let mut pf = ReleasePf::new(dir.path());
+    let result = release_all_with(StateFile::Absent, claimed.borrow_mut().take().unwrap(), &mut pf);
+    assert!(result.is_err(), "the release must not report a clean host");
+    assert!(pf.dropped.is_empty());
+    assert_eq!(
+        lockdown_state::load(dir.path()),
+        Some(host_baseline_record(OLD, true)),
+        "and it does not clear the engage's record"
+    );
+}
+
+impl StandingEngage<'_> {
+    /// Let the next `n` loads succeed, then fail the one after: the engage's
+    /// cover load passes and its back-out restore fails.
+    fn fail_after_loads(mut self, n: u32) -> Self {
+        self.loads_to_pass = n;
+        self.loads_to_fail = 1;
+        self
+    }
 }
