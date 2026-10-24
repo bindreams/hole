@@ -24,7 +24,7 @@ pub trait Fs: Send + Sync {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        super::sys::read(path)
     }
 
     fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
