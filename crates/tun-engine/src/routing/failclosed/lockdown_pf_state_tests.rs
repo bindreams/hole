@@ -278,6 +278,29 @@ fn clear_if_token_none_clears_only_a_record_that_names_no_token() {
 }
 
 #[skuld::test]
+fn clear_if_holds_reports_whether_it_removed_the_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(!clear_if_holds(tmp.path(), "7").unwrap(), "no record: nothing removed");
+
+    save(tmp.path(), &with_token("newer"), None).unwrap();
+    assert!(!clear_if_holds(tmp.path(), "old").unwrap(), "another token: not ours");
+    assert_eq!(load(tmp.path()), Some(with_token("newer")));
+
+    save(tmp.path(), &with_token("7"), None).unwrap();
+    assert!(clear_if_holds(tmp.path(), "7").unwrap());
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+
+    // An unusable record that still names the token is the same record.
+    std::fs::write(
+        tmp.path().join(STATE_FILE_NAME),
+        br#"{"version":99,"pf_token":"7","main_snapshot":"","nat_snapshot":""}"#,
+    )
+    .unwrap();
+    assert!(clear_if_holds(tmp.path(), "7").unwrap());
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
 fn holds_is_true_only_for_a_present_record_carrying_the_token() {
     let tmp = tempfile::tempdir().unwrap();
     assert!(!holds(tmp.path(), "1"), "no record holds nothing");

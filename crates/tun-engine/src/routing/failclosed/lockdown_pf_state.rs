@@ -202,6 +202,20 @@ pub fn clear_if_token(state_dir: &Path, token: Option<&str>) -> std::io::Result<
     remove_file(state_dir)
 }
 
+/// Delete the record iff it still names `token`, and say whether it did. For an
+/// engage backing out: it drops the pf refcount only when this returned `true`,
+/// because a record that is gone or is another engage's had its token dropped (or
+/// never held it) by whoever removed or wrote it. The compare and the delete are
+/// one critical section, so a release cannot land between them.
+pub fn clear_if_holds(state_dir: &Path, token: &str) -> std::io::Result<bool> {
+    let _guard = LOCK.acquire();
+    if load_presence(state_dir).pf_token() != Some(token) {
+        return Ok(false);
+    }
+    remove_file(state_dir)?;
+    Ok(true)
+}
+
 /// Whether the record is a readable one naming `token`: the check an engage
 /// makes after its ruleset loads, to learn that no release removed or replaced
 /// the record it wrote (or reused) while it ran.

@@ -983,7 +983,7 @@ fn swap_lockdown_record(
 /// function's doc), and a cold engage has no window that reordering could close
 /// (this module's doc).
 ///
-/// On load failure the host is restored (`lockdown_disengage`) and Err returned;
+/// On load failure the host is restored (`back_out_engage`) and Err returned;
 /// the bridge's fail-FATAL caller aborts the start.
 pub fn engage_lockdown(
     server_ip: IpAddr,
@@ -1031,10 +1031,9 @@ pub(crate) trait LockdownEngageOps: CoverRulesetOps {
     /// Whether the record still names `token` ([`lockdown_state::holds`]): the
     /// commit check after the ruleset loads.
     fn holds(&mut self, token: &str) -> bool;
-    /// [`lockdown_disengage`]: restore the host from the record on disk and
-    /// clear what this engage holds. Only for an engage whose record is still
-    /// its own; once a release removed it there is nothing on disk to read.
-    fn disengage(&mut self);
+    /// Delete the record iff it still names `token` ([`lockdown_state::clear_if_holds`]),
+    /// and say whether it did: only then is the pf refcount this engage's to drop.
+    fn clear_if_held(&mut self, token: &str) -> Result<bool, RoutingError>;
     /// `pfctl -f /etc/pf.conf`.
     fn reload_default(&mut self) -> Result<(), RoutingError>;
 }
@@ -1046,12 +1045,19 @@ fn unwind_refcount(ops: &mut dyn LockdownEngageOps, token: &str, message: &str) 
     }
 }
 
-/// Put the host back to `baseline`, the baseline this engage itself holds, for
-/// an engage whose record a release removed. The release restored the host and
-/// took the record and its token with it, so nothing on disk names the
-/// baseline any more and nothing here drops a refcount. Best-effort: the engage
-/// is failing with [`RoutingError::SupersededByRelease`] either way.
-fn restore_held_baseline(ops: &mut dyn LockdownEngageOps, baseline: &lockdown_state::LockdownPfState) {
+/// Back a failed or superseded engage out: put the host back to `baseline`, the
+/// baseline this engage itself holds, then give up what it still owns.
+///
+/// The baseline comes from memory because a release may have removed the record
+/// that names it. The record and the refcount are given up only if the record
+/// still names `token`: a release that removed it dropped the token with it, and
+/// a record another engage wrote is that engage's. The clear comes first and
+/// decides the drop, so a release cannot land between them and double-drop.
+///
+/// A restore that fails leaves the record and the token alone: the host still
+/// carries this engage's cover, and the record is what the next start's recovery
+/// restores from. Best-effort otherwise; the caller is failing either way.
+fn back_out_engage(ops: &mut dyn LockdownEngageOps, token: &str, baseline: &lockdown_state::LockdownPfState) {
     let restored = match baseline_restore_ruleset(baseline) {
         Some(ruleset) => ops.load_ruleset(&ruleset),
         None => ops.reload_default(),
@@ -1059,8 +1065,17 @@ fn restore_held_baseline(ops: &mut dyn LockdownEngageOps, baseline: &lockdown_st
     if let Err(e) = restored {
         tracing::warn!(
             error = %util::error_chain::error_chain(&e),
-            "restoring the host baseline failed backing out a superseded lockdown engage"
+            "restoring the host baseline failed backing out a lockdown engage; its record stays for recovery"
         );
+        return;
+    }
+    match ops.clear_if_held(token) {
+        Ok(true) => unwind_refcount(ops, token, "pfctl -X failed backing out a lockdown engage"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            error = %util::error_chain::error_chain(&e),
+            "clearing the lockdown record failed backing out an engage; the refcount is left for recovery"
+        ),
     }
 }
 
@@ -1072,9 +1087,10 @@ fn restore_held_baseline(ops: &mut dyn LockdownEngageOps, baseline: &lockdown_st
 /// as it read at entry, and the final ruleset load is followed by a commit check
 /// that the record still names this engage's token. Either failing is
 /// [`RoutingError::SupersededByRelease`]: the engage backs out whatever it took
-/// and leaves the host as the release left it. After the load that means
-/// restoring the baseline the engage holds in memory, because the release
-/// removed the record a disk-driven restore would read.
+/// and leaves the host as the release left it. After the load, and when the load
+/// itself fails, that means [`back_out_engage`]: restoring the baseline the
+/// engage holds in memory, because the release removed the record a disk-driven
+/// restore would read.
 fn engage_lockdown_with(
     server_ip: IpAddr,
     tun_name: &str,
@@ -1144,23 +1160,23 @@ fn engage_lockdown_with(
     // Through the shared loader, so this path's "no state purge" is
     // [`purges_state`]'s decision rather than the absence of a call here.
     if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, ops) {
-        // Restore the host (snapshot reload + drop refcount) before failing, so
-        // a partially-loaded ruleset never strands the host.
-        ops.disengage();
+        // Restore the host before failing, so a partially-loaded ruleset never
+        // strands the host.
+        back_out_engage(ops, &token, &baseline);
         return Err(e);
     }
 
     // Commit check: the ruleset is live. If the record no longer names this
     // engage's token, a release removed or replaced it while this engage ran —
     // and restored the host, which the load above then re-blocked. Back out to
-    // the baseline held here: the record on disk is gone or is not this
-    // engage's, so neither it nor its token is this engage's to restore or drop.
+    // the baseline held here; `back_out_engage` leaves a record and a token that
+    // are no longer this engage's.
     if !ops.holds(&token) {
         tracing::warn!(
             "a release removed the standing cover's record while it was being engaged; backing the \
              engage out"
         );
-        restore_held_baseline(ops, &baseline);
+        back_out_engage(ops, &token, &baseline);
         return Err(RoutingError::SupersededByRelease);
     }
 
@@ -1703,8 +1719,9 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
         lockdown_state::holds(self.state_dir, token)
     }
 
-    fn disengage(&mut self) {
-        lockdown_disengage(self.state_dir);
+    fn clear_if_held(&mut self, token: &str) -> Result<bool, RoutingError> {
+        lockdown_state::clear_if_holds(self.state_dir, token)
+            .map_err(|e| RoutingError::RouteSetup(format!("lockdown-pf-state clear failed: {e}")))
     }
 
     fn reload_default(&mut self) -> Result<(), RoutingError> {
