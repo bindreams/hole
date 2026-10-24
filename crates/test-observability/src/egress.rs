@@ -41,8 +41,8 @@
 //! told from a permit that breaks only sometimes, and rerunning that would be an
 //! uncapped wait on no external event.
 //!
-//! No wait here has a cap: each round re-probes the real condition, the test's
-//! own nextest timeout is the bound, and every change of state is logged.
+//! No wait here has a cap: each round re-probes the real condition, the CI job's
+//! wall clock is the only bound, and every change of state is logged.
 
 use std::io;
 use std::net::TcpStream;
