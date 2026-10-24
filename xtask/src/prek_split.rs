@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::ValueEnum;
 use serde::Deserialize;
 
@@ -123,29 +123,64 @@ impl LintSplit {
     }
 }
 
+impl LintSplit {
+    /// `prek install-hooks` over the hooks [`Self::portable_args`] runs.
+    pub fn portable_prepare_args(&self) -> Vec<String> {
+        prepare_args(&self.portable_args())
+    }
+
+    /// `prek install-hooks` over the hooks [`Self::platform_dependent_args`] runs.
+    pub fn platform_dependent_prepare_args(&self) -> Option<Vec<String>> {
+        self.platform_dependent_args().map(|args| prepare_args(&args))
+    }
+}
+
+/// The `install-hooks` call covering the same hooks as the `run` call `run_args`.
+fn prepare_args(run_args: &[String]) -> Vec<String> {
+    std::iter::once("install-hooks".to_string())
+        .chain(
+            run_args
+                .iter()
+                .skip(1)
+                .filter(|a| !matches!(a.as_str(), "--all-files" | "--show-diff-on-failure"))
+                .cloned(),
+        )
+        .collect()
+}
+
 /// Perform `which` against the repository at `repo_root`.
 pub fn run(which: PrekRun, repo_root: &Path) -> Result<()> {
+    run_with(which, repo_root, &mut |args| run_prek(args, repo_root))
+}
+
+/// [`run`] with the `prek` invocation as a parameter, so the order and retrying of its calls can be checked.
+pub(crate) fn run_with(which: PrekRun, repo_root: &Path, prek: &mut dyn FnMut(&[String]) -> Result<()>) -> Result<()> {
     let read = |rel: &str| std::fs::read_to_string(repo_root.join(rel)).with_context(|| format!("reading {rel}"));
     let split = LintSplit::parse(&read(".github/lint.toml")?, &read("prek.toml")?)?;
-    let args = match which {
-        PrekRun::Portable => split.portable_args(),
-        PrekRun::PlatformDependent => match split.platform_dependent_args() {
-            Some(args) => args,
-            None => {
-                println!("xtask: .github/lint.toml lists no platform-dependent hook; nothing to run");
-                return Ok(());
+    let (prepare, args) = match which {
+        PrekRun::Portable => (split.portable_prepare_args(), split.portable_args()),
+        PrekRun::PlatformDependent => {
+            match (split.platform_dependent_prepare_args(), split.platform_dependent_args()) {
+                (Some(prepare), Some(args)) => (prepare, args),
+                _ => {
+                    println!("xtask: .github/lint.toml lists no platform-dependent hook; nothing to run");
+                    return Ok(());
+                }
             }
-        },
+        }
     };
+    // A config prek cannot parse fails the same way on every attempt, so check it
+    // locally before the retry loop below.
+    prek(&["validate-config".to_string(), "prek.toml".to_string()])?;
+    // Hook repositories and environments come from the network: fetch them under
+    // retry, then run the hooks once. Retrying the run would retry a lint failure.
+    println!("xtask: prek {}", prepare.join(" "));
+    crate::retry::until_ok("prek install-hooks", || prek(&prepare))?;
     println!("xtask: prek {}", args.join(" "));
-    let mut cmd = Command::new("prek");
-    let status = cmd
-        .args(&args)
-        .current_dir(repo_root)
-        .status()
-        .context("running prek (is it installed? `uv tool install prek`)")?;
-    if !status.success() {
-        bail!("prek {} failed: {status}", args.join(" "));
-    }
-    Ok(())
+    prek(&args)
+}
+
+fn run_prek(args: &[String], repo_root: &Path) -> Result<()> {
+    crate::command::run_inherited(Command::new("prek").args(args).current_dir(repo_root))
+        .map_err(|e| crate::command::hint_if_not_found(e, "is prek installed? `uv tool install prek`"))
 }

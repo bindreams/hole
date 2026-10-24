@@ -21,10 +21,12 @@ pub mod ci_nextest_parity;
 pub mod ci_platform_coverage;
 pub mod ci_timeouts;
 pub mod ci_toolchain_pins;
+pub mod command;
 // macOS-only: renders with the system font via the Typst library (a macOS-only
 // dependency — the DMG background is a darwin feature).
 #[cfg(target_os = "macos")]
 pub mod dmg_background;
+pub mod download;
 pub mod ex_ray;
 pub mod finish_vendor_bump;
 pub mod galoshes;
@@ -37,6 +39,7 @@ pub mod manifest;
 pub mod orchestrate;
 pub mod prek_split;
 pub mod pull_subrepo;
+pub mod retry;
 pub mod run_injected_env;
 pub mod schemars_pin;
 pub mod skuld_label_coverage;

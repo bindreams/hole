@@ -47,13 +47,11 @@ jobs:
           token: ${{ steps.nathan.outputs.token }}
 
       - name: Ensure origin/main is available
-        run: git fetch origin main --quiet
+        run: .github/scripts/retry.sh git fetch origin main --quiet
 
       - uses: ./.github/actions/setup-rust
 
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: crates/ex-ray/go.mod
+      - uses: ./.github/actions/setup-go
 
       # git-subrepo isn't part of the ubuntu-latest image or any
       # apt/npm/go package — it's a bash-script tool installed by cloning
@@ -62,7 +60,7 @@ jobs:
       # workflow's fixup logic targets.
       - name: Install git-subrepo 0.4.9
         run: |
-          git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
+          .github/scripts/retry.sh git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
           echo "$RUNNER_TEMP/git-subrepo/lib" >> "$GITHUB_PATH"
 
       - name: Determine dep + tag
@@ -115,6 +113,9 @@ jobs:
           git checkout -b "$branch"
           echo "ref_name=$branch" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch crate sources
+        run: .github/scripts/cargo-fetch.sh
+
       - name: git identity
         run: |
           git config user.name "nathan-blahaj[bot]"
@@ -139,6 +140,9 @@ jobs:
         id: finish
         if: steps.pull.outputs.result == 'clean'
         continue-on-error: true
+        # Its `go mod` fetches retry without a cap: this bound turns a fetch that can never succeed into a failed step
+        # (Push and the failure report still run) instead of a job timeout that cancels them.
+        timeout-minutes: 10
         run: cargo xtask finish-vendor-bump -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.dep }}" "${{ steps.target.outputs.tag }}"
 
       - name: Commit the conflicted tree anyway (CI-only policy — see VENDORING.md)
@@ -187,7 +191,7 @@ jobs:
           exit 1
 
       - name: Fail the job if Finish failed
-        if: steps.finish.outcome == 'failure'
+        if: steps.finish.outcome == 'failure' || steps.finish.outcome == 'cancelled'
         run: |
-          echo "::error::the 'Finish' step failed — see its log above for the reason (an identity-check failure, an unresolved .vendor-conflict sentinel left by a prior conflicted push, or an earlier error like a malformed go.mod/VENDORING.md heading). Any commits it made before failing were still pushed."
+          echo "::error::the 'Finish' step failed or timed out — see its log above for the reason (a go fetch that kept failing until the step timeout, an identity-check failure, an unresolved .vendor-conflict sentinel left by a prior conflicted push, or an earlier error like a malformed go.mod/VENDORING.md heading). Any commits it made before failing were still pushed."
           exit 1

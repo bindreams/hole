@@ -58,6 +58,9 @@ pub(crate) struct MockProxy {
     /// flight, instead of sleeping. One-shot per MockProxy. See
     /// bindreams/hole#383.
     start_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    /// If Some, run on every `start` once it is past the gate — where
+    /// production's plugin chain has already recorded its pid.
+    start_hook: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl MockProxy {
@@ -66,6 +69,7 @@ impl MockProxy {
             state: Arc::new(MockProxyState::default()),
             start_gate: None,
             start_entered: std::sync::Mutex::new(None),
+            start_hook: None,
         }
     }
 
@@ -79,6 +83,11 @@ impl MockProxy {
         let mut m = Self::new();
         m.start_gate = Some(gate);
         m
+    }
+
+    pub(crate) fn with_start_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.start_hook = Some(Box::new(hook));
+        self
     }
 
     fn with_entered_signal(mut self, tx: oneshot::Sender<()>) -> Self {
@@ -102,6 +111,9 @@ impl Proxy for MockProxy {
         }
         if let Some(gate) = self.start_gate.as_ref() {
             gate.notified().await;
+        }
+        if let Some(hook) = self.start_hook.as_ref() {
+            hook();
         }
         self.state.start_calls.fetch_add(1, Ordering::SeqCst);
         if self.state.fail_start.load(Ordering::SeqCst) {

@@ -18,6 +18,8 @@ jobs:
     # happening to stay idempotent on a repeat run.
     if: github.event.head_commit.author.name != 'nathan-blahaj[bot]'
     runs-on: ubuntu-latest
+    # The fetch below retries until it succeeds, so this is its bound.
+    timeout-minutes: 10
     steps:
       # `uses: ./...` (below) resolves against the checked-out workspace,
       # which is empty at job start — this bootstrap checkout exists only
@@ -37,6 +39,14 @@ jobs:
           token: ${{ steps.nathan.outputs.token }}
 
       - uses: astral-sh/setup-uv@v10.3.0
+
+      # `uv run` would fetch the Python dependencies outside any retry, so a
+      # lost network fails the push as if the update were wrong. A stale
+      # lockfile fails the same way on every attempt: check it offline first.
+      - name: Fetch msi-installer dependencies
+        run: |
+          uv lock --check --offline --directory msi-installer
+          .github/scripts/retry.sh uv sync --directory msi-installer
 
       - name: Update WiX URL and SHA256
         run: uv run --directory msi-installer upgrade-wix

@@ -490,3 +490,42 @@ fn skip_check_vendoring_integrity_matches_prek_toml_hook_id() {
          prek.toml's check-vendoring-integrity hook id"
     );
 }
+
+/// The network phase alone: it brings upstream's tag into the fetch ref and touches nothing else, so a
+/// retry of it repeats safely.
+#[skuld::test]
+fn the_fetch_phase_runs_alone_and_leaves_the_branch_untouched() {
+    let fx = Fixture::build(ConflictKind::None);
+    let head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
+
+    pull_subrepo::fetch_upstream(&fx.downstream, "vendor", "v2").unwrap();
+
+    let upstream_v2 = git_output(&fx.dir.path().join("upstream"), &["rev-parse", "v2^{commit}"]);
+    assert_eq!(
+        git_output(&fx.downstream, &["rev-parse", "refs/subrepo/vendor/fetch"]),
+        upstream_v2
+    );
+    assert_eq!(git_output(&fx.downstream, &["rev-parse", "HEAD"]), head);
+    assert!(git_output(&fx.downstream, &["branch", "--list", "subrepo/vendor"])
+        .trim()
+        .is_empty());
+    assert!(git_output(&fx.downstream, &["status", "--porcelain"]).trim().is_empty());
+}
+
+/// A tag upstream does not have is the answer of a reachable upstream, not a lost network: no retry makes it appear.
+#[skuld::test]
+fn a_tag_upstream_does_not_have_is_not_retried() {
+    let fx = Fixture::build(ConflictKind::None);
+    let err = pull_subrepo::fetch_upstream(&fx.downstream, "vendor", "this-tag-does-not-exist").unwrap_err();
+    assert!(crate::retry::is_permanent(&err), "{err:#}");
+    assert!(format!("{err:#}").contains("this-tag-does-not-exist"), "{err:#}");
+}
+
+/// `run` fetches before it pulls, so a nonexistent tag stops it there with the fetch phase's answer.
+#[skuld::test]
+fn a_nonexistent_tag_stops_the_run_at_the_fetch_phase() {
+    let fx = Fixture::build(ConflictKind::None);
+    let result = pull_subrepo::run(&fx.downstream, "vendor", "this-tag-does-not-exist");
+    let err = result.expect_err("a nonexistent tag must be an error");
+    assert!(format!("{err:#}").contains("does not exist upstream"), "{err:#}");
+}

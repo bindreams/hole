@@ -508,13 +508,18 @@ fn two_real_conflicts_are_both_reported() {
 }
 #[skuld::test]
 fn an_unexpected_pull_failure_surfaces_as_an_error_not_a_conflict() {
-    // A nonexistent tag fails at git-subrepo's fetch step, with neither
-    // the stale-parent stderr text nor the merge-conflict stdout text —
-    // handle_conflict's catch-all bail branch, otherwise untested by every
-    // other ConflictKind (which only ever produce one of those two).
+    // A failed pull with neither the stale-parent stderr text nor a conflict worktree takes
+    // handle_conflict's catch-all bail, otherwise untested by every other ConflictKind (which only ever
+    // produce one of those two). `run` turns a nonexistent tag away in its fetch phase, before the pull,
+    // so the failed pull here is any failed command.
     let fx = Fixture::build(ConflictKind::None);
-    let _err = pull_subrepo::run(&fx.downstream, "vendor", "this-tag-does-not-exist")
-        .expect_err("a nonexistent tag should surface as an Err, not Outcome::Conflicted");
+    let failed = std::process::Command::new("git")
+        .arg("--no-such-flag")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let _err = crate::pull_subrepo::conflict::handle_conflict(&fx.downstream, "vendor", "v2", &failed, None)
+        .expect_err("a failed pull with no conflict should surface as an Err, not Outcome::Conflicted");
 }
 #[skuld::test]
 fn allowlisted_conflict_resolves_from_a_linked_worktree() {
@@ -830,7 +835,7 @@ fn finish_conflict_fold_in_subrepo_commit_failure_is_disclosed() {
 #[skuld::test]
 fn handle_conflict_bails_when_the_worktree_has_no_unmerged_paths() {
     // handle_conflict's catch-all bail has two distinct triggers: no
-    // worktree at all (tested via a nonexistent tag, see
+    // worktree at all (tested by
     // an_unexpected_pull_failure_surfaces_as_an_error_not_a_conflict), and
     // a worktree that exists but has no unmerged paths at all — a
     // distinct, structurally load-bearing branch since this module's own
