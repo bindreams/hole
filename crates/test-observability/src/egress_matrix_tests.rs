@@ -189,8 +189,7 @@ fn a_permitted_host_that_is_down_on_its_own_is_waited_for_not_charged_to_the_cov
     );
 }
 
-/// How long past an outage the blocked host stays down by itself (a different anycast edge than the
-/// one that recovered). The scripted tick clock has no unit; this is longer than any run here.
+/// How long past an outage the blocked host stays down by itself, in ticks; longer than any run here.
 const BLOCK_STAYS_DOWN_FOR: u32 = 25;
 
 /// The network is down over `down` and the blocked host stays down for `BLOCK_STAYS_DOWN_FOR` ticks

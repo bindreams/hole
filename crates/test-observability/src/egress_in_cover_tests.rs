@@ -148,6 +148,22 @@ fn captured_readings_are_never_wavered() {
 }
 
 #[skuld::test]
+fn a_marker_that_was_read_leaves_the_outside_host_unprobed_whatever_the_vouch() {
+    // Something in the engage answered, so the judge has no outside host to ask about.
+    let why = || "x".to_string();
+    for markers in [[true, false], [false, true], [true, true]] {
+        assert_eq!(
+            Failure::captured(why(), CONTROL, &[false, false], &markers),
+            Failure::Failed {
+                why: why(),
+                targets: vec![]
+            },
+            "{markers:?}"
+        );
+    }
+}
+
+#[skuld::test]
 fn captured_readings_with_nothing_answering_leave_the_outside_host_to_the_judge() {
     let why = || "x".to_string();
     assert_eq!(
@@ -197,6 +213,10 @@ fn a_defect_is_a_defect_with_the_control_down() {
 fn a_wavering_is_waited_out_and_never_a_defect() {
     let net = Net::new(1..4, &[]);
     judged(&net, &clean, Failure::Wavered("wavered".into())).unwrap();
+    // open, then the control until it answers.
+    assert_eq!(*net.answered.borrow(), [true, false, false, false, true]);
+    assert!(net.probed.borrow().iter().all(|a| a == CONTROL));
+    assert_eq!(net.pauses.get(), 3);
 }
 
 #[skuld::test]
@@ -256,6 +276,10 @@ fn a_failed_target_that_is_down_outside_the_cover_is_waited_for() {
 fn a_failure_with_the_control_down_around_the_teardown_is_excused() {
     let net = Net::new(1..4, &[]);
     judged(&net, &clean, failed("no")).unwrap();
+    // open, the control on both sides of the teardown, then the control until it answers.
+    assert_eq!(*net.answered.borrow(), [true, false, false, false, true]);
+    assert!(net.probed.borrow().iter().all(|a| a == CONTROL));
+    assert_eq!(net.pauses.get(), 1);
 }
 
 #[skuld::test]

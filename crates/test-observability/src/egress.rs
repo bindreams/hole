@@ -138,6 +138,10 @@ pub fn read_with_network_up<T, E: std::fmt::Display>(
 /// A scenario that fails reports a [`Failure`] AFTER dropping its cover, built from the readings it
 /// took inside the cover ([`InCover`]); each run is bracketed by a `Window`. `blocked` lists every
 /// host the scenario claims the cover blocks.
+///
+/// A run that held is repeated when a `blocked` host does not answer outside the cover afterwards: its
+/// block claim was not observed. A host that was down only through the run and is back by then stays
+/// unseen, as with any outage between two probes.
 pub fn rerun_until_network_holds<T>(
     what: &str,
     control: &str,
@@ -366,7 +370,8 @@ pub(crate) fn rerun_until_network_holds_on<T>(
     loop {
         let window = open_window_on(host, what, control, blocked, hole_state)?;
         match scenario() {
-            Ok(value) => return Ok(value),
+            Ok(value) if blocked_hosts_answer(host, what, blocked) => return Ok(value),
+            Ok(_) => {}
             Err(failure) => judge_on(host, window, failure)?,
         }
     }
@@ -383,7 +388,8 @@ pub(crate) async fn rerun_until_network_holds_async_on<T>(
     loop {
         let window = open_window_on(host, what, control, blocked, hole_state)?;
         match scenario().await {
-            Ok(value) => return Ok(value),
+            Ok(value) if blocked_hosts_answer(host, what, blocked) => return Ok(value),
+            Ok(_) => {}
             Err(failure) => judge_on(host, window, failure)?,
         }
     }
@@ -407,6 +413,19 @@ pub(crate) async fn rerun_uncovered_on<T>(
             }
         }
     }
+}
+
+/// After a run that held: whether every host the scenario claims the cover blocks answers outside it.
+/// One that does not may have been down on its own through the run, so the claim was not observed: the
+/// run is repeated, and the next window waits for the host.
+fn blocked_hosts_answer(host: &mut impl Host, what: &str, blocked: &[&str]) -> bool {
+    let down = failing_targets(host, blocked);
+    if !down.is_empty() {
+        tracing::warn!(
+            "{what}: {down:?} do not answer outside the cover after a run that held, so its block claims were not observed; running again once they do"
+        );
+    }
+    down.is_empty()
 }
 
 pub(crate) fn open_window_on<'a>(

@@ -355,6 +355,26 @@ fn a_reading_that_fails_with_the_network_up_is_the_verdict_not_retaken() {
     assert_eq!(net.pauses.get(), 0);
 }
 
+#[skuld::test]
+fn a_reading_that_fails_during_an_outage_is_retaken_not_returned() {
+    // Probe before the read answers (tick 0); the read fails at tick 1 and the probe after it (tick 2) is
+    // down: the failure belongs to the outage, so the read is taken again once the control answers.
+    let net = Net::new(1..4, &[]);
+    let tries = Cell::new(0);
+    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+        tries.set(tries.get() + 1);
+        if net.step() {
+            Ok(7)
+        } else {
+            Err("no default route")
+        }
+    })
+    .unwrap();
+    assert_eq!(reading, 7);
+    assert_eq!(tries.get(), 2, "the failed reading was returned instead of retaken");
+    assert!(net.pauses.get() >= 1);
+}
+
 // rerun_until_network_holds ===========================================================================================
 
 fn scenario_result<T>(
@@ -399,6 +419,93 @@ fn a_scenario_that_left_a_cover_behind_is_a_defect_even_with_the_network_down() 
     .unwrap_err();
     assert!(err.contains("the permit probe failed"), "{err}");
     assert!(err.contains("the transient cover"), "{err}");
+}
+
+#[skuld::test]
+fn a_blocked_host_that_is_down_after_a_run_that_held_is_waited_for_and_the_run_repeated() {
+    // The host answers at open (ticks 0..2), then is down for the probe after the first run and answers again later.
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 2..6);
+    let runs = Cell::new(0);
+    let out = rerun_until_network_holds_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &[TARGET],
+        &clean,
+        || -> Result<_, Failure> {
+            runs.set(runs.get() + 1);
+            Ok("held")
+        },
+    )
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(
+        runs.get(),
+        2,
+        "a block claim was passed over a host that was down outside the cover"
+    );
+    assert!(
+        net.pauses.get() >= 1,
+        "the down host was not waited for before the repeat"
+    );
+}
+
+#[skuld::test]
+fn a_blocked_host_that_answers_after_a_run_that_held_ends_it() {
+    let net = Net::new(0..0, &[]);
+    let runs = Cell::new(0);
+    rerun_until_network_holds_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &[TARGET],
+        &clean,
+        || -> Result<_, Failure> {
+            runs.set(runs.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(runs.get(), 1);
+    assert_eq!(net.probes_of(TARGET), 2, "one probe at open and one after the run");
+}
+
+#[skuld::test]
+fn a_blocked_host_that_is_down_after_a_run_that_left_a_cover_is_a_defect() {
+    let cover = Cell::new(false);
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 2..u32::MAX);
+    let err = rerun_until_network_holds_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &[TARGET],
+        &|| cover.get().then(|| "the transient cover".to_string()),
+        || -> Result<(), Failure> {
+            cover.set(true);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("the transient cover"), "{err}");
+}
+
+#[skuld::test]
+fn the_async_runner_also_probes_the_blocked_hosts_after_a_run_that_held() {
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 2..6);
+    let runs = Cell::new(0);
+    ready(rerun_until_network_holds_async_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &[TARGET],
+        &clean,
+        async || -> Result<(), Failure> {
+            runs.set(runs.get() + 1);
+            Ok(())
+        },
+    ))
+    .unwrap();
+    assert_eq!(runs.get(), 2);
 }
 
 // The async entry points ==============================================================================================
