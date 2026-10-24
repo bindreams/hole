@@ -54,6 +54,7 @@ use std::time::{Duration, Instant};
 use tun::AbstractDevice;
 
 use super::engage;
+use crate::test_utils::resolver_set_uncovered;
 use crate::{GLOBAL_NET_STATE, TUN};
 
 /// TEST-NET-1 (RFC 5737). Not a real public resolver — a runner whose own
@@ -61,7 +62,6 @@ use crate::{GLOBAL_NET_STATE, TUN};
 /// nothing reaches 192.0.2.53 by accident.
 const RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
 const RESOLVER_NET: &str = "192.0.2.0/24";
-const NETWORK_CONTROL: &str = "1.1.1.1:443";
 const TUN_LOCAL: Ipv4Addr = Ipv4Addr::new(10, 255, 254, 5);
 const TUN_PEER: Ipv4Addr = Ipv4Addr::new(10, 255, 254, 6);
 
@@ -88,47 +88,8 @@ fn run(cmd: &str, args: &[&str]) -> (bool, String) {
     }
 }
 
-/// The resolver set and raw `scutil --dns` output. These tests engage no cover, so a held one is an earlier
-/// test's leak. The oracle reads the OS, so `no_cover_dir` names nothing.
-fn resolver_set(what: &str) -> (String, Vec<String>) {
-    let no_cover_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
-    hole_test_observability::egress::read_with_network_up(
-        what,
-        NETWORK_CONTROL,
-        &|| crate::test_utils::held_covers(no_cover_dir.path()),
-        || {
-            let dns = scutil_dns_checked()?;
-            let servers = nameservers(&dns);
-            Ok::<_, String>((dns, servers))
-        },
-    )
-}
-
 fn scutil_dns() -> String {
     run("scutil", &["--dns"]).1
-}
-
-/// `scutil --dns`, or why it could not be read: a failed read is taken again, not compared.
-fn scutil_dns_checked() -> Result<String, String> {
-    match run("scutil", &["--dns"]) {
-        (true, dns) => Ok(dns),
-        (false, why) => Err(why),
-    }
-}
-
-/// Every `nameserver[N] : ADDR` line, sorted and deduped — the structural
-/// shape of "which resolvers does this machine use", stable enough to
-/// compare before against after.
-fn nameservers(scutil_dns_output: &str) -> Vec<String> {
-    let mut out: Vec<String> = scutil_dns_output
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("nameserver["))
-        .map(str::to_owned)
-        .collect();
-    out.sort();
-    out.dedup();
-    out
 }
 
 // configd change notification =========================================================================================
@@ -364,7 +325,7 @@ impl Drop for RouteGuard {
 /// store thread, `Steering`) — not the mechanism itself — regressed.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_steer_global_net_state_steers_the_os_resolver() {
-    let (before_dns, before_nameservers) = resolver_set("the resolver set before");
+    let (before_dns, before_nameservers) = resolver_set_uncovered("the resolver set before");
     println!("[dns_steer] before:\n{before_dns}");
 
     // 1. Open a real utun. Name is NOT requested — kernel-assigned, read back
@@ -453,7 +414,7 @@ fn dns_steer_global_net_state_steers_the_os_resolver() {
     let out = route_guard.delete();
     println!("{out}");
 
-    let (after_dns, after_nameservers) = resolver_set("dns_steer: the resolver set after withdraw");
+    let (after_dns, after_nameservers) = resolver_set_uncovered("dns_steer: the resolver set after withdraw");
     println!("[dns_steer] after:\n{after_dns}");
 
     println!(

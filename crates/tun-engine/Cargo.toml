@@ -27,7 +27,7 @@ workspace = true
 # router without an OS device (`hole-bridge`, via a dev-dependency).
 # Production builds do NOT enable it, so none of these modules are compiled
 # into them. Same shape as garter's `test-utils`.
-test-utils = ["dep:rand"]
+test-utils = ["dep:rand", "dep:hole-test-observability"]
 
 [lib]
 harness = false
@@ -58,6 +58,8 @@ smoltcp = { version = "0.13", default-features = false, features = [
     # Hold a listener in SynReceived so the accept verdict precedes the SYN-ACK.
     "socket-tcp-pause-synack",
 ] }
+# `test-utils` feature: `test_utils::resolvers` reads the resolver set through the egress waits.
+hole-test-observability = { path = "../test-observability", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

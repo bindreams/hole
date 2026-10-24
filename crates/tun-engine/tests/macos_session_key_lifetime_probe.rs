@@ -113,6 +113,7 @@ mod macos_impl {
     use system_configuration::sys::schema_definitions::{
         kSCPropNetDNSSearchOrder, kSCPropNetDNSServerAddresses, kSCPropNetDNSSupplementalMatchDomains,
     };
+    use tun_engine::test_utils::resolver_set_uncovered;
 
     /// TEST-NET-1 (RFC 5737), distinct from `dns_steer/privileged_tests.rs`'s
     /// own resolver constant purely for grep-ability across logs — the two
@@ -121,8 +122,6 @@ mod macos_impl {
     /// been safe too.
     const LIFETIME_PROBE_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 60);
     const KILLED_PROCESS_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 61);
-
-    const NETWORK_CONTROL: &str = "1.1.1.1:443";
 
     const DNS_CONFIG_NOTIFY_KEY: &str = "com.apple.system.SystemConfiguration.dns_configuration";
 
@@ -146,51 +145,8 @@ mod macos_impl {
         }
     }
 
-    /// The resolver set and raw `scutil --dns` output. These tests engage no cover, so a held one is an
-    /// earlier test's leak. The oracle reads the OS, so `no_cover_dir` names nothing.
-    fn resolver_set(what: &str) -> (String, Vec<String>) {
-        let no_cover_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
-        hole_test_observability::egress::read_with_network_up(
-            what,
-            NETWORK_CONTROL,
-            &|| tun_engine::test_utils::held_covers(no_cover_dir.path()),
-            || {
-                let dns = scutil_dns_checked()?;
-                let servers = nameservers(&dns);
-                Ok::<_, String>((dns, servers))
-            },
-        )
-    }
-
     fn scutil_dns() -> String {
         run("scutil", &["--dns"]).1
-    }
-
-    /// `scutil --dns`, or why it could not be read: a failed read is taken again, not compared.
-    fn scutil_dns_checked() -> Result<String, String> {
-        match run("scutil", &["--dns"]) {
-            (true, dns) => Ok(dns),
-            (false, why) => Err(why),
-        }
-    }
-
-    /// Every `nameserver[N] : ADDR` line, sorted and deduped — the structural
-    /// shape of "which resolvers does this machine use", stable enough to
-    /// compare before against after. Duplicated from
-    /// `dns_steer/privileged_tests.rs` rather than shared: this file is a
-    /// separate binary, and `test_utils` (the crate's one shared privileged-
-    /// lane harness module) is explicitly for cross-platform/cross-crate
-    /// helpers, not single-file macOS-only FFI wrappers like this one.
-    fn nameservers(scutil_dns_output: &str) -> Vec<String> {
-        let mut out: Vec<String> = scutil_dns_output
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.starts_with("nameserver["))
-            .map(str::to_owned)
-            .collect();
-        out.sort();
-        out.dedup();
-        out
     }
 
     // configd change notification =====================================================================================
@@ -349,7 +305,7 @@ mod macos_impl {
     /// rule this plan carries forward from route ownership.
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn macos_dns_global_net_state_session_keys_die_with_their_session() {
-        let (before_dns, before_nameservers) = resolver_set("the resolver set before");
+        let (before_dns, before_nameservers) = resolver_set_uncovered("the resolver set before");
         println!("[lifetime-probe] before:\n{before_dns}");
 
         let session = uuid::Uuid::new_v4().to_string();
@@ -383,7 +339,7 @@ mod macos_impl {
         drop(store);
 
         let unmerged = notify.settle(budget(30), &resolver_str, false);
-        let (after_dns, after_nameservers) = resolver_set("lifetime probe: the resolver set after the drop");
+        let (after_dns, after_nameservers) = resolver_set_uncovered("lifetime probe: the resolver set after the drop");
         println!("[lifetime-probe] after drop (unmerged={unmerged}):\n{after_dns}");
 
         println!(
@@ -449,7 +405,7 @@ mod macos_impl {
     /// improvising an ungated sweep to cover the gap — **stop and escalate**.
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn macos_dns_global_net_state_session_keys_die_with_a_killed_process() {
-        let (before_dns, before_nameservers) = resolver_set("the resolver set before");
+        let (before_dns, before_nameservers) = resolver_set_uncovered("the resolver set before");
         println!("[killed-process-probe] before:\n{before_dns}");
 
         let exe = std::env::current_exe().expect("HARNESS: current_exe");
@@ -498,7 +454,8 @@ mod macos_impl {
         println!("[killed-process-probe] holder child exit status: {status:?}");
 
         let unmerged = notify.settle(budget(30), &resolver_str, false);
-        let (after_dns, after_nameservers) = resolver_set("killed-process probe: the resolver set after SIGKILL");
+        let (after_dns, after_nameservers) =
+            resolver_set_uncovered("killed-process probe: the resolver set after SIGKILL");
         println!("[killed-process-probe] after SIGKILL (unmerged={unmerged}):\n{after_dns}");
 
         let mut stderr = String::new();

@@ -28,16 +28,16 @@
 //! because this crate cannot reach that module's private items. It now
 //! exists three times: there, here, and
 //! `tun-engine/tests/macos_session_key_lifetime_probe.rs`, each carrying its
-//! own `unsafe` `notify_register_file_descriptor` declarations.
-//! `tun_engine::test_utils` is the natural home for one shared copy;
-//! tracked separately rather than done here.
+//! own `unsafe` `notify_register_file_descriptor` declarations. The resolver reads
+//! themselves are shared (`tun_engine::test_utils::resolver_set`).
 //!
 //! **The runner's own network is not under test.** The before and after resolver sets are read with
-//! a control host answering around them (`hole_test_observability::egress::read_with_network_up`),
-//! and a Start that fails is judged through a `Window` with the same control: a lost network is
-//! waited out, a failure with the network up is a defect. The control has no bypass route, so a failed
-//! Start that leaves its split routes behind would starve it: the Hole-state read ([`held_state`])
-//! counts those routes as held, which makes that failure a defect at once and never a wait.
+//! a control host answering around them (`tun_engine::test_utils::resolver_set`), and a Start that
+//! fails is run through `egress::rerun_uncovered` with the same control: a lost network is waited out,
+//! a failure with the network up is a defect. The control has no bypass route, so a failed Start that
+//! leaves its split routes behind would starve it: the Hole-state read ([`held_state`]) counts those
+//! routes as held, and a route it cannot read as held too, which makes that failure a defect at once
+//! and never a wait.
 //!
 //! `DnsConfig::default()` (real Cloudflare resolvers, DoH) is used rather
 //! than a synthetic/unreachable address: the bridge's own start-time
@@ -82,13 +82,9 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use hole_common::config::{DnsConfig, ServerEntry};
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
-use hole_test_observability::egress::{self, Failure, HoleState, Window};
-use tun_engine::test_utils::held_covers;
+use hole_test_observability::egress;
+use tun_engine::test_utils::{held_covers, nameservers, resolver_set, NETWORK_CONTROL};
 use util::port_alloc::Protocols;
-
-/// A host no cover and no tunnel here ever blocks: the control that tells a runner network loss
-/// from a Hole defect, for the resolver reads and the Start.
-const NETWORK_CONTROL: &str = "8.8.8.8:443";
 
 // configd change notification (duplicated from
 // `tun_engine::dns_steer::privileged_tests` — private to that crate, see
@@ -191,69 +187,57 @@ fn scutil_dns() -> String {
         .unwrap_or_else(|e| format!("HARNESS: failed to spawn scutil --dns: {e}"))
 }
 
-/// `scutil --dns`, or why it could not be read: a failed read is taken again, not compared.
-fn scutil_dns_checked() -> Result<String, String> {
-    let output = Command::new("scutil")
-        .arg("--dns")
-        .output()
-        .map_err(|e| format!("failed to spawn scutil --dns: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("scutil --dns exited with {}", output.status));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// The raw `scutil --dns` output and its resolver set, read with the network up: the runner's own
-/// resolver leaves with its network, so a set read while it was away is no evidence about Hole.
-fn resolver_set(what: &str, hole_state: HoleState<'_>) -> (String, Vec<String>) {
-    egress::read_with_network_up(what, NETWORK_CONTROL, hole_state, || {
-        let dns = scutil_dns_checked()?;
-        let servers = nameservers(&dns);
-        Ok::<_, String>((dns, servers))
-    })
-}
-
 /// What Hole holds right now: a cover, or its split routes through its own TUN. The routes are read
 /// from the kernel's lookup and attributed to Hole by the `utun` carrying `TUN_SUBNET`'s address.
 fn held_state(state_dir: &Path) -> Option<String> {
     held_covers(state_dir).or_else(split_routes_held)
 }
 
+/// A split route that cannot be read counts as held, with the cause: left-behind routes starve the
+/// control, so reading "nothing held" off a failed read would wait out a defect as a network loss.
 fn split_routes_held() -> Option<String> {
-    let tun_addr = TUN_SUBNET.split('/').next().expect("TUN_SUBNET has an address part");
     [SPLIT_LOW_PROBE, SPLIT_HIGH_PROBE].into_iter().find_map(|dest| {
-        let iface = route_get_interface(dest)?;
-        (iface.starts_with("utun") && utun_holds_address(&iface, tun_addr))
-            .then(|| format!("the split route covering {dest}, through Hole's TUN {iface}"))
+        split_route_held(dest)
+            .unwrap_or_else(|why| Some(format!("the split route covering {dest} could not be read: {why}")))
     })
 }
 
-/// Every `nameserver[N] : ADDR` line, sorted and deduped — the structural
-/// shape of "which resolvers does this machine use", stable enough to
-/// compare before against after. Same technique as
-/// `tun_engine::dns_steer::privileged_tests::nameservers`.
-fn nameservers(scutil_dns_output: &str) -> Vec<String> {
-    let mut out: Vec<String> = scutil_dns_output
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("nameserver["))
-        .map(str::to_owned)
-        .collect();
-    out.sort();
-    out.dedup();
-    out
+fn split_route_held(dest: &str) -> Result<Option<String>, String> {
+    let tun_addr = TUN_SUBNET.split('/').next().expect("TUN_SUBNET has an address part");
+    let Some(iface) = route_lookup(dest)? else {
+        return Ok(None);
+    };
+    if !iface.starts_with("utun") || !utun_address_held(&iface, tun_addr)? {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "the split route covering {dest}, through Hole's TUN {iface}"
+    )))
 }
 
-/// Whether `iface` currently holds `addr`, per `ifconfig <iface>`.
-fn utun_holds_address(iface: &str, addr: &str) -> bool {
-    let Ok(output) = Command::new("ifconfig").arg(iface).output() else {
-        return false;
-    };
-    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-        // `ifconfig` prints e.g. "\tinet 10.255.0.1 netmask 0xffffff00 ..."
+/// Whether `iface` currently holds `addr`, per `ifconfig <iface>`; `Err` when `ifconfig` could not answer.
+fn utun_address_held(iface: &str, addr: &str) -> Result<bool, String> {
+    let output = Command::new("ifconfig")
+        .arg(iface)
+        .output()
+        .map_err(|e| format!("ifconfig {iface} could not be spawned: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ifconfig {iface} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        // `ifconfig` prints e.g. "	inet 10.255.0.1 netmask 0xffffff00 ..."
         let mut fields = line.split_whitespace();
         fields.next() == Some("inet") && fields.next() == Some(addr)
-    })
+    }))
+}
+
+/// [`utun_address_held`] for a caller with no way to continue without the answer.
+fn utun_holds_address(iface: &str, addr: &str) -> bool {
+    utun_address_held(iface, addr).unwrap_or_else(|why| panic!("HARNESS: {why}"))
 }
 
 /// Every interface name `ifconfig -l` currently lists, in the order given.
@@ -320,14 +304,32 @@ const SPLIT_HIGH_PROBE: &str = "200.1.2.3";
 /// (typically the default), which the caller asserts differs from the TUN
 /// interface.
 fn route_get_interface(dest: &str) -> Option<String> {
+    route_lookup(dest).unwrap_or_else(|why| panic!("HARNESS: {why}"))
+}
+
+/// [`route_get_interface`], with `Err` when `route(8)` could not answer. It exits 0 for a present and an
+/// absent destination alike, so presence is its stdout's `interface:` line and absence its stderr's
+/// `not in table` (as `tun_engine`'s own `prefix_route` reads it); anything else is no answer.
+fn route_lookup(dest: &str) -> Result<Option<String>, String> {
     let output = Command::new("route")
         .args(["-n", "get", dest])
         .output()
-        .unwrap_or_else(|e| panic!("HARNESS: failed to spawn route -n get {dest}: {e}"));
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
+        .map_err(|e| format!("route -n get {dest} could not be spawned: {e}"))?;
+    if let Some(iface) = String::from_utf8_lossy(&output.stdout)
+        .lines()
         .find_map(|l| l.trim().strip_prefix("interface: "))
-        .map(str::to_owned)
+    {
+        return Ok(Some(iface.to_owned()));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not in table") {
+        return Ok(None);
+    }
+    Err(format!(
+        "route -n get {dest} reported neither an interface nor a confirmed absence (exit {}): {}",
+        output.status,
+        stderr.trim()
+    ))
 }
 
 // Config ==============================================================================================================
@@ -398,12 +400,8 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     let start_notify = DnsConfigNotify::register().expect("register for configd's dns_configuration notification");
 
     // A Full-mode Start needs the default route and an upstream, so it fails when the runner loses its
-    // network. No cover is engaged in this test, so the control is probed on both sides of the Start and
-    // the failure is judged by them.
-    loop {
-        let window = Window::open("macos full tunnel: Start", NETWORK_CONTROL, &[], &held)
-            .unwrap_or_else(|why| panic!("HARNESS: {why}"));
-        let control_before = egress::probe(NETWORK_CONTROL).is_ok();
+    // network.
+    egress::rerun_uncovered("macos full tunnel: Start", NETWORK_CONTROL, &held, async || {
         let resp = harness
             .send(BridgeRequest::Start {
                 config: config.clone(),
@@ -412,18 +410,13 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
             })
             .await
             .expect("send Start");
-        if matches!(resp, BridgeResponse::Ack) {
-            break;
+        match resp {
+            BridgeResponse::Ack => Ok(()),
+            other => Err(format!("expected Ack from Start, got {other:?}")),
         }
-        let control_after = egress::probe(NETWORK_CONTROL).is_ok();
-        let failure = Failure::uncovered(
-            format!("expected Ack from Start, got {resp:?}"),
-            &[control_before, control_after],
-        );
-        if let Err(why) = window.judge(failure) {
-            panic!("{why}");
-        }
-    }
+    })
+    .await
+    .unwrap_or_else(|why| panic!("{why}"));
 
     // (a) a live utun the OS did not have before.
     let after_start_ifaces = ifconfig_list();
