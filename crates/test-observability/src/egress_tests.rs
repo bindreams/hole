@@ -16,6 +16,8 @@ struct Net {
     down: Range<u32>,
     blocked: &'static [&'static str],
     probed: RefCell<Vec<String>>,
+    /// Whether each probe in `probed` answered, in the same order.
+    answered: RefCell<Vec<bool>>,
     dumps: Cell<u32>,
     pauses: Cell<u32>,
 }
@@ -27,6 +29,7 @@ impl Net {
             down,
             blocked,
             probed: RefCell::new(Vec::new()),
+            answered: RefCell::new(Vec::new()),
             dumps: Cell::new(0),
             pauses: Cell::new(0),
         }
@@ -47,13 +50,15 @@ impl Net {
 impl Host for &Net {
     fn probe(&mut self, addr: &str) -> io::Result<()> {
         self.probed.borrow_mut().push(addr.to_string());
-        if !self.step() {
-            return Err(io::ErrorKind::NetworkUnreachable.into());
-        }
-        if self.blocked.contains(&addr) {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        Ok(())
+        let result = if !self.step() {
+            Err(io::ErrorKind::NetworkUnreachable.into())
+        } else if self.blocked.contains(&addr) {
+            Err(io::ErrorKind::TimedOut.into())
+        } else {
+            Ok(())
+        };
+        self.answered.borrow_mut().push(result.is_ok());
+        result
     }
 
     fn pause(&mut self) {
@@ -263,7 +268,8 @@ fn scenario_result<T>(
 
 #[skuld::test]
 fn a_scenario_that_failed_while_the_network_was_down_is_rerun_until_it_holds() {
-    let net = Net::new(0..6, &[]);
+    // The control answers at open (tick 0); the outage then covers the in-cover probe and the judge.
+    let net = Net::new(1..6, &[]);
     let runs = Cell::new(0);
     let out = scenario_result(&net, &clean, || {
         runs.set(runs.get() + 1);
@@ -276,11 +282,140 @@ fn a_scenario_that_failed_while_the_network_was_down_is_rerun_until_it_holds() {
     })
     .unwrap();
     assert_eq!(out, "held");
-    assert!(runs.get() >= 2);
+    assert_eq!(runs.get(), 2);
 }
 
 #[skuld::test]
-fn a_scenario_that_failed_with_the_network_up_is_a_defect() {
+fn a_scenario_that_left_a_cover_behind_is_a_defect_even_with_the_network_down() {
+    let cover = Cell::new(false);
+    let net = Net::new(1..u32::MAX, &[]);
+    let err = scenario_result(
+        &net,
+        &|| cover.get().then(|| "the transient cover".to_string()),
+        || -> Result<(), String> {
+            cover.set(true);
+            Err("the permit probe failed".to_string())
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("the transient cover"), "{err}");
+}
+
+// Window ==============================================================================================================
+
+fn open<'a>(net: &Net, hole: HoleState<'a>) -> Result<Window<'a>, String> {
+    open_window_on(&mut { net }, "t", CONTROL, hole)
+}
+
+fn judge(net: &Net, window: Window<'_>, why: &str) -> Result<(), String> {
+    judge_on(&mut { net }, window, why.to_string())
+}
+
+#[skuld::test]
+fn a_window_opens_only_once_the_control_answers() {
+    let net = Net::new(0..2, &[]);
+    open(&net, &clean).unwrap();
+    assert_eq!(net.probes_of(CONTROL), 3);
+}
+
+#[skuld::test]
+fn a_window_does_not_open_while_hole_holds_a_cover_and_the_control_fails() {
+    let net = Net::new(0..u32::MAX, &[]);
+    let err = open(&net, &|| Some("a leaked cover".to_string()))
+        .err()
+        .expect("opened over a cover");
+    assert!(err.contains("a leaked cover"), "{err}");
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn a_window_does_not_open_over_a_cover_the_control_can_still_reach_through() {
+    // The control answers but Hole still holds a cover: the run would start from a dirty host.
+    let net = Net::new(0..0, &[]);
+    let err = open(&net, &|| Some("a leaked cover".to_string()))
+        .err()
+        .expect("opened over a cover");
+    assert!(err.contains("a leaked cover"), "{err}");
+}
+
+#[skuld::test]
+fn a_failed_run_with_the_control_answering_on_both_sides_is_a_defect() {
+    let net = Net::new(0..0, &[]);
+    let window = open(&net, &clean).unwrap();
+    let err = judge(&net, window, "the permit probe failed").unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("before and after"), "{err}");
+}
+
+#[skuld::test]
+fn a_failed_run_with_the_control_down_afterwards_is_excused_and_waited_out() {
+    // tick 0: control answers at open; tick 1..4: down at judge; the wait probes the control until it answers.
+    let net = Net::new(1..4, &[]);
+    let window = open(&net, &clean).unwrap();
+    judge(&net, window, "the permit probe failed").unwrap();
+    assert_eq!(*net.answered.borrow(), [true, false, false, false, true]);
+    assert!(net.probed.borrow().iter().all(|a| a == CONTROL));
+}
+
+#[skuld::test]
+fn a_failed_run_that_left_a_cover_is_a_defect_with_the_control_down() {
+    // The oracle reports nothing at open and a cover after the run: waiting for the control would wait forever.
+    let cover = Cell::new(false);
+    let hole = || cover.get().then(|| "the transient cover".to_string());
+    let net = Net::new(1..u32::MAX, &[]);
+    let window = open(&net, &hole).unwrap();
+    cover.set(true);
+    let err = judge(&net, window, "the permit probe failed").unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("the transient cover"), "{err}");
+    assert_eq!(
+        net.probes_of(CONTROL),
+        1,
+        "the control was waited on after a cover was found"
+    );
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn an_outage_before_the_window_is_not_charged_to_the_run() {
+    // The control is down at open and answers by the time the scenario starts.
+    let net = Net::new(0..3, &[]);
+    let window = open(&net, &clean).unwrap();
+    let started = net.tick.get();
+    assert!(started >= 3, "the window opened inside the outage");
+    let err = judge(&net, window, "the permit probe failed").unwrap_err();
+    assert!(err.contains("before and after"), "{err}");
+}
+
+#[skuld::test]
+fn every_rerun_is_preceded_by_a_control_probe_that_answered() {
+    // Run 1 fails with the control down at judge (ticks 1..4); run 2 holds.
+    let net = Net::new(1..4, &[]);
+    let starts = RefCell::new(Vec::new());
+    let out = scenario_result(&net, &clean, || {
+        starts.borrow_mut().push((net.probed.borrow().len(), net.tick.get()));
+        if starts.borrow().len() == 1 {
+            Err("the permit probe failed".to_string())
+        } else {
+            Ok("held")
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    let starts = starts.into_inner();
+    assert_eq!(starts.len(), 2, "the scenario must be rerun exactly once");
+    let (probes_at_rerun, tick_at_rerun) = starts[1];
+    assert!(tick_at_rerun >= 4, "the rerun started inside the outage");
+    assert!(
+        net.answered.borrow()[probes_at_rerun - 1],
+        "the last probe before the rerun did not answer"
+    );
+    assert_eq!(net.probed.borrow()[probes_at_rerun - 1], CONTROL);
+}
+
+#[skuld::test]
+fn a_scenario_that_fails_with_the_control_answering_on_both_sides_is_not_rerun() {
     let net = Net::new(0..0, &[]);
     let runs = Cell::new(0);
     let err = scenario_result(&net, &clean, || -> Result<(), String> {
@@ -289,20 +424,8 @@ fn a_scenario_that_failed_with_the_network_up_is_a_defect() {
     })
     .unwrap_err();
     assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("before and after"), "{err}");
     assert_eq!(runs.get(), 1);
-}
-
-#[skuld::test]
-fn a_scenario_that_left_a_cover_behind_is_a_defect_even_with_the_network_down() {
-    let net = Net::new(0..u32::MAX, &[]);
-    let err = scenario_result(
-        &net,
-        &|| Some("the transient cover".to_string()),
-        || -> Result<(), String> { Err("the permit probe failed".to_string()) },
-    )
-    .unwrap_err();
-    assert!(err.contains("the permit probe failed"), "{err}");
-    assert!(err.contains("the transient cover"), "{err}");
 }
 
 // connect_when_reachable ==============================================================================================

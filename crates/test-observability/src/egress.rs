@@ -5,7 +5,7 @@
 //! CI runner that briefly loses its network fails those probes exactly as a
 //! broken cover would, so a failed probe alone proves nothing about Hole.
 //!
-//! Two independent signals separate the two causes:
+//! Three independent signals separate the two causes:
 //!
 //! * **Hole's own state**, read from the OS by the caller ([`HoleState`]). A
 //!   failed probe while Hole still holds a cover is Hole's, whatever the network
@@ -15,13 +15,18 @@
 //! * **A control host** the lifted cover never blocks. It tells a lost network
 //!   from a target that is unreachable for another reason, and it is probed on
 //!   both sides of whatever it vouches for.
+//! * **A [`Window`]** around a scenario that probes while a cover is engaged. A
+//!   cover blocks every host but its own permits, so nothing can be probed inside
+//!   it; the control is probed just before the engage and just after the teardown
+//!   instead. A failed run is excused only when the control failed at either end.
+//!   The residual: an outage that starts and ends inside one scenario run.
 //!
 //! No wait here has a cap: each round re-probes the real condition, the test's
 //! own nextest timeout is the bound, and every change of state is logged.
 
 use std::io;
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod diagnostics;
 
@@ -102,13 +107,13 @@ pub fn read_with_network_up<T>(what: &str, control: &str, read: impl FnMut() -> 
     read_with_network_up_on(&mut System, what, control, read)
 }
 
-/// Run `scenario` (engage a cover, probe while it is engaged, tear it down) until
-/// it holds, and return its value.
+/// Run `scenario` (engage a cover, probe while it is engaged, tear it down) until it holds, and
+/// return its value.
 ///
-/// A probe made while the cover is engaged cannot use a control host: the cover
-/// blocks everything but its own permit. So a permit probe that fails is
-/// reported as `Err(why)` AFTER the scenario has dropped its cover, and the
-/// verdict is taken by [`judge_failed_run`].
+/// A probe made while the cover is engaged cannot use a control host: the cover blocks everything but
+/// its own permits. So a failed permit probe is reported as `Err(why)` AFTER the scenario has dropped
+/// its cover, and every run is bracketed by a [`Window`]: opened before the run (the control answers,
+/// Hole holds nothing), judged after it. Each rerun therefore starts only after the control answered.
 pub fn rerun_until_network_holds<T>(
     what: &str,
     control: &str,
@@ -118,18 +123,40 @@ pub fn rerun_until_network_holds<T>(
     rerun_until_network_holds_on(&mut System, what, control, hole_state, scenario)
 }
 
-/// The verdict on one failed run of a scenario whose cover has already been torn down, for a caller
-/// whose scenario cannot be a sync closure (it awaits): `Ok(())` means the network was down and has
-/// answered again, so run the scenario again; `Err` is a defect, to be reported as it stands.
+/// The control probes that bracket one run of a scenario that probes while a cover is engaged.
 ///
-/// * `hole_state` reports a cover: the scenario left one behind, a defect;
-/// * `control` fails: the network was down. It waits for `control` to answer;
-/// * `control` answers: the failure was the cover's, a defect, returned as `why`.
+/// [`Window::open`] waits (uncapped) until `control` answers and Hole holds nothing, then starts the
+/// clock. After the scenario tore its cover down, [`Window::judge`] decides what a failed run was:
 ///
-/// A control that answers does not prove the network was up during the failed probe: an outage that
-/// ended before the control probe reads as a permit failure.
-pub fn judge_failed_run(what: &str, control: &str, hole_state: HoleState<'_>, why: String) -> Result<(), String> {
-    judge_failed_run_on(&mut System, what, control, hole_state, why)
+/// * Hole holds a cover: the scenario left one behind, a defect;
+/// * `control` answers: it answered before the run and answers after it, so the network was up on both
+///   sides and the cover is the cause, a defect;
+/// * `control` fails: the network was down at the end of the run. It waits for `control` and returns
+///   `Ok(())`: run the scenario again.
+///
+/// Only [`Window::open`] builds one, so a caller cannot judge without a reading from before the run.
+/// For a caller whose scenario cannot be a sync closure (it awaits); the rest use
+/// [`rerun_until_network_holds`].
+pub struct Window<'a> {
+    what: &'a str,
+    control: &'a str,
+    hole_state: HoleState<'a>,
+    opened: Instant,
+}
+
+impl<'a> Window<'a> {
+    /// Wait until `control` answers and `hole_state` reports nothing, then open the window. `Err` when
+    /// Hole holds a cover before the run: waiting would never end it, and the run would start dirty.
+    pub fn open(what: &'a str, control: &'a str, hole_state: HoleState<'a>) -> Result<Window<'a>, String> {
+        open_window_on(&mut System, what, control, hole_state)
+    }
+
+    /// The verdict on one failed run, after its cover is torn down: `Ok(())` means the network was down
+    /// at the end of it and has answered again, so run the scenario again; `Err` is a defect, `why`
+    /// and what the window saw.
+    pub fn judge(self, why: String) -> Result<(), String> {
+        judge_on(&mut System, self, why)
+    }
 }
 
 /// Open a TCP connection to `addr` once the network answers, and return it. For a precondition that
@@ -289,20 +316,41 @@ pub(crate) fn rerun_until_network_holds_on<T>(
     mut scenario: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
     loop {
+        let window = open_window_on(host, what, control, hole_state)?;
         match scenario() {
             Ok(value) => return Ok(value),
-            Err(why) => judge_failed_run_on(host, what, control, hole_state, why)?,
+            Err(why) => judge_on(host, window, why)?,
         }
     }
 }
 
-pub(crate) fn judge_failed_run_on(
+pub(crate) fn open_window_on<'a>(
     host: &mut impl Host,
-    what: &str,
-    control: &str,
-    hole_state: HoleState<'_>,
-    why: String,
-) -> Result<(), String> {
+    what: &'a str,
+    control: &'a str,
+    hole_state: HoleState<'a>,
+) -> Result<Window<'a>, String> {
+    wait_for_egress_on(host, what, &[control], hole_state)?;
+    if let Some(held) = hole_state() {
+        return Err(format!(
+            "{what}: Hole already holds {held} before the scenario engages anything"
+        ));
+    }
+    Ok(Window {
+        what,
+        control,
+        hole_state,
+        opened: Instant::now(),
+    })
+}
+
+pub(crate) fn judge_on(host: &mut impl Host, window: Window<'_>, why: String) -> Result<(), String> {
+    let Window {
+        what,
+        control,
+        hole_state,
+        opened,
+    } = window;
     if let Some(held) = hole_state() {
         return Err(format!(
             "{why}
@@ -310,11 +358,15 @@ pub(crate) fn judge_failed_run_on(
         ));
     }
     if host.probe(control).is_ok() {
-        return Err(why);
+        return Err(format!(
+            "{why}
+{what}: {control} answered before and after a {:?} window and Hole holds no cover, so the cover is the cause",
+            opened.elapsed()
+        ));
     }
     tracing::warn!(
         "{what}: {why}
-{control} does not answer, so the network was down; running the scenario again once it does"
+{control} does not answer after the run, so the network was down; running the scenario again once it does"
     );
     wait_for_egress_on(host, what, &[control], hole_state)
 }

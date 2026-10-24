@@ -409,8 +409,11 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
 
     // Phase B runs again while the runner's network is down: the probes that need a route off the box (the
     // bypass route's winner, the no-leak target) cannot tell a lost network from a cover, and a lockdown
-    // cover blocks every control host. A run whose off-box probes never reached the stack is judged only
-    // after the cover is released, by `judge_failed_run`.
+    // cover blocks every control host. Each run is bracketed by a `Window` (control probes outside any
+    // cover); a run whose probes failed is judged only after the cover is released.
+    let control = no_leak_target_addr().to_string();
+    let state_dir = harness.state_dir.path().to_path_buf();
+    let held = || tun_engine::test_utils::held_lockdown(&state_dir);
     let (
         arm,
         armed,
@@ -422,6 +425,8 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         permitted_reachable,
         path_to_no_leak,
     ) = loop {
+        let window = hole_test_observability::egress::Window::open("live-tun-permit phase B", &control, &held)
+            .unwrap_or_else(|why| panic!("HARNESS: {why}"));
         // Recovery record + escape guard BEFORE anything is armed — written once
         // the harness's state directory exists, well before the SetLockdown{true}
         // call below. From here on the function is unwind-safe even though Phase
@@ -493,17 +498,16 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
 
         let off_box_probe_failed = start_b_acked
             && (!no_leak.is_some_and(|fate| fate.is_verdict())
-                || !matches!(&path_to_no_leak, Some(Ok(iface)) if iface == bypass.interface()));
+                || !matches!(&path_to_no_leak, Some(Ok(iface)) if iface == bypass.interface())
+                || permitted_reachable != Some(ProbeFate::Delivered));
         if off_box_probe_failed {
             let why = format!(
-                "the off-box probes of phase B never reached the stack: no_leak={no_leak:?},                  path_to_no_leak={path_to_no_leak:?} (expected the bypass interface '{}')",
+                "the probes of phase B never reached the stack: no_leak={no_leak:?}, \
+                 path_to_no_leak={path_to_no_leak:?} (expected the bypass interface '{}'), \
+                 permitted_reachable={permitted_reachable:?}",
                 bypass.interface()
             );
-            let control = no_leak_target_addr().to_string();
-            let held = || tun_engine::test_utils::held_lockdown(harness.state_dir.path());
-            if let Err(why) =
-                hole_test_observability::egress::judge_failed_run("live-tun-permit phase B", &control, &held, why)
-            {
+            if let Err(why) = window.judge(why) {
                 panic!("HARNESS: {why}");
             }
             continue;
