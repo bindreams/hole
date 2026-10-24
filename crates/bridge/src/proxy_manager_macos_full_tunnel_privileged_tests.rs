@@ -23,13 +23,9 @@
 //! `com.apple.system.SystemConfiguration.dns_configuration` notification
 //! before the mutating call (`Start`, then `Stop`) and block on it before
 //! reading `scutil --dns`** — a bare read races configd's own
-//! recomputation and can pass vacuously in either direction. The harness is
-//! copied from `tun_engine::dns_steer::privileged_tests` — the original —
-//! because this crate cannot reach that module's private items. It now
-//! exists three times: there, here, and
-//! `tun-engine/tests/macos_session_key_lifetime_probe.rs`, each carrying its
-//! own `unsafe` `notify_register_file_descriptor` declarations. The resolver reads
-//! themselves are shared (`tun_engine::test_utils::resolver_set`).
+//! recomputation and can pass vacuously in either direction. The notification
+//! and the resolver reads are shared with the tun-engine DNS tests
+//! (`tun_engine::test_utils::{DnsConfigNotify, resolver_set}`).
 //!
 //! **The runner's own network is not under test.** The before and after resolver sets are read with
 //! a control host answering around them (`tun_engine::test_utils::resolver_set`), and a Start that
@@ -68,8 +64,6 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
-use std::ffi::CString;
-use std::io;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -83,95 +77,8 @@ use crate::test_support::skuld_fixtures::*;
 use hole_common::config::{DnsConfig, ServerEntry};
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
 use hole_test_observability::egress;
-use tun_engine::test_utils::{held_covers, nameservers, resolver_set, NETWORK_CONTROL};
+use tun_engine::test_utils::{held_covers, nameservers, resolver_set, DnsConfigNotify, NETWORK_CONTROL};
 use util::port_alloc::Protocols;
-
-// configd change notification (duplicated from
-// `tun_engine::dns_steer::privileged_tests` — private to that crate, see
-// module doc) =========================================================================================================
-
-const DNS_CONFIG_NOTIFY_KEY: &str = "com.apple.system.SystemConfiguration.dns_configuration";
-
-extern "C" {
-    fn notify_register_file_descriptor(
-        name: *const libc::c_char,
-        notify_fd: *mut libc::c_int,
-        flags: libc::c_int,
-        out_token: *mut libc::c_int,
-    ) -> u32;
-    fn notify_cancel(token: libc::c_int) -> u32;
-}
-
-/// A live registration for configd's DNS-configuration-changed notification.
-/// Every wait below rendezvous on this rather than on elapsed time; the
-/// `deadline` passed to `wait`/`settle` is the failure bound surfaced to a
-/// human when configd never posts, not a sync sleep.
-struct DnsConfigNotify {
-    fd: libc::c_int,
-    token: libc::c_int,
-}
-
-impl DnsConfigNotify {
-    fn register() -> Option<Self> {
-        let name = CString::new(DNS_CONFIG_NOTIFY_KEY).expect("notify key has no interior NUL");
-        let mut fd: libc::c_int = -1;
-        let mut token: libc::c_int = 0;
-        // SAFETY: `name` is a valid NUL-terminated string that outlives the
-        // call; `fd`/`token` are live out-params.
-        let status = unsafe { notify_register_file_descriptor(name.as_ptr(), &mut fd, 0, &mut token) };
-        (status == 0).then_some(Self { fd, token })
-    }
-
-    fn wait(&self, deadline: Instant) -> bool {
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            let millis = libc::c_int::try_from(remaining.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
-            let mut pfd = libc::pollfd {
-                fd: self.fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: single live pollfd, count matches.
-            match unsafe { libc::poll(&mut pfd, 1, millis) } {
-                -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
-                -1 => return false,
-                0 => return false,
-                _ => {
-                    let mut token_be = [0u8; 4];
-                    // SAFETY: reading 4 bytes into a 4-byte buffer.
-                    let n = unsafe { libc::read(self.fd, token_be.as_mut_ptr().cast(), 4) };
-                    return n == 4;
-                }
-            }
-        }
-    }
-
-    /// Block until `scutil --dns` mentioning `needle` equals `want`, driven
-    /// by configd's own change posts. Checks the predicate first so an
-    /// already-satisfied state needs no event at all.
-    fn settle(&self, deadline: Instant, needle: &str, want: bool) -> bool {
-        loop {
-            if scutil_dns().contains(needle) == want {
-                return true;
-            }
-            if !self.wait(deadline) {
-                return scutil_dns().contains(needle) == want;
-            }
-        }
-    }
-}
-
-impl Drop for DnsConfigNotify {
-    fn drop(&mut self) {
-        // SAFETY: token was produced by a successful registration.
-        unsafe {
-            notify_cancel(self.token);
-        }
-    }
-}
 
 fn budget(secs: u64) -> Instant {
     Instant::now() + Duration::from_secs(secs)

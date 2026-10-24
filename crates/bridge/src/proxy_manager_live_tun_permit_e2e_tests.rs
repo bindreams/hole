@@ -221,9 +221,7 @@ fn install_bypass_route(gw: &GatewayInfo) -> Bypass {
 /// Duplicates macOS `route(8)`'s exit-0-on-failure oracle
 /// (`tun_engine::routing::macos_route_command_succeeded` /
 /// `macos_route_confirmed_absent`) rather than importing it — both are
-/// `pub(crate)` to `tun-engine`, unreachable from this crate — the same
-/// reason this file already duplicates its `DnsConfigNotify` harness from
-/// `tun_engine::dns_steer::privileged_tests` (see the module doc).
+/// `pub(crate)` to `tun-engine`, unreachable from this crate.
 struct MacosGatewayRoute {
     dest: IpAddr,
     gateway: IpAddr,

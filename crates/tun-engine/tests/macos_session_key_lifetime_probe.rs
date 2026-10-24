@@ -98,7 +98,6 @@ const GLOBAL_NET_STATE: skuld::Label;
 mod macos_impl {
     use super::{GLOBAL_NET_STATE, HOLDER_ENV, TUN};
 
-    use std::ffi::CString;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{IpAddr, Ipv4Addr};
     use std::process::{Child, Command, Stdio};
@@ -113,7 +112,7 @@ mod macos_impl {
     use system_configuration::sys::schema_definitions::{
         kSCPropNetDNSSearchOrder, kSCPropNetDNSServerAddresses, kSCPropNetDNSSupplementalMatchDomains,
     };
-    use tun_engine::test_utils::resolver_set_uncovered;
+    use tun_engine::test_utils::{resolver_set_uncovered, DnsConfigNotify};
 
     /// TEST-NET-1 (RFC 5737), distinct from `dns_steer/privileged_tests.rs`'s
     /// own resolver constant purely for grep-ability across logs — the two
@@ -122,8 +121,6 @@ mod macos_impl {
     /// been safe too.
     const LIFETIME_PROBE_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 60);
     const KILLED_PROCESS_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 61);
-
-    const DNS_CONFIG_NOTIFY_KEY: &str = "com.apple.system.SystemConfiguration.dns_configuration";
 
     fn budget(secs: u64) -> Instant {
         Instant::now() + Duration::from_secs(secs)
@@ -147,94 +144,6 @@ mod macos_impl {
 
     fn scutil_dns() -> String {
         run("scutil", &["--dns"]).1
-    }
-
-    // configd change notification =====================================================================================
-
-    extern "C" {
-        fn notify_register_file_descriptor(
-            name: *const libc::c_char,
-            notify_fd: *mut libc::c_int,
-            flags: libc::c_int,
-            out_token: *mut libc::c_int,
-        ) -> u32;
-        fn notify_cancel(token: libc::c_int) -> u32;
-    }
-
-    /// A live registration for configd's DNS-configuration-changed
-    /// notification — see the module doc for why every wait here rendezvous
-    /// on this rather than on elapsed time.
-    struct DnsConfigNotify {
-        fd: libc::c_int,
-        token: libc::c_int,
-    }
-
-    impl DnsConfigNotify {
-        fn register() -> Option<Self> {
-            let name = CString::new(DNS_CONFIG_NOTIFY_KEY).expect("notify key has no interior NUL");
-            let mut fd: libc::c_int = -1;
-            let mut token: libc::c_int = 0;
-            // SAFETY: `name` is a valid NUL-terminated string that outlives
-            // the call; `fd`/`token` are live out-params.
-            let status = unsafe { notify_register_file_descriptor(name.as_ptr(), &mut fd, 0, &mut token) };
-            (status == 0).then_some(Self { fd, token })
-        }
-
-        /// Block until configd posts a DNS-configuration change, or
-        /// `deadline` passes. `deadline` is a failure bound on an EXTERNAL
-        /// event, not a sync sleep — see the module doc.
-        fn wait(&self, deadline: Instant) -> bool {
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return false;
-                }
-                let millis = libc::c_int::try_from(remaining.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
-                let mut pfd = libc::pollfd {
-                    fd: self.fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: single live pollfd, count matches.
-                match unsafe { libc::poll(&mut pfd, 1, millis) } {
-                    -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
-                    -1 => return false,
-                    0 => return false,
-                    _ => {
-                        let mut token_be = [0u8; 4];
-                        // SAFETY: reading 4 bytes into a 4-byte buffer.
-                        let n = unsafe { libc::read(self.fd, token_be.as_mut_ptr().cast(), 4) };
-                        return n == 4;
-                    }
-                }
-            }
-        }
-
-        /// Block until `scutil --dns` mentioning `needle` equals `want`,
-        /// driven by configd's own change posts. Checks the predicate first
-        /// so an already-satisfied state needs no event at all — this is
-        /// what makes registering AFTER a mutation that may already have
-        /// landed (Step 2b registers after the holder's readiness line, not
-        /// before its `engage` call) still sound.
-        fn settle(&self, deadline: Instant, needle: &str, want: bool) -> bool {
-            loop {
-                if scutil_dns().contains(needle) == want {
-                    return true;
-                }
-                if !self.wait(deadline) {
-                    return scutil_dns().contains(needle) == want;
-                }
-            }
-        }
-    }
-
-    impl Drop for DnsConfigNotify {
-        fn drop(&mut self) {
-            // SAFETY: token was produced by a successful registration.
-            unsafe {
-                notify_cancel(self.token);
-            }
-        }
     }
 
     // Raw dictionary construction (Step 2 ONLY) =======================================================================
