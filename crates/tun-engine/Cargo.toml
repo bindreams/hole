@@ -103,8 +103,7 @@ skuld = { workspace = true }
 util = { path = "../util", features = ["test-support"] }
 hole-test-observability = { path = "../test-observability" }
 # The integration tests (`tests/*.rs`) link the library built without `cfg(test)`, so they reach
-# `test_utils` (the cover oracle) only through the feature. Dev-dependencies are never built into a
-# production artifact.
+# `test_utils` (the cover oracle) only through the feature.
 tun-engine = { path = ".", features = ["test-utils"] }
 # Recovery-path redaction tests capture tracing output through a
 # `RedactingWriter`: `WaitableWriter` (garter's `test-utils` feature) as the

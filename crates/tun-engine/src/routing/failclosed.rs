@@ -1105,8 +1105,6 @@ mod boot_time_tripwire_tests;
 #[path = "failclosed/stale_key_policy_tests.rs"]
 mod stale_key_policy_tests;
 
-// Reads back what Hole's covers hold, for the privileged tests' egress waits (this crate's and the bridge's, through
-// `test_utils`). Windows and macOS only: the covers exist nowhere else.
 #[cfg(all(any(test, feature = "test-utils"), any(target_os = "windows", target_os = "macos")))]
 #[path = "failclosed/cover_oracle.rs"]
 pub(crate) mod cover_oracle;

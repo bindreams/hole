@@ -6,8 +6,6 @@
 //! be a defect. Fixing one placement at a time is how a new hole appears in the last fix; the matrix
 //! is what has to hold.
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
-
 use super::*;
 
 /// The server permit, which is also the control host (as in the lockdown scenarios).
@@ -53,7 +51,7 @@ fn placements() -> Vec<Range<u32>> {
 }
 
 /// The whole run a privileged test makes: a window around one engage-probe-release scenario, then the
-/// check that egress is back. A panic is a defect like an `Err`.
+/// check that egress is back.
 fn full_run(net: &Net, cover: Cover, with_second: bool) -> Result<(), String> {
     let hole = || net.cover.get().then(|| "a cover".to_string());
     let scenario = || {
@@ -70,14 +68,9 @@ fn full_run(net: &Net, cover: Cover, with_second: bool) -> Result<(), String> {
         }
         verdict
     };
-    let ran = catch_unwind(AssertUnwindSafe(|| {
-        rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)
-    }));
-    match ran {
-        Err(_) => Err("the scenario panicked".to_string()),
-        Ok(Err(why)) => Err(why),
-        Ok(Ok(())) => check_egress_restored_on(&mut { net }, "t", &[BLOCK], CONTROL, &hole),
-    }
+    // A run that never settles panics in the scripted host: a spin fails the test, it is not a verdict.
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)?;
+    check_egress_restored_on(&mut { net }, "t", &[BLOCK], CONTROL, &hole)
 }
 
 fn verdicts(cover: Cover, with_second: bool, net: impl Fn(Range<u32>) -> Net) -> Vec<(Range<u32>, Result<(), String>)> {

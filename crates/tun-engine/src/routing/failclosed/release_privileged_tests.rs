@@ -401,10 +401,12 @@ fn macos_release_all_sees_a_transient_cover_whose_record_is_gone() {
         .release_all_covers()
         .expect("release_all_covers must clear the stranded transient cover");
 
-    assert!(
-        held.is_some(),
-        "pf still blocks with the record gone, so the oracle must still report the cover"
-    );
+    let held = held.expect("pf still blocks with the record gone, so the oracle must still report the cover");
+    // The answer must come from the live ruleset: not from a record (there is none) and not from a pf
+    // that could not be asked, which would also read as held.
+    assert!(held.contains("the live pf ruleset has a block rule"), "{held}");
+    assert!(!held.contains("its state record exists"), "{held}");
+    assert!(!held.contains("pf could not be asked"), "{held}");
 }
 
 // windows_release_all_on_a_clean_host_is_ok / macos counterpart =======================================================

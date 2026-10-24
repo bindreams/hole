@@ -3,9 +3,7 @@
 //! The egress waits in `hole_test_observability::egress` take this as their `HoleState`: an unreachable
 //! target while a cover is installed is Hole's, never the runner's network. The reads are the ones the
 //! production code already makes for the same question, so a test cannot disagree with the sweep about
-//! what is installed. The state directory a cover was engaged with is never what answers alone: a cover
-//! an earlier test left under another directory, or one whose record a release cleared while the firewall
-//! still blocks, reads as held.
+//! what is installed.
 
 use std::path::Path;
 
@@ -36,7 +34,7 @@ fn lockdown_held(state_dir: &Path) -> Option<String> {
         .then(|| format!("a standing lockdown cover (OS says {presence:?})"))
 }
 
-/// Windows: the transient cover's twelve fixed filter keys, read the way the lockdown probe reads its own.
+/// Windows: the transient cover's fixed filter keys.
 #[cfg(target_os = "windows")]
 fn transient_held(_state_dir: &Path) -> Option<String> {
     let presence = super::platform::transient_cover_presence();
@@ -72,10 +70,22 @@ fn live_main_ruleset_blocks() -> Option<bool> {
     use crate::routing::{run_capturing, BestEffortPhase};
     use util::system_tool::SystemTool;
 
-    let out = run_capturing(SystemTool::Pfctl, &["-sr"], None, BestEffortPhase::RecoverCover).ok()?;
-    out.status
-        .success()
-        .then(|| ruleset_has_block_rule(&String::from_utf8_lossy(&out.stdout)))
+    let out = match run_capturing(SystemTool::Pfctl, &["-sr"], None, BestEffortPhase::RecoverCover) {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!("pfctl -sr could not run, so pf could not be asked: {e}");
+            return None;
+        }
+    };
+    if !out.status.success() {
+        tracing::warn!(
+            "pfctl -sr exited {}, so pf could not be asked: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    Some(ruleset_has_block_rule(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// Whether a `pfctl -sr` listing has a block rule: a rule line whose first word is `block`. A clean

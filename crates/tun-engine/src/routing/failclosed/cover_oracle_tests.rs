@@ -39,3 +39,32 @@ fn a_line_that_only_mentions_block_is_not_a_block_rule() {
                    blocklist\n";
     assert!(!ruleset_has_block_rule(listing));
 }
+
+// The macOS oracle reads a block rule off `pfctl -sr`; these feed it the rulesets Hole's own builders emit,
+// so a builder that stops starting a line with `block` blinds the oracle here, not only in the privileged lane.
+
+#[cfg(target_os = "macos")]
+const SERVER: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+#[cfg(target_os = "macos")]
+const RESOLVER: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 53));
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn the_transient_ruleset_without_a_resolver_has_a_block_rule() {
+    let ruleset = super::platform::build_pf_ruleset(SERVER, None);
+    assert!(ruleset_has_block_rule(&ruleset), "{ruleset}");
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn the_transient_ruleset_with_a_resolver_has_a_block_rule() {
+    let ruleset = super::platform::build_pf_ruleset(SERVER, Some(RESOLVER));
+    assert!(ruleset_has_block_rule(&ruleset), "{ruleset}");
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn the_lockdown_main_ruleset_has_a_block_rule() {
+    let ruleset = super::platform::build_lockdown_main_ruleset("utun9", SERVER, "");
+    assert!(ruleset_has_block_rule(&ruleset), "{ruleset}");
+}

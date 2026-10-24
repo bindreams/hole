@@ -61,8 +61,6 @@ use crate::{GLOBAL_NET_STATE, TUN};
 /// nothing reaches 192.0.2.53 by accident.
 const RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
 const RESOLVER_NET: &str = "192.0.2.0/24";
-/// A host the runner reaches while its network is up; a failing probe of it means the network is
-/// gone, which takes the runner's own resolvers with it.
 const NETWORK_CONTROL: &str = "1.1.1.1:443";
 const TUN_LOCAL: Ipv4Addr = Ipv4Addr::new(10, 255, 254, 5);
 const TUN_PEER: Ipv4Addr = Ipv4Addr::new(10, 255, 254, 6);
@@ -90,10 +88,8 @@ fn run(cmd: &str, args: &[&str]) -> (bool, String) {
     }
 }
 
-/// The resolver set and its raw `scutil --dns` output, taken with the network answering on both sides: the
-/// runner's own resolvers vanish with its network. These tests engage no cover, so a cover that blocks the
-/// control is an earlier test's leak and fails the reading at once; the oracle reads the OS (the live pf
-/// ruleset), so the directory it is handed names nothing.
+/// The resolver set and raw `scutil --dns` output. These tests engage no cover, so a held one is an earlier
+/// test's leak. The oracle reads the OS, so `no_cover_dir` names nothing.
 fn resolver_set(what: &str) -> (String, Vec<String>) {
     let no_cover_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
     hole_test_observability::egress::read_with_network_up(
