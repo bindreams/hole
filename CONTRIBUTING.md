@@ -2375,8 +2375,8 @@ guard's own doc for its disclosed gap.
 #### Concurrent writers
 
 The tray's Unblock (`handle_unblock`) takes none of `ProxyManager`'s locks, so it
-runs while a start, a stop or a reconcile is mid-flight. Every record both can
-write is therefore ordered by something that is not that mutex:
+runs while a start, a stop or a reconcile is mid-flight. Each thing both can
+write is ordered by something that is not that mutex:
 
 - `bridge-lockdown.json`: `lockdown_state::update` classifies, decides and writes
   under one in-process lock. The start's adoption promotion is
@@ -2393,28 +2393,42 @@ write is therefore ordered by something that is not that mutex:
   concurrent rename-replace can fail a read on Windows). A reap removes only the
   records it accounted for; the file goes when none remain. That rewrite keeps
   the owner of the file it replaces unless the caller names one; an append does not.
+- A cover installed after an Unblock released: `failclosed::release_epoch`.
+  Every release entry (`release_all`, `disengage_lockdown`, both through
+  `sweep_with_witness`) calls `begin_release` before its first firewall call, and
+  `handle_unblock` holds its own guard through the persisted `Off`. An install
+  opens a `ReleaseWatch` first, which refuses while a release is in flight, and
+  checks it after: the facade's `engage` / `engage_lockdown` on both platforms
+  (the cover is dropped, `SupersededByRelease`), and `start_cancellable` after
+  every `install_failclosed_cover` and `install_lockdown` (the cover is dropped,
+  the start is `Cancelled`). The epoch is a leaf lock over two integers per
+  `state_dir`; a release never waits for an install, which is what keeps Unblock
+  working while a start wedges. `Cover::drop` does not begin a release, so a
+  start's own teardown cannot cancel that start.
 - macOS `bridge-failclosed.json` and `bridge-lockdown-pf.json`: a `pfctl` call
-  cannot run under a lock, so these are optimistic. An engage reads the record at
-  entry, writes with `swap` (a compare against that view), and checks `holds`
-  after its ruleset loads; a release clears with `clear_if_token`, only the record
-  it acted on. A lost compare or a failed check is
-  `RoutingError::SupersededByRelease`: the engage drops what it took, restores the
-  host, and the start reports cancelled. That holds for the transient cover too:
-  the start is cancelled, not run uncovered and not retried with another engage.
-  A standing engage backs out the same way when its check fails and when its
-  own load fails: it restores the baseline it holds in memory, not the record
-  on disk (a release removed that), then clears the record and drops the token
-  only if the record still names its token. A restore that fails keeps both.
+  cannot run under a lock, so these are claimed rather than locked
+  ([`pf_claim`](crates/tun-engine/src/routing/failclosed/pf_claim.rs)). A release
+  rewrites each live record as a tombstone (`releasing: true`, absent from every
+  ordinary record) before any pf call, restores, clears the tombstone, and drops
+  the token only if its own clear removed it. An engage reads the record at entry,
+  writes with `swap` (a compare against that view), and checks `holds` after its
+  ruleset loads: a tombstone, a missing record or another token is
+  `SupersededByRelease` (the start is cancelled, also for the transient cover); a
+  record that cannot be read is a failure, not a release. A back-out restores the
+  baseline the engage holds in memory, clears and drops only a live record that is
+  its own, and, if the restore fails, puts its record back over nothing or over the
+  tombstone, which the release then refuses to clear (the Unblock reports an
+  error). A failed restore therefore always leaves a record, and a token is dropped
+  by exactly the party whose clear removed its record. A tombstone left by a failed
+  or crashed release reads to an older binary as an unusable record with its token
+  salvaged, and an engage adopts it like any leftover cover.
 
 The leaf rule: while one of these locks is held nothing else is acquired, and no
-`.await`, firewall, `pfctl` or process call runs. That is what lets Unblock take
-them without waiting on a wedged start.
+`.await`, firewall, `pfctl` or process call runs.
 
-Not closed by any of this, and tracked in
-[#1119](https://github.com/bindreams/hole/issues/1119): a start whose cover
-install lands after an Unblock's release leaves the host blocked with intent
-`Off`, and on macOS a release that begins before an engage's `holds` check and
-ends after it can clear a record the engage then reports as held.
+These orderings are in-process. A second bridge, or `hole bridge unlock` run from
+a shell while a bridge is up, is not ordered by them
+([#878](https://github.com/bindreams/hole/issues/878)).
 
 ### Update cutover
 

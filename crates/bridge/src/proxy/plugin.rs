@@ -30,8 +30,7 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// `Drop` does not touch the plugin state file. It aborts the chain's task
 /// without knowing whether garter's teardown finished, so the plugins it
-/// records may outlive it; only [`PluginChain::kill_tracked`]'s reap, and only
-/// for the records it accounted for, may remove them.
+/// records may outlive it; only [`PluginChain::kill_tracked`]'s reap removes them.
 pub struct PluginChain {
     task: ChainTask,
     local_addr: SocketAddr,

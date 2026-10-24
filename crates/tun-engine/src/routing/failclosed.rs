@@ -110,7 +110,9 @@ pub enum Swap {
     Applied,
     /// The record changed since the caller read it, so nothing was written. The
     /// only writers are an engage and a release: this one lost to a release (or
-    /// a later engage), and the caller backs out.
+    /// a later engage), and the caller backs out. Writing from the older view
+    /// would resurrect a record the release cleared, or stack a second one on a
+    /// host the release already restored.
     Superseded,
 }
 
@@ -469,8 +471,9 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
 ///    warning on failure and do not fail the call. A cover's state-file clear
 ///    is different: it is *skipped* whenever that cover's replacement ruleset
-///    did not confirm, because the file is the cover's only record — clearing
-///    it after an unconfirmed restore would make the next call read a clean
+///    did not confirm (on macOS the record then stays as the tombstone the
+///    release claimed it with), because the file is the cover's only record —
+///    clearing it after an unconfirmed restore would make the next call read a clean
 ///    host while the block persists (a manufactured, permanent lockout).
 ///
 /// Windows keeps no cover state file at all: the filter set is compiled-in

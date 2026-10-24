@@ -72,8 +72,7 @@ pub(crate) fn reap_loaded_with(
         Loaded::State(state) => state,
     };
 
-    // A record is removed only once it is accounted for: killed, provably gone,
-    // or provably unrestorable on this host. Kills run outside the state lock.
+    // Kills run outside the state lock.
     let mut accounted = Vec::new();
     let mut all_accounted = true;
     for record in &state.plugins {

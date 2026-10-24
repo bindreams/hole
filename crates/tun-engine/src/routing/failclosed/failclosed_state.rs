@@ -52,9 +52,7 @@ pub struct FailClosedState {
     pub releasing: bool,
 }
 
-/// Serializes every read-modify-write of this record in this process, so an
-/// engage's compare-and-set and a release's clear cannot interleave. A leaf
-/// lock ([`RecordLock`]): only file I/O runs under it, never a `pfctl` call.
+/// Orders this record's engage compare-and-set against a release's clear. A [`RecordLock`] leaf.
 static LOCK: RecordLock = RecordLock::new(());
 
 impl PfRecord for FailClosedState {
@@ -150,9 +148,7 @@ fn remove_file(state_dir: &Path) -> std::io::Result<()> {
 
 /// Persist `new` iff the record still reads as `expected` (what the caller read
 /// when it started), as one critical section. [`Swap::Superseded`] writes
-/// nothing: a release cleared or replaced the record since, and writing from the
-/// caller's older view would resurrect it or stack a second record on a host the
-/// release already restored.
+/// nothing: a release cleared or replaced the record since.
 ///
 /// `expected` is the [`StateFile`] as [`load_presence`] returned it, not a
 /// collapsed `Option`: an `Unusable` record compares by its salvaged token, so

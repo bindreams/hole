@@ -1057,9 +1057,7 @@ fn restored_ruleset(ops: &StandingEngage<'_>) -> String {
 
 #[skuld::test]
 fn a_release_after_the_load_leaves_the_reused_baseline_restored_not_the_default_ruleset() {
-    // `ReuseToken`: the baseline is the persisted record's. The release restores
-    // it and clears the record; the engage's back-out must not reload the default
-    // because the record it would read is gone.
+    // `ReuseToken`: the baseline is the persisted record's.
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::seed(dir.path(), &host_baseline_record(OLD, true));
     let mut ops = StandingEngage::new(dir.path(), true).after("load_ruleset", |d| {

@@ -1075,8 +1075,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             resolver_permit: ech_resolver_permit,
                         });
                     }
-                    // A release took the record this engage was writing: the user
-                    // asked to be let out, so neither run uncovered nor engage again.
+                    // Superseded by a release: cancel, neither run uncovered nor engage again.
                     Err(e) if e.cancels_the_start() => return Err(e.into()),
                     Err(e) => {
                         if let Some((old_permit, original_pin)) = repair_fallback {
@@ -2014,10 +2013,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     None => {}
                 }
 
-                // 2. Stop plugin chain: reap the tracked identities explicitly — the
-                // reap is the ONLY thing allowed to remove records from the state
-                // file, and only the ones it accounted for — then drop, which just
-                // cancels the chain's token and aborts its task. Drop must not touch
+                // 2. Stop plugin chain: reap the tracked identities explicitly — only
+                // the reap removes records from the state file — then drop, which
+                // just cancels the chain's token and aborts its task. Drop must not touch
                 // the file: the abort cannot know whether teardown finished, so a
                 // clear there would forget still-live plugins.
                 run_phase(

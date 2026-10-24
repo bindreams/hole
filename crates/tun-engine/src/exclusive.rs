@@ -124,7 +124,7 @@ impl Drop for Exclusive {
 /// **Leaf contract:** nothing else is acquired while a [`RecordGuard`] is held,
 /// and no OS, firewall, pf or process call and no `.await` runs under it: only
 /// file I/O. That is what lets an escape path that must never block on a wedged
-/// start or teardown (`handle_unblock`) take it. `RecordGuard` is `!Send`, so
+/// start or teardown take it. `RecordGuard` is `!Send`, so
 /// the `.await` half is compiler-enforced.
 ///
 /// `T` is in-process state that must change atomically with the file (an epoch

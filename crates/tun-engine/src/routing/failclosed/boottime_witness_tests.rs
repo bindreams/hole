@@ -402,11 +402,7 @@ fn every_recorded_engage_moves_the_epoch() {
 
 #[skuld::test]
 fn an_engage_that_commits_during_a_disarming_sweep_stays_recorded() {
-    // The sweep read `Armed`, deleted the old twin (`Removed`, so it will
-    // `Disarm`), and a concurrent engage committed a NEW twin and recorded it
-    // in between. `Armed` -> `Armed` is invisible to a value comparison, which
-    // is why the epoch exists: without it the sweep's `armed: false` lands over
-    // the new twin and the next sweep reads "nothing outstanding".
+    // `Armed` -> `Armed` is invisible to a value comparison; only the epoch vetoes the stale `Disarm`.
     let state = dir();
     super::record_armed(state.path(), None);
 

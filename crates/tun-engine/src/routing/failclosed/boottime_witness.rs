@@ -69,7 +69,7 @@
 //!   path that does not run through `super::sweep_with_witness`, because the
 //!   guard carries no `state_dir` to write to. It fires when an engage COMMITS
 //!   (so the record is already `Armed`) and a later fatal phase of the same
-//!   start fails, unwinding `ProxyManager`'s locally-owned guard; an ordinary
+//!   start fails, or a release overtakes the engage, unwinding the guard; an ordinary
 //!   disconnect is unaffected, since that releases through
 //!   `Routing::release_all_covers` first and drops an already-swept cover. The
 //!   twins were genuinely watched going, so this is an OVER-report: the record
@@ -214,8 +214,7 @@ fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> std::io::Re
 #[cfg(any(target_os = "windows", test, feature = "test-utils"))]
 pub(crate) fn record_armed(state_dir: &Path, owner: Option<(u32, u32)>) {
     let mut epochs = STATE.acquire();
-    // Bumped even if the write below fails: the veto on a concurrent disarm is
-    // the safe direction.
+    // Bumped even if the write below fails.
     *epochs.entry(state_dir.to_path_buf()).or_insert(0) += 1;
     write_or_warn(state_dir, true, owner);
 }
@@ -263,9 +262,7 @@ pub(crate) enum WitnessUpdate {
 
 /// The record's next value, or `None` when nothing needs writing.
 ///
-/// Pure, and a table rather than a condition spread over the write site,
-/// because the rules that matter are all about which CURRENT values a write may
-/// land on: an `Arm` never rewrites an existing `Armed` (pointless I/O that can
+/// Pure, and a table rather than a condition spread over the write site. An `Arm` never rewrites an existing `Armed` (pointless I/O that can
 /// only fail), a `Disarm` never writes `false` over `Unset` or `Disarmed` (the
 /// first would litter every host that never armed a twin with a file saying
 /// so, on every `release-covers` it ever runs), and a `Disarm` never lands when

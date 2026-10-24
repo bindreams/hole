@@ -6,8 +6,8 @@
 //! pattern. `plugin_recovery` owns the reap and is the only component allowed
 //! to remove records from the file.
 //!
-//! Every read-modify-write of the file, and every [`load`], runs under [`LOCK`],
-//! an in-process leaf lock. Appends come from plugin spawns on tokio workers (a sink from an
+//! Every read-modify-write of the file, and every [`load`], runs under [`LOCK`].
+//! Appends come from plugin spawns on tokio workers (a sink from an
 //! aborted attempt can outlive the attempt), the reap from the stop path; an
 //! unordered load/modify/save would lose a record or resurrect a reaped one.
 //!
@@ -119,9 +119,7 @@ fn save_with(
     Ok(())
 }
 
-/// Append a single record to the state file. Creates the file if missing.
-/// Reads existing records, merges, atomically writes the result, all under
-/// [`LOCK`].
+/// Merge `record` into the file under [`LOCK`], creating it if missing.
 pub fn append_record(
     state_dir: &Path,
     record: cosca::identity::ProcessIdRecord,
@@ -130,8 +128,7 @@ pub fn append_record(
     append_record_with(state_dir, record, owner, || {})
 }
 
-/// [`append_record`] with a hook that runs inside the critical section,
-/// between the load and the save.
+/// Test seam: [`append_record`] with `in_section` run between load and save.
 fn append_record_with(
     state_dir: &Path,
     record: cosca::identity::ProcessIdRecord,

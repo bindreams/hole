@@ -21,10 +21,10 @@ pub enum RoutingError {
     /// the log, not a toast; use [`RoutingError::redacted`] for a toast.
     #[error("{}", state_unreadable(&path.display()))]
     StateUnreadable { path: PathBuf },
-    /// A release (the tray's Unblock, `bridge unlock`, a cover sweep) removed a
-    /// cover's record while an engage was installing that cover, so the engage
-    /// backed out and the host is as the release left it. Not a failure of the
-    /// cover: the user asked to be let out.
+    /// A release removed or claimed a cover's record while an engage was
+    /// installing that cover, or began during the install, so the engage backed
+    /// out and the host is as the release left it. Not a failure of the cover:
+    /// the user asked to be let out.
     #[error("the fail-closed cover was released while it was being engaged, and was backed out")]
     SupersededByRelease,
 }
@@ -51,7 +51,7 @@ impl RoutingError {
 
     /// Whether this error means the user's release ended the engage, so the
     /// start that made it is cancelled: never run uncovered, never retried with
-    /// another engage. One exhaustive match, so a new variant must choose.
+    /// another engage.
     pub fn cancels_the_start(&self) -> bool {
         match self {
             RoutingError::Gateway(_) => false,

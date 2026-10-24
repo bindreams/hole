@@ -96,8 +96,6 @@ impl Intent {
     /// "May a start that just honoured an adopted cover record the kill switch
     /// as armed?" — `Unset | Unreadable`. `On` needs no write, and `Off` is the
     /// user's explicit choice: an adopted claim is never proof it still stands.
-    ///
-    /// Consumers, in full: [`promote_unrecorded`].
     pub fn admits_adoption_promotion(self) -> bool {
         match self {
             Intent::Unset | Intent::Unreadable => true,

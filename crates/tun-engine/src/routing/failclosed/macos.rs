@@ -50,6 +50,12 @@
 //!   — across a reboot, but the state file persists), so a reconnect re-enables
 //!   pf and loads a live ruleset instead of an inert one.
 //!
+//! - **Claim before restore.** A release rewrites each live record as a tombstone
+//!   (`releasing`) before any pf call, restores, clears the tombstone, and drops
+//!   the token only if its own clear removed the record; an engage that lost
+//!   backs out and, if its own restore fails, puts its record back. The rules
+//!   are in [`super::pf_claim`], the interleavings in `macos_release_race_tests`.
+//!
 //! Documented caveats (pf has no programmatic API — `pfctl` text I/O IS the
 //! interface, as `netsh`/`route` are for routing):
 //! - The transient restore reloads `/etc/pf.conf`; the lockdown restore reloads
@@ -601,9 +607,7 @@ fn engage_with(
     resolver_ip: Option<IpAddr>,
     ops: &mut dyn EngageOps,
 ) -> Result<String, RoutingError> {
-    // 0. The record as it reads at entry. Every write below is a compare-and-set
-    //    against this view, so a release that runs between here and a write
-    //    makes the write back out instead of resurrecting what it cleared.
+    // 0. The record as it reads at entry; the baseline for every compare-and-set below.
     let expected = ops.read_transient();
 
     // 1. Read current enabled-state (read-only) — DIAGNOSTIC ONLY, so it is
@@ -1908,9 +1912,8 @@ pub fn release_all(state_dir: &Path, _witness: super::ArmingWitness) -> SweepOut
 #[path = "macos_tests.rs"]
 mod macos_tests;
 
-/// A release landing between the steps of an engage, driven over real record
-/// files and a pf double. A descendant of this module for the same reason as
-/// [`macos_transition_tests`]: it drives private sequencers.
+/// A release landing between the steps of an engage. A descendant of this module
+/// because it drives private sequencers.
 #[cfg(test)]
 #[path = "macos_release_race_tests.rs"]
 mod macos_release_race_tests;
