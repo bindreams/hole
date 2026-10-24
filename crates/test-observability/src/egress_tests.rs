@@ -66,6 +66,11 @@ impl Net {
         self
     }
 
+    /// Probe `addr` once, as a scenario does inside its cover.
+    fn reachable(&self, addr: &str) -> bool {
+        Host::probe(&mut { self }, addr).is_ok()
+    }
+
     fn probes_of(&self, addr: &str) -> usize {
         self.probed.borrow().iter().filter(|a| *a == addr).count()
     }
@@ -178,11 +183,35 @@ fn a_lost_network_is_waited_out_and_the_target_then_answers() {
     assert!(net.tick.get() >= 9, "returned before the network was back");
 }
 
+fn a_cover() -> Option<String> {
+    Some("a lockdown cover".to_string())
+}
+
 #[skuld::test]
-fn a_target_blocked_while_the_control_answers_is_a_defect() {
+fn a_target_down_while_the_control_answers_and_hole_holds_nothing_is_waited_for() {
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 0..12);
+    check(&net, &[TARGET], &clean).unwrap();
+    assert!(net.pauses.get() > 0);
+}
+
+#[skuld::test]
+fn a_target_down_while_the_control_answers_and_hole_holds_a_cover_is_a_defect() {
     let net = Net::new(0..0, &[TARGET]);
-    let err = check(&net, &[TARGET], &clean).unwrap_err();
-    assert!(err.contains("unreachable"), "{err}");
+    let err = check(&net, &[TARGET], &a_cover).unwrap_err();
+    assert!(err.contains("a lockdown cover"), "{err}");
+}
+
+#[skuld::test]
+fn a_cover_found_while_waiting_for_a_target_that_is_down_is_a_defect() {
+    // Down on its own at first, then a cover appears: the wait ends as a defect.
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 0..u32::MAX);
+    let asked = Cell::new(0);
+    let err = check(&net, &[TARGET], &|| {
+        asked.set(asked.get() + 1);
+        (asked.get() > 2).then(|| "a cover".to_string())
+    })
+    .unwrap_err();
+    assert!(err.contains("a cover"), "{err}");
 }
 
 #[skuld::test]
@@ -190,15 +219,8 @@ fn a_blocked_target_is_probed_once_not_twice() {
     // The assertion is immediate: a release that returns before egress is restored must not pass on a
     // second probe taken seconds later.
     let net = Net::new(0..0, &[TARGET]);
-    let _ = check(&net, &[TARGET], &clean);
+    let _ = check(&net, &[TARGET], &a_cover);
     assert_eq!(net.probes_of(TARGET), 1);
-}
-
-#[skuld::test]
-fn a_block_that_outlives_a_network_loss_is_still_a_defect() {
-    let net = Net::new(0..5, &[TARGET]);
-    let err = check(&net, &[TARGET], &clean).unwrap_err();
-    assert!(err.contains("unreachable"), "{err}");
 }
 
 #[skuld::test]
@@ -230,7 +252,7 @@ fn the_log_blames_the_environment_only_when_hole_holds_nothing() {
 #[skuld::test]
 fn every_target_must_answer_not_just_the_first() {
     let net = Net::new(0..0, &["1.0.0.1:853"]);
-    let err = check(&net, &["8.8.8.8:443", "1.0.0.1:853"], &clean).unwrap_err();
+    let err = check(&net, &["8.8.8.8:443", "1.0.0.1:853"], &a_cover).unwrap_err();
     assert!(err.contains("1.0.0.1:853"), "{err}");
 }
 

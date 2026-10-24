@@ -21,7 +21,9 @@
 //!   each probe whose result it reports ([`InCover`]), and hands the readings to
 //!   the judge as a [`Failure`]. A failure is a defect only when the permit
 //!   answered on both sides and the failing targets, probed outside the cover
-//!   after teardown, answer there with the control answering around them.
+//!   after teardown, answer there with the control answering around them. A
+//!   scenario that reads a capture of the NIC probes the permit over TCP on both
+//!   sides of its markers the same way ([`Failure::captured`]).
 //!
 //! A reading of runner state is vouched for by the control around it: a read
 //! that fails, or is not bracketed by an answering control, is taken again; a
@@ -31,7 +33,10 @@
 //! What no probe can rule out is an outage that falls entirely between two
 //! adjacent probes of one engage: a probe cannot show the network up at an
 //! instant. A cover that blocks its own permit looks the same as an outage over
-//! every in-cover probe, so that case is a defect.
+//! every in-cover probe, so that case is a defect. So is a permit that readings
+//! taken across cover reloads find broken ([`Failure::covered`]) while the control
+//! answers around the teardown: a rerun needs a probe outside any cover to have
+//! failed, or a defect that shows only sometimes would be rerun without end.
 //!
 //! No wait here has a cap: each round re-probes the real condition, the test's
 //! own nextest timeout is the bound, and every change of state is logged.
@@ -90,15 +95,16 @@ pub fn assert_egress_restored(what: &str, targets: &[&str], control: &str, hole_
 ///
 /// For the assertion that a lifted cover let egress back out. A probe of
 /// `targets` that fails with the network demonstrably up is the verdict: a
-/// release that returns before egress is restored is a defect. A failure is
+/// release that returns while Hole still holds a cover is a defect. A failure is
 ///
 /// * Hole's when `hole_state` reports a cover, at once, whatever `control` says;
 /// * the environment's when `control` fails on either side of the probe: the
 ///   outage may have ended between the two, so only a control that answered
 ///   before AND after vouches for the network. It waits for `control`, then
 ///   probes again;
-/// * Hole's otherwise: `targets` unreachable with the network demonstrably up
-///   and no cover installed.
+/// * the environment's otherwise: with Hole holding nothing and `control`
+///   answering, a target that is down is down on its own (one anycast host can
+///   be). It waits for the target, then probes again.
 ///
 /// `control` must be a host the lifted cover never blocked. For a caller that
 /// must run cleanup between the measurement and the verdict.
@@ -305,9 +311,12 @@ pub(crate) fn check_egress_restored_on(
         }
         let control_after = host.probe(control).is_ok();
         if control_before && control_after {
-            return Err(format!(
-                "{what}: {failing:?} stay unreachable while {control} answers and Hole holds no cover"
-            ));
+            tracing::warn!(
+                "{what}: {failing:?} are unreachable while {control} answers and Hole holds no cover, so they are down on their own; waiting for them"
+            );
+            let down: Vec<&str> = failing.iter().map(|(t, _)| t.as_str()).collect();
+            wait_for_egress_on(host, what, &down, hole_state)?;
+            continue;
         }
         tracing::warn!("{what}: {control} did not answer around the probe of {failing:?}; waiting for the network");
         wait_for_egress_on(host, what, &[control], hole_state)?;

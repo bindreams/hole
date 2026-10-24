@@ -243,9 +243,15 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
             // surface as a synchronous `send_to` error (WSAEACCES), which is itself
             // no-leak evidence — but the capture is still the authority, so swallow
             // the result and let the wire decide.
+            //
+            // The cover permits the server IP, which is also the control host, so a TCP connect to it on
+            // each side of the markers vouches for the network inside this engage. It is not UDP, so the
+            // capture does not see it.
+            let vouch_before = hole_test_observability::egress::probe(&control).is_ok();
             let head_sent = send_marker(&rt, &socket, permitted_tail, nonce_head);
             let _ = send_marker(&rt, &socket, non_permitted, nonce_leak);
             let tail_sent = send_marker(&rt, &socket, permitted_tail, nonce_tail);
+            let vouch_after = hole_test_observability::egress::probe(&control).is_ok();
 
             pktmon(&["stop"]);
             pktmon(&["etl2pcap", &cap.to_string_lossy(), "--out", &pcap.to_string_lossy()]);
@@ -281,6 +287,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
                      (head: sent {head_sent:?}, seen {head_seen}; tail: sent {tail_sent:?}, seen {tail_seen})"
                 ),
                 &control,
+                &[vouch_before, vouch_after],
                 &[head_seen, tail_seen],
             ))
         });

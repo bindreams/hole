@@ -111,23 +111,20 @@ fn an_outage_over_one_probe_between_two_answering_permits_is_not_seen() {
 // Failure::covered / uncovered ========================================================================================
 
 #[skuld::test]
-fn covered_readings_decide_between_failed_and_wavered() {
+fn covered_readings_are_never_wavered() {
+    // They span cover changes, so a miss cannot be told from a permit the reloads broke: the control
+    // around the teardown decides.
     let why = || "x".to_string();
-    assert_eq!(
-        Failure::covered(why(), CONTROL, &[true, true]),
-        Failure::Failed {
-            why: why(),
-            targets: vec![]
-        }
-    );
-    assert_eq!(
-        Failure::covered(why(), CONTROL, &[true, false]),
-        Failure::Wavered(why())
-    );
-    assert_eq!(
-        Failure::covered(why(), CONTROL, &[false, true]),
-        Failure::Wavered(why())
-    );
+    for readings in [[true, true], [true, false], [false, true]] {
+        assert_eq!(
+            Failure::covered(why(), CONTROL, &readings),
+            Failure::Failed {
+                why: why(),
+                targets: vec![]
+            },
+            "{readings:?}"
+        );
+    }
     assert_eq!(
         Failure::covered(why(), CONTROL, &[false, false]),
         Failure::Failed {
@@ -138,20 +135,34 @@ fn covered_readings_decide_between_failed_and_wavered() {
 }
 
 #[skuld::test]
-fn captured_readings_are_never_wavered() {
+fn a_missing_vouch_reading_around_the_markers_is_a_wavering() {
     let why = || "x".to_string();
-    for readings in [[true, true], [true, false], [false, true]] {
+    for vouch in [[true, false], [false, true], [false, false]] {
+        for markers in [[true, false], [false, false]] {
+            assert_eq!(
+                Failure::captured(why(), CONTROL, &vouch, &markers),
+                Failure::Wavered(why()),
+                "{vouch:?} {markers:?}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn captured_readings_with_both_vouch_readings_are_judged_by_the_control() {
+    let why = || "x".to_string();
+    for markers in [[true, false], [false, true]] {
         assert_eq!(
-            Failure::captured(why(), CONTROL, &readings),
+            Failure::captured(why(), CONTROL, &[true, true], &markers),
             Failure::Failed {
                 why: why(),
                 targets: vec![]
             },
-            "{readings:?}"
+            "{markers:?}"
         );
     }
     assert_eq!(
-        Failure::captured(why(), CONTROL, &[false, false]),
+        Failure::captured(why(), CONTROL, &[true, true], &[false, false]),
         Failure::Failed {
             why: why(),
             targets: vec![CONTROL.to_string()]

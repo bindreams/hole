@@ -169,29 +169,103 @@ fn a_permitted_host_that_is_down_on_its_own_is_waited_for_not_charged_to_the_cov
     );
 }
 
-/// The scenario's readings come off the wire, not the network: the permitted head datagram is never
-/// captured while the tail is, whatever the network does.
-fn wire_run(net: &Net) -> Result<(), String> {
+/// What a wire scenario reports for markers missing from the capture, given its permit readings.
+fn wire_failure(vouch: &[bool], markers: &[bool]) -> Failure {
+    Failure::captured("a marker was not captured".to_string(), CONTROL, vouch, markers)
+}
+
+/// A wire scenario: the permit is probed before the head marker and after the tail, and each marker
+/// reaches the capture only while the network is up. `readings` turns what the run saw into its failure.
+fn wire_run(net: &Net, readings: fn(&[bool], &[bool]) -> Failure) -> Result<(), String> {
     let hole = || net.cover.get().then(|| "a cover".to_string());
     let scenario = || {
         net.engage(&[PERMIT]);
+        let vouch_before = net.reachable(PERMIT);
+        let head = net.step();
+        net.step(); // the leak marker: its own outcome is the capture's
+        let tail = net.step();
+        let vouch_after = net.reachable(PERMIT);
         net.release();
-        Err::<(), _>(Failure::captured(
-            "head not captured".to_string(),
-            CONTROL,
-            &[false, true],
+        if head && tail {
+            return Ok(());
+        }
+        Err(readings(&[vouch_before, vouch_after], &[head, tail]))
+    };
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)
+}
+
+/// The ticks of a wire run's first pass: window open 0, permit 1, head 2, leak 3, tail 4, permit 5.
+/// An outage that starts after the first permit probe and ends by the second is between two adjacent
+/// probes of one engage, so the run cannot tell it from a marker the cover dropped.
+fn between_the_vouch_probes(down: &Range<u32>) -> bool {
+    !down.is_empty() && down.start >= 2 && down.end <= 5
+}
+
+#[skuld::test]
+fn a_wire_run_with_an_outage_inside_it_is_rerun_not_charged() {
+    let defects: Vec<_> = placements()
+        .into_iter()
+        .filter(|down| !between_the_vouch_probes(down))
+        .filter(|down| wire_run(&Net::new(down.clone(), &[]), wire_failure).is_err())
+        .collect();
+    assert!(defects.is_empty(), "a wire run was charged under outages {defects:?}");
+}
+
+#[skuld::test]
+fn an_outage_between_the_vouch_probes_is_the_stated_residual() {
+    let net = Net::new(2..3, &[]);
+    assert!(wire_run(&net, wire_failure).is_err());
+}
+
+#[skuld::test]
+fn a_head_only_wire_drop_with_the_control_answering_is_a_defect_under_every_placement() {
+    // The head is dropped whatever the network does; the permit answers on both sides.
+    let passed: Vec<_> = placements()
+        .into_iter()
+        .filter(|down| {
+            let net = Net::new(down.clone(), &[]);
+            let hole = || net.cover.get().then(|| "a cover".to_string());
+            let scenario = || {
+                net.engage(&[PERMIT]);
+                net.release();
+                Err::<(), _>(wire_failure(&[true, true], &[false, true]))
+            };
+            rerun_until_network_holds_on(&mut { &net }, "t", CONTROL, &hole, scenario).is_ok()
+        })
+        .collect();
+    assert!(passed.is_empty(), "a wire drop was excused under {passed:?}");
+}
+
+/// A permit reading that breaks only after the cover was reloaded, with the control answering.
+fn reload_run(net: &Net) -> Result<(), String> {
+    let hole = || net.cover.get().then(|| "a cover".to_string());
+    let scenario = || {
+        net.engage(&[PERMIT]);
+        let cold = net.reachable(PERMIT);
+        net.release();
+        Err::<(), _>(Failure::covered(
+            "the permit broke after the reloads".to_string(),
+            PERMIT,
+            &[cold, false],
         ))
     };
     rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)
 }
 
 #[skuld::test]
-fn a_head_only_wire_drop_with_the_control_answering_is_a_defect_under_every_placement() {
+fn a_permit_broken_by_the_reloads_with_the_control_answering_is_a_defect_under_every_placement() {
+    // A spin panics inside the scripted host, so a rerun without end fails here too.
     let passed: Vec<_> = placements()
         .into_iter()
-        .filter(|down| wire_run(&Net::new(down.clone(), &[])).is_ok())
+        .filter(|down| reload_run(&Net::new(down.clone(), &[])).is_ok())
         .collect();
-    assert!(passed.is_empty(), "a wire drop was excused under {passed:?}");
+    assert!(passed.is_empty(), "a broken permit was excused under {passed:?}");
+}
+
+#[skuld::test]
+fn a_restored_target_that_is_down_on_its_own_is_waited_for_not_charged_to_the_release() {
+    let net = Net::new(0..0, &[]).with_host_down(BLOCK, 0..40);
+    check_egress_restored_on(&mut { &net }, "t", &[BLOCK], CONTROL, &|| None).unwrap();
 }
 
 // read_with_network_up ================================================================================================

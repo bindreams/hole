@@ -14,8 +14,8 @@ use super::{Host, System};
 pub enum Failure {
     /// A defect no network loss explains: a probe got through the block.
     Defect(String),
-    /// The permit answered at some readings and not others, so the network wavered inside the run.
-    /// The run says nothing about the cover; run it again once the network answers.
+    /// The permit answered at some readings and not others within one engage, so the network wavered
+    /// inside the run. The run says nothing about the cover; run it again once the network answers.
     Wavered(String),
     /// `targets` failed with the permit answering on both sides of each (or the permit itself never
     /// answered). The judge probes them outside the cover: a target that is down there is waited for,
@@ -28,33 +28,31 @@ pub enum Failure {
 }
 
 impl Failure {
-    /// A run inside a cover whose permit readings were taken in order across it: all answered, the
-    /// failure stands (`Failed`, the control decides); some answered, the network wavered; none
-    /// answered, the permit itself failed and `outside` (a host that answers outside the cover) is the
-    /// target the judge probes. For readings that are reachability probes.
+    /// A run whose permit readings were taken in order across cover changes (reloads): some of them may
+    /// be a permit Hole broke, so a miss is no evidence of an outage and the control around the
+    /// teardown decides (`Failed`). If none answered, the permit itself failed and `outside` (a host
+    /// that answers outside the cover) is the target the judge probes. For readings that are
+    /// reachability probes.
     pub fn covered(why: String, outside: &str, readings: &[bool]) -> Failure {
-        let answered = readings.iter().filter(|a| **a).count();
-        if answered == readings.len() {
-            Failure::Failed {
-                why,
-                targets: Vec::new(),
-            }
-        } else if answered > 0 {
-            Failure::Wavered(why)
+        let targets = if readings.iter().any(|a| *a) {
+            Vec::new()
         } else {
-            Failure::Failed {
-                why,
-                targets: vec![outside.to_string()],
-            }
-        }
+            vec![outside.to_string()]
+        };
+        Failure::Failed { why, targets }
     }
 
-    /// Like [`covered`](Failure::covered), for readings of a marker in a local capture of the NIC. Whether
-    /// a datagram leaves the NIC does not depend on the network upstream, so a mixed reading is no
-    /// evidence of a wavering network: any missing marker is `Failed`, and the control around the
-    /// teardown decides.
-    pub fn captured(why: String, outside: &str, readings: &[bool]) -> Failure {
-        let targets = if readings.iter().any(|a| *a) {
+    /// A run whose markers were read from a local capture of the NIC, with `vouch` the readings of a
+    /// permitted host probed over TCP on both sides of the markers in the same engage. A missing
+    /// `vouch` reading is a wavering network. Otherwise the capture decides: whether a datagram leaves
+    /// the NIC does not depend on the network upstream, so a missing marker is `Failed`, and the
+    /// control around the teardown decides. `outside` is the target the judge probes when no marker
+    /// was seen.
+    pub fn captured(why: String, outside: &str, vouch: &[bool], markers: &[bool]) -> Failure {
+        if !vouch.iter().all(|a| *a) {
+            return Failure::Wavered(why);
+        }
+        let targets = if markers.iter().any(|a| *a) {
             Vec::new()
         } else {
             vec![outside.to_string()]

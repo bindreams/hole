@@ -135,21 +135,45 @@ impl Markers {
     }
 }
 
+/// What a head/leak/tail run sent, and whether the control answered over TCP on each side of it.
+struct Sent {
+    head: std::io::Result<()>,
+    tail: std::io::Result<()>,
+    vouch: [bool; 2],
+}
+
+impl Default for Sent {
+    fn default() -> Self {
+        Sent {
+            head: Ok(()),
+            tail: Ok(()),
+            vouch: [true, true],
+        }
+    }
+}
+
 /// Send the head, the leak and the tail, in that order from `socket`. The leak send is allowed to fail:
 /// a WFP block at ALE_AUTH_CONNECT can surface as a synchronous `send_to` error, itself no-leak
 /// evidence, but the capture is the authority. The permitted head and tail are the readings on both sides
-/// of the leak marker.
+/// of the leak marker. The confinement blocks port 53 only, so the control on 443 vouches for the
+/// network from inside the run; it is TCP, which the UDP capture does not see.
 fn send_head_leak_tail(
     rt: &tokio::runtime::Runtime,
     socket: &tokio::net::UdpSocket,
     markers: &Markers,
     leak_to: SocketAddr,
-) -> (std::io::Result<()>, std::io::Result<()>) {
+) -> Sent {
     let permitted = SocketAddr::from((server_ip(), 53));
+    let before = hole_test_observability::egress::probe(&control()).is_ok();
     let head = send_marker(rt, socket, permitted, markers.head);
     let _ = send_marker(rt, socket, leak_to, markers.leak);
     let tail = send_marker(rt, socket, permitted, markers.tail);
-    (head, tail)
+    let after = hole_test_observability::egress::probe(&control()).is_ok();
+    Sent {
+        head,
+        tail,
+        vouch: [before, after],
+    }
 }
 
 /// The verdict of a head/leak/tail capture: a leak marker on the wire is a defect whatever the network
@@ -157,24 +181,25 @@ fn send_head_leak_tail(
 fn head_leak_tail_verdict(
     pcap: &Path,
     markers: &Markers,
-    sent: &(std::io::Result<()>, std::io::Result<()>),
+    sent: &Sent,
     leaked: &str,
     missing: &str,
 ) -> Result<(), Failure> {
     if capture_contains_nonce(pcap, markers.leak) {
         return Err(Failure::Defect(leaked.to_string()));
     }
-    let head_seen = sent.0.is_ok() && capture_contains_nonce(pcap, markers.head);
-    let tail_seen = sent.1.is_ok() && capture_contains_nonce(pcap, markers.tail);
+    let head_seen = sent.head.is_ok() && capture_contains_nonce(pcap, markers.head);
+    let tail_seen = sent.tail.is_ok() && capture_contains_nonce(pcap, markers.tail);
     if head_seen && tail_seen {
         return Ok(());
     }
     Err(Failure::captured(
         format!(
             "{missing} (head: sent {:?}, seen {head_seen}; tail: sent {:?}, seen {tail_seen})",
-            sent.0, sent.1
+            sent.head, sent.tail
         ),
         &control(),
+        &sent.vouch,
         &[head_seen, tail_seen],
     ))
 }
@@ -286,7 +311,7 @@ fn dns_confine_global_net_state_blocks_dns_off_the_tun() {
         let (rt, socket) = probe_socket();
         let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
         let markers = Markers::new();
-        let mut sent = (Ok(()), Ok(()));
+        let mut sent = Sent::default();
         let pcap = capture_udp_window(dir.path(), "blocks-off-tun", || {
             sent = send_head_leak_tail(&rt, &socket, &markers, OFF_TUNNEL_DNS.parse().expect("literal"));
         });
@@ -357,7 +382,7 @@ fn dns_confine_global_net_state_is_sensitive_to_the_interface_it_names() {
         let (rt, socket) = probe_socket();
         let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
         let markers = Markers::new();
-        let mut sent = (Ok(()), Ok(()));
+        let mut sent = Sent::default();
         let pcap = capture_udp_window(dir.path(), "sensitive-to-interface", || {
             // The leak routes via device B, which the confinement does not name.
             sent = send_head_leak_tail(&rt, &socket, &markers, SocketAddr::from((PROBE_IP, 53)));
