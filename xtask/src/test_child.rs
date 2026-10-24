@@ -13,6 +13,8 @@ pub const OUT_ENV: &str = "XTASK_TEST_OUT";
 pub const CONTROL_ENV: &str = "XTASK_TEST_CONTROL";
 /// Grandchild's clean-release exit code (shared so the test can't drift).
 pub const CHILD_RELEASE_EXIT: i32 = 42;
+/// Exit code of the `retry-loop` mode when `until_ok` ended with the interrupted error.
+pub const RETRY_LOOP_INTERRUPTED_EXIT: i32 = 43;
 /// Grandchild's error-path exit code — a read error must NOT masquerade as the
 /// clean-release code.
 pub const CHILD_ERROR_EXIT: i32 = 99;
@@ -22,6 +24,7 @@ pub fn maybe_run() {
     match mode.as_str() {
         "interrupt-parent" => run_interrupt_parent(),
         "interrupt-child" => run_interrupt_child(),
+        "retry-loop" => run_retry_loop(),
         "list-env" => list_env(),
         "strip-then-list-env-in-child" => strip_then_list_env_in_child(),
         "strip-then-repo-root" => strip_then_repo_root(),
@@ -101,6 +104,30 @@ fn run_interrupt_child() -> ! {
             Err(_) => std::process::exit(CHILD_ERROR_EXIT),
         }
     }
+}
+
+/// Install the handler, announce readiness, then retry an operation that never succeeds. Only an interrupt
+/// ends it: exit [`RETRY_LOOP_INTERRUPTED_EXIT`] on the interrupted error, 1 on any other.
+fn run_retry_loop() -> ! {
+    crate::install_transparent_interrupt();
+    let addr = std::env::var(CONTROL_ENV).expect("control env");
+    {
+        let mut conn = TcpStream::connect(&addr).expect("dial control");
+        conn.write_all(
+            b"R
+",
+        )
+        .expect("readiness");
+    }
+    let err = crate::retry::until_ok("retry-loop test", || -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("never succeeds"))
+    })
+    .expect_err("the operation never succeeds");
+    std::process::exit(if crate::retry::is_interrupted(&err) {
+        RETRY_LOOP_INTERRUPTED_EXIT
+    } else {
+        1
+    });
 }
 
 /// Print the name of every variable this process has, one per line.

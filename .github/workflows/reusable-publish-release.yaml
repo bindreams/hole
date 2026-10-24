@@ -78,6 +78,12 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=releases/${{ inputs.track }}/v${V}" >> "$GITHUB_OUTPUT"
 
+      # Only `.github/scripts` (retry.sh) is needed from the repository.
+      - uses: actions/checkout@v7
+        if: ${{ !inputs.dry-run }}
+        with:
+          sparse-checkout: .github/scripts
+
       # dry-run branch: checkout, install Rust, run dry-run, exit.
       # No draft verification, no crates.io publish, no GitHub release edit.
       - uses: actions/checkout@v7
@@ -88,10 +94,20 @@ jobs:
       - uses: ./.github/actions/setup-rust
         if: ${{ inputs.dry-run && inputs.crates-publish }}
 
+      - name: Fetch crate sources
+        if: ${{ inputs.dry-run && inputs.crates-publish }}
+        run: .github/scripts/cargo-fetch.sh
+
+      # Packaging and its verify build run offline from the fetched sources, so a packaging error fails at once.
+      - name: Run cargo package
+        if: ${{ inputs.dry-run && inputs.crates-publish }}
+        run: cargo package --offline -p ${{ inputs.crates-name }}
+
+      # `cargo publish` always asks the registry; only that round trip is retried.
       - name: Run cargo publish --dry-run
         if: ${{ inputs.dry-run && inputs.crates-publish }}
         run: |
-          cargo publish --dry-run -p ${{ inputs.crates-name }}
+          .github/scripts/retry.sh cargo publish --dry-run --no-verify -p ${{ inputs.crates-name }}
           echo "Dry-run complete; exiting without touching crates.io or the GitHub release."
 
       # Real-publish branch (when not dry-run).
@@ -99,6 +115,8 @@ jobs:
         if: ${{ !inputs.dry-run }}
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          # Wait for the API to answer (with the token: the unauthenticated limit is 60/h per shared IP), then ask once: a missing release is the answer, not a lost network.
+          .github/scripts/retry.sh gh api -X GET zen --silent
           RELEASE_JSON=$(gh release view "$TAG" --json isDraft,assets)
           IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')
           if [ "$IS_DRAFT" != "true" ]; then
@@ -116,12 +134,12 @@ jobs:
 
       - name: Download verification files
         if: ${{ !inputs.dry-run && inputs.verify-signature }}
-        run: gh release download "${{ steps.version.outputs.tag }}" --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
+        run: .github/scripts/retry.sh gh release download "${{ steps.version.outputs.tag }}" --clobber --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
 
       - name: Install minisign
         if: ${{ !inputs.dry-run && inputs.verify-signature }}
         run: |
-          curl -sL -o minisign.tar.gz https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
+          .github/scripts/retry.sh curl -fsSL -o minisign.tar.gz https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
           tar xzf minisign.tar.gz
           install minisign-linux/x86_64/minisign /usr/local/bin/minisign
           rm -rf minisign.tar.gz minisign-linux
@@ -139,16 +157,30 @@ jobs:
           CRATES_UA: "hole-release-pipeline (https://github.com/bindreams/hole)"
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          CODE=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}")
-          if [ "$CODE" = "200" ]; then
-            echo "already_published=true" >> "$GITHUB_OUTPUT"
-            echo "Version ${VERSION} already on crates.io; will skip publish."
-          elif [ "$CODE" = "404" ]; then
-            echo "already_published=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Unexpected HTTP $CODE from crates.io API"
-            exit 1
-          fi
+          # 200 and 404 are the answers. No answer (000), a rate limit and a server error are not: ask again
+          # until the job's timeout-minutes.
+          while true; do
+            CODE=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}" || true)
+            case "$CODE" in
+              200)
+                echo "already_published=true" >> "$GITHUB_OUTPUT"
+                echo "Version ${VERSION} already on crates.io; will skip publish."
+                break
+                ;;
+              404)
+                echo "already_published=false" >> "$GITHUB_OUTPUT"
+                break
+                ;;
+              000 | 429 | 5??)
+                echo "crates.io API answered HTTP $CODE; asking again in 10s"
+                sleep 10
+                ;;
+              *)
+                echo "::error::Unexpected HTTP $CODE from crates.io API"
+                exit 1
+                ;;
+            esac
+          done
 
       - uses: actions/checkout@v7
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}
@@ -157,6 +189,10 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}
+
+      - name: Fetch crate sources
+        if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}
+        run: .github/scripts/cargo-fetch.sh
 
       - name: Publish to crates.io
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}

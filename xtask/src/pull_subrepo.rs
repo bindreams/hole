@@ -63,6 +63,7 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     ensure_clean_tree(repo_root, subdir)?;
     ensure_no_in_progress_conflict_resolution(repo_root, subdir)?;
 
+    fetch_upstream(repo_root, subdir, tag)?;
     let first = attempt_pull(repo_root, subdir, tag)?;
     if first.status.success() {
         best_effort_clean(repo_root, subdir);
@@ -85,6 +86,48 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     }
 
     conflict::handle_conflict(repo_root, subdir, tag, &first, None)
+}
+
+/// Fetch `tag` from the subrepo's upstream, retrying until the network answers. It changes nothing but
+/// the fetch ref, so repeating it is safe; `git subrepo pull` then runs after a fetch that just worked.
+/// The pull fetches once more itself (git-subrepo cannot reuse this fetch), so a network that fails in the
+/// instant between the two still fails the pull.
+///
+/// A tag the upstream does not have is told from a lost network by `git ls-remote --exit-code`, which
+/// exits 2 for "reached the remote, no such ref" and fails otherwise; the first ends the loop. An
+/// upstream that cannot be reached for any other reason (a wrong URL, no access) fails the same way a lost
+/// network does and is retried, with git's message printed on each attempt.
+pub(crate) fn fetch_upstream(repo_root: &Path, subdir: &str, tag: &str) -> Result<()> {
+    let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
+    let gitrepo =
+        std::fs::read_to_string(&gitrepo_path).with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
+    let remote = gitrepo_field(&gitrepo, "remote")
+        .with_context(|| format!("{} has no `remote = ` line", gitrepo_path.display()))?;
+    crate::retry::until_ok("git subrepo fetch", || {
+        let mut ls_remote = Command::new("git");
+        ls_remote
+            .args(["ls-remote", "--exit-code", &remote, tag])
+            .current_dir(repo_root);
+        let output = crate::command::run_output(&mut ls_remote)?;
+        match output.status.code() {
+            Some(0) => {}
+            Some(2) => {
+                return Err(crate::retry::permanent(anyhow::anyhow!(
+                    "`{tag}` does not exist upstream ({remote})"
+                )))
+            }
+            _ => bail!(
+                "`git ls-remote {remote} {tag}` failed: {}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            ),
+        }
+        crate::command::run_inherited(
+            Command::new("git")
+                .args(["subrepo", "fetch", subdir, "-b", tag])
+                .current_dir(repo_root),
+        )
+    })
 }
 
 /// Every fallible step after `fix_stale_parent` lands its `.gitrepo`

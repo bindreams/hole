@@ -28,9 +28,7 @@ runs:
 
     # The Go pin lives in the module's own `toolchain` directive, so a bare
     # `go` on PATH and CI resolve the same release.
-    - uses: actions/setup-go@v7
-      with:
-        go-version-file: crates/ex-ray/go.mod
+    - uses: ./.github/actions/setup-go
 
     # Node.js is required by the `frontend-build` xtask target, which is now
     # on `hole-msi.depends`. Without `npm`, Windows runners can't produce
@@ -48,7 +46,25 @@ runs:
         cachekey: ${{ steps.setup-rust.outputs.cachekey }}
         save: ${{ inputs.save-cache }}
 
-    - uses: mozilla-actions/sccache-action@v0.0.11
+    # sccache only speeds compiles up. Its setup downloads a release, outside
+    # this repo's retry helpers; when that fails, build without it rather than
+    # fail on a lost network, and leave a warning.
+    - id: sccache
+      uses: mozilla-actions/sccache-action@v0.0.11
+      continue-on-error: true
+
+    - name: Build without sccache (its setup could not fetch it)
+      if: steps.sccache.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::warning::mozilla-actions/sccache-action failed; building without sccache"
+        echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+
+    # Compiling `xtask` below fetches crates, so a network loss would fail it
+    # with no product defect behind it; `retry.sh` waits for the network.
+    - name: Fetch crate sources
+      shell: bash
+      run: .github/scripts/cargo-fetch.sh
 
     - name: Fetch runtime deps (ex-ray, wintun)
       shell: bash

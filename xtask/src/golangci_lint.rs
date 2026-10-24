@@ -152,29 +152,13 @@ pub fn ensure(repo_root: &Path) -> Result<PathBuf> {
         return Ok(bin_path);
     }
 
-    let url = asset.url();
-    eprintln!("xtask: downloading golangci-lint v{VERSION} from {url}");
-    let response = ureq::get(&url)
-        .call()
-        .with_context(|| format!("failed to download {url}"))?;
-    // ureq's `read_to_vec` defaults to a 10 MiB cap; the golangci-lint archives
-    // are ~40 MiB. 128 MiB is a generous ceiling above any plausible archive
-    // size — a guard against a runaway/malicious server, not a tuning knob.
-    let archive_bytes = response
-        .into_body()
-        .into_with_config()
-        .limit(128 * 1024 * 1024)
-        .read_to_vec()
-        .context("failed to read golangci-lint archive response body")?;
-
-    let actual = sha256_hex(&archive_bytes);
-    if actual != asset.sha256 {
-        bail!(
-            "golangci-lint archive {} hash mismatch: expected {}, got {actual}",
-            asset.file_name,
-            asset.sha256
-        );
-    }
+    // Ceiling against a runaway server; the archives are ~40 MiB.
+    let archive_bytes = crate::download::fetch_verified(
+        &format!("golangci-lint v{VERSION}"),
+        &asset.url(),
+        128 * 1024 * 1024,
+        asset.sha256,
+    )?;
 
     // The binary nests under `golangci-lint-<version>-<os>-<arch>/` — the
     // archive filename minus its extension.
@@ -249,12 +233,6 @@ fn make_executable(path: &Path) -> Result<()> {
         let _ = path;
     }
     Ok(())
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(data);
-    hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
