@@ -111,6 +111,7 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
     let verdict = hole_test_observability::egress::rerun_until_network_holds(
         "the standing cover's permit",
         PERMITTED,
+        &[NON_PERMITTED],
         &held_hole,
         || {
             lockdown_state::set_enabled(dir.path(), true, None).unwrap();

@@ -649,7 +649,8 @@ fn run_live_tun_permit_core(
         let server = format!("{SERVER_IP}:443");
         let held = || held_covers(guard.state_dir());
         let (send2, seen2_udp, permit_seen, tcp2, seen2_tcp, permit_seen_tcp) = loop {
-            let window = Window::open("live-tun-permit phase 2", &server, &held).unwrap_or_else(|why| panic!("{why}"));
+            let window = Window::open("live-tun-permit phase 2", &server, &[NON_PERMITTED], &held)
+                .unwrap_or_else(|why| panic!("{why}"));
             let cover = engage_lockdown(server_ip(), dev1.tun_name(), &resolver, &[], guard.state_dir(), None)
                 .expect("engage real standing lockdown cover naming device 1");
 

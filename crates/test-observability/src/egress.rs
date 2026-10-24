@@ -19,7 +19,8 @@
 //!   cover blocks every host but its own permits, so the control cannot be probed
 //!   inside it: the scenario probes a host the cover permits, before and after
 //!   each probe whose result it reports ([`InCover`]), and hands the readings to
-//!   the judge as a [`Failure`]. A failure is a defect only when the permit
+//!   the judge as a [`Failure`]. Every run opens only once the hosts it claims the cover
+//!   blocks answer outside any cover, a rerun's included. A failure is a defect only when the permit
 //!   answered on both sides and the failing targets, probed outside the cover
 //!   after teardown, answer there with the control answering around them. A
 //!   scenario that reads a capture of the NIC probes the permit over TCP on both
@@ -145,19 +146,22 @@ pub fn read_with_network_up<T, E: std::fmt::Display>(
 /// return its value.
 ///
 /// A scenario that fails reports a [`Failure`] AFTER dropping its cover, built from the readings it
-/// took inside the cover ([`InCover`]); each run is bracketed by a [`Window`].
+/// took inside the cover ([`InCover`]); each run is bracketed by a [`Window`]. `blocked` lists every
+/// host the scenario claims the cover blocks.
 pub fn rerun_until_network_holds<T>(
     what: &str,
     control: &str,
+    blocked: &[&str],
     hole_state: HoleState<'_>,
     scenario: impl FnMut() -> Result<T, Failure>,
 ) -> Result<T, String> {
-    rerun_until_network_holds_on(&mut System, what, control, hole_state, scenario)
+    rerun_until_network_holds_on(&mut System, what, control, blocked, hole_state, scenario)
 }
 
 /// The control probes that bracket one run of a scenario that probes while a cover is engaged.
 ///
-/// [`Window::open`] waits (uncapped) until `control` answers and Hole holds nothing. After the
+/// [`Window::open`] waits (uncapped) until `control` and every `blocked` host answer and Hole holds
+/// nothing: a block verdict is only evidence if the host would have answered without the cover. After the
 /// scenario tore its cover down, [`Window::judge`] decides what a [`Failure`] was:
 ///
 /// * Hole holds a cover: the scenario left one behind, a defect;
@@ -179,10 +183,16 @@ pub struct Window<'a> {
 }
 
 impl<'a> Window<'a> {
-    /// Wait until `control` answers and `hole_state` reports nothing, then open the window. `Err` when
-    /// Hole holds a cover before the run: waiting would never end it, and the run would start dirty.
-    pub fn open(what: &'a str, control: &'a str, hole_state: HoleState<'a>) -> Result<Window<'a>, String> {
-        open_window_on(&mut System, what, control, hole_state)
+    /// Wait until `control` and every host in `blocked` (the ones the scenario claims its cover blocks)
+    /// answer and `hole_state` reports nothing, then open the window. `Err` when Hole holds a cover
+    /// before the run: waiting would never end it, and the run would start dirty.
+    pub fn open(
+        what: &'a str,
+        control: &'a str,
+        blocked: &[&str],
+        hole_state: HoleState<'a>,
+    ) -> Result<Window<'a>, String> {
+        open_window_on(&mut System, what, control, blocked, hole_state)
     }
 
     /// The verdict on one failed run, after its cover is torn down: `Ok(())` is to run the scenario
@@ -355,11 +365,12 @@ pub(crate) fn rerun_until_network_holds_on<T>(
     host: &mut impl Host,
     what: &str,
     control: &str,
+    blocked: &[&str],
     hole_state: HoleState<'_>,
     mut scenario: impl FnMut() -> Result<T, Failure>,
 ) -> Result<T, String> {
     loop {
-        let window = open_window_on(host, what, control, hole_state)?;
+        let window = open_window_on(host, what, control, blocked, hole_state)?;
         match scenario() {
             Ok(value) => return Ok(value),
             Err(failure) => judge_on(host, window, failure)?,
@@ -371,9 +382,11 @@ pub(crate) fn open_window_on<'a>(
     host: &mut impl Host,
     what: &'a str,
     control: &'a str,
+    blocked: &[&str],
     hole_state: HoleState<'a>,
 ) -> Result<Window<'a>, String> {
-    wait_for_egress_on(host, what, &[control], hole_state)?;
+    let waited: Vec<&str> = std::iter::once(control).chain(blocked.iter().copied()).collect();
+    wait_for_egress_on(host, what, &waited, hole_state)?;
     if let Some(held) = hole_state() {
         return Err(format!(
             "{what}: Hole already holds {held} before the scenario engages anything"

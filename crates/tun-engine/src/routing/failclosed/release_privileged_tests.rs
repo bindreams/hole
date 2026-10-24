@@ -118,16 +118,22 @@ fn check_restored(what: &str, targets: &[&str], state_dir: &std::path::Path) -> 
 #[track_caller]
 fn release_stranded(what: &str, routing: &SystemRouting, state_dir: &std::path::Path, mut engage: impl FnMut()) {
     let claim = format!("{what} must still be blocking egress (leak!)");
-    permit_scenario("release_all of a stranded cover", state_dir, PERMITTED, || {
-        engage();
-        let verdict = InCover::new(PERMITTED, "the server-IP permit must beat the stranded block-all")
-            .blocked(NON_PERMITTED, &claim)
-            .run();
-        routing
-            .release_all_covers()
-            .unwrap_or_else(|e| panic!("release_all_covers must clear {what}: {e}"));
-        verdict
-    });
+    permit_scenario(
+        "release_all of a stranded cover",
+        state_dir,
+        PERMITTED,
+        &[NON_PERMITTED],
+        || {
+            engage();
+            let verdict = InCover::new(PERMITTED, "the server-IP permit must beat the stranded block-all")
+                .blocked(NON_PERMITTED, &claim)
+                .run();
+            routing
+                .release_all_covers()
+                .unwrap_or_else(|e| panic!("release_all_covers must clear {what}: {e}"));
+            verdict
+        },
+    );
 }
 
 // windows_release_all_clears_a_stranded_lockdown_cover / macos counterpart ============================================
@@ -557,43 +563,49 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
         let _ = SystemTool::Pfctl.command().unwrap().args(["-X", token]).output();
     };
 
-    let token = permit_scenario("recover_cover of an unreadable record", dir.path(), PERMITTED, || {
-        // The TRANSIENT cover — `recover_cover`'s subject.
-        let cover = routing
-            .install_failclosed_cover(server_ip, None)
-            .expect("engage real pf transient cover");
-        // Read the real enable token back BEFORE overwriting the file, so the rolled-back payload
-        // below carries the REAL token and the safety net has one to fall back on.
-        let token = super::failclosed_state::load(dir.path())
-            .expect("the engage must have persisted a state file")
-            .pf_token;
-        cover.disarm(); // stand in for the crash: no guard remains
+    let token = permit_scenario(
+        "recover_cover of an unreadable record",
+        dir.path(),
+        PERMITTED,
+        &[NON_PERMITTED],
+        || {
+            // The TRANSIENT cover — `recover_cover`'s subject.
+            let cover = routing
+                .install_failclosed_cover(server_ip, None)
+                .expect("engage real pf transient cover");
+            // Read the real enable token back BEFORE overwriting the file, so the rolled-back payload
+            // below carries the REAL token and the safety net has one to fall back on.
+            let token = super::failclosed_state::load(dir.path())
+                .expect("the engage must have persisted a state file")
+                .pf_token;
+            cover.disarm(); // stand in for the crash: no guard remains
 
-        let rolled_back = format!(
-            r#"{{"version":{},"pf_token":"{token}","pf_was_enabled":false}}"#,
-            super::failclosed_state::SCHEMA_VERSION + 1
-        );
-        std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();
-        let presence = super::failclosed_state::load_presence(dir.path());
-        assert!(
-            matches!(presence, super::StateFile::Unusable { .. }),
-            "this test's premise: the payload must be UNREADABLE to this binary. On `Present` the \
+            let rolled_back = format!(
+                r#"{{"version":{},"pf_token":"{token}","pf_was_enabled":false}}"#,
+                super::failclosed_state::SCHEMA_VERSION + 1
+            );
+            std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();
+            let presence = super::failclosed_state::load_presence(dir.path());
+            assert!(
+                matches!(presence, super::StateFile::Unusable { .. }),
+                "this test's premise: the payload must be UNREADABLE to this binary. On `Present` the \
              sweep takes the arm it handled before this fix and proves nothing: {rolled_back} -> \
              {presence:?}"
-        );
+            );
 
-        let verdict = InCover::new(PERMITTED, "the server-IP permit must beat the stranded block-all")
-            .blocked(
-                NON_PERMITTED,
-                "the stranded transient cover must still be blocking egress before the sweep runs (leak!)",
-            )
-            .run();
+            let verdict = InCover::new(PERMITTED, "the server-IP permit must beat the stranded block-all")
+                .blocked(
+                    NON_PERMITTED,
+                    "the stranded transient cover must still be blocking egress before the sweep runs (leak!)",
+                )
+                .run();
 
-        crate::routing::failclosed::recover_cover(dir.path(), false);
+            crate::routing::failclosed::recover_cover(dir.path(), false);
 
-        // The cover is gone before the verdict is judged; a rerun engages a new token.
-        verdict.inspect_err(|_| drop_token(&token)).map(|()| token)
-    });
+            // The cover is gone before the verdict is judged; a rerun engages a new token.
+            verdict.inspect_err(|_| drop_token(&token)).map(|()| token)
+        },
+    );
 
     let restored = check_restored(
         "recover_cover must restore egress even with an unreadable state file",

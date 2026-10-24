@@ -69,7 +69,7 @@ fn full_run(net: &Net, cover: Cover, with_second: bool) -> Result<(), String> {
         verdict
     };
     // A run that never settles panics in the scripted host: a spin fails the test, it is not a verdict.
-    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)?;
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &[BLOCK], &hole, scenario)?;
     check_egress_restored_on(&mut { net }, "t", &[BLOCK], CONTROL, &hole)
 }
 
@@ -107,13 +107,13 @@ fn within(lo: u32, hi: u32) -> Vec<Range<u32>> {
         .collect()
 }
 
-/// An outage over every in-cover probe of the first run (ticks 1..=3: permit, block, permit) that has
+/// An outage over every in-cover probe of the first run (ticks 2..=4: permit, block, permit) that has
 /// ended when the judge looks: indistinguishable from a cover that blocks its own permit.
-const OVER_EVERY_IN_COVER_PROBE: Range<u32> = 1..4;
+const OVER_EVERY_IN_COVER_PROBE: Range<u32> = 2..5;
 /// An outage over the block probe alone, between two answering permits: no probe sees it.
-const OVER_THE_BLOCK_PROBE_ALONE: Range<u32> = 2..3;
+const OVER_THE_BLOCK_PROBE_ALONE: Range<u32> = 3..4;
 /// An outage over the final "egress is back" probe alone, between two answering control probes.
-const OVER_THE_RESTORE_PROBE_ALONE: Range<u32> = 5..6;
+const OVER_THE_RESTORE_PROBE_ALONE: Range<u32> = 6..7;
 
 #[skuld::test]
 fn no_outage_placement_is_charged_to_a_healthy_cover() {
@@ -121,7 +121,7 @@ fn no_outage_placement_is_charged_to_a_healthy_cover() {
         Cover::Healthy,
         false,
         true,
-        &[within(1, 4), vec![OVER_THE_RESTORE_PROBE_ALONE]].concat(),
+        &[within(2, 5), vec![OVER_THE_RESTORE_PROBE_ALONE]].concat(),
         |d| Net::new(d, &[]),
     );
     assert!(defects.is_empty(), "outages read as defects: {defects:#?}");
@@ -129,9 +129,9 @@ fn no_outage_placement_is_charged_to_a_healthy_cover() {
 
 #[skuld::test]
 fn an_outage_over_an_in_cover_reading_that_ended_before_the_teardown_probe_is_a_defect() {
-    // The permit before the block probe is missing (tick 1) and the network is back by tick 2: nothing
+    // The permit before the block probe is missing (tick 2) and the network is back by tick 3: nothing
     // outside the cover failed, so a rerun would be a wait on no failed probe.
-    let net = Net::new(1..2, &[]);
+    let net = Net::new(2..3, &[]);
     assert!(full_run(&net, Cover::Healthy, false).is_err());
 }
 
@@ -177,15 +177,50 @@ fn a_cover_that_blocks_its_own_permit_is_a_defect_under_every_placement() {
 fn a_permitted_host_that_is_down_on_its_own_is_waited_for_not_charged_to_the_cover() {
     // The second permit is down for a stretch of ticks that covers its in-cover probe and the judge's
     // look at it; the cover permits it, so nothing is wrong with the cover. With the second permit the
-    // run has five in-cover probes (ticks 1..=5) and a restore probe at tick 8.
-    let mut residual = within(1, 6);
-    residual.push(8..9);
+    // run has five in-cover probes (ticks 2..=6) and a restore probe at tick 9.
+    let mut residual = within(2, 7);
+    residual.push(9..10);
     let defects = wrong_verdicts(Cover::Healthy, true, true, &residual, |d| {
         Net::new(d, &[]).with_host_down(SECOND_PERMIT, 0..40)
     });
     assert!(
         defects.is_empty(),
         "a remote host's own outage read as a defect: {defects:#?}"
+    );
+}
+
+/// How long past an outage the blocked host stays down by itself (a different anycast edge than the
+/// one that recovered). The scripted tick clock has no unit; this is longer than any run here.
+const BLOCK_STAYS_DOWN_FOR: u32 = 25;
+
+/// The network is down over `down` and the blocked host stays down for `BLOCK_STAYS_DOWN_FOR` ticks
+/// after it ends, so a rerun starts while the blocked host is still down and the control answers.
+fn block_outlasts(down: Range<u32>) -> Net {
+    let stays = down.start..down.end + BLOCK_STAYS_DOWN_FOR;
+    Net::new(down, &[]).with_host_down(BLOCK, stays)
+}
+
+#[skuld::test]
+fn a_blocked_host_that_outlasts_an_outage_never_hides_a_leaking_cover() {
+    let passed = wrong_verdicts(
+        Cover::Leaks,
+        false,
+        false,
+        &[OVER_THE_BLOCK_PROBE_ALONE],
+        block_outlasts,
+    );
+    assert!(
+        passed.is_empty(),
+        "a leaking cover passed with the blocked host down past the outage under outages {passed:#?}"
+    );
+}
+
+#[skuld::test]
+fn a_blocked_host_that_outlasts_an_outage_is_waited_for_not_charged_to_a_healthy_cover() {
+    let defects = wrong_verdicts(Cover::Healthy, false, true, &within(2, 5), block_outlasts);
+    assert!(
+        defects.is_empty(),
+        "a healthy cover was charged with the blocked host down past the outage under outages {defects:#?}"
     );
 }
 
@@ -211,7 +246,7 @@ fn wire_run(net: &Net, readings: fn(&[bool], &[bool]) -> Failure) -> Result<(), 
         }
         Err(readings(&[vouch_before, vouch_after], &[head, tail]))
     };
-    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &[], &hole, scenario)
 }
 
 /// The ticks of a wire run's first pass: window open 0, permit 1, head 2, leak 3, tail 4, permit 5, then
@@ -249,7 +284,7 @@ fn a_head_only_wire_drop_with_the_control_answering_is_a_defect_under_every_plac
                 net.release();
                 Err::<(), _>(wire_failure(&[true, true], &[false, true]))
             };
-            rerun_until_network_holds_on(&mut { &net }, "t", CONTROL, &hole, scenario).is_ok()
+            rerun_until_network_holds_on(&mut { &net }, "t", CONTROL, &[], &hole, scenario).is_ok()
         })
         .collect();
     assert!(passed.is_empty(), "a wire drop was excused under {passed:?}");
@@ -267,7 +302,7 @@ fn confined_run(net: &Net, readings: fn(&[bool], &[bool]) -> Failure) -> Result<
         net.release();
         Err::<(), _>(readings(&[before, after], &[false]))
     };
-    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &clean, scenario)
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &[], &clean, scenario)
 }
 
 #[skuld::test]
@@ -302,7 +337,7 @@ fn reload_run(net: &Net) -> Result<(), String> {
         net.release();
         Err::<(), _>(Failure::covered("the permit broke after the reloads".to_string()))
     };
-    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &[], &hole, scenario)
 }
 
 #[skuld::test]

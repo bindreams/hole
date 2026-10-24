@@ -362,7 +362,7 @@ fn scenario_result<T>(
     hole: HoleState<'_>,
     scenario: impl FnMut() -> Result<T, Failure>,
 ) -> Result<T, String> {
-    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, hole, scenario)
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &[], hole, scenario)
 }
 
 #[skuld::test]
@@ -404,7 +404,7 @@ fn a_scenario_that_left_a_cover_behind_is_a_defect_even_with_the_network_down() 
 // Window ==============================================================================================================
 
 fn open<'a>(net: &Net, hole: HoleState<'a>) -> Result<Window<'a>, String> {
-    open_window_on(&mut { net }, "t", CONTROL, hole)
+    open_window_on(&mut { net }, "t", CONTROL, &[], hole)
 }
 
 fn judge(net: &Net, window: Window<'_>, why: &str) -> Result<(), String> {
@@ -416,6 +416,28 @@ fn a_window_opens_only_once_the_control_answers() {
     let net = Net::new(0..2, &[]);
     open(&net, &clean).unwrap();
     assert_eq!(net.probes_of(CONTROL), 3);
+}
+
+#[skuld::test]
+fn a_window_opens_only_once_every_blocked_host_answers_too() {
+    // The control answers throughout; the blocked host is down on its own for the first 6 ticks.
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 0..6);
+    open_window_on(&mut { &net }, "t", CONTROL, &[TARGET], &clean).unwrap();
+    assert_eq!(net.probes_of(TARGET), 4);
+    assert_eq!(net.pauses.get(), 3);
+}
+
+#[skuld::test]
+fn a_window_does_not_wait_for_a_blocked_host_while_hole_holds_a_cover() {
+    // A blocked host that fails while Hole holds a cover is not a network loss: it fails at once.
+    let net = Net::new(0..0, &[TARGET]);
+    let err = open_window_on(&mut { &net }, "t", CONTROL, &[TARGET], &|| {
+        Some("a leaked cover".to_string())
+    })
+    .err()
+    .expect("opened over a cover");
+    assert!(err.contains("a leaked cover"), "{err}");
+    assert_eq!(net.pauses.get(), 0);
 }
 
 #[skuld::test]

@@ -148,8 +148,12 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
     // Phase A: cover OFF — positive control. ==========================================================================
     // No cover blocks the control, so it is probed inside the run, before and after: a failure with both
     // answering is the capture pipeline's (or the product's), a miss on either side is the network's.
-    let phase_a =
-        hole_test_observability::egress::rerun_until_network_holds("nic capture: phase A", &control, &held, || {
+    let phase_a = hole_test_observability::egress::rerun_until_network_holds(
+        "nic capture: phase A",
+        &control,
+        &[],
+        &held,
+        || {
             let control_before = hole_test_observability::egress::probe(&control).is_ok();
             let nonce_a_ctrl = nonce();
             let cap = dir.path().join("phase_a.etl");
@@ -191,14 +195,19 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
                 None => Ok(()),
                 Some(why) => Err(Failure::uncovered(why, &[control_before, control_after])),
             }
-        });
+        },
+    );
     if let Err(why) = phase_a {
         panic!("{why}");
     }
 
     // Phase B: cover ON — the no-leak proof. ==========================================================================
-    let phase_b =
-        hole_test_observability::egress::rerun_until_network_holds("nic capture: phase B", &control, &held, || {
+    let phase_b = hole_test_observability::egress::rerun_until_network_holds(
+        "nic capture: phase B",
+        &control,
+        &[],
+        &held,
+        || {
             lockdown_state::set_enabled(dir.path(), true, None).expect("persist lockdown intent");
             let cover = engage_lockdown(
                 server_ip,
@@ -290,7 +299,8 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
                 &[vouch_before, vouch_after],
                 &[head_seen, tail_seen],
             ))
-        });
+        },
+    );
     if let Err(why) = phase_b {
         panic!("{why}");
     }

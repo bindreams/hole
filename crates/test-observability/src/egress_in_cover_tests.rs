@@ -181,7 +181,7 @@ fn uncovered_readings_excuse_any_miss() {
 // Window::judge on each Failure =======================================================================================
 
 fn judged(net: &Net, hole: HoleState<'_>, failure: Failure) -> Result<(), String> {
-    let window = open_window_on(&mut { net }, "t", CONTROL, hole).unwrap();
+    let window = open_window_on(&mut { net }, "t", CONTROL, &[], hole).unwrap();
     judge_on(&mut { net }, window, failure)
 }
 
@@ -211,7 +211,7 @@ fn a_wavering_over_a_cover_that_was_left_behind_is_a_defect() {
     let net = Net::new(1..u32::MAX, &[]);
     let cover = Cell::new(false);
     let hole = || cover.get().then(|| "the lockdown cover".to_string());
-    let window = open_window_on(&mut { &net }, "t", CONTROL, &hole).unwrap();
+    let window = open_window_on(&mut { &net }, "t", CONTROL, &[], &hole).unwrap();
     cover.set(true);
     let err = judge_on(&mut { &net }, window, Failure::Wavered("wavered".into())).unwrap_err();
     assert!(err.contains("the lockdown cover"), "{err}");

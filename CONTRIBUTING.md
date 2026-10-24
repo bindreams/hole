@@ -3002,7 +3002,9 @@ and a rerun repeats the platform's whole job.
   cannot use a control host, so the scenario vouches for the network from inside
   the cover: it probes a host the cover permits before and after each probe whose
   result it reports (`egress::InCover`), and `egress::Window` judges the readings
-  after the teardown. A failure is a defect only when the permit answered on both
+  after the teardown. A scenario hands the window the hosts it claims the cover
+  blocks, and every run (a rerun's too) opens only once they answer outside any
+  cover, so a block is never read off a host that is down on its own. A failure is a defect only when the permit answered on both
   sides and the failing targets, probed outside the cover, answer there with the
   control answering around them; a target that is down outside any cover is
   waited for (`check_egress_restored` does the same for a restored-egress

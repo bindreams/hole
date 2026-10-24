@@ -35,7 +35,9 @@
 //! **The runner's own network is not under test.** The before and after resolver sets are read with
 //! a control host answering around them (`hole_test_observability::egress::read_with_network_up`),
 //! and a Start that fails is judged through a `Window` with the same control: a lost network is
-//! waited out, a failure with the network up is a defect.
+//! waited out, a failure with the network up is a defect. The control has no bypass route, so a failed
+//! Start that leaves its split routes behind would starve it: the Hole-state read ([`held_state`])
+//! counts those routes as held, which makes that failure a defect at once and never a wait.
 //!
 //! `DnsConfig::default()` (real Cloudflare resolvers, DoH) is used rather
 //! than a synthetic/unreachable address: the bridge's own start-time
@@ -211,6 +213,21 @@ fn resolver_set(what: &str, hole_state: HoleState<'_>) -> (String, Vec<String>) 
     })
 }
 
+/// What Hole holds right now: a cover, or its split routes through its own TUN. The routes are read
+/// from the kernel's lookup and attributed to Hole by the `utun` carrying `TUN_SUBNET`'s address.
+fn held_state(state_dir: &Path) -> Option<String> {
+    held_covers(state_dir).or_else(split_routes_held)
+}
+
+fn split_routes_held() -> Option<String> {
+    let tun_addr = TUN_SUBNET.split('/').next().expect("TUN_SUBNET has an address part");
+    [SPLIT_LOW_PROBE, SPLIT_HIGH_PROBE].into_iter().find_map(|dest| {
+        let iface = route_get_interface(dest)?;
+        (iface.starts_with("utun") && utun_holds_address(&iface, tun_addr))
+            .then(|| format!("the split route covering {dest}, through Hole's TUN {iface}"))
+    })
+}
+
 /// Every `nameserver[N] : ADDR` line, sorted and deduped — the structural
 /// shape of "which resolvers does this machine use", stable enough to
 /// compare before against after. Same technique as
@@ -353,7 +370,7 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     // so a directory of its own names nothing.
     let early_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
     let (before_dns, before_nameservers) = resolver_set("macos full tunnel: the resolver set before", &|| {
-        held_covers(early_dir.path())
+        held_state(early_dir.path())
     });
     println!("[macos_full_tunnel] before ifconfig -l: {before_ifaces:?}");
     println!("[macos_full_tunnel] before scutil --dns:\n{before_dns}");
@@ -374,7 +391,7 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
 
     let mut harness = DistHarness::spawn(dist).await.expect("HARNESS: spawn DistHarness");
     let state_dir = harness.state_dir.path().to_path_buf();
-    let held = || held_covers(&state_dir);
+    let held = || held_state(&state_dir);
 
     // Register for configd's change post BEFORE the mutating call, so the
     // settle below cannot miss the post it causes.
@@ -384,7 +401,7 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     // network. No cover is engaged in this test, so the control is probed on both sides of the Start and
     // the failure is judged by them.
     loop {
-        let window = Window::open("macos full tunnel: Start", NETWORK_CONTROL, &held)
+        let window = Window::open("macos full tunnel: Start", NETWORK_CONTROL, &[], &held)
             .unwrap_or_else(|why| panic!("HARNESS: {why}"));
         let control_before = egress::probe(NETWORK_CONTROL).is_ok();
         let resp = harness

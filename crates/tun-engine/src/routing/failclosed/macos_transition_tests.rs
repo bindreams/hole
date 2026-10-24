@@ -396,6 +396,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         "transition sampling",
         dir.path(),
         &format!("{SERVER_A}:443"),
+        &[NON_PERMITTED],
         || {
             let addrs = [SERVER_A, SERVER_B];
 

@@ -105,6 +105,7 @@ fn judged_off_box(what: &str, scenario: impl FnMut() -> Result<(), Failure>) {
     let verdict = hole_test_observability::egress::rerun_until_network_holds(
         what,
         &control(),
+        &[],
         &|| crate::test_utils::held_covers(no_cover_dir.path()),
         scenario,
     );

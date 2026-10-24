@@ -84,6 +84,12 @@ const RESOLVER: &str = "1.0.0.1:443";
 const RESOLVER_OTHER_PORT: &str = "1.0.0.1:853";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const NON_PERMITTED: &str = "8.8.8.8:443";
+// Every host the scenarios claim a cover blocks, handed to the egress window: a block verdict is
+// only evidence if the host answers with no cover, so each rerun waits for these as well.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const BLOCKED: &[&str] = &[NON_PERMITTED];
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const RESOLVER_BLOCKED: &[&str] = &[RESOLVER_OTHER_PORT, NON_PERMITTED];
 
 /// The precondition every test starts from: the targets answer and no cover is installed. A cover left
 /// by an earlier test fails here at once instead of reading as a lost network.
@@ -175,7 +181,7 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 
     // The cover blocks every control host, so the scenario vouches for the network with the permit it
     // holds, on both sides of the block probe; the verdict is judged after the cover is dropped.
-    permit_scenario("lockdown permit", dir.path(), PERMITTED, || {
+    permit_scenario("lockdown permit", dir.path(), PERMITTED, BLOCKED, || {
         // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
         // source to exercise the real resolve + `LocalInterface` filter path.
         let cover = engage_lockdown(
@@ -250,7 +256,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         "pre-engage pf must report no lockdown cover"
     );
 
-    permit_scenario("lockdown permit", dir.path(), PERMITTED, || {
+    permit_scenario("lockdown permit", dir.path(), PERMITTED, BLOCKED, || {
         let cover = engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path(), None)
             .expect("engage real pf lockdown cover");
 
@@ -342,7 +348,7 @@ fn a_simulated_reboot_rearms_the_cover() {
 
     wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
-    permit_scenario("rearm", dir.path(), PERMITTED, || {
+    permit_scenario("rearm", dir.path(), PERMITTED, BLOCKED, || {
         // First engage: FreshEnable (no persisted state yet).
         let cover = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
             .expect("engage real pf lockdown cover");
@@ -470,7 +476,7 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
     // network blip is never a false pass.
     wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
-    permit_scenario("transient permit", dir.path(), PERMITTED, || {
+    permit_scenario("transient permit", dir.path(), PERMITTED, BLOCKED, || {
         let cover = engage(server_ip, None, dir.path(), None).expect("engage real WFP transient cover");
 
         let verdict = transient_probes().run();
@@ -496,15 +502,21 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
 
     wait_for_baseline(dir.path(), &[PERMITTED, RESOLVER, RESOLVER_OTHER_PORT, NON_PERMITTED]);
 
-    permit_scenario("transient resolver permit", dir.path(), PERMITTED, || {
-        let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
-            .expect("engage real WFP transient cover with a resolver permit");
+    permit_scenario(
+        "transient resolver permit",
+        dir.path(),
+        PERMITTED,
+        RESOLVER_BLOCKED,
+        || {
+            let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
+                .expect("engage real WFP transient cover with a resolver permit");
 
-        let verdict = resolver_probes().run();
+            let verdict = resolver_probes().run();
 
-        drop(cover);
-        verdict
-    });
+            drop(cover);
+            verdict
+        },
+    );
     assert_restored(
         "disengage must restore egress",
         &[NON_PERMITTED, RESOLVER_OTHER_PORT],
@@ -524,7 +536,7 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
 
     wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
-    permit_scenario("transient permit", dir.path(), PERMITTED, || {
+    permit_scenario("transient permit", dir.path(), PERMITTED, BLOCKED, || {
         let cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
 
         // (a) The live ruleset carries our block-all.
@@ -556,22 +568,28 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
 
     wait_for_baseline(dir.path(), &[PERMITTED, RESOLVER, RESOLVER_OTHER_PORT, NON_PERMITTED]);
 
-    permit_scenario("transient resolver permit", dir.path(), PERMITTED, || {
-        let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
-            .expect("engage real pf transient cover with a resolver permit");
+    permit_scenario(
+        "transient resolver permit",
+        dir.path(),
+        PERMITTED,
+        RESOLVER_BLOCKED,
+        || {
+            let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
+                .expect("engage real pf transient cover with a resolver permit");
 
-        let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
-        let rules = String::from_utf8_lossy(&sr.stdout);
-        assert!(
-            rules.contains("1.0.0.1"),
-            "live ruleset must carry the resolver permit:\n{rules}"
-        );
+            let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
+            let rules = String::from_utf8_lossy(&sr.stdout);
+            assert!(
+                rules.contains("1.0.0.1"),
+                "live ruleset must carry the resolver permit:\n{rules}"
+            );
 
-        let verdict = resolver_probes().run();
+            let verdict = resolver_probes().run();
 
-        drop(cover);
-        verdict
-    });
+            drop(cover);
+            verdict
+        },
+    );
     assert_restored(
         "disengage must restore egress",
         &[NON_PERMITTED, RESOLVER_OTHER_PORT],

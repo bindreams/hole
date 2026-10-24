@@ -386,7 +386,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // A Full-mode Start installs routes through the default gateway, so it fails with no default route. No
     // cover blocks the control in this phase, so it is probed on both sides of the Start.
     loop {
-        let window = hole_test_observability::egress::Window::open("live-tun-permit phase A", &control, &held)
+        let window = hole_test_observability::egress::Window::open("live-tun-permit phase A", &control, &[], &held)
             .unwrap_or_else(|why| panic!("HARNESS: {why}"));
         let control_before = hole_test_observability::egress::probe(&control).is_ok();
         let resp = harness
@@ -445,7 +445,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // network inside it (`Failure::Unvouched`). Residual: an outage that starts and ends inside a run
     // reads as a defect.
     let (cover_presence, tun_outcome, no_leak, permitted_reachable, path_to_no_leak) = loop {
-        let window = hole_test_observability::egress::Window::open("live-tun-permit phase B", &control, &held)
+        let window = hole_test_observability::egress::Window::open("live-tun-permit phase B", &control, &[], &held)
             .unwrap_or_else(|why| panic!("HARNESS: {why}"));
         // Recovery record + escape guard BEFORE anything is armed — written once
         // the harness's state directory exists, well before the SetLockdown{true}
