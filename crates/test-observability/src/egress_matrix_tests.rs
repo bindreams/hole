@@ -298,13 +298,9 @@ fn reload_run(net: &Net) -> Result<(), String> {
     let hole = || net.cover.get().then(|| "a cover".to_string());
     let scenario = || {
         net.engage(&[PERMIT]);
-        let cold = net.reachable(PERMIT);
+        net.reachable(PERMIT);
         net.release();
-        Err::<(), _>(Failure::covered(
-            "the permit broke after the reloads".to_string(),
-            PERMIT,
-            &[cold, false],
-        ))
+        Err::<(), _>(Failure::covered("the permit broke after the reloads".to_string()))
     };
     rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &hole, scenario)
 }

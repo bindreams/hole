@@ -117,25 +117,14 @@ fn an_outage_over_one_probe_between_two_answering_permits_is_not_seen() {
 // Failure::covered / uncovered ========================================================================================
 
 #[skuld::test]
-fn covered_readings_are_never_wavered() {
-    // They span cover changes, so a miss cannot be told from a permit the reloads broke: the control
-    // around the teardown decides.
-    let why = || "x".to_string();
-    for readings in [[true, true], [true, false], [false, true]] {
-        assert_eq!(
-            Failure::covered(why(), CONTROL, &readings),
-            Failure::Failed {
-                why: why(),
-                targets: vec![]
-            },
-            "{readings:?}"
-        );
-    }
+fn a_covered_run_is_never_wavered() {
+    // Its permit readings span cover changes, so a miss cannot be told from a permit the reloads broke:
+    // the control around the teardown decides.
     assert_eq!(
-        Failure::covered(why(), CONTROL, &[false, false]),
+        Failure::covered("x".to_string()),
         Failure::Failed {
-            why: why(),
-            targets: vec![CONTROL.to_string()]
+            why: "x".to_string(),
+            targets: vec![]
         }
     );
 }

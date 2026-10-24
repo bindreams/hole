@@ -30,18 +30,14 @@ pub enum Failure {
 }
 
 impl Failure {
-    /// A run whose permit readings were taken in order across cover changes (reloads): some of them may
-    /// be a permit Hole broke, so a miss is no evidence of an outage and the control around the
-    /// teardown decides (`Failed`). If none answered, the permit itself failed and `outside` (a host
-    /// that answers outside the cover) is the target the judge probes. For readings that are
-    /// reachability probes.
-    pub fn covered(why: String, outside: &str, readings: &[bool]) -> Failure {
-        let targets = if readings.iter().any(|a| *a) {
-            Vec::new()
-        } else {
-            vec![outside.to_string()]
-        };
-        Failure::Failed { why, targets }
+    /// A run whose permit readings were taken in order across cover changes (reloads), after the
+    /// cold engage's permit answered: a later miss may be a permit Hole broke, so it is no evidence of
+    /// an outage and the control around the teardown decides (`Failed`, no targets).
+    pub fn covered(why: String) -> Failure {
+        Failure::Failed {
+            why,
+            targets: Vec::new(),
+        }
     }
 
     /// A run whose markers were read from a local capture of the NIC, with `vouch` the readings of a

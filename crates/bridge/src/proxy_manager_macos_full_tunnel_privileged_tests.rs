@@ -32,6 +32,11 @@
 //! `tun_engine::test_utils` is the natural home for one shared copy;
 //! tracked separately rather than done here.
 //!
+//! **The runner's own network is not under test.** The before and after resolver sets are read with
+//! a control host answering around them (`hole_test_observability::egress::read_with_network_up`),
+//! and a Start that fails is judged through a `Window` with the same control: a lost network is
+//! waited out, a failure with the network up is a defect.
+//!
 //! `DnsConfig::default()` (real Cloudflare resolvers, DoH) is used rather
 //! than a synthetic/unreachable address: the bridge's own start-time
 //! forwarder self-test (CLAUDE.md `#dns-forwarder`) would fail Start outright
@@ -75,7 +80,13 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use hole_common::config::{DnsConfig, ServerEntry};
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
+use hole_test_observability::egress::{self, Failure, HoleState, Window};
+use tun_engine::test_utils::held_covers;
 use util::port_alloc::Protocols;
+
+/// A host no cover and no tunnel here ever blocks: the control that tells a runner network loss
+/// from a Hole defect, for the resolver reads and the Start.
+const NETWORK_CONTROL: &str = "8.8.8.8:443";
 
 // configd change notification (duplicated from
 // `tun_engine::dns_steer::privileged_tests` — private to that crate, see
@@ -176,6 +187,28 @@ fn scutil_dns() -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_else(|e| format!("HARNESS: failed to spawn scutil --dns: {e}"))
+}
+
+/// `scutil --dns`, or why it could not be read: a failed read is taken again, not compared.
+fn scutil_dns_checked() -> Result<String, String> {
+    let output = Command::new("scutil")
+        .arg("--dns")
+        .output()
+        .map_err(|e| format!("failed to spawn scutil --dns: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("scutil --dns exited with {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The raw `scutil --dns` output and its resolver set, read with the network up: the runner's own
+/// resolver leaves with its network, so a set read while it was away is no evidence about Hole.
+fn resolver_set(what: &str, hole_state: HoleState<'_>) -> (String, Vec<String>) {
+    egress::read_with_network_up(what, NETWORK_CONTROL, hole_state, || {
+        let dns = scutil_dns_checked()?;
+        let servers = nameservers(&dns);
+        Ok::<_, String>((dns, servers))
+    })
 }
 
 /// Every `nameserver[N] : ADDR` line, sorted and deduped — the structural
@@ -316,8 +349,12 @@ fn e2e_macos_full_tunnel_installs_the_os_state_it_claims(
 
 async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     let before_ifaces = ifconfig_list();
-    let before_dns = scutil_dns();
-    let before_nameservers = nameservers(&before_dns);
+    // The harness's state directory does not exist yet; the oracle reads the OS (the live pf ruleset),
+    // so a directory of its own names nothing.
+    let early_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
+    let (before_dns, before_nameservers) = resolver_set("macos full tunnel: the resolver set before", &|| {
+        held_covers(early_dir.path())
+    });
     println!("[macos_full_tunnel] before ifconfig -l: {before_ifaces:?}");
     println!("[macos_full_tunnel] before scutil --dns:\n{before_dns}");
 
@@ -336,23 +373,40 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     let configured_servers: Vec<String> = config.dns.servers.iter().map(ToString::to_string).collect();
 
     let mut harness = DistHarness::spawn(dist).await.expect("HARNESS: spawn DistHarness");
+    let state_dir = harness.state_dir.path().to_path_buf();
+    let held = || held_covers(&state_dir);
 
     // Register for configd's change post BEFORE the mutating call, so the
     // settle below cannot miss the post it causes.
     let start_notify = DnsConfigNotify::register().expect("register for configd's dns_configuration notification");
 
-    let resp = harness
-        .send(BridgeRequest::Start {
-            config,
-            attempt_id: "macos-full-tunnel-os-state-e2e".into(),
-            on_startup: Some(hole_common::config::StartupBehavior::default()),
-        })
-        .await
-        .expect("send Start");
-    assert!(
-        matches!(resp, BridgeResponse::Ack),
-        "expected Ack from Start, got {resp:?}"
-    );
+    // A Full-mode Start needs the default route and an upstream, so it fails when the runner loses its
+    // network. No cover is engaged in this test, so the control is probed on both sides of the Start and
+    // the failure is judged by them.
+    loop {
+        let window = Window::open("macos full tunnel: Start", NETWORK_CONTROL, &held)
+            .unwrap_or_else(|why| panic!("HARNESS: {why}"));
+        let control_before = egress::probe(NETWORK_CONTROL).is_ok();
+        let resp = harness
+            .send(BridgeRequest::Start {
+                config: config.clone(),
+                attempt_id: "macos-full-tunnel-os-state-e2e".into(),
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
+            })
+            .await
+            .expect("send Start");
+        if matches!(resp, BridgeResponse::Ack) {
+            break;
+        }
+        let control_after = egress::probe(NETWORK_CONTROL).is_ok();
+        let failure = Failure::uncovered(
+            format!("expected Ack from Start, got {resp:?}"),
+            &[control_before, control_after],
+        );
+        if let Err(why) = window.judge(failure) {
+            panic!("{why}");
+        }
+    }
 
     // (a) a live utun the OS did not have before.
     let after_start_ifaces = ifconfig_list();
@@ -462,8 +516,7 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     );
 
     let unmerged = stop_notify.settle(budget(30), &configured_servers[0], false);
-    let dns_after_stop = scutil_dns();
-    let after_nameservers = nameservers(&dns_after_stop);
+    let (dns_after_stop, after_nameservers) = resolver_set("macos full tunnel: the resolver set after Stop", &held);
     println!(
         "[macos_full_tunnel] configd's DNS configuration no longer lists the configured resolver: {unmerged}\n{dns_after_stop}"
     );

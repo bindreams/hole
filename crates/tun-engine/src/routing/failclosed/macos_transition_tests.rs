@@ -692,9 +692,8 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                 // The cold engage's permit answered, so the control around the teardown decides: down is a
                 // rerun; answering is a defect, including an outage inside the run that has ended by then.
                 drop(held.take());
-                return Err(hole_test_observability::egress::Failure::covered(
-                    format!(
-                        "positive control: only {raw_hits}/{control_total_attempts} ({raw_rate:.1}%) connects to a \
+                return Err(hole_test_observability::egress::Failure::covered(format!(
+                    "positive control: only {raw_hits}/{control_total_attempts} ({raw_rate:.1}%) connects to a \
              PERMITTED server ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?}, under the \
              {CONTROL_RATE_FLOOR_PCT:.0}% floor (of which {permitted_attempts} survived the \
              commit-generation filter). The never-admitted assertion above is therefore not trustworthy: \
@@ -706,10 +705,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
              do NOT lower the floor: {PROBER_TIMEOUT:?} is the prober pool's budget too, and raising it \
              thins the pool's probe density, which IS this guard's sensitivity. The knob is loaded both \
              ways."
-                    ),
-                    &format!("{SERVER_A}:443"),
-                    &[true],
-                ));
+                )));
             }
 
             // The last cover's normal Drop restores /etc/pf.conf.
