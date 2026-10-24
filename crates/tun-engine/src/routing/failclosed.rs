@@ -130,7 +130,7 @@ pub mod lockdown_pf_state;
 pub mod pf_claim;
 
 #[cfg(any(target_os = "macos", test))]
-pub(crate) mod drop_right;
+pub(crate) mod dropped_tokens;
 
 pub mod luid;
 pub use luid::{LuidResolver, SystemLuidResolver};

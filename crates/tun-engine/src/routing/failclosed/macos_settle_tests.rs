@@ -1,4 +1,4 @@
-//! What a release leaves behind when `pfctl` fails, and who may drop a token.
+//! What a release leaves behind when `pfctl` fails, and that a token is dropped once.
 //!
 //! The record is the evidence a retry acts on, so it goes only after the token
 //! it names is confirmed dropped. Over the real record files, with `pfctl` doubled.
@@ -19,7 +19,7 @@ fn standing_left(dir: &Path) -> StateFile<lockdown_state::LockdownPfState> {
 fn a_release_whose_pfctl_x_fails_keeps_the_tombstone_and_a_retry_drops_each_token_once() {
     let dir = tempfile::tempdir().unwrap();
     state::seed(dir.path(), &transient_record(OLD));
-    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    lockdown_state::seed(dir.path(), &standing_record(OLD_S));
     let mut failing = ReleasePf::new(dir.path()).fail_drops(2);
 
     release_over(&mut failing).expect("the host is restored; a refcount that would not drop is logged");
@@ -31,12 +31,12 @@ fn a_release_whose_pfctl_x_fails_keeps_the_tombstone_and_a_retry_drops_each_toke
     );
     assert_eq!(
         standing_left(dir.path()),
-        StateFile::Present(standing_tombstone_of(OLD))
+        StateFile::Present(standing_tombstone_of(OLD_S))
     );
 
     let retried = release(dir.path());
 
-    assert_eq!(retried, vec![OLD.to_string(), OLD.to_string()], "one drop per cover");
+    assert_eq!(retried, vec![OLD.to_string(), OLD_S.to_string()], "one drop per cover");
     assert!(!record_exists(dir.path(), state::STATE_FILE_NAME));
     assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
 }
@@ -109,7 +109,7 @@ fn a_transient_disengage_whose_pfctl_x_fails_keeps_its_record_for_the_next_sweep
 fn a_release_whose_restore_fails_keeps_the_token_and_a_retry_drops_it_once() {
     let dir = tempfile::tempdir().unwrap();
     state::seed(dir.path(), &transient_record(OLD));
-    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    lockdown_state::seed(dir.path(), &standing_record(OLD_S));
     // The transient restore, then the standing snapshot load and its fallback.
     let mut failing = ReleasePf::new(dir.path()).fail_restores(3);
 
@@ -121,7 +121,7 @@ fn a_release_whose_restore_fails_keeps_the_token_and_a_retry_drops_it_once() {
 
     let retried = release(dir.path());
 
-    assert_eq!(retried, vec![OLD.to_string(), OLD.to_string()]);
+    assert_eq!(retried, vec![OLD.to_string(), OLD_S.to_string()]);
     assert!(!record_exists(dir.path(), state::STATE_FILE_NAME));
     assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
 }
@@ -137,17 +137,17 @@ fn a_transient_disengage_whose_restore_fails_keeps_the_token_too() {
     assert_eq!(transient_left(dir.path()), StateFile::Present(transient_record(OLD)));
 }
 
-// One party settles a token at a time =================================================================================
+// A token is dropped once =============================================================================================
 
 #[skuld::test]
-fn a_party_that_settles_a_token_while_a_release_is_dropping_it_neither_drops_nor_clears() {
+fn a_party_that_settles_a_token_a_release_has_dropped_but_not_cleared_drops_nothing_again() {
     let dir = tempfile::tempdir().unwrap();
     state::seed(dir.path(), &transient_record(OLD));
     let other = RefCell::new(None);
     let mut pf = ReleasePf::new(dir.path());
     pf.on_drop = Some(Box::new(|d: &Path| {
         let mut second = ReleasePf::new(d);
-        release_over(&mut second).expect("another release may not complete a drop it does not own");
+        release_over(&mut second).expect("a second release finds the token dropped");
         *other.borrow_mut() = Some((second.drop_attempts, record_exists(d, state::STATE_FILE_NAME)));
     }));
 
@@ -155,7 +155,7 @@ fn a_party_that_settles_a_token_while_a_release_is_dropping_it_neither_drops_nor
 
     let (attempts, record_stood) = other.borrow_mut().take().expect("the hook ran");
     assert!(attempts.is_empty(), "{attempts:?}");
-    assert!(record_stood, "the record stays until the owner has dropped the token");
+    assert!(!record_stood, "and it cleared the record the first release had yet to");
     assert_eq!(pf.dropped, vec![OLD.to_string()]);
     assert!(!record_exists(dir.path(), state::STATE_FILE_NAME));
 }
@@ -223,18 +223,17 @@ fn a_standing_back_out_that_dropped_the_token_removes_the_tombstone_a_release_wr
 }
 
 #[skuld::test]
-fn a_standing_back_out_leaves_a_token_another_party_is_settling_to_them() {
+fn a_standing_back_out_does_not_drop_a_token_that_was_already_dropped() {
     let dir = tempfile::tempdir().unwrap();
-    let _held = drop_right::take(dir.path(), pf_claim::Record::Standing, MINE).expect("free");
+    dropped_tokens::drop_once(dir.path(), MINE, || Ok(())).unwrap();
     let mut ops = StandingEngage::new(dir.path(), false).fail_loads(1);
 
     engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the load fails");
 
     assert!(ops.dropped.is_empty(), "{:?}", ops.dropped);
-    assert_eq!(
-        lockdown_state::holds(dir.path(), MINE),
-        Held::Held,
-        "the record stays for the holder, who restores and clears it"
+    assert!(
+        !record_exists(dir.path(), lockdown_state::STATE_FILE_NAME),
+        "and the record that named it goes"
     );
 }
 

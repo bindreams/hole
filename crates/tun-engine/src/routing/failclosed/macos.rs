@@ -52,11 +52,12 @@
 //!
 //! - **Claim before restore.** A release rewrites each live record as a tombstone
 //!   (`releasing`) before any pf call, restores, drops the token, and only then
-//!   clears the tombstone, so a failed drop leaves the record for a retry; one
-//!   party at a time holds the right to drop a token ([`super::drop_right`]). An
-//!   engage that lost backs out and, if its own restore fails, puts its record
-//!   back. The rules are in [`super::pf_claim`], the interleavings in
-//!   `macos_release_race_tests`.
+//!   clears the tombstone, so a failed drop leaves the record for a retry. A token
+//!   is dropped once however many parties ask ([`super::dropped_tokens`]), and an
+//!   engage never writes a record once a release has begun
+//!   ([`super::release_epoch`]). An engage that lost backs out and, if its own
+//!   restore fails, puts its record back. The rules are in [`super::pf_claim`], the
+//!   interleavings in `macos_interleaving_tests`.
 //!
 //! Documented caveats (pf has no programmatic API — `pfctl` text I/O IS the
 //! interface, as `netsh`/`route` are for routing):
@@ -80,7 +81,7 @@ use crate::error::RoutingError;
 use util::system_tool::SystemTool;
 // `macos.rs` is mounted as `mod platform` under `failclosed`, so `super` is the
 // `failclosed` module and `failclosed_state` is its sibling child.
-use super::drop_right::{self, DropRight};
+use super::dropped_tokens;
 use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
 use super::pf_claim::{self, Cleared, Record};
@@ -422,11 +423,20 @@ fn pfctl<P: Phase>(_args: &[&str], _stdin: Option<&[u8]>, _phase: P) -> Result<s
 
 /// `pfctl -E` (refcounted enable) + parse the enable token from its output. The
 /// token prints to stderr (or stdout on some hosts), so try both.
-fn enable_pf_capture_token() -> Result<String, RoutingError> {
+fn enable_pf_capture_token(state_dir: &Path) -> Result<String, RoutingError> {
     let en = pfctl(&["-E"], None, FatalPhase::CoverEngage)?;
-    parse_enable_token(&String::from_utf8_lossy(&en.stderr))
+    let token = parse_enable_token(&String::from_utf8_lossy(&en.stderr))
         .or_else(|| parse_enable_token(&String::from_utf8_lossy(&en.stdout)))
-        .ok_or_else(|| RoutingError::RouteSetup("pfctl -E returned no token".into()))
+        .ok_or_else(|| RoutingError::RouteSetup("pfctl -E returned no token".into()))?;
+    dropped_tokens::minted(state_dir, &token);
+    Ok(token)
+}
+
+/// `pfctl -X <token>`, once per token ([`dropped_tokens::drop_once`]).
+fn real_drop_token<P: Phase>(state_dir: &Path, token: &str, phase: P) -> Result<(), RoutingError> {
+    dropped_tokens::drop_once(state_dir, token, || {
+        pfctl_status(pfctl(&["-X", token], None, phase), "pfctl -X")
+    })
 }
 
 /// Which cover a [`Cover`] guard owns — selects its Drop disengage path.
@@ -580,7 +590,8 @@ pub(crate) trait EngageOps: CoverRulesetOps {
     /// the live one naming `token`. A release is `SupersededByRelease`; a record
     /// that cannot be read is a failure, not a release.
     fn transient_commit_check(&mut self, token: &str) -> Result<(), RoutingError>;
-    /// `pfctl -X <token>`: drop a pf enable refcount.
+    /// `pfctl -X <token>`: drop a pf enable refcount, once per token
+    /// ([`dropped_tokens::drop_once`]).
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
     /// The back-out: [`disengage_with`] for `token`. Whether the restore was
     /// confirmed.
@@ -588,6 +599,22 @@ pub(crate) trait EngageOps: CoverRulesetOps {
     /// Put this engage's record back after a restore that failed
     /// ([`state::reassert`]), so recovery has something to act on.
     fn reassert_transient(&mut self, token: &str);
+}
+
+/// Drop the token an engage's record write displaced. The write took the only
+/// record that named it, so nobody else will: a leftover from a cover whose release
+/// did not finish, or a salvaged token from an unusable file. A drop that fails
+/// is logged and the refcount stays until pf is reset, as it did before the write.
+fn drop_displaced(overwritten: Option<&str>, new: &str, drop_token: impl FnOnce(&str) -> Result<(), RoutingError>) {
+    let Some(old) = overwritten.filter(|old| *old != new) else {
+        return;
+    };
+    if let Err(e) = drop_token(old) {
+        tracing::warn!(
+            error = %util::error_chain::error_chain(&e),
+            "pfctl -X failed for the token a new cover's record replaced; pf keeps that refcount until it is reset"
+        );
+    }
 }
 
 pub fn engage(
@@ -671,12 +698,15 @@ fn engage_with(
         pf_was_enabled: was_enabled,
         releasing: false,
     };
+    // The record this overwrites may name a token nothing else will drop: a leftover
+    // from a cover whose release did not finish. The engage takes it over.
     if let Err(e) = ops.save_transient(&expected, &st) {
         if let Err(xe) = ops.drop_token(&token) {
             tracing::warn!(error = %util::error_chain::error_chain(&xe), "pfctl -X failed unwinding a failed transient engage");
         }
         return Err(e);
     }
+    drop_displaced(expected.pf_token(), &token, |old| ops.drop_token(old));
 
     // 4. Load our self-contained blocking ruleset from stdin — NO `-Fa`; see
     //    this module's doc for why that is atomic for the rules. The state
@@ -1042,19 +1072,13 @@ pub(crate) trait LockdownEngageOps: CoverRulesetOps {
         expected: &StateFile<lockdown_state::LockdownPfState>,
         fresh: &lockdown_state::LockdownPfState,
     ) -> Result<(), RoutingError>;
-    /// `pfctl -X <token>`: drop a pf enable refcount.
+    /// `pfctl -X <token>`: drop a pf enable refcount, once per token
+    /// ([`dropped_tokens::drop_once`]).
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
     /// The commit check after the ruleset loads: `Ok` iff the record is still the
     /// live one naming `token`. A release is `SupersededByRelease`; a record that
     /// cannot be read is a failure, not a release.
     fn commit_check(&mut self, token: &str) -> Result<(), RoutingError>;
-    /// The right to settle `token`, or `None` while another party holds it
-    /// ([`drop_right`]).
-    fn drop_right(&mut self, token: &str) -> Option<DropRight>;
-    /// Whether the record still names `token`, live, claimed or unreadable
-    /// ([`pf_claim::names`]). A token is dropped before the record naming it is
-    /// cleared, so a record that names it means it is not dropped yet.
-    fn names_token(&mut self, token: &str) -> bool;
     /// Delete the record naming `token`, whatever has become of it since the
     /// engage's check: its refcount is gone, so no record may name it.
     fn clear_dropped(&mut self, token: &str) -> Result<(), RoutingError>;
@@ -1076,10 +1100,10 @@ fn unwind_refcount(ops: &mut dyn LockdownEngageOps, token: &str, message: &str) 
 /// baseline this engage itself holds, then give up what it still owns.
 ///
 /// The baseline comes from memory because a release may have removed the record
-/// that names it. The refcount is dropped, and then the record cleared, only if
-/// this engage holds the right to ([`drop_right`]) and the record is still its
-/// own live one: a token whose record a release removed (or has claimed, and will
-/// settle) is not dropped here. A drop that fails leaves the record for recovery.
+/// that names it. The engage's refcount is dropped, whatever became of its record
+/// (a token is dropped once however many parties ask: [`dropped_tokens`]), and
+/// then every record naming it is cleared, a release's tombstone included: the
+/// token is gone. A drop that fails leaves the record for recovery.
 ///
 /// A restore that fails leaves a record behind for recovery: the engage's own, if
 /// it is still there, and otherwise the engage's record put back over nothing or
@@ -1101,12 +1125,6 @@ fn back_out_engage(ops: &mut dyn LockdownEngageOps, token: &str, baseline: &lock
                 "putting the lockdown record back failed after a failed back-out; the block may have no record"
             );
         }
-        return;
-    }
-    let Some(_right) = ops.drop_right(token) else {
-        return;
-    };
-    if !ops.names_token(token) {
         return;
     }
     if let Err(e) = ops.drop_token(token) {
@@ -1186,6 +1204,7 @@ fn engage_lockdown_with(
                 unwind_refcount(ops, &token, "pfctl -X failed unwinding a failed lockdown re-enable");
                 return Err(e);
             }
+            drop_displaced(entry.pf_token(), &token, |old| ops.drop_token(old));
             (token, fresh)
         }
         // First engage: enable + snapshot the host.
@@ -1195,7 +1214,10 @@ fn engage_lockdown_with(
             // `-E` on any error before propagating — else the refcount leaks with
             // no state file to recover it from.
             match ops.capture_and_persist(&token, &entry) {
-                Ok(baseline) => (token, baseline),
+                Ok(baseline) => {
+                    drop_displaced(entry.pf_token(), &token, |old| ops.drop_token(old));
+                    (token, baseline)
+                }
                 Err(e) => {
                     unwind_refcount(ops, &token, "pfctl -X failed unwinding a failed lockdown engage");
                     return Err(e);
@@ -1402,8 +1424,9 @@ pub(crate) trait PfOps {
     fn reload_default(&mut self) -> Result<(), RoutingError>;
     /// `pfctl -f -` with `text` on stdin: load a specific ruleset.
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
-    /// `pfctl -X <token>`: drop a pf enable refcount. What a failure does is
-    /// the caller's choice ([`DropFailure`]); no caller may discard it unlogged.
+    /// `pfctl -X <token>`: drop a pf enable refcount, once per token
+    /// ([`dropped_tokens::drop_once`]). What a failure does is the caller's choice
+    /// ([`DropFailure`]); no caller may discard it unlogged.
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
     /// Clear the transient cover's record that a release (or a disengage) settled
     /// under `token`. `claimed` says whether the caller holds the record's
@@ -1413,9 +1436,6 @@ pub(crate) trait PfOps {
     fn clear_transient(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError>;
     /// The same for the standing lockdown cover's record.
     fn clear_standing(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError>;
-    /// The right to settle `token` under `record`, or `None` while another party
-    /// holds it ([`drop_right`]).
-    fn drop_right(&mut self, record: Record, token: &str) -> Option<DropRight>;
     /// What clearing `record` under `token` would find, without clearing it
     /// ([`pf_claim::would_clear`]).
     fn peek(&mut self, record: Record, token: Option<&str>, claimed: bool) -> Cleared;
@@ -1448,13 +1468,6 @@ impl Record {
         }
     }
 
-    fn cover(self) -> &'static str {
-        match self {
-            Record::Transient => "transient",
-            Record::Standing => "standing",
-        }
-    }
-
     fn clear(self, ops: &mut dyn PfOps, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError> {
         match self {
             Record::Transient => ops.clear_transient(token, claimed),
@@ -1478,11 +1491,12 @@ enum DropFailure {
 /// refcount, then clear the record that names it, in that order, so a drop that
 /// fails leaves the record for a retry.
 ///
-/// One party settles a token at a time ([`drop_right`]); another party's settle
-/// is left to the holder. A token whose record is already gone was dropped by
-/// whoever removed it, and a record the caller did not claim standing in a
-/// claimed one's place (an engage re-asserted it) is not the caller's to clear:
-/// that is an error, never a false success.
+/// The token is dropped whatever the record reads now: a token is dropped once
+/// however many parties ask ([`dropped_tokens`]), so a record that was replaced or
+/// removed by someone who did not drop it cannot strand the refcount, and one that
+/// was is no cause to drop it twice. The one record not cleared is a live record
+/// standing where a claimed one was (an engage re-asserted it): that is not the
+/// caller's, and it is an error, never a false success.
 fn settle(
     ops: &mut dyn PfOps,
     record: Record,
@@ -1508,17 +1522,8 @@ fn settle(
             }
         };
     };
-    let Some(_right) = ops.drop_right(record, token) else {
-        tracing::debug!(
-            "another party is settling the {} cover's token; leaving it to them",
-            record.cover()
-        );
-        return Ok(());
-    };
-    match ops.peek(record, Some(token), claimed) {
-        Cleared::Removed => {}
-        Cleared::Gone => return Ok(()),
-        replaced @ Cleared::Replaced => return replaced.refusal().map_or(Ok(()), Err),
+    if let replaced @ Cleared::Replaced = ops.peek(record, Some(token), claimed) {
+        return replaced.refusal().map_or(Ok(()), Err);
     }
     if let Err(e) = ops.drop_token(token) {
         return match on_drop_failure {
@@ -1747,7 +1752,7 @@ impl EngageOps for RealEngageOps<'_> {
     }
 
     fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
-        enable_pf_capture_token()
+        enable_pf_capture_token(self.state_dir)
     }
 
     fn read_transient(&mut self) -> StateFile<state::FailClosedState> {
@@ -1774,7 +1779,7 @@ impl EngageOps for RealEngageOps<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        pfctl_status(pfctl(&["-X", token], None, FatalPhase::CoverEngage), "pfctl -X")
+        real_drop_token(self.state_dir, token, FatalPhase::CoverEngage)
     }
 
     fn transient_restore(&mut self, token: &str) -> bool {
@@ -1839,7 +1844,7 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
     }
 
     fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
-        enable_pf_capture_token()
+        enable_pf_capture_token(self.state_dir)
     }
 
     fn capture_and_persist(
@@ -1859,7 +1864,7 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        pfctl_status(pfctl(&["-X", token], None, FatalPhase::CoverEngage), "pfctl -X")
+        real_drop_token(self.state_dir, token, FatalPhase::CoverEngage)
     }
 
     fn commit_check(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -1867,14 +1872,6 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
             Some(e) => Err(e),
             None => Ok(()),
         }
-    }
-
-    fn drop_right(&mut self, token: &str) -> Option<DropRight> {
-        drop_right::take(self.state_dir, Record::Standing, token)
-    }
-
-    fn names_token(&mut self, token: &str) -> bool {
-        pf_claim::names(&lockdown_state::load_presence(self.state_dir), Some(token))
     }
 
     fn clear_dropped(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -1934,7 +1931,7 @@ impl PfOps for RealPfOps<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        pfctl_status(pfctl(&["-X", token], None, BestEffortPhase::RecoverCover), "pfctl -X")
+        real_drop_token(self.state_dir, token, BestEffortPhase::RecoverCover)
     }
 
     fn clear_transient(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError> {
@@ -1943,10 +1940,6 @@ impl PfOps for RealPfOps<'_> {
 
     fn clear_standing(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError> {
         clear_standing_record(self.state_dir, token, claimed)
-    }
-
-    fn drop_right(&mut self, record: Record, token: &str) -> Option<DropRight> {
-        drop_right::take(self.state_dir, record, token)
     }
 
     fn peek(&mut self, record: Record, token: Option<&str>, claimed: bool) -> Cleared {

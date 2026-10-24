@@ -1497,10 +1497,6 @@ impl PfOps for RecordingPfOps {
         }
     }
 
-    fn drop_right(&mut self, _record: Record, _token: &str) -> Option<DropRight> {
-        Some(DropRight::detached())
-    }
-
     fn peek(&mut self, _record: Record, _token: Option<&str>, _claimed: bool) -> Cleared {
         self.cleared_as.unwrap_or(Cleared::Removed)
     }
@@ -1854,8 +1850,8 @@ fn a_clear_is_made_as_a_claimed_one_only_for_a_tombstone() {
 }
 
 #[skuld::test]
-fn what_the_clear_would_find_decides_the_drop() {
-    for (found, drops) in [(Cleared::Removed, true), (Cleared::Gone, false)] {
+fn a_release_drops_its_tokens_whether_the_records_are_there_or_were_removed() {
+    for found in [Cleared::Removed, Cleared::Gone] {
         let mut ops = RecordingPfOps {
             cleared_as: Some(found),
             ..Default::default()
@@ -1867,10 +1863,9 @@ fn what_the_clear_would_find_decides_the_drop() {
         );
         assert!(result.is_ok(), "{found:?}: {result:?}");
         assert_eq!(
-            ops.dropped.is_empty(),
-            !drops,
-            "{found:?}: the token is dropped iff the record is this release's to clear: {:?}",
-            ops.dropped
+            ops.dropped,
+            vec!["111".to_string(), "222".to_string()],
+            "{found:?}: only a record the release did not claim keeps it from dropping"
         );
     }
 }
@@ -1962,13 +1957,15 @@ fn a_disengage_whose_restore_fails_clears_nothing_and_drops_nothing() {
 }
 
 #[skuld::test]
-fn a_disengage_over_a_record_a_release_removed_drops_nothing() {
+fn a_disengage_over_a_record_a_release_removed_still_asks_for_the_drop() {
+    // Whether the token is dropped already is the ledger's to say, not the record's:
+    // a record that names another token, or none, is no proof it is gone.
     let mut ops = RecordingPfOps {
         cleared_as: Some(Cleared::Gone),
         ..Default::default()
     };
     assert!(disengage_with(Some("111"), false, &mut ops));
-    assert!(ops.dropped.is_empty(), "the release dropped it: {:?}", ops.dropped);
+    assert_eq!(ops.dropped, vec!["111".to_string()]);
 }
 
 #[skuld::test]
@@ -2010,16 +2007,24 @@ fn a_lockdown_disengage_drops_before_it_clears_and_as_claimed_for_a_tombstone() 
 }
 
 #[skuld::test]
-fn a_lockdown_disengage_whose_record_is_gone_or_replaced_drops_nothing() {
-    for (found, is_err) in [(Cleared::Gone, false), (Cleared::Replaced, true)] {
-        let mut ops = RecordingPfOps {
-            cleared_as: Some(found),
-            ..Default::default()
-        };
-        let result = disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops);
-        assert_eq!(result.is_err(), is_err, "{found:?}: {result:?}");
-        assert!(ops.dropped.is_empty(), "{found:?}: {:?}", ops.dropped);
-    }
+fn a_lockdown_disengage_whose_record_is_replaced_drops_nothing_and_says_so() {
+    let mut ops = RecordingPfOps {
+        cleared_as: Some(Cleared::Replaced),
+        ..Default::default()
+    };
+    let result = disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops);
+    assert!(result.is_err(), "{result:?}");
+    assert!(ops.dropped.is_empty(), "{:?}", ops.dropped);
+}
+
+#[skuld::test]
+fn a_lockdown_disengage_whose_record_is_gone_still_asks_for_the_drop() {
+    let mut ops = RecordingPfOps {
+        cleared_as: Some(Cleared::Gone),
+        ..Default::default()
+    };
+    disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops).unwrap();
+    assert_eq!(ops.dropped, vec!["222".to_string()]);
 }
 
 #[skuld::test]

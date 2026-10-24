@@ -20,11 +20,7 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, Sender};
-
-use crate::routing::failclosed::drop_right;
-use crate::routing::failclosed::pf_claim::Record;
 
 /// Something two parties can contend for.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -39,8 +35,6 @@ pub enum Res {
     Enabled,
     /// One pf enable token.
     Token(String),
-    /// The right to drop one token.
-    Right(Record, String),
     /// The release epoch.
     Epoch,
 }
@@ -286,16 +280,8 @@ fn run_once<W: Sync, T: Send + 'static>(
             resume.push(resume_tx);
             let events = events.clone();
             scope.spawn(move || {
-                let gate = Rc::new(gate_for(id, events.clone(), resume_rx));
-                let hook_gate = Rc::clone(&gate);
-                // A cancel here must not unwind out of `DropRight::drop`, which would skip
-                // the release; the party meets the cancel again at its next step.
-                drop_right::set_before_release(Some(Box::new(move |_dir, record, token| {
-                    let op = Op::new("release_right").writes(Res::Right(record, token.to_owned()));
-                    let _ = catch_unwind(AssertUnwindSafe(|| hook_gate.step(op)));
-                })));
+                let gate = gate_for(id, events.clone(), resume_rx);
                 let result = catch_unwind(AssertUnwindSafe(|| party(world, &gate)));
-                drop_right::set_before_release(None);
                 let done = result.map_err(|payload| panic_message(&*payload));
                 let _ = events.send(Event::Done(id, done));
             });

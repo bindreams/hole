@@ -3,7 +3,8 @@
 //! The records are real files in a temp dir and every record step is the
 //! production one (claim, compare-and-set, clear, peek, drop right). Only pf is
 //! modelled: an enable-token set, the ruleset that is loaded, and a log of
-//! violations the model itself can see (`pfctl -X` of a token that is not live).
+//! violations the model itself can see (`pfctl -X` of a token that is not live,
+//! which the production `dropped_tokens` ledger is there to keep from happening).
 //! Each party is the production sequence a caller runs: the facade's epoch calls
 //! around `engage_with` / `engage_lockdown_with` / `release_all_over` /
 //! `disengage_lockdown_over`, and the overtaken cover's drop.
@@ -89,7 +90,7 @@ struct Pf {
     /// Tokens a release wrote a tombstone over, in this run.
     claimed: BTreeSet<(Record, String)>,
     /// Tokens pf holds that no record names, by construction of the entry.
-    unreachable: BTreeSet<String>,
+    anonymous: BTreeSet<String>,
 }
 
 pub struct World {
@@ -102,7 +103,7 @@ pub struct Final {
     pub live: BTreeSet<String>,
     pub rules: Rules,
     pub violations: Vec<String>,
-    pub unreachable: BTreeSet<String>,
+    pub anonymous: BTreeSet<String>,
     pub transient: StateFile<state::FailClosedState>,
     pub standing: StateFile<lockdown_state::LockdownPfState>,
 }
@@ -113,7 +114,7 @@ impl World {
         assert!(!dir.exists(), "a world starts in a directory of its own");
         std::fs::create_dir_all(&dir).unwrap();
         let mut live = BTreeSet::new();
-        let mut unreachable = BTreeSet::new();
+        let mut anonymous = BTreeSet::new();
         seed_transient(&dir, transient);
         seed_standing(&dir, standing);
         for (entry, old, anon) in [(transient, T_OLD, "T-anon"), (standing, S_OLD, "S-anon")] {
@@ -121,7 +122,7 @@ impl World {
                 live.insert(old.to_owned());
             } else if entry == Entry::UnusableAnonymous {
                 live.insert(anon.to_owned());
-                unreachable.insert(anon.to_owned());
+                anonymous.insert(anon.to_owned());
             }
         }
         let rules = if standing != Entry::Absent {
@@ -139,7 +140,7 @@ impl World {
                 rules,
                 violations: Vec::new(),
                 claimed: BTreeSet::new(),
-                unreachable,
+                anonymous,
             }),
         }
     }
@@ -149,10 +150,14 @@ impl World {
     }
 
     fn mint(&self, who: &str) -> String {
-        let mut pf = self.pf();
-        pf.minted += 1;
-        let token = format!("{who}-{}", pf.minted);
-        pf.live.insert(token.clone());
+        let token = {
+            let mut pf = self.pf();
+            pf.minted += 1;
+            let token = format!("{who}-{}", pf.minted);
+            pf.live.insert(token.clone());
+            token
+        };
+        dropped_tokens::minted(&self.dir, &token);
         token
     }
 
@@ -172,16 +177,19 @@ impl World {
         self.pf().rules = rules;
     }
 
-    /// `pfctl -X`: a token that is not live is a double drop.
+    /// `pfctl -X`, through the production ledger: a drop it lets through of a
+    /// token that is not live is a double drop.
     fn drop_token(&self, who: &str, token: &str) -> Result<(), RoutingError> {
-        let mut pf = self.pf();
-        if pf.live.remove(token) {
-            return Ok(());
-        }
-        pf.violations.push(format!(
-            "{who} dropped {token}, which pf no longer holds (a double drop)"
-        ));
-        Err(RoutingError::RouteSetup(format!("pfctl -X: {token} is not live")))
+        dropped_tokens::drop_once(&self.dir, token, || {
+            let mut pf = self.pf();
+            if pf.live.remove(token) {
+                return Ok(());
+            }
+            pf.violations.push(format!(
+                "{who} dropped {token}, which pf no longer holds (a double drop)"
+            ));
+            Err(RoutingError::RouteSetup(format!("pfctl -X: {token} is not live")))
+        })
     }
 
     fn note_claim(&self, record: Record, before: &StateFile<impl PfRecord>, after: &StateFile<impl PfRecord>) {
@@ -198,7 +206,7 @@ impl World {
             live: pf.live.clone(),
             rules: pf.rules.clone(),
             violations: pf.violations.clone(),
-            unreachable: pf.unreachable.clone(),
+            anonymous: pf.anonymous.clone(),
             transient: state::load_presence(&self.dir),
             standing: lockdown_state::load_presence(&self.dir),
         }
@@ -311,12 +319,6 @@ impl PfOps for PfParty<'_> {
     fn clear_standing(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError> {
         self.gate.step(Op::new("clear_standing").writes(Res::Standing));
         clear_standing_record(&self.world.dir, token, claimed)
-    }
-
-    fn drop_right(&mut self, record: Record, token: &str) -> Option<DropRight> {
-        self.gate
-            .step(Op::new("take_right").writes(Res::Right(record, token.into())));
-        drop_right::take(&self.world.dir, record, token)
     }
 
     fn peek(&mut self, record: Record, token: Option<&str>, claimed: bool) -> Cleared {
@@ -515,17 +517,6 @@ impl LockdownEngageOps for StandingParty<'_> {
     fn commit_check(&mut self, token: &str) -> Result<(), RoutingError> {
         self.gate.step(Op::new("commit_check").reads(Res::Standing));
         self.real.commit_check(token)
-    }
-
-    fn drop_right(&mut self, token: &str) -> Option<DropRight> {
-        self.gate
-            .step(Op::new("take_right").writes(Res::Right(Record::Standing, token.into())));
-        self.real.drop_right(token)
-    }
-
-    fn names_token(&mut self, token: &str) -> bool {
-        self.gate.step(Op::new("names_token").reads(Res::Standing));
-        self.real.names_token(token)
     }
 
     fn clear_dropped(&mut self, token: &str) -> Result<(), RoutingError> {

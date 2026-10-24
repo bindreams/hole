@@ -28,6 +28,8 @@ enum PfAction {
 
 const INJECTED_LOAD_FAILURE: &str = "injected pf load failure";
 const OLD: &str = "100";
+/// The standing cover's old token: pf hands each cover its own.
+const OLD_S: &str = "101";
 const MINE: &str = "424242";
 
 fn server() -> IpAddr {
@@ -83,7 +85,7 @@ struct ReleasePf<'a> {
     /// How many `pfctl -X` still fail, counted from the next one.
     drops_to_fail: u32,
     on_restore: Option<Hook<'a>>,
-    /// Runs as the release drops a token, which is when it holds the right to.
+    /// Runs as the release has dropped a token and not yet cleared the record that names it.
     on_drop: Option<Hook<'a>>,
     /// The record files as they read at the first pf call.
     at_first_pf_call: Option<(
@@ -142,16 +144,20 @@ impl PfOps for ReleasePf<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        let dir = self.dir;
+        let dropped = dropped_tokens::drop_once(dir, token, || {
+            self.drop_attempts.push(token.to_owned());
+            if self.drops_to_fail > 0 {
+                self.drops_to_fail -= 1;
+                return Err(RoutingError::RouteSetup("injected pfctl -X failure".into()));
+            }
+            self.dropped.push(token.to_owned());
+            Ok(())
+        });
         if let Some(hook) = self.on_drop.take() {
-            hook(self.dir);
+            hook(dir);
         }
-        self.drop_attempts.push(token.to_owned());
-        if self.drops_to_fail > 0 {
-            self.drops_to_fail -= 1;
-            return Err(RoutingError::RouteSetup("injected pfctl -X failure".into()));
-        }
-        self.dropped.push(token.to_owned());
-        Ok(())
+        dropped
     }
 
     fn clear_transient(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError> {
@@ -160,10 +166,6 @@ impl PfOps for ReleasePf<'_> {
 
     fn clear_standing(&mut self, token: Option<&str>, claimed: bool) -> Result<Cleared, RoutingError> {
         clear_standing_record(self.dir, token, claimed)
-    }
-
-    fn drop_right(&mut self, record: pf_claim::Record, token: &str) -> Option<DropRight> {
-        drop_right::take(self.dir, record, token)
     }
 
     fn peek(&mut self, record: pf_claim::Record, token: Option<&str>, claimed: bool) -> Cleared {
@@ -199,11 +201,11 @@ fn release(dir: &Path) -> Vec<String> {
 fn a_release_with_no_concurrent_engage_clears_both_records() {
     let dir = tempfile::tempdir().unwrap();
     state::seed(dir.path(), &transient_record(OLD));
-    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    lockdown_state::seed(dir.path(), &standing_record(OLD_S));
 
     let dropped = release(dir.path());
 
-    assert_eq!(dropped, vec![OLD.to_string(), OLD.to_string()]);
+    assert_eq!(dropped, vec![OLD.to_string(), OLD_S.to_string()]);
     assert!(!record_exists(dir.path(), state::STATE_FILE_NAME));
     assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
 }
@@ -212,21 +214,21 @@ fn a_release_with_no_concurrent_engage_clears_both_records() {
 fn a_release_claims_both_records_before_its_first_pf_call() {
     let dir = tempfile::tempdir().unwrap();
     state::seed(dir.path(), &transient_record(OLD));
-    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    lockdown_state::seed(dir.path(), &standing_record(OLD_S));
     let mut pf = ReleasePf::new(dir.path());
 
     release_over(&mut pf).unwrap();
 
     let (transient, standing) = pf.at_first_pf_call.expect("the release restored something");
     assert_eq!(transient, StateFile::Present(transient_tombstone_of(OLD)));
-    assert_eq!(standing, StateFile::Present(standing_tombstone_of(OLD)));
+    assert_eq!(standing, StateFile::Present(standing_tombstone_of(OLD_S)));
 }
 
 #[skuld::test]
 fn a_release_whose_restore_fails_leaves_its_tombstone_and_its_token_for_recovery() {
     let dir = tempfile::tempdir().unwrap();
     state::seed(dir.path(), &transient_record(OLD));
-    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    lockdown_state::seed(dir.path(), &standing_record(OLD_S));
     // The transient restore, then the standing snapshot load and its fallback.
     let mut pf = ReleasePf::new(dir.path()).fail_restores(3);
 
@@ -240,7 +242,7 @@ fn a_release_whose_restore_fails_leaves_its_tombstone_and_its_token_for_recovery
     );
     assert_eq!(
         lockdown_state::load_presence(dir.path()),
-        StateFile::Present(standing_tombstone_of(OLD)),
+        StateFile::Present(standing_tombstone_of(OLD_S)),
         "a tombstone is still a record naming the token: the recovery sweep acts on it"
     );
 }
@@ -435,8 +437,11 @@ impl EngageOps for TransientEngage<'_> {
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
         self.log.push("drop_token");
-        self.dropped.push(token.to_owned());
-        Ok(())
+        let dropped = &mut self.dropped;
+        dropped_tokens::drop_once(self.real.state_dir, token, || {
+            dropped.push(token.to_owned());
+            Ok(())
+        })
     }
 
     fn transient_restore(&mut self, token: &str) -> bool {
@@ -712,6 +717,55 @@ fn a_transient_back_out_whose_restore_fails_keeps_the_live_record_it_wrote() {
     );
 }
 
+// The token a record write displaces ----------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_transient_engage_over_a_leftover_record_drops_the_token_that_record_named() {
+    for leftover in [transient_record(OLD), transient_tombstone_of(OLD)] {
+        let dir = tempfile::tempdir().unwrap();
+        state::seed(dir.path(), &leftover);
+        let mut ops = TransientEngage::new(dir.path());
+
+        let token = engage_with(server(), None, &mut ops).expect("no release ran");
+
+        assert_eq!(token, MINE);
+        assert_eq!(
+            ops.dropped,
+            vec![OLD.to_string()],
+            "nothing else names the leftover's refcount"
+        );
+        assert_eq!(state::holds(dir.path(), MINE), Held::Held);
+        let (saved, dropped) = (
+            ops.log.iter().position(|s| *s == "save_transient"),
+            ops.log.iter().position(|s| *s == "drop_token"),
+        );
+        assert!(
+            saved < dropped,
+            "the leftover's record is replaced first: {:?}",
+            ops.log
+        );
+    }
+}
+
+#[skuld::test]
+fn a_transient_engage_whose_write_is_refused_drops_only_its_own_token() {
+    // A release began after the engage's watch opened, so the write is refused and the
+    // leftover record stays for that release to settle.
+    let dir = tempfile::tempdir().unwrap();
+    state::seed(dir.path(), &transient_record(OLD));
+    let mut ops = TransientEngage::new(dir.path());
+    let _release = crate::routing::failclosed::begin_release(dir.path());
+
+    let err = engage_with(server(), None, &mut ops).expect_err("a release began");
+
+    assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
+    assert_eq!(ops.dropped, vec![MINE.to_string()]);
+    assert_eq!(
+        state::load_presence(dir.path()),
+        StateFile::Present(transient_record(OLD))
+    );
+}
+
 // The standing engage =================================================================================================
 
 /// [`LockdownEngageOps`] over the real standing record, as [`TransientEngage`].
@@ -837,29 +891,22 @@ impl LockdownEngageOps for StandingEngage<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        self.dropped.push(token.to_owned());
+        let (dropped, fails) = (&mut self.dropped, self.drops_fail);
+        let result = dropped_tokens::drop_once(self.real.state_dir, token, || {
+            dropped.push(token.to_owned());
+            if fails {
+                return Err(RoutingError::RouteSetup("injected pfctl -X failure".into()));
+            }
+            Ok(())
+        });
         self.step("drop_token");
-        if self.drops_fail {
-            return Err(RoutingError::RouteSetup("injected pfctl -X failure".into()));
-        }
-        Ok(())
+        result
     }
 
     fn commit_check(&mut self, token: &str) -> Result<(), RoutingError> {
         let checked = self.real.commit_check(token);
         self.step("commit_check");
         checked
-    }
-
-    fn drop_right(&mut self, token: &str) -> Option<DropRight> {
-        let right = self.real.drop_right(token);
-        self.step("drop_right");
-        right
-    }
-
-    fn names_token(&mut self, token: &str) -> bool {
-        self.log.push("names_token");
-        self.real.names_token(token)
     }
 
     fn clear_dropped(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -970,8 +1017,8 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_when_the_token_is_reus
             "load_ruleset",
             "commit_check",
             "load_ruleset",
-            "drop_right",
-            "names_token"
+            "drop_token",
+            "clear_dropped",
         ],
         "no new refcount is taken, and the block-all just loaded is replaced by the restore"
     );
@@ -991,7 +1038,7 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_on_a_fresh_engage() {
     assert_eq!(*released.borrow(), vec![MINE.to_string()]);
     assert_eq!(
         &ops.log[ops.log.len() - 4..],
-        ["commit_check", "load_ruleset", "drop_right", "names_token"],
+        ["commit_check", "load_ruleset", "drop_token", "clear_dropped"],
         "the restore follows the commit check: {:?}",
         ops.log
     );
@@ -1005,9 +1052,9 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_on_a_fresh_engage() {
 #[skuld::test]
 fn a_release_that_has_claimed_but_not_yet_restored_supersedes_the_standing_engage_which_settles_the_token() {
     // The commit check runs between the release's claim and its clear. The engage
-    // backs out and, holding the right to the token its tombstone still names, drops
-    // it and clears the record; the release that settles afterwards finds nothing
-    // to drop. Once in total, and by whichever party got the right.
+    // backs out and drops the token its tombstone still names, then clears the
+    // record; the release that settles afterwards finds the token dropped. Once in
+    // total, by whichever party got there first.
     let dir = tempfile::tempdir().unwrap();
     let claimed = RefCell::new(None);
     let mut ops = StandingEngage::new(dir.path(), false).after("load_ruleset", |d| {
@@ -1023,32 +1070,6 @@ fn a_release_that_has_claimed_but_not_yet_restored_supersedes_the_standing_engag
     release_all_with(StateFile::Absent, claimed.borrow_mut().take().unwrap(), &mut pf).expect("the release succeeds");
 
     assert!(pf.dropped.is_empty(), "the engage already dropped it: {:?}", pf.dropped);
-}
-
-#[skuld::test]
-fn a_release_that_cannot_take_the_right_leaves_the_token_to_an_engage_that_settles_the_tombstone() {
-    // The engage holds the right when the release asks for it, so the release
-    // leaves the token to the engage. The engage must therefore settle a tombstone
-    // naming its token, or nobody does.
-    let dir = tempfile::tempdir().unwrap();
-    let release_while_holding = RefCell::new(None);
-    let mut ops = StandingEngage::new(dir.path(), false)
-        .after("load_ruleset", |d| {
-            lockdown_state::claim_for_release(d, None);
-        })
-        .after("drop_right", |d| {
-            let mut pf = ReleasePf::new(d);
-            let result = release_all_with(StateFile::Absent, lockdown_state::load_presence(d), &mut pf);
-            *release_while_holding.borrow_mut() = Some((result, pf.dropped));
-        });
-
-    engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the record is claimed");
-
-    let (result, released) = release_while_holding.borrow_mut().take().expect("the release ran");
-    result.expect("a release that leaves the token to the holder succeeds");
-    assert!(released.is_empty(), "it could not take the right: {released:?}");
-    assert_eq!(ops.dropped, vec![MINE.to_string()], "the engage dropped it");
-    assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
 }
 
 #[skuld::test]
@@ -1072,6 +1093,50 @@ fn a_standing_record_that_cannot_be_read_after_the_load_fails_the_engage_it_does
         "an unreadable record that still names the token is this engage's own to clear"
     );
     assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
+}
+
+#[skuld::test]
+fn a_standing_engage_over_an_unusable_record_drops_the_token_it_still_names() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(lockdown_state::STATE_FILE_NAME),
+        format!(r#"{{"version":99,"pf_token":"{OLD}"}}"#),
+    )
+    .unwrap();
+    let mut ops = StandingEngage::new(dir.path(), true);
+
+    let token = engage_lockdown_with(server(), "utun9", &mut ops).expect("no release ran");
+
+    assert_eq!(token, MINE);
+    assert_eq!(ops.dropped, vec![OLD.to_string()]);
+    assert_eq!(lockdown_state::holds(dir.path(), MINE), Held::Held);
+}
+
+#[skuld::test]
+fn a_standing_engage_that_replaces_a_stale_token_drops_it_once_the_fresh_record_stands() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    let mut ops = StandingEngage::new(dir.path(), false);
+
+    let token = engage_lockdown_with(server(), "utun9", &mut ops).expect("no release ran");
+
+    assert_eq!(token, MINE, "pf was reset, so the engage enables afresh");
+    assert_eq!(ops.dropped, vec![OLD.to_string()]);
+    assert_eq!(lockdown_state::holds(dir.path(), MINE), Held::Held);
+}
+
+#[skuld::test]
+fn a_standing_engage_that_adopts_a_record_drops_nothing() {
+    for leftover in [standing_record(OLD), standing_tombstone_of(OLD)] {
+        let dir = tempfile::tempdir().unwrap();
+        lockdown_state::seed(dir.path(), &leftover);
+        let mut ops = StandingEngage::new(dir.path(), true);
+
+        let token = engage_lockdown_with(server(), "utun9", &mut ops).expect("no release ran");
+
+        assert_eq!(token, OLD, "the cover is adopted with its own token");
+        assert!(ops.dropped.is_empty(), "{:?}", ops.dropped);
+    }
 }
 
 // A tombstone found at entry ------------------------------------------------------------------------------------------
@@ -1298,7 +1363,11 @@ fn a_failed_load_restores_the_reenabled_baseline_and_drops_the_fresh_token() {
         "{restored}"
     );
     assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
-    assert_eq!(ops.dropped, vec![MINE.to_string()]);
+    assert_eq!(
+        ops.dropped,
+        vec![OLD.to_string(), MINE.to_string()],
+        "the token the fresh record replaced, then the fresh one"
+    );
 }
 
 #[skuld::test]
@@ -1359,7 +1428,11 @@ fn a_release_during_a_failed_load_leaves_the_reenabled_baseline_restored_not_the
 
     assert!(!actions.contains(&PfAction::ReloadDefault), "{actions:?}");
     assert!(matches!(actions.last(), Some(PfAction::Load(t)) if t.contains(HOST_FILTER) && t.contains(HOST_NAT)));
-    assert!(dropped.is_empty(), "{dropped:?}");
+    assert_eq!(
+        dropped,
+        vec![OLD.to_string()],
+        "only the token the fresh record replaced: the release dropped the fresh one"
+    );
     assert!(!record_left);
 }
 

@@ -4,22 +4,30 @@
 //! standing engage, `release_all`, `disengage_lockdown`); the matrix is every
 //! unordered pair of them, from every entry state of the records they touch
 //! (absent, live, a tombstone, unusable with and without a token), over every
-//! order of their steps. A step is one operation on shared state (a record
-//! read, write or clear, a pf call, a drop right, the release epoch).
+//! order of their steps. A step is one operation on shared state: a record read,
+//! write or clear, a pf call, the release epoch. The records are real files and
+//! every record step is the production one; only pf is modelled
+//! (`macos_interleaving_world.rs`), and the search is `macos_interleaving_explore.rs`.
 //!
 //! After each run the world must satisfy, for any order:
 //!
-//! - a pf token is dropped only while pf holds it (never twice);
-//! - no record names a token pf no longer holds;
-//! - no token pf holds is left without a record naming it, except one an engage
-//!   overwrote as an unclaimed leftover or one whose record never named it;
+//! - a token is let go of at most once (the model flags a second `pfctl -X`);
+//! - no record names a token pf no longer holds, and no token pf holds is left
+//!   without a record naming it (but for the anonymous one an unusable file never
+//!   named);
 //! - a release and a disengage return `Ok` (nothing here fails them), an engage
-//!   fails only as `SupersededByRelease`, and an engage that returns `Ok` holds a
-//!   live record naming its token and began after every release that ran;
+//!   fails only as `SupersededByRelease`, and an engage that returns `Ok` had no
+//!   release begin while it ran and holds a live record naming its token;
 //! - a pf block with no engage that succeeded has a record to recover it from,
 //!   and a release leaves an open host when no engage succeeded.
 //!
-//! The ownership rules the cells exercise are in [`super::pf_claim`].
+//! Two engages never overlap in the bridge (`start_cancellable` holds the proxy
+//! lock), and one replacing the other's record is the cover transition `engage`
+//! supports, so the last rule about an engage's own record is asserted only when
+//! no other engage runs; the rest hold for every pair.
+//!
+//! The rules the cells exercise are in [`super::pf_claim`], [`super::dropped_tokens`]
+//! and [`super::release_epoch`].
 
 use super::*;
 
@@ -28,7 +36,7 @@ mod explore;
 #[path = "macos_interleaving_world.rs"]
 mod world;
 
-use explore::{explore, Run};
+use explore::{explore, Run, Stats};
 use world::{run_party, Entry, Final, Kind, Outcome, Rules, World};
 
 /// What a cell found.
@@ -50,12 +58,13 @@ fn violations(kinds: [Kind; 2], end: &Final, run: &Run<Outcome>) -> Vec<String> 
         }
     }
 
+    let both_engage = kinds.iter().all(|k| k.is_engage());
     for o in &outcomes {
         match (&o.failure, o.kind.is_engage()) {
             (Some((_, why)), false) => out.push(format!("{} failed: {why}", o.kind)),
             (Some((false, why)), true) => out.push(format!("{} failed other than as superseded: {why}", o.kind)),
             (Some((true, _)), true) => {}
-            (None, true) if !o.held_on_return => out.push(format!(
+            (None, true) if !o.held_on_return && !both_engage => out.push(format!(
                 "{} returned Ok without a live record naming its token and held in pf",
                 o.kind
             )),
@@ -98,7 +107,7 @@ fn violations(kinds: [Kind; 2], end: &Final, run: &Run<Outcome>) -> Vec<String> 
         }
     }
     for token in &end.live {
-        if !named.contains(&token.as_str()) && !end.unreachable.contains(token) {
+        if !named.contains(&token.as_str()) && !end.anonymous.contains(token) {
             out.push(format!("pf still holds {token} and no record names it"));
         }
     }
@@ -152,16 +161,11 @@ fn explore_cell(
     standing: Entry,
     base: &std::path::Path,
     dirs: &mut usize,
-) -> (usize, Option<Red>) {
+) -> (Stats, Option<Red>) {
     let cell = format!(
         "{} + {} | transient {transient}, standing {standing}",
         kinds[0], kinds[1]
     );
-    if let Ok(only) = std::env::var("DBG_CELL") {
-        if !cell.contains(&only) {
-            return (0, None);
-        }
-    }
     let mut last: Option<std::path::PathBuf> = None;
     let mut failing = 0usize;
     let mut first = None;
@@ -176,7 +180,6 @@ fn explore_cell(
     };
     let a = |w: &World, g: &explore::Gate| run_party(kinds[0], w, g);
     let b = |w: &World, g: &explore::Gate| run_party(kinds[1], w, g);
-    let started = std::time::Instant::now();
     let stats = explore(&[&a, &b], fresh, |world, run| {
         let found = violations(kinds, &world.finish(), &run);
         if !found.is_empty() {
@@ -184,12 +187,6 @@ fn explore_cell(
             first.get_or_insert_with(|| format!("{}\n    {}", counterexample(kinds, &run), found.join("\n    ")));
         }
     });
-    eprintln!(
-        "CELL {cell}: {} runs, {} abandoned, {:?}",
-        stats.runs,
-        stats.abandoned,
-        started.elapsed()
-    );
     let runs = stats.runs;
     if let Some(dir) = last.take() {
         let _ = std::fs::remove_dir_all(dir);
@@ -200,7 +197,7 @@ fn explore_cell(
         failing,
         first,
     });
-    (runs, red)
+    (stats, red)
 }
 
 fn entries(any_party_touches: bool) -> &'static [Entry] {
@@ -211,25 +208,21 @@ fn entries(any_party_touches: bool) -> &'static [Entry] {
     }
 }
 
-#[skuld::test]
-fn no_interleaving_of_two_cover_parties_breaks_a_pf_record_invariant() {
+/// Every cell of one pair: its entry states, and every order of its steps from each.
+fn explore_pair(a: Kind, b: Kind) {
     let base = tempfile::tempdir().unwrap();
     let mut red = Vec::new();
-    let (mut cells, mut runs, mut dirs) = (0, 0, 0usize);
-    for (i, &a) in Kind::ALL.iter().enumerate() {
-        for &b in &Kind::ALL[i..] {
-            let kinds = [a, b];
-            for &t in entries(a.touches_transient() || b.touches_transient()) {
-                for &s in entries(a.touches_standing() || b.touches_standing()) {
-                    let (r, found) = explore_cell(kinds, t, s, base.path(), &mut dirs);
-                    cells += 1;
-                    runs += r;
-                    red.extend(found);
-                }
-            }
+    let (mut cells, mut runs, mut abandoned, mut dirs) = (0, 0, 0, 0usize);
+    for &t in entries(a.touches_transient() || b.touches_transient()) {
+        for &s in entries(a.touches_standing() || b.touches_standing()) {
+            let (stats, found) = explore_cell([a, b], t, s, base.path(), &mut dirs);
+            cells += 1;
+            runs += stats.runs;
+            abandoned += stats.abandoned;
+            red.extend(found);
         }
     }
-    eprintln!("{cells} cells, {runs} interleavings checked");
+    eprintln!("{a} + {b}: {cells} cells, {runs} interleavings checked, {abandoned} abandoned as already covered");
     let report: Vec<String> = red
         .iter()
         .map(|r| format!("{} ({} of {} runs)\n  {}", r.cell, r.failing, r.runs, r.first))
@@ -240,4 +233,54 @@ fn no_interleaving_of_two_cover_parties_breaks_a_pf_record_invariant() {
         red.len(),
         report.join("\n")
     );
+}
+
+#[skuld::test]
+fn no_order_of_two_release_alls_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::Release, Kind::Release);
+}
+
+#[skuld::test]
+fn no_order_of_release_all_and_disengage_lockdown_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::Release, Kind::Disengage);
+}
+
+#[skuld::test]
+fn no_order_of_release_all_and_a_transient_engage_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::Release, Kind::TransientEngage);
+}
+
+#[skuld::test]
+fn no_order_of_release_all_and_a_standing_engage_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::Release, Kind::StandingEngage);
+}
+
+#[skuld::test]
+fn no_order_of_two_disengage_lockdowns_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::Disengage, Kind::Disengage);
+}
+
+#[skuld::test]
+fn no_order_of_disengage_lockdown_and_a_transient_engage_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::Disengage, Kind::TransientEngage);
+}
+
+#[skuld::test]
+fn no_order_of_disengage_lockdown_and_a_standing_engage_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::Disengage, Kind::StandingEngage);
+}
+
+#[skuld::test]
+fn no_order_of_two_transient_engages_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::TransientEngage, Kind::TransientEngage);
+}
+
+#[skuld::test]
+fn no_order_of_a_transient_and_a_standing_engage_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::TransientEngage, Kind::StandingEngage);
+}
+
+#[skuld::test]
+fn no_order_of_two_standing_engages_breaks_a_pf_record_invariant() {
+    explore_pair(Kind::StandingEngage, Kind::StandingEngage);
 }
