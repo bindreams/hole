@@ -143,3 +143,98 @@ fn clear_removes_file_and_tolerates_absence() {
     assert!(!tmp.path().join(STATE_FILE_NAME).exists());
     clear(tmp.path()).unwrap(); // second clear is a no-op
 }
+
+// update / promote_unrecorded -----------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn update_holds_the_record_lock_while_deciding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut held_inside = false;
+    update(tmp.path(), None, |_| {
+        held_inside = LOCK.try_acquire().is_none();
+        None
+    })
+    .unwrap();
+    assert!(
+        held_inside,
+        "the read, the decision and the write must be one critical section"
+    );
+    assert!(LOCK.try_acquire().is_some(), "the lock must be released on return");
+}
+
+#[skuld::test]
+fn update_decides_on_the_classified_intent_and_writes_only_some() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut seen = Vec::new();
+    assert_eq!(
+        update(tmp.path(), None, |i| {
+            seen.push(i);
+            None
+        })
+        .unwrap(),
+        None
+    );
+    assert_eq!(load_intent(tmp.path()), Intent::Unset, "None must not write");
+    assert_eq!(
+        update(tmp.path(), None, |i| {
+            seen.push(i);
+            Some(true)
+        })
+        .unwrap(),
+        Some(true)
+    );
+    assert_eq!(load_intent(tmp.path()), Intent::On);
+    update(tmp.path(), None, |i| {
+        seen.push(i);
+        Some(false)
+    })
+    .unwrap();
+    assert_eq!(load_intent(tmp.path()), Intent::Off);
+    assert_eq!(seen, [Intent::Unset, Intent::Unset, Intent::On]);
+}
+
+#[skuld::test]
+fn promote_declines_over_a_recorded_off_and_on() {
+    for (enabled, want) in [(false, Intent::Off), (true, Intent::On)] {
+        let tmp = tempfile::tempdir().unwrap();
+        set_enabled(tmp.path(), enabled, None).unwrap();
+        assert!(!promote_unrecorded(tmp.path(), None).unwrap());
+        assert_eq!(load_intent(tmp.path()), want, "a recorded value is never rewritten");
+    }
+}
+
+#[skuld::test]
+fn promote_writes_over_unset_and_unreadable() {
+    let unset = tempfile::tempdir().unwrap();
+    assert!(promote_unrecorded(unset.path(), None).unwrap());
+    assert_eq!(load_intent(unset.path()), Intent::On);
+
+    let unreadable = tempfile::tempdir().unwrap();
+    write_raw(unreadable.path(), b"{not json");
+    assert!(promote_unrecorded(unreadable.path(), None).unwrap());
+    assert_eq!(load_intent(unreadable.path()), Intent::On);
+}
+
+#[skuld::test]
+fn unblock_then_promote_leaves_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    set_enabled(tmp.path(), false, None).unwrap();
+    promote_unrecorded(tmp.path(), None).unwrap();
+    assert_eq!(load_intent(tmp.path()), Intent::Off);
+}
+
+#[skuld::test]
+fn promote_then_unblock_leaves_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    promote_unrecorded(tmp.path(), None).unwrap();
+    set_enabled(tmp.path(), false, None).unwrap();
+    assert_eq!(load_intent(tmp.path()), Intent::Off);
+}
+
+#[skuld::test]
+fn admits_adoption_promotion_is_exhaustive_per_variant() {
+    assert!(Intent::Unset.admits_adoption_promotion());
+    assert!(Intent::Unreadable.admits_adoption_promotion());
+    assert!(!Intent::On.admits_adoption_promotion());
+    assert!(!Intent::Off.admits_adoption_promotion());
+}

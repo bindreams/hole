@@ -40,7 +40,9 @@
 
 use std::fs::File;
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 // Extensibility hooks =================================================================================================
 
@@ -110,6 +112,62 @@ impl Drop for Exclusive {
         // this open file description/handle closes, which happens when
         // `self.file` drops right after this. No explicit unlock call.
         on_token_drop();
+    }
+}
+
+// RecordLock ==========================================================================================================
+
+/// An in-process leaf mutex that makes one state file's read-modify-write a
+/// single critical section (the cross-process [`Exclusive`] is for files
+/// several processes write; this is for a record only this process writes).
+///
+/// **Leaf contract:** nothing else is acquired while a [`RecordGuard`] is held,
+/// and no OS, firewall, pf or process call and no `.await` runs under it: only
+/// file I/O. That is what lets an escape path that must never block on a wedged
+/// start or teardown (`handle_unblock`) take it. `RecordGuard` is `!Send`, so
+/// the `.await` half is compiler-enforced.
+///
+/// `T` is in-process state that must change atomically with the file (an epoch
+/// counter); it is `()` when the file is all there is.
+///
+/// Poison is recovered, not propagated: the lock guards a file whose every
+/// write is an atomic rename, not an invariant a panic can leave half-done.
+pub struct RecordLock<T = ()>(Mutex<T>);
+
+/// Held [`RecordLock`]. Derefs to the lock's value.
+pub struct RecordGuard<T: 'static = ()>(MutexGuard<'static, T>);
+
+impl<T> RecordLock<T> {
+    pub const fn new(value: T) -> Self {
+        RecordLock(Mutex::new(value))
+    }
+
+    /// Block until the lock is free.
+    pub fn acquire(&'static self) -> RecordGuard<T> {
+        RecordGuard(self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// `None` while the lock is held. Tests use this to assert a section holds
+    /// the lock; production code has no reason to try.
+    pub fn try_acquire(&'static self) -> Option<RecordGuard<T>> {
+        match self.0.try_lock() {
+            Ok(g) => Some(RecordGuard(g)),
+            Err(TryLockError::Poisoned(p)) => Some(RecordGuard(p.into_inner())),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+}
+
+impl<T> Deref for RecordGuard<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for RecordGuard<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
     }
 }
 

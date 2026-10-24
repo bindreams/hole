@@ -2278,11 +2278,12 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
 /// installed is first-hand evidence, stronger than the startup measurement
 /// `decide_cover_recovery` grounds its own repair write in.
 ///
-/// Promotes only over `Unset`/`Unreadable` — an intent already `On` needs no
-/// write, and an explicit recorded `Off` must never be clobbered: it can race
-/// this same start (an out-of-process `hole bridge unlock` writing `Off`
-/// between `standing_cover_expected`'s snapshot and this call), and a claim is
-/// never proof the intent is still unset.
+/// Promotes only over `Unset`/`Unreadable` ([`lockdown_state::Intent::admits_adoption_promotion`]).
+/// An explicit recorded `Off` must never be clobbered: an out-of-process
+/// `hole bridge unlock` or the tray's Unblock can write it at any moment, and a
+/// claim is never proof the intent is still unset. The check and the write are
+/// one critical section ([`lockdown_state::promote_unrecorded`]), so no `Off`
+/// can land between them.
 ///
 /// Best-effort: the write only makes the preference durable, and failing the
 /// connect over a bookkeeping error would be the worse trade.
@@ -2291,13 +2292,7 @@ fn promote_adopted_claim(state_dir: Option<&std::path::Path>, owner: Option<(u32
         warn!("lockdown: standing cover installed with no state_dir; the kill switch cannot be persisted");
         return;
     };
-    if matches!(
-        lockdown_state::load_intent(dir),
-        lockdown_state::Intent::On | lockdown_state::Intent::Off
-    ) {
-        return;
-    }
-    if let Err(e) = lockdown_state::set_enabled(dir, true, owner) {
+    if let Err(e) = lockdown_state::promote_unrecorded(dir, owner) {
         warn!(error = %util::error_chain::error_chain(&e), "lockdown: could not persist the adopted kill switch; it will not survive this run");
     }
 }

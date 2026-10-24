@@ -6149,6 +6149,21 @@ fn promote_adopted_claim_does_not_clobber_a_recorded_off() {
     );
 }
 
+#[skuld::test]
+fn promote_adopted_claim_arms_an_unset_or_unreadable_intent() {
+    let unset = tempfile::tempdir().unwrap();
+    promote_adopted_claim(Some(unset.path()), None);
+    assert_eq!(lockdown_state::load_intent(unset.path()), lockdown_state::Intent::On);
+
+    let unreadable = tempfile::tempdir().unwrap();
+    std::fs::write(unreadable.path().join(lockdown_state::STATE_FILE_NAME), b"{not json").unwrap();
+    promote_adopted_claim(Some(unreadable.path()), None);
+    assert_eq!(
+        lockdown_state::load_intent(unreadable.path()),
+        lockdown_state::Intent::On
+    );
+}
+
 // Start-diagnostic redaction ==========================================================================================
 
 /// `ProxyStartedDiag` is the richest Hole-authored line on the start path.
