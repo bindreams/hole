@@ -42,6 +42,8 @@ use hole_test_observability::egress::InCover;
 // rather than redeclared (a second `#[skuld::label] const TUN` — or
 // `GLOBAL_NET_STATE` — in one binary panics at test-runner startup with
 // "label declared multiple times").
+#[cfg(target_os = "macos")]
+use crate::test_utils::describe_output;
 use crate::{GLOBAL_NET_STATE, TUN};
 #[cfg(target_os = "macos")]
 use util::system_tool::SystemTool;
@@ -558,9 +560,16 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     // Best-effort and AFTER the sweep: the sweep salvages the `pf_token` out of the unusable record
     // itself and drops it, so this normally finds the refcount already released and fails harmlessly.
     // It stays so that a sweep whose own `-X` failed cannot leave the runner's pf enabled under an
-    // unreferenced token until reboot.
-    let drop_token = |token: &str| {
-        let _ = SystemTool::Pfctl.command().unwrap().args(["-X", token]).output();
+    // unreferenced token until reboot; a `-X` that succeeds here is that case and is logged as one.
+    let drop_token = |token: &str| match SystemTool::Pfctl.command().unwrap().args(["-X", token]).output() {
+        Ok(out) if out.status.success() => {
+            tracing::warn!(
+                "recover_cover left pf token {token} held: the test dropped it ({})",
+                describe_output(&out)
+            );
+        }
+        Ok(out) => tracing::debug!("pfctl -X {token} after the sweep: {}", describe_output(&out)),
+        Err(e) => tracing::warn!("pfctl -X {token} could not be spawned: {e}"),
     };
 
     let token = permit_scenario(
