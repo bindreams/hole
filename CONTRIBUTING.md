@@ -2669,12 +2669,8 @@ cargo xtask run hole-tests   # canonical local nextest invocation
 cargo xtask run doc-hole     # rustdoc, warnings denied (`doc-ex-galoshes` on Linux and Windows/arm64)
 ```
 
-In a fresh clone or git worktree, `cargo clippy --workspace` and `cargo build -p hole`
-build `hole` with default features and fail until `ui/dist/` exists (see
-[Tauri dev/prod feature toggle](#tauri-devprod-feature-toggle)): run
-`cargo xtask build frontend-build`, or create an empty `ui/dist/` (gitignored) when no
-bundled frontend is needed. The pre-commit hook lints with `--no-default-features` and
-needs neither.
+A default-feature build of `hole` needs `ui/dist/`, which a fresh clone or worktree lacks; see
+[Tauri dev/prod feature toggle](#tauri-devprod-feature-toggle). The pre-commit hook does not.
 
 CI runs the doc targets on every leg after clippy. Unpublished crates (every
 workspace crate except `garter`) are documented with `--document-private-items`
@@ -2706,9 +2702,11 @@ not required, though a dev build still recompiles `hole` once after `ui/dist`
 changes: tauri-build 2.7.1 always watches `frontendDist`. Production is
 unaffected. The `hole` / `hole-tests` xtask targets pass
 `--no-default-features`; `hole-msi` / `hole-dmg` use the default and depend on
-`frontend-build`. **Running `cargo build -p hole` directly: add
-`--no-default-features` for dev, or `cargo xtask build frontend-build` first.**
-See #372.
+`frontend-build`. **Running `cargo build -p hole` or `cargo clippy --workspace` directly:
+add `--no-default-features` for dev, or `cargo xtask build frontend-build` first.** The
+build script checks only that `ui/dist/` exists, so never stand in an empty one: a
+production or installer build from that tree ships a blank dashboard without an error.
+The pre-commit hook lints with `--no-default-features`. See #372.
 
 ### Windows installer
 
