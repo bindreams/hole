@@ -329,12 +329,21 @@ struct TransientEngage<'a> {
     loads_to_fail: u32,
 }
 
+/// A watch on `dir`, opened now and never closed: the engage doubles hold it for the length
+/// of the test process.
+fn watch_of(dir: &Path) -> &'static crate::routing::failclosed::ReleaseWatch {
+    Box::leak(Box::new(
+        crate::routing::failclosed::watch_releases(dir).expect("no release in flight"),
+    ))
+}
+
 impl<'a> TransientEngage<'a> {
     fn new(dir: &'a Path) -> Self {
         Self {
             real: RealEngageOps {
                 state_dir: dir,
                 owner: None,
+                watch: watch_of(dir),
             },
             token: MINE,
             log: Vec::new(),
@@ -719,23 +728,16 @@ struct StandingEngage<'a> {
     loads_to_pass: u32,
     /// Whether `pfctl -X` fails.
     drops_fail: bool,
-    /// What `release_began` answers.
-    release_began: bool,
-    after: Option<(&'static str, Hook<'a>)>,
+    after: Vec<(&'static str, Hook<'a>)>,
 }
 
 impl<'a> StandingEngage<'a> {
     fn new(dir: &'a Path, pf_enabled: bool) -> Self {
-        // The double answers `release_began` itself; the real ops only need a
-        // watch to exist.
-        let watch: &'static crate::routing::failclosed::ReleaseWatch = Box::leak(Box::new(
-            crate::routing::failclosed::watch_releases(dir).expect("no release in flight"),
-        ));
         Self {
             real: RealLockdownEngageOps {
                 state_dir: dir,
                 owner: None,
-                watch,
+                watch: watch_of(dir),
             },
             pf_enabled,
             log: Vec::new(),
@@ -744,13 +746,12 @@ impl<'a> StandingEngage<'a> {
             loads_to_fail: 0,
             loads_to_pass: 0,
             drops_fail: false,
-            release_began: false,
-            after: None,
+            after: Vec::new(),
         }
     }
 
     fn after(mut self, step: &'static str, hook: impl FnOnce(&Path) + 'a) -> Self {
-        self.after = Some((step, Box::new(hook)));
+        self.after.push((step, Box::new(hook)));
         self
     }
 
@@ -762,8 +763,8 @@ impl<'a> StandingEngage<'a> {
 
     fn step(&mut self, name: &'static str) {
         self.log.push(name);
-        if matches!(&self.after, Some((n, _)) if *n == name) {
-            let (_, hook) = self.after.take().expect("just matched");
+        while let Some(at) = self.after.iter().position(|(n, _)| *n == name) {
+            let (_, hook) = self.after.remove(at);
             hook(self.real.state_dir);
         }
     }
@@ -802,11 +803,6 @@ impl LockdownEngageOps for StandingEngage<'_> {
         read
     }
 
-    fn release_began(&mut self) -> bool {
-        self.log.push("release_began");
-        self.release_began
-    }
-
     fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
         self.step("enable_capture_token");
         Ok(MINE.to_owned())
@@ -820,8 +816,7 @@ impl LockdownEngageOps for StandingEngage<'_> {
         // The production persist, fed a clean-host capture instead of `pfctl -sr`.
         let persisted = persist_baseline(
             token,
-            self.real.state_dir,
-            None,
+            self.real.site(),
             expected,
             CoverPresence::Absent,
             "scrub-anchor \"com.apple/*\" all fragment reassemble\n".into(),
@@ -857,13 +852,14 @@ impl LockdownEngageOps for StandingEngage<'_> {
     }
 
     fn drop_right(&mut self, token: &str) -> Option<DropRight> {
-        self.log.push("drop_right");
-        self.real.drop_right(token)
+        let right = self.real.drop_right(token);
+        self.step("drop_right");
+        right
     }
 
-    fn holds_to_settle(&mut self, token: &str) -> bool {
-        self.log.push("holds_to_settle");
-        self.real.holds_to_settle(token)
+    fn names_token(&mut self, token: &str) -> bool {
+        self.log.push("names_token");
+        self.real.names_token(token)
     }
 
     fn clear_dropped(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -975,7 +971,7 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_when_the_token_is_reus
             "commit_check",
             "load_ruleset",
             "drop_right",
-            "holds_to_settle"
+            "names_token"
         ],
         "no new refcount is taken, and the block-all just loaded is replaced by the restore"
     );
@@ -995,7 +991,7 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_on_a_fresh_engage() {
     assert_eq!(*released.borrow(), vec![MINE.to_string()]);
     assert_eq!(
         &ops.log[ops.log.len() - 4..],
-        ["commit_check", "load_ruleset", "drop_right", "holds_to_settle"],
+        ["commit_check", "load_ruleset", "drop_right", "names_token"],
         "the restore follows the commit check: {:?}",
         ops.log
     );
@@ -1007,10 +1003,11 @@ fn a_release_after_the_load_is_caught_by_the_commit_check_on_a_fresh_engage() {
 }
 
 #[skuld::test]
-fn a_release_that_has_claimed_but_not_yet_restored_supersedes_the_standing_engage_and_keeps_its_drop() {
+fn a_release_that_has_claimed_but_not_yet_restored_supersedes_the_standing_engage_which_settles_the_token() {
     // The commit check runs between the release's claim and its clear. The engage
-    // backs out but does not clear a tombstone, so the release still removes the
-    // record and drops the token: once in total.
+    // backs out and, holding the right to the token its tombstone still names, drops
+    // it and clears the record; the release that settles afterwards finds nothing
+    // to drop. Once in total, and by whichever party got the right.
     let dir = tempfile::tempdir().unwrap();
     let claimed = RefCell::new(None);
     let mut ops = StandingEngage::new(dir.path(), false).after("load_ruleset", |d| {
@@ -1019,17 +1016,38 @@ fn a_release_that_has_claimed_but_not_yet_restored_supersedes_the_standing_engag
 
     let err = engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the record is claimed");
     assert!(matches!(err, RoutingError::SupersededByRelease), "{err}");
-    assert!(ops.dropped.is_empty(), "the engage does not touch a tombstone's token");
-    assert_eq!(
-        lockdown_state::load(dir.path()).map(|r| r.releasing),
-        Some(true),
-        "the claim stands for the release to clear"
-    );
+    assert_eq!(ops.dropped, vec![MINE.to_string()]);
+    assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
 
     let mut pf = ReleasePf::new(dir.path());
     release_all_with(StateFile::Absent, claimed.borrow_mut().take().unwrap(), &mut pf).expect("the release succeeds");
 
-    assert_eq!(pf.dropped, vec![MINE.to_string()]);
+    assert!(pf.dropped.is_empty(), "the engage already dropped it: {:?}", pf.dropped);
+}
+
+#[skuld::test]
+fn a_release_that_cannot_take_the_right_leaves_the_token_to_an_engage_that_settles_the_tombstone() {
+    // The engage holds the right when the release asks for it, so the release
+    // leaves the token to the engage. The engage must therefore settle a tombstone
+    // naming its token, or nobody does.
+    let dir = tempfile::tempdir().unwrap();
+    let release_while_holding = RefCell::new(None);
+    let mut ops = StandingEngage::new(dir.path(), false)
+        .after("load_ruleset", |d| {
+            lockdown_state::claim_for_release(d, None);
+        })
+        .after("drop_right", |d| {
+            let mut pf = ReleasePf::new(d);
+            let result = release_all_with(StateFile::Absent, lockdown_state::load_presence(d), &mut pf);
+            *release_while_holding.borrow_mut() = Some((result, pf.dropped));
+        });
+
+    engage_lockdown_with(server(), "utun9", &mut ops).expect_err("the record is claimed");
+
+    let (result, released) = release_while_holding.borrow_mut().take().expect("the release ran");
+    result.expect("a release that leaves the token to the holder succeeds");
+    assert!(released.is_empty(), "it could not take the right: {released:?}");
+    assert_eq!(ops.dropped, vec![MINE.to_string()], "the engage dropped it");
     assert!(!record_exists(dir.path(), lockdown_state::STATE_FILE_NAME));
 }
 
@@ -1078,11 +1096,12 @@ fn an_engage_takes_back_a_tombstone_a_failed_release_left_and_adopts_its_cover()
 #[skuld::test]
 fn an_engage_never_takes_back_a_tombstone_over_a_release_that_began() {
     // A release that began after the facade's watch wrote the tombstone the
-    // engage just read. Taking it back would steal the release's claim.
+    // engage just read, or left it alone because it was one already. Taking it back
+    // would steal the release's claim, and the record still reads as the engage saw it.
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::seed(dir.path(), &standing_tombstone_of(OLD));
     let mut ops = StandingEngage::new(dir.path(), true);
-    ops.release_began = true;
+    let _release = crate::routing::failclosed::begin_release(dir.path());
 
     let err = engage_lockdown_with(server(), "utun9", &mut ops).expect_err("a release began");
 

@@ -66,8 +66,13 @@ fn engage_publishing(
     commit_gen: &std::sync::atomic::AtomicUsize,
     server_idx: usize,
 ) -> Result<Cover, RoutingError> {
+    let watch = crate::routing::failclosed::watch_releases(state_dir)?;
     let mut ops = PublishOnCommit {
-        inner: RealEngageOps { state_dir, owner: None },
+        inner: RealEngageOps {
+            state_dir,
+            owner: None,
+            watch,
+        },
         permitted_idx,
         commit_gen,
         server_idx,

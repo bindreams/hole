@@ -136,16 +136,6 @@ pub fn would_clear<R: PfRecord>(current: &StateFile<R>, token: Option<&str>, cla
     }
 }
 
-/// Whether an engage backing out may clear `current`: its own live record, or
-/// its own record gone unreadable. Never a tombstone, which a release owns.
-pub fn holds_clear<R: PfRecord>(current: &StateFile<R>, token: &str) -> bool {
-    match current {
-        StateFile::Present(r) => r.pf_token() == token && !r.releasing(),
-        StateFile::Unusable { pf_token } => pf_token.as_deref() == Some(token),
-        StateFile::Absent => false,
-    }
-}
-
 /// Whether an engage whose restore failed puts its record back over `current`:
 /// over nothing (a release already cleared) or over its own tombstone (a release
 /// is yet to clear).

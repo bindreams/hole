@@ -1,4 +1,5 @@
 use super::super::ownership_double::Recording;
+use super::super::release_epoch::{begin_release, watch_releases, ReleaseWatch};
 use super::*;
 
 #[skuld::test]
@@ -89,10 +90,21 @@ fn with_token(token: &str) -> FailClosedState {
     }
 }
 
+fn watch(dir: &Path) -> ReleaseWatch {
+    watch_releases(dir).expect("no release is in flight")
+}
+
 #[skuld::test]
 fn swap_applies_over_an_absent_record_when_absence_was_expected() {
     let tmp = tempfile::tempdir().unwrap();
-    let swap = swap(tmp.path(), &StateFile::Absent, &with_token("1"), None).unwrap();
+    let swap = swap(
+        tmp.path(),
+        &StateFile::Absent,
+        &with_token("1"),
+        None,
+        &watch(tmp.path()),
+    )
+    .unwrap();
     assert_eq!(swap, Swap::Applied);
     assert_eq!(load(tmp.path()), Some(with_token("1")));
 }
@@ -104,7 +116,7 @@ fn swap_is_superseded_by_a_changed_token() {
     let expected = load_presence(tmp.path());
     save(tmp.path(), &with_token("newer"), None).unwrap();
 
-    let swap = swap(tmp.path(), &expected, &with_token("mine"), None).unwrap();
+    let swap = swap(tmp.path(), &expected, &with_token("mine"), None, &watch(tmp.path())).unwrap();
 
     assert_eq!(swap, Swap::Superseded);
     assert_eq!(
@@ -121,7 +133,7 @@ fn swap_is_superseded_when_the_expected_record_was_cleared() {
     let expected = load_presence(tmp.path());
     clear_if_token(tmp.path(), Some("old")).unwrap();
 
-    let swap = swap(tmp.path(), &expected, &with_token("mine"), None).unwrap();
+    let swap = swap(tmp.path(), &expected, &with_token("mine"), None, &watch(tmp.path())).unwrap();
 
     assert_eq!(swap, Swap::Superseded);
     assert!(
@@ -142,7 +154,7 @@ fn swap_applies_over_an_equal_unusable_file() {
     assert!(matches!(&expected, StateFile::Unusable { pf_token: Some(t) } if t == "salvaged"));
 
     assert_eq!(
-        swap(tmp.path(), &expected, &with_token("mine"), None).unwrap(),
+        swap(tmp.path(), &expected, &with_token("mine"), None, &watch(tmp.path())).unwrap(),
         Swap::Applied
     );
     assert_eq!(load(tmp.path()), Some(with_token("mine")));
@@ -152,11 +164,74 @@ fn swap_applies_over_an_equal_unusable_file() {
 fn swap_holds_the_record_lock_while_comparing_and_writing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut held_inside = false;
-    swap_with(tmp.path(), &StateFile::Absent, &with_token("1"), None, || {
-        held_inside = LOCK.try_acquire().is_none();
-    })
+    swap_with(
+        tmp.path(),
+        &StateFile::Absent,
+        &with_token("1"),
+        None,
+        &watch(tmp.path()),
+        || {
+            held_inside = LOCK.try_acquire().is_none();
+        },
+    )
     .unwrap();
     assert!(held_inside, "the compare and the write must be one critical section");
+}
+
+#[skuld::test]
+fn swap_is_superseded_once_a_release_began_even_when_the_record_reads_as_expected() {
+    // A release that claims a record only rewrites it when it is a live one. Over a
+    // tombstone or an unusable file it writes nothing, so the record still equals the
+    // engage's view; the epoch is what says a release is settling it.
+    for seeded in [Some(true), Some(false), None] {
+        let tmp = tempfile::tempdir().unwrap();
+        match seeded {
+            Some(releasing) => save(tmp.path(), &with_token("old").with_releasing(releasing), None).unwrap(),
+            None => {
+                std::fs::write(tmp.path().join(STATE_FILE_NAME), b"not json").unwrap();
+            }
+        }
+        let expected = load_presence(tmp.path());
+        let engage_watch = watch(tmp.path());
+        let _release = begin_release(tmp.path());
+
+        let swap = swap(tmp.path(), &expected, &with_token("mine"), None, &engage_watch).unwrap();
+
+        assert_eq!(swap, Swap::Superseded, "seeded {seeded:?}");
+        assert_eq!(load_presence(tmp.path()), expected, "and nothing is written");
+    }
+}
+
+#[skuld::test]
+fn swap_is_superseded_by_a_release_that_has_already_ended() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engage_watch = watch(tmp.path());
+    drop(begin_release(tmp.path()));
+
+    let swap = swap(tmp.path(), &StateFile::Absent, &with_token("mine"), None, &engage_watch).unwrap();
+
+    assert_eq!(swap, Swap::Superseded);
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
+fn swap_checks_the_watch_without_taking_a_second_lock() {
+    // The check runs under the record lock; a lock taken under it would break the
+    // leaf rule. A release beginning inside the section is seen at once.
+    let tmp = tempfile::tempdir().unwrap();
+    let engage_watch = watch(tmp.path());
+    let swap = swap_with(
+        tmp.path(),
+        &StateFile::Absent,
+        &with_token("mine"),
+        None,
+        &engage_watch,
+        || {
+            std::mem::forget(begin_release(tmp.path()));
+        },
+    )
+    .unwrap();
+    assert_eq!(swap, Swap::Superseded);
 }
 
 #[skuld::test]

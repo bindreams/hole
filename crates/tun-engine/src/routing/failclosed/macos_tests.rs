@@ -2228,10 +2228,14 @@ fn self_capture_persists_no_baseline_but_keeps_the_nat_rules() {
     // engages, with nothing on disk to restore it from.
     let tmp = tempfile::tempdir().unwrap();
     let nat = "nat on en0 from any to any -> (en0)\n";
+    let watch = crate::routing::failclosed::watch_releases(tmp.path()).unwrap();
     let returned = persist_baseline(
         "tok",
-        tmp.path(),
-        None,
+        RecordSite {
+            state_dir: tmp.path(),
+            owner: None,
+            watch: &watch,
+        },
         &StateFile::Absent,
         CoverPresence::Live,
         "block drop out quick all label \"hole-lockdown\"\n".into(),
@@ -2254,10 +2258,14 @@ fn a_measured_clean_host_captures_its_baseline() {
     let tmp = tempfile::tempdir().unwrap();
     let main = "scrub-anchor \"com.apple/*\" all fragment reassemble\n";
     let nat = "nat-anchor \"com.apple/*\" all\n";
+    let watch = crate::routing::failclosed::watch_releases(tmp.path()).unwrap();
     persist_baseline(
         "tok",
-        tmp.path(),
-        None,
+        RecordSite {
+            state_dir: tmp.path(),
+            owner: None,
+            watch: &watch,
+        },
         &StateFile::Absent,
         CoverPresence::Absent,
         main.into(),

@@ -84,6 +84,7 @@ use super::drop_right::{self, DropRight};
 use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
 use super::pf_claim::{self, Cleared, Record};
+use super::release_epoch::ReleaseWatch;
 use super::Clearance;
 use super::StateFile;
 use super::Swap;
@@ -594,8 +595,17 @@ pub fn engage(
     resolver_ip: Option<IpAddr>,
     state_dir: &Path,
     owner: Option<(u32, u32)>,
+    watch: &ReleaseWatch,
 ) -> Result<Cover, RoutingError> {
-    let token = engage_with(server_ip, resolver_ip, &mut RealEngageOps { state_dir, owner })?;
+    let token = engage_with(
+        server_ip,
+        resolver_ip,
+        &mut RealEngageOps {
+            state_dir,
+            owner,
+            watch,
+        },
+    )?;
     Ok(Cover {
         token,
         state_dir: state_dir.to_owned(),
@@ -885,14 +895,23 @@ impl RecoverOps for RealRecoverOps<'_> {
 /// it depends on no claim about `pfctl -sr`'s print format.
 fn capture_and_persist(
     token: &str,
-    state_dir: &Path,
-    owner: Option<(u32, u32)>,
+    site: RecordSite<'_>,
     expected: &StateFile<lockdown_state::LockdownPfState>,
 ) -> Result<lockdown_state::LockdownPfState, RoutingError> {
-    let presence = lockdown_cover_presence(state_dir);
+    let presence = lockdown_cover_presence(site.state_dir);
     let main_snapshot = pfctl_stdout(pfctl(&["-sr"], None, FatalPhase::CoverEngage), "pfctl -sr")?;
     let nat_snapshot = pfctl_stdout(pfctl(&["-sn"], None, FatalPhase::CoverEngage), "pfctl -sn")?;
-    persist_baseline(token, state_dir, owner, expected, presence, main_snapshot, nat_snapshot)
+    persist_baseline(token, site, expected, presence, main_snapshot, nat_snapshot)
+}
+
+/// Where an engage writes its records, as whom, and the watch that ends its right
+/// to: a write is refused ([`RoutingError::SupersededByRelease`]) once a release has
+/// begun since the watch opened.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordSite<'a> {
+    pub state_dir: &'a Path,
+    pub owner: Option<(u32, u32)>,
+    pub watch: &'a ReleaseWatch,
 }
 
 /// Persist the engage-time baseline. Pure over its inputs — the snapshots and
@@ -909,13 +928,13 @@ fn capture_and_persist(
 /// host NAT the moment the cover engages, with nothing on disk to restore from.
 ///
 /// The write is a compare-and-set against `expected`, the record as the engage
-/// read it at entry: a release that cleared or replaced it since makes this
+/// read it at entry, and it is refused once a release has begun: a release that
+/// cleared, replaced or claimed it since makes this
 /// [`RoutingError::SupersededByRelease`] with nothing written, never a baseline
 /// stacked on a host the release already restored.
 fn persist_baseline(
     token: &str,
-    state_dir: &Path,
-    owner: Option<(u32, u32)>,
+    site: RecordSite<'_>,
     expected: &StateFile<lockdown_state::LockdownPfState>,
     presence: crate::routing::CoverPresence,
     main_snapshot: String,
@@ -936,7 +955,7 @@ fn persist_baseline(
         main_snapshot_captured: captured,
         releasing: false,
     };
-    swap_lockdown_record(state_dir, expected, &record, owner)?;
+    swap_lockdown_record(site, expected, &record)?;
     Ok(record)
 }
 
@@ -944,12 +963,11 @@ fn persist_baseline(
 /// engage reports: a lost compare is [`RoutingError::SupersededByRelease`], a
 /// failed write is a state-write failure.
 fn swap_lockdown_record(
-    state_dir: &Path,
+    site: RecordSite<'_>,
     expected: &StateFile<lockdown_state::LockdownPfState>,
     new: &lockdown_state::LockdownPfState,
-    owner: Option<(u32, u32)>,
 ) -> Result<(), RoutingError> {
-    match lockdown_state::swap(state_dir, expected, new, owner) {
+    match lockdown_state::swap(site.state_dir, expected, new, site.owner, site.watch) {
         Ok(Swap::Applied) => Ok(()),
         Ok(Swap::Superseded) => Err(RoutingError::SupersededByRelease),
         Err(e) => Err(RoutingError::state_write_failed("lockdown-pf-state", &e)),
@@ -1007,8 +1025,6 @@ pub(crate) trait LockdownEngageOps: CoverRulesetOps {
     /// `bridge-lockdown-pf.json` as it reads now: the engage's view at entry,
     /// which every later write is a compare-and-set against.
     fn read_record(&mut self) -> StateFile<lockdown_state::LockdownPfState>;
-    /// Whether a release has begun since this engage's release watch opened.
-    fn release_began(&mut self) -> bool;
     /// `pfctl -E` (refcounted enable) + capture the enable token.
     fn enable_capture_token(&mut self) -> Result<String, RoutingError>;
     /// Snapshot the host's filter and translation rules and persist them with
@@ -1035,9 +1051,10 @@ pub(crate) trait LockdownEngageOps: CoverRulesetOps {
     /// The right to settle `token`, or `None` while another party holds it
     /// ([`drop_right`]).
     fn drop_right(&mut self, token: &str) -> Option<DropRight>;
-    /// Whether the record is this engage's own live one, or its own gone
-    /// unreadable ([`pf_claim::holds_clear`]): a claimed record is a release's.
-    fn holds_to_settle(&mut self, token: &str) -> bool;
+    /// Whether the record still names `token`, live, claimed or unreadable
+    /// ([`pf_claim::names`]). A token is dropped before the record naming it is
+    /// cleared, so a record that names it means it is not dropped yet.
+    fn names_token(&mut self, token: &str) -> bool;
     /// Delete the record naming `token`, whatever has become of it since the
     /// engage's check: its refcount is gone, so no record may name it.
     fn clear_dropped(&mut self, token: &str) -> Result<(), RoutingError>;
@@ -1089,7 +1106,7 @@ fn back_out_engage(ops: &mut dyn LockdownEngageOps, token: &str, baseline: &lock
     let Some(_right) = ops.drop_right(token) else {
         return;
     };
-    if !ops.holds_to_settle(token) {
+    if !ops.names_token(token) {
         return;
     }
     if let Err(e) = ops.drop_token(token) {
@@ -1130,12 +1147,9 @@ fn engage_lockdown_with(
     let mut entry = ops.read_record();
     // A tombstone at entry is a release that failed to restore, and its cover is
     // adopted like any other: the first write takes the claim back. A release
-    // that began since the facade's watch opened wrote it instead, and its claim
-    // is not this engage's to take.
+    // that began since the facade's watch opened wrote it instead, and the write
+    // is refused.
     if let Some(live) = pf_claim::unclaimed(&entry) {
-        if ops.release_began() {
-            return Err(RoutingError::SupersededByRelease);
-        }
         ops.persist(&entry, &live)?;
         entry = StateFile::Present(live);
     }
@@ -1687,6 +1701,8 @@ struct RealPfOps<'a> {
 struct RealEngageOps<'a> {
     state_dir: &'a Path,
     owner: Option<(u32, u32)>,
+    /// Opened by the facade before this engage began.
+    watch: &'a ReleaseWatch,
 }
 
 /// `pfctl -f -` with `text` on stdin, one [`FatalPhase::CoverEngage`]
@@ -1743,7 +1759,7 @@ impl EngageOps for RealEngageOps<'_> {
         expected: &StateFile<state::FailClosedState>,
         st: &state::FailClosedState,
     ) -> Result<(), RoutingError> {
-        match state::swap(self.state_dir, expected, st, self.owner) {
+        match state::swap(self.state_dir, expected, st, self.owner, self.watch) {
             Ok(Swap::Applied) => Ok(()),
             Ok(Swap::Superseded) => Err(RoutingError::SupersededByRelease),
             Err(e) => Err(RoutingError::state_write_failed("failclosed-state", &e)),
@@ -1792,6 +1808,16 @@ struct RealLockdownEngageOps<'a> {
     watch: &'a super::release_epoch::ReleaseWatch,
 }
 
+impl RealLockdownEngageOps<'_> {
+    fn site(&self) -> RecordSite<'_> {
+        RecordSite {
+            state_dir: self.state_dir,
+            owner: self.owner,
+            watch: self.watch,
+        }
+    }
+}
+
 impl CoverRulesetOps for RealLockdownEngageOps<'_> {
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
         real_load_ruleset(text)
@@ -1812,10 +1838,6 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
         lockdown_state::load_presence(self.state_dir)
     }
 
-    fn release_began(&mut self) -> bool {
-        self.watch.check().is_err()
-    }
-
     fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
         enable_pf_capture_token()
     }
@@ -1825,7 +1847,7 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
         token: &str,
         expected: &StateFile<lockdown_state::LockdownPfState>,
     ) -> Result<lockdown_state::LockdownPfState, RoutingError> {
-        capture_and_persist(token, self.state_dir, self.owner, expected)
+        capture_and_persist(token, self.site(), expected)
     }
 
     fn persist(
@@ -1833,7 +1855,7 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
         expected: &StateFile<lockdown_state::LockdownPfState>,
         fresh: &lockdown_state::LockdownPfState,
     ) -> Result<(), RoutingError> {
-        swap_lockdown_record(self.state_dir, expected, fresh, self.owner)
+        swap_lockdown_record(self.site(), expected, fresh)
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -1851,8 +1873,8 @@ impl LockdownEngageOps for RealLockdownEngageOps<'_> {
         drop_right::take(self.state_dir, Record::Standing, token)
     }
 
-    fn holds_to_settle(&mut self, token: &str) -> bool {
-        pf_claim::holds_clear(&lockdown_state::load_presence(self.state_dir), token)
+    fn names_token(&mut self, token: &str) -> bool {
+        pf_claim::names(&lockdown_state::load_presence(self.state_dir), Some(token))
     }
 
     fn clear_dropped(&mut self, token: &str) -> Result<(), RoutingError> {

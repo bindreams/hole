@@ -215,8 +215,16 @@ pub fn engage(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    let inner = release_epoch::engage_within_watch(state_dir, |_watch| {
-        platform::engage(server_ip, resolver_ip, state_dir, owner)
+    let inner = release_epoch::engage_within_watch(state_dir, |watch| {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = watch;
+            platform::engage(server_ip, resolver_ip, state_dir, owner)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            platform::engage(server_ip, resolver_ip, state_dir, owner, watch)
+        }
     })?;
     Ok(Cover { _inner: inner })
 }

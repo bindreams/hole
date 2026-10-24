@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use util::ownership::{Ownership, RealOwnership};
 
 use super::pf_claim::{self, Cleared, Held};
+use super::release_epoch::ReleaseWatch;
 use super::{PfRecord, StateFile, Swap};
 use crate::exclusive::RecordLock;
 
@@ -178,8 +179,11 @@ fn remove_file(state_dir: &Path) -> std::io::Result<()> {
 }
 
 /// Persist `new` iff the record still reads as `expected` (what the caller read
-/// when it started), as one critical section. [`Swap::Superseded`] writes
-/// nothing: a release cleared or replaced the record since.
+/// when it started) and no release has begun since `watch` opened, as one
+/// critical section. [`Swap::Superseded`] writes nothing: a release cleared,
+/// replaced or claimed the record since, or is about to, and a record the
+/// release is settling is never written over (it would orphan the release's
+/// token), however much it reads like `expected`.
 ///
 /// `expected` is the [`StateFile`] as [`load_presence`] returned it, not a
 /// collapsed `Option`: an `Unusable` record compares by its salvaged token, so
@@ -189,8 +193,9 @@ pub fn swap(
     expected: &StateFile<LockdownPfState>,
     new: &LockdownPfState,
     owner: Option<(u32, u32)>,
+    watch: &ReleaseWatch,
 ) -> std::io::Result<Swap> {
-    swap_with(state_dir, expected, new, owner, || {})
+    swap_with(state_dir, expected, new, owner, watch, || {})
 }
 
 /// [`swap`] with a hook that runs inside the critical section, between the
@@ -200,12 +205,15 @@ fn swap_with(
     expected: &StateFile<LockdownPfState>,
     new: &LockdownPfState,
     owner: Option<(u32, u32)>,
+    watch: &ReleaseWatch,
     in_section: impl FnOnce(),
 ) -> std::io::Result<Swap> {
     let _guard = LOCK.acquire();
     let current = load_presence(state_dir);
     in_section();
-    if current != *expected {
+    // Under the lock, so a release's claim, which takes it, either follows this
+    // write or finds the epoch moved here.
+    if watch.check().is_err() || current != *expected {
         return Ok(Swap::Superseded);
     }
     save(state_dir, new, owner)?;

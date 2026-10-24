@@ -185,17 +185,17 @@ fn a_release_of_an_unusable_record_clears_it_when_the_token_matches() {
 // An engage's clear and re-assert =====================================================================================
 
 #[skuld::test]
-fn an_engage_clears_a_live_or_unreadable_record_naming_its_token_but_never_a_tombstone() {
-    assert!(holds_clear(&live(MINE), MINE));
+fn a_record_names_a_token_in_every_state_it_can_be_in() {
+    assert!(names(&live(MINE), Some(MINE)));
     assert!(
-        holds_clear(&unusable(Some(MINE)), MINE),
-        "its own record, gone unreadable"
+        names(&tombstone_of(MINE), Some(MINE)),
+        "a release's claim still names it"
     );
-    assert!(!holds_clear(&tombstone_of(MINE), MINE), "the release owns it");
-    assert!(!holds_clear(&live(OTHER), MINE));
-    assert!(!holds_clear(&unusable(Some(OTHER)), MINE));
-    assert!(!holds_clear(&unusable(None), MINE));
-    assert!(!holds_clear(&absent(), MINE));
+    assert!(names(&unusable(Some(MINE)), Some(MINE)), "gone unreadable");
+    assert!(!names(&live(OTHER), Some(MINE)));
+    assert!(!names(&unusable(Some(OTHER)), Some(MINE)));
+    assert!(!names(&unusable(None), Some(MINE)));
+    assert!(!names(&absent(), Some(MINE)));
 }
 
 #[skuld::test]

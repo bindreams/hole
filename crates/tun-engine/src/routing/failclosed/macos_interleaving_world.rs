@@ -86,12 +86,9 @@ struct Pf {
     minted: u32,
     rules: Rules,
     violations: Vec<String>,
-    /// Tokens present before the run began.
-    seeded: BTreeSet<String>,
     /// Tokens a release wrote a tombstone over, in this run.
     claimed: BTreeSet<(Record, String)>,
-    /// Tokens that no record can ever name again, by construction of the entry
-    /// or by an engage that overwrote an unclaimed leftover.
+    /// Tokens pf holds that no record names, by construction of the entry.
     unreachable: BTreeSet<String>,
 }
 
@@ -137,7 +134,6 @@ impl World {
         Self {
             dir,
             pf: Mutex::new(Pf {
-                seeded: live.clone(),
                 live,
                 minted: 0,
                 rules,
@@ -193,20 +189,6 @@ impl World {
             if !b.releasing() && a.releasing() {
                 self.pf().claimed.insert((record, a.pf_token().to_owned()));
             }
-        }
-    }
-
-    /// An engage's compare-and-set applied over `before`. The token it replaced
-    /// is nobody's to drop afterwards, which is the engage's doing only when no
-    /// release had claimed it.
-    fn note_overwrite(&self, record: Record, before: &StateFile<impl PfRecord>, new_token: &str) {
-        let Some(old) = before.pf_token() else { return };
-        if old == new_token {
-            return;
-        }
-        let mut pf = self.pf();
-        if pf.seeded.contains(old) && !pf.claimed.contains(&(record, old.to_owned())) {
-            pf.unreachable.insert(old.to_owned());
         }
     }
 
@@ -414,12 +396,7 @@ impl EngageOps for TransientParty<'_> {
         st: &state::FailClosedState,
     ) -> Result<(), RoutingError> {
         self.gate.step(Op::new("save_transient").writes(Res::Transient));
-        let before = state::load_presence(&self.world.dir);
-        let saved = self.real.save_transient(expected, st);
-        if saved.is_ok() {
-            self.world.note_overwrite(Record::Transient, &before, &st.pf_token);
-        }
-        saved
+        self.real.save_transient(expected, st)
     }
 
     fn transient_commit_check(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -489,11 +466,6 @@ impl LockdownEngageOps for StandingParty<'_> {
         self.real.read_record()
     }
 
-    fn release_began(&mut self) -> bool {
-        self.gate.step(Op::new("release_began").reads(Res::Epoch));
-        self.real.release_began()
-    }
-
     fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
         self.gate.step(Op::new("enable").writes(Res::Enabled));
         let token = self.world.mint("S");
@@ -512,18 +484,14 @@ impl LockdownEngageOps for StandingParty<'_> {
             Rules::Standing(_) => crate::routing::CoverPresence::Live,
             Rules::Open | Rules::Transient(_) => crate::routing::CoverPresence::Absent,
         };
-        let before = lockdown_state::load_presence(&self.world.dir);
-        let record = persist_baseline(
+        persist_baseline(
             token,
-            &self.world.dir,
-            None,
+            self.real.site(),
             expected,
             presence,
             HOST_RULES.into(),
             String::new(),
-        )?;
-        self.world.note_overwrite(Record::Standing, &before, token);
-        Ok(record)
+        )
     }
 
     fn persist(
@@ -532,12 +500,7 @@ impl LockdownEngageOps for StandingParty<'_> {
         fresh: &lockdown_state::LockdownPfState,
     ) -> Result<(), RoutingError> {
         self.gate.step(Op::new("persist").writes(Res::Standing));
-        let before = lockdown_state::load_presence(&self.world.dir);
-        let persisted = self.real.persist(expected, fresh);
-        if persisted.is_ok() {
-            self.world.note_overwrite(Record::Standing, &before, &fresh.pf_token);
-        }
-        persisted
+        self.real.persist(expected, fresh)
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -560,9 +523,9 @@ impl LockdownEngageOps for StandingParty<'_> {
         self.real.drop_right(token)
     }
 
-    fn holds_to_settle(&mut self, token: &str) -> bool {
-        self.gate.step(Op::new("holds_to_settle").reads(Res::Standing));
-        self.real.holds_to_settle(token)
+    fn names_token(&mut self, token: &str) -> bool {
+        self.gate.step(Op::new("names_token").reads(Res::Standing));
+        self.real.names_token(token)
     }
 
     fn clear_dropped(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -676,10 +639,10 @@ pub fn run_party(kind: Kind, world: &World, gate: &Gate) -> Outcome {
                 real: RealEngageOps {
                     state_dir: &world.dir,
                     owner: None,
+                    watch,
                 },
                 token: None,
             };
-            let _ = watch;
             engage_with(server(), None, &mut ops)
         }),
         Kind::StandingEngage => engage(kind, world, gate, |watch| {
