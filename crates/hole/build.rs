@@ -72,8 +72,7 @@ fn report_missing_frontend_dist() -> bool {
     let Some(dir) = missing else { return false };
     println!(
         "cargo::error=`frontendDist` {} does not exist. Production mode embeds the frontend: run \
-         `cargo xtask build frontend-build`, or create an empty `ui/dist` (gitignored) for checks that \
-         do not run the GUI, or build with `--no-default-features`",
+         `cargo xtask build frontend-build`, or build with `--no-default-features`",
         dir.display()
     );
     true

@@ -2705,7 +2705,8 @@ unaffected. The `hole` / `hole-tests` xtask targets pass
 `frontend-build`. **Running `cargo build -p hole` or `cargo clippy --workspace` directly:
 add `--no-default-features` for dev, or `cargo xtask build frontend-build` first.** The
 build script checks only that `ui/dist/` exists, so never stand in an empty one: a
-production or installer build from that tree ships a blank dashboard without an error.
+default-feature build from that tree (`cargo build --release`, `uv run --directory msi-installer build`) ships a
+blank dashboard without an error.
 The pre-commit hook lints with `--no-default-features`. See #372.
 
 ### Windows installer
