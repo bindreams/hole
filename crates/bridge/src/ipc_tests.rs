@@ -1166,30 +1166,93 @@ async fn an_unblock_whose_release_fails_still_ends_its_release() {
     );
 }
 
-/// The release spans the persisted `Off` as well as the firewall call: the persist runs
-/// off-thread behind an `.await`, so only the guard's scope proves it, and the scope is
-/// pinned here.
+/// The release spans the persisted `Off` as well as the firewall call, even when the
+/// client goes away and hyper drops the handler future at the persist's `.await`.
+/// The persist is held at the target file's lock, so it cannot end before the
+/// assertions run; dropping the runtime is what joins it.
 #[skuld::test]
-fn the_unblock_handler_holds_its_release_through_the_persist() {
+fn a_dropped_unblock_handler_future_does_not_end_the_release_before_the_persist() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use tun_engine::routing::failclosed::watch_releases;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = ipc_state_over(MockRouting::new(dir.path().to_owned()), dir.path().to_owned());
+
+    // Declared first, dropped last: dropping it joins the persist, which waits on `holder`, which
+    // waits on `let_go_tx`. A failed assertion drops `let_go_tx` first and unblocks the chain.
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (let_go_tx, let_go_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn({
+        let dir = dir.path().to_owned();
+        move || {
+            target::apply(&dir, None, |current| {
+                entered_tx.send(()).unwrap();
+                let _ = let_go_rx.recv();
+                current
+            })
+        }
+    });
+    entered_rx.recv().unwrap();
+
+    runtime.block_on(async {
+        let mut handler = Box::pin(super::handle_unblock(axum::extract::State(state)));
+        let polled = handler.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(matches!(polled, Poll::Pending), "the persist is waiting on the lock");
+    });
+
+    assert!(
+        watch_releases(dir.path()).is_err(),
+        "the handler future is gone, but the persist it spawned is not done: the release is still in flight"
+    );
+
+    let_go_tx.send(()).unwrap();
+    holder.join().unwrap().unwrap();
+    drop(runtime);
+    assert!(
+        watch_releases(dir.path()).is_ok(),
+        "and it ends with the persist, not before and not never"
+    );
+}
+
+/// The release is announced before the first firewall call, and the guard moves into
+/// the persist's closure so nothing the handler future does can end it early.
+#[skuld::test]
+fn the_unblock_handler_hands_its_release_to_the_persist() {
     let src = include_str!("ipc.rs");
     let start = src.find("async fn handle_unblock").expect("handle_unblock must exist");
-    let body = &src[start..src[start..].find("\n}\n").map(|i| start + i).expect("the handler ends")];
+    let body = &src[start
+        ..src[start..]
+            .find(
+                "
+}",
+            )
+            .map(|i| start + i)
+            .expect("the handler ends")];
 
     let begin = body
-        .find("let _release = ")
+        .find("let release = ")
         .expect("the guard must be a named binding, not `_`");
-    let release = body.find("release_all_covers()").expect("the handler releases covers");
+    let released = body.find("release_all_covers()").expect("the handler releases covers");
+    let spawn = body.find("spawn_blocking").expect("the persist runs off-thread");
+    let moved = body
+        .find("let _release = release;")
+        .expect("the persist's closure must take the guard");
     let persist = body
         .find("lockdown_state::set_enabled")
         .expect("the handler persists the intent");
     assert!(
-        begin < release,
+        begin < released,
         "the release is announced before the first firewall call"
     );
-    assert!(release < persist);
     assert!(
-        !body.contains("drop(_release"),
-        "the guard must live to the end of the handler, past the persist"
+        spawn < moved && moved < persist,
+        "the closure owns the guard through the persist"
+    );
+    assert!(
+        !body.contains("drop(release"),
+        "the guard ends with the closure, not at a call in the handler"
     );
 }
 
