@@ -232,6 +232,16 @@ pub(crate) struct MockRoutingState {
     /// `RoutingError::SupersededByRelease` — a release took the cover's record
     /// while it was being engaged. Checked before `fail_cover_for_resolvers`.
     supersede_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
+    /// `install_failclosed_cover` calls, counted at ENTRY, before any failure
+    /// the mock injects: tells "never tried" from "tried and refused", which
+    /// `cover_engage_calls` (counted only on success) cannot.
+    pub(crate) cover_engage_attempts: AtomicU32,
+    /// Runs once, at the entry of the next `install_failclosed_cover` or
+    /// `install_lockdown`: a release (the tray's Unblock) landing during the
+    /// install.
+    on_install: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Releases a test left in flight (guards held until the test ends).
+    releases_in_flight: std::sync::Mutex<Vec<tun_engine::routing::failclosed::ReleaseInFlight>>,
     /// `install` excludes any [`RouteId`] in this set from the persisted
     /// `installed` list — simulates a route whose `add` failed (e.g. another
     /// VPN already holds that prefix), analogous to `fail_cover_for_resolvers`.
@@ -271,10 +281,41 @@ impl Default for MockRoutingState {
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
             supersede_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            cover_engage_attempts: AtomicU32::new(0),
+            on_install: std::sync::Mutex::new(None),
+            releases_in_flight: std::sync::Mutex::new(Vec::new()),
             fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_teardown_installed: std::sync::Mutex::new(None),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
         }
+    }
+}
+
+impl MockRoutingState {
+    fn run_on_install(&self) {
+        let hook = self.on_install.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Arrange for a release to begin during the next cover install, as the
+    /// tray's Unblock does. `in_flight` keeps it running past the install; else
+    /// it has ended by the time the install returns.
+    fn release_during_next_install(self: &Arc<Self>, state_dir: &std::path::Path, in_flight: bool) {
+        let state = Arc::clone(self);
+        let dir = state_dir.to_path_buf();
+        *self.on_install.lock().unwrap() = Some(Box::new(move || {
+            let release = tun_engine::routing::failclosed::begin_release(&dir);
+            if in_flight {
+                state.releases_in_flight.lock().unwrap().push(release);
+            }
+        }));
+    }
+
+    /// End every release a test left in flight.
+    fn end_releases(&self) {
+        self.releases_in_flight.lock().unwrap().clear();
     }
 }
 
@@ -455,6 +496,8 @@ impl Routing for MockRouting {
         server_ip: IpAddr,
         resolver_ip: Option<IpAddr>,
     ) -> Result<MockCover, RoutingError> {
+        self.state.cover_engage_attempts.fetch_add(1, Ordering::SeqCst);
+        self.state.run_on_install();
         if self.state.fail_cover.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock cover failure".into()));
         }
@@ -491,6 +534,7 @@ impl Routing for MockRouting {
         tun: &TunIdentity,
         _app_ids: &[std::path::PathBuf],
     ) -> Result<MockCover, RoutingError> {
+        self.state.run_on_install();
         if self.state.fail_lockdown.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock lockdown failure".into()));
         }
@@ -1678,6 +1722,55 @@ fn lockdown_engage_failure_is_fatal_and_tears_down() {
         assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 0);
         assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
         assert!(pm.last_error().is_some());
+    });
+}
+
+#[skuld::test]
+fn an_unblock_that_lands_during_the_lockdown_install_cancels_the_start_and_unwinds_it() {
+    rt().block_on(async {
+        for in_flight in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            st.release_during_next_install(dir.path(), in_flight);
+
+            let err = pm.start(&test_config()).await.unwrap_err();
+
+            assert!(
+                matches!(err, ProxyError::Cancelled),
+                "in_flight={in_flight}: expected Cancelled, got {err:?}"
+            );
+            assert_eq!(pm.state(), ProxyState::Stopped);
+            assert_eq!(
+                st.lockdown_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "the standing cover the release overtook is dropped"
+            );
+            assert_eq!(
+                st.teardown_calls.load(Ordering::SeqCst),
+                1,
+                "and the routes it was installed over are torn down"
+            );
+            assert_eq!(pm.last_error(), None, "a cancelled start records no failure");
+            st.end_releases();
+        }
+    });
+}
+
+#[skuld::test]
+fn a_standing_start_that_begins_during_an_unblock_is_cancelled_before_it_installs_anything() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let _release = tun_engine::routing::failclosed::begin_release(dir.path());
+
+        let err = pm.start(&test_config()).await.unwrap_err();
+
+        assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+        assert_eq!(st.install_calls.load(Ordering::SeqCst), 0, "no routes are installed");
     });
 }
 
@@ -3681,7 +3774,108 @@ mod self_test {
             assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
             assert_eq!(pm.last_error(), None, "a cancelled start records no failure");
             assert!(!pm.blocked_until_connected());
-            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                st.cover_engage_attempts.load(Ordering::SeqCst),
+                1,
+                "one attempt, refused by the release: a superseded start is not re-engaged"
+            );
+        });
+    }
+
+    // A release that overtakes a start --------------------------------------------------------------------------------
+
+    #[skuld::test]
+    fn an_unblock_that_lands_during_the_cover_install_cancels_the_start_and_drops_the_cover() {
+        rt().block_on(async {
+            for in_flight in [false, true] {
+                let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+                st.release_during_next_install(dir.path(), in_flight);
+
+                let err = pm
+                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                assert!(
+                    matches!(err, ProxyError::Cancelled),
+                    "in_flight={in_flight}: expected Cancelled, got {err:?}"
+                );
+                assert_eq!(pm.last_error(), None, "a cancelled start records no failure");
+                assert!(
+                    !pm.blocked_until_connected(),
+                    "the cover the release overtook is not held"
+                );
+                assert_eq!(
+                    st.cover_disengage_calls.load(Ordering::SeqCst),
+                    1,
+                    "in_flight={in_flight}: the cover this start installed is dropped"
+                );
+                assert_eq!(
+                    st.cover_engage_attempts.load(Ordering::SeqCst),
+                    1,
+                    "and the start does not engage again"
+                );
+                st.end_releases();
+            }
+        });
+    }
+
+    #[skuld::test]
+    fn a_start_that_begins_during_an_unblock_is_cancelled_before_it_installs_anything() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+            let _release = tun_engine::routing::failclosed::begin_release(dir.path());
+
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst), 0);
+            assert_eq!(st.install_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[skuld::test]
+    fn an_unblock_that_ended_before_the_start_began_does_not_cancel_it() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+            drop(tun_engine::routing::failclosed::begin_release(dir.path()));
+
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(
+                !matches!(err, ProxyError::Cancelled),
+                "a release that finished before this start began has nothing to do with it: {err:?}"
+            );
+            assert!(pm.blocked_until_connected(), "the covered start holds its cover");
+            assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[skuld::test]
+    fn an_unblock_that_lands_during_a_repairs_corrected_engage_is_not_followed_by_a_restore_engage() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _resolver, dir) = repair_setup().await;
+            let before = st.cover_engage_attempts.load(Ordering::SeqCst);
+            st.release_during_next_install(dir.path(), false);
+
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert!(!pm.blocked_until_connected());
+            assert_eq!(
+                st.cover_engage_attempts.load(Ordering::SeqCst) - before,
+                1,
+                "the corrected engage only: a start the release overtook does not restore the old cover"
+            );
         });
     }
 
@@ -4367,9 +4561,9 @@ mod self_test {
                 "the release stands: no cover is re-engaged"
             );
             assert_eq!(
-                st.cover_engage_calls.load(Ordering::SeqCst),
-                1,
-                "no restore engage after a release"
+                st.cover_engage_attempts.load(Ordering::SeqCst),
+                2,
+                "the first start's engage and the corrected one that was refused: no restore engage after a release"
             );
         });
     }

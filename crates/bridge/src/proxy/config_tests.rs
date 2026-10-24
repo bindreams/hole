@@ -439,21 +439,16 @@ fn a_cover_released_while_engaging_cancels_the_start() {
     );
 }
 
-/// `cancels_the_start` (what `start_inner` consults on an engage error whose
-/// text it keeps) and the `From` conversion (what the other call sites use)
-/// must agree.
+/// Only a release cancels a start; an error that merely mentions a state file does not.
 #[skuld::test]
-fn cancels_the_start_agrees_with_the_conversion() {
+fn an_error_that_is_not_a_release_does_not_cancel_the_start() {
     let path = std::path::PathBuf::from("bridge-routes.json");
-    let errors = [
+    for e in [
         tun_engine::RoutingError::RouteSetup("x".into()),
         tun_engine::RoutingError::StateUnreadable { path },
-        tun_engine::RoutingError::SupersededByRelease,
-    ];
-    for e in errors {
-        let cancels = e.cancels_the_start();
+    ] {
         let converted = ProxyError::from(e);
-        assert_eq!(cancels, matches!(converted, ProxyError::Cancelled), "{converted:?}");
+        assert!(!matches!(converted, ProxyError::Cancelled), "{converted:?}");
     }
 }
 
