@@ -151,6 +151,15 @@ pub(crate) mod platform;
 #[path = "failclosed/macos.rs"]
 mod platform;
 
+// The pf cover's sequencing (engage, back-out, release, recovery) runs over
+// injected `pfctl` and record seams, so its tests build on every host. This is
+// the same module as `platform` above, compiled a second time for test builds
+// on hosts that have no `pfctl`: a race between an engage and a release is
+// proved where the tests run, not only on the macOS legs.
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "failclosed/macos.rs"]
+mod pf_on_any_host;
+
 /// RAII guard for an engaged fail-closed cover. Dropping it disengages the
 /// cover (Windows: delete the WFP filters by GUID; macOS: restore
 /// `/etc/pf.conf` and drop the pf enable refcount). `Send` so the PR3 cutover

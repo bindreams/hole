@@ -189,7 +189,7 @@ pub fn holds(state_dir: &Path, token: &str) -> bool {
 /// Test-only unconditional write, for fixtures that need a record the engage
 /// paths would never produce (a deliberately broken one). Production writers
 /// go through [`swap`].
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 pub(crate) fn seed(state_dir: &Path, state: &FailClosedState) {
     let _guard = LOCK.acquire();
     save(state_dir, state, None).expect("seed the record");

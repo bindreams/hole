@@ -57,11 +57,18 @@
 //!   no dump of them), so both restore under pf defaults.
 //! - The `pfctl -E` token is parsed from stderr — its only exposure.
 
+// Test builds on other hosts compile this module to drive its sequencers; the
+// production `pfctl` entry points have no caller there.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::net::IpAddr;
 use std::path::Path;
 
-use super::super::{run_capturing, BestEffortPhase, FatalPhase, Phase};
+#[cfg(target_os = "macos")]
+use super::super::run_capturing;
+use super::super::{BestEffortPhase, FatalPhase, Phase};
 use crate::error::RoutingError;
+#[cfg(target_os = "macos")]
 use util::system_tool::SystemTool;
 // `macos.rs` is mounted as `mod platform` under `failclosed`, so `super` is the
 // `failclosed` module and `failclosed_state` is its sibling child.
@@ -389,9 +396,17 @@ fn engage_pf_action(pf_enabled: bool, has_persisted: bool) -> PfEngageAction {
 const PFCONF: &str = "/etc/pf.conf";
 
 /// Runs `pfctl` through [`SystemTool::Pfctl`] (absolute path).
+#[cfg(target_os = "macos")]
 fn pfctl<P: Phase>(args: &[&str], stdin: Option<&[u8]>, phase: P) -> Result<std::process::Output, RoutingError> {
     run_capturing(SystemTool::Pfctl, args, stdin, phase)
         .map_err(|e| RoutingError::RouteSetup(format!("pfctl spawn failed: {e}")))
+}
+
+/// Test builds on a host without `pfctl` drive every sequencer through its ops
+/// seam; reaching the real tool there is a test that forgot to inject one.
+#[cfg(not(target_os = "macos"))]
+fn pfctl<P: Phase>(_args: &[&str], _stdin: Option<&[u8]>, _phase: P) -> Result<std::process::Output, RoutingError> {
+    unreachable!("pfctl exists only on macOS; inject the ops seam")
 }
 
 /// `pfctl -E` (refcounted enable) + parse the enable token from its output. The
@@ -1824,6 +1839,6 @@ mod macos_release_race_tests;
 /// because they reach for [`Cover`]'s private `token` field and the private
 /// [`pfctl`] helper — and that is what descendance buys, not sharing a file
 /// with [`macos_tests`].
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 #[path = "macos_transition_tests.rs"]
 mod macos_transition_tests;

@@ -178,6 +178,7 @@ fn ruleset_resolver_pass_is_scoped_to_tcp_443_not_unrestricted() {
 ///
 /// Fails loudly on a missing or failing `pfctl`, never skips: a cover ruleset
 /// this host's own `pfctl` will not parse is a bug on its own terms.
+#[cfg(target_os = "macos")]
 fn pfctl_normalized(ruleset: &str) -> Vec<String> {
     use std::io::Write;
     use std::process::Stdio;
@@ -215,6 +216,7 @@ fn pfctl_normalized(ruleset: &str) -> Vec<String> {
 /// `ruleset` with the `no state` qualifier stripped from every permit that is
 /// not a loopback pass — the pre-fix shape of both cover rulesets, and the
 /// positive control for the assertion below.
+#[cfg(target_os = "macos")]
 fn without_permit_no_state(ruleset: &str) -> String {
     ruleset
         .lines()
@@ -249,6 +251,7 @@ fn without_permit_no_state(ruleset: &str) -> String {
 /// from it, so on the very regression this exists to catch — a permit that
 /// never carried `no state` — the strip is a no-op and a control-first order
 /// would report "the control proves nothing" over the real, named defect.
+#[cfg(target_os = "macos")]
 fn assert_no_permit_is_syn_only(ruleset: &str, what: &str) {
     let is_pass = |l: &&String| l.trim_start().starts_with("pass");
 
@@ -296,6 +299,7 @@ fn assert_no_permit_is_syn_only(ruleset: &str, what: &str) {
 /// caller's own `ech-doh` URL, typically a well-known public DoH address a
 /// browser on the same host already holds a TLS connection to, and the engage
 /// purges that connection's state host-wide.
+#[cfg(target_os = "macos")]
 #[skuld::test]
 fn transient_cover_permits_are_never_syn_only() {
     assert_no_permit_is_syn_only(&build_pf_ruleset(v4(), Some(resolver())), "the transient cover");
@@ -306,6 +310,7 @@ fn transient_cover_permits_are_never_syn_only() {
 /// already carrying traffic when the ruleset commits; on a stock macOS whose pf
 /// this engage's own `pfctl -E` enabled, those flows hold no state entry for
 /// [`purges_state`]'s non-purge to preserve.
+#[cfg(target_os = "macos")]
 #[skuld::test]
 fn lockdown_permits_are_never_syn_only() {
     assert_no_permit_is_syn_only(&build_lockdown_main_ruleset(TUN_IF, v4(), ""), "the standing lockdown");
@@ -460,9 +465,8 @@ fn a_live_presence_with_a_captured_snapshot_restores_it_and_drops_the_token() {
 // single place every status-bearing read goes through.
 
 fn exit_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
-    use std::os::unix::process::ExitStatusExt;
     std::process::Output {
-        status: std::process::ExitStatus::from_raw(if code == 0 { 0 } else { code << 8 }),
+        status: exit_status(if code == 0 { 0 } else { code << 8 }),
         stdout: stdout.as_bytes().to_vec(),
         stderr: stderr.as_bytes().to_vec(),
     }
@@ -746,9 +750,18 @@ fn restore_empty_nat_has_no_blank_line() {
 
 // restore_confirmed ===================================================================================================
 
-fn exit_status(code: i32) -> std::process::ExitStatus {
+/// A status from the host's raw encoding; only zero (success) and non-zero are
+/// read, so the two encodings need not agree on anything else.
+#[cfg(unix)]
+fn exit_status(raw: i32) -> std::process::ExitStatus {
     use std::os::unix::process::ExitStatusExt;
-    std::process::ExitStatus::from_raw(code)
+    std::process::ExitStatus::from_raw(raw)
+}
+
+#[cfg(windows)]
+fn exit_status(raw: i32) -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(raw as u32)
 }
 
 fn output_with_status(code: i32) -> Result<std::process::Output, RoutingError> {
@@ -1411,6 +1424,7 @@ fn a_failed_enable_capture_token_fails_the_engage_without_a_spurious_unwind() {
 /// rely on. Since the parse precedes the open, the failure here is identical
 /// under root: the test cannot go vacuous if it is ever run elevated, and it
 /// needs no `TUN`/`GLOBAL_NET_STATE` label and no root.
+#[cfg(target_os = "macos")]
 #[skuld::test]
 fn drop_refcount_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
     use tracing_subscriber::layer::{Layer, SubscriberExt};

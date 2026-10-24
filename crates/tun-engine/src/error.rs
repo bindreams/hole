@@ -62,7 +62,7 @@ impl RoutingError {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 impl RoutingError {
     /// A state file under `what` could not be written. The toast text names the
     /// error's kind only (`tempfile`'s error text names the path); the full
