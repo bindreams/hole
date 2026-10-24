@@ -614,3 +614,34 @@ fn live_tun_permit_holds_for_a_real_session_with_the_kill_switch_armed(
 ) {
     rt().block_on(run_live_tun_permit_session(dist, ss));
 }
+
+fn ack() -> Result<BridgeResponse, String> {
+    Ok(BridgeResponse::Ack)
+}
+
+#[skuld::test]
+fn a_release_where_every_step_acked_and_nothing_is_held_is_clean() {
+    assert_eq!(
+        release_defect(&[("Stop", &ack()), ("SetLockdown(false)", &ack())], None),
+        None
+    );
+}
+
+#[skuld::test]
+fn a_release_step_that_did_not_ack_is_a_defect_naming_the_step() {
+    let refused: Result<BridgeResponse, String> = Err("500".into());
+    let why = release_defect(&[("Stop", &ack()), ("SetLockdown(false)", &refused)], None)
+        .expect("a step that did not Ack is a defect");
+    assert!(why.contains("SetLockdown(false) did not Ack"), "{why}");
+    assert!(!why.contains("Stop did not Ack"), "{why}");
+}
+
+#[skuld::test]
+fn a_cover_still_held_after_both_steps_acked_is_a_defect() {
+    let why = release_defect(
+        &[("Stop", &ack()), ("SetLockdown(false)", &ack())],
+        Some("the lockdown cover".into()),
+    )
+    .expect("a held cover is a defect");
+    assert!(why.contains("the lockdown cover"), "{why}");
+}

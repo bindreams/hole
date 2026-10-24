@@ -516,9 +516,29 @@ fn an_uncovered_step_that_failed_during_an_outage_is_rerun_after_it() {
 }
 
 #[skuld::test]
-fn an_uncovered_step_that_failed_after_the_control_went_down_during_it_is_rerun() {
-    // The control answers at open and before the step (ticks 0, 1) and is down only after it (tick 2..4).
-    let net = Net::new(2..4, &[]);
+fn an_uncovered_step_that_failed_while_the_control_blinked_after_it_is_rerun() {
+    // The control answers at open and before the step (ticks 0, 1), is down for the probe after it (tick 2)
+    // and answers again by the time the judge asks, so only that bracketing probe shows the outage.
+    let net = Net::new(2..3, &[]);
+    let runs = Cell::new(0);
+    let out = uncovered_result(&net, &clean, async || {
+        runs.set(runs.get() + 1);
+        if runs.get() == 1 {
+            Err("Start did not Ack".to_string())
+        } else {
+            Ok("held")
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(runs.get(), 2);
+}
+
+#[skuld::test]
+fn an_uncovered_step_that_failed_while_the_control_blinked_before_it_is_rerun() {
+    // The control answers at open (tick 0), is down for the probe before the step (tick 1) and answers
+    // from then on, so only that bracketing probe shows the outage.
+    let net = Net::new(1..2, &[]);
     let runs = Cell::new(0);
     let out = uncovered_result(&net, &clean, async || {
         runs.set(runs.get() + 1);
