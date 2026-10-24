@@ -146,7 +146,7 @@ fn wire_form_pins_the_token_as_a_decimal_string() {
 }
 
 #[skuld::test]
-fn clear_removes_file() {
+fn remove_file_removes_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let state = PluginState {
         version: SCHEMA_VERSION,
@@ -154,14 +154,14 @@ fn clear_removes_file() {
     };
     save(dir.path(), &state, None).unwrap();
     assert!(dir.path().join(STATE_FILE_NAME).exists());
-    clear(dir.path()).unwrap();
+    remove_file(dir.path()).unwrap();
     assert!(!dir.path().join(STATE_FILE_NAME).exists());
 }
 
 #[skuld::test]
-fn clear_tolerates_missing_file() {
+fn remove_file_tolerates_a_missing_file() {
     let dir = tempfile::tempdir().unwrap();
-    clear(dir.path()).unwrap();
+    remove_file(dir.path()).unwrap();
 }
 
 #[skuld::test]
@@ -233,4 +233,114 @@ fn an_unreadable_append_writes_nothing_and_reports_the_error() {
         vec![first],
         "a failed read must write nothing: the prior record was dropped"
     );
+}
+
+// Concurrent writers ==================================================================================================
+
+fn loaded_plugins(dir: &std::path::Path) -> Vec<ProcessIdRecord> {
+    match load(dir) {
+        Loaded::State(s) => s.plugins,
+        other => panic!("expected a loadable state, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn append_holds_the_plugin_lock_across_load_and_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut held_inside = false;
+    append_record_with(dir.path(), synthetic(1, 1), None, || {
+        held_inside = lock_is_held();
+    })
+    .unwrap();
+    assert!(
+        held_inside,
+        "the load, the push and the save must be one critical section"
+    );
+    assert!(!lock_is_held(), "the lock is released on return");
+}
+
+#[skuld::test]
+fn remove_accounted_holds_the_plugin_lock_while_rewriting() {
+    let dir = tempfile::tempdir().unwrap();
+    append_record(dir.path(), synthetic(1, 1), None).unwrap();
+    let mut held_inside = false;
+    remove_accounted_with(dir.path(), &[synthetic(1, 1)], None, || {
+        held_inside = lock_is_held();
+    })
+    .unwrap();
+    assert!(held_inside);
+    assert!(!lock_is_held());
+}
+
+#[skuld::test]
+fn an_append_then_a_removal_keeps_the_appended_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir.path(), r1.clone(), None).unwrap();
+    append_record(dir.path(), r2.clone(), None).unwrap();
+    remove_accounted(dir.path(), &[r1], None).unwrap();
+    assert_eq!(loaded_plugins(dir.path()), vec![r2]);
+}
+
+#[skuld::test]
+fn a_removal_then_an_append_does_not_resurrect_the_removed_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir.path(), r1.clone(), None).unwrap();
+    remove_accounted(dir.path(), &[r1], None).unwrap();
+    assert!(
+        !dir.path().join(STATE_FILE_NAME).exists(),
+        "the file goes when no record remains"
+    );
+    append_record(dir.path(), r2.clone(), None).unwrap();
+    assert_eq!(loaded_plugins(dir.path()), vec![r2]);
+}
+
+#[skuld::test]
+fn remove_accounted_drops_exactly_the_accounted_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2, r3) = (synthetic(1, 1), synthetic(2, 2), synthetic(3, 3));
+    for r in [&r1, &r2, &r3] {
+        append_record(dir.path(), r.clone(), None).unwrap();
+    }
+    remove_accounted(dir.path(), &[r1, r3.clone()], None).unwrap();
+    assert_eq!(loaded_plugins(dir.path()), vec![r2.clone()]);
+
+    // A record the file does not hold is not an error and removes nothing.
+    remove_accounted(dir.path(), &[r3], None).unwrap();
+    assert_eq!(loaded_plugins(dir.path()), vec![r2]);
+}
+
+#[skuld::test]
+fn remove_accounted_over_an_absent_file_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    remove_accounted(dir.path(), &[synthetic(1, 1)], None).unwrap();
+    assert!(!dir.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
+fn remove_accounted_leaves_a_file_it_cannot_read_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    unreadable_fixture(dir.path());
+    remove_accounted(dir.path(), &[synthetic(1, 1)], None).expect_err("an unreadable file cannot be edited");
+    assert!(dir.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
+fn clear_if_unusable_clears_only_an_unusable_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(STATE_FILE_NAME), b"{not json").unwrap();
+    clear_if_unusable(dir.path()).unwrap();
+    assert!(!dir.path().join(STATE_FILE_NAME).exists());
+
+    append_record(dir.path(), synthetic(1, 1), None).unwrap();
+    clear_if_unusable(dir.path()).unwrap();
+    assert_eq!(
+        loaded_plugins(dir.path()),
+        vec![synthetic(1, 1)],
+        "a file that has become usable since the caller looked is not worthless"
+    );
+
+    let absent = tempfile::tempdir().unwrap();
+    clear_if_unusable(absent.path()).unwrap();
 }

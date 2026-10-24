@@ -4,7 +4,12 @@
 //! a plugin chain starts and reads it back on startup to reap processes leaked
 //! by a previous crashed run. Mirrors the `routing::state` crash-recovery
 //! pattern. `plugin_recovery` owns the reap and is the only component allowed
-//! to delete the file.
+//! to remove records from the file.
+//!
+//! Every read-modify-write of the file runs under [`LOCK`], an in-process leaf
+//! lock. Appends come from plugin spawns on tokio workers (a sink from an
+//! aborted attempt can outlive the attempt), the reap from the stop path; an
+//! unordered load/modify/save would lose a record or resurrect a reaped one.
 //!
 //! A record pairs the pid with the kernel's own start token, so a recycled pid
 //! never restores to the recorded process — see `cosca::identity`.
@@ -12,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tun_engine::exclusive::RecordLock;
 
 // Types ===============================================================================================================
 
@@ -47,6 +53,18 @@ pub enum Loaded {
     State(PluginState),
 }
 
+/// Serializes every read-modify-write of the state file in this process. A leaf
+/// lock ([`RecordLock`]): the sections below do file I/O and nothing else, and
+/// the reap's kills run outside it.
+static LOCK: RecordLock = RecordLock::new(());
+
+/// Whether a critical section is open right now. Tests use it to prove a
+/// section holds the lock, or that a slow call does not.
+#[cfg(test)]
+pub(crate) fn lock_is_held() -> bool {
+    LOCK.try_acquire().is_none()
+}
+
 fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
 }
@@ -54,8 +72,9 @@ fn state_file(state_dir: &Path) -> PathBuf {
 // I/O =================================================================================================================
 
 /// Write `state` to `<state_dir>/bridge-plugins.json` atomically.
-/// Same atomic-write pattern as `routing::state::write`.
-pub fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+/// Same atomic-write pattern as `routing::state::write`. Private: a write
+/// outside [`LOCK`] could lose a concurrent append.
+fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     util::ownership::chown_if_some(state_dir, owner);
 
@@ -71,18 +90,33 @@ pub fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) ->
 }
 
 /// Append a single record to the state file. Creates the file if missing.
-/// Reads existing records, merges, atomically writes the result.
+/// Reads existing records, merges, atomically writes the result, all under
+/// [`LOCK`].
 pub fn append_record(
     state_dir: &Path,
     record: cosca::identity::ProcessIdRecord,
     owner: Option<(u32, u32)>,
 ) -> std::io::Result<()> {
-    append_loaded(load(state_dir), state_dir, record, owner)
+    append_record_with(state_dir, record, owner, || {})
 }
 
-/// The append's dispositions, over an already-loaded state. Taking `Loaded` by
-/// value makes every arm drivable from a test without a fixture that has to
-/// defeat a real `fs::read`.
+/// [`append_record`] with a hook that runs inside the critical section,
+/// between the load and the save.
+fn append_record_with(
+    state_dir: &Path,
+    record: cosca::identity::ProcessIdRecord,
+    owner: Option<(u32, u32)>,
+    in_section: impl FnOnce(),
+) -> std::io::Result<()> {
+    let _guard = LOCK.acquire();
+    let loaded = load(state_dir);
+    in_section();
+    append_loaded(loaded, state_dir, record, owner)
+}
+
+/// The append's dispositions, over an already-loaded state (read under
+/// [`LOCK`] by the caller). Taking `Loaded` by value makes every arm drivable
+/// from a test without a fixture that has to defeat a real `fs::read`.
 ///
 /// Called at plugin spawn, where a file that will not parse is already dead
 /// weight, so `Absent` and `Unusable` both start a fresh state. A file that
@@ -135,10 +169,60 @@ pub fn load(state_dir: &Path) -> Loaded {
     }
 }
 
-/// Delete the state file. Tolerates a missing file.
-pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    let path = state_file(state_dir);
-    match std::fs::remove_file(&path) {
+/// Remove exactly the `accounted` records, deleting the file when none remain.
+///
+/// The caller loaded the file earlier and settled those records (killed, gone,
+/// or unrestorable here); the file may have grown since, and what grew is not
+/// the caller's to touch. A file that is absent or has become unusable holds
+/// nothing to remove.
+pub(crate) fn remove_accounted(
+    state_dir: &Path,
+    accounted: &[cosca::identity::ProcessIdRecord],
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<()> {
+    remove_accounted_with(state_dir, accounted, owner, || {})
+}
+
+/// [`remove_accounted`] with a hook that runs inside the critical section,
+/// between the load and the write.
+fn remove_accounted_with(
+    state_dir: &Path,
+    accounted: &[cosca::identity::ProcessIdRecord],
+    owner: Option<(u32, u32)>,
+    in_section: impl FnOnce(),
+) -> std::io::Result<()> {
+    let _guard = LOCK.acquire();
+    let loaded = load(state_dir);
+    in_section();
+    let mut state = match loaded {
+        Loaded::State(state) => state,
+        Loaded::Unreadable(e) => return Err(e),
+        Loaded::Absent | Loaded::Unusable => return Ok(()),
+    };
+    let before = state.plugins.len();
+    state.plugins.retain(|r| !accounted.contains(r));
+    if state.plugins.is_empty() {
+        return remove_file(state_dir);
+    }
+    if state.plugins.len() == before {
+        return Ok(());
+    }
+    save(state_dir, &state, owner)
+}
+
+/// Delete the state file iff it is still unusable. The caller classified it
+/// earlier; an append may have rewritten it with live records since.
+pub(crate) fn clear_if_unusable(state_dir: &Path) -> std::io::Result<()> {
+    let _guard = LOCK.acquire();
+    match load(state_dir) {
+        Loaded::Unusable => remove_file(state_dir),
+        Loaded::Absent | Loaded::Unreadable(_) | Loaded::State(_) => Ok(()),
+    }
+}
+
+/// Delete the state file. Tolerates a missing file. Callers hold [`LOCK`].
+fn remove_file(state_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(state_file(state_dir)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),

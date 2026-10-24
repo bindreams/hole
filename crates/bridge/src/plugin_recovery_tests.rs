@@ -265,3 +265,98 @@ fn an_accounted_record_after_an_unaccounted_one_still_keeps_the_file() {
         "one unaccounted record keeps the file however many accounted ones follow it"
     );
 }
+
+// Concurrent writers ==================================================================================================
+
+/// An inert record that names no process on any host.
+fn synthetic_record(pid: u32) -> cosca::identity::ProcessIdRecord {
+    cosca::identity::ProcessIdRecord {
+        version: cosca::identity::RECORD_VERSION,
+        platform: cosca::identity::Platform::Windows,
+        pid,
+        token: u64::from(pid),
+        boot_id: None,
+        pid_ns: None,
+    }
+}
+
+fn recorded(dir: &Path) -> Vec<cosca::identity::ProcessIdRecord> {
+    match plugin_state::load(dir) {
+        plugin_state::Loaded::State(s) => s.plugins,
+        other => panic!("expected a loadable state file, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn a_record_appended_while_the_reap_kills_survives_the_clear() {
+    // A plugin attempt that was aborted can still be appending its record while
+    // the next stop reaps. The append lands between the reap's load and its
+    // removal; the removal must take only what the reap accounted for.
+    let dir = tempfile::tempdir().unwrap();
+    let reaped = seed_state_file(dir.path());
+    let late = synthetic_record(7777);
+    let state = plugin_state::PluginState {
+        version: plugin_state::SCHEMA_VERSION,
+        plugins: vec![reaped],
+    };
+
+    reap_loaded_with(plugin_state::Loaded::State(state), dir.path(), real_restore, |_| {
+        assert!(
+            !plugin_state::lock_is_held(),
+            "a kill can wait on the OS, so it must not run under the record lock"
+        );
+        plugin_state::append_record(dir.path(), late.clone(), None).unwrap();
+        Ok(())
+    });
+
+    assert_eq!(recorded(dir.path()), vec![late]);
+}
+
+#[skuld::test]
+fn an_unusable_file_rewritten_by_an_append_is_not_cleared() {
+    // The reap classified the file as worthless; before it acts, an append
+    // rewrites it with a live record.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(plugin_state::STATE_FILE_NAME), b"{not json").unwrap();
+    let appended = synthetic_record(8888);
+    plugin_state::append_record(dir.path(), appended.clone(), None).unwrap();
+
+    reap_loaded(plugin_state::Loaded::Unusable, dir.path());
+
+    assert_eq!(recorded(dir.path()), vec![appended]);
+}
+
+#[skuld::test]
+fn a_reap_that_cannot_account_for_a_record_keeps_that_record_and_removes_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    // Records that restore on every host (the fixture's own identity) but name
+    // no live process; the kill is injected.
+    let template = cosca::identity::ProcessId::current()
+        .to_record()
+        .expect("persist this process's identity");
+    let unaccounted = cosca::identity::ProcessIdRecord {
+        pid: 4242,
+        ..template.clone()
+    };
+    let accounted = cosca::identity::ProcessIdRecord { pid: 4243, ..template };
+    plugin_state::append_record(dir.path(), unaccounted.clone(), None).unwrap();
+    plugin_state::append_record(dir.path(), accounted.clone(), None).unwrap();
+    let state = plugin_state::PluginState {
+        version: plugin_state::SCHEMA_VERSION,
+        plugins: vec![unaccounted.clone(), accounted],
+    };
+
+    reap_loaded_with(plugin_state::Loaded::State(state), dir.path(), real_restore, |id| {
+        if id.pid() == 4242 {
+            Err(unassessable())
+        } else {
+            Ok(())
+        }
+    });
+
+    assert_eq!(
+        recorded(dir.path()),
+        vec![unaccounted],
+        "the next start retries only the record this reap could not settle"
+    );
+}

@@ -9,10 +9,11 @@
 // plugin-chain stop (`PluginChain::kill_tracked`), and the test harness's
 // teardown.
 //
-// The invariant this exists to hold: the state file may be deleted only by a
-// component that has just accounted for every record it contains. Deleting it
-// after a failed load would forget plugins that are still running, and they
-// hold a server connection and a local port forever.
+// The invariant this exists to hold: a record may be removed only by the
+// component that accounted for it, and the file goes when none remain. Removing
+// a record after a failed load would forget a plugin that is still running, and
+// it holds a server connection and a local port forever. A record appended
+// while the reap ran is not one it accounted for, so it stays.
 //
 // Best-effort — errors are logged, nothing unwinds. `Drop` in the test harness
 // calls this, and a panic there while a test is already unwinding would abort
@@ -22,7 +23,8 @@ use crate::plugin_state::{self, Loaded};
 use cosca::identity::{ProcessId, Resolved};
 use std::path::Path;
 
-/// Kill every plugin process recorded under `state_dir`, then clear the record.
+/// Kill every plugin process recorded under `state_dir`, then remove the records
+/// that were accounted for.
 pub fn reap_recorded_plugins(state_dir: &Path) {
     reap_loaded(plugin_state::load(state_dir), state_dir);
 }
@@ -64,14 +66,15 @@ pub(crate) fn reap_loaded_with(
                 path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
                 "plugin state file is not usable at this schema; discarding it and accepting a one-time orphan leak"
             );
-            clear_or_log(state_dir);
+            clear_unusable_or_log(state_dir);
             return;
         }
         Loaded::State(state) => state,
     };
 
-    // The file may be deleted only once every record in it is accounted for:
-    // killed, provably gone, or provably unrestorable on this host.
+    // A record is removed only once it is accounted for: killed, provably gone,
+    // or provably unrestorable on this host. Kills run outside the state lock.
+    let mut accounted = Vec::new();
     let mut all_accounted = true;
     for record in &state.plugins {
         let id = match restore(record) {
@@ -84,6 +87,7 @@ pub(crate) fn reap_loaded_with(
                     error = %util::error_chain::error_chain(&e),
                     "recorded plugin identity cannot be restored on this host; nothing here can name it"
                 );
+                accounted.push(record.clone());
                 continue;
             }
             Err(e) => {
@@ -108,12 +112,15 @@ pub(crate) fn reap_loaded_with(
         // misroute a kill — the kill is cosca's own identity-checked call.
         let observation = observe(id);
         match kill(id) {
-            Ok(()) => tracing::info!(
-                pid = record.pid,
-                token = record.token,
-                observation,
-                "reaped recorded plugin"
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    pid = record.pid,
+                    token = record.token,
+                    observation,
+                    "reaped recorded plugin"
+                );
+                accounted.push(record.clone());
+            }
             // Unaccounted: cosca fails a kill only for a target it could not
             // open or assess, i.e. exactly when it may still be running.
             Err(e) => {
@@ -129,12 +136,13 @@ pub(crate) fn reap_loaded_with(
         }
     }
 
-    if all_accounted {
-        clear_or_log(state_dir);
-    } else {
+    if let Err(e) = plugin_state::remove_accounted(state_dir, &accounted, None) {
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to remove reaped records from the plugin state file");
+    }
+    if !all_accounted {
         tracing::warn!(
             path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
-            "keeping the plugin state file: a record could not be accounted for"
+            "keeping the unaccounted records in the plugin state file for the next start"
         );
     }
 }
@@ -169,8 +177,8 @@ fn settles_the_record(e: &cosca::error::Error) -> bool {
 
 /// A dropped `clear` failure leaves the file in place forever, which is the
 /// same litter bug one layer down — so state the disposition at every call.
-fn clear_or_log(state_dir: &Path) {
-    if let Err(e) = plugin_state::clear(state_dir) {
+fn clear_unusable_or_log(state_dir: &Path) {
+    if let Err(e) = plugin_state::clear_if_unusable(state_dir) {
         tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear plugin state file");
     }
 }
