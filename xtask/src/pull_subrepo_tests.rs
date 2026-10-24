@@ -1,8 +1,10 @@
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
-use std::process::Command;
+use std::process::{Command, Output};
 
-use super::pull_subrepo::test_support::{git, git_output, install_rejecting_pre_commit_hook, ConflictKind, Fixture};
-use super::pull_subrepo::{self, Outcome};
+use super::pull_subrepo::test_support::{
+    git, git_output, install_rejecting_pre_commit_hook, Conflict, ConflictKind, Fixture,
+};
+use super::pull_subrepo::{self, Outcome, PullRecord, StaleParentRetry};
 
 #[skuld::test]
 fn clean_pull_on_the_very_first_attempt_from_a_plain_checkout() {
@@ -11,7 +13,126 @@ fn clean_pull_on_the_very_first_attempt_from_a_plain_checkout() {
     // test also corrupts the parent or dirties the tree first.
     let fx = Fixture::build(ConflictKind::None);
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean));
+    outcome.expect_clean();
+}
+#[skuld::test]
+fn a_clean_outcome_carries_the_pull_that_produced_it() {
+    let fx = Fixture::build(ConflictKind::None);
+    let clean = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("pull should succeed")
+        .expect_clean();
+    // git-subrepo exits 0 for a merge that applied without conflicts.
+    assert_eq!(clean.pull.exit_code, Some(0), "{clean:?}");
+    // git-subrepo prints its success line on stdout.
+    assert!(clean.pull.stdout.contains("pulled from"), "{clean:?}");
+    assert!(clean.stale_parent_retry.is_none(), "{clean:?}");
+    assert!(clean.auto_resolved.is_empty(), "{clean:?}");
+}
+#[skuld::test]
+fn a_clean_outcome_after_auto_resolving_carries_the_failed_merge_and_the_paths_it_resolved() {
+    // The pull itself exits 1 when `git merge` stops on the go.mod conflict;
+    // `Clean` is only reached by `handle_conflict` resolving it afterwards,
+    // so the record must be the pull that reported the conflict.
+    let fx = Fixture::build(ConflictKind::Allowlisted);
+    let clean = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("pull should succeed")
+        .expect_clean();
+    assert_eq!(clean.pull.exit_code, Some(1), "{clean:?}");
+    assert!(clean.pull.stdout.contains("go.mod"), "{clean:?}");
+    assert!(clean.auto_resolved.contains(&"go.mod".to_string()), "{clean:?}");
+    assert!(format!("{clean:?}").contains("go.mod"), "{clean:?}");
+}
+#[skuld::test]
+fn a_pull_record_holds_the_exit_code_and_both_streams_of_the_output() {
+    let record = PullRecord::from_output(&Output {
+        status: exit_status(3),
+        stdout: b"OUT".to_vec(),
+        stderr: b"ERR".to_vec(),
+    });
+    assert_eq!(record.exit_code, Some(3));
+    assert_eq!(record.stdout, "OUT");
+    assert_eq!(record.stderr, "ERR");
+}
+#[skuld::test]
+fn debug_of_a_pull_record_prints_the_streams_with_real_line_breaks() {
+    let record = PullRecord {
+        exit_code: Some(3),
+        stdout: "OUT1\nOUT2".to_string(),
+        stderr: "ERR1\nERR2".to_string(),
+    };
+    let shown = format!("{record:?}");
+    assert!(shown.contains("exit code: 3"), "{shown}");
+    assert!(shown.contains("OUT1\nOUT2"), "{shown}");
+    assert!(shown.contains("ERR1\nERR2"), "{shown}");
+}
+#[skuld::test]
+fn debug_of_a_pull_record_without_an_exit_code_says_so() {
+    let record = PullRecord {
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+    };
+    assert!(format!("{record:?}").contains("signal"), "{record:?}");
+}
+#[skuld::test]
+fn debug_of_an_outcome_shows_every_field_with_real_line_breaks() {
+    let clean = Outcome::Clean {
+        pull: PullRecord {
+            exit_code: Some(0),
+            stdout: "OUT1\nOUT2".to_string(),
+            stderr: String::new(),
+        },
+        stale_parent_retry: Some(StaleParentRetry {
+            fixup_commit: "FIXUP".to_string(),
+            failed_pull: PullRecord {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "FAILED1\nFAILED2".to_string(),
+            },
+        }),
+        auto_resolved: vec!["AUTO".to_string()],
+    };
+    let shown = format!("{clean:?}");
+    for field in ["OUT1\nOUT2", "FIXUP", "FAILED1\nFAILED2", "AUTO"] {
+        assert!(shown.contains(field), "{field} missing from {shown}");
+    }
+
+    let conflicted = Outcome::Conflicted {
+        worktree: "WT".into(),
+        unresolved: vec!["UNRES".to_string()],
+        auto_resolved: vec!["AUTO".to_string()],
+        fixup_commit: Some("FIXUP".to_string()),
+    };
+    let shown = format!("{conflicted:?}");
+    for field in ["WT", "UNRES", "AUTO", "FIXUP"] {
+        assert!(shown.contains(field), "{field} missing from {shown}");
+    }
+}
+#[skuld::test]
+fn the_pull_record_keeps_git_subreps_messages_when_the_environment_asks_it_to_be_quiet() {
+    // git-subrepo's `say()` prints nothing under `GIT_SUBREPO_QUIET`, and a CI runner or a
+    // developer's shell may export it. Nothing but the pull_subrepo tests sets it, so no lock.
+    let fx = Fixture::build(ConflictKind::None);
+    let saved = std::env::var_os("GIT_SUBREPO_QUIET");
+    unsafe { std::env::set_var("GIT_SUBREPO_QUIET", "1") };
+    let result = pull_subrepo::run(&fx.downstream, "vendor", "v2");
+    match saved {
+        Some(v) => unsafe { std::env::set_var("GIT_SUBREPO_QUIET", v) },
+        None => unsafe { std::env::remove_var("GIT_SUBREPO_QUIET") },
+    }
+    let clean = result.expect("pull should succeed").expect_clean();
+    assert!(clean.pull.stdout.contains("pulled from"), "{clean:?}");
+}
+
+#[cfg(windows)]
+fn exit_status(code: u32) -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code)
+}
+#[cfg(unix)]
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code << 8)
 }
 #[skuld::test]
 fn clean_pull_after_squash_merge_auto_fixes_stale_parent() {
@@ -32,8 +153,21 @@ fn clean_pull_after_squash_merge_auto_fixes_stale_parent() {
     );
     assert!(String::from_utf8_lossy(&raw.stderr).contains("is not an ancestor"));
 
-    let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    assert!(matches!(outcome, Outcome::Clean));
+    let clean = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("pull should succeed")
+        .expect_clean();
+
+    // The result is the retry's pull, and it keeps the failed pull and the fixup that led to it.
+    assert_eq!(clean.pull.exit_code, Some(0), "{clean:?}");
+    let retry = clean.stale_parent_retry.as_ref().expect("a stale-parent retry");
+    assert_ne!(retry.failed_pull.exit_code, Some(0), "{clean:?}");
+    assert!(retry.failed_pull.stderr.contains("is not an ancestor"), "{clean:?}");
+    // The fixup commit realigns `.gitrepo` and nothing else.
+    let touched = git_output(
+        &fx.downstream,
+        &["show", "--name-only", "--format=", &retry.fixup_commit],
+    );
+    assert_eq!(touched.trim(), "vendor/.gitrepo", "{clean:?}");
 
     let patched = std::fs::read_to_string(fx.downstream.join("vendor/patched.txt")).unwrap();
     assert!(
@@ -50,7 +184,7 @@ fn refuses_to_run_when_a_conflict_resolution_is_already_in_progress() {
 
     let first = pull_subrepo::run(&fx.downstream, "vendor", "v2")
         .expect("first conflicted run should report Conflicted, not Err");
-    assert!(matches!(first, Outcome::Conflicted { .. }));
+    first.expect_conflicted();
 
     // Simulate the human being mid-resolution: the worktree pull_subrepo::run
     // left behind still has unmerged patched.txt in it. Running again
@@ -58,11 +192,8 @@ fn refuses_to_run_when_a_conflict_resolution_is_already_in_progress() {
     // clean` it out from under them — `git subrepo clean` skips
     // git-subrepo's own working-copy-clean guard, so it would otherwise
     // delete their in-progress resolution with no confirmation.
-    let result = pull_subrepo::run(&fx.downstream, "vendor", "v2");
-    assert!(
-        result.is_err(),
-        "must refuse rather than silently discard an in-progress resolution"
-    );
+    let _err = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect_err("must refuse rather than silently discard an in-progress resolution");
 
     // The conflict markers must still be there — proving nothing got wiped.
     let worktree = fx.dir.path().join("downstream/.git/tmp/subrepo/vendor");
@@ -77,8 +208,7 @@ fn dirty_tree_is_rejected_before_touching_anything() {
     let fx = Fixture::build(ConflictKind::None);
     std::fs::write(fx.downstream.join("README.md"), "dirty\n").unwrap();
 
-    let result = pull_subrepo::run(&fx.downstream, "vendor", "v2");
-    assert!(result.is_err(), "a dirty tree must be rejected up front");
+    let _err = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect_err("a dirty tree must be rejected up front");
 
     let readme = std::fs::read_to_string(fx.downstream.join("README.md")).unwrap();
     assert_eq!(readme, "dirty\n", "the dirty file must be untouched");
@@ -91,7 +221,7 @@ fn works_identically_from_a_linked_worktree() {
 
     let outcome =
         pull_subrepo::run(&worktree_path, "vendor", "v2").expect("pull should succeed from a linked worktree");
-    assert!(matches!(outcome, Outcome::Clean));
+    outcome.expect_clean();
 }
 #[skuld::test]
 fn leftover_subrepo_branch_from_a_manual_pull_does_not_block_a_later_pull() {
@@ -111,17 +241,15 @@ fn leftover_subrepo_branch_from_a_manual_pull_does_not_block_a_later_pull() {
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2")
         .expect("a leftover branch from a completed pull must not block a later pull");
-    assert!(matches!(outcome, Outcome::Clean));
+    outcome.expect_clean();
 }
 #[skuld::test]
 fn ref_unsafe_subdir_is_rejected_before_touching_anything() {
     let fx = Fixture::build(ConflictKind::None);
     let before_head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
 
-    let err = match pull_subrepo::run(&fx.downstream, "some vendor", "v2") {
-        Err(e) => e,
-        Ok(_) => panic!("a subdir needing percent-encoding must be rejected up front"),
-    };
+    let err = pull_subrepo::run(&fx.downstream, "some vendor", "v2")
+        .expect_err("a subdir needing percent-encoding must be rejected up front");
     assert!(
         format!("{err:#}").contains("check-ref-format"),
         "error should name the actual cause: {err:#}"
@@ -138,7 +266,7 @@ fn trailing_slash_subdir_still_pulls_cleanly() {
     // before building worktree/branch paths from `subdir`.
     let fx = Fixture::build(ConflictKind::None);
     let outcome = pull_subrepo::run(&fx.downstream, "vendor/", "v2").expect("a trailing slash must not be rejected");
-    assert!(matches!(outcome, Outcome::Clean));
+    outcome.expect_clean();
 }
 #[skuld::test]
 fn up_to_date_pull_still_realigns_the_branch_pin() {
@@ -147,13 +275,13 @@ fn up_to_date_pull_still_realigns_the_branch_pin() {
     // untouched — Outcome::Clean must still mean the tag pin is current.
     let fx = Fixture::build(ConflictKind::None);
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("first pull to v2 should succeed");
-    assert!(matches!(outcome, Outcome::Clean));
+    outcome.expect_clean();
 
     let upstream = fx.dir.path().join("upstream");
     git(&upstream, &["tag", "v3", "v2"]);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v3").expect("re-tag pull to v3 should succeed");
-    assert!(matches!(outcome, Outcome::Clean));
+    outcome.expect_clean();
 
     let gitrepo = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
     assert!(
@@ -179,11 +307,8 @@ fn untracked_file_inside_subdir_colliding_with_upstream_is_rejected_before_touch
     std::fs::write(fx.downstream.join("vendor/newfile.txt"), "untracked local content\n").unwrap();
 
     let before_head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
-    let result = pull_subrepo::run(&fx.downstream, "vendor", "v2");
-    assert!(
-        result.is_err(),
-        "an untracked file colliding with upstream must be rejected up front"
-    );
+    let _err = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect_err("an untracked file colliding with upstream must be rejected up front");
 
     let after_head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
     assert_eq!(before_head, after_head, "nothing should be committed on rejection");
@@ -201,7 +326,7 @@ fn leading_dot_slash_subdir_normalizes_and_pulls_cleanly() {
     // collapse against, so this test covers only the leading `./` form.
     let fx = Fixture::build(ConflictKind::None);
     let outcome = pull_subrepo::run(&fx.downstream, "./vendor", "v2").expect("a leading ./ must not be rejected");
-    assert!(matches!(outcome, Outcome::Clean));
+    outcome.expect_clean();
 }
 #[skuld::test]
 fn stale_parent_fixup_commit_is_disclosed_when_the_retry_still_conflicts() {
@@ -219,21 +344,35 @@ fn stale_parent_fixup_commit_is_disclosed_when_the_retry_still_conflicts() {
     // HEAD at this point is exactly the fixup commit fix_stale_parent made.
     let fixup_commit = git_output(&fx.downstream, &["rev-parse", "HEAD"]).trim().to_string();
 
-    match outcome {
-        Outcome::Conflicted {
-            unresolved,
-            fixup_commit: disclosed,
-            ..
-        } => {
-            assert_eq!(unresolved, vec!["patched.txt".to_string()]);
-            assert_eq!(
-                disclosed.as_deref(),
-                Some(fixup_commit.as_str()),
-                "the fixup commit must be disclosed in Outcome::Conflicted"
-            );
-        }
-        Outcome::Clean => panic!("expected a real conflict on patched.txt to survive"),
-    }
+    let Conflict {
+        unresolved,
+        fixup_commit: disclosed,
+        ..
+    } = outcome.expect_conflicted();
+    assert_eq!(unresolved, vec!["patched.txt".to_string()]);
+    assert_eq!(
+        disclosed.as_deref(),
+        Some(fixup_commit.as_str()),
+        "the fixup commit must be disclosed in Outcome::Conflicted"
+    );
+}
+#[skuld::test]
+fn a_clean_outcome_after_a_stale_parent_fixup_and_an_auto_resolve_carries_all_three() {
+    let fx = Fixture::build(ConflictKind::Allowlisted);
+    fx.corrupt_parent();
+    let clean = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("pull should succeed")
+        .expect_clean();
+    // The retried pull is the one that reported the go.mod conflict.
+    assert_eq!(clean.pull.exit_code, Some(1), "{clean:?}");
+    assert!(clean.auto_resolved.contains(&"go.mod".to_string()), "{clean:?}");
+    let retry = clean.stale_parent_retry.as_ref().expect("a stale-parent retry");
+    assert!(retry.failed_pull.stderr.contains("is not an ancestor"), "{clean:?}");
+    let touched = git_output(
+        &fx.downstream,
+        &["show", "--name-only", "--format=", &retry.fixup_commit],
+    );
+    assert_eq!(touched.trim(), "vendor/.gitrepo", "{clean:?}");
 }
 #[skuld::test]
 fn stale_parent_fixup_add_commit_failure_is_disclosed() {
@@ -245,10 +384,8 @@ fn stale_parent_fixup_add_commit_failure_is_disclosed() {
     fx.corrupt_parent();
     install_rejecting_pre_commit_hook(&fx.downstream);
 
-    let err = match pull_subrepo::run(&fx.downstream, "vendor", "v2") {
-        Err(e) => e,
-        Ok(_) => panic!("expected the blocked fixup commit to surface as an error"),
-    };
+    let err = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect_err("expected the blocked fixup commit to surface as an error");
     let message = format!("{err:#}");
     assert!(
         message.contains("already modified and staged to realign `parent`"),
@@ -271,14 +408,12 @@ fn tag_pin_realignment_commit_failure_after_a_plain_pull_discloses_both_layers()
     git(&upstream, &["tag", "v3", "v2"]);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("first pull to v2 should succeed");
-    assert!(matches!(outcome, Outcome::Clean));
+    outcome.expect_clean();
 
     install_rejecting_pre_commit_hook(&fx.downstream);
 
-    let err = match pull_subrepo::run(&fx.downstream, "vendor", "v3") {
-        Err(e) => e,
-        Ok(_) => panic!("expected the blocked tag-pin realignment commit to surface as an error"),
-    };
+    let err = pull_subrepo::run(&fx.downstream, "vendor", "v3")
+        .expect_err("expected the blocked tag-pin realignment commit to surface as an error");
     let message = format!("{err:#}");
     assert!(
         message.contains("already succeeded"),
@@ -311,11 +446,9 @@ fn a_branch_with_unfolded_work_is_rejected_even_though_the_worktree_is_gone() {
     git(&worktree, &["commit", "-m", "resolve conflict"]);
     std::fs::remove_dir_all(&worktree).unwrap();
 
-    let result = pull_subrepo::run(&fx.downstream, "vendor", "v2");
-    assert!(
-        result.is_err(),
+    let _err = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect_err(
         "a branch carrying an un-folded-in resolution commit must be refused even once its \
-         worktree is gone"
+         worktree is gone",
     );
 }
 
@@ -393,6 +526,6 @@ fn a_tag_upstream_does_not_have_is_not_retried() {
 fn a_nonexistent_tag_stops_the_run_at_the_fetch_phase() {
     let fx = Fixture::build(ConflictKind::None);
     let result = pull_subrepo::run(&fx.downstream, "vendor", "this-tag-does-not-exist");
-    let err = result.err().expect("a nonexistent tag must be an error");
+    let err = result.expect_err("a nonexistent tag must be an error");
     assert!(format!("{err:#}").contains("does not exist upstream"), "{err:#}");
 }

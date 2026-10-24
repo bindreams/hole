@@ -645,7 +645,7 @@ fn always_run_hazard_end_to_end_clean_path() {
 
     let outcome = pull_subrepo::run(&downstream, "crates/ex-ray/third_party/widget", "v1.1.0")
         .expect("pull-subrepo's own intermediate commits must succeed despite the always-failing hook");
-    assert!(matches!(outcome, pull_subrepo::Outcome::Clean), "expected a clean pull");
+    outcome.expect_clean();
 
     let identity = finish_vendor_bump::run(&downstream, "crates/ex-ray/third_party/widget", "widget", "v1.1.0")
         .expect("finish-vendor-bump's own commits must succeed despite the always-failing hook");
@@ -687,10 +687,7 @@ fn always_run_hazard_end_to_end_conflicted_path() {
 
     let outcome = pull_subrepo::run(&downstream, "crates/ex-ray/third_party/widget", "v1.1.0")
         .expect("a real conflict is a reported Outcome, not an Err, even with the hook installed");
-    assert!(
-        matches!(outcome, pull_subrepo::Outcome::Conflicted { .. }),
-        "expected a real conflict"
-    );
+    outcome.expect_conflicted();
 
     pull_subrepo::force_commit_conflicted(&downstream, "crates/ex-ray/third_party/widget", "v1.1.0").expect(
         "force_commit_conflicted's and handle_conflict's own finishing commits must succeed despite the \

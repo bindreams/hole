@@ -629,7 +629,7 @@ pub fn run_provision_upstream_v2ray() -> Result<()> {
 pub fn run_pull_subrepo(path: String, tag: String) -> Result<()> {
     let repo_root = repo_root()?;
     match pull_subrepo::run(&repo_root, &path, &tag)? {
-        pull_subrepo::Outcome::Clean => {
+        pull_subrepo::Outcome::Clean { .. } => {
             println!("xtask: pulled {path} to {tag} cleanly");
             Ok(())
         }

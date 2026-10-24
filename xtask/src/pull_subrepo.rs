@@ -11,6 +11,7 @@
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -29,12 +30,21 @@ pub(crate) mod test_support;
 
 pub use conflict::force_commit_conflicted;
 
+#[derive(Debug)]
 pub enum Outcome {
     /// Pull succeeded (cleanly, or after auto-resolving only the
     /// documented-safe allowlist). Usually a new commit updating `<subdir>`
     /// now sits on HEAD; if `<subdir>` was already at `tag`, `git subrepo
-    /// pull` is a no-op and HEAD is unchanged instead.
-    Clean,
+    /// pull` is a no-op and HEAD is unchanged instead. `pull` is the `git
+    /// subrepo pull` behind this result (after an auto-resolved conflict, the
+    /// pull that reported it); `stale_parent_retry` is set when that pull was
+    /// a retry, and `auto_resolved` lists the paths this module resolved to
+    /// upstream.
+    Clean {
+        pull: PullRecord,
+        stale_parent_retry: Option<StaleParentRetry>,
+        auto_resolved: Vec<String>,
+    },
     /// A conflict remains outside the safe allowlist. The pull attempt
     /// itself committed nothing to the caller's branch. `unresolved`'s
     /// paths are left in the temp merge worktree exactly as `git merge`
@@ -57,6 +67,48 @@ pub enum Outcome {
     },
 }
 
+/// What one `git subrepo pull` did. Its `Debug` prints the streams with real
+/// line breaks, so a test failure formatting an `Outcome` shows them readably.
+#[derive(Clone)]
+pub struct PullRecord {
+    /// `None` when the process was terminated by a signal.
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl PullRecord {
+    pub(crate) fn from_output(pull: &Output) -> Self {
+        Self {
+            exit_code: pull.status.code(),
+            stdout: String::from_utf8_lossy(&pull.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&pull.stderr).into_owned(),
+        }
+    }
+}
+
+impl fmt::Debug for PullRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = self
+            .exit_code
+            .map_or_else(|| "none (terminated by a signal)".to_string(), |c| c.to_string());
+        write!(
+            f,
+            "\ngit subrepo pull exit code: {code}\nstdout:\n{}\nstderr:\n{}",
+            self.stdout, self.stderr
+        )
+    }
+}
+
+/// The stale-parent recovery behind a pull: the pull that failed with "is not
+/// an ancestor", and the commit that realigned `.gitrepo`'s `parent` before
+/// the retry.
+#[derive(Debug, Clone)]
+pub struct StaleParentRetry {
+    pub fixup_commit: String,
+    pub failed_pull: PullRecord,
+}
+
 pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     let subdir = &normalize_subdir(subdir);
     assert_subdir_is_ref_safe(repo_root, subdir)?;
@@ -76,13 +128,20 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
              this failure — check `git log -1` before assuming nothing happened"
                 .to_string()
         })?;
-        return Ok(Outcome::Clean);
+        return Ok(Outcome::Clean {
+            pull: PullRecord::from_output(&first),
+            stale_parent_retry: None,
+            auto_resolved: Vec::new(),
+        });
     }
 
     let stderr = String::from_utf8_lossy(&first.stderr);
     if stderr.contains("is not an ancestor") {
-        let fixup_commit = fix_stale_parent(repo_root, subdir)?;
-        return retry_after_stale_parent_fixup(repo_root, subdir, tag, &fixup_commit);
+        let retry = StaleParentRetry {
+            fixup_commit: fix_stale_parent(repo_root, subdir)?,
+            failed_pull: PullRecord::from_output(&first),
+        };
+        return retry_after_stale_parent_fixup(repo_root, subdir, tag, retry);
     }
 
     conflict::handle_conflict(repo_root, subdir, tag, &first, None)
@@ -137,7 +196,13 @@ pub(crate) fn fetch_upstream(repo_root: &Path, subdir: &str, tag: &str) -> Resul
 /// after that leaves it a silent side effect. One shared closure, applied
 /// to every fallible call in this retry, so a future added step can't
 /// reintroduce the gap by omission.
-fn retry_after_stale_parent_fixup(repo_root: &Path, subdir: &str, tag: &str, fixup_commit: &str) -> Result<Outcome> {
+fn retry_after_stale_parent_fixup(
+    repo_root: &Path,
+    subdir: &str,
+    tag: &str,
+    retry: StaleParentRetry,
+) -> Result<Outcome> {
+    let fixup_commit = retry.fixup_commit.as_str();
     // `{fixup_commit}~1` (not `HEAD~1`) is deliberate: by the time
     // `ensure_tag_pin_matches` below runs, a successful `second` pull has
     // already added its own content commit on top of `fixup_commit`, so
@@ -156,9 +221,13 @@ fn retry_after_stale_parent_fixup(repo_root: &Path, subdir: &str, tag: &str, fix
     if second.status.success() {
         best_effort_clean(repo_root, subdir);
         ensure_tag_pin_matches(repo_root, subdir, tag).with_context(disclose)?;
-        return Ok(Outcome::Clean);
+        return Ok(Outcome::Clean {
+            pull: PullRecord::from_output(&second),
+            stale_parent_retry: Some(retry),
+            auto_resolved: Vec::new(),
+        });
     }
-    conflict::handle_conflict(repo_root, subdir, tag, &second, Some(fixup_commit)).with_context(disclose)
+    conflict::handle_conflict(repo_root, subdir, tag, &second, Some(&retry)).with_context(disclose)
 }
 
 /// Mirrors git-subrepo's own `check-and-normalize-subdir`: strips a leading
@@ -361,6 +430,9 @@ fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
         .args(["subrepo", "pull", subdir, "-b", tag])
         .current_dir(repo_root)
         .env("SKIP", skip_check_vendoring_integrity())
+        // `say()` prints nothing under it, and the pull record is the diagnostic of an
+        // unexpected outcome.
+        .env_remove("GIT_SUBREPO_QUIET")
         .output()
         .with_context(|| format!("failed to run `git subrepo pull {subdir} -b {tag}`"))
 }
