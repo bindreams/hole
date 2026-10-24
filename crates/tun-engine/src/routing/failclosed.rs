@@ -125,6 +125,9 @@ pub mod lockdown_state;
 
 pub mod boottime_witness;
 
+pub mod release_epoch;
+pub use release_epoch::{begin_release, watch_releases, ReleaseInFlight, ReleaseWatch};
+
 // Compiled out of a macOS PRODUCTION build — Windows' boot-time twin read-back
 // is its only caller — but kept for every lane's TESTS, because the rule it
 // encodes is platform-free and a rule proved only where the hazard lives is
@@ -186,9 +189,9 @@ pub fn engage(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    Ok(Cover {
-        _inner: platform::engage(server_ip, resolver_ip, state_dir, owner)?,
-    })
+    let inner =
+        release_epoch::engage_within_watch(state_dir, || platform::engage(server_ip, resolver_ip, state_dir, owner))?;
+    Ok(Cover { _inner: inner })
 }
 
 /// Sweep a transient cover left behind by a crashed run. Idempotent — a no-op
@@ -229,16 +232,18 @@ pub fn engage_lockdown(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    #[cfg(target_os = "windows")]
-    let inner = {
-        let luid = resolver.resolve(tun_name)?;
-        platform::engage_lockdown(server_ip, luid, app_ids, state_dir, owner)?
-    };
-    #[cfg(target_os = "macos")]
-    let inner = {
-        let _ = (resolver, app_ids);
-        platform::engage_lockdown(server_ip, tun_name, state_dir, owner)?
-    };
+    let inner = release_epoch::engage_within_watch(state_dir, || {
+        #[cfg(target_os = "windows")]
+        {
+            let luid = resolver.resolve(tun_name)?;
+            platform::engage_lockdown(server_ip, luid, app_ids, state_dir, owner)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (resolver, app_ids);
+            platform::engage_lockdown(server_ip, tun_name, state_dir, owner)
+        }
+    })?;
     Ok(Cover { _inner: inner })
 }
 
@@ -1019,6 +1024,9 @@ fn sweep_with_witness(
     owner: Option<(u32, u32)>,
     sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
+    // Announced before the sweep's first firewall call, held through the
+    // witness write: an engage that overlaps any of it backs out.
+    let _release = release_epoch::begin_release(state_dir);
     let snapshot = boottime_witness::snapshot(state_dir);
     let SweepOutcome { clearance, failure } = sweep(snapshot.witness);
     // The record is written from what the sweep OBSERVED, before its failure
