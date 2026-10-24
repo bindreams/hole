@@ -128,7 +128,7 @@ fn an_unreadable_state_file_is_kept_for_the_next_start() {
 #[skuld::test]
 fn an_unusable_state_file_is_cleared() {
     let dir = tempfile::tempdir().unwrap();
-    seed_state_file(dir.path());
+    std::fs::write(dir.path().join(plugin_state::STATE_FILE_NAME), b"{not json").unwrap();
 
     reap_loaded(plugin_state::Loaded::Unusable, dir.path());
 

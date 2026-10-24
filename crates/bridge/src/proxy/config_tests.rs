@@ -426,6 +426,19 @@ fn an_unreadable_route_record_reaches_the_toast_as_its_file_name_only() {
     }
 }
 
+/// An Unblock released the cover this start was engaging: the user asked to be
+/// let out, so the start is cancelled and no failure toast follows.
+#[skuld::test]
+fn a_cover_released_while_engaging_cancels_the_start() {
+    let err = ProxyError::from(tun_engine::RoutingError::SupersededByRelease);
+
+    assert!(matches!(err, ProxyError::Cancelled), "{err:?}");
+    assert_eq!(
+        hole_common::protocol::StartError::from(&err),
+        hole_common::protocol::StartError::Cancelled
+    );
+}
+
 // Key-material classification -----------------------------------------------------------------------------------------
 //
 // The 2022-blake3 ciphers take the password as base64 key material, so
