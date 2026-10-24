@@ -336,7 +336,23 @@ impl Drop for MacosGatewayRoute {
 // The session-level test ==============================================================================================
 
 async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
-    let gw = tun_engine::get_default_gateway_info().expect("HARNESS: get_default_gateway_info");
+    // Every step below that needs a route off the box is judged against this control host, outside any
+    // cover: a runner network loss is waited out, a leftover cover or a step that fails with the network
+    // up is a defect.
+    let control = no_leak_target_addr().to_string();
+
+    // The default route disappears with the runner's network, so a gateway read taken then is not a
+    // verdict about anything. The harness's state directory does not exist yet; the oracle reads the OS
+    // (WFP filters, the live pf ruleset), so a directory of its own names nothing.
+    let early_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
+    let gw = hole_test_observability::egress::read_with_network_up(
+        "live-tun-permit: the default gateway",
+        &control,
+        &|| tun_engine::test_utils::held_covers(early_dir.path()),
+        tun_engine::get_default_gateway_info,
+    )
+    .expect("HARNESS: get_default_gateway_info");
+    // A route-table write to the gateway just read: no packet leaves the box.
     let bypass = install_bypass_route(&gw);
 
     let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -360,23 +376,34 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     };
 
     let mut harness = DistHarness::spawn(dist).await.expect("HARNESS: spawn DistHarness");
+    let state_dir = harness.state_dir.path().to_path_buf();
+    let held = || tun_engine::test_utils::held_covers(&state_dir);
 
     // Phase A — harness control, cover OFF. A completed three-way handshake
     // to a nonexistent TEST-NET host is the only outcome a firewall drop
     // provably cannot manufacture, so this is the baseline phase B is judged
     // against, not merely a smoke test.
-    let resp = harness
-        .send(BridgeRequest::Start {
-            config: config.clone(),
-            attempt_id: "live-tun-permit-e2e-a".into(),
-            on_startup: Some(hole_common::config::StartupBehavior::default()),
-        })
-        .await
-        .expect("HARNESS: send Start (phase A)");
-    assert!(
-        matches!(resp, BridgeResponse::Ack),
-        "HARNESS/CONTROL FAILED: phase A Start did not Ack: {resp:?}"
-    );
+    //
+    // A Full-mode Start installs routes through the default gateway, so it fails with no default route: a
+    // refused Start is judged against the control host like phase B's probes.
+    loop {
+        let window = hole_test_observability::egress::Window::open("live-tun-permit phase A", &control, &held)
+            .unwrap_or_else(|why| panic!("HARNESS: {why}"));
+        let resp = harness
+            .send(BridgeRequest::Start {
+                config: config.clone(),
+                attempt_id: "live-tun-permit-e2e-a".into(),
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
+            })
+            .await
+            .expect("HARNESS: send Start (phase A)");
+        if matches!(resp, BridgeResponse::Ack) {
+            break;
+        }
+        if let Err(why) = window.judge(format!("HARNESS/CONTROL FAILED: phase A Start did not Ack: {resp:?}")) {
+            panic!("{why}");
+        }
+    }
 
     let control_outcome = probe_tunnel();
     assert_eq!(
@@ -394,8 +421,8 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // `install_bypass_route` is the only thing that verifies the route.
     hole_test_observability::egress::wait_for_egress(
         "HARNESS/CONTROL: baseline reachability over the bypass route",
-        &[&no_leak_target_addr().to_string()],
-        &|| tun_engine::test_utils::held_covers(harness.state_dir.path()),
+        &[&control],
+        &held,
     );
 
     let resp = harness
@@ -411,20 +438,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     // bypass route's winner, the no-leak target) cannot tell a lost network from a cover, and a lockdown
     // cover blocks every control host. Each run is bracketed by a `Window` (control probes outside any
     // cover); a run whose probes failed is judged only after the cover is released.
-    let control = no_leak_target_addr().to_string();
-    let state_dir = harness.state_dir.path().to_path_buf();
-    let held = || tun_engine::test_utils::held_covers(&state_dir);
-    let (
-        arm,
-        armed,
-        start_b,
-        start_b_acked,
-        cover_presence,
-        tun_outcome,
-        no_leak,
-        permitted_reachable,
-        path_to_no_leak,
-    ) = loop {
+    let (cover_presence, tun_outcome, no_leak, permitted_reachable, path_to_no_leak) = loop {
         let window = hole_test_observability::egress::Window::open("live-tun-permit phase B", &control, &held)
             .unwrap_or_else(|why| panic!("HARNESS: {why}"));
         // Recovery record + escape guard BEFORE anything is armed — written once
@@ -496,27 +510,37 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         // is the escape from.
         drop(guard);
 
-        let off_box_probe_failed = start_b_acked
-            && (!no_leak.is_some_and(|fate| fate.is_verdict())
-                || !matches!(&path_to_no_leak, Some(Ok(iface)) if iface == bypass.interface())
-                || permitted_reachable != Some(ProbeFate::Delivered));
-        if off_box_probe_failed {
-            let why = format!(
+        // A refused arm or Start counts like a failed probe: Start needs the default route (see phase A),
+        // and an outage that begins mid-iteration is what the window brackets.
+        let failed_step = if !armed {
+            Some(format!(
+                "SetLockdown(true) did not Ack, so the kill switch was never armed and nothing below is a verdict \
+                 about a cover: {arm:?}"
+            ))
+        } else if !start_b_acked {
+            Some(format!(
+                "phase B Start did not Ack (with the kill switch armed): {start_b:?}"
+            ))
+        } else if !no_leak.is_some_and(|fate| fate.is_verdict())
+            || !matches!(&path_to_no_leak, Some(Ok(iface)) if iface == bypass.interface())
+            || permitted_reachable != Some(ProbeFate::Delivered)
+        {
+            Some(format!(
                 "the probes of phase B never reached the stack: no_leak={no_leak:?}, \
                  path_to_no_leak={path_to_no_leak:?} (expected the bypass interface '{}'), \
                  permitted_reachable={permitted_reachable:?}",
                 bypass.interface()
-            );
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = failed_step {
             if let Err(why) = window.judge(why) {
                 panic!("HARNESS: {why}");
             }
             continue;
         }
         break (
-            arm,
-            armed,
-            start_b,
-            start_b_acked,
             cover_presence,
             tun_outcome,
             no_leak,
@@ -525,15 +549,6 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         );
     };
 
-    assert!(
-        armed,
-        "HARNESS: SetLockdown(true) did not Ack, so the kill switch was never armed and nothing below is a \
-         verdict about a cover: {arm:?}"
-    );
-    assert!(
-        start_b_acked,
-        "HARNESS: phase B Start did not Ack (with the kill switch armed): {start_b:?}"
-    );
     assert_eq!(
         permitted_reachable,
         Some(ProbeFate::Delivered),

@@ -204,14 +204,15 @@ fn a_reading_taken_as_the_network_returns_is_retaken() {
     // first, the outage is seen and the reading is taken again, whatever the first one said.
     let net = Net::new(0..1, &[]);
     let readings = Cell::new(0);
-    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, || {
+    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
         readings.set(readings.get() + 1);
         if net.step() {
             1
         } else {
             0
         }
-    });
+    })
+    .unwrap();
     assert_eq!(reading, 1);
     assert_eq!(readings.get(), 2);
 }
@@ -220,14 +221,15 @@ fn a_reading_taken_as_the_network_returns_is_retaken() {
 fn a_reading_taken_during_an_outage_is_retaken() {
     let net = Net::new(1..6, &[]);
     let readings = Cell::new(0);
-    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, || {
+    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
         readings.set(readings.get() + 1);
         if net.step() {
             1
         } else {
             0
         }
-    });
+    })
+    .unwrap();
     assert_eq!(reading, 1);
     assert!(readings.get() >= 2);
 }
@@ -236,10 +238,11 @@ fn a_reading_taken_during_an_outage_is_retaken() {
 fn a_reading_with_the_network_up_on_both_sides_is_returned_as_it_is() {
     // A disagreement the network cannot explain is the caller's to assert on.
     let net = Net::new(0..0, &[]);
-    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, || {
+    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
         net.step();
         0
-    });
+    })
+    .unwrap();
     assert_eq!(reading, 0);
 }
 
@@ -247,13 +250,44 @@ fn a_reading_with_the_network_up_on_both_sides_is_returned_as_it_is() {
 fn a_resolver_set_reading_is_retaken_after_a_network_loss() {
     // The shape the macOS resolver-set tests use: a reading is a (raw output, parsed set) pair.
     let net = Net::new(1..4, &[]);
-    let (raw, servers) = read_with_network_up_on(&mut { &net }, "t", CONTROL, || {
+    let (raw, servers) = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
         let raw = if net.step() { "nameserver[0] : 192.168.64.1" } else { "" };
         let servers: Vec<String> = raw.lines().map(str::to_owned).collect();
         (raw.to_string(), servers)
-    });
+    })
+    .unwrap();
     assert_eq!(servers, vec!["nameserver[0] : 192.168.64.1".to_string()]);
     assert!(raw.contains("192.168.64.1"));
+}
+
+#[skuld::test]
+fn a_reading_taken_while_hole_holds_a_cover_and_the_control_is_down_fails_at_once() {
+    // A cover left by an earlier test blocks the control, so waiting for the network would never end.
+    let net = Net::new(0..0, &[CONTROL]);
+    let err = read_with_network_up_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &|| Some("a lockdown cover".to_string()),
+        || 1,
+    )
+    .unwrap_err();
+    assert!(err.contains("a lockdown cover"), "{err}");
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn a_cover_found_while_waiting_out_a_network_loss_fails_the_reading() {
+    // The control drops out around the first reading; the cover is only seen on a later round.
+    let net = Net::new(1..6, &[]);
+    let polls = Cell::new(0);
+    let hole = || {
+        polls.set(polls.get() + 1);
+        (polls.get() >= 2).then(|| "a transient cover".to_string())
+    };
+    let err = read_with_network_up_on(&mut { &net }, "t", CONTROL, &hole, || 1).unwrap_err();
+    assert!(err.contains("a transient cover"), "{err}");
+    assert_eq!(net.pauses.get(), 1);
 }
 
 // rerun_until_network_holds ===========================================================================================

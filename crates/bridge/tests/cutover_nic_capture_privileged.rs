@@ -98,13 +98,26 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
     let non_permitted: SocketAddr = SocketAddr::new(NON_PERMITTED_IP.parse().unwrap(), DST_PORT);
     let permitted_tail: SocketAddr = SocketAddr::new(server_ip, DST_PORT);
 
+    // Every step below that sends off the box can fail because the runner lost its network. The control
+    // host answers outside any cover; `held` reads the covers the OS reports, so a cover an earlier test
+    // left fails at once instead of waiting as a network loss.
+    let control = format!("{SERVER_IP}:443");
+    let held = || tun_engine::test_utils::held_covers(dir.path());
+
     // The PHYSICAL egress NIC's interface index pins the sentinel socket so every
     // marker egresses the real NIC (not loopback). The capture targets ALL NIC
     // components (`--comp nics`): no fragile friendly-name→component-id mapping
     // (pktmon names a component by adapter description, not the connection name),
     // and an SR-IOV VF datapath can't dodge an all-NIC capture. The nonce-payload
     // match — not the component — is what attributes a captured frame to a marker.
-    let gw = get_default_gateway_info().expect("default egress NIC must be discoverable");
+    // The default route disappears with the network, so the read is retaken once the control answers.
+    let gw = hole_test_observability::egress::read_with_network_up(
+        "nic capture: the default gateway",
+        &control,
+        &held,
+        get_default_gateway_info,
+    )
+    .expect("default egress NIC must be discoverable");
     assert!(
         !gw.gateway_ip.is_loopback() && !gw.interface_name.trim().is_empty(),
         "egress NIC must be a real non-loopback interface, got {:?}",
@@ -122,7 +135,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
     hole_test_observability::egress::wait_for_egress(
         "pre-cover baseline",
         &[&non_permitted.to_string(), &permitted_tail.to_string()],
-        &|| tun_engine::test_utils::held_covers(dir.path()),
+        &held,
     );
 
     // One UDP socket pinned to the physical NIC index — used for every marker so
@@ -132,109 +145,126 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
         .expect("bind a UDP socket to the egress NIC index");
 
     // Phase A: cover OFF — positive control. ==========================================================================
-    let nonce_a_ctrl = nonce();
-    {
-        let cap = dir.path().join("phase_a.etl");
-        let pcap = dir.path().join("phase_a.pcapng");
-        // Filter to UDP only, capture all NIC components, log the whole packet.
-        pktmon(&["filter", "remove"]); // start from a clean filter set
-        pktmon(&["filter", "add", "hole-nic-capture", "-t", "UDP"]);
-        let _guard = PktmonGuard;
-        pktmon(&[
-            "start",
-            "--capture",
-            "--comp",
-            "nics",
-            "--pkt-size",
-            "0",
-            "--file-name",
-            &cap.to_string_lossy(),
-        ]);
+    // A run that fails with the control answering on both sides is the capture pipeline's (or the
+    // product's), not the network's; a lost network runs it again.
+    let phase_a =
+        hole_test_observability::egress::rerun_until_network_holds("nic capture: phase A", &control, &held, || {
+            let nonce_a_ctrl = nonce();
+            let cap = dir.path().join("phase_a.etl");
+            let pcap = dir.path().join("phase_a.pcapng");
+            // Filter to UDP only, capture all NIC components, log the whole packet.
+            pktmon(&["filter", "remove"]); // start from a clean filter set
+            pktmon(&["filter", "add", "hole-nic-capture", "-t", "UDP"]);
+            let _guard = PktmonGuard;
+            pktmon(&[
+                "start",
+                "--capture",
+                "--comp",
+                "nics",
+                "--pkt-size",
+                "0",
+                "--file-name",
+                &cap.to_string_lossy(),
+            ]);
 
-        send_marker(&rt, &socket, non_permitted, nonce_a_ctrl).expect("positive-control marker send");
+            let sent = send_marker(&rt, &socket, non_permitted, nonce_a_ctrl);
 
-        pktmon(&["stop"]);
-        pktmon(&["etl2pcap", &cap.to_string_lossy(), "--out", &pcap.to_string_lossy()]);
-        drop(_guard); // remove the Phase-A filter before Phase-B re-adds it
+            pktmon(&["stop"]);
+            pktmon(&["etl2pcap", &cap.to_string_lossy(), "--out", &pcap.to_string_lossy()]);
+            drop(_guard); // remove the Phase-A filter before Phase-B re-adds it
 
-        assert!(
-            capture_contains_nonce(&pcap, nonce_a_ctrl),
-            "POSITIVE CONTROL FAILED: the capture pipeline/NIC/filter did not record a marker sent with NO cover \
-             engaged — an empty Phase-B capture would be meaningless. NIC={:?} (comp nics)",
-            gw.interface_name
-        );
+            sent.map_err(|e| format!("POSITIVE CONTROL FAILED: the marker send failed with NO cover engaged: {e:?}"))?;
+            capture_contains_nonce(&pcap, nonce_a_ctrl)
+                .then_some(())
+                .ok_or_else(|| {
+                    format!(
+                "POSITIVE CONTROL FAILED: the capture pipeline/NIC/filter did not record a marker sent with NO cover \
+                 engaged — an empty Phase-B capture would be meaningless. NIC={:?} (comp nics)",
+                gw.interface_name
+            )
+                })
+        });
+    if let Err(why) = phase_a {
+        panic!("{why}");
     }
 
     // Phase B: cover ON — the no-leak proof. ==========================================================================
-    lockdown_state::set_enabled(dir.path(), true, None).expect("persist lockdown intent");
-    let cover = engage_lockdown(
-        server_ip,
-        "Loopback Pseudo-Interface 1", // always-present LUID source; the block governs the probed egress
-        &SystemLuidResolver,
-        &[],
-        dir.path(),
-        None,
-    )
-    .expect("engage the real standing lockdown cover");
+    let phase_b =
+        hole_test_observability::egress::rerun_until_network_holds("nic capture: phase B", &control, &held, || {
+            lockdown_state::set_enabled(dir.path(), true, None).expect("persist lockdown intent");
+            let cover = engage_lockdown(
+                server_ip,
+                "Loopback Pseudo-Interface 1", // always-present LUID source; the block governs the probed egress
+                &SystemLuidResolver,
+                &[],
+                dir.path(),
+                None,
+            )
+            .expect("engage the real standing lockdown cover");
 
-    let nonce_leak = nonce(); // → non-permitted: must NOT appear (a leak)
-    let nonce_tail = nonce(); // → server IP: MUST appear (permit holds) + rendezvous
-    {
-        let cap = dir.path().join("phase_b.etl");
-        let pcap = dir.path().join("phase_b.pcapng");
-        pktmon(&["filter", "remove"]);
-        pktmon(&["filter", "add", "hole-nic-capture", "-t", "UDP"]);
-        let _guard = PktmonGuard;
-        pktmon(&[
-            "start",
-            "--capture",
-            "--comp",
-            "nics",
-            "--pkt-size",
-            "0",
-            "--file-name",
-            &cap.to_string_lossy(),
-        ]);
+            let nonce_leak = nonce(); // → non-permitted: must NOT appear (a leak)
+            let nonce_tail = nonce(); // → server IP: MUST appear (permit holds) + rendezvous
+            let cap = dir.path().join("phase_b.etl");
+            let pcap = dir.path().join("phase_b.pcapng");
+            pktmon(&["filter", "remove"]);
+            pktmon(&["filter", "add", "hole-nic-capture", "-t", "UDP"]);
+            let _guard = PktmonGuard;
+            pktmon(&[
+                "start",
+                "--capture",
+                "--comp",
+                "nics",
+                "--pkt-size",
+                "0",
+                "--file-name",
+                &cap.to_string_lossy(),
+            ]);
 
-        // ORDER MATTERS: the would-leak marker first, the permitted tail second,
-        // both from the same socket+NIC. ALE classification is synchronous on the
-        // send path and pktmon records a single NIC component in egress order, so
-        // the FIFO holds at BOTH layers: the tail's presence proves the leak
-        // marker's ALE decision already resolved (same egress FIFO), so its
-        // absence is a DROP, not a pending send. No sleep, no poll.
-        //
-        // The leak send is allowed to FAIL: a WFP block at ALE_AUTH_CONNECT can
-        // surface as a synchronous `send_to` error (WSAEACCES), which is itself
-        // no-leak evidence — but the capture is still the authority, so swallow
-        // the result and let the wire decide. The tail send MUST succeed (it is
-        // permitted), and is the rendezvous, so it stays strict.
-        let _ = send_marker(&rt, &socket, non_permitted, nonce_leak);
-        send_marker(&rt, &socket, permitted_tail, nonce_tail).expect("permitted-tail marker send");
+            // ORDER MATTERS: the would-leak marker first, the permitted tail second,
+            // both from the same socket+NIC. ALE classification is synchronous on the
+            // send path and pktmon records a single NIC component in egress order, so
+            // the FIFO holds at BOTH layers: the tail's presence proves the leak
+            // marker's ALE decision already resolved (same egress FIFO), so its
+            // absence is a DROP, not a pending send. No sleep, no poll.
+            //
+            // The leak send is allowed to FAIL: a WFP block at ALE_AUTH_CONNECT can
+            // surface as a synchronous `send_to` error (WSAEACCES), which is itself
+            // no-leak evidence — but the capture is still the authority, so swallow
+            // the result and let the wire decide. The tail send is permitted and is the
+            // rendezvous; a failure of it is judged below.
+            let _ = send_marker(&rt, &socket, non_permitted, nonce_leak);
+            let tail_sent = send_marker(&rt, &socket, permitted_tail, nonce_tail);
 
-        pktmon(&["stop"]);
-        pktmon(&["etl2pcap", &cap.to_string_lossy(), "--out", &pcap.to_string_lossy()]);
+            pktmon(&["stop"]);
+            pktmon(&["etl2pcap", &cap.to_string_lossy(), "--out", &pcap.to_string_lossy()]);
 
-        let tail_seen = capture_contains_nonce(&pcap, nonce_tail);
-        let leak_seen = capture_contains_nonce(&pcap, nonce_leak);
+            let tail_seen = capture_contains_nonce(&pcap, nonce_tail);
+            let leak_seen = capture_contains_nonce(&pcap, nonce_leak);
 
-        // Tear the cover down BEFORE the asserts so a failure never leaves the box
-        // severed. The capture verdicts are already in hand.
-        drop(cover);
-        lockdown_state::set_enabled(dir.path(), false, None).ok();
-        let _clearance_has_no_reader_in_cleanup = disengage_lockdown(dir.path());
+            // Tear the cover down BEFORE the asserts so a failure never leaves the box
+            // severed. The capture verdicts are already in hand.
+            drop(cover);
+            lockdown_state::set_enabled(dir.path(), false, None).ok();
+            let _clearance_has_no_reader_in_cleanup = disengage_lockdown(dir.path());
 
-        // Rendezvous: the permitted tail egressed (server permit beats block-all),
-        // proving the capture window covered the leak marker's decision too.
-        assert!(
-            tail_seen,
-            "permitted-tail marker (→ server IP {server_ip}) must egress the NIC: the server permit must beat \
-             block-all AND the capture must have been live for the leak marker's decision"
-        );
-        // The invariant: no UDP leaked to the non-permitted destination.
-        assert!(
-            !leak_seen,
-            "UDP LEAK: a datagram to the non-permitted host {non_permitted} egressed the physical NIC while the \
+            // The invariant: no UDP leaked to the non-permitted destination. A marker on the wire is a leak
+            // whatever the network was doing.
+            assert!(
+                !leak_seen,
+                "UDP LEAK: a datagram to the non-permitted host {non_permitted} egressed the physical NIC while the \
              standing cover was engaged"
-        );
+            );
+            // Rendezvous: the permitted tail egressed (server permit beats block-all),
+            // proving the capture window covered the leak marker's decision too.
+            tail_sent.map_err(|e| format!("permitted-tail marker send: {e:?}"))?;
+            tail_seen.then_some(()).ok_or_else(|| {
+                format!(
+                    "permitted-tail marker (→ server IP {server_ip}) must egress the NIC: the server permit must beat \
+                 block-all AND the capture must have been live for the leak marker's decision"
+                )
+            })
+        });
+    if let Err(why) = phase_b {
+        panic!("{why}");
     }
 }

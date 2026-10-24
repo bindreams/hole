@@ -3009,17 +3009,22 @@ and a rerun repeats the platform's whole job.
   blocks every host but its permits. Each such scenario runs inside an
   `egress::Window`: opened (control answers, Hole holds nothing) just before
   the engage, judged just after the teardown. A failed run is rerun only when
-  the control failed at either end; a control that answered at both ends, or
+  the control failed after it; a control that answered at both ends, or
   any Hole state, is a defect and fails with the window length in the message
   (`rerun_until_network_holds`, or `Window` directly for an async scenario).
   The one residual is an outage that starts and ends inside one scenario run;
   every outage seen in CI lasted 20 s or more. The block probe and the permit
   probe of one test share an engage, so a permit that answers vouches for the
   block probe taken just before it. `check_egress_restored` (and
-  `assert_egress_restored`) probes once, with the control on both sides; there
-  is no second chance for a release that returned before egress was restored.
-  A resolver-set reading is taken between control probes
-  (`read_with_network_up`).
+  `assert_egress_restored`) probes the targets once with the control on both
+  sides; a failure with the control down on either side waits for the network
+  and probes again, and one with the control up on both is the release's.
+  A read of runner state (the resolver set, the default gateway) is taken
+  between control probes (`read_with_network_up`), which takes the same
+  `HoleState`: a cover that blocks the control fails the read at once. Every
+  step of a privileged test that needs a route off the box goes through one of
+  these (a refused `Start` included); a step that touches only loopback, a TUN
+  the test owns, or local files does not.
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 

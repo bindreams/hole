@@ -93,6 +93,26 @@ fn server_ip() -> IpAddr {
     SERVER_IP.parse().expect("literal")
 }
 
+/// Run `scenario` until it holds, treating a failed run as a runner network loss only when the control
+/// host fails outside it too. For a step that reaches a host through the physical adapter: with the
+/// network down that step fails whatever the confinement does. The confinement is a process-scoped
+/// dynamic session that dies with its guard, so the oracle does not read it; it reads the covers an
+/// earlier test may have left, which would block the control (or the probe) and must fail the run as a
+/// leak, not wait as a network loss.
+fn judged_off_box(what: &str, scenario: impl FnMut() -> Result<(), String>) {
+    let control = format!("{SERVER_IP}:443");
+    let no_cover_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
+    let verdict = hole_test_observability::egress::rerun_until_network_holds(
+        what,
+        &control,
+        &|| crate::test_utils::held_covers(no_cover_dir.path()),
+        scenario,
+    );
+    if let Err(why) = verdict {
+        panic!("{why}");
+    }
+}
+
 /// A tokio runtime plus a bound, unconnected UDP socket — the pair
 /// [`send_marker`] needs. Not bound to any interface: which one a marker
 /// actually egresses is left to the OS route lookup for its destination,
@@ -185,33 +205,38 @@ fn dns_confine_global_net_state_blocks_dns_off_the_tun() {
     let dev = open_device("dns-confine-test-tun-b", "10.255.249.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
-    let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
+    judged_off_box("dns_confine: DNS off the tun", || {
+        let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
 
-    let (rt, socket) = probe_socket();
-    let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
-    let leak = nonce();
-    let tail = nonce();
-    let pcap = capture_udp_window(dir.path(), "blocks-off-tun", || {
-        // The leak send is allowed to fail: a WFP block at ALE_AUTH_CONNECT
-        // can surface as a synchronous `send_to` error, itself no-leak
-        // evidence — but the capture is the authority, so swallow the result
-        // and let the wire decide. The tail send must succeed (it is
-        // permitted) and is the rendezvous, so it stays strict.
-        let _ = send_marker(&rt, &socket, OFF_TUNNEL_DNS.parse().expect("literal"), leak);
-        send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), tail).expect("permitted-tail marker send");
+        let (rt, socket) = probe_socket();
+        let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+        let leak = nonce();
+        let tail = nonce();
+        let mut tail_sent = Ok(());
+        let pcap = capture_udp_window(dir.path(), "blocks-off-tun", || {
+            // The leak send is allowed to fail: a WFP block at ALE_AUTH_CONNECT
+            // can surface as a synchronous `send_to` error, itself no-leak
+            // evidence — but the capture is the authority, so swallow the result
+            // and let the wire decide. The tail send is permitted and is the
+            // rendezvous; a failure of it is judged below.
+            let _ = send_marker(&rt, &socket, OFF_TUNNEL_DNS.parse().expect("literal"), leak);
+            tail_sent = send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), tail);
+        });
+
+        drop(confinement);
+
+        // A marker on the wire is a leak whatever the network was doing.
+        assert!(
+            !capture_contains_nonce(&pcap, leak),
+            "DNS LEAK: a datagram to the off-tunnel host {OFF_TUNNEL_DNS} egressed while the confinement was engaged"
+        );
+        tail_sent.map_err(|e| format!("permitted-tail marker send: {e:?}"))?;
+        capture_contains_nonce(&pcap, tail).then_some(()).ok_or_else(|| {
+            format!(
+                "permitted-tail marker (→ server IP {SERVER_IP}) must egress: the server permit must hold AND the \n                 capture must have been live for the leak marker's decision"
+            )
+        })
     });
-
-    drop(confinement);
-
-    assert!(
-        capture_contains_nonce(&pcap, tail),
-        "permitted-tail marker (→ server IP {SERVER_IP}) must egress: the server permit must hold AND the \
-         capture must have been live for the leak marker's decision"
-    );
-    assert!(
-        !capture_contains_nonce(&pcap, leak),
-        "DNS LEAK: a datagram to the off-tunnel host {OFF_TUNNEL_DNS} egressed while the confinement was engaged"
-    );
 }
 
 /// The confinement must not be a general egress block: the SAME off-tunnel
@@ -221,27 +246,15 @@ fn dns_confine_global_net_state_leaves_other_ports_alone() {
     let dev = open_device("dns-confine-test-tun-c", "10.255.248.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
-    // The confinement is a process-scoped dynamic session that dies with its guard, so once the guard is
-    // dropped nothing of Hole's is left installed; a probe that failed while it was engaged is blamed on the
-    // network only if a control host fails outside it too.
-    let control = format!("{SERVER_IP}:443");
-    let verdict = hole_test_observability::egress::rerun_until_network_holds(
-        "dns_confine: a non-DNS port",
-        &control,
-        &|| None,
-        || {
-            let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
-            let result =
-                TcpStream::connect_timeout(&OFF_TUNNEL_OTHER_PORT.parse().expect("literal"), Duration::from_secs(5));
-            drop(confinement);
-            result.map(drop).map_err(|e| {
-                format!("a non-DNS port on an off-tunnel host must stay unaffected by the confinement: {e:?}")
-            })
-        },
-    );
-    if let Err(why) = verdict {
-        panic!("{why}");
-    }
+    judged_off_box("dns_confine: a non-DNS port", || {
+        let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
+        let result =
+            TcpStream::connect_timeout(&OFF_TUNNEL_OTHER_PORT.parse().expect("literal"), Duration::from_secs(5));
+        drop(confinement);
+        result
+            .map(drop)
+            .map_err(|e| format!("a non-DNS port on an off-tunnel host must stay unaffected by the confinement: {e:?}"))
+    });
 }
 
 /// Anti-vacuity: engage naming device A (a real, live, uninvolved TUN), then
@@ -264,33 +277,37 @@ fn dns_confine_global_net_state_is_sensitive_to_the_interface_it_names() {
     let route = OwnedRoute::add(PROBE_NET, name_b, None);
     route.assert_wins_for(IpAddr::V4(PROBE_IP));
 
-    // Engage naming ONLY device A.
-    let confinement = engage(luid_a, server_ip()).expect("engage real DNS confinement naming device A");
+    judged_off_box("dns_confine: the interface the confinement names", || {
+        // Engage naming ONLY device A.
+        let confinement = engage(luid_a, server_ip()).expect("engage real DNS confinement naming device A");
 
-    let (rt, socket) = probe_socket();
-    let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
-    let leak = nonce();
-    let tail = nonce();
-    let pcap = capture_udp_window(dir.path(), "sensitive-to-interface", || {
-        // The leak routes via device B, which the confinement does not name
-        // — allowed to fail synchronously, same as blocks_dns_off_the_tun.
-        let _ = send_marker(&rt, &socket, SocketAddr::from((PROBE_IP, 53)), leak);
-        send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), tail).expect("permitted-tail marker send");
+        let (rt, socket) = probe_socket();
+        let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+        let leak = nonce();
+        let tail = nonce();
+        let mut tail_sent = Ok(());
+        let pcap = capture_udp_window(dir.path(), "sensitive-to-interface", || {
+            // The leak routes via device B, which the confinement does not name
+            // — allowed to fail synchronously, same as blocks_dns_off_the_tun.
+            let _ = send_marker(&rt, &socket, SocketAddr::from((PROBE_IP, 53)), leak);
+            tail_sent = send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), tail);
+        });
+
+        drop(confinement);
+
+        // The leak is the wire's verdict whatever the network was doing; the tail is judged below.
+        assert!(
+            !capture_contains_nonce(&pcap, leak),
+            "a confinement naming device A must NOT permit DNS actually routed via device B — the permit is not              sensitive to the interface it names: marker egressed"
+        );
+        tail_sent.map_err(|e| format!("permitted-tail marker send: {e:?}"))?;
+        capture_contains_nonce(&pcap, tail).then_some(()).ok_or_else(|| {
+            format!(
+                "permitted-tail marker (→ server IP {SERVER_IP}) must egress: the capture must have been live for the                  leak marker's decision"
+            )
+        })
     });
-
-    drop(confinement);
     drop(dev_b);
-
-    assert!(
-        capture_contains_nonce(&pcap, tail),
-        "permitted-tail marker (→ server IP {SERVER_IP}) must egress: the capture must have been live for the \
-         leak marker's decision"
-    );
-    assert!(
-        !capture_contains_nonce(&pcap, leak),
-        "a confinement naming device A must NOT permit DNS actually routed via device B — the permit is not \
-         sensitive to the interface it names: marker egressed"
-    );
 }
 
 /// Rule #0, asserted rather than assumed: dropping the guard must fully
@@ -303,21 +320,23 @@ fn dns_confine_global_net_state_filters_die_with_the_session() {
     let dev = open_device("dns-confine-test-tun-f", "10.255.245.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
-    let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
-    drop(confinement);
+    judged_off_box("dns_confine: DNS after the guard drops", || {
+        let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
+        drop(confinement);
 
-    let (rt, socket) = probe_socket();
-    let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
-    let marker = nonce();
-    let pcap = capture_udp_window(dir.path(), "filters-die-with-session", || {
-        send_marker(&rt, &socket, OFF_TUNNEL_DNS.parse().expect("literal"), marker)
-            .expect("dropping the confinement guard must restore off-tunnel DNS send");
+        let (rt, socket) = probe_socket();
+        let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+        let marker = nonce();
+        let mut sent = Ok(());
+        let pcap = capture_udp_window(dir.path(), "filters-die-with-session", || {
+            sent = send_marker(&rt, &socket, OFF_TUNNEL_DNS.parse().expect("literal"), marker);
+        });
+
+        sent.map_err(|e| format!("dropping the confinement guard must restore off-tunnel DNS send: {e:?}"))?;
+        capture_contains_nonce(&pcap, marker).then_some(()).ok_or_else(|| {
+            "dropping the confinement guard must restore off-tunnel DNS: marker not found in the capture".to_string()
+        })
     });
-
-    assert!(
-        capture_contains_nonce(&pcap, marker),
-        "dropping the confinement guard must restore off-tunnel DNS: marker not found in the capture"
-    );
 }
 
 /// Live proof that the Shadowsocks server permit matches on port 53 too —
@@ -329,23 +348,25 @@ fn dns_confine_global_net_state_permits_the_server_on_port_53() {
     let dev = open_device("dns-confine-test-tun-g", "10.255.244.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
-    let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
+    judged_off_box("dns_confine: the server on port 53", || {
+        let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
 
-    let (rt, socket) = probe_socket();
-    let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
-    let marker = nonce();
-    let pcap = capture_udp_window(dir.path(), "permits-server-53", || {
-        send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), marker)
-            .expect("the server IP must be accepted for send on port 53");
+        let (rt, socket) = probe_socket();
+        let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+        let marker = nonce();
+        let mut sent = Ok(());
+        let pcap = capture_udp_window(dir.path(), "permits-server-53", || {
+            sent = send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), marker);
+        });
+
+        drop(confinement);
+
+        sent.map_err(|e| format!("the server IP must be accepted for send on port 53: {e:?}"))?;
+        capture_contains_nonce(&pcap, marker).then_some(()).ok_or_else(|| {
+            "the server IP must stay reachable on port 53 even though it is not the tunnel LUID: marker not found              in the capture"
+                .to_string()
+        })
     });
-
-    drop(confinement);
-
-    assert!(
-        capture_contains_nonce(&pcap, marker),
-        "the server IP must stay reachable on port 53 even though it is not the tunnel LUID: marker not found \
-         in the capture"
-    );
 }
 
 /// SHIP GATE (Task 6, #846 plan). The vendor header calls the

@@ -73,9 +73,9 @@ pub fn assert_egress_restored(what: &str, targets: &[&str], control: &str, hole_
 
 /// Wait out a lost network and report whether every host in `targets` answers.
 ///
-/// For the assertion that a lifted cover let egress back out. The first probe
-/// of `targets` is the verdict; there is no second chance, because a release
-/// that returns before egress is restored is a defect. A failure is
+/// For the assertion that a lifted cover let egress back out. A probe of
+/// `targets` that fails with the network demonstrably up is the verdict: a
+/// release that returns before egress is restored is a defect. A failure is
 ///
 /// * Hole's when `hole_state` reports a cover, at once, whatever `control` says;
 /// * the environment's when `control` fails on either side of the probe: the
@@ -101,10 +101,13 @@ pub fn check_egress_restored(
 /// For a comparison against the runner's own state (its resolver set): the
 /// network going away takes that state with it, so a reading taken while it was
 /// away is not evidence about Hole. A control probe that failed before or after
-/// the read sends it back to wait for the network and read again. A reading
-/// that disagrees with the network up on both sides is the caller's to assert on.
-pub fn read_with_network_up<T>(what: &str, control: &str, read: impl FnMut() -> T) -> T {
-    read_with_network_up_on(&mut System, what, control, read)
+/// the read sends it back to wait for the network and read again, and a cover
+/// Hole holds while it waits panics at once ([`wait_for_egress`]): a cover that
+/// blocks `control` is no network loss. A reading that disagrees with the
+/// network up on both sides is the caller's to assert on.
+#[track_caller]
+pub fn read_with_network_up<T>(what: &str, control: &str, hole_state: HoleState<'_>, read: impl FnMut() -> T) -> T {
+    read_with_network_up_on(&mut System, what, control, hole_state, read).unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// Run `scenario` (engage a cover, probe while it is engaged, tear it down) until it holds, and
@@ -291,20 +294,20 @@ pub(crate) fn read_with_network_up_on<T>(
     host: &mut impl Host,
     what: &str,
     control: &str,
+    hole_state: HoleState<'_>,
     mut read: impl FnMut() -> T,
-) -> T {
-    let no_hole_state = || None;
+) -> Result<T, String> {
     loop {
         let before = host.probe(control).is_ok();
         let reading = read();
         let after = host.probe(control).is_ok();
         if before && after {
-            return reading;
+            return Ok(reading);
         }
         tracing::warn!(
             "{what}: {control} did not answer around the reading; waiting for the network and reading again"
         );
-        wait_for_egress_on(host, what, &[control], &no_hole_state).expect("no Hole state is ever reported here");
+        wait_for_egress_on(host, what, &[control], hole_state)?;
     }
 }
 

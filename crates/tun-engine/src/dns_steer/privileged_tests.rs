@@ -90,6 +90,24 @@ fn run(cmd: &str, args: &[&str]) -> (bool, String) {
     }
 }
 
+/// The resolver set and its raw `scutil --dns` output, taken with the network answering on both sides: the
+/// runner's own resolvers vanish with its network. These tests engage no cover, so a cover that blocks the
+/// control is an earlier test's leak and fails the reading at once; the oracle reads the OS (the live pf
+/// ruleset), so the directory it is handed names nothing.
+fn resolver_set(what: &str) -> (String, Vec<String>) {
+    let no_cover_dir = tempfile::tempdir().expect("HARNESS: tempdir for the cover oracle");
+    hole_test_observability::egress::read_with_network_up(
+        what,
+        NETWORK_CONTROL,
+        &|| crate::test_utils::held_covers(no_cover_dir.path()),
+        || {
+            let dns = scutil_dns();
+            let servers = nameservers(&dns);
+            (dns, servers)
+        },
+    )
+}
+
 fn scutil_dns() -> String {
     run("scutil", &["--dns"]).1
 }
@@ -342,14 +360,7 @@ impl Drop for RouteGuard {
 /// store thread, `Steering`) — not the mechanism itself — regressed.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_steer_global_net_state_steers_the_os_resolver() {
-    // Read with the network answering on both sides: the runner's own resolvers vanish with its network,
-    // and a baseline taken then would be compared against a healthy reading afterwards.
-    let (before_dns, before_nameservers) =
-        hole_test_observability::egress::read_with_network_up("the resolver set before", NETWORK_CONTROL, || {
-            let dns = scutil_dns();
-            let servers = nameservers(&dns);
-            (dns, servers)
-        });
+    let (before_dns, before_nameservers) = resolver_set("the resolver set before");
     println!("[dns_steer] before:\n{before_dns}");
 
     // 1. Open a real utun. Name is NOT requested — kernel-assigned, read back
@@ -438,17 +449,7 @@ fn dns_steer_global_net_state_steers_the_os_resolver() {
     let out = route_guard.delete();
     println!("{out}");
 
-    // The runner's own resolvers vanish when its network does; a reading taken then says nothing about
-    // whether `withdraw` left them alone, so it is retaken once the network answers.
-    let (after_dns, after_nameservers) = hole_test_observability::egress::read_with_network_up(
-        "dns_steer: the resolver set after withdraw",
-        NETWORK_CONTROL,
-        || {
-            let dns = scutil_dns();
-            let servers = nameservers(&dns);
-            (dns, servers)
-        },
-    );
+    let (after_dns, after_nameservers) = resolver_set("dns_steer: the resolver set after withdraw");
     println!("[dns_steer] after:\n{after_dns}");
 
     println!(
