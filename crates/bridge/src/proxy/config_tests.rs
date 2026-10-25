@@ -426,6 +426,32 @@ fn an_unreadable_route_record_reaches_the_toast_as_its_file_name_only() {
     }
 }
 
+/// An Unblock released the cover this start was engaging: the user asked to be
+/// let out, so the start is cancelled and no failure toast follows.
+#[skuld::test]
+fn a_cover_released_while_engaging_cancels_the_start() {
+    let err = ProxyError::from(tun_engine::RoutingError::SupersededByRelease);
+
+    assert!(matches!(err, ProxyError::Cancelled), "{err:?}");
+    assert_eq!(
+        hole_common::protocol::StartError::from(&err),
+        hole_common::protocol::StartError::Cancelled
+    );
+}
+
+/// Only a release cancels a start; an error that merely mentions a state file does not.
+#[skuld::test]
+fn an_error_that_is_not_a_release_does_not_cancel_the_start() {
+    let path = std::path::PathBuf::from("bridge-routes.json");
+    for e in [
+        tun_engine::RoutingError::RouteSetup("x".into()),
+        tun_engine::RoutingError::StateUnreadable { path },
+    ] {
+        let converted = ProxyError::from(e);
+        assert!(!matches!(converted, ProxyError::Cancelled), "{converted:?}");
+    }
+}
+
 // Key-material classification -----------------------------------------------------------------------------------------
 //
 // The 2022-blake3 ciphers take the password as base64 key material, so

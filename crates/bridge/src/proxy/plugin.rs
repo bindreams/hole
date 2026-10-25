@@ -30,8 +30,7 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// `Drop` does not touch the plugin state file. It aborts the chain's task
 /// without knowing whether garter's teardown finished, so the plugins it
-/// records may outlive it; only [`PluginChain::kill_tracked`]'s reap, which
-/// accounts for every record, may delete it.
+/// records may outlive it; only [`PluginChain::kill_tracked`]'s reap removes them.
 pub struct PluginChain {
     task: ChainTask,
     local_addr: SocketAddr,
@@ -123,9 +122,9 @@ impl PluginChain {
         }
     }
 
-    /// Reap every tracked plugin process and clear the state file. Called
-    /// from `ProxyManager::stop` before dropping the chain, so the stop path
-    /// doesn't race with the OS reaping.
+    /// Reap every tracked plugin process and remove the records it accounted
+    /// for from the state file. Called from `ProxyManager::stop` before
+    /// dropping the chain, so the stop path doesn't race with the OS reaping.
     pub fn kill_tracked(&self) {
         let Some(ref dir) = self.state_dir else { return };
         crate::plugin_recovery::reap_recorded_plugins(dir);

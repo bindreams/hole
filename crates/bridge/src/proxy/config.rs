@@ -286,11 +286,15 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
 
 impl From<tun_engine::RoutingError> for ProxyError {
     fn from(e: tun_engine::RoutingError) -> Self {
+        if e.cancels_the_start() {
+            return ProxyError::Cancelled;
+        }
         match e {
             tun_engine::RoutingError::Gateway(s) => ProxyError::Gateway(s),
             tun_engine::RoutingError::RouteSetup(s) => ProxyError::RouteSetup(s),
             // The path is in the bridge log (tun-engine logged it); the toast names the file only.
             tun_engine::RoutingError::StateUnreadable { .. } => ProxyError::RouteSetup(e.redacted()),
+            tun_engine::RoutingError::SupersededByRelease => unreachable!("`cancels_the_start` answered it above"),
         }
     }
 }

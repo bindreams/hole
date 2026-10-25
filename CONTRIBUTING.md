@@ -897,8 +897,8 @@ leaves working DNS + broken routes, not the inverse):
   GUIDs and needs no file. See [Fail-closed cover](#fail-closed-cover).
 - **`bridge-plugins.json`** — persisted cosca process identities;
   `plugin_recovery::reap_recorded_plugins` kills survivors by exact identity —
-  no tolerance window — and deletes the file only after accounting for every
-  record it named. The same reap runs at bridge start, at chain stop, and in the
+  no tolerance window — and removes only the records it accounted for, deleting
+  the file when none remain. The same reap runs at bridge start, at chain stop, and in the
   test harness's teardown. At bridge start it runs before the boot reconcile
   (`boot::recover_then_reconcile`: route recovery, reap, reconcile): the reap
   kills every recorded plugin, so running it after would kill the auto-connect's
@@ -2087,8 +2087,8 @@ service's own state dir. Its records are not the release's to take:
 `scripts/network-reset.py`, the out-of-band escape for a host with no working
 bridge, reads `bridge-routes.json` and `bridge-dns{,.superseded}.json` out of
 `service_state_dir()` to undo a leaked bypass route or a rewritten adapter's
-DNS, and `bridge-plugins.json` may be deleted only by something that has
-accounted for every plugin in it. An uninstall is the moment those become the
+DNS, and `bridge-plugins.json` may lose a record only to something that has
+accounted for that plugin. An uninstall is the moment those become the
 *only* escape — deleting them there would leave the leak on the host with the
 record of how to undo it destroyed by the uninstall itself, which is #1003's own
 end state one layer down. Nor is the directory itself the release's:
@@ -2325,7 +2325,8 @@ Disclosed residuals:
    claim can outlive an unblock done this way. Harmless in practice — both
    public reads of the claim already fold in the persisted intent and
    short-circuit to "not armed" the moment intent reads `Off`, which
-   `handle_unblock` writes before it ever attempts the release — and the
+   `handle_unblock` writes once its release is confirmed (it releases first and
+   persists after, so a failed release leaves the Unblock item in place) — and the
    connect path calls `install_lockdown` unconditionally whenever a standing
    cover is expected, never skipping it because the claim was already `true`.
    Only `turn_lockdown_off` clears the persisted intent, so the escape still
@@ -2370,6 +2371,80 @@ one sanctioned site (`stop_with`'s own teardown), and
 documented reasons each releases directly instead of routing through the
 others. Both are blind to an added accessor under a different name; see each
 guard's own doc for its disclosed gap.
+
+#### Concurrent writers
+
+The tray's Unblock (`handle_unblock`) takes none of `ProxyManager`'s locks, so it
+runs while a start, a stop or a reconcile is mid-flight. Each thing both can
+write is ordered by something that is not that mutex:
+
+- `bridge-lockdown.json`: `lockdown_state::update` classifies, decides and writes
+  under one in-process lock. The start's adoption promotion is
+  `promote_unrecorded`, which writes only over `Unset` / `Unreadable`
+  (`Intent::admits_adoption_promotion`), so an Unblock's `Off` is never
+  overwritten.
+- `bridge-boottime.json`: a sweep takes a `Snapshot` (record and arm epoch) before
+  it deletes anything, and `apply` re-reads under the lock. An engage's
+  `record_armed` bumps the epoch, and a `Disarm` is dropped when the epoch moved:
+  `Armed` to `Armed` is invisible to a value comparison. A dropped disarm is an
+  over-report, and the next sweep makes it.
+- `bridge-plugins.json`: append, `remove_accounted` and `clear_if_unusable` run
+  under one lock, kills outside it, and so does the reap's first read (a
+  concurrent rename-replace can fail a read on Windows). A reap removes only the
+  records it accounted for; the file goes when none remain. That rewrite keeps
+  the owner of the file it replaces unless the caller names one; an append does not.
+- A cover installed after an Unblock released: `failclosed::release_epoch`.
+  Every release entry (`release_all`, `disengage_lockdown`, both through
+  `sweep_with_witness`) calls `begin_release` before its first firewall call, and
+  `handle_unblock` holds its own guard through the persisted `Off`. An install
+  opens a `ReleaseWatch` first, which refuses while a release is in flight, and
+  checks it after: the facade's `engage` / `engage_lockdown` on both platforms
+  (the cover is dropped, `SupersededByRelease`), and `start_cancellable` after
+  every `install_failclosed_cover` and `install_lockdown` (the cover is dropped,
+  the start is `Cancelled`). The epoch is two atomics per `state_dir`; a release
+  never waits for an install, which is what keeps Unblock working while a start
+  wedges. `Cover::drop` does not begin a release, so a start's own teardown cannot
+  cancel that start.
+- macOS `bridge-failclosed.json` and `bridge-lockdown-pf.json`: a `pfctl` call
+  cannot run under a lock, so these are claimed rather than locked
+  ([`pf_claim`](crates/tun-engine/src/routing/failclosed/pf_claim.rs)). A release
+  rewrites each live record as a tombstone (`releasing: true`, absent from every
+  ordinary record) before any pf call, restores, drops the token, and only then
+  clears the tombstone: a restore that fails keeps the token, a `pfctl -X` that
+  fails keeps the record, and a retry finishes either. An engage reads the record
+  at entry and writes with `swap`, a compare against that view that the epoch also
+  gates: **no engage writes once a release has begun since its watch opened**,
+  whatever the record reads, so a release's tombstone, or the unusable file it
+  could not claim, is never written over. After its ruleset loads the engage checks
+  `holds`: a tombstone, a missing record or another token is `SupersededByRelease`
+  (the start is cancelled, also for the transient cover); a record that cannot be
+  read is a failure, not a release. A token is dropped once however many parties
+  ask ([`dropped_tokens`](crates/tun-engine/src/routing/failclosed/dropped_tokens.rs)),
+  so nobody negotiates who owns it: a release, a back-out and a cover's drop each
+  drop theirs whatever became of its record, and a second ask finds it dropped.
+  The ledger is a mutex held across the `pfctl -X`, so an Unblock can wait for one
+  drop in flight. An engage whose write replaces a record that named another token
+  drops that token once the write lands: the leftover of a release that did not
+  finish, or the token salvaged from an unusable file, which nothing else names. A
+  back-out restores the baseline the engage holds in memory, then drops the
+  engage's token and clears every record naming it, a tombstone included. If the
+  restore fails it puts its record back over nothing or over the tombstone, which
+  the release then refuses to clear (the Unblock reports an error); that record
+  can name a token a release already dropped. A failed restore therefore always
+  leaves a record. A tombstone left by a failed or crashed release reads to an
+  older binary as an unusable record with its token salvaged, and an engage adopts
+  it like any leftover cover. Every pair of these parties, from every state of the
+  records, over every order of their steps, is checked by `macos_interleaving_tests`
+  (a dynamic partial-order search over the production sequencers; only pf is
+  modelled), on every host.
+
+The leaf rule: while one of these locks is held nothing else is acquired, and no
+`.await`, firewall, `pfctl` or process call runs. The dropped-token ledger is not
+one of these locks: it is held across `pfctl -X`, and nothing is acquired under it.
+
+These orderings are in-process. A second bridge, or `hole bridge unlock` run from
+a shell while a bridge is up, is not ordered by them
+([#878](https://github.com/bindreams/hole/issues/878)).
 
 ### Update cutover
 

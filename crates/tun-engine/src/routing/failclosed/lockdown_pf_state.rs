@@ -11,6 +11,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use util::ownership::{Ownership, RealOwnership};
+
+use super::pf_claim::{self, Cleared, Held};
+use super::release_epoch::ReleaseWatch;
+use super::{PfRecord, StateFile, Swap};
+use crate::exclusive::RecordLock;
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const STATE_FILE_NAME: &str = "bridge-lockdown-pf.json";
 
@@ -47,26 +54,60 @@ pub struct LockdownPfState {
     /// ones, so the default applies cleanly.
     #[serde(default = "default_true")]
     pub main_snapshot_captured: bool,
+    /// Set by a release that has claimed this record and not yet cleared it: a
+    /// tombstone. Absent from every ordinary record, so those serialize as
+    /// before and a rolled-back binary, which denies unknown fields, reads a
+    /// tombstone as `Unusable` with its token salvaged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub releasing: bool,
 }
 
 fn default_true() -> bool {
     true
 }
 
+/// Orders this record's engage compare-and-set against a release's clear. A [`RecordLock`] leaf.
+static LOCK: RecordLock = RecordLock::new(());
+
+impl PfRecord for LockdownPfState {
+    fn pf_token(&self) -> &str {
+        &self.pf_token
+    }
+
+    fn releasing(&self) -> bool {
+        self.releasing
+    }
+
+    fn with_releasing(&self, releasing: bool) -> Self {
+        Self {
+            releasing,
+            ..self.clone()
+        }
+    }
+}
+
 fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
 }
 
-pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     util::ownership::chown_if_some(state_dir, owner);
+    write_record(state_dir, state)?;
+    util::ownership::chown_if_some(&state_file(state_dir), owner);
+    Ok(())
+}
+
+/// Replace the record file atomically, leaving its owner to the caller.
+fn write_record(state_dir: &Path, state: &LockdownPfState) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let path = state_file(state_dir);
     let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
     tmp.write_all(&json)?;
+    // A unit test cannot observe a power cut, and the interleaving matrix writes
+    // records thousands of times: the flush would be most of its run time.
+    #[cfg(not(test))]
     tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
+    tmp.persist(state_file(state_dir)).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -130,12 +171,149 @@ pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
     }
 }
 
-pub fn clear(state_dir: &Path) -> std::io::Result<()> {
+/// Unconditional delete, tolerating absence. Callers hold [`LOCK`].
+fn remove_file(state_dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(state_file(state_dir)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Persist `new` iff the record still reads as `expected` (what the caller read
+/// when it started) and no release has begun since `watch` opened, as one
+/// critical section. [`Swap::Superseded`] writes nothing: a release cleared,
+/// replaced or claimed the record since, or is about to, and a record the
+/// release is settling is never written over (it would orphan the release's
+/// token), however much it reads like `expected`.
+///
+/// `expected` is the [`StateFile`] as [`load_presence`] returned it, not a
+/// collapsed `Option`: an `Unusable` record compares by its salvaged token, so
+/// an engage that found one overwrites exactly that file and no other.
+pub fn swap(
+    state_dir: &Path,
+    expected: &StateFile<LockdownPfState>,
+    new: &LockdownPfState,
+    owner: Option<(u32, u32)>,
+    watch: &ReleaseWatch,
+) -> std::io::Result<Swap> {
+    swap_with(state_dir, expected, new, owner, watch, || {})
+}
+
+/// [`swap`] with a hook that runs inside the critical section, between the
+/// compare and the write: the one place a test can observe the lock held.
+fn swap_with(
+    state_dir: &Path,
+    expected: &StateFile<LockdownPfState>,
+    new: &LockdownPfState,
+    owner: Option<(u32, u32)>,
+    watch: &ReleaseWatch,
+    in_section: impl FnOnce(),
+) -> std::io::Result<Swap> {
+    let _guard = LOCK.acquire();
+    let current = load_presence(state_dir);
+    in_section();
+    // Under the lock, so a release's claim, which takes it, either follows this
+    // write or finds the epoch moved here.
+    if watch.check().is_err() || current != *expected {
+        return Ok(Swap::Superseded);
+    }
+    save(state_dir, new, owner)?;
+    Ok(Swap::Applied)
+}
+
+/// Delete the record iff it names `token` (`None`: iff it is an unusable file that
+/// yielded none), and say whether it did. For a caller that has dropped the token it
+/// settled the cover under: no record may go on naming it, tombstone or not.
+pub fn clear_if_token(state_dir: &Path, token: Option<&str>) -> std::io::Result<bool> {
+    let _guard = LOCK.acquire();
+    if !pf_claim::names(&load_presence(state_dir), token) {
+        return Ok(false);
+    }
+    remove_file(state_dir)?;
+    Ok(true)
+}
+
+/// Claim the record for a release: rewrite a live one as its tombstone, under the
+/// lock and before any pf call. Returns the record as it now stands, so
+/// `Present(r)` with `r.releasing` is a claim on disk. A record that cannot be
+/// claimed (absent, already a tombstone, unusable) is returned as read, and so
+/// is one whose write failed: the release goes on unclaimed, because the restore
+/// matters more than the bookkeeping.
+pub fn claim_for_release(state_dir: &Path, owner: Option<(u32, u32)>) -> StateFile<LockdownPfState> {
+    claim_with(state_dir, owner, &RealOwnership, write_record)
+}
+
+/// [`claim_for_release`] over an injected [`Ownership`] and write.
+///
+/// The tombstone replaces a file this process did not necessarily create, so it
+/// keeps that file's owner (read before the replace) unless a caller asked for
+/// one. The state directory is never touched: a rewrite of a record is not a
+/// reason to hand its directory to whoever owns the record.
+fn claim_with(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    ownership: &impl Ownership,
+    write: impl FnOnce(&Path, &LockdownPfState) -> std::io::Result<()>,
+) -> StateFile<LockdownPfState> {
+    let _guard = LOCK.acquire();
+    let current = load_presence(state_dir);
+    let Some(claimed) = pf_claim::tombstone(&current) else {
+        return current;
+    };
+    let file = state_file(state_dir);
+    let file_owner = owner.or_else(|| ownership.owner_of(&file));
+    match write(state_dir, &claimed) {
+        Ok(()) => {
+            ownership.chown(&file, file_owner);
+            StateFile::Present(claimed)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %util::error_chain::error_chain(&e),
+                "lockdown-pf-state could not be claimed for release; releasing it unclaimed"
+            );
+            current
+        }
+    }
+}
+
+/// A release's final clear: remove the record only if it is the tombstone the
+/// release claimed (or an unusable file naming `token`), and say what it found
+/// ([`Cleared`]).
+pub fn clear_released(state_dir: &Path, token: Option<&str>) -> std::io::Result<Cleared> {
+    let _guard = LOCK.acquire();
+    let cleared = pf_claim::release_clear(&load_presence(state_dir), token);
+    if cleared == Cleared::Removed {
+        remove_file(state_dir)?;
+    }
+    Ok(cleared)
+}
+
+/// Put `record` back after an engage's restore failed, but only over nothing or
+/// over its own tombstone (see [`pf_claim::reasserts`]). Whether it did.
+pub fn reassert(state_dir: &Path, record: &LockdownPfState, owner: Option<(u32, u32)>) -> std::io::Result<bool> {
+    let _guard = LOCK.acquire();
+    if !pf_claim::reasserts(&load_presence(state_dir), &record.pf_token) {
+        return Ok(false);
+    }
+    save(state_dir, record, owner)?;
+    Ok(true)
+}
+
+/// What the engage's commit check found: whether the record is still the live
+/// one naming `token` ([`Held`]).
+pub fn holds(state_dir: &Path, token: &str) -> Held {
+    Held::of(&load_presence(state_dir), token)
+}
+
+/// Test-only unconditional write, for fixtures that need a record the engage
+/// paths would never produce (a deliberately broken one). Production writers
+/// go through [`swap`].
+#[cfg(test)]
+pub(crate) fn seed(state_dir: &Path, state: &LockdownPfState) {
+    let _guard = LOCK.acquire();
+    save(state_dir, state, None).expect("seed the record");
 }
 
 #[cfg(test)]

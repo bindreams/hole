@@ -778,6 +778,14 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
 async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Announced before the first firewall call and held through the persist
+    // below: a start that opened its release watch earlier, or that begins now,
+    // is cancelled instead of installing a cover this Unblock would then leave
+    // behind with the intent `Off`. Takes no lock a start holds. The persist's
+    // closure owns the guard: hyper drops this future when the client goes
+    // away, and the persist runs on regardless.
+    let release = tun_engine::routing::failclosed::begin_release(&state.state_dir);
+
     // Invalidate any transient cover guard a concurrent, lock-holding
     // `start_cancellable` may still be tracking internally — set
     // unconditionally, a no-op if nothing is tracked, reachable without
@@ -812,6 +820,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     let owner = state.owner;
     let generation = Arc::clone(&state.unblock_generation);
     let persisted = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _release = release;
         // The bump is the COMMIT hook, not part of the closure: it must not
         // announce a write that `save` then failed to make, and it must happen
         // before the exclusive lock is released so a concurrent

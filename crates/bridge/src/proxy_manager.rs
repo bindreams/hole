@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
+use tun_engine::routing::failclosed::{watch_releases, ReleaseWatch};
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
 
 use crate::reconciler::{teardown_cover_disposition, transient_cover_disposition, CoverDisposition};
@@ -865,6 +866,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             self.posture.take_pending();
         }
 
+        // Opened before this start decides anything from state an Unblock writes
+        // (the intent, the target), and checked after every cover it installs: an
+        // Unblock that begins in between is not undone by a cover installed after
+        // its release, and the start reports `Cancelled`. Refused outright while
+        // an Unblock is in flight.
+        let release_watch = self.state_dir.as_deref().map(watch_releases).transpose()?;
+
         // A (re)start supersedes any prior out-of-band death — clear the death
         // reason regardless of this attempt's outcome.
         self.death_reason = None;
@@ -1057,6 +1065,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
                 match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
+                        // Dropped here, uncommitted, if a release overtook it.
+                        overtaken_by_release(release_watch.as_ref())?;
                         self.posture.hold_pending(BlockedStart {
                             cover,
                             host: config.server.server.expose().to_string(),
@@ -1065,10 +1075,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             resolver_permit: ech_resolver_permit,
                         });
                     }
+                    // Superseded by a release: cancel, neither run uncovered nor engage again.
+                    Err(e) if e.cancels_the_start() => return Err(e.into()),
                     Err(e) => {
                         if let Some((old_permit, original_pin)) = repair_fallback {
                             match self.routing.install_failclosed_cover(server_ip, old_permit) {
                                 Ok(cover) => {
+                                    overtaken_by_release(release_watch.as_ref())?;
                                     self.posture.hold_pending(BlockedStart {
                                         cover,
                                         host: config.server.server.expose().to_string(),
@@ -1103,6 +1116,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                     }
                                     self.last_error = Some(e.to_string());
                                 }
+                                Err(e2) if e2.cancels_the_start() => return Err(e2.into()),
                                 Err(e2) => {
                                     warn!(
                                         error = %util::error_chain::error_chain(&e),
@@ -1202,6 +1216,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             lockdown_on,
             self.state_dir.as_deref(),
             self.state_owner,
+            release_watch.as_ref(),
             cancel,
         )
         .await;
@@ -1368,6 +1383,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         standing_cover_expected: bool,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
+        // The watch `start_cancellable` opened; checked after the standing cover installs.
+        release_watch: Option<&ReleaseWatch>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
@@ -1797,9 +1814,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // began before an unblock cannot install a cover after it; any other
         // fresh read (`On`, `Unreadable`, `Unset`) leaves the snapshot's own
         // verdict (which already folded in `adopted_standing_cover`) alone.
-        // This narrows, never widens, the window a full lock would close —
-        // the remaining gap is the same class of race #878 tracks and this
-        // plan does not fix.
         let standing_cover_expected = match state_dir.map(lockdown_state::load_intent) {
             Some(Intent::Off) => false,
             _ => standing_cover_expected,
@@ -1816,6 +1830,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let lockdown = if standing_cover_expected {
             match routing.install_lockdown(server_ip, &tun_identity, &app_ids) {
                 Ok(cover) => {
+                    if let Err(e) = overtaken_by_release(release_watch) {
+                        drop(cover);
+                        if let Some(mut d) = dispatcher.take() {
+                            d.shutdown().await;
+                        }
+                        return Err(e);
+                    }
                     promote_adopted_claim(state_dir, owner);
                     Some(cover)
                 }
@@ -1992,10 +2013,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     None => {}
                 }
 
-                // 2. Stop plugin chain: reap the tracked identities explicitly — the
-                // reap is the ONLY thing allowed to delete the state file, and only
-                // once it has accounted for every record — then drop, which just
-                // cancels the chain's token and aborts its task. Drop must not touch
+                // 2. Stop plugin chain: reap the tracked identities explicitly — only
+                // the reap removes records from the state file — then drop, which
+                // just cancels the chain's token and aborts its task. Drop must not touch
                 // the file: the abort cannot know whether teardown finished, so a
                 // clear there would forget still-live plugins.
                 run_phase(
@@ -2273,16 +2293,26 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
     }
 }
 
+/// `Cancelled` if a release began since `watch` opened. The caller drops the cover
+/// it just installed on `Err`.
+fn overtaken_by_release(watch: Option<&ReleaseWatch>) -> Result<(), ProxyError> {
+    match watch {
+        Some(watch) => watch.check().map_err(ProxyError::from),
+        None => Ok(()),
+    }
+}
+
 /// Write the armed state to `bridge-lockdown.json` the moment an adopted claim
 /// is first honoured by a real `install_lockdown`. A cover this bridge just
 /// installed is first-hand evidence, stronger than the startup measurement
 /// `decide_cover_recovery` grounds its own repair write in.
 ///
-/// Promotes only over `Unset`/`Unreadable` — an intent already `On` needs no
-/// write, and an explicit recorded `Off` must never be clobbered: it can race
-/// this same start (an out-of-process `hole bridge unlock` writing `Off`
-/// between `standing_cover_expected`'s snapshot and this call), and a claim is
-/// never proof the intent is still unset.
+/// Promotes only over `Unset`/`Unreadable` ([`lockdown_state::Intent::admits_adoption_promotion`]).
+/// An explicit recorded `Off` must never be clobbered: an out-of-process
+/// `hole bridge unlock` or the tray's Unblock can write it at any moment, and a
+/// claim is never proof the intent is still unset. The check and the write are
+/// one critical section ([`lockdown_state::promote_unrecorded`]), so no `Off`
+/// can land between them.
 ///
 /// Best-effort: the write only makes the preference durable, and failing the
 /// connect over a bookkeeping error would be the worse trade.
@@ -2291,13 +2321,7 @@ fn promote_adopted_claim(state_dir: Option<&std::path::Path>, owner: Option<(u32
         warn!("lockdown: standing cover installed with no state_dir; the kill switch cannot be persisted");
         return;
     };
-    if matches!(
-        lockdown_state::load_intent(dir),
-        lockdown_state::Intent::On | lockdown_state::Intent::Off
-    ) {
-        return;
-    }
-    if let Err(e) = lockdown_state::set_enabled(dir, true, owner) {
+    if let Err(e) = lockdown_state::promote_unrecorded(dir, owner) {
         warn!(error = %util::error_chain::error_chain(&e), "lockdown: could not persist the adopted kill switch; it will not survive this run");
     }
 }
