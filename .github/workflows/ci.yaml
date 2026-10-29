@@ -97,7 +97,7 @@ jobs:
           python-version: "3.x"
 
       - id: setup-uv
-        uses: astral-sh/setup-uv@v10.3.1
+        uses: astral-sh/setup-uv@v10.3.2
         timeout-minutes: 5
 
       - id: setup-build
