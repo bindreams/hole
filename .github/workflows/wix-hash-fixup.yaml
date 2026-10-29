@@ -38,7 +38,7 @@ jobs:
         with:
           token: ${{ steps.nathan.outputs.token }}
 
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@v10.3.1
 
       # `uv run` would fetch the Python dependencies outside any retry, so a
       # lost network fails the push as if the update were wrong. A stale
