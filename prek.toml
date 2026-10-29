@@ -176,7 +176,7 @@ pass_filenames = false
 # deps; pytest is their inline test runner (supplied here the same way
 # CI's "Test release scripts" step supplies it).
 # renovate: datasource=pypi depName=ty
-additional_dependencies = ["ty==0.0.65", "pathspec>=0.12", "PyYAML>=6", "pytest"]
+additional_dependencies = ["ty==0.0.91", "pathspec>=0.12", "PyYAML>=6", "pytest"]
 
 [[repos.hooks]]
 id = "validate-docs"
