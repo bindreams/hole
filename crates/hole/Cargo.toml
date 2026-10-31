@@ -55,7 +55,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 thiserror = "2"
 tempfile = "3"
-base64 = "0.22"
+base64 = "0.23"
 uuid = { version = "1", features = ["v4"] }
 contracts = "0.6"
 dirs = "7"
@@ -69,7 +69,7 @@ http = "1"
 bytes = "1"
 ureq = { version = "3", features = ["json"] }
 sha2 = "0.11"
-minisign-verify = "0.2"
+minisign-verify = "0.3"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 same-file = "1"
 
@@ -105,7 +105,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 skuld = { workspace = true }
-icns = "0.4"
+icns = "0.5"
 png = "0.18"
 hole-test-observability = { path = "../test-observability" }
 axum = { version = "0.8", default-features = false, features = ["json"] }
@@ -137,8 +137,8 @@ tauri-build = { version = "2", features = ["codegen"] }
 xtask-lib = { path = "../../xtask-lib", features = ["version", "tauri-config"] }
 # `read_from` is the loader tauri-build and tauri-codegen use; the pre-check reads the config through it.
 tauri-utils = "2"
-resvg = "0.47"
+resvg = "0.48"
 png = "0.18"
-ico = "0.5"
-icns = "0.4"
+ico = "0.6"
+icns = "0.5"
 serde_json = "1"
