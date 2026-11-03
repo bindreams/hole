@@ -25,7 +25,7 @@ use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallErro
 use crate::service_scm::hold::Look;
 use crate::service_scm::retire::{FailureActions, Opening, ServiceSession, StartConfig, StartWrite, Survivors};
 use crate::service_scm::scan::ScanFinding;
-use crate::service_scm::settle::{AwaitExitsOutcome, ExitWait, StopActor};
+use crate::service_scm::settle::{ExitWait, StopActor};
 use crate::service_scm::Observed;
 use crate::service_start::StartType;
 
@@ -129,12 +129,7 @@ impl Survivors for GoneSession {
             held = self.processes.held(),
             "waiting for the processes of a removed service entry to exit"
         );
-        match self.processes.await_exits(ExitWait::TerminateOrphansThenWait)? {
-            AwaitExitsOutcome::AllExited => Ok(()),
-            AwaitExitsOutcome::Woke => {
-                unreachable!("a wait with no interval returns only once every process has exited")
-            }
-        }
+        self.processes.await_exits(ExitWait::TerminateOrphansThenWait)
     }
 }
 
@@ -155,7 +150,7 @@ impl StopActor for RetireSession {
         self.stop.await_callback()
     }
 
-    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<AwaitExitsOutcome> {
+    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()> {
         self.stop.await_held_exits(wait)
     }
 

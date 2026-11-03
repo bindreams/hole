@@ -10,7 +10,6 @@
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::time::Duration;
 
 use tracing::{info, warn};
 use windows::Win32::Foundation::{GetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -27,7 +26,7 @@ use crate::disable_record::{creation_time_of, Stamp};
 use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::service_scm::hold::{Basis, Look, Opened, ProcessHolds, ProcessSource};
 use crate::service_scm::scan::{scan, ListedProcess, ProcessEnumerator, ScanFinding, ScanResult};
-use crate::service_scm::settle::{AwaitExitsOutcome, ExitWait};
+use crate::service_scm::settle::{ExitWait, SCM_REQUERY_MILLIS};
 
 use super::service_sid::ServiceSid;
 
@@ -287,30 +286,23 @@ impl ServiceProcesses {
     }
 
     /// Waits on every held process as `wait` says, after ending the orphans if
-    /// it says so. Without an interval ([`ExitWait::requery_interval`]) it blocks
+    /// it says so. Without an interval ([`ExitWait::requery_millis`]) it blocks
     /// until every process has exited: an external event with no bound of its
     /// own to choose (the exit of the service's own process, which the SCM has
     /// told to stop, or of an orphan [`terminate_live`](Self::terminate_live) just
-    /// ended). With one it returns [`AwaitExitsOutcome::Woke`] once a process is
-    /// still alive after the interval, and the caller looks at the SCM again.
-    pub(super) fn await_exits(&self, wait: ExitWait) -> io::Result<AwaitExitsOutcome> {
+    /// ended). With one it returns once a process is still alive after the
+    /// interval, and the caller looks at the SCM again.
+    pub(super) fn await_exits(&self, wait: ExitWait) -> io::Result<()> {
         if wait.terminates_orphans() {
             self.terminate_live()?;
         }
-        self.wait_on_each(wait.requery_interval())
+        self.wait_on_each(wait.requery_millis())
     }
 
-    /// Waits on each held process in turn, for `interval` each, or until it
-    /// exits with `None`. The one place a held process is blocked on.
-    fn wait_on_each(&self, interval: Option<Duration>) -> io::Result<AwaitExitsOutcome> {
-        let timeout = match interval {
-            None => INFINITE,
-            Some(interval) => {
-                let millis = u32::try_from(interval.as_millis()).expect("an interval that fits a wait timeout");
-                debug_assert_ne!(millis, INFINITE, "an interval is not the infinite wait");
-                millis
-            }
-        };
+    /// Waits on each held process in turn, for `millis` each, or until it exits
+    /// with `None`. The one place a held process is blocked on.
+    fn wait_on_each(&self, millis: Option<u32>) -> io::Result<()> {
+        let timeout = millis.unwrap_or(INFINITE);
         for process in self.holds.processes() {
             let handle = HANDLE(process.as_raw_handle());
             // SAFETY: `handle` is the live handle `process` owns.
@@ -318,14 +310,17 @@ impl ServiceProcesses {
             if waited == WAIT_OBJECT_0 {
                 continue;
             }
-            if waited == WAIT_TIMEOUT && interval.is_some() {
-                return Ok(AwaitExitsOutcome::Woke);
+            if waited == WAIT_TIMEOUT && millis.is_some() {
+                return Ok(());
             }
             return Err(ScmCall::WaitForSingleObject.failed_with(&io::Error::last_os_error()));
         }
-        Ok(AwaitExitsOutcome::AllExited)
+        Ok(())
     }
 }
+
+// A wake interval equal to `INFINITE` would block for ever.
+const _: () = assert!(SCM_REQUERY_MILLIS != INFINITE);
 
 #[cfg(test)]
 #[path = "service_processes_tests.rs"]

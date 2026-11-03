@@ -1988,12 +1988,12 @@ state read before its act loses that race, so four rules close it:
   notification, and every iteration of the loop ends in one of those or in a
   state a query read; nothing retries on a count, and no wake is taken for an
   answer. One wait wakes: outside STOPPED the wait on the held processes returns
-  every `SCM_REQUERY_INTERVAL` (`ExitWait::requery_interval`), because the SCM
+  every `SCM_REQUERY_MILLIS` (`ExitWait::requery_millis`), because the SCM
   sends a service marked for deletion no notification and no process exit says
   its state moved. The interval only paces re-queries of an SCM that sends
   nothing. It is not the sleep-poll `service_scm` replaced: nothing is concluded
-  from its expiry, a wake is `AwaitExitsOutcome::Woke` and never an exit, and the
-  loop looks at the SCM again and ends only on a state that look reads (STOPPED:
+  from its expiry, a wake is never taken for an exit (the wait returns the same
+  `()` either way), and the loop looks at the SCM again and ends only on a state that look reads (STOPPED:
   the orphans are terminated; RUNNING: the Stop path; a different id: the new
   one is held). A bridge that never exits on its stop hangs the uninstall. That
   is the owner's ruling: no hang of that kind is on record, so no bound is built, and
@@ -2110,7 +2110,7 @@ and waited out on process handles like any other. What Microsoft documents as 10
   this call wrote is cleared and the settle loop runs.
 - An arm that is refused with 1072 makes the loop go on without arming
   (`Settle::without_arm`): it holds what the scan finds, waits on every held
-  process (the wait wakes every `SCM_REQUERY_INTERVAL`), and looks at the SCM
+  process (the wait wakes every `SCM_REQUERY_MILLIS`), and looks at the SCM
   again whether the wait woke or the processes exited. A Stop sent to a held
   RUNNING process is waited on the same way. A look that shows the service's
   process gone (the one it named has exited, or an id no process

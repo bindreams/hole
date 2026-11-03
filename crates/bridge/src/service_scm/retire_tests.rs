@@ -6,7 +6,7 @@ use crate::disable_record::RecordState;
 use crate::service_scm::call_error::{ScmCall, ScmCallError};
 use crate::service_scm::hold::{Look, ProcessFate};
 use crate::service_scm::scan::ScanFinding;
-use crate::service_scm::settle::{AwaitExitsOutcome, ExitWait};
+use crate::service_scm::settle::ExitWait;
 use crate::service_scm::Observed;
 
 /// A look at a service whose process is held and alive.
@@ -130,9 +130,8 @@ impl StopActor for FakeSession<'_> {
     fn await_callback(&mut self) -> io::Result<()> {
         self.call("await_callback")
     }
-    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<AwaitExitsOutcome> {
-        self.call("await_held_exits")?;
-        Ok(AwaitExitsOutcome::AllExited)
+    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
+        self.call("await_held_exits")
     }
     fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
         self.call("hold_scanned")?;
@@ -1106,9 +1105,8 @@ impl StopActor for Model {
     fn await_callback(&mut self) -> io::Result<()> {
         self.step(None, |_| {})
     }
-    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<AwaitExitsOutcome> {
-        self.step(None, |_| {})?;
-        Ok(AwaitExitsOutcome::AllExited)
+    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
+        self.step(None, |_| {})
     }
     fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
         self.step(None, |_| {})?;

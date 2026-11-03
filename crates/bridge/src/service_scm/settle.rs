@@ -23,7 +23,6 @@
 //! and restart-on-failure first, as the retirement and the update cutover do.
 
 use std::io;
-use std::time::Duration;
 
 use tracing::{info, warn};
 
@@ -137,13 +136,13 @@ impl ProcessFate {
     }
 }
 
-/// How often a wait on the held processes asks the SCM again while the service is
-/// not STOPPED. The SCM sends a service marked for deletion no notification, and
+/// How often, in milliseconds, a wait on the held processes asks the SCM again
+/// while the service is not STOPPED. The SCM sends a service marked for deletion no notification, and
 /// no process exit says its state moved, so this only paces re-queries of an SCM
 /// that sends nothing. It is not a return to the sleep-poll `service_scm`
 /// replaced: nothing is concluded from its expiry, a wake with nothing changed
 /// waits again, and the loop ends only on a state a query reads.
-pub const SCM_REQUERY_INTERVAL: Duration = Duration::from_secs(2);
+pub const SCM_REQUERY_MILLIS: u32 = 2_000;
 
 /// How the wait on the held processes goes. Every wait covers every held process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +151,7 @@ pub enum ExitWait {
     /// process is on its way down, and a process only a scan found may be a live
     /// bridge's plugin still being torn down or a SID-carrying stranger that took
     /// a stale id, which only the SCM's STOPPED tells apart. The wait wakes every
-    /// [`SCM_REQUERY_INTERVAL`] for a fresh look at the SCM.
+    /// [`SCM_REQUERY_MILLIS`] for a fresh look at the SCM.
     OnTheirOwn,
     /// The SCM reports STOPPED. An orphan (a plugin left by a crashed bridge, a
     /// cutover child left suspended, or a process held only on an id the SCM
@@ -174,26 +173,14 @@ impl ExitWait {
         }
     }
 
-    /// How long a wait of this kind blocks before it wakes for a fresh look at
-    /// the SCM; `None` blocks until every process has exited.
-    pub fn requery_interval(self) -> Option<Duration> {
+    /// How many milliseconds a wait of this kind blocks before it wakes for a
+    /// fresh look at the SCM; `None` blocks until every process has exited.
+    pub fn requery_millis(self) -> Option<u32> {
         match self {
-            ExitWait::OnTheirOwn => Some(SCM_REQUERY_INTERVAL),
+            ExitWait::OnTheirOwn => Some(SCM_REQUERY_MILLIS),
             ExitWait::TerminateOrphansThenWait => None,
         }
     }
-}
-
-/// How a wait on the held processes ended. A wake is not an exit and proves
-/// nothing about either the processes or the SCM: the caller looks again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use]
-pub enum AwaitExitsOutcome {
-    /// Every process the wait covers has exited.
-    AllExited,
-    /// The wait's interval ([`ExitWait::requery_interval`]) passed with a
-    /// process still alive.
-    Woke,
 }
 
 impl Look {
@@ -224,8 +211,9 @@ pub trait StopActor {
     /// Sleep until the armed notification fires.
     fn await_callback(&mut self) -> io::Result<()>;
     /// Wait on the held processes as `wait` says: until every one has exited, or
-    /// until [`ExitWait::requery_interval`] has passed.
-    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<AwaitExitsOutcome>;
+    /// until [`ExitWait::requery_millis`] has passed. A return says neither: a
+    /// wake proves nothing about the processes or the SCM, so the caller looks.
+    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()>;
     /// Scan for the live processes that carry the service's token, other than
     /// the calling one, and hold them. Says what the scan itself found: only
     /// [`ScanFinding::Nothing`] lets the wait end.
@@ -286,7 +274,7 @@ impl SettleError {
 /// notification. The handle already open still queries and takes a Stop, so the
 /// loop goes on without arming: it holds the processes the scan finds and waits
 /// on all of them, and each time that wait exits or wakes
-/// ([`SCM_REQUERY_INTERVAL`]) it looks at the SCM again. Nothing is ended before
+/// ([`SCM_REQUERY_MILLIS`]) it looks at the SCM again. Nothing is ended before
 /// the SCM reports STOPPED. If a live state is left with no process alive, the
 /// only event is the SCM's, which cannot be asked for, and the refusal is the
 /// result.
@@ -347,9 +335,8 @@ impl<A: StopActor> Settle<'_, A> {
     /// Wait on the held processes as `wait` says, then look. An exit and a wake
     /// end alike: neither says what state the SCM is in.
     fn await_exits_then_look(&mut self, wait: ExitWait) -> Result<Next, SettleError> {
-        match self.actor.await_held_exits(wait).map_err(SettleError::AwaitExit)? {
-            AwaitExitsOutcome::AllExited | AwaitExitsOutcome::Woke => Ok(Next::Look(self.observe()?)),
-        }
+        self.actor.await_held_exits(wait).map_err(SettleError::AwaitExit)?;
+        Ok(Next::Look(self.observe()?))
     }
 
     fn await_callback(&mut self) -> Result<(), SettleError> {
