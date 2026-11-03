@@ -3508,13 +3508,12 @@ active file are all by a single name in it. A log directory the walk refuses (a
 symlink a user could have planted) disables the file sink with one line on the
 real stderr, which carries no path; the bridge keeps running.
 
-The active file never holds more than the limit, whatever the user plants in the directory. A name the rotation
-cannot be renamed over (a directory at `bridge.log.1`, a handle without delete sharing on it) sends the full file to
-`bridge.log.1.fallback` instead, replacing the one before it, so at most one such file exists; a rotation that
-reaches `bridge.log.1` again removes the fallback, which holds older lines. When neither name can take the file (the
-active file itself is held without delete sharing, or both names are directories) it stays full and the lines are
-dropped, as they are while it cannot be opened, until a rotation succeeds: a log the user can block must not fill the
-volume of the account that writes it.
+A name the rotation cannot be renamed over (a directory at `bridge.log.1`, a handle without delete sharing on it)
+sends the full file to `bridge.log.1.fallback` instead, replacing the one before it, so at most one such file exists;
+a rotation that reaches `bridge.log.1` again removes the fallback, which holds older lines. When neither name can take
+the file (the active file itself is held without delete sharing, or both names are directories) no line is lost: the
+file keeps being appended past the limit while the holder keeps it, and the next rotation that succeeds restores the
+limit. Only a file that cannot be opened loses lines, and says so once on the real stderr.
 
 ### WebView2 and Chromium logs
 

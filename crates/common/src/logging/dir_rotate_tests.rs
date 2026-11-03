@@ -221,10 +221,10 @@ fn a_rotation_that_reaches_the_rotated_name_again_removes_the_fallback(#[fixture
     assert_eq!(read(dir, "bridge.log"), bytes[200..]);
 }
 
-/// A name the rotation can take the file to, and a fallback that is a directory too: nothing can take the full file, so
-/// it stays at the limit and the lines are dropped (as when the file cannot be opened), until a name is free.
+/// Both names a rotation can take the file to are directories: nothing can take the full file, so it keeps every
+/// line and grows past the limit, until a name is free and the next rotation restores the limit.
 #[skuld::test]
-fn a_file_no_name_can_take_stays_at_the_limit_and_rotates_when_a_name_frees(#[fixture(temp_dir)] dir: &Path) {
+fn a_file_no_name_can_take_keeps_every_line_and_rotates_when_a_name_frees(#[fixture(temp_dir)] dir: &Path) {
     let bytes = stream(260);
     let mut w = writer(dir, 100);
     w.write_all(&bytes[..60]).unwrap();
@@ -233,13 +233,13 @@ fn a_file_no_name_can_take_stays_at_the_limit_and_rotates_when_a_name_frees(#[fi
 
     w.write_all(&bytes[60..200]).unwrap();
     w.flush().unwrap();
-    assert_eq!(read(dir, "bridge.log"), bytes[..100]);
+    assert_eq!(read(dir, "bridge.log"), bytes[..200]);
 
     unblock(dir, "bridge.log.1");
     w.write_all(&bytes[200..]).unwrap();
     drop(w);
 
-    assert_eq!(read(dir, "bridge.log.1"), bytes[..100]);
+    assert_eq!(read(dir, "bridge.log.1"), bytes[..200]);
     assert_eq!(read(dir, "bridge.log"), bytes[200..]);
 }
 
@@ -259,13 +259,13 @@ fn a_write_that_took_bytes_never_fails_when_the_rotation_does(#[fixture(temp_dir
     }
     drop(w);
 
-    assert_eq!(read(dir, "bridge.log"), bytes[..100]);
+    assert_eq!(read(dir, "bridge.log"), bytes);
 }
 
 /// A reader that holds the active file without sharing delete: on Windows nothing can rename it, whatever the name.
 #[cfg(windows)]
 #[skuld::test]
-fn a_file_held_without_delete_sharing_stays_at_the_limit(#[fixture(temp_dir)] dir: &Path) {
+fn a_file_held_without_delete_sharing_keeps_every_line_until_it_is_released(#[fixture(temp_dir)] dir: &Path) {
     use std::os::windows::fs::OpenOptionsExt;
 
     const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
@@ -280,13 +280,13 @@ fn a_file_held_without_delete_sharing_stays_at_the_limit(#[fixture(temp_dir)] di
 
     w.write_all(&bytes[100..]).unwrap();
     w.flush().unwrap();
-    assert_eq!(read(dir, "bridge.log"), bytes[..100]);
+    assert_eq!(read(dir, "bridge.log"), bytes);
     assert_eq!(names(dir), ["bridge.log"]);
 
     drop(holder);
     w.write_all(b"next").unwrap();
     drop(w);
-    assert_eq!(read(dir, "bridge.log.1"), bytes[..100]);
+    assert_eq!(read(dir, "bridge.log.1"), bytes);
     assert_eq!(read(dir, "bridge.log"), b"next");
 }
 
