@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 
 /// Pinned upstream `shadowsocks/v2ray-plugin` commit
 /// (`e9af1cdd2549d528deb20a4ab8d61c5fbe51f306`) — the revision Hole vendored
@@ -187,48 +187,44 @@ fn clone_build_and_install(repo_root: &Path, build_dir: &Path, bin_path: &Path) 
     // fail because the commit isn't in the shallow history. A full clone is
     // simple and reliable; the checkout is removed immediately after the
     // build, so the disk cost is transient.
-    run_git(repo_root, &["clone", UPSTREAM_REPO, &build_dir.to_string_lossy()])
-        .context("failed to clone upstream v2ray-plugin")?;
+    crate::retry::until_ok("git clone of upstream v2ray-plugin", || {
+        // A failed attempt can leave a partial checkout, which would fail the next `clone`.
+        if build_dir.exists() {
+            // Fatal: a clone cannot succeed into a directory that cannot be cleared.
+            std::fs::remove_dir_all(build_dir)
+                .with_context(|| format!("failed to remove partial clone {}", build_dir.display()))
+                .map_err(crate::retry::permanent)?;
+        }
+        run_git(repo_root, &["clone", UPSTREAM_REPO, &build_dir.to_string_lossy()])
+    })
+    .context("failed to clone upstream v2ray-plugin")?;
     run_git(build_dir, &["checkout", PINNED_COMMIT])
         .with_context(|| format!("failed to check out pinned commit {PINNED_COMMIT}"))?;
 
+    // Fetch the plugin's Go modules first, so a network loss retries here instead of failing the build.
+    let mut download = Command::new("go");
+    download.args(["mod", "download"]).current_dir(build_dir);
+    crate::retry::until_ok("go mod download (upstream v2ray-plugin)", || {
+        crate::ex_ray::run_go(&mut download)
+    })?;
+
     // Same Go invocation as `crate::ex_ray::build`: trimpath + stripped
     // symbols, CGO disabled, build the package in the current dir.
-    let status = Command::new("go")
+    let mut build = Command::new("go");
+    build
         .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
         .arg(bin_path)
         .arg(".")
         .current_dir(build_dir)
-        .env("CGO_ENABLED", "0")
-        .status();
-
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => bail!(
-            "go build of upstream v2ray-plugin failed with exit code {}",
-            s.code().unwrap_or(-1)
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(anyhow!("Go toolchain not found. Install from https://go.dev/dl/"))
-        }
-        Err(e) => Err(anyhow!("failed to run go build for upstream v2ray-plugin: {e}")),
-    }
+        .env("CGO_ENABLED", "0");
+    crate::ex_ray::run_go(&mut build)
 }
 
-/// Run `git <args>` in `cwd`, erroring with captured stderr on failure.
+/// Run `git <args>` in `cwd`, erroring with the command and captured stderr on failure.
 fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git").args(args).current_dir(cwd).output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow!("git not found on PATH (required to provision upstream v2ray-plugin)")
-        } else {
-            anyhow!("failed to run git {args:?}: {e}")
-        }
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git {args:?} failed: {}", stderr.trim());
-    }
-    Ok(())
+    crate::command::run_captured(Command::new("git").args(args).current_dir(cwd))
+        .map(|_| ())
+        .map_err(|e| crate::command::hint_if_not_found(e, "git is required to provision upstream v2ray-plugin"))
 }
 
 fn sha256_file(path: &Path) -> Result<String> {

@@ -63,7 +63,7 @@ pub async fn prompt_elevation(app: &AppHandle, request: BridgeRequest) -> Elevat
         let mut config = state.config.lock().unwrap();
         config.elevation_prompt_shown = true;
         if let Err(e) = state.config_store.save(&config) {
-            warn!(error = %e, path = %state.config_store.path().display(), "failed to persist elevation_prompt_shown");
+            warn!(error = %util::error_chain::error_chain(&e), path = %state.config_store.path().display(), "failed to persist elevation_prompt_shown");
         }
     }
 
@@ -238,21 +238,30 @@ async fn run_elevated_send(request: &BridgeRequest, subcommand: &str, req_flag: 
     let exe = match setup::bridge_binary_path() {
         Ok(p) => p,
         Err(e) => {
-            error!("cannot resolve binary path: {e}");
+            error!(
+                "cannot resolve binary path: {error}",
+                error = util::error_chain::error_chain(&e)
+            );
             return ElevationResult::LaunchFailure;
         }
     };
     let request_file = match write_request_file(request) {
         Ok(f) => f,
         Err(e) => {
-            error!("failed to write request file: {e}");
+            error!(
+                "failed to write request file: {error}",
+                error = util::error_chain::error_chain(&e)
+            );
             return ElevationResult::LaunchFailure;
         }
     };
     let result_file = match write_result_file_target() {
         Ok(f) => f,
         Err(e) => {
-            error!("failed to create result file: {e}");
+            error!(
+                "failed to create result file: {error}",
+                error = util::error_chain::error_chain(&e)
+            );
             return ElevationResult::LaunchFailure;
         }
     };
@@ -287,7 +296,10 @@ async fn run_elevated_send(request: &BridgeRequest, subcommand: &str, req_flag: 
     match &run_result {
         Ok(()) => {}
         Err(setup::SetupError::Cancelled) => info!("user cancelled elevation prompt"),
-        Err(e) => error!("elevated {subcommand} failed: {e}"),
+        Err(e) => error!(
+            "elevated {subcommand} failed: {error}",
+            error = util::error_chain::error_chain(e)
+        ),
     }
 
     // Read the child's answer before the TempPaths drop (request_file is kept

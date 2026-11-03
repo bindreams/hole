@@ -132,7 +132,7 @@ fn read_target(state_dir: &Path) -> Target {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Target::Off,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "target-state read failed; treating as no authority to connect");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "target-state read failed; treating as no authority to connect");
             return Target::Unreadable;
         }
     };
@@ -349,7 +349,7 @@ fn state_sddl() -> String {
     match current_user_sid() {
         Ok(sid) => format!("{}(A;;GA;;;{sid})", crate::ipc::SDDL_BASE),
         Err(e) => {
-            tracing::warn!(error = %e, "could not resolve this process's user SID; state DACL is admin-only");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), "could not resolve this process's user SID; state DACL is admin-only");
             crate::ipc::SDDL_BASE.to_string()
         }
     }
@@ -614,7 +614,7 @@ pub(crate) fn load_startup_preference(state_dir: &Path) -> StartupPreference {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StartupPreference::default(),
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "startup-preference read failed; using defaults");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "startup-preference read failed; using defaults");
             return StartupPreference::default();
         }
     };

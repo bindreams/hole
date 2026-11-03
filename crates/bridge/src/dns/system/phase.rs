@@ -97,7 +97,7 @@ where
         Err(e) => {
             let mapped: DnsError = e.into();
             if P::BEST_EFFORT {
-                tracing::warn!(op, error = %mapped, "DNS apply step failed; continuing");
+                tracing::warn!(op, error = %util::error_chain::error_chain(&mapped), "DNS apply step failed; continuing");
                 Ok(None)
             } else {
                 Err(mapped)

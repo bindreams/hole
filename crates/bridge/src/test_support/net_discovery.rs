@@ -33,7 +33,7 @@ use std::time::Duration;
 /// surfaces as an ownership failure blaming the wrong subsystem.
 pub(crate) struct HostNetwork {
     interfaces: Vec<default_net::Interface>,
-    primary_ipv4: Result<Ipv4Addr, String>,
+    primary_ipv4: Result<Ipv4Addr, PrimaryIpv4Error>,
 }
 
 impl HostNetwork {
@@ -62,8 +62,41 @@ impl HostNetwork {
         })
     }
 
+    /// [`read`](Self::read), taken again until the snapshot has a usable off-link route.
+    ///
+    /// The whole snapshot is retaken, not just the route, so the interface list and the route still come
+    /// from one construction. Only a [`PrimaryIpv4Error::NetworkLoss`] is waited out: a scan that failed
+    /// outright, or a route lookup refused for another reason, is returned. No cap: the CI step's
+    /// `timeout-minutes` is the bound.
+    pub(crate) fn read_when_routed() -> Result<Self, String> {
+        Self::read_when_routed_with(Self::read, || std::thread::sleep(ROUTE_POLL_INTERVAL))
+    }
+
+    pub(crate) fn read_when_routed_with(
+        mut read: impl FnMut() -> Result<Self, String>,
+        mut pause: impl FnMut(),
+    ) -> Result<Self, String> {
+        let mut last_logged: Option<String> = None;
+        loop {
+            let host = read()?;
+            match host.primary_ipv4() {
+                Ok(ip) => {
+                    if last_logged.is_some() {
+                        tracing::info!("the host has a primary IPv4 route again: {ip}");
+                    }
+                    return Ok(host);
+                }
+                Err(why) if why.is_network_loss() => {
+                    log_route_wait(&mut last_logged, why);
+                    pause();
+                }
+                Err(why) => return Err(format!("cannot detect the primary IPv4: {why}")),
+            }
+        }
+    }
+
     /// The source address the kernel picks for off-link IPv4 traffic.
-    pub(crate) fn primary_ipv4(&self) -> Result<Ipv4Addr, String> {
+    pub(crate) fn primary_ipv4(&self) -> Result<Ipv4Addr, PrimaryIpv4Error> {
         self.primary_ipv4.clone()
     }
 
@@ -88,6 +121,65 @@ impl HostNetwork {
     }
 }
 
+/// Why [`detect_primary_ipv4`] found no address.
+///
+/// The two kinds differ in what waiting does: a lost network comes back, a refusal does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrimaryIpv4Error {
+    /// The host has no network right now: the kernel has no route, or the interface holds only a
+    /// link-local address because it has no lease yet.
+    NetworkLoss(String),
+    /// Anything else (the socket cannot be made, the lookup is refused, the answer is loopback).
+    Failed(String),
+}
+
+impl PrimaryIpv4Error {
+    /// Whether the failure ends when the network returns. The one place that decides it.
+    pub(crate) fn is_network_loss(&self) -> bool {
+        match self {
+            Self::NetworkLoss(_) => true,
+            Self::Failed(_) => false,
+        }
+    }
+
+    /// Classify the error of the UDP `connect` that runs the route lookup.
+    ///
+    /// Network unreachable, host unreachable and network down are the kernel saying there is no route
+    /// (Windows reports the same three as `WSAENETUNREACH`, `WSAEHOSTUNREACH` and `WSAENETDOWN`).
+    pub(crate) fn from_connect(err: std::io::Error) -> Self {
+        match err.kind() {
+            ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::NetworkDown => {
+                Self::NetworkLoss(err.to_string())
+            }
+            _ => Self::Failed(err.to_string()),
+        }
+    }
+
+    /// Accept the source address the kernel chose, or say why it cannot be the target of a test.
+    ///
+    /// A link-local address (APIPA) is what an interface holds while it waits for a lease. Loopback and
+    /// unspecified defeat the purpose of a non-loopback target and do not change by waiting.
+    pub(crate) fn check_source(ip: Ipv4Addr) -> Result<Ipv4Addr, Self> {
+        if ip.is_link_local() {
+            return Err(Self::NetworkLoss(format!("the primary IPv4 is link-local: {ip}")));
+        }
+        if ip.is_loopback() || ip.is_unspecified() {
+            return Err(Self::Failed(format!("detected unusable primary IPv4: {ip}")));
+        }
+        Ok(ip)
+    }
+}
+
+impl std::fmt::Display for PrimaryIpv4Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NetworkLoss(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for PrimaryIpv4Error {}
+
 /// Discover a routable primary IPv4 address: ask the kernel which source it
 /// would use for off-link traffic.
 ///
@@ -96,21 +188,62 @@ impl HostNetwork {
 /// `default_net::get_default_interface()` is this same read plus a scan for
 /// the interface holding the answer, so nothing is lost by skipping it.
 ///
-/// Returns `Err` if the kernel's answer is loopback / link-local /
-/// unspecified, which would defeat the purpose of a non-loopback target.
-pub(crate) fn detect_primary_ipv4() -> Result<Ipv4Addr, String> {
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    sock.connect("8.8.8.8:53").map_err(|e| e.to_string())?;
-    match sock.local_addr().map_err(|e| e.to_string())? {
-        SocketAddr::V4(v4) => {
-            let ip = *v4.ip();
-            if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
-                Err(format!("detected unusable primary IPv4: {ip}"))
-            } else {
-                Ok(ip)
+/// Returns `Err` if the kernel has no route, or its answer is loopback /
+/// link-local / unspecified, which would defeat the purpose of a non-loopback
+/// target. [`PrimaryIpv4Error`] says which of those ends by itself.
+pub(crate) fn detect_primary_ipv4() -> Result<Ipv4Addr, PrimaryIpv4Error> {
+    let failed = |e: std::io::Error| PrimaryIpv4Error::Failed(e.to_string());
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(failed)?;
+    sock.connect("8.8.8.8:53").map_err(PrimaryIpv4Error::from_connect)?;
+    match sock.local_addr().map_err(failed)? {
+        SocketAddr::V4(v4) => PrimaryIpv4Error::check_source(*v4.ip()),
+        SocketAddr::V6(_) => Err(PrimaryIpv4Error::Failed("no IPv4 primary interface".to_string())),
+    }
+}
+
+/// How long to wait between two reads of the kernel's route while it has none.
+/// Pacing for an external event; every round re-reads the real condition.
+const ROUTE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// [`detect_primary_ipv4`], waiting while the host has no network.
+///
+/// A CI runner can lose its network for a minute, and the kernel then answers
+/// `Network is unreachable`: the environment, not the test. There is no cap; the
+/// CI step's `timeout-minutes` is the bound, and each change of the kernel's
+/// answer is logged while it waits. Any other failure is returned at once:
+/// waiting does not change it.
+pub(crate) fn wait_for_primary_ipv4() -> Result<Ipv4Addr, PrimaryIpv4Error> {
+    wait_for_primary_ipv4_with(detect_primary_ipv4, || std::thread::sleep(ROUTE_POLL_INTERVAL))
+}
+
+pub(crate) fn wait_for_primary_ipv4_with(
+    mut detect: impl FnMut() -> Result<Ipv4Addr, PrimaryIpv4Error>,
+    mut pause: impl FnMut(),
+) -> Result<Ipv4Addr, PrimaryIpv4Error> {
+    let mut last_logged: Option<String> = None;
+    loop {
+        match detect() {
+            Ok(ip) => {
+                if last_logged.is_some() {
+                    tracing::info!("the host has a primary IPv4 route again: {ip}");
+                }
+                return Ok(ip);
             }
+            Err(why) if why.is_network_loss() => {
+                log_route_wait(&mut last_logged, why);
+                pause();
+            }
+            Err(why) => return Err(why),
         }
-        SocketAddr::V6(_) => Err("no IPv4 primary interface".to_string()),
+    }
+}
+
+/// Log each change of the kernel's answer while a wait for the route goes on.
+fn log_route_wait(last_logged: &mut Option<String>, why: PrimaryIpv4Error) {
+    let why = why.to_string();
+    if last_logged.as_ref() != Some(&why) {
+        tracing::warn!("waiting for the host to have a primary IPv4 route ({why}); this is the environment, not Hole");
+        *last_logged = Some(why);
     }
 }
 

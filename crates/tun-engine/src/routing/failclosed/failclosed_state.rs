@@ -74,7 +74,7 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "failclosed-state read failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "failclosed-state read failed");
             // No bytes, so nothing to salvage a token from.
             return StateFile::Unusable { pf_token: None };
         }
@@ -90,7 +90,7 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
             StateFile::unusable(&bytes)
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "failclosed-state parse failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "failclosed-state parse failed");
             StateFile::unusable(&bytes)
         }
     }

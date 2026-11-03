@@ -95,7 +95,7 @@ windows_service::define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_arguments: Vec<OsString>) {
     if let Err(e) = run_service() {
-        error!(error = %e, "service failed");
+        error!(error = %util::error_chain::error_chain(&*e), "service failed");
     }
 }
 
@@ -278,7 +278,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let etw_guard = match crate::diagnostics::etw::start_consumer() {
             Ok(g) => Some(g),
             Err(e) => {
-                tracing::error!(error = %e, "etw consumer failed to start");
+                tracing::error!(error = %util::error_chain::error_chain(&e), "etw consumer failed to start");
                 None
             }
         };
@@ -286,7 +286,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // Returns once the connection tasks are gone, so the proxy manager's
         // last handle is the one dropped in `DropResources`.
         if let Err(e) = server.run_until(shutdown.cancelled()).await {
-            error!(error = %e, "IPC server error");
+            error!(error = %util::error_chain::error_chain(&e), "IPC server error");
         }
         info!("shutdown signal received");
 
@@ -307,7 +307,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     if let Err(e) = &run_result {
-        error!(error = %e, "bridge runtime error");
+        error!(error = %util::error_chain::error_chain(&**e), "bridge runtime error");
     }
 
     // Dropping the runtime joins blocking tasks, so `Stopped` follows it. Report
@@ -368,23 +368,9 @@ where
         });
     }
 
-    async fn recover_routes(&mut self) {
-        crate::route_recovery::recover_and_record(&self.state_dir, &self.proxy).await;
-    }
-
-    async fn reconcile(&mut self) {
+    async fn boot_sequence(&mut self) {
         // Reconcile the persisted target before any GUI or client can connect.
-        // Must run after route recovery; see reconcile_once.
-        crate::reconciler::reconcile_once(&self.state_dir, None, &self.proxy, &self.shutdown).await;
-    }
-
-    async fn reap_plugins(&mut self) {
-        let state_dir = self.state_dir.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir)).await
-        {
-            tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
-        }
+        crate::boot::recover_then_reconcile(&self.state_dir, None, &self.proxy, &self.shutdown).await;
     }
 
     async fn sweep_crash_markers(&mut self) {
@@ -438,7 +424,7 @@ fn stopped_status(exit_code: u32) -> ServiceStatus {
 /// from->to schema bump across the cutover cannot strand it.
 pub(crate) fn sweep_marker(log_dir: &Path) {
     if let Err(e) = hole_common::update_marker::clear(log_dir) {
-        tracing::warn!(error = %e, "failed to clear update-in-progress marker");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear update-in-progress marker");
     }
 }
 
@@ -488,7 +474,7 @@ pub(crate) fn sweep_old_binaries(install_dir: &Path) {
     let entries = match std::fs::read_dir(install_dir) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(error = %e, dir = %install_dir.display(), "old-binary sweep: read_dir failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), dir = %install_dir.display(), "old-binary sweep: read_dir failed");
             return;
         }
     };
@@ -500,7 +486,7 @@ pub(crate) fn sweep_old_binaries(install_dir: &Path) {
         }
         if let Err(e) = std::fs::remove_file(entry.path()) {
             // Still mapped by a live process — expected; a later start retries.
-            tracing::debug!(error = %e, file = %name, "old-binary sweep: still mapped, deferring");
+            tracing::debug!(error = %util::error_chain::error_chain(&e), file = %name, "old-binary sweep: still mapped, deferring");
         }
     }
 }

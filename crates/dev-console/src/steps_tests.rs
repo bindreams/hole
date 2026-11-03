@@ -1,5 +1,7 @@
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
+#[cfg(unix)]
+use crate::steps::run_step;
 use crate::steps::{resolve_tool, stage_dir_path, StageDirGuard};
 
 use tokio::io::AsyncReadExt as _;
@@ -268,4 +270,59 @@ async fn preflight_children_are_contained_and_reap_their_descendants() {
             "the tree teardown must reach the grandchild; got: {e:?}"
         ),
     }
+}
+
+/// A preflight root that ends by itself, normally, leaves a member that ignores `SIGTERM`; `run_step` must kill it. The
+/// root exits only once released, after the member has dialed, so the kill cannot beat the member's readiness.
+#[cfg(unix)]
+#[skuld::test]
+async fn a_step_that_ends_by_itself_kills_the_member_it_left_behind() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(std::env::current_exe().unwrap());
+    cmd.arg(std::env::current_exe().unwrap());
+    cmd.env(
+        crate::test_child::MODE_ENV,
+        "spawn-term-ignoring-grandchild-and-exit-when-released",
+    );
+    cmd.env(
+        crate::test_child::CONTROL_ENV,
+        listener.local_addr().unwrap().to_string(),
+    );
+    let mut interrupts = crate::interrupts::Interrupts::install();
+
+    let observe = async {
+        // The root announces itself with `r`, the member with `+`.
+        let mut member = None;
+        let mut root = None;
+        while member.is_none() || root.is_none() {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut byte = [0u8; 1];
+            conn.read_exact(&mut byte).await.unwrap();
+            match byte[0] {
+                b'r' => root = Some(conn),
+                b'+' => member = Some(conn),
+                other => panic!("unexpected announcement byte {other}"),
+            }
+        }
+        root.unwrap().write_all(b"x").await.unwrap();
+        // Only the member holds this connection, so the end of the stream proves it died.
+        let mut buf = [0u8; 1];
+        match member.unwrap().read(&mut buf).await {
+            Ok(0) => {}
+            Ok(n) => panic!("member sent {n} unexpected byte(s)"),
+            Err(e) => assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+                "run_step must kill a member its root left behind; got: {e:?}"
+            ),
+        }
+    };
+    let (step, ()) = tokio::join!(run_step(&mut cmd, "test step", false, &mut interrupts), observe);
+
+    step.expect("the root exited with status 0");
 }

@@ -216,8 +216,13 @@ fn run_job(leg: &Leg, ci_yaml: &str, job_id: &str, failing: Option<&str>) -> Res
     Ok(ran)
 }
 
+/// The composite action ci.yaml's diagnostic uploads go through: an
+/// `upload-artifact` step and an echo, no toolchain.
+const UPLOAD_DIAGNOSTICS_ACTION: &str = "./.github/actions/upload-diagnostics";
+
 /// Ids of the steps of `job_id` after `id` that are in `ran` and are not an
-/// artifact upload (`uses: actions/upload-artifact@…`). Whatever runs after a
+/// artifact upload (`uses: actions/upload-artifact@…` or
+/// [`UPLOAD_DIAGNOSTICS_ACTION`]). Whatever runs after a
 /// lane that corrupts the machine or leaves root-owned files must not be able
 /// to run a toolchain, and a `uses:` step can be one (`setup-build`,
 /// `setup-node`), so it is reported like a script step.
@@ -231,7 +236,7 @@ pub fn non_upload_steps_after(ci_yaml: &str, job_id: &str, id: &str, ran: &BTree
         let is_upload = step
             .uses
             .as_deref()
-            .is_some_and(|u| u.starts_with("actions/upload-artifact@"));
+            .is_some_and(|u| u.starts_with("actions/upload-artifact@") || u == UPLOAD_DIAGNOSTICS_ACTION);
         if after.iter().any(|a| a == step_id) && ran.contains(step_id) && !is_upload {
             out.push(step_id.to_string());
         }

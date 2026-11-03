@@ -282,6 +282,9 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// argument below). Closing #617 needs a cover that survives reboot on its
 /// own; see #1000.
 ///
+/// Called only from `boot::recover_then_reconcile`, which owns the order of the
+/// boot steps.
+///
 /// Must run strictly after `route_recovery::recover_and_record` completes —
 /// that call is what measures `CoverPresence` and folds a live-cover finding
 /// into the manager's `adopted_standing_cover` claim, which
@@ -333,7 +336,7 @@ pub async fn reconcile_once<P, R, D>(
         Ok(Ok(target)) => target,
         Ok(Err(error)) => {
             tracing::error!(
-                %error,
+                error = %util::error_chain::error_chain(&error),
                 "reconcile_once: failed to persist the startup-resolved target; reading current disk state instead of guessing"
             );
             target::load(state_dir)
@@ -361,7 +364,7 @@ pub async fn reconcile_once<P, R, D>(
             Phase::Cover(CoverStep::Release) => match pm.routing_handle().release_all_covers() {
                 Ok(()) => pm.set_standing_cover_adopted(false),
                 Err(error) => {
-                    tracing::warn!(%error, "reconcile_once: failed to release a stray standing cover");
+                    tracing::warn!(error = %util::error_chain::error_chain(&error), "reconcile_once: failed to release a stray standing cover");
                 }
             },
             // Engaging happens inside `start_cancellable` below, not here —
@@ -385,7 +388,7 @@ pub async fn reconcile_once<P, R, D>(
                 // switch on, which engages the STANDING cover instead; that
                 // path is untouched and still holds on failure.
                 if let Err(error) = pm.start_cancellable(config, false, cancel.child_token()).await {
-                    tracing::warn!(%error, "reconcile_once: failed to start the persisted target");
+                    tracing::warn!(error = %util::error_chain::error_chain(&error), "reconcile_once: failed to start the persisted target");
                 }
             }
             Phase::Tunnel(TunnelStep::Hold) => {}

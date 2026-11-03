@@ -96,7 +96,7 @@ fn read_state(state_dir: &Path) -> Result<LockdownState, Intent> {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Intent::Unset),
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "lockdown-state read failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "lockdown-state read failed");
             return Err(Intent::Unreadable);
         }
     };
@@ -111,7 +111,7 @@ fn read_state(state_dir: &Path) -> Result<LockdownState, Intent> {
             Err(Intent::Unreadable)
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "lockdown-state parse failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "lockdown-state parse failed");
             Err(Intent::Unreadable)
         }
     }

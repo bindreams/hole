@@ -22,14 +22,12 @@ fn sweep_wiring_reports_and_deletes_bridge_marker() {
     // context. It does NOT assert that foreground.rs / macos.rs / windows.rs
     // actually CALL sweep at the right point in the startup sequence — that
     // PLACEMENT is verified by code review, exactly as the sibling
-    // reap_recorded_plugins / recover_dns_config call placements are likewise
-    // untested (the entry-point bodies block on server.run()).
+    // recover_dns_config call placement is likewise untested (the entry-point
+    // bodies block on server.run()).
     //
-    // Route recovery is no longer in that cohort: its three ungated call sites
-    // collapsed into `route_recovery::recover_and_record`, and
-    // `recover_routes_has_exactly_one_bridge_caller` guards that there is still
-    // exactly one — because the tray escape's visibility now depends on the
-    // verdict that caller records.
+    // Route recovery, the plugin reap and the boot reconcile are not in that
+    // cohort: boot_tests.rs guards their callership and the
+    // recovery-before-reconcile and reap-before-reconcile orders.
     use garter::test_utils::WaitableWriter;
     use garter::tracing_test::set_default_in_current_thread;
 

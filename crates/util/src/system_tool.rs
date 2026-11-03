@@ -127,6 +127,14 @@ mod tools {
         }
     }
 
+    /// Starts the child in a console of its own with no window, so a console
+    /// tool spawned from a process that has no console does not open one.
+    pub(super) fn hide_console_window(command: &mut Command) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
     /// The system `powershell.exe`. Not a [`SystemTool`]: a
     /// root PowerShell autoloads cmdlets from `PSModulePath`, whose default
     /// begins with the invoking user's writable
@@ -163,6 +171,7 @@ mod tools {
         pub fn command(script: &str) -> io::Result<Command> {
             let modules = module_directory()?;
             let mut command = Command::new(Self::path()?);
+            hide_console_window(&mut command);
             command
                 .env("PSModulePath", &modules)
                 .args(["-NoProfile", "-Command"])
@@ -250,14 +259,19 @@ impl SystemTool {
     }
 
     /// The only sanctioned constructor of a `Command` for a system tool. Its
-    /// program is [`path`](Self::path), never a bare name.
+    /// program is [`path`](Self::path), never a bare name. On Windows the
+    /// command is created with `CREATE_NO_WINDOW` (see `hide_console_window`).
     ///
     /// # Errors
     ///
     /// As [`path`](Self::path).
     #[allow(clippy::disallowed_methods)] // this IS the sanctioned constructor; clippy.toml routes every other site here
     pub fn command(self) -> io::Result<Command> {
-        Ok(Command::new(self.path()?))
+        #[allow(unused_mut)]
+        let mut command = Command::new(self.path()?);
+        #[cfg(windows)]
+        tools::hide_console_window(&mut command);
+        Ok(command)
     }
 
     /// The argv text for logging: the absolute path followed by `args`. When the
@@ -305,3 +319,8 @@ fn powershell_literal(text: &str) -> String {
 #[cfg(test)]
 #[path = "system_tool_tests.rs"]
 mod system_tool_tests;
+
+#[cfg(windows)]
+#[cfg(test)]
+#[path = "system_tool_console_tests.rs"]
+mod system_tool_console_tests;

@@ -64,7 +64,7 @@ pub(crate) async fn flush_all<W: AsyncWrite + Unpin>(
 ) -> Flush {
     let tx_result = flush(tun, tx_queue, cancel).await;
     if let Flush::Failed(e) = &tx_result {
-        warn!("TUN write error: {e}");
+        warn!("TUN write error: {error}", error = util::error_chain::error_chain(e));
     }
     if matches!(tx_result, Flush::Cancelled) {
         return Flush::Cancelled;
@@ -72,7 +72,10 @@ pub(crate) async fn flush_all<W: AsyncWrite + Unpin>(
 
     let reply_result = flush(tun, replies, cancel).await;
     if let Flush::Failed(e) = &reply_result {
-        warn!("TUN write error (UDP reply): {e}");
+        warn!(
+            "TUN write error (UDP reply): {error}",
+            error = util::error_chain::error_chain(e)
+        );
     }
 
     match (tx_result, reply_result) {

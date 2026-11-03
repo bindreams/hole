@@ -12,12 +12,16 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
 from rich.console import Console
 from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TransferSpeedColumn
+from tenacity import RetryCallState, Retrying, retry_if_exception, wait_exponential_jitter
 
 _PKG_DIR = Path(__file__).resolve().parent
 WXS_PATH = _PKG_DIR / "hole.wxs"
@@ -186,8 +190,75 @@ def _accept_wix_eula(wix_exe: Path, version: str) -> None:
         )
 
 
+# Pause between download attempts: 1 s doubling to 30 s, with jitter.
+_DOWNLOAD_WAIT = wait_exponential_jitter(initial=1, max=30)
+
+
+# Client errors that ask for another try rather than naming a wrong request.
+_RETRY_LATER_STATUSES = (408, 429)
+
+
+def _nap(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _is_transient(error: BaseException) -> bool:
+    """Whether a download failure is the network's, so another attempt can succeed.
+
+    A transport failure (name resolution, connect, a body cut short), a 5xx, and a 408 or 429 (the server asking
+    for another try) are; any other 4xx names a request that is wrong (a moved or removed asset) and will be
+    wrong again.
+    """
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code >= 500 or error.response.status_code in _RETRY_LATER_STATUSES
+    return isinstance(error, httpx.TransportError)
+
+
+def _requested_wait(error: BaseException | None, now: datetime | None = None) -> float:
+    """Seconds a `Retry-After` on `error` asks for (whole seconds, or an HTTP date read against `now`), else 0."""
+    if not isinstance(error, httpx.HTTPStatusError):
+        return 0
+    value = error.response.headers.get("Retry-After", "").strip()
+    if value.isascii() and value.isdigit():
+        return int(value)
+    try:
+        date = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return 0
+    if date.tzinfo is None:
+        return 0
+    return max(0.0, (date - (now or datetime.now(timezone.utc))).total_seconds())
+
+
+def _wait_before_retry(state: RetryCallState) -> float:
+    """The backoff, or the wait the server named if that is longer."""
+    outcome = state.outcome
+    return max(_DOWNLOAD_WAIT(state), _requested_wait(outcome.exception() if outcome else None))
+
+
 def _download_and_hash(url: str, dest: Path, console: Console) -> str:
-    """Download a file and return its SHA256 hex digest."""
+    """Download a file and return its SHA256 hex digest.
+
+    A runner that loses its network mid-build must not fail the build, so a transient failure (see
+    `_is_transient`) is retried until the download completes, with no attempt cap. Anything else is raised.
+    """
+
+    def report(state) -> None:
+        console.print(f"[yellow]download of {dest.name} failed ({state.outcome.exception()!r}); retrying[/]")
+
+    for attempt in Retrying(
+        retry=retry_if_exception(_is_transient),
+        wait=_wait_before_retry,
+        sleep=lambda seconds: _nap(seconds),
+        before_sleep=report,
+        reraise=True,
+    ):
+        with attempt:
+            return _download_once(url, dest, console)
+    raise AssertionError("an uncapped Retrying yields until it returns or raises")
+
+
+def _download_once(url: str, dest: Path, console: Console) -> str:
     tmp = dest.with_suffix(".tmp")
     tmp.unlink(missing_ok=True)
 

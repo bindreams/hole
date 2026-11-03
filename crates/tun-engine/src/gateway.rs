@@ -89,19 +89,47 @@ pub fn get_default_gateway_info() -> Result<GatewayInfo, GatewayError> {
     classify_hop(hop, ipv6_available)
 }
 
+/// `default-net` reports a failed query as text only, so that text becomes the
+/// error's `source()`. `code` is `0`: `default-net` exposes no OS status, so
+/// there is none to record.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn default_net_query_failed(default_net_error: String) -> GatewayError {
+    GatewayError::RouteQueryFailed {
+        code: 0,
+        source: std::io::Error::other(default_net_error),
+    }
+}
+
+/// The OS index of the default interface `name`, which `default-net` reported
+/// at `default_net_index`. A failed lookup is logged with that index, as the
+/// Windows path does: the error's `Display` omits it, and `error_chain` renders
+/// `Display` only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn index_or_unavailable(
+    name: &str,
+    default_net_index: u32,
+    lookup: impl FnOnce(&str) -> std::io::Result<u32>,
+) -> Result<u32, GatewayError> {
+    lookup(name).map_err(|source| {
+        warn!(
+            interface_index = default_net_index,
+            error = %util::error_chain::error_chain(&source),
+            "the default interface's name does not resolve to an OS index"
+        );
+        GatewayError::InterfaceNameUnavailable {
+            interface_index: default_net_index,
+            source,
+        }
+    })
+}
+
 /// Detect the system's default gateway IP and original interface name.
 #[cfg(target_os = "macos")]
 pub fn get_default_gateway_info() -> Result<GatewayInfo, GatewayError> {
-    let iface = default_net::get_default_interface().map_err(|e| GatewayError::RouteQueryFailed {
-        code: 0,
-        source: std::io::Error::other(e),
-    })?;
+    let iface = default_net::get_default_interface().map_err(default_net_query_failed)?;
 
     let interface_alias = iface.name.clone();
-    let interface_index = interface_index_by_name(&iface.name).map_err(|e| GatewayError::InterfaceNameUnavailable {
-        interface_index: iface.index,
-        source: e,
-    })?;
+    let interface_index = index_or_unavailable(&iface.name, iface.index, interface_index_by_name)?;
     let next_hop = iface
         .gateway
         .as_ref()

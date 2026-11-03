@@ -79,3 +79,34 @@ async fn run_preserves_the_backend_error_variant() {
         "expected Err(Confine(_)), got {result:?}"
     );
 }
+
+/// A swallowed cosmetic failure leaves only the warn behind; it must name the
+/// cause that `DnsError`'s own text omits.
+#[skuld::test]
+async fn a_cosmetic_failure_logs_the_cause_chain() {
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false),
+    );
+    let result: Result<Option<()>, DnsError> = {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        run::<Cosmetic, _, io::Error>("flush-cache", || {
+            Err(crate::test_support::io_error_hiding(
+                crate::test_support::MOCK_ROOT_CAUSE,
+            ))
+        })
+        .await
+    };
+
+    assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
+    let log = writer.snapshot_string();
+    assert!(
+        log.contains(crate::test_support::MOCK_ROOT_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}

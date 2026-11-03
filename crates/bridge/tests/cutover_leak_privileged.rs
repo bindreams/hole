@@ -33,9 +33,7 @@ const TUN: skuld::Label;
 const GLOBAL_NET_STATE: skuld::Label;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::net::TcpStream;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::time::Duration;
+use hole_test_observability::egress::InCover;
 
 // Routable anycast hosts on :443 (the runner has outbound internet). The cover
 // permits the server IP and blocks everything else, so this proves no-leak.
@@ -45,13 +43,6 @@ const SERVER_IP: &str = "1.1.1.1";
 const PERMITTED: &str = "1.1.1.1:443";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const NON_PERMITTED: &str = "8.8.8.8:443";
-
-/// External-event probe with a graceful failure bound: the timeout is the
-/// failure-to-human signal, not a sync sleep; assertions are Ok/Err, not timing.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn connect(addr: &str) -> std::io::Result<TcpStream> {
-    TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5))
-}
 
 // The wire-level NIC-capture UDP no-leak proof lives in
 // `cutover_nic_capture_privileged.rs` (Windows in-box pktmon — no pcap crate /
@@ -108,48 +99,60 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
     let server_ip: std::net::IpAddr = SERVER_IP.parse().unwrap();
 
     // Baseline (PRE-cover): both hosts reachable. A failure here is a network/
-    // environment problem, not the cover -- fail loud and self-validate the probe.
-    assert!(
-        connect(PERMITTED).is_ok() && connect(NON_PERMITTED).is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts"
-    );
+    // environment problem, not the cover -- wait for the network to answer. A cover left by an
+    // earlier test fails at once instead.
+    hole_test_observability::egress::wait_for_egress("pre-cover baseline", &[PERMITTED, NON_PERMITTED], &|| {
+        tun_engine::test_utils::held_covers(dir.path())
+    });
 
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-    let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path(), None)
-        .expect("engage the real standing lockdown cover");
+    // The cover blocks every control host, so a failed permit probe tears the cover down and asks the
+    // control outside it: a lost network runs the scenario again, a live control means the permit failed.
+    let held_hole = || tun_engine::test_utils::held_covers(dir.path());
+    let verdict = hole_test_observability::egress::rerun_until_network_holds(
+        "the standing cover's permit",
+        PERMITTED,
+        &[NON_PERMITTED],
+        &held_hole,
+        || {
+            lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+            let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path(), None)
+                .expect("engage the real standing lockdown cover");
 
-    // Engaged: server permitted (permit beats block-all), others blocked (no leak).
-    assert!(
-        connect(PERMITTED).is_ok(),
-        "server-IP permit must hold while engaged: {PERMITTED}"
-    );
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "non-permitted egress must be blocked: {NON_PERMITTED}"
-    );
+            // Engaged: server permitted (permit beats block-all), others blocked (no leak). The cover is
+            // released by its guard on an early return.
+            InCover::new(PERMITTED, "server-IP permit must hold while engaged")
+                .blocked(NON_PERMITTED, "non-permitted egress must be blocked")
+                .run()?;
 
-    // The cutover-shutdown action: disarm (persist-without-disengage), NOT drop.
-    cover.disarm();
+            // The cutover-shutdown action: disarm (persist-without-disengage), NOT drop.
+            cover.disarm();
 
-    // THE INVARIANT: the block survives disarm -- the filters persist across the
-    // restart gap (server still permitted, others still blocked). A disarm that
-    // disengaged would let NON_PERMITTED through here (the leak this guards).
-    assert!(
-        connect(PERMITTED).is_ok(),
-        "server-IP permit must survive disarm: {PERMITTED}"
-    );
-    assert!(
-        connect(NON_PERMITTED).is_err(),
-        "disarm must NOT disengage the cover (leak!): {NON_PERMITTED} connected after disarm"
-    );
+            // THE INVARIANT: the block survives disarm -- the filters persist across the
+            // restart gap (server still permitted, others still blocked). A disarm that
+            // disengaged would let NON_PERMITTED through here (the leak this guards).
+            let after_disarm = InCover::new(PERMITTED, "server-IP permit must survive disarm")
+                .blocked(
+                    NON_PERMITTED,
+                    "disarm must NOT disengage the cover (leak!): connected after disarm",
+                )
+                .run();
 
-    // Cleanup: fully disengage via the persisted state (no live guard remains
-    // after disarm), restoring egress so the box is left open.
-    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
-    let _clearance_has_no_reader_in_cleanup =
-        disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
-    assert!(
-        connect(NON_PERMITTED).is_ok(),
-        "cleanup disengage must restore egress: {NON_PERMITTED}"
+            // Cleanup before any verdict: no live guard remains after disarm, so fully disengage via the
+            // persisted state, restoring egress so the box is left open whatever the verdict.
+            lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+            let _clearance_has_no_reader_in_cleanup =
+                disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
+
+            after_disarm
+        },
+    );
+    if let Err(why) = verdict {
+        panic!("{why}");
+    }
+    hole_test_observability::egress::assert_egress_restored(
+        "cleanup disengage must restore egress",
+        &[NON_PERMITTED],
+        PERMITTED,
+        &held_hole,
     );
 }

@@ -10,9 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
 #[cfg(target_os = "windows")]
-use anyhow::{anyhow, Context};
+use anyhow::Context;
+use anyhow::Result;
 
 #[cfg(target_os = "windows")]
 const WINTUN_URL: &str = "https://www.wintun.net/builds/wintun-0.14.1.zip";
@@ -52,20 +52,8 @@ fn ensure_windows(repo_root: &Path) -> Result<PathBuf> {
         // to re-download.
     }
 
-    eprintln!("xtask: downloading wintun.dll from {WINTUN_URL}");
-    let response = ureq::get(WINTUN_URL).call().context("failed to download wintun zip")?;
-
-    let zip_data = response
-        .into_body()
-        .read_to_vec()
-        .context("failed to read wintun zip response body")?;
-
-    let actual_hash = sha256_hex(&zip_data);
-    if actual_hash != WINTUN_ZIP_SHA256 {
-        return Err(anyhow!(
-            "wintun.zip hash mismatch: expected {WINTUN_ZIP_SHA256}, got {actual_hash}"
-        ));
-    }
+    // Ceiling against a runaway server; the zip is ~0.4 MiB.
+    let zip_data = crate::download::fetch_verified("wintun.dll", WINTUN_URL, 16 * 1024 * 1024, WINTUN_ZIP_SHA256)?;
 
     // Extract wintun.dll from zip — the layout inside the zip is
     // `wintun/bin/<arch>/wintun.dll`. We pin amd64.
@@ -84,11 +72,4 @@ fn ensure_windows(repo_root: &Path) -> Result<PathBuf> {
 
     eprintln!("xtask: wintun.dll downloaded and verified ({} bytes)", dll_data.len());
     Ok(dll_path)
-}
-
-#[cfg(target_os = "windows")]
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(data);
-    hash.iter().map(|b| format!("{b:02x}")).collect()
 }

@@ -40,7 +40,7 @@ tempfile = "3"
 tombstone = { path = "../tombstone" }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # WSAIoctl(SIO_UDP_CONNRESET) — see `bind_udp` in yamux.rs (#415).

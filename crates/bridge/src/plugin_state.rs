@@ -129,7 +129,7 @@ pub fn load(state_dir: &Path) -> Loaded {
             Loaded::Unusable
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "plugin-state parse failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "plugin-state parse failed");
             Loaded::Unusable
         }
     }

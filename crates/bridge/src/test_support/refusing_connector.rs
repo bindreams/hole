@@ -172,6 +172,35 @@ impl UpstreamConnector for RefusingConnector {
     }
 }
 
+// CauseHiding =========================================================================================================
+
+/// Fails every connect with an error whose `Display` omits its cause
+/// ([`crate::test_support::io_error_hiding`]), so a log site that drops
+/// `source()` loses it.
+#[derive(Debug)]
+pub(crate) struct CauseHidingConnector;
+
+impl CauseHidingConnector {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self)
+    }
+}
+
+#[async_trait::async_trait]
+impl UpstreamConnector for CauseHidingConnector {
+    async fn connect_tcp(&self, _target: SocketAddr) -> io::Result<ConnectedStream> {
+        Err(crate::test_support::io_error_hiding(
+            crate::test_support::MOCK_ROOT_CAUSE,
+        ))
+    }
+
+    async fn connect_udp(&self, _target: SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
+        Err(crate::test_support::io_error_hiding(
+            crate::test_support::MOCK_ROOT_CAUSE,
+        ))
+    }
+}
+
 // Gated ===============================================================================================================
 
 /// Publishes a signal the instant `connect_tcp` is entered, blocks until

@@ -17,10 +17,16 @@ jobs:
   publish:
     name: Verify and publish
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # Only `.github/scripts` (retry.sh) is needed from the repository.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+
       - name: Normalize and validate version
         id: version
         run: |
@@ -32,6 +38,8 @@ jobs:
       - name: Verify draft release exists with signature
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          # Wait for the API to answer (with the token: the unauthenticated limit is 60/h per shared IP), then ask once: a missing release is the answer, not a lost network.
+          .github/scripts/retry.sh gh api -X GET zen --silent
           RELEASE_JSON=$(gh release view "$TAG" --json isDraft,assets)
 
           IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')
@@ -47,11 +55,11 @@ jobs:
           fi
 
       - name: Download verification files
-        run: gh release download "${{ steps.version.outputs.tag }}" --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
+        run: .github/scripts/retry.sh gh release download "${{ steps.version.outputs.tag }}" --clobber --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
 
       - name: Install minisign
         run: |
-          curl -sL -o minisign.tar.gz https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
+          .github/scripts/retry.sh curl -fsSL -o minisign.tar.gz https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
           tar xzf minisign.tar.gz
           install minisign-linux/x86_64/minisign /usr/local/bin/minisign
           rm -rf minisign.tar.gz minisign-linux

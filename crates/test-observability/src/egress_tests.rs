@@ -1,0 +1,871 @@
+use std::cell::{Cell, RefCell};
+use std::io;
+use std::ops::Range;
+
+use super::*;
+
+const CONTROL: &str = "1.1.1.1:443";
+const TARGET: &str = "8.8.8.8:443";
+
+/// A scripted network on a clock that ticks once per probe or reading, so a test can place an outage
+/// at an exact position in the sequence of operations. Probes inside `down` fail whatever their
+/// target (the runner lost its network); outside it every probe answers, except the addresses in
+/// `blocked` (a cover that outlived its guard).
+struct Net {
+    tick: Cell<u32>,
+    down: Range<u32>,
+    blocked: &'static [&'static str],
+    /// A cover engaged on this host: while `cover` is set, only the addresses in `permits` answer.
+    cover: Cell<bool>,
+    permits: Cell<&'static [&'static str]>,
+    /// One remote host down for a stretch of ticks, whatever else the network is doing.
+    host_down: Option<(&'static str, Range<u32>)>,
+    probed: RefCell<Vec<String>>,
+    /// Whether each probe in `probed` answered, in the same order.
+    answered: RefCell<Vec<bool>>,
+    dumps: Cell<u32>,
+    pauses: Cell<u32>,
+}
+
+impl Net {
+    fn new(down: Range<u32>, blocked: &'static [&'static str]) -> Self {
+        Net {
+            tick: Cell::new(0),
+            down,
+            blocked,
+            cover: Cell::new(false),
+            permits: Cell::new(&[]),
+            host_down: None,
+            probed: RefCell::new(Vec::new()),
+            answered: RefCell::new(Vec::new()),
+            dumps: Cell::new(0),
+            pauses: Cell::new(0),
+        }
+    }
+
+    /// Advance the clock and say whether the network is up at the tick that just ran.
+    fn step(&self) -> bool {
+        let t = self.tick.get();
+        // A harness bound, not a product one: a verdict that never settles is a failed test, not a hang.
+        assert!(t < 100_000, "the scripted run never settled (a spin)");
+        self.tick.set(t + 1);
+        !self.down.contains(&t)
+    }
+
+    fn engage(&self, permits: &'static [&'static str]) {
+        self.permits.set(permits);
+        self.cover.set(true);
+    }
+
+    fn release(&self) {
+        self.cover.set(false);
+    }
+
+    fn with_host_down(mut self, addr: &'static str, ticks: Range<u32>) -> Self {
+        self.host_down = Some((addr, ticks));
+        self
+    }
+
+    /// Probe `addr` once, as a scenario does inside its cover.
+    fn reachable(&self, addr: &str) -> bool {
+        Host::probe(&mut { self }, addr).is_ok()
+    }
+
+    fn probes_of(&self, addr: &str) -> usize {
+        self.probed.borrow().iter().filter(|a| *a == addr).count()
+    }
+}
+
+impl Host for &Net {
+    fn probe(&mut self, addr: &str) -> io::Result<()> {
+        self.probed.borrow_mut().push(addr.to_string());
+        let tick = self.tick.get();
+        let up = self.step();
+        let host_down = self
+            .host_down
+            .as_ref()
+            .is_some_and(|(a, r)| *a == addr && r.contains(&tick));
+        let covered = self.cover.get() && !self.permits.get().contains(&addr);
+        let result = if !up {
+            Err(io::ErrorKind::NetworkUnreachable.into())
+        } else if host_down || covered || self.blocked.contains(&addr) {
+            Err(io::ErrorKind::TimedOut.into())
+        } else {
+            Ok(())
+        };
+        self.answered.borrow_mut().push(result.is_ok());
+        result
+    }
+
+    fn pause(&mut self) {
+        self.pauses.set(self.pauses.get() + 1);
+    }
+
+    fn dump(&mut self, _what: &str) {
+        self.dumps.set(self.dumps.get() + 1);
+    }
+}
+
+fn clean() -> Option<String> {
+    None
+}
+
+/// A failure the permit vouched for: the control and nothing else decides it.
+fn failed(why: &str) -> Failure {
+    Failure::Failed {
+        why: why.to_string(),
+        targets: Vec::new(),
+    }
+}
+
+fn wait(net: &Net, targets: &[&str], hole: HoleState<'_>) -> Result<(), String> {
+    wait_for_egress_on(&mut { net }, "t", targets, hole)
+}
+
+fn check(net: &Net, targets: &[&str], hole: HoleState<'_>) -> Result<(), String> {
+    check_egress_restored_on(&mut { net }, "t", targets, CONTROL, hole)
+}
+
+// wait_for_egress =====================================================================================================
+
+#[skuld::test]
+fn waiting_returns_only_after_the_network_is_back() {
+    let net = Net::new(0..7, &[]);
+    wait(&net, &["1.1.1.1:443", TARGET], &clean).unwrap();
+    // Each round probes both targets, so 7 failed probes span 4 rounds: 4 pauses, then a clean round.
+    assert_eq!(net.pauses.get(), 4);
+    assert!(net.tick.get() >= 7, "returned before the network was back");
+}
+
+#[skuld::test]
+fn the_os_is_dumped_once_however_long_the_wait() {
+    let net = Net::new(0..9, &[]);
+    wait(&net, &[TARGET], &clean).unwrap();
+    assert_eq!(net.dumps.get(), 1);
+}
+
+#[skuld::test]
+fn nothing_is_dumped_when_the_network_never_failed() {
+    let net = Net::new(0..0, &[]);
+    wait(&net, &[TARGET], &clean).unwrap();
+    assert_eq!(net.dumps.get(), 0);
+}
+
+#[skuld::test]
+fn an_unreachable_target_with_hole_state_installed_fails_at_once() {
+    // A cover left behind by an earlier test: waiting for the network would wait forever.
+    let net = Net::new(0..0, &[TARGET]);
+    let err = wait(&net, &[TARGET], &|| Some("a lockdown cover".to_string())).unwrap_err();
+    assert!(err.contains("a lockdown cover"), "{err}");
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn hole_state_is_consulted_again_every_round() {
+    // The oracle answers "nothing" for the first round and "a cover" afterwards.
+    let net = Net::new(0..100, &[]);
+    let asked = Cell::new(0);
+    let err = wait(&net, &[TARGET], &|| {
+        asked.set(asked.get() + 1);
+        (asked.get() > 1).then(|| "a cover".to_string())
+    })
+    .unwrap_err();
+    assert!(err.contains("a cover"), "{err}");
+    assert_eq!(net.pauses.get(), 1);
+}
+
+// check_egress_restored ===============================================================================================
+
+#[skuld::test]
+fn a_lost_network_is_waited_out_and_the_target_then_answers() {
+    let net = Net::new(0..9, &[]);
+    check(&net, &[TARGET], &clean).unwrap();
+    assert!(net.tick.get() >= 9, "returned before the network was back");
+}
+
+fn a_cover() -> Option<String> {
+    Some("a lockdown cover".to_string())
+}
+
+#[skuld::test]
+fn a_target_down_while_the_control_answers_and_hole_holds_nothing_is_waited_for() {
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 0..12);
+    check(&net, &[TARGET], &clean).unwrap();
+    assert!(net.pauses.get() > 0);
+}
+
+#[skuld::test]
+fn a_target_down_while_the_control_answers_and_hole_holds_a_cover_is_a_defect() {
+    let net = Net::new(0..0, &[TARGET]);
+    let err = check(&net, &[TARGET], &a_cover).unwrap_err();
+    assert!(err.contains("a lockdown cover"), "{err}");
+}
+
+#[skuld::test]
+fn a_cover_found_while_waiting_for_a_target_that_is_down_is_a_defect() {
+    // Down on its own at first, then a cover appears: the wait ends as a defect.
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 0..u32::MAX);
+    let asked = Cell::new(0);
+    let err = check(&net, &[TARGET], &|| {
+        asked.set(asked.get() + 1);
+        (asked.get() > 2).then(|| "a cover".to_string())
+    })
+    .unwrap_err();
+    assert!(err.contains("a cover"), "{err}");
+}
+
+#[skuld::test]
+fn a_blocked_target_is_probed_once_not_twice() {
+    // The assertion is immediate: a release that returns before egress is restored must not pass on a
+    // second probe taken seconds later.
+    let net = Net::new(0..0, &[TARGET]);
+    let _ = check(&net, &[TARGET], &a_cover);
+    assert_eq!(net.probes_of(TARGET), 1);
+}
+
+#[skuld::test]
+fn a_cover_left_behind_fails_at_once_even_though_the_control_fails_too() {
+    // A partial release: the control's own permit is gone with the rest, so both fail. Without the
+    // oracle that reads as a lost network and waits forever.
+    let net = Net::new(0..u32::MAX, &[]);
+    let err = check(&net, &[TARGET], &|| Some("the lockdown block-all".to_string())).unwrap_err();
+    assert!(err.contains("the lockdown block-all"), "{err}");
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn an_outage_that_ends_right_after_the_target_failed_is_not_a_defect() {
+    // control fails (tick 0), target fails (tick 1), control answers (tick 2): the control answering
+    // afterwards says nothing about the network when the target was probed.
+    let net = Net::new(0..2, &[]);
+    check(&net, &[TARGET], &clean).unwrap();
+}
+
+#[skuld::test]
+fn the_log_blames_the_environment_only_when_hole_holds_nothing() {
+    // Hole holds nothing while the network is down: the wait is the environment's.
+    let net = Net::new(0..4, &[]);
+    check(&net, &[TARGET], &clean).unwrap();
+    assert_eq!(net.dumps.get(), 1);
+}
+
+#[skuld::test]
+fn every_target_must_answer_not_just_the_first() {
+    let net = Net::new(0..0, &["1.0.0.1:853"]);
+    let err = check(&net, &["8.8.8.8:443", "1.0.0.1:853"], &a_cover).unwrap_err();
+    assert!(err.contains("1.0.0.1:853"), "{err}");
+}
+
+// read_with_network_up ================================================================================================
+
+#[skuld::test]
+fn a_reading_taken_as_the_network_returns_is_retaken() {
+    // The outage covers only the first operation (the control probe before the read), so the reading is retaken.
+    let net = Net::new(0..1, &[]);
+    let readings = Cell::new(0);
+    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+        readings.set(readings.get() + 1);
+        Ok::<_, String>(if net.step() { 1 } else { 0 })
+    })
+    .unwrap();
+    assert_eq!(reading, 1);
+    assert_eq!(readings.get(), 2);
+}
+
+#[skuld::test]
+fn a_reading_taken_during_an_outage_is_retaken() {
+    let net = Net::new(1..6, &[]);
+    let readings = Cell::new(0);
+    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+        readings.set(readings.get() + 1);
+        Ok::<_, String>(if net.step() { 1 } else { 0 })
+    })
+    .unwrap();
+    assert_eq!(reading, 1);
+    assert!(readings.get() >= 2);
+}
+
+#[skuld::test]
+fn a_reading_with_the_network_up_on_both_sides_is_returned_as_it_is() {
+    // A disagreement the network cannot explain is the caller's to assert on.
+    let net = Net::new(0..0, &[]);
+    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+        net.step();
+        Ok::<_, String>(0)
+    })
+    .unwrap();
+    assert_eq!(reading, 0);
+}
+
+#[skuld::test]
+fn a_resolver_set_reading_is_retaken_after_a_network_loss() {
+    // The shape the macOS resolver-set tests use: a reading is a (raw output, parsed set) pair.
+    let net = Net::new(1..4, &[]);
+    let (raw, servers) = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+        let raw = if net.step() { "nameserver[0] : 192.168.64.1" } else { "" };
+        let servers: Vec<String> = raw.lines().map(str::to_owned).collect();
+        Ok::<_, String>((raw.to_string(), servers))
+    })
+    .unwrap();
+    assert_eq!(servers, vec!["nameserver[0] : 192.168.64.1".to_string()]);
+    assert!(raw.contains("192.168.64.1"));
+}
+
+#[skuld::test]
+fn a_reading_taken_while_hole_holds_a_cover_and_the_control_is_down_fails_at_once() {
+    // A cover left by an earlier test blocks the control, so waiting for the network would never end.
+    let net = Net::new(0..0, &[CONTROL]);
+    let err = read_with_network_up_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &|| Some("a lockdown cover".to_string()),
+        || Ok::<_, String>(1),
+    )
+    .unwrap_err();
+    assert!(err.contains("a lockdown cover"), "{err}");
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn a_cover_found_while_waiting_out_a_network_loss_fails_the_reading() {
+    // The control drops out around the first reading; the cover is only seen on a later round.
+    let net = Net::new(1..6, &[]);
+    let polls = Cell::new(0);
+    let hole = || {
+        polls.set(polls.get() + 1);
+        (polls.get() >= 2).then(|| "a transient cover".to_string())
+    };
+    let err = read_with_network_up_on(&mut { &net }, "t", CONTROL, &hole, || Ok::<_, String>(1)).unwrap_err();
+    assert!(err.contains("a transient cover"), "{err}");
+    assert_eq!(net.pauses.get(), 1);
+}
+
+#[skuld::test]
+fn a_reading_that_fails_with_the_network_up_is_the_verdict_not_retaken() {
+    let net = Net::new(0..0, &[]);
+    let tries = Cell::new(0);
+    let err = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+        tries.set(tries.get() + 1);
+        Err::<u32, _>("no default route")
+    })
+    .unwrap_err();
+    assert!(err.contains("no default route"), "{err}");
+    assert_eq!(tries.get(), 1);
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn a_reading_that_fails_during_an_outage_is_retaken_not_returned() {
+    // Probe before the read answers (tick 0); the read fails at tick 1 and the probe after it (tick 2) is
+    // down: the failure belongs to the outage, so the read is taken again once the control answers.
+    let net = Net::new(1..4, &[]);
+    let tries = Cell::new(0);
+    let reading = read_with_network_up_on(&mut { &net }, "t", CONTROL, &clean, || {
+        tries.set(tries.get() + 1);
+        if net.step() {
+            Ok(7)
+        } else {
+            Err("no default route")
+        }
+    })
+    .unwrap();
+    assert_eq!(reading, 7);
+    assert_eq!(tries.get(), 2, "the failed reading was returned instead of retaken");
+    assert!(net.pauses.get() >= 1);
+}
+
+// rerun_until_network_holds ===========================================================================================
+
+fn scenario_result<T>(
+    net: &Net,
+    hole: HoleState<'_>,
+    scenario: impl FnMut() -> Result<T, Failure>,
+) -> Result<T, String> {
+    rerun_until_network_holds_on(&mut { net }, "t", CONTROL, &[], hole, scenario)
+}
+
+#[skuld::test]
+fn a_scenario_that_failed_while_the_network_was_down_is_rerun_until_it_holds() {
+    // The control answers at open (tick 0); the outage then covers the in-cover probe and the judge.
+    let net = Net::new(1..6, &[]);
+    let runs = Cell::new(0);
+    let out = scenario_result(&net, &clean, || {
+        runs.set(runs.get() + 1);
+        // The in-cover probe fails exactly while the network is down.
+        if net.step() {
+            Ok("held")
+        } else {
+            Err(failed("the permit probe failed"))
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(runs.get(), 2);
+}
+
+#[skuld::test]
+fn a_scenario_that_left_a_cover_behind_is_a_defect_even_with_the_network_down() {
+    let cover = Cell::new(false);
+    let net = Net::new(1..u32::MAX, &[]);
+    let err = scenario_result(
+        &net,
+        &|| cover.get().then(|| "the transient cover".to_string()),
+        || -> Result<(), Failure> {
+            cover.set(true);
+            Err(failed("the permit probe failed"))
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("the transient cover"), "{err}");
+}
+
+#[skuld::test]
+fn a_blocked_host_that_is_down_after_a_run_that_held_is_waited_for_and_the_run_repeated() {
+    // The host answers at open (ticks 0..2), then is down for the probe after the first run and answers again later.
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 2..6);
+    let runs = Cell::new(0);
+    let out = rerun_until_network_holds_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &[TARGET],
+        &clean,
+        || -> Result<_, Failure> {
+            runs.set(runs.get() + 1);
+            Ok("held")
+        },
+    )
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(
+        runs.get(),
+        2,
+        "a block claim was passed over a host that was down outside the cover"
+    );
+    assert!(
+        net.pauses.get() >= 1,
+        "the down host was not waited for before the repeat"
+    );
+}
+
+#[skuld::test]
+fn a_blocked_host_that_answers_after_a_run_that_held_ends_it() {
+    let net = Net::new(0..0, &[]);
+    let runs = Cell::new(0);
+    rerun_until_network_holds_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &[TARGET],
+        &clean,
+        || -> Result<_, Failure> {
+            runs.set(runs.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(runs.get(), 1);
+    assert_eq!(net.probes_of(TARGET), 2, "one probe at open and one after the run");
+}
+
+#[skuld::test]
+fn a_blocked_host_that_is_down_after_a_run_that_left_a_cover_is_a_defect() {
+    let cover = Cell::new(false);
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 2..u32::MAX);
+    let err = rerun_until_network_holds_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &[TARGET],
+        &|| cover.get().then(|| "the transient cover".to_string()),
+        || -> Result<(), Failure> {
+            cover.set(true);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("the transient cover"), "{err}");
+}
+
+#[skuld::test]
+fn the_async_runner_also_probes_the_blocked_hosts_after_a_run_that_held() {
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 2..6);
+    let runs = Cell::new(0);
+    ready(rerun_until_network_holds_async_on(
+        &mut { &net },
+        "t",
+        CONTROL,
+        &[TARGET],
+        &clean,
+        async || -> Result<(), Failure> {
+            runs.set(runs.get() + 1);
+            Ok(())
+        },
+    ))
+    .unwrap();
+    assert_eq!(runs.get(), 2);
+}
+
+// The async entry points ==============================================================================================
+
+/// Run a future that never pends on the scripted host.
+fn ready<F: std::future::Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(out) => out,
+        std::task::Poll::Pending => panic!("the scripted run pended"),
+    }
+}
+
+fn async_scenario_result<T>(
+    net: &Net,
+    hole: HoleState<'_>,
+    scenario: impl AsyncFnMut() -> Result<T, Failure>,
+) -> Result<T, String> {
+    ready(rerun_until_network_holds_async_on(
+        &mut { net },
+        "t",
+        CONTROL,
+        &[],
+        hole,
+        scenario,
+    ))
+}
+
+fn uncovered_result<T>(
+    net: &Net,
+    hole: HoleState<'_>,
+    step: impl AsyncFnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    ready(rerun_uncovered_on(&mut { net }, "t", CONTROL, hole, step))
+}
+
+#[skuld::test]
+fn an_async_scenario_that_failed_while_the_network_was_down_is_rerun_until_it_holds() {
+    let net = Net::new(1..6, &[]);
+    let runs = Cell::new(0);
+    let out = async_scenario_result(&net, &clean, async || {
+        runs.set(runs.get() + 1);
+        if net.step() {
+            Ok("held")
+        } else {
+            Err(failed("the permit probe failed"))
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(runs.get(), 2);
+}
+
+#[skuld::test]
+fn an_async_scenario_that_fails_with_the_control_answering_on_both_sides_is_not_rerun() {
+    let net = Net::new(0..0, &[]);
+    let runs = Cell::new(0);
+    let err = async_scenario_result(&net, &clean, async || -> Result<(), Failure> {
+        runs.set(runs.get() + 1);
+        Err(failed("the permit probe failed"))
+    })
+    .unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("answer outside the cover"), "{err}");
+    assert_eq!(runs.get(), 1);
+}
+
+#[skuld::test]
+fn an_async_scenario_that_left_a_cover_behind_is_a_defect_even_with_the_network_down() {
+    let cover = Cell::new(false);
+    let net = Net::new(1..u32::MAX, &[]);
+    let err = async_scenario_result(
+        &net,
+        &|| cover.get().then(|| "the transient cover".to_string()),
+        async || -> Result<(), Failure> {
+            cover.set(true);
+            Err(failed("the permit probe failed"))
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("the transient cover"), "{err}");
+}
+
+#[skuld::test]
+fn an_uncovered_step_is_bracketed_by_the_control_and_returned_when_it_holds() {
+    let net = Net::new(0..0, &[]);
+    let out = uncovered_result(&net, &clean, async || {
+        // The control was probed once at open and once just before the step.
+        assert_eq!(net.probes_of(CONTROL), 2);
+        Ok::<_, String>("held")
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(net.probes_of(CONTROL), 2, "a step that holds is not probed after");
+}
+
+#[skuld::test]
+fn an_uncovered_step_that_failed_during_an_outage_is_rerun_after_it() {
+    // Open answers (tick 0); the outage then covers the before-probe and the after-probe.
+    let net = Net::new(1..5, &[]);
+    let runs = Cell::new(0);
+    let out = uncovered_result(&net, &clean, async || {
+        runs.set(runs.get() + 1);
+        if runs.get() == 1 {
+            Err("Start did not Ack".to_string())
+        } else {
+            Ok("held")
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(runs.get(), 2);
+}
+
+#[skuld::test]
+fn an_uncovered_step_that_failed_while_the_control_blinked_after_it_is_rerun() {
+    // The control answers at open and before the step (ticks 0, 1), is down for the probe after it (tick 2)
+    // and answers again by the time the judge asks, so only that bracketing probe shows the outage.
+    let net = Net::new(2..3, &[]);
+    let runs = Cell::new(0);
+    let out = uncovered_result(&net, &clean, async || {
+        runs.set(runs.get() + 1);
+        if runs.get() == 1 {
+            Err("Start did not Ack".to_string())
+        } else {
+            Ok("held")
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(runs.get(), 2);
+}
+
+#[skuld::test]
+fn an_uncovered_step_that_failed_while_the_control_blinked_before_it_is_rerun() {
+    // The control answers at open (tick 0), is down for the probe before the step (tick 1) and answers
+    // from then on, so only that bracketing probe shows the outage.
+    let net = Net::new(1..2, &[]);
+    let runs = Cell::new(0);
+    let out = uncovered_result(&net, &clean, async || {
+        runs.set(runs.get() + 1);
+        if runs.get() == 1 {
+            Err("Start did not Ack".to_string())
+        } else {
+            Ok("held")
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    assert_eq!(runs.get(), 2);
+}
+
+#[skuld::test]
+fn an_uncovered_step_that_failed_with_the_control_answering_around_it_is_a_defect() {
+    let net = Net::new(0..0, &[]);
+    let runs = Cell::new(0);
+    let err = uncovered_result(&net, &clean, async || -> Result<(), String> {
+        runs.set(runs.get() + 1);
+        Err("Start did not Ack".to_string())
+    })
+    .unwrap_err();
+    assert!(err.contains("Start did not Ack"), "{err}");
+    assert_eq!(runs.get(), 1);
+}
+
+// Window ==============================================================================================================
+
+fn open<'a>(net: &Net, hole: HoleState<'a>) -> Result<Window<'a>, String> {
+    open_window_on(&mut { net }, "t", CONTROL, &[], hole)
+}
+
+fn judge(net: &Net, window: Window<'_>, why: &str) -> Result<(), String> {
+    judge_on(&mut { net }, window, failed(why))
+}
+
+#[skuld::test]
+fn a_window_opens_only_once_the_control_answers() {
+    let net = Net::new(0..2, &[]);
+    open(&net, &clean).unwrap();
+    assert_eq!(net.probes_of(CONTROL), 3);
+}
+
+#[skuld::test]
+fn a_window_opens_only_once_every_blocked_host_answers_too() {
+    // The control answers throughout; the blocked host is down on its own for the first 6 ticks.
+    let net = Net::new(0..0, &[]).with_host_down(TARGET, 0..6);
+    open_window_on(&mut { &net }, "t", CONTROL, &[TARGET], &clean).unwrap();
+    assert_eq!(net.probes_of(TARGET), 4);
+    assert_eq!(net.pauses.get(), 3);
+}
+
+#[skuld::test]
+fn a_window_does_not_wait_for_a_blocked_host_while_hole_holds_a_cover() {
+    // A blocked host that fails while Hole holds a cover is not a network loss: it fails at once.
+    let net = Net::new(0..0, &[TARGET]);
+    let err = open_window_on(&mut { &net }, "t", CONTROL, &[TARGET], &|| {
+        Some("a leaked cover".to_string())
+    })
+    .err()
+    .expect("opened over a cover");
+    assert!(err.contains("a leaked cover"), "{err}");
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn a_window_does_not_open_while_hole_holds_a_cover_and_the_control_fails() {
+    let net = Net::new(0..u32::MAX, &[]);
+    let err = open(&net, &|| Some("a leaked cover".to_string()))
+        .err()
+        .expect("opened over a cover");
+    assert!(err.contains("a leaked cover"), "{err}");
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn a_window_does_not_open_over_a_cover_the_control_can_still_reach_through() {
+    // The control answers but Hole still holds a cover: the run would start from a dirty host.
+    let net = Net::new(0..0, &[]);
+    let err = open(&net, &|| Some("a leaked cover".to_string()))
+        .err()
+        .expect("opened over a cover");
+    assert!(err.contains("a leaked cover"), "{err}");
+}
+
+#[skuld::test]
+fn a_failed_run_with_the_control_answering_on_both_sides_is_a_defect() {
+    let net = Net::new(0..0, &[]);
+    let window = open(&net, &clean).unwrap();
+    let err = judge(&net, window, "the permit probe failed").unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("answer outside the cover"), "{err}");
+}
+
+#[skuld::test]
+fn a_failed_run_with_the_control_down_afterwards_is_excused_and_waited_out() {
+    // tick 0: control answers at open; tick 1..4: down at judge; the wait probes the control until it answers.
+    let net = Net::new(1..4, &[]);
+    let window = open(&net, &clean).unwrap();
+    judge(&net, window, "the permit probe failed").unwrap();
+    assert_eq!(*net.answered.borrow(), [true, false, false, false, true]);
+    assert!(net.probed.borrow().iter().all(|a| a == CONTROL));
+}
+
+#[skuld::test]
+fn a_failed_run_that_left_a_cover_is_a_defect_with_the_control_down() {
+    // The oracle reports nothing at open and a cover after the run: waiting for the control would wait forever.
+    let cover = Cell::new(false);
+    let hole = || cover.get().then(|| "the transient cover".to_string());
+    let net = Net::new(1..u32::MAX, &[]);
+    let window = open(&net, &hole).unwrap();
+    cover.set(true);
+    let err = judge(&net, window, "the permit probe failed").unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("the transient cover"), "{err}");
+    assert_eq!(
+        net.probes_of(CONTROL),
+        1,
+        "the control was waited on after a cover was found"
+    );
+    assert_eq!(net.pauses.get(), 0);
+}
+
+#[skuld::test]
+fn an_outage_before_the_window_is_not_charged_to_the_run() {
+    // The control is down at open and answers by the time the scenario starts.
+    let net = Net::new(0..3, &[]);
+    let window = open(&net, &clean).unwrap();
+    let started = net.tick.get();
+    assert!(started >= 3, "the window opened inside the outage");
+    let err = judge(&net, window, "the permit probe failed").unwrap_err();
+    assert!(err.contains("answer outside the cover"), "{err}");
+}
+
+#[skuld::test]
+fn every_rerun_is_preceded_by_a_control_probe_that_answered() {
+    // Run 1 fails with the control down at judge (ticks 1..4); run 2 holds.
+    let net = Net::new(1..4, &[]);
+    let starts = RefCell::new(Vec::new());
+    let out = scenario_result(&net, &clean, || {
+        starts.borrow_mut().push((net.probed.borrow().len(), net.tick.get()));
+        if starts.borrow().len() == 1 {
+            Err(failed("the permit probe failed"))
+        } else {
+            Ok("held")
+        }
+    })
+    .unwrap();
+    assert_eq!(out, "held");
+    let starts = starts.into_inner();
+    assert_eq!(starts.len(), 2, "the scenario must be rerun exactly once");
+    let (probes_at_rerun, tick_at_rerun) = starts[1];
+    assert!(tick_at_rerun >= 4, "the rerun started inside the outage");
+    assert!(
+        net.answered.borrow()[probes_at_rerun - 1],
+        "the last probe before the rerun did not answer"
+    );
+    assert_eq!(net.probed.borrow()[probes_at_rerun - 1], CONTROL);
+}
+
+#[skuld::test]
+fn a_scenario_that_fails_with_the_control_answering_on_both_sides_is_not_rerun() {
+    let net = Net::new(0..0, &[]);
+    let runs = Cell::new(0);
+    let err = scenario_result(&net, &clean, || -> Result<(), Failure> {
+        runs.set(runs.get() + 1);
+        Err(failed("the permit probe failed"))
+    })
+    .unwrap_err();
+    assert!(err.contains("the permit probe failed"), "{err}");
+    assert!(err.contains("answer outside the cover"), "{err}");
+    assert_eq!(runs.get(), 1);
+}
+
+// connect_when_reachable ==============================================================================================
+
+#[skuld::test]
+fn a_connection_lost_between_the_wait_and_the_connect_is_opened_on_the_next_round() {
+    // tick 0: the wait's probe answers; tick 1: the connect lands in an outage; then the network is back.
+    let net = Net::new(1..2, &[]);
+    let opened = connect_when_reachable_on(&mut { &net }, "t", TARGET, &clean, |_| {
+        if net.step() {
+            Ok("held")
+        } else {
+            Err(io::ErrorKind::NetworkUnreachable.into())
+        }
+    })
+    .unwrap();
+    assert_eq!(opened, "held");
+}
+
+#[skuld::test]
+fn a_connection_that_keeps_failing_after_an_answered_probe_is_paced_not_spun() {
+    let net = Net::new(0..0, &[]);
+    let tries = Cell::new(0);
+    connect_when_reachable_on(&mut { &net }, "t", TARGET, &clean, |_| {
+        tries.set(tries.get() + 1);
+        if tries.get() < 3 {
+            Err(io::ErrorKind::ConnectionRefused.into())
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(net.pauses.get(), 2);
+}
+
+#[skuld::test]
+fn a_connection_is_not_awaited_while_hole_holds_a_cover() {
+    let net = Net::new(0..0, &[TARGET]);
+    let err = connect_when_reachable_on(&mut { &net }, "t", TARGET, &|| Some("a cover".to_string()), |_| {
+        Ok::<(), io::Error>(())
+    })
+    .unwrap_err();
+    assert!(err.contains("a cover"), "{err}");
+}
+
+#[path = "egress_matrix_tests.rs"]
+mod matrix;
+
+#[path = "egress_in_cover_tests.rs"]
+mod in_cover;

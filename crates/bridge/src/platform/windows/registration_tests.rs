@@ -101,14 +101,8 @@ impl StartupSteps for RecordingStartup<'_> {
     fn forward_shutdown(&mut self) {
         self.log.borrow_mut().push("forward_shutdown");
     }
-    async fn recover_routes(&mut self) {
-        self.log.borrow_mut().push("recover_routes");
-    }
-    async fn reconcile(&mut self) {
-        self.log.borrow_mut().push("reconcile");
-    }
-    async fn reap_plugins(&mut self) {
-        self.log.borrow_mut().push("reap_plugins");
+    async fn boot_sequence(&mut self) {
+        self.log.borrow_mut().push("boot_sequence");
     }
     async fn sweep_crash_markers(&mut self) {
         self.log.borrow_mut().push("sweep_crash_markers");
@@ -139,9 +133,7 @@ fn every_startup_step_runs_exactly_once() {
         "repairs",
         "recover_dns",
         "forward_shutdown",
-        "recover_routes",
-        "reconcile",
-        "reap_plugins",
+        "boot_sequence",
         "sweep_crash_markers",
         "sweep_old_binaries",
     ];
@@ -162,14 +154,16 @@ fn the_startup_repairs_come_before_every_step_that_can_stop_the_bridge() {
 #[skuld::test]
 fn dns_is_recovered_before_the_routes() {
     let order = startup_order();
-    assert!(at(&order, "recover_dns") < at(&order, "recover_routes"), "{order:?}");
+    assert!(at(&order, "recover_dns") < at(&order, "boot_sequence"), "{order:?}");
 }
 
-/// The reconcile reads what the recoveries repaired, and a Stop that arrives
-/// during it must be able to abandon the auto-connect.
+/// A Stop that arrives during the reconcile must be able to abandon the
+/// auto-connect.
 #[skuld::test]
-fn the_reconcile_follows_the_route_recovery_and_the_shutdown_forwarding() {
+fn the_reconcile_follows_the_shutdown_forwarding() {
     let order = startup_order();
-    assert!(at(&order, "recover_routes") < at(&order, "reconcile"), "{order:?}");
-    assert!(at(&order, "forward_shutdown") < at(&order, "reconcile"), "{order:?}");
+    assert!(
+        at(&order, "forward_shutdown") < at(&order, "boot_sequence"),
+        "{order:?}"
+    );
 }

@@ -101,7 +101,7 @@ objc2-foundation = { version = "0.3", features = ["NSData"] }
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # `tests/elevated_ownership_privileged.rs` reads the real uid/euid and resolves
 # `nobody` to prove the marker chown lands on the published inode.
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
 skuld = { workspace = true }

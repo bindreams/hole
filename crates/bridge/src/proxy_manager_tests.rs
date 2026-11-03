@@ -58,6 +58,9 @@ pub(crate) struct MockProxy {
     /// flight, instead of sleeping. One-shot per MockProxy. See
     /// bindreams/hole#383.
     start_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    /// If Some, run on every `start` once it is past the gate — where
+    /// production's plugin chain has already recorded its pid.
+    start_hook: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl MockProxy {
@@ -66,6 +69,7 @@ impl MockProxy {
             state: Arc::new(MockProxyState::default()),
             start_gate: None,
             start_entered: std::sync::Mutex::new(None),
+            start_hook: None,
         }
     }
 
@@ -79,6 +83,11 @@ impl MockProxy {
         let mut m = Self::new();
         m.start_gate = Some(gate);
         m
+    }
+
+    pub(crate) fn with_start_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.start_hook = Some(Box::new(hook));
+        self
     }
 
     fn with_entered_signal(mut self, tx: oneshot::Sender<()>) -> Self {
@@ -102,6 +111,9 @@ impl Proxy for MockProxy {
         }
         if let Some(gate) = self.start_gate.as_ref() {
             gate.notified().await;
+        }
+        if let Some(hook) = self.start_hook.as_ref() {
+            hook();
         }
         self.state.start_calls.fetch_add(1, Ordering::SeqCst);
         if self.state.fail_start.load(Ordering::SeqCst) {
@@ -297,7 +309,7 @@ impl MockRouting {
         m
     }
 
-    fn failing_gateway(state_dir: PathBuf) -> Self {
+    pub(crate) fn failing_gateway(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_gateway.store(true, Ordering::SeqCst);
         m
@@ -407,7 +419,7 @@ impl Routing for MockRouting {
 
     fn default_gateway(&self, _dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
         if self.state.fail_gateway.load(Ordering::SeqCst) {
-            return Err(RoutingError::Gateway("mock gateway failure".into()));
+            return Err(crate::test_support::mock_gateway_failure());
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
@@ -420,7 +432,7 @@ impl Routing for MockRouting {
 
     fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
         if self.state.fail_gateway.load(Ordering::SeqCst) {
-            return Err(RoutingError::Gateway("mock gateway failure".into()));
+            return Err(crate::test_support::mock_gateway_failure());
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
@@ -1982,7 +1994,10 @@ fn gateway_failure_sets_last_error() {
         assert!(matches!(err, ProxyError::Gateway(_)));
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().is_some(), "default_gateway failure must set last_error");
-        assert!(pm.last_error().unwrap().contains("mock gateway failure"));
+        assert_eq!(
+            pm.last_error().unwrap(),
+            "gateway detection failed: Could not read the system routing table. See bridge.log for details."
+        );
     });
 }
 
@@ -2621,7 +2636,18 @@ fn confinement_failure_aborts_the_start() {
 
         let result = pm.start(&config).await;
         match result {
-            Err(ProxyError::DnsConfinementFailed { .. }) => {}
+            Err(e @ ProxyError::DnsConfinementFailed { .. }) => {
+                assert_eq!(
+                    e.to_string(),
+                    "could not confine DNS to the tunnel: could not reach the firewall",
+                    "the toast text must not change"
+                );
+                let chain = util::error_chain::error_chain(&e).to_string();
+                assert!(
+                    chain.contains("mock confine failure"),
+                    "the log line must carry the OS cause: {chain}"
+                );
+            }
             other => panic!(
                 "expected Err(DnsConfinementFailed), got {}",
                 describe_start_result(&other)

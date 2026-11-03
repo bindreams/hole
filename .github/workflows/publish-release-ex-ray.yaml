@@ -17,10 +17,16 @@ jobs:
   publish:
     name: Verify and publish
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # Only `.github/scripts` (retry.sh) is needed from the repository.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+
       - name: Normalize and validate version
         id: version
         run: |
@@ -34,6 +40,8 @@ jobs:
       - name: Verify draft release exists
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          # Wait for the API to answer (with the token: the unauthenticated limit is 60/h per shared IP), then ask once: a missing release is the answer, not a lost network.
+          .github/scripts/retry.sh gh api -X GET zen --silent
           IS_DRAFT=$(gh release view "$TAG" --json isDraft -q .isDraft)
           if [ "$IS_DRAFT" != "true" ]; then
             echo "::error::Release $TAG is not a draft"

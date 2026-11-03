@@ -57,7 +57,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [build-dependencies]
 typify = "0.6"

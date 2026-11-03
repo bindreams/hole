@@ -322,7 +322,7 @@ impl<F: Fn(StopPhase) -> std::io::Result<()>> StopProgress<F> {
             "service stop phase"
         );
         if let Err(e) = outcome {
-            tracing::warn!(error = %e, ?phase, "failed to report StopPending to the SCM");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), ?phase, "failed to report StopPending to the SCM");
         }
     }
 }
@@ -447,7 +447,7 @@ pub async fn tear_down_service<F, P, R, E, H>(
         |progress| async move {
             let mut pm = proxy_for_stop.lock().await;
             if let Err(e) = pm.stop_with_progress(event, |phase| progress.enter(phase)).await {
-                tracing::error!(error = %e, "error stopping proxy during shutdown");
+                tracing::error!(error = %util::error_chain::error_chain(&e), "error stopping proxy during shutdown");
             }
         },
         etw,
@@ -485,7 +485,7 @@ pub fn finish_stop<F: Fn(StopPhase) -> std::io::Result<()>>(
     progress.enter(StopPhase::ShutdownRuntime);
     drop_runtime();
     if let Err(e) = report_stopped() {
-        tracing::warn!(error = %e, "failed to report Stopped to the SCM");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to report Stopped to the SCM");
     }
 }
 

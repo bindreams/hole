@@ -152,6 +152,35 @@ fn record_resume_or_kill_kills_on_record_failure() {
     assert!(!sentinel.exists(), "the killed suspended child never ran");
 }
 
+// The failure that killed the child is logged with its cause chain.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn record_resume_or_kill_logs_the_cause_of_the_failure() {
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+    let mut child = windows::spawn_suspended_command("cmd /c exit 0").unwrap();
+
+    let out = windows::record_resume_or_kill(
+        &mut child,
+        Err(crate::test_support::io_error_hiding(
+            crate::test_support::MOCK_ROOT_CAUSE,
+        )),
+        || panic!("resume must not run after a record failure"),
+    );
+
+    assert!(out.is_err(), "a record failure returns Err");
+    child.wait().unwrap();
+    let log = writer.snapshot();
+    assert!(
+        log.contains(crate::test_support::MOCK_ROOT_CAUSE),
+        "bridge.log must name the cause: {log}"
+    );
+}
+
 // The suspend->resume ordering primitive, asserted POSITIVELY: a suspended child
 // does not run (its sentinel is absent) until resumed, then it runs (sentinel
 // appears). Driven through the `spawn_suspended_command` inner seam so the

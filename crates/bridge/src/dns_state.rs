@@ -135,7 +135,7 @@ pub fn load(state_dir: &Path) -> Option<DnsState> {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "dns-state read failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "dns-state read failed");
             return None;
         }
     };
@@ -150,7 +150,7 @@ pub fn load(state_dir: &Path) -> Option<DnsState> {
             None
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "dns-state parse failed");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), path = %path.display(), "dns-state parse failed");
             None
         }
     }

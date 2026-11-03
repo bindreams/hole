@@ -10,6 +10,10 @@ left unrendered.
 
 Usage:
     uv run scripts/validate-docs.py
+    uv run scripts/validate-docs.py --fetch-only
+
+`--fetch-only` resolves and downloads the build's tools and builds nothing, so CI
+can run the fetch under a retry without retrying a docs failure.
 """
 
 import re
@@ -64,7 +68,30 @@ def check_rendered(out_dir: Path, versions: dict[str, str]) -> list[str]:
     return problems
 
 
+def sphinx_command(*sphinx_args: str) -> list[str]:
+    """The `uv run` invocation of `sphinx-build` with the pinned docs requirements.
+
+    Every caller shares the exact `uv` flags: the environment a fetch-only call
+    resolves is the one the build then reuses from uv's cache.
+    """
+    return [
+        "uv",
+        "run",
+        "--no-project",
+        "--python",
+        "3.13",
+        "--with-requirements",
+        str(REPO_ROOT / "docs" / "requirements.txt"),
+        "--",
+        "sphinx-build",
+        *sphinx_args,
+    ]
+
+
 def main() -> int:
+    if sys.argv[1:] == ["--fetch-only"]:
+        return subprocess.run(sphinx_command("--version"), cwd=REPO_ROOT).returncode
+
     # A fresh output directory every run. Reusing one lets Sphinx build
     # incrementally -- it skips re-reading unchanged pages, so a broken
     # cross-reference passes here while a cold Read the Docs build fails -- and
@@ -75,22 +102,7 @@ def main() -> int:
         # this script's own dependencies. Output is inherited: capturing it
         # would silence the warnings this script exists to surface.
         build = subprocess.run(
-            [
-                "uv",
-                "run",
-                "--no-project",
-                "--python",
-                "3.13",
-                "--with-requirements",
-                str(REPO_ROOT / "docs" / "requirements.txt"),
-                "--",
-                "sphinx-build",
-                "-W",
-                "-b",
-                "html",
-                str(REPO_ROOT / "docs"),
-                str(out_dir),
-            ],
+            sphinx_command("-W", "-b", "html", str(REPO_ROOT / "docs"), str(out_dir)),
             cwd=REPO_ROOT,
         )
         if build.returncode != 0:
@@ -188,3 +200,14 @@ def test_check_rendered_rejects_missing_versions_line(tmp_path: Path) -> None:
 
     assert len(problems) == 1
     assert "index.html" in problems[0]
+
+
+def test_sphinx_command_appends_args_after_the_pinned_requirements() -> None:
+    command = sphinx_command("--version")
+
+    assert command[:2] == ["uv", "run"]
+    requirements = command[command.index("--with-requirements") + 1]
+    assert Path(requirements) == REPO_ROOT / "docs" / "requirements.txt"
+    assert command[-2:] == ["sphinx-build", "--version"]
+    # The fetch and the build resolve the same environment only with the same flags.
+    assert sphinx_command("-W", "-b", "html")[: len(command) - 1] == command[:-1]

@@ -95,7 +95,7 @@ if (-not $ExeArgs) {
 # whitespace, e.g. a python `-c` payload from the -ExeArgs test seam, is
 # otherwise split into multiple argv entries by the child process.
 $quotedExeArgs = $ExeArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
-$proc = Start-Process $ExePath -ArgumentList $quotedExeArgs -PassThru
+$proc = Start-Process $ExePath -ArgumentList $quotedExeArgs -NoNewWindow -PassThru
 
 if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     Write-Host "::error::msiexec $Verb did not exit within $BoundMinutes minute(s) -- capturing diagnostics before failing the step"

@@ -26,7 +26,7 @@ fn main() {
         return;
     }
 
-    let repo_root = git_repo_root();
+    let repo_root = repo_root();
     let cache_icons_dir = repo_root.join(".cache").join("icons");
     std::fs::create_dir_all(&cache_icons_dir).expect("failed to create .cache/icons/");
 
@@ -72,8 +72,7 @@ fn report_missing_frontend_dist() -> bool {
     let Some(dir) = missing else { return false };
     println!(
         "cargo::error=`frontendDist` {} does not exist. Production mode embeds the frontend: run \
-         `cargo xtask build frontend-build`, or create an empty `ui/dist` (gitignored) for checks that \
-         do not run the GUI, or build with `--no-default-features`",
+         `cargo xtask build frontend-build`, or build with `--no-default-features`",
         dir.display()
     );
     true
@@ -173,15 +172,14 @@ fn ensure_external_bin_stubs(repo_root: &Path) {
 
 // Repo root ===========================================================================================================
 
-fn git_repo_root() -> PathBuf {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .expect("failed to run `git rev-parse --show-toplevel` — is git installed?");
-
-    assert!(output.status.success(), "git rev-parse --show-toplevel failed");
-
-    PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+/// Repo root from `CARGO_MANIFEST_DIR` (`<repo>/crates/hole`); `git rev-parse` is wrong under a git hook (`GIT_DIR` set).
+fn repo_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("CARGO_MANIFEST_DIR is <repo>/crates/hole")
+        .to_path_buf()
 }
 
 // Version =============================================================================================================

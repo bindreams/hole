@@ -77,6 +77,11 @@ reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` 
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
+path = "cosca::Command::raw_executable"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
+[[disallowed-methods]]
 path = "cosca::Command::arg"
 reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
@@ -93,6 +98,11 @@ allow-invalid = true  # only crates that depend on cosca (with its `tokio` featu
 
 [[disallowed-methods]]
 path = "cosca::tokio::Command::executable"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
+
+[[disallowed-methods]]
+path = "cosca::tokio::Command::raw_executable"
 reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 

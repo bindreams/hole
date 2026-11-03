@@ -85,7 +85,7 @@ async fn recover_and_record_on_a_clean_host_leaves_the_claim_false() {
     let dir = tempfile::tempdir().unwrap();
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(fresh_manager(dir.path())));
 
-    crate::route_recovery::recover_and_record(dir.path(), &proxy).await;
+    crate::route_recovery::recover_and_record(dir.path(), &proxy, crate::route_recovery::recover_bridge_routes).await;
 
     assert!(
         !proxy.lock().await.standing_cover_adopted(),

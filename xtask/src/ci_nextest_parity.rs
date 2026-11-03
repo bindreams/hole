@@ -22,9 +22,10 @@
 //! variables may be stripped or exported — anything else feeds cargo's
 //! fingerprint, and normalizing it away would hide the very rebuild being
 //! guarded against. Two launcher forms are exempt because they cannot change
-//! what cargo builds: the [`NO_COMPILE_GATE`] wrapper, and `NAME=$NAME`, which
-//! hands the child the value it already has. The latter is how a `sudo env`
-//! child gets back a variable `sudo` dropped.
+//! what cargo builds: the [`NO_COMPILE_GATE`] wrapper, and the forward
+//! `${NAME+"NAME=$NAME"}`, which hands the child the variable as it already is,
+//! set or unset. The latter is how a `sudo env` child gets back a variable
+//! `sudo` dropped.
 
 use std::collections::BTreeSet;
 
@@ -107,7 +108,7 @@ pub struct Launch {
     pub gated: bool,
     /// Started through `sudo`.
     pub privileged: bool,
-    /// Variables handed on with `NAME=$NAME`, i.e. restored to the ambient value.
+    /// Variables handed on with `${NAME+"NAME=$NAME"}`, i.e. restored to the ambient state.
     pub forwarded: BTreeSet<String>,
 }
 
@@ -208,27 +209,86 @@ fn step_label(step: &CiStep, index: usize) -> String {
 
 /// One command split into its launcher prefix and the comparable remainder:
 /// whitespace collapsed to single spaces, launchers dropped.
+///
+/// The prefix must have the shape `[NAME=value ...] [gate] [sudo [ARG ...]] [env [ARG ...]]`,
+/// a shape in which every stripped assignment reaches the command as written: the shell
+/// assigns only an unquoted `NAME=` word before the command, the gate runs its first
+/// argument, `sudo` resets the environment it inherits, and `env`/`sudo` arguments are
+/// expanded words. Any other prefix is an error rather than a guess.
 fn split_launch(cmd: &str) -> Result<(Launch, String)> {
     let toks: Vec<&str> = cmd.split_whitespace().collect();
     let mut launch = Launch::default();
+    let mut phase = Phase::Shell;
+    let mut shell_assigned = false;
     let mut start = 0;
     while let Some(tok) = toks.get(start) {
-        match classify(tok) {
-            Token::Gate => launch.gated = true,
-            Token::Sudo => launch.privileged = true,
-            Token::Launcher => {}
-            Token::Forward(name) => {
-                launch.forwarded.insert(name.to_string());
-            }
+        let token = classify(tok);
+        let launcher = match token {
+            Token::Gate => Some(Phase::Gate),
+            Token::Sudo => Some(Phase::Sudo),
+            Token::Env => Some(Phase::Env),
             Token::Command => break,
-            Token::ForeignEnv(name) => bail!(
-                "command {cmd:?} sets {name:?} inline, which is outside the fingerprint-neutral \
-                 set {FINGERPRINT_NEUTRAL_ENV:?} — stripping it would hide a cargo rebuild"
-            ),
+            Token::Forward(_) | Token::Assign { .. } => None,
+        };
+        if let Some(next) = launcher {
+            if next <= phase {
+                bail!("command {cmd:?} has {tok:?} out of the launcher order [NAME=value ...] [gate] [sudo [ARG ...]] [env [ARG ...]]");
+            }
+            phase = next;
+        }
+        match token {
+            Token::Gate => launch.gated = true,
+            Token::Sudo => {
+                if shell_assigned {
+                    bail!("command {cmd:?} assigns before `sudo`, which resets the environment and drops it");
+                }
+                launch.privileged = true;
+            }
+            Token::Env | Token::Command => {}
+            Token::Forward(name) => {
+                if phase < Phase::Sudo {
+                    bail!("command {cmd:?} forwards {name:?} outside the arguments of `env` or `sudo`, so it runs as a command");
+                }
+                if !FINGERPRINT_NEUTRAL_ENV.contains(&name) {
+                    launch.forwarded.insert(name.to_string());
+                }
+            }
+            Token::Assign { name, quoted, literal } => {
+                let one_word = match phase {
+                    Phase::Shell => literal,
+                    Phase::Gate => false,
+                    Phase::Sudo | Phase::Env => quoted || literal,
+                };
+                if !one_word {
+                    bail!("command {cmd:?} sets {name:?} in a word that does not assign it as written");
+                }
+                shell_assigned |= phase == Phase::Shell;
+                if !FINGERPRINT_NEUTRAL_ENV.contains(&name) {
+                    bail!(
+                        "command {cmd:?} sets {name:?} inline, which is outside the fingerprint-neutral \
+                         set {FINGERPRINT_NEUTRAL_ENV:?} — stripping it would hide a cargo rebuild \
+                         (to forward the ambient value, pass ${{{name}+\"{name}=${name}\"}} to `env`)"
+                    );
+                }
+            }
         }
         start += 1;
     }
     Ok((launch, toks[start..].join(" ")))
+}
+
+/// The launcher prefix's segments, in the only order they may appear.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Phase {
+    /// Before any command word: the shell assigns an unquoted `NAME=` word, so
+    /// only a literal one is taken as written.
+    Shell,
+    /// The argv of the [`NO_COMPILE_GATE`] wrapper, which runs its first word.
+    Gate,
+    /// The arguments of `sudo`.
+    Sudo,
+    /// The arguments of `env`.
+    Env,
 }
 
 enum Token<'a> {
@@ -236,12 +296,13 @@ enum Token<'a> {
     Gate,
     /// `sudo`: the command runs with a replaced environment.
     Sudo,
-    /// Sets up the environment rather than naming the command.
-    Launcher,
-    /// `NAME=$NAME`: the child gets the value the ambient environment has.
+    /// `env`.
+    Env,
+    /// `${NAME+"NAME=$NAME"}`: the child gets the variable as the ambient environment has it.
     Forward(&'a str),
-    /// An assignment of a variable cargo's fingerprint may depend on.
-    ForeignEnv(&'a str),
+    /// `NAME=value`: `quoted` if the word is one quoted span, `literal` if it is
+    /// unquoted and has nothing the shell would expand or split.
+    Assign { name: &'a str, quoted: bool, literal: bool },
     /// The command itself — everything from here on is compared.
     Command,
 }
@@ -255,26 +316,68 @@ fn classify(tok: &str) -> Token<'_> {
         return Token::Sudo;
     }
     if stripped == "env" {
-        return Token::Launcher;
+        return Token::Env;
+    }
+    if let Some(name) = forwarded_name(tok) {
+        return Token::Forward(name);
     }
     match stripped.split_once('=') {
-        Some((key, value)) if is_env_var_name(key) => {
-            if value == format!("${key}") || value == format!("${{{key}}}") {
-                // Checked before the neutral list: a forward is a launcher whatever the name,
-                // but only a name outside that list is worth reporting as one.
-                if FINGERPRINT_NEUTRAL_ENV.contains(&key) {
-                    Token::Launcher
-                } else {
-                    Token::Forward(key)
-                }
-            } else if FINGERPRINT_NEUTRAL_ENV.contains(&key) {
-                Token::Launcher
-            } else {
-                Token::ForeignEnv(key)
-            }
-        }
+        Some((name, value)) if is_env_var_name(name) => Token::Assign {
+            name,
+            quoted: is_one_quoted_span(tok),
+            literal: stripped.len() == tok.len() && value.chars().all(is_literal_char),
+        },
         _ => Token::Command,
     }
+}
+
+/// Whether `tok` is a single quoted span that expands to exactly one word:
+/// `'…'` with no `'` inside, or `"…"` made only of [`is_literal_char`]s,
+/// `$NAME` and `${NAME}` (not `$@`, `${a[@]}`, or a substitution).
+fn is_one_quoted_span(tok: &str) -> bool {
+    if let Some(inner) = tok.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        return !inner.contains('\'');
+    }
+    let Some(mut rest) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
+        return false;
+    };
+    while let Some(c) = rest.chars().next() {
+        if is_literal_char(c) {
+            rest = &rest[1..];
+            continue;
+        }
+        let Some(after) = rest.strip_prefix('$') else {
+            return false;
+        };
+        let (name, tail) = match after.strip_prefix('{') {
+            Some(braced) => match braced.split_once('}') {
+                Some(split) => split,
+                None => return false,
+            },
+            None => after.split_at(
+                after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len()),
+            ),
+        };
+        if !is_env_var_name(name) {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+/// A character the shell takes literally in or out of quotes.
+fn is_literal_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c)
+}
+
+/// `NAME` of the raw token `${NAME+"NAME=$NAME"}`, the one form that hands the
+/// child the variable unchanged: `"NAME=$NAME"` would set an unset one to empty.
+fn forwarded_name(tok: &str) -> Option<&str> {
+    let (key, word) = tok.strip_prefix("${")?.strip_suffix('}')?.split_once('+')?;
+    (is_env_var_name(key) && word == format!("\"{key}=${key}\"")).then_some(key)
 }
 
 /// A POSIX environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.

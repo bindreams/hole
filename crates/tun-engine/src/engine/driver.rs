@@ -141,7 +141,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
                         }
                     }
                     Err(e) => {
-                        warn!("TUN read error: {e}");
+                        warn!("TUN read error: {error}", error = util::error_chain::error_chain(&e));
                         break;
                     }
                 }
@@ -267,7 +267,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
                     r = router.route_tcp(meta, flow) => r,
                 };
                 if let Err(e) = result {
-                    debug!("TCP Router error for {dst_ip}:{dst_port}: {e}");
+                    debug!(
+                        "TCP Router error for {dst_ip}:{dst_port}: {error}",
+                        error = util::error_chain::error_chain(&e)
+                    );
                 }
                 drop(permit);
             });
@@ -426,7 +429,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
                 r = router.route_udp(meta, flow) => r,
             };
             if let Err(e) = result {
-                debug!("UDP Router error for {}: {e}", dst);
+                debug!(
+                    "UDP Router error for {}: {error}",
+                    dst,
+                    error = util::error_chain::error_chain(&e)
+                );
             }
         });
 

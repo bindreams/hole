@@ -72,7 +72,7 @@ impl UpstreamConnector for Socks5Connector {
                 })
             }
             Err(e) => {
-                tracing::debug!(%target, elapsed_ms, error = %e, "Socks5Connector::connect_tcp failed");
+                tracing::debug!(%target, elapsed_ms, error = %util::error_chain::error_chain(&e), "Socks5Connector::connect_tcp failed");
                 Err(io::Error::other(format!("SOCKS5 CONNECT to {target}: {e}")))
             }
         }

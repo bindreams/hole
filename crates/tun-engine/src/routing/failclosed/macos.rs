@@ -296,7 +296,7 @@ pub(crate) fn pf_label_answer(out: Result<std::process::Output, RoutingError>) -
         Ok(out) => out,
         Err(e) => {
             tracing::warn!(
-                error = %e,
+                error = %util::error_chain::error_chain(&e),
                 "`pfctl -s labels` could not be run, so pf's own answer about the lockdown cover \
                  is unavailable and presence falls back to the state file alone"
             );
@@ -498,7 +498,7 @@ fn load_cover_ruleset<T: CoverRulesetOps + ?Sized>(
     if purges_state(kind) {
         if let Err(e) = ops.flush_states() {
             tracing::warn!(
-                error = %e,
+                error = %util::error_chain::error_chain(&e),
                 "pf state purge failed after the cover ruleset loaded; flows established before \
                  this engage may keep flowing past it"
             );
@@ -571,7 +571,7 @@ fn engage_with(
         Ok(enabled) => enabled,
         Err(e) => {
             tracing::warn!(
-                error = %e,
+                error = %util::error_chain::error_chain(&e),
                 "could not read whether pf was already enabled; recording it as not enabled and \
                  continuing the engage — this read is diagnostic and the cover does not depend on it"
             );
@@ -608,7 +608,7 @@ fn engage_with(
     };
     if let Err(e) = ops.save_transient(&st) {
         if let Err(xe) = ops.drop_token(&token) {
-            tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed transient engage");
+            tracing::warn!(error = %util::error_chain::error_chain(&xe), "pfctl -X failed unwinding a failed transient engage");
         }
         return Err(e);
     }
@@ -715,7 +715,7 @@ fn restore_confirmed(adopting: bool, out: &Result<std::process::Output, RoutingE
 /// `engage_lockdown`'s two unwind arms it came from).
 fn drop_refcount_or_warn<P: Phase>(token: &str, phase: P, message: &str) {
     if let Err(e) = pfctl_status(pfctl(&["-X", token], None, phase), "pfctl -X") {
-        tracing::warn!(error = %e, "{message}");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "{message}");
     }
 }
 
@@ -742,7 +742,7 @@ fn disengage(token: Option<&str>, state_dir: &Path, adopting: bool) {
     } else {
         let out = pfctl(&["-f", PFCONF], None, BestEffortPhase::RecoverCover);
         if let Err(ref e) = out {
-            tracing::warn!(error = %e, "pf ruleset restore failed during cover disengage");
+            tracing::warn!(error = %util::error_chain::error_chain(e), "pf ruleset restore failed during cover disengage");
         }
         out
     };
@@ -765,7 +765,7 @@ fn disengage(token: Option<&str>, state_dir: &Path, adopting: bool) {
     }
     if restore_confirmed(adopting, &reload) {
         if let Err(e) = state::clear(state_dir) {
-            tracing::warn!(error = %e, "failclosed-state clear failed during cover disengage");
+            tracing::warn!(error = %util::error_chain::error_chain(&e), "failclosed-state clear failed during cover disengage");
         }
     } else {
         tracing::warn!(
@@ -1102,7 +1102,7 @@ fn disengage_lockdown_with(
     // State cleared only after a confirmed restore — a failed clear is the only
     // remaining best-effort step (the cover is already down).
     if let Err(e) = ops.clear_standing() {
-        tracing::warn!(error = %e, "lockdown-pf-state clear failed after disengage");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "lockdown-pf-state clear failed after disengage");
     }
     Ok(())
 }
@@ -1163,7 +1163,7 @@ fn lockdown_disengage(state_dir: &Path) {
         // Always `Clearance::proven` on macOS, and `Drop` has no reader for
         // it either way.
         Ok(_clearance_is_unconditional_here) => {}
-        Err(e) => tracing::warn!(error = %e, "lockdown disengage failed during Drop"),
+        Err(e) => tracing::warn!(error = %util::error_chain::error_chain(&e), "lockdown disengage failed during Drop"),
     }
 }
 
@@ -1203,7 +1203,7 @@ pub(crate) trait PfOps {
 /// is per-call-site, so a warn still names which of the three drops it was.
 fn drop_token_or_warn(ops: &mut dyn PfOps, token: &str, message: &str) {
     if let Err(e) = ops.drop_token(token) {
-        tracing::warn!(error = %e, "{message}");
+        tracing::warn!(error = %util::error_chain::error_chain(&e), "{message}");
     }
 }
 
@@ -1259,7 +1259,7 @@ pub(crate) fn release_all_with(
             match reload {
                 Ok(()) => {
                     if let Err(e) = ops.clear_transient() {
-                        tracing::warn!(error = %e, "failclosed-state clear failed during release_all");
+                        tracing::warn!(error = %util::error_chain::error_chain(&e), "failclosed-state clear failed during release_all");
                     }
                 }
                 Err(e) => first_err = Some(e),
@@ -1277,7 +1277,7 @@ pub(crate) fn release_all_with(
             match reload {
                 Ok(()) => {
                     if let Err(e) = ops.clear_transient() {
-                        tracing::warn!(error = %e, "failclosed-state clear failed during release_all");
+                        tracing::warn!(error = %util::error_chain::error_chain(&e), "failclosed-state clear failed during release_all");
                     }
                 }
                 Err(e) => first_err = Some(e),
@@ -1302,7 +1302,7 @@ pub(crate) fn release_all_with(
             match outcome {
                 Ok(()) => {
                     if let Err(e) = ops.clear_standing() {
-                        tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");
+                        tracing::warn!(error = %util::error_chain::error_chain(&e), "lockdown-pf-state clear failed during release_all");
                     }
                 }
                 Err(e) => {
@@ -1319,7 +1319,7 @@ pub(crate) fn release_all_with(
                 Err(snapshot_err) => match ops.reload_default() {
                     Ok(()) => {
                         tracing::warn!(
-                            error = %snapshot_err,
+                            error = %util::error_chain::error_chain(&snapshot_err),
                             "captured pf snapshot could not load; fell back to the default ruleset — \
                              the host's captured pf rules could not be restored"
                         );
@@ -1340,7 +1340,7 @@ pub(crate) fn release_all_with(
             match outcome {
                 Ok(()) => {
                     if let Err(e) = ops.clear_standing() {
-                        tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");
+                        tracing::warn!(error = %util::error_chain::error_chain(&e), "lockdown-pf-state clear failed during release_all");
                     }
                 }
                 Err(e) => {
@@ -1366,7 +1366,7 @@ pub(crate) fn release_all_with(
             match outcome {
                 Ok(()) => {
                     if let Err(e) = ops.clear_standing() {
-                        tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");
+                        tracing::warn!(error = %util::error_chain::error_chain(&e), "lockdown-pf-state clear failed during release_all");
                     }
                 }
                 Err(e) => {

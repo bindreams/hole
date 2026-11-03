@@ -22,24 +22,9 @@ use crate::dns::system::Dns;
 use crate::proxy::Proxy;
 use crate::proxy_manager::ProxyManager;
 
-/// Run crash recovery for routes and the standing lockdown cover, then record
-/// on `proxy` whether this run adopted a live standing cover.
-///
-/// Offloaded to a blocking thread so a hung `netsh`/`route`/`pfctl` cannot
-/// wedge the runtime while the IPC socket is bound but not yet serving. A
-/// panicked task is logged and leaves the claim false — the conservative
-/// direction for the connect path, and the intent file still carries the tray's
-/// answer.
-pub async fn recover_and_record<P, R, D>(state_dir: &Path, proxy: &Arc<Mutex<ProxyManager<P, R, D>>>)
-where
-    P: Proxy,
-    R: Routing,
-    D: Dns,
-{
-    let dir = state_dir.to_path_buf();
-    // Taken from the manager rather than re-derived, so recovery's intent
-    // repair cannot chown to a different owner than the manager's own writes.
-    let owner = proxy.lock().await.state_owner();
+/// The bridge's route and standing-cover recovery: the one call to
+/// `tun_engine::routing::recover_routes`.
+pub(crate) fn recover_bridge_routes(state_dir: &Path, owner: Option<(u32, u32)>) -> Recovery {
     // The reclaim's compile-time fallback name — `Some` where the platform
     // has a fixed constant to offer (Windows), `None` where the real device
     // name is kernel-assigned and unknowable ahead of opening it (macOS);
@@ -48,8 +33,31 @@ where
     let tun_name_fallback = Some(crate::proxy::config::WINDOWS_TUN_ALIAS);
     #[cfg(not(target_os = "windows"))]
     let tun_name_fallback = None;
-    let outcome =
-        tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&dir, owner, tun_name_fallback)).await;
+    tun_engine::routing::recover_routes(state_dir, owner, tun_name_fallback)
+}
+
+/// Run crash recovery for routes and the standing lockdown cover through
+/// `recover` (production passes [`recover_bridge_routes`]; the parameter lets a
+/// test inject the verdict, which the real one only reaches with elevation),
+/// then record on `proxy` whether this run adopted a live standing cover.
+///
+/// Offloaded to a blocking thread so a hung `netsh`/`route`/`pfctl` cannot
+/// wedge the runtime while the IPC socket is bound but not yet serving. A
+/// panicked task is logged and leaves the claim false — the conservative
+/// direction for the connect path, and the intent file still carries the tray's
+/// answer.
+pub async fn recover_and_record<P, R, D, F>(state_dir: &Path, proxy: &Arc<Mutex<ProxyManager<P, R, D>>>, recover: F)
+where
+    P: Proxy,
+    R: Routing,
+    D: Dns,
+    F: FnOnce(&Path, Option<(u32, u32)>) -> Recovery + Send + 'static,
+{
+    let dir = state_dir.to_path_buf();
+    // Taken from the manager rather than re-derived, so recovery's intent
+    // repair cannot chown to a different owner than the manager's own writes.
+    let owner = proxy.lock().await.state_owner();
+    let outcome = tokio::task::spawn_blocking(move || recover(&dir, owner)).await;
     record_recovery_outcome(outcome, proxy).await;
 }
 

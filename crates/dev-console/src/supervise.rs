@@ -30,12 +30,10 @@ pub(crate) const GRACE_TIMEOUT: Duration = Duration::from_secs(10);
 /// same reason: the WarnRecovery bridge keeps its pipes open forever.
 const PRINTER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// dev.py:306-307 parity (`terminate_tree`: `if proc.poll() is not None:
-/// return`). The guard must not be deleted as redundant with anything cosca
-/// does internally: `terminate_tree`'s `killpg` takes an **unpinned pgid**
-/// (bindreams/cosca#54), so signalling an exited child's group can land on an
-/// unrelated one. The lone `terminate()` is identity-bound and needs no such
-/// guard — which is exactly what makes this one look droppable.
+/// Whether `child` has exited; `shutdown()` asks it of the bridge only, whose wait reaps it in the supervision arms.
+/// `terminate_tree`'s `killpg` takes an **unpinned pgid** (bindreams/cosca#54), so signalling a reaped child's group
+/// can land on an unrelated one. Vite and the GUI never reach `shutdown()` reaped: their funnel only sees an unreaped
+/// root (see [`wait_and_kill_leftovers`] and [`teardown_grouped`]).
 ///
 /// cosca also refuses a graceful op on Windows once an exit has been *reported*,
 /// because its async backend can release the process handle and stop pinning
@@ -409,7 +407,9 @@ async fn startup_and_supervise(
     // poll() before each probe round).
     tokio::select! {
         biased;
-        status = vite.wait() => {
+        status = wait_and_kill_leftovers(vite, "Vite") => {
+            // Reaped and its tree gone: nothing left for the funnel to tear down.
+            vite_slot.take();
             note!("{YELLOW}Vite exited with code {}{RESET}", status?.code().unwrap_or(-1));
             return Ok(ExitCause::StartupFailed);
         }
@@ -451,10 +451,17 @@ async fn startup_and_supervise(
 
     // Steady state: first exit / Ctrl+C / SIGTERM wins (replaces dev.py's
     // done.wait(0.5) poll loop and reaper threads — tokio makes them events).
+    // The funnel must not tear down a reaped root, hence `slot.take()`.
     Ok(tokio::select! {
         status = bridge.wait() => exited("bridge", status),
-        status = vite.wait() => exited("vite", status),
-        status = gui.wait() => exited("client", status),
+        status = wait_and_kill_leftovers(vite, "Vite") => {
+            vite_slot.take();
+            exited("vite", status)
+        }
+        status = wait_and_kill_leftovers(gui, "Gui") => {
+            gui_slot.take();
+            exited("client", status)
+        }
         _ = interrupts.recv() => ExitCause::Interrupted,
     })
 }
@@ -538,35 +545,94 @@ async fn shutdown(bridge: Option<&mut Child>, vite: Option<&mut Child>, gui: Opt
     }
 }
 
-/// Graceful group signal → bounded wait → hard tree-kill. Shared by
-/// shutdown() and the grandchild-reap integration test.
-pub(crate) async fn teardown_grouped(child: &mut Child, role: ChildRole) {
-    // See has_exited. Lingering group members (if any) are reaped by the Drop
-    // backstop's tree kill.
-    if has_exited(child) {
-        return;
-    }
-    // The group signal, not the lone one: Vite is `npm run dev`, and npm exits
-    // on SIGTERM without forwarding it — a lone signal would satisfy the grace
-    // wait while node and esbuild survived to be SIGKILLed by the Drop
-    // backstop, silently downgrading a graceful teardown to a hard kill.
-    if let Err(e) = child.terminate_tree() {
-        // Every error from this call means NO signal went out and the tree is
-        // still running, so the grace wait below is about to look like a stall
-        // with no cause. Say which it was.
-        enote!("{YELLOW}{role:?} did not receive the cooperative signal: {e}{RESET}");
-    }
-    // Class-2 bound: out-of-process exit that may never come (10s).
-    if tokio::time::timeout(GRACE_TIMEOUT, child.wait()).await.is_err() {
-        debug_assert_eq!(grace_timeout_action(role, Os::host()), GraceTimeoutAction::HardKill);
-        // Signal-only: the wait below is what reaps, and it must run even if
-        // the tree teardown reported a refusal — that report is what tells us
-        // whether the root actually died.
-        if let Err(e) = child.kill_tree() {
-            enote!("{YELLOW}{role:?} tree kill did not reach every member: {e}{RESET}");
+/// Waits for `child`'s root to exit, kills the tree it left behind, then reaps
+/// the root. The kill comes first because cosca's `Drop` no longer kills a
+/// pgid-based tree once the root is reaped (the pgid may name an unrelated
+/// group by then), and an unreaped root keeps its pgid ours.
+///
+/// The root must not have been waited on yet (asserted in debug builds);
+/// afterwards the child needs no teardown.
+///
+/// If the exit cannot be watched without reaping, the root is reaped anyway to
+/// end the wait and its tree is left running on POSIX: a group kill after the
+/// reap could hit an unrelated group. That is reported, not repaired.
+pub(crate) async fn wait_and_kill_leftovers(
+    child: &mut Child,
+    what: &str,
+) -> Result<std::process::ExitStatus, cosca::error::Error> {
+    debug_assert_root_unreaped(child, what);
+    match cosca::tokio::Process::from_id(child.id()).wait().await {
+        Ok(()) => kill_tree_reporting(child, what),
+        Err(e) => {
+            let tree = if cfg!(windows) {
+                "its job object kills the tree when the child is dropped"
+            } else {
+                "its tree is left running, as a group kill after the reap could hit an unrelated group"
+            };
+            enote!("{YELLOW}{what} exit could not be watched ({e}); {tree}{RESET}");
         }
-        let _ = child.wait().await;
     }
+    child.wait().await
+}
+
+/// A root that was reaped has a pgid that may name another group, so a tree kill through it is unsafe.
+fn debug_assert_root_unreaped(child: &Child, what: &str) {
+    debug_assert!(
+        child.id().exists() != cosca::identity::Existence::Gone,
+        "{what}: the root was already reaped; its pgid may name an unrelated group"
+    );
+}
+
+/// Signal-only, so the caller's wait is what reaps. A refusal is reported
+/// because it means members are still running.
+fn kill_tree_reporting(child: &mut Child, what: &str) {
+    if let Err(e) = child.kill_tree() {
+        enote!("{YELLOW}{what} tree kill did not reach every member: {e}{RESET}");
+    }
+}
+
+/// Graceful group signal → bounded wait → hard tree-kill → reap. Shared by
+/// shutdown() and the grandchild-reap integration test.
+///
+/// The tree is killed on every path, with the root still unreaped: a root that
+/// ended on the signal can leave a member that ignores it, and cosca's `Drop`
+/// will not reach that member once the root is reaped. `child` must not have
+/// been waited on (see [`wait_and_kill_leftovers`]; asserted in debug builds).
+pub(crate) async fn teardown_grouped(child: &mut Child, role: ChildRole) {
+    debug_assert_root_unreaped(child, &format!("{role:?}"));
+    let root = cosca::tokio::Process::from_id(child.id());
+    let exited = match root.wait_timeout(Duration::ZERO).await {
+        Ok(exited) => exited,
+        Err(e) => {
+            enote!("{YELLOW}{role:?} exit could not be watched ({e}){RESET}");
+            false
+        }
+    };
+    if !exited {
+        // The group signal, not the lone one: Vite is `npm run dev`, and npm exits
+        // on SIGTERM without forwarding it — a lone signal would satisfy the grace
+        // wait while node and esbuild survived to be SIGKILLed below, silently
+        // downgrading a graceful teardown to a hard kill.
+        if let Err(e) = child.terminate_tree() {
+            // Every error from this call means NO signal went out and the tree is
+            // still running, so the grace wait below is about to look like a stall
+            // with no cause. Say which it was.
+            enote!("{YELLOW}{role:?} did not receive the cooperative signal: {e}{RESET}");
+        }
+        // Class-2 bound: out-of-process exit that may never come (10s).
+        match root.wait_timeout(GRACE_TIMEOUT).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug_assert_eq!(grace_timeout_action(role, Os::host()), GraceTimeoutAction::HardKill)
+            }
+            Err(e) => enote!("{YELLOW}{role:?} exit could not be watched ({e}){RESET}"),
+        }
+    }
+    // Signal-only: the wait below is what reaps, and it must run even if the
+    // tree teardown reported a refusal — that report is what tells us whether
+    // the root actually died.
+    kill_tree_reporting(child, &format!("{role:?}"));
+    let _ = child.wait().await;
 }
 
 /// `ContainMode::Session` is the dev.py `start_new_session` parity (dev.py:296):

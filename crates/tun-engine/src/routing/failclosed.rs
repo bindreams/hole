@@ -288,7 +288,9 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Pat
             // to carry — is false for exactly that reason.
             match disengage_lockdown(state_dir) {
                 Ok(_clearance_is_persisted_not_reported_at_startup) => {}
-                Err(e) => tracing::warn!(error = %e, "lockdown sweep could not disengage the cover"),
+                Err(e) => {
+                    tracing::warn!(error = %util::error_chain::error_chain(&e), "lockdown sweep could not disengage the cover")
+                }
             }
         }
     }
@@ -1102,6 +1104,19 @@ mod boot_time_tripwire_tests;
 #[cfg(test)]
 #[path = "failclosed/stale_key_policy_tests.rs"]
 mod stale_key_policy_tests;
+
+#[cfg(all(any(test, feature = "test-utils"), any(target_os = "windows", target_os = "macos")))]
+#[path = "failclosed/cover_oracle.rs"]
+pub(crate) mod cover_oracle;
+
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[path = "failclosed/cover_oracle_tests.rs"]
+mod cover_oracle_tests;
+
+// Names `hole_test_observability`, a dev-dependency: `cfg(test)` only, unlike the oracle it wraps.
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[path = "failclosed/permit_scenario.rs"]
+mod permit_scenario;
 
 // Privileged-lane real-engage verification (#527): engages the REAL OS cover and
 // asserts it blocks egress. Gated to the elevated `hole-tests` TUN lane by the

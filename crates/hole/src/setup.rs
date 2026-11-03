@@ -808,7 +808,10 @@ pub async fn prompt_bridge_install(app: tauri::AppHandle, prompt: InstallPrompt)
     let exe = match bridge_binary_path() {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!("cannot resolve binary path: {e}");
+            tracing::error!(
+                "cannot resolve binary path: {error}",
+                error = util::error_chain::error_chain(&e)
+            );
             app.dialog()
                 .message(format!("Failed to determine binary path: {e}"))
                 .title("Setup Error")
@@ -849,7 +852,7 @@ pub async fn prompt_bridge_install(app: tauri::AppHandle, prompt: InstallPrompt)
             false
         }
         Ok(Err(e)) => {
-            tracing::error!("elevation failed: {e}");
+            tracing::error!("elevation failed: {error}", error = util::error_chain::error_chain(&e));
             app.dialog()
                 .message(format!("{}\n\n{e}", prompt.failure_headline()))
                 .title("Setup Error")

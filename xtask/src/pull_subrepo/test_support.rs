@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
+use super::{Outcome, PullRecord, StaleParentRetry};
+
 /// Guards the `SKIP` env var against a cross-test race: `skuld` runs every
 /// `#[skuld::test]` in this crate's process concurrently, and
 /// `pull_subrepo::skip_check_vendoring_integrity_matches_prek_toml_hook_id`
@@ -489,5 +491,58 @@ pub(crate) fn install_rejecting_pre_commit_hook(repo: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// The fields of an `Outcome::Conflicted`, for a test that asserts on them.
+pub(crate) struct Conflict {
+    pub(crate) worktree: PathBuf,
+    pub(crate) unresolved: Vec<String>,
+    pub(crate) auto_resolved: Vec<String>,
+    pub(crate) fixup_commit: Option<String>,
+}
+
+/// The fields of an `Outcome::Clean`, for a test that asserts on them.
+#[derive(Debug)]
+pub(crate) struct CleanPull {
+    pub(crate) pull: PullRecord,
+    pub(crate) stale_parent_retry: Option<StaleParentRetry>,
+    pub(crate) auto_resolved: Vec<String>,
+}
+
+impl Outcome {
+    /// Panic with the full `Debug` form, which includes the pull record for `Clean`.
+    #[track_caller]
+    pub(crate) fn expect_clean(self) -> CleanPull {
+        match self {
+            Outcome::Clean {
+                pull,
+                stale_parent_retry,
+                auto_resolved,
+            } => CleanPull {
+                pull,
+                stale_parent_retry,
+                auto_resolved,
+            },
+            other @ Outcome::Conflicted { .. } => panic!("expected Outcome::Clean, got {other:?}"),
+        }
+    }
+
+    #[track_caller]
+    pub(crate) fn expect_conflicted(self) -> Conflict {
+        match self {
+            Outcome::Conflicted {
+                worktree,
+                unresolved,
+                auto_resolved,
+                fixup_commit,
+            } => Conflict {
+                worktree,
+                unresolved,
+                auto_resolved,
+                fixup_commit,
+            },
+            other @ Outcome::Clean { .. } => panic!("expected Outcome::Conflicted, got {other:?}"),
+        }
     }
 }

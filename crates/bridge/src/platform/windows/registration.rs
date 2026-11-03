@@ -53,7 +53,7 @@ pub fn install_service<S: NewServiceSteps>(steps: &mut S) -> io::Result<()> {
     steps.registered();
     steps.configure(&service)?;
     if let Err(e) = steps.failure_actions(&service) {
-        warn!(error = %e, "could not configure SCM restart-on-failure; service installed without auto-restart");
+        warn!(error = %util::error_chain::error_chain(&e), "could not configure SCM restart-on-failure; service installed without auto-restart");
     }
     Ok(())
 }
@@ -96,12 +96,9 @@ pub trait StartupSteps {
     async fn recover_dns(&mut self);
     /// Forward the SCM's Stop to the root cancellation token.
     fn forward_shutdown(&mut self);
-    /// Route recovery, recording the result for the connect path.
-    async fn recover_routes(&mut self);
-    /// Reconcile the persisted target.
-    async fn reconcile(&mut self);
-    /// Reap the plugins a crashed bridge left recorded.
-    async fn reap_plugins(&mut self);
+    /// The boot sequence all three entry points share: route recovery, the plugin
+    /// reap, then the reconcile of the persisted target.
+    async fn boot_sequence(&mut self);
     /// Sweep native-crash markers.
     async fn sweep_crash_markers(&mut self);
     /// Sweep `hole.exe.old-*` leftovers.
@@ -114,15 +111,12 @@ pub trait StartupSteps {
 ///   reaches a repair placed after it.
 /// - DNS recovery runs first of the state recoveries.
 /// - The Stop is forwarded before the reconcile, so a Stop that arrives mid-boot
-///   abandons the auto-connect, and the reconcile follows the route recovery it
-///   reads.
+///   abandons the auto-connect.
 pub async fn run_startup_steps<S: StartupSteps>(steps: &mut S) {
     steps.repairs().await;
     steps.recover_dns().await;
     steps.forward_shutdown();
-    steps.recover_routes().await;
-    steps.reconcile().await;
-    steps.reap_plugins().await;
+    steps.boot_sequence().await;
     steps.sweep_crash_markers().await;
     steps.sweep_old_binaries().await;
 }

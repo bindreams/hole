@@ -378,13 +378,16 @@ environment and by an assignment `SystemPowershell::command` prepends to every s
 environment alone does not hold): its default begins with the invoking user's
 writable `Documents\WindowsPowerShell\Modules`, and cmdlet autoload would run a
 planted module as SYSTEM/admin.
+On Windows both constructors also set `CREATE_NO_WINDOW`: the release GUI and its
+elevated children have no console, so a console tool started without it would open
+a visible console window.
 `RouteCommand`/`SetupCommand` carry a `SystemTool` plus the arguments, not an argv
 whose first element is a program name. Compile-time enforcement is
 [`clippy.toml`](clippy.toml): `std::process::Command::new`,
 `tokio::process::Command::new` and every `cosca` command constructor
 (`Command::new`, `run`, `run_line`, sync and `tokio`) are disallowed, and so are
-the `cosca::Command` methods that name its program (`executable`, `arg`, `args`,
-`commandline`), because `Command: Default` is a constructor no path can ban. A
+the `cosca::Command` methods that name its program (`executable`, `raw_executable`,
+`arg`, `args`, `commandline`), because `Command: Default` is a constructor no path can ban. A
 spawn that is not an OS tool (Hole's own executable, the unprivileged GUI's
 `osascript`, the developer's `sudo`, `xtask`/`dev-console` tooling, test
 harnesses) takes an `#[allow]` with its reason; test files and tooling files take
@@ -902,7 +905,10 @@ leaves working DNS + broken routes, not the inverse):
   `plugin_recovery::reap_recorded_plugins` kills survivors by exact identity —
   no tolerance window — and deletes the file only after accounting for every
   record it named. The same reap runs at bridge start, at chain stop, and in the
-  test harness's teardown.
+  test harness's teardown. At bridge start it runs before the boot reconcile
+  (`boot::recover_then_reconcile`: route recovery, reap, reconcile): the reap
+  kills every recorded plugin, so running it after would kill the auto-connect's
+  own. IPC is not served until the boot returns.
 - **`bridge-dns.json`** — read-only now. The bridge stopped writing this file
   (DNS confinement is process-scoped WFP state, not a file — see
   [DNS forwarder](#dns-forwarder)); what's left is the evidence-gated upgrade
@@ -3128,8 +3134,9 @@ on a client path (the vendored tree is lint-excluded): re-verify on every re-mer
 - Go toolchain (for ex-ray; built by `cargo xtask deps`) — pinned by the
   `toolchain` directive in [crates/ex-ray/go.mod](crates/ex-ray/go.mod), which
   `go` enforces on a bare `go build` and CI feeds to `actions/setup-go`
-- Node.js ≥24 — a *range* (`engines.node` in [package.json](package.json)),
-  resolved at job time
+- Node.js 24 — a *range* (`engines.node` in [package.json](package.json)),
+  resolved at job time, whose floor is the first release that distrusts the
+  compromised eMudhra intermediates
 
 Rust and Go are exact pins, so a release of either cannot turn `main` red on its
 own. Bump them deliberately: clippy gains lints between releases, and
@@ -3178,6 +3185,9 @@ cargo xtask run hole-tests   # canonical local nextest invocation
 cargo xtask run doc-hole     # rustdoc, warnings denied (`doc-ex-galoshes` on Linux and Windows/arm64)
 ```
 
+A default-feature build of `hole` needs `ui/dist/`, which a fresh clone or worktree lacks; see
+[Tauri dev/prod feature toggle](#tauri-devprod-feature-toggle). The pre-commit hook does not.
+
 CI runs the doc targets on every leg after clippy. Unpublished crates (every
 workspace crate except `garter`) are documented with `--document-private-items`
 and `-A rustdoc::private_intra_doc_links`: their docs are only read in source, so a
@@ -3208,9 +3218,12 @@ not required, though a dev build still recompiles `hole` once after `ui/dist`
 changes: tauri-build 2.7.1 always watches `frontendDist`. Production is
 unaffected. The `hole` / `hole-tests` xtask targets pass
 `--no-default-features`; `hole-msi` / `hole-dmg` use the default and depend on
-`frontend-build`. **Running `cargo build -p hole` directly: add
-`--no-default-features` for dev, or `cargo xtask build frontend-build` first.**
-See #372.
+`frontend-build`. **Running `cargo build -p hole` or `cargo clippy --workspace` directly:
+add `--no-default-features` for dev, or `cargo xtask build frontend-build` first.** The
+build script checks only that `ui/dist/` exists, so never stand in an empty one: a
+default-feature build from that tree (`cargo build --release`, `uv run --directory msi-installer build`) ships a
+blank dashboard without an error.
+The pre-commit hook lints with `--no-default-features`. See #372.
 
 ### Windows installer
 
@@ -3441,12 +3454,102 @@ and a rerun repeats the platform's whole job.
   `xtask/src/child_env.rs`); build scripts named `.git/packed-refs`
   or a packed branch ref in `rerun-if-changed`, and a missing path reruns the
   script on every invocation (`xtask-lib/src/git_rerun.rs`); and `sudo env`
-  dropped `CARGO_INCREMENTAL`, which is part of every workspace unit's profile.
+  dropped `CARGO_INCREMENTAL`, which is part of every workspace unit's profile,
+  and `PKG_CONFIG_PATH`, which aws-lc-sys's build script tracks.
   The strip is a prefix rule, so `hole-verify-run-env` records its environment
   with `env -0` (an external process sees names a shell builtin omits, such as
   `ProgramFiles(x86)`), runs under a real `cargo run`, and fails on any variable
   cargo started adding that is neither the parent's, stripped, nor on
   `KEPT_TOOLCHAIN` (`xtask/src/run_injected_env.rs`).
+- **Provisioning fetches retry until they succeed.** A runner that loses its
+  network for a minute must not fail a step with no product defect behind it.
+  Every download, clone, package or module fetch retries with no attempt cap
+  (the job or step `timeout-minutes` is the bound) and prints each failure's
+  cause: `.github/scripts/retry.sh` for shell, `.github/scripts/retry.ps1` for
+  PowerShell, `xtask/src/retry.rs` (`retry::until_ok`) for xtask, `tenacity` for
+  the MSI project's WiX download. Wrap only the fetch, never a build or a test:
+  a real failure would retry until the timeout. Where the fetch and the work
+  share a command (`uv run`, `prek run`, `npx`), a fetch-only call runs first
+  and fills the cache (`scripts/validate-docs.py --fetch-only` for the docs
+  hook).
+  A retry must not hide a failure the network did not cause. Each tool's
+  deterministic check runs outside the retry where one exists: `uv lock --check --offline`, `prek validate-config`, `npm ci --dry-run --offline` (a lockfile
+  out of sync with `package.json` needs a registry lookup, which offline
+  fails), and for cargo `.github/scripts/cargo-fetch.sh`, which retries a
+  plain `cargo fetch` and then compares `Cargo.lock` with what it was, because
+  `cargo fetch --locked` exits 101 both for a stale lock and for a lost network
+  and the lock check needs the registry index. That check is CI's only: it runs in
+  `setup-build` and the release jobs before any xtask step, and `cargo xtask`
+  leaves a developer's lock to cargo, which updates it as it always has. `until_ok` stops on a failure marked
+  `retry::permanent` (a 4xx other than 408 and 429, a complete body with the
+  wrong hash, a missing working directory, a transport error no attempt can
+  fix such as a malformed URL or a rejected certificate: only I/O errors,
+  timeouts, name-resolution and connection failures, 5xx, 408 and 429
+  retry), `retry.ps1` stops on an HTTP 4xx
+  other than 408 and 429, the MSI project's WiX download does the same, and the
+  shell and xtask helpers stop on a missing program. Ctrl-C ends the xtask loop, though xtask itself survives the signal (#568): the handler records it, and `until_ok` checks before and after every attempt (a download also between body chunks) and wakes from its backoff. 408 and 429 ask for another
+  try, so they retry, and a `Retry-After`, in seconds or as an HTTP date, is
+  waited out (the backoff is the floor; `retry.ps1` reads the date form on
+  PowerShell 7 only). Where the tool offers no way to tell, a deterministic failure retries
+  until the timeout and the log shows its cause on every attempt: `go mod download` (a nonexistent version or a checksum mismatch exits 1 like a lost
+  network; a stale `go.sum` does not loop, since `go build` fails it at once),
+  `cargo fetch` (a manifest cargo cannot parse), `uv sync` and `uv tool install`
+  (a yanked pin or a source build that fails), `npm ci` and `npx`, `prek install-hooks`,
+  `GOTOOLCHAIN=goX.Y.Z go version` (a toolchain that does not exist), `go mod tidy` (in the vendor bump, whose `Finish` step has a 10-minute step bound so that the step fails and `Push` still runs, rather than the 30-minute job bound cancelling them), `gh release download`, `git clone`, `curl -f`, `brew`, `cargo binstall`.
+  Three tools get a discriminator instead: `git ls-remote --exit-code` tells a
+  tag upstream lacks (exit 2) from a lost network before `pull-subrepo`
+  fetches; `cargo package --offline` runs a release's packaging and verify
+  build from the fetched sources, so only `cargo publish --dry-run --no-verify`
+  (which always asks the registry) is retried; and the publish workflows wait
+  for `api.github.com` to answer (`gh api zen`, with the job's token: the
+  unauthenticated limit is 60 an hour per shared runner IP) before asking
+  `gh release view` once. The real
+  `cargo publish` is not retried: a retry after an upload whose answer was lost
+  would fail on the version that just landed.
+  A `uses:` action that fetches cannot be wrapped: `setup-go` and the
+  sccache action are `continue-on-error` with a visible warning and a
+  fallback (`.github/actions/setup-go` pins the release through the `go`
+  command; a build without sccache), and diagnostic-only artifact uploads go
+  through `.github/actions/upload-diagnostics`, which warns instead of
+  failing. The release workflows' `upload-artifact` steps feed later jobs and
+  stay unwrapped, as do the other actions (binstall, cache): no incident has
+  been seen there.
+  `xtask/src/command.rs` names the command and the status in a failed child's
+  error.
+- **A test that needs egress tells a network loss from a Hole defect.** The
+  oracle is Hole's own state, not a remote host
+  (`tun_engine::test_utils::held_covers`): a failed probe while Hole holds a
+  cover fails at once as a defect, and with no cover and the control host down
+  the test waits for the network, uncapped. A probe made while a cover is engaged
+  cannot use a control host, so the scenario vouches for the network from inside
+  the cover: it probes a host the cover permits before and after each probe whose
+  result it reports (`egress::InCover`), and the egress window judges the readings
+  after the teardown. A scenario hands the window the hosts it claims the cover
+  blocks, and every run (a rerun's too) opens only once they answer outside any
+  cover, and a run that held is repeated when one of them is down outside the cover afterwards, so a block is never read off a host that is down on its own. A failure is a defect only when the permit answered on both
+  sides and the failing targets, probed outside the cover, answer there with the
+  control answering around them; a target that is down outside any cover is
+  waited for (`check_egress_restored` does the same for a restored-egress
+  target, so only a cover Hole still holds fails it). A rerun needs a probe
+  outside any cover to have failed, because rerunning a defect that shows only
+  sometimes would be an uncapped wait on no external event: a reading missing
+  inside a cover, whether within one engage or across reloads, is judged by the
+  control around the teardown, down being a rerun and answering a defect. A read
+  of runner state goes through
+  `read_with_network_up`, which retakes a read the control did not bracket; a
+  read that fails with the control answering on both sides is a defect. A
+  reading of a marker in a NIC capture is `Failure::captured`: the scenario
+  probes the permit over TCP on both sides of its markers, and a missing marker
+  is judged by the control around the teardown like any other miss. What no
+  probe can rule out is an outage that falls entirely between two adjacent
+  probes of one engage, and one that covers an in-cover reading and has ended
+  by the teardown probe: neither can be told from a cover that breaks its
+  permit (including one that blocks it outright), so both are defects.
+  A scenario with no permitted host to
+  vouch with (the live-TUN e2e, whose cover permits only a loopback server) is
+  judged by the control outside the run alone (`Failure::Unvouched`). The
+  mechanism is in `hole_test_observability::egress` and
+  `routing/failclosed/cover_oracle.rs`.
 - **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
   plus `Validate PR title`.
 
@@ -3534,6 +3637,16 @@ Spotlight "Hole" must reveal it.
   framework/job timeout is the failure-to-human signal). Use the codebase's
   rendezvous primitives (oneshot, `watch`, `WaitableWriter`, `CancellationToken`,
   `JoinHandle.await`, `tokio::time::pause/advance`) for intra-process sync (#383).
+- **A lost network is not a product defect** — a probe of real egress fails the
+  same way for a broken cover and for a runner whose network dropped. A test's
+  precondition on the host's primary IPv4 (`net_discovery::wait_for_primary_ipv4`,
+  `HostNetwork::read_when_routed`) waits until the kernel has an off-link route,
+  with no cap and a log line per change of state; the CI step's `timeout-minutes`
+  is the bound. Only a lost network is waited out (`PrimaryIpv4Error::NetworkLoss`:
+  network or host unreachable, network down, a link-local source address); any
+  other error, such as a refused socket, fails at once with its cause.
+  See [CI layout](#ci-layout) for how a test that probes real egress tells a
+  network loss from a Hole defect.
 - **Every crate runs in CI** — the `every_workspace_crate_runs_in_ci` conformance
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test
