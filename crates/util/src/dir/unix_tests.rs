@@ -556,7 +556,8 @@ fn with_no_expected_owner_any_regular_file_is_trusted() {
 
 #[skuld::test]
 fn a_file_with_another_name_is_not_trusted_whoever_owns_it() {
-    // A name for the file is what a hard link a user planted adds, and appending would change the file at the other name.
+    // A name for the file is what a hard link a user planted adds, and appending would change the file at the other
+    // name.
     let linked = |uid| Facts {
         regular: true,
         uid,

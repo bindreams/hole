@@ -697,8 +697,8 @@ re-derive them.
 1. **Write only to a file you made or the owner already owns.** A file kept at a name across runs (the log) is
    opened with `Dir::append_own_file`: created with `O_EXCL`, or an existing file taken only if it is the expected
    owner's with no other name (unix: its uid and a link count of 1; Windows: no other name). Anything else at the
-   name (another name of a file, a link, a FIFO) is unlinked and replaced, never written through, and an existing file's owner and mode are
-   left alone.
+   name (another name of a file, a link, a FIFO) is unlinked and replaced, never written through, and an existing
+   file's owner and mode are left alone.
 
 1. **Read through the handle too.** A privileged read of a fixed name in such a folder is `ReadDir::read` after the
    same walk (`util::dir::read_state_file` for a state file). `std::fs::read` opens by path without `O_NONBLOCK`: a

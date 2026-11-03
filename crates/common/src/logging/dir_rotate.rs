@@ -72,8 +72,8 @@ impl DirRotate {
         this
     }
 
-    /// Opens the active file (see [`Dir::append_own_file`]: a file at the name that is not the owner's, or has another name, is replaced,
-    /// never written to), and counts what it already holds. A new file is given to `owner`. The first failure to
+    /// Opens the active file (see [`Dir::append_own_file`]: a file at the name that is not the owner's, or has
+    /// another name, is replaced, never written to), and counts what it already holds. A new file is given to `owner`. The first failure to
     /// open is said once; later ones, and the retry at every write, are silent.
     fn open_active(&mut self) {
         match self.dir.append_own_file(&self.name, 0o644, self.owner) {
@@ -92,9 +92,9 @@ impl DirRotate {
             .map_or(0, |meta| meta.len() as usize);
     }
 
-    /// Renames the active file over `<name>.1` and opens a fresh active file. If `<name>.1` cannot take it, the fallback
-    /// does; once `<name>.1` can again, the fallback, which holds older lines, is removed. If neither can, the same
-    /// file is reopened, over the limit, and the next write tries again.
+    /// Renames the active file over `<name>.1` and opens a fresh active file. If `<name>.1` cannot take it, the
+    /// fallback does; once `<name>.1` can again, the fallback, which holds older lines, is removed. If neither can,
+    /// the same file is reopened, over the limit, and the next write tries again.
     fn rotate(&mut self) {
         // Closed first: Windows does not rename a file that a handle without delete sharing has open, and no
         // other handle of ours does.

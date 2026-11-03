@@ -44,8 +44,8 @@ enum AtAPlantedName {
     /// Takes the name over or removes it, whatever sits there: afterwards the name no longer leads to what was
     /// planted.
     Replaces,
-    /// Like [`Self::Replaces`], except that a file the expected owner already owns is kept and locked as it is (the lock
-    /// does this by contract, without changing it): a hard link to a file of the owner's own.
+    /// Like [`Self::Replaces`], except that a file the expected owner already owns is kept and locked as it is
+    /// (the lock does this by contract, without changing it): a hard link to a file of the owner's own.
     KeepsAFileItsOwnerOwns,
     /// A claim that is lost: `AlreadyExists`, with the planted name left as it was.
     ClaimedElsewhere,
@@ -95,8 +95,8 @@ impl std::fmt::Display for LeftAsItIs {
 
 impl std::error::Error for LeftAsItIs {}
 
-/// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's, or a
-/// versioned file's decision to leave a file it cannot read as it is.
+/// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's,
+/// or a versioned file's decision to leave a file it cannot read as it is.
 fn is_a_refusal(err: &io::Error) -> bool {
     let mut current = err.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static));
     while let Some(error) = current {
@@ -884,7 +884,8 @@ struct JsonParse<'a> {
     converted: bool,
 }
 
-/// Whether `line` calls `name` bare: not as part of a longer name or a path (`extend_from_slice(` is not `from_slice(`).
+/// Whether `line` calls `name` bare: not as part of a longer name or a path (`extend_from_slice(` is not
+/// `from_slice(`).
 fn calls_by_name(line: &str, name: &str) -> bool {
     line.match_indices(name).any(|(at, _)| {
         let before = line[..at].chars().next_back();
@@ -1056,7 +1057,8 @@ fn the_json_parse_scan_sees_every_spelling_of_a_parse() {
         sites("use serde_json::{from_str, Value};\nlet v = from_str::<T>(s);"),
         1
     );
-    // Not a parse: a name that is only part of another, an import the file never calls, a `from_*` that is not serde_json's.
+    // Not a parse: a name that is only part of another, an import the file never calls, a `from_*` that is not
+    // serde_json's.
     assert_eq!(sites("use serde_json::from_slice;\nbuf.extend_from_slice(b);"), 0);
     assert_eq!(sites("buf.extend_from_slice(b);\nlet a = u8::from_str(s);"), 0);
     assert_eq!(sites("let v = from_slice(b);"), 0);

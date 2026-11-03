@@ -221,17 +221,17 @@ impl Exclusive {
     /// `Ok(None)` means the lock is currently held by someone else (this
     /// process or another) — contention, not an error. `owner`, when
     /// `Some((uid, gid))`, is applied via `fchown` once the lock is held (unix;
-    /// Windows ignores it) to a file with one name, and an existing lock file is only used if `uid`
-    /// owns it; `None` expects no owner and leaves an existing file as it is
-    /// (the root-owned `--service` daemon case). See the module doc's open
-    /// protocol.
+    /// Windows ignores it), and only to a file with one name. An existing lock
+    /// file is only used if `uid` owns it. `None` expects no owner and leaves an
+    /// existing file as it is (the root-owned `--service` daemon case). See the
+    /// module doc's open protocol.
     ///
     /// Missing directories above the file are created. A symlink, directory,
-    /// socket or other non-regular file at the path, one owned by a third party, or a directory in the path that is a symlink
-    /// or (with an `owner`) owned by a third party, is refused with an
-    /// `InvalidData` error holding a [`Refused`]; a refused file is never
-    /// re-permissioned and nothing is created outside the directory the path
-    /// names.
+    /// socket or other non-regular file at the path, one owned by a third party,
+    /// or a directory in the path that is a symlink or (with an `owner`) owned
+    /// by a third party, is refused with an `InvalidData` error holding a
+    /// [`Refused`]; a refused file is never re-permissioned and nothing is
+    /// created outside the directory the path names.
     pub fn try_acquire(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Option<Self>> {
         Self::try_acquire_as(path, owner, platform::caller())
     }

@@ -291,7 +291,8 @@ impl Dir {
     /// existing one that is `owner`'s own with no other name (unix: owned by `owner`'s uid, or any regular file with no
     /// `owner`, and a link count of 1; Windows: a regular file with no other name, as the system makes one).
     /// Anything else at the name (another name of a file, a link, a FIFO) is unlinked and replaced by a fresh file:
-    /// it is never written to, and never changed. A directory at the name is an error. An existing file's mode and owner are left as they are.
+    /// it is never written to, and never changed. A directory at the name is an error. An existing file's mode and
+    /// owner are left as they are.
     /// For a log in a folder a user may own, where a name the user planted must not make a privileged writer
     /// change a file it did not make.
     pub fn append_own_file(&self, name: &OsStr, mode: u32, owner: Option<(u32, u32)>) -> io::Result<File> {
