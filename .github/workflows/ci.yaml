@@ -968,8 +968,7 @@ jobs:
       # xtask/src/schemars_pin.rs's module doc for why that's not verified here.
       #
       # Runs on the Node 24 that `package.json` pins, which is what Renovate's
-      # `engines` asks for: an unpinned `npx renovate` on a Node outside that range
-      # resolved a years-old Renovate that the validator's own CLI then misread.
+      # `engines` asks for.
       #
       # Named explicitly, with --no-global: naming a config file makes the
       # validator treat it as *global* self-hosted config by default, which
@@ -989,7 +988,7 @@ jobs:
           # renovate: datasource=npm depName=renovate
           RENOVATE_VERSION: "44.209.0"
         run: |
-          # Fetch under retry, without calling the validator; then validate offline, once.
+          # Retry covers only the fetch; the validation runs offline, once, so a retry can't mask a config error.
           .github/scripts/retry.sh npx --yes --package "renovate@${RENOVATE_VERSION}" -- node --version
           npx --offline --package "renovate@${RENOVATE_VERSION}" renovate-config-validator --strict --no-global .github/renovate.json
 
