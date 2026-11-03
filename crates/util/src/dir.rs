@@ -68,7 +68,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -525,7 +525,7 @@ pub fn read_state_file(state_dir: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
 /// not wait for the read. A symlink at the name is an error, not followed.
 fn read_whole(dir: &File, name: &OsStr) -> io::Result<Vec<u8>> {
     single_component(name)?;
-    read_to_end(platform::open_file(dir, name, OpenFile::Read)?)
+    platform::read_to_end(platform::open_file(dir, name, OpenFile::Read)?)
 }
 
 /// [`read_whole`] for a file the folder's owner must vouch for ([`trail::may_read`]): refused with
@@ -536,13 +536,7 @@ fn read_whole_vouched(dir: &File, name: &OsStr) -> io::Result<Vec<u8>> {
     if !platform::is_vouched_for(dir, &file)? {
         return Err(Refusal::ForeignFile.into_io_error());
     }
-    read_to_end(file)
-}
-
-fn read_to_end(mut file: File) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    platform::read_to_end(file)
 }
 
 /// `name` must be one ordinary file name: no separator, and not empty, `.` or `..`.

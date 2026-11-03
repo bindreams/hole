@@ -289,7 +289,7 @@ fn load_maps_io_failure_to_unreadable_never_corrupt() {
 fn a_failed_read_logs_the_error_text() {
     struct Fails;
     impl Fs for Fails {
-        fn read(&self, _path: &std::path::Path) -> io::Result<Vec<u8>> {
+        fn read(&self, _dir: &crate::dir::ReadDir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
             Err(io::Error::other("disk on fire"))
         }
     }

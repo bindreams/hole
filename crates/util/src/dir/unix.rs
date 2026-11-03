@@ -497,6 +497,15 @@ pub(super) fn give_file(file: &File, owner: Option<(u32, u32)>) {
     chown_best_effort(file, owner);
 }
 
+/// The rest of `file`.
+pub(super) fn read_to_end(mut file: File) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 pub(super) fn secure_dir(dir: &File, owner: Option<(u32, u32)>, mode: Option<u32>) -> io::Result<()> {
     chown_best_effort(dir, owner);
     match mode {

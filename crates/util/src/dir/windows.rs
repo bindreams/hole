@@ -23,8 +23,8 @@ use windows::Wdk::Storage::FileSystem::{
     NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows::Win32::Foundation::{
-    LocalFree, RtlNtStatusToDosError, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
-    ERROR_SUCCESS, HANDLE, HLOCAL, NTSTATUS, OBJECT_ATTRIBUTE_FLAGS, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    LocalFree, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_SUCCESS, HANDLE, HLOCAL,
+    NTSTATUS, OBJECT_ATTRIBUTE_FLAGS, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT};
 use windows::Win32::Security::{
@@ -47,6 +47,8 @@ use super::{EntryKind, OpenFile, Refusal};
 
 mod link;
 use link::{Sid, Step};
+mod status;
+pub(in crate::dir) use status::read_to_end;
 
 /// Nothing on Windows depends on who is opening.
 pub struct Caller;
@@ -63,14 +65,12 @@ const SHARE_ALL: FILE_SHARE_MODE = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHAR
 /// What a file the caller opens shares: everything but `DELETE`, so the name stays bound to the open file.
 const SHARE_NO_DELETE: FILE_SHARE_MODE = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0);
 
-/// The OS error of a failed `NTSTATUS`.
+/// The error of a failed `NTSTATUS`, naming it.
 fn nt(status: NTSTATUS) -> io::Result<()> {
     if status.0 >= 0 {
         return Ok(());
     }
-    // SAFETY: `RtlNtStatusToDosError` takes a status by value and has no preconditions.
-    let code = unsafe { RtlNtStatusToDosError(status) };
-    Err(io::Error::from_raw_os_error(code as i32))
+    Err(status::error_of(status))
 }
 
 fn options(flags: &[NTCREATEFILE_CREATE_OPTIONS]) -> NTCREATEFILE_CREATE_OPTIONS {
@@ -816,7 +816,9 @@ pub(super) fn link(dir: &File, existing: &OsStr, new: &OsStr) -> io::Result<()> 
 }
 
 fn posix_rename_unsupported(err: &io::Error) -> bool {
-    let Some(code) = err.raw_os_error() else { return false };
+    let Some(code) = crate::error_chain::raw_os_error(err) else {
+        return false;
+    };
     [ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION]
         .iter()
         .any(|unsupported| unsupported.0 as i32 == code)

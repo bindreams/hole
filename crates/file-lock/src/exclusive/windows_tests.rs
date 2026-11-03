@@ -40,3 +40,24 @@ fn a_handle_that_is_not_a_disk_file_is_refused() {
     };
     assert_eq!(vet(facts), Err(Refusal::NotRegular));
 }
+
+// A failed open names its NTSTATUS ------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_lock_file_held_without_sharing_fails_to_open_naming_its_ntstatus() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("held.lock");
+    let _holder = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+
+    let err = open_locked(&path, false, None, caller()).unwrap_err();
+
+    // STATUS_SHARING_VIOLATION
+    assert!(err.to_string().contains("NTSTATUS 0xC0000043"), "{err}");
+}
