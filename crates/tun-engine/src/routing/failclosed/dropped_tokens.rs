@@ -29,14 +29,36 @@ pub fn drop_once(
     token: &str,
     drop: impl FnOnce() -> Result<(), RoutingError>,
 ) -> Result<(), RoutingError> {
+    drop_remembering(state_dir, token, drop, false)
+}
+
+/// [`drop_once`] for a drop nobody will retry (the token a new record displaced:
+/// no record names it any more). The attempt is remembered whether or not it
+/// failed; the failure is still returned, for the caller to log.
+pub fn drop_once_best_effort(
+    state_dir: &Path,
+    token: &str,
+    drop: impl FnOnce() -> Result<(), RoutingError>,
+) -> Result<(), RoutingError> {
+    drop_remembering(state_dir, token, drop, true)
+}
+
+fn drop_remembering(
+    state_dir: &Path,
+    token: &str,
+    drop: impl FnOnce() -> Result<(), RoutingError>,
+    remember_failure: bool,
+) -> Result<(), RoutingError> {
     let mut dropped = DROPPED.lock().unwrap_or_else(PoisonError::into_inner);
     let key = (state_dir.to_owned(), token.to_owned());
     if dropped.contains(&key) {
         return Ok(());
     }
-    drop()?;
-    dropped.insert(key);
-    Ok(())
+    let result = drop();
+    if result.is_ok() || remember_failure {
+        dropped.insert(key);
+    }
+    result
 }
 
 /// Forget that `token` was dropped: `pfctl -E` returned it again, and this is a

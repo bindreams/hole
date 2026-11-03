@@ -329,7 +329,12 @@ struct TransientEngage<'a> {
     after: Option<(&'static str, Hook<'a>)>,
     /// How many ruleset loads still fail (1: the engage's own).
     loads_to_fail: u32,
+    /// The `pfctl -X` double answers `pf: token invalid`.
+    drops_fail: bool,
 }
+
+/// What `pfctl -X` prints for a token pf no longer holds.
+const TOKEN_INVALID: &str = "pf: token invalid";
 
 /// A watch on `dir`, opened now and never closed: the engage doubles hold it for the length
 /// of the test process.
@@ -353,6 +358,7 @@ impl<'a> TransientEngage<'a> {
             restore_pf: ReleasePf::new(dir),
             after: None,
             loads_to_fail: 0,
+            drops_fail: false,
         }
     }
 
@@ -364,6 +370,25 @@ impl<'a> TransientEngage<'a> {
     fn fail_loads(mut self, n: u32) -> Self {
         self.loads_to_fail = n;
         self
+    }
+
+    /// Every `pfctl -X` of this engage fails, as it does for a token a reboot retired.
+    fn fail_drops(mut self) -> Self {
+        self.drops_fail = true;
+        self
+    }
+
+    /// The `pfctl -X` double: records the attempt, then answers per `drops_fail`.
+    fn pfctl_x<'b>(&'b mut self, token: &'b str) -> impl FnOnce() -> Result<(), RoutingError> + 'b {
+        let (dropped, fail) = (&mut self.dropped, self.drops_fail);
+        move || {
+            dropped.push(token.to_owned());
+            if fail {
+                Err(RoutingError::RouteSetup(format!("pfctl -X failed: {TOKEN_INVALID}")))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     /// The back-out's own restore fails.
@@ -437,11 +462,14 @@ impl EngageOps for TransientEngage<'_> {
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
         self.log.push("drop_token");
-        let dropped = &mut self.dropped;
-        dropped_tokens::drop_once(self.real.state_dir, token, || {
-            dropped.push(token.to_owned());
-            Ok(())
-        })
+        let state_dir = self.real.state_dir;
+        dropped_tokens::drop_once(state_dir, token, self.pfctl_x(token))
+    }
+
+    fn drop_displaced_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.log.push("drop_token");
+        let state_dir = self.real.state_dir;
+        dropped_tokens::drop_once_best_effort(state_dir, token, self.pfctl_x(token))
     }
 
     fn transient_restore(&mut self, token: &str) -> bool {
@@ -747,6 +775,71 @@ fn a_transient_engage_over_a_leftover_record_drops_the_token_that_record_named()
     }
 }
 
+/// Run `f` and return what it returned with every WARN it logged.
+fn warnings_during<T>(f: impl FnOnce() -> T) -> (T, String) {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let out = {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        f()
+    };
+    (out, writer.snapshot())
+}
+
+/// Asking the ledger to drop `token` again runs nothing: it was settled.
+fn assert_token_settled(dir: &Path, token: &str) {
+    let ran = std::cell::Cell::new(false);
+    dropped_tokens::drop_once(dir, token, || {
+        ran.set(true);
+        Ok(())
+    })
+    .expect("a settled token is not dropped again");
+    assert!(!ran.get(), "{token} is not recorded as settled");
+}
+
+#[skuld::test]
+fn a_transient_engage_succeeds_when_the_drop_of_the_token_it_displaced_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    state::seed(dir.path(), &transient_record(OLD));
+    let mut ops = TransientEngage::new(dir.path()).fail_drops();
+
+    let (engaged, warned) = warnings_during(|| engage_with(server(), None, &mut ops));
+
+    assert_eq!(engaged.expect("a displaced token's drop is best-effort"), MINE);
+    assert_eq!(state::holds(dir.path(), MINE), Held::Held);
+    assert_eq!(ops.dropped, vec![OLD.to_string()], "the drop ran once");
+    assert!(
+        warned.contains(&format!("token={OLD}")) && warned.contains(TOKEN_INVALID),
+        "the warn names the token and what pfctl said: {warned}"
+    );
+    assert_token_settled(dir.path(), OLD);
+}
+
+#[skuld::test]
+fn a_standing_engage_succeeds_when_the_drop_of_the_token_it_displaced_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::seed(dir.path(), &standing_record(OLD));
+    let mut ops = StandingEngage::new(dir.path(), false).fail_drops();
+
+    let (engaged, warned) = warnings_during(|| engage_lockdown_with(server(), "utun9", &mut ops));
+
+    assert_eq!(engaged.expect("a displaced token's drop is best-effort"), MINE);
+    assert_eq!(lockdown_state::holds(dir.path(), MINE), Held::Held);
+    assert_eq!(ops.dropped, vec![OLD.to_string()], "the drop ran once");
+    assert!(
+        warned.contains(&format!("token={OLD}")) && warned.contains("injected pfctl -X failure"),
+        "the warn names the token and what pfctl said: {warned}"
+    );
+    assert_token_settled(dir.path(), OLD);
+}
+
 #[skuld::test]
 fn a_transient_engage_whose_write_is_refused_drops_only_its_own_token() {
     // A release began after the engage's watch opened, so the write is refused and the
@@ -891,14 +984,15 @@ impl LockdownEngageOps for StandingEngage<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        let (dropped, fails) = (&mut self.dropped, self.drops_fail);
-        let result = dropped_tokens::drop_once(self.real.state_dir, token, || {
-            dropped.push(token.to_owned());
-            if fails {
-                return Err(RoutingError::RouteSetup("injected pfctl -X failure".into()));
-            }
-            Ok(())
-        });
+        let state_dir = self.real.state_dir;
+        let result = dropped_tokens::drop_once(state_dir, token, self.pfctl_x(token));
+        self.step("drop_token");
+        result
+    }
+
+    fn drop_displaced_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        let state_dir = self.real.state_dir;
+        let result = dropped_tokens::drop_once_best_effort(state_dir, token, self.pfctl_x(token));
         self.step("drop_token");
         result
     }
@@ -1553,6 +1647,18 @@ impl StandingEngage<'_> {
     fn fail_drops(mut self) -> Self {
         self.drops_fail = true;
         self
+    }
+
+    /// The `pfctl -X` double: records the attempt, then answers per `drops_fail`.
+    fn pfctl_x<'b>(&'b mut self, token: &'b str) -> impl FnOnce() -> Result<(), RoutingError> + 'b {
+        let (dropped, fails) = (&mut self.dropped, self.drops_fail);
+        move || {
+            dropped.push(token.to_owned());
+            if fails {
+                return Err(RoutingError::RouteSetup("injected pfctl -X failure".into()));
+            }
+            Ok(())
+        }
     }
 
     /// Let the next `n` loads succeed, then fail the one after: the engage's

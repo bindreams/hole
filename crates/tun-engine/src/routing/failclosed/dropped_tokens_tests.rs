@@ -35,6 +35,33 @@ fn a_drop_that_failed_is_run_again() {
 }
 
 #[skuld::test]
+fn a_best_effort_drop_that_failed_is_settled_and_not_run_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let failed = drop_once_best_effort(dir.path(), "7", || {
+        Err(RoutingError::RouteSetup("pfctl -X failed: pf: token invalid".into()))
+    });
+    assert!(failed.is_err(), "the failure is still reported, for the caller to log");
+
+    let calls = Cell::new(0);
+    drop_once(dir.path(), "7", counted(&calls)).unwrap();
+    drop_once_best_effort(dir.path(), "7", counted(&calls)).unwrap();
+    assert_eq!(calls.get(), 0, "neither asker runs a drop for a token already settled");
+}
+
+#[skuld::test]
+fn a_token_pf_hands_out_again_after_a_settled_failure_can_be_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = drop_once_best_effort(dir.path(), "7", || {
+        Err(RoutingError::RouteSetup("token invalid".into()))
+    });
+    minted(dir.path(), "7");
+
+    let calls = Cell::new(0);
+    drop_once(dir.path(), "7", counted(&calls)).unwrap();
+    assert_eq!(calls.get(), 1);
+}
+
+#[skuld::test]
 fn a_token_pf_hands_out_again_can_be_dropped_again() {
     let dir = tempfile::tempdir().unwrap();
     let calls = Cell::new(0);

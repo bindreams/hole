@@ -1017,6 +1017,10 @@ impl EngageOps for RecordingEngageOps {
         }
     }
 
+    fn drop_displaced_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.drop_token(token)
+    }
+
     fn transient_commit_check(&mut self, _token: &str) -> Result<(), RoutingError> {
         self.log.push("transient_commit_check");
         Ok(())

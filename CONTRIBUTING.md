@@ -2425,8 +2425,10 @@ write is ordered by something that is not that mutex:
   The ledger is a mutex held across the `pfctl -X`, so an Unblock can wait for one
   drop in flight. An engage whose write replaces a record that named another token
   drops that token once the write lands: the leftover of a release that did not
-  finish, or the token salvaged from an unusable file, which nothing else names. A
-  back-out restores the baseline the engage holds in memory, then drops the
+  finish, or the token salvaged from an unusable file, which nothing else names. That
+  drop is best-effort: a failure (`pf: token invalid` for a token a reboot retired) is
+  warned with the token and never fails the engage, and the ledger records the token
+  as settled either way. A back-out restores the baseline the engage holds in memory, then drops the
   engage's token and clears every record naming it, a tombstone included. If the
   restore fails it puts its record back over nothing or over the tombstone, which
   the release then refuses to clear (the Unblock reports an error); that record

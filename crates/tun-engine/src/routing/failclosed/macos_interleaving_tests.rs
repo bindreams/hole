@@ -241,17 +241,17 @@ fn no_order_of_two_release_alls_breaks_a_pf_record_invariant() {
 }
 
 #[skuld::test]
-fn no_order_of_release_all_and_disengage_lockdown_breaks_a_pf_record_invariant() {
+fn no_order_of_a_full_release_and_disengage_lockdown_breaks_a_pf_record_invariant() {
     explore_pair(Kind::Release, Kind::Disengage);
 }
 
 #[skuld::test]
-fn no_order_of_release_all_and_a_transient_engage_breaks_a_pf_record_invariant() {
+fn no_order_of_a_full_release_and_a_transient_engage_breaks_a_pf_record_invariant() {
     explore_pair(Kind::Release, Kind::TransientEngage);
 }
 
 #[skuld::test]
-fn no_order_of_release_all_and_a_standing_engage_breaks_a_pf_record_invariant() {
+fn no_order_of_a_full_release_and_a_standing_engage_breaks_a_pf_record_invariant() {
     explore_pair(Kind::Release, Kind::StandingEngage);
 }
 

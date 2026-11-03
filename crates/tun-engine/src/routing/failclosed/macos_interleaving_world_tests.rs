@@ -180,16 +180,23 @@ impl World {
     /// `pfctl -X`, through the production ledger: a drop it lets through of a
     /// token that is not live is a double drop.
     fn drop_token(&self, who: &str, token: &str) -> Result<(), RoutingError> {
-        dropped_tokens::drop_once(&self.dir, token, || {
-            let mut pf = self.pf();
-            if pf.live.remove(token) {
-                return Ok(());
-            }
-            pf.violations.push(format!(
-                "{who} dropped {token}, which pf no longer holds (a double drop)"
-            ));
-            Err(RoutingError::RouteSetup(format!("pfctl -X: {token} is not live")))
-        })
+        dropped_tokens::drop_once(&self.dir, token, || self.pf_drop(who, token))
+    }
+
+    /// [`Self::drop_token`] for a token a record write displaced.
+    fn drop_displaced_token(&self, who: &str, token: &str) -> Result<(), RoutingError> {
+        dropped_tokens::drop_once_best_effort(&self.dir, token, || self.pf_drop(who, token))
+    }
+
+    fn pf_drop(&self, who: &str, token: &str) -> Result<(), RoutingError> {
+        let mut pf = self.pf();
+        if pf.live.remove(token) {
+            return Ok(());
+        }
+        pf.violations.push(format!(
+            "{who} dropped {token}, which pf no longer holds (a double drop)"
+        ));
+        Err(RoutingError::RouteSetup(format!("pfctl -X: {token} is not live")))
     }
 
     fn note_claim(&self, record: Record, before: &StateFile<impl PfRecord>, after: &StateFile<impl PfRecord>) {
@@ -415,6 +422,15 @@ impl EngageOps for TransientParty<'_> {
         self.world.drop_token("the transient engage", token)
     }
 
+    fn drop_displaced_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.gate.step(
+            Op::new("drop_token")
+                .writes(Res::Token(token.into()))
+                .commutes(Res::Enabled),
+        );
+        self.world.drop_displaced_token("the transient engage", token)
+    }
+
     fn transient_restore(&mut self, token: &str) -> bool {
         disengage_with(
             Some(token),
@@ -512,6 +528,15 @@ impl LockdownEngageOps for StandingParty<'_> {
                 .commutes(Res::Enabled),
         );
         self.world.drop_token("the standing engage", token)
+    }
+
+    fn drop_displaced_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.gate.step(
+            Op::new("drop_token")
+                .writes(Res::Token(token.into()))
+                .commutes(Res::Enabled),
+        );
+        self.world.drop_displaced_token("the standing engage", token)
     }
 
     fn commit_check(&mut self, token: &str) -> Result<(), RoutingError> {
