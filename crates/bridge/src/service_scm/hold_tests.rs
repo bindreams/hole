@@ -303,7 +303,6 @@ fn a_process_without_the_service_sid_is_never_held_in_any_live_state() {
                 observed: live,
                 fate: ProcessFate::Unheld,
                 held_alive: false,
-                named_alive: false,
                 ever_held: false
             },
             "{live:?}"
@@ -426,7 +425,6 @@ fn a_held_process_that_has_not_exited_is_alive_whatever_the_state() {
                 observed: live,
                 fate: ProcessFate::Alive,
                 held_alive: true,
-                named_alive: true,
                 ever_held: true
             },
             "{live:?}"
@@ -456,7 +454,6 @@ fn a_held_process_that_has_exited_is_an_exit_only_where_the_id_is_valid() {
                 observed: stale,
                 fate,
                 held_alive: false,
-                named_alive: false,
                 ever_held: true
             },
             "{stale:?}"
@@ -494,7 +491,6 @@ fn a_pending_service_whose_named_id_no_process_has_is_unheld_not_exited() {
                 observed: pending,
                 fate: ProcessFate::Unheld,
                 held_alive: false,
-                named_alive: false,
                 ever_held: false
             },
             "{pending:?}"
@@ -525,7 +521,6 @@ fn a_stopped_service_whose_earlier_process_still_runs_has_a_live_hold() {
             observed: Observed::Stopped,
             fate: ProcessFate::Unheld,
             held_alive: true,
-            named_alive: true,
             ever_held: true
         }
     );
@@ -552,7 +547,6 @@ fn a_stopped_service_whose_earlier_process_has_exited_has_no_live_hold() {
             observed: Observed::Stopped,
             fate: ProcessFate::Unheld,
             held_alive: false,
-            named_alive: false,
             ever_held: true
         }
     );
@@ -983,51 +977,9 @@ fn a_scanned_process_named_in_a_pending_state_stays_an_orphan() {
     }
 }
 
-/// A look tells the processes the SCM named from the others: an orphan alive
-/// leaves `held_alive` set and `named_alive` clear, and the other way round.
-#[skuld::test]
-fn a_look_tells_a_live_named_process_from_a_live_orphan() {
-    let log = Log::default();
-    let mut source = Script::new(
-        &log,
-        vec![
-            reading(Observed::Running, 100),
-            reading(Observed::Running, 100),
-            reading(Observed::StopPending, 0),
-            reading(Observed::StopPending, 0),
-        ],
-    );
-    let mut holds = ProcessHolds::default();
-    holds.look(&mut source).unwrap();
-    holds.adopt(300, process(&log, 300));
-
-    source.exited.push(100);
-    let only_orphan = holds.look(&mut source).unwrap();
-    assert!(only_orphan.held_alive && !only_orphan.named_alive, "{only_orphan:?}");
-
-    source.exited.clear();
-    source.exited.push(300);
-    let only_named = holds.look(&mut source).unwrap();
-    assert!(only_named.held_alive && only_named.named_alive, "{only_named:?}");
-}
-
-/// A wait on the processes' own exit covers the ones the SCM told to stop; the
-/// terminating wait covers every one.
-#[skuld::test]
-fn a_wait_covers_the_processes_its_kind_covers() {
-    let log = Log::default();
-    let mut source = Script::new(&log, steady(Observed::Running, 100));
-    let mut holds = ProcessHolds::default();
-    holds.look(&mut source).unwrap();
-    holds.adopt(300, process(&log, 300));
-    let pids = |wait| holds.awaited(wait).map(|handle| handle.pid).collect::<Vec<_>>();
-    assert_eq!(pids(ExitWait::OnTheirOwn), vec![100]);
-    assert_eq!(pids(ExitWait::TerminateOrphansThenWait), vec![100, 300]);
-}
-
 /// What a wait after `look` does to the holds: the pids it terminates, then
-/// the pids it waits on. The same two reads `ServiceProcesses::await_exits`
-/// makes, off the wait the look asks for.
+/// the pids it waits on (every held process). The same two reads
+/// `ServiceProcesses::await_exits` makes, off the wait the look asks for.
 fn wait_plan(holds: &ProcessHolds<Handle>, look: Look) -> (Vec<u32>, Vec<u32>) {
     let wait = look.exit_wait();
     let terminated = if wait.terminates_orphans() {
@@ -1035,7 +987,7 @@ fn wait_plan(holds: &ProcessHolds<Handle>, look: Look) -> (Vec<u32>, Vec<u32>) {
     } else {
         Vec::new()
     };
-    let waited = holds.awaited(wait).map(|handle| handle.pid).collect();
+    let waited = holds.processes().map(|handle| handle.pid).collect();
     (terminated, waited)
 }
 

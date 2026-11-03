@@ -2479,7 +2479,10 @@ impl hole_bridge::service_scm::settle::StopActor for WatchedStop<'_> {
         self.inner.await_callback()
     }
 
-    fn await_held_exits(&mut self, wait: hole_bridge::service_scm::settle::ExitWait) -> std::io::Result<()> {
+    fn await_held_exits(
+        &mut self,
+        wait: hole_bridge::service_scm::settle::ExitWait,
+    ) -> std::io::Result<hole_bridge::service_scm::settle::AwaitExitsOutcome> {
         (self.on_await_held_exits)();
         self.inner.await_held_exits(wait)
     }

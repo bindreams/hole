@@ -12,7 +12,6 @@ use tracing::warn;
 
 use super::call_error::{scm_call_error, ScmCall, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
 use super::scan::{scan, ListedProcess, ProcessEnumerator, ScanFinding, ScanResult, Undetermined};
-use super::settle::ExitWait;
 use super::{Observed, ReportedPid};
 
 /// One look at a service: its state and the process id it names (0: none).
@@ -53,13 +52,9 @@ pub struct Look {
     pub observed: Observed,
     pub fate: ProcessFate,
     /// Whether any process held so far has not exited, the named one or not:
-    /// a process outlives the STOPPED the SCM reports for it.
+    /// a process outlives the STOPPED the SCM reports for it, and the SCM names
+    /// none while a service starts, so the service's own is then held by a scan.
     pub held_alive: bool,
-    /// Whether a held process the SCM named, validly or not (the service's own,
-    /// or one held on a pending-state id), has not exited. Outside STOPPED only
-    /// these are waited on: a process only a scan found has no Stop on its way
-    /// and is dealt with once the SCM reports STOPPED.
-    pub named_alive: bool,
     /// Whether anything has been held so far, alive or since exited. A marked
     /// service cannot be armed on, so once everything held has exited and a
     /// scan finds nothing, this is what says that the SCM's lagging state is
@@ -321,16 +316,6 @@ impl Origin {
         }
     }
 
-    /// Whether a wait outside STOPPED covers a process held this way: the
-    /// ones the SCM named, validly or not.
-    fn is_awaited_before_stopped(self) -> bool {
-        match self {
-            Origin::Named => true,
-            Origin::Claimed => true,
-            Origin::Scanned => false,
-        }
-    }
-
     /// Whether the STOPPED wait ends a process held this way. The one place that
     /// says which held processes may be terminated.
     fn is_terminated_at_stopped(self) -> bool {
@@ -371,16 +356,6 @@ impl<P> ProcessHolds<P> {
     /// The held processes.
     pub fn processes(&self) -> impl Iterator<Item = &P> {
         self.held.iter().map(|held| &held.process)
-    }
-
-    /// The held processes a wait of this kind covers: the ones the SCM named,
-    /// and the orphans only where the wait says so
-    /// ([`ExitWait::waits_on_orphans`]).
-    pub fn awaited(&self, wait: ExitWait) -> impl Iterator<Item = &P> {
-        self.held
-            .iter()
-            .filter(move |held| held.origin.is_awaited_before_stopped() || wait.waits_on_orphans())
-            .map(|held| &held.process)
     }
 
     /// The orphans, with their ids: the held processes the STOPPED wait ends,
@@ -514,12 +489,10 @@ impl<P> ProcessHolds<P> {
             source.has_exited(&held.process)
         })?;
         let held_alive = self.any_alive(|process| source.has_exited(process))?;
-        let named_alive = self.any_named_alive(|process| source.has_exited(process))?;
         Ok(Look {
             observed: reading.observed,
             fate,
             held_alive,
-            named_alive,
             ever_held: !self.held.is_empty(),
         })
     }
@@ -529,16 +502,6 @@ impl<P> ProcessHolds<P> {
     pub fn any_alive(&self, mut has_exited: impl FnMut(&P) -> io::Result<bool>) -> io::Result<bool> {
         for held in &self.held {
             if !has_exited(&held.process)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// [`any_alive`](Self::any_alive) over the processes the SCM named.
-    pub fn any_named_alive(&self, mut has_exited: impl FnMut(&P) -> io::Result<bool>) -> io::Result<bool> {
-        for process in self.awaited(ExitWait::OnTheirOwn) {
-            if !has_exited(process)? {
                 return Ok(true);
             }
         }

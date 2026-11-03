@@ -1984,18 +1984,27 @@ state read before its act loses that race, so four rules close it:
   timer; each one is a real scan, and each is separated from the last by the
   exit of what it found alive. Any other process on the host that exits
   between a listing and its probe also costs one more scan.
-- **No wait here has a bound.** Each is the exit of a process the SCM has been
-  told to stop, or an SCM notification, and every iteration of the loop ends in
-  one of those or in a state change a query read; nothing retries on a count or
-  a timer. A bridge that never exits on its stop hangs the uninstall. That is the
-  owner's ruling: no hang of that kind is on record, so no bound is built, and
+- **No wait here has a bound.** Each is the exit of a process, or an SCM
+  notification, and every iteration of the loop ends in one of those or in a
+  state a query read; nothing retries on a count, and no wake is taken for an
+  answer. One wait wakes: outside STOPPED the wait on the held processes returns
+  every `SCM_REQUERY_INTERVAL` (`ExitWait::requery_interval`), because the SCM
+  sends a service marked for deletion no notification and no process exit says
+  its state moved. The interval only paces re-queries of an SCM that sends
+  nothing. It is not the sleep-poll `service_scm` replaced: nothing is concluded
+  from its expiry, a wake is `AwaitExitsOutcome::Woke` and never an exit, and the
+  loop looks at the SCM again and ends only on a state that look reads (STOPPED:
+  the orphans are terminated; RUNNING: the Stop path; a different id: the new
+  one is held). A bridge that never exits on its stop hangs the uninstall. That
+  is the owner's ruling: no hang of that kind is on record, so no bound is built, and
   the trail a hang leaves is the `stop wait:` and `held = N` lines the wait logs
   (bridge.log for the service, `gui-cli.log` for the CLI) beside the SCM's own
   checkpoints. A wait later seen to hang is fixed at its cause. That holds for
   the service's own process, the one the SCM named in a state whose id is valid
   (RUNNING, `Origin::Named`) and told to stop, even when it outlives its
   STOPPED: it is waited on, with no bound. The exception is a process the SCM's
-  Stop is not known to reach. Once the SCM reports STOPPED
+  Stop is not known to reach. Nothing is terminated before the SCM reports
+  STOPPED. Once it does
   (`ExitWait::TerminateOrphansThenWait`, chosen from the look alone), or the
   entry is gone, every such **orphan** is terminated (`TerminateProcess`, with
   `SeDebugPrivilege` enabled first, which an elevated administrator holds
@@ -2013,17 +2022,19 @@ state read before its act loses that race, so four rules close it:
   not for one found only by a late scan. A claim that settles makes a process the
   service's: the SCM naming a held process again in RUNNING makes it `Named`
   (`ReportedPid::is_a_claim_about_the_service`), and nothing else does. A scan
-  that finds the process the SCM named does not make it an orphan. While the
-  service is not STOPPED, the wait covers only the processes the SCM named,
-  validly or not (`ProcessHolds::awaited`): a scanned orphan has no Stop on its
-  way and may be a live bridge's plugin still being torn down, so it is neither
-  waited on nor terminated until the SCM reports STOPPED or the entry is gone.
-  Which of these a process is, and what each is waited on or ended for, is one
-  exhaustive match per question on `Origin`, never a match at a call site. A
-  service marked for deletion refuses every arm, so there the loop has no event
-  but a named process's exit; with only a scanned orphan alive outside STOPPED
-  it has none, and the result is the SCM's refusal of the arm (as for any live
-  state with nothing to wait on), not a wait on the orphan.
+  that finds the process the SCM named does not make it an orphan. Every wait
+  covers every held process, a scanned one included: while the service is not
+  STOPPED a scanned orphan may be a live bridge's plugin still being torn down,
+  or the service's own process while it starts (the SCM names none in
+  START_PENDING, measured), so it is waited on and not terminated until the SCM
+  reports STOPPED or the entry is gone. Which of these a process is, and what
+  each is ended for, is one exhaustive match per question on `Origin`, never a
+  match at a call site. A service marked for deletion refuses every arm and gets
+  no notification, so there the loop waits on every held process with the wake
+  and looks at the SCM each time it returns; a claimed or scanned process that
+  never exits holds the loop only until a look reads STOPPED. With nothing alive
+  and nothing ever shown it has no event, and the result is the SCM's refusal
+  of the arm (as for any live state with nothing to wait on).
 - **A process id the SCM names is a claim; the service SID in the token is the
   identity.** Microsoft documents that the id
   ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks))
@@ -2098,17 +2109,19 @@ and waited out on process handles like any other. What Microsoft documents as 10
   was disabled, so there is nothing to restore and no delete to issue; the record
   this call wrote is cleared and the settle loop runs.
 - An arm that is refused with 1072 makes the loop go on without arming
-  (`Settle::without_arm`): it holds what the scan finds and waits on those
-  processes. With a held RUNNING process it never arms at all. A look that shows
-  the service's process gone (the one it named has exited, or an id no process
+  (`Settle::without_arm`): it holds what the scan finds, waits on every held
+  process (the wait wakes every `SCM_REQUERY_INTERVAL`), and looks at the SCM
+  again whether the wait woke or the processes exited. A Stop sent to a held
+  RUNNING process is waited on the same way. A look that shows the service's
+  process gone (the one it named has exited, or an id no process
   has in a state whose id is valid, or nothing named and every held process
   exited) settles the wait once a scan finds nothing.
 - A `DeleteService` that answers 1072 is a success: someone else's delete got
   there first.
-- The one state with no event to wait on is a live or pending state with nothing
-  ever held and no arm possible (a process without the service SID, or
-  START_PENDING before its process exists). It fails with the refusal, naming the
-  state: retryable, reported, never `Ok`.
+- The one state with no event to wait on is a live or pending state with
+  nothing alive and no arm possible (a process without the service SID, or
+  START_PENDING before its process exists and before a scan finds it). It fails
+  with the refusal, naming the state: retryable, reported, never `Ok`.
 
 **A gone entry** (1060 at open) is stopped as far as the SCM is concerned, so
 only the scan can see a process of it that lingers. `wait_out_survivors` scans,

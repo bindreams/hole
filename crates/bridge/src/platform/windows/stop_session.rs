@@ -22,7 +22,7 @@ use super::{scm_failure, SERVICE_NAME};
 use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::service_scm::hold::{Basis, Look, Opened, ProcessSource, Reading};
 use crate::service_scm::scan::ScanFinding;
-use crate::service_scm::settle::{ExitWait, StopActor};
+use crate::service_scm::settle::{AwaitExitsOutcome, ExitWait, StopActor};
 use crate::service_scm::{observed_from_state, Observed, SystemScmActor};
 
 /// The rights the session's handle is opened with: exactly those its calls
@@ -94,7 +94,7 @@ impl StopActor for StopSession {
         self.actor.await_callback()
     }
 
-    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()> {
+    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<AwaitExitsOutcome> {
         self.processes.await_exits(wait)
     }
 

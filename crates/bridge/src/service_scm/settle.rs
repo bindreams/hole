@@ -23,6 +23,7 @@
 //! and restart-on-failure first, as the retirement and the update cutover do.
 
 use std::io;
+use std::time::Duration;
 
 use tracing::{info, warn};
 
@@ -136,14 +137,22 @@ impl ProcessFate {
     }
 }
 
-/// How the wait on the held processes goes.
+/// How often a wait on the held processes asks the SCM again while the service is
+/// not STOPPED. The SCM sends a service marked for deletion no notification, and
+/// no process exit says its state moved, so this only paces re-queries of an SCM
+/// that sends nothing. It is not a return to the sleep-poll `service_scm`
+/// replaced: nothing is concluded from its expiry, a wake with nothing changed
+/// waits again, and the loop ends only on a state a query reads.
+pub const SCM_REQUERY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How the wait on the held processes goes. Every wait covers every held process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitWait {
-    /// The processes the SCM named, validly or not, exit on their own: its Stop
-    /// is on its way to them, or the service is still going down. A process only
-    /// a scan found has no Stop on its way and may be a live bridge's plugin
-    /// still being torn down, so it is neither waited on nor ended: it waits for
-    /// the SCM's STOPPED.
+    /// The SCM has not reported STOPPED, so nothing is ended: the service's own
+    /// process is on its way down, and a process only a scan found may be a live
+    /// bridge's plugin still being torn down or a SID-carrying stranger that took
+    /// a stale id, which only the SCM's STOPPED tells apart. The wait wakes every
+    /// [`SCM_REQUERY_INTERVAL`] for a fresh look at the SCM.
     OnTheirOwn,
     /// The SCM reports STOPPED. An orphan (a plugin left by a crashed bridge, a
     /// cutover child left suspended, or a process held only on an id the SCM
@@ -151,7 +160,8 @@ pub enum ExitWait {
     /// is terminated, or it would be waited on for ever while the machine-wide
     /// lock is held; the service is Disabled, so nothing starts another. The
     /// service's own process, named in a state whose id is valid, is waited on
-    /// with no bound, as before STOPPED. Then every held process is waited on.
+    /// with no bound, as before STOPPED. Then every held process is waited on,
+    /// with no wake: STOPPED is the state, and only an exit is left to wait for.
     TerminateOrphansThenWait,
 }
 
@@ -164,26 +174,29 @@ impl ExitWait {
         }
     }
 
-    /// Whether a wait of this kind covers the orphans.
-    pub fn waits_on_orphans(self) -> bool {
+    /// How long a wait of this kind blocks before it wakes for a fresh look at
+    /// the SCM; `None` blocks until every process has exited.
+    pub fn requery_interval(self) -> Option<Duration> {
         match self {
-            ExitWait::OnTheirOwn => false,
-            ExitWait::TerminateOrphansThenWait => true,
+            ExitWait::OnTheirOwn => Some(SCM_REQUERY_INTERVAL),
+            ExitWait::TerminateOrphansThenWait => None,
         }
     }
 }
 
-impl Look {
-    /// Whether the wait this look asks for ([`exit_wait`](Self::exit_wait))
-    /// has a live process to wait on.
-    pub fn has_a_process_to_await(self) -> bool {
-        if self.exit_wait().waits_on_orphans() {
-            self.held_alive
-        } else {
-            self.named_alive
-        }
-    }
+/// How a wait on the held processes ended. A wake is not an exit and proves
+/// nothing about either the processes or the SCM: the caller looks again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum AwaitExitsOutcome {
+    /// Every process the wait covers has exited.
+    AllExited,
+    /// The wait's interval ([`ExitWait::requery_interval`]) passed with a
+    /// process still alive.
+    Woke,
+}
 
+impl Look {
     /// How to wait on the held processes after this look: the one place that
     /// says when a held process is terminated instead of waited for.
     pub fn exit_wait(self) -> ExitWait {
@@ -210,8 +223,9 @@ pub trait StopActor {
     fn control_stop(&mut self) -> io::Result<()>;
     /// Sleep until the armed notification fires.
     fn await_callback(&mut self) -> io::Result<()>;
-    /// Wait until every held process has exited, as `wait` says.
-    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()>;
+    /// Wait on the held processes as `wait` says: until every one has exited, or
+    /// until [`ExitWait::requery_interval`] has passed.
+    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<AwaitExitsOutcome>;
     /// Scan for the live processes that carry the service's token, other than
     /// the calling one, and hold them. Says what the scan itself found: only
     /// [`ScanFinding::Nothing`] lets the wait end.
@@ -264,18 +278,18 @@ impl SettleError {
 /// is not that: the exited process may have started a child after the listing.
 ///
 /// Every iteration ends in a real event (a process exit, an SCM notification)
-/// or in a state change a query read; nothing is retried on a count or a
-/// timer. A Stop the service refuses is an error only if the look that follows
-/// still finds it RUNNING over a process.
+/// or in a state a query read; nothing is retried on a count, and no wake of a
+/// wait is taken for an answer. A Stop the service refuses is an error only if
+/// the look that follows still finds it RUNNING over a process.
 ///
-/// A service marked for deletion refuses every arm. The handle already open
-/// still queries and takes a Stop, so the loop goes on without arming: it
-/// holds the processes the scan finds and waits on the ones the look's state
-/// covers ([`Look::has_a_process_to_await`]). If a live state is left with no
-/// such process to wait on, the only event is the SCM's, which cannot be asked
-/// for, and the refusal is the result: a process only a scan found, alive
-/// outside STOPPED, is not an event (waiting on it could last for ever, and it
-/// is ended only at STOPPED).
+/// A service marked for deletion refuses every arm, and the SCM sends it no
+/// notification. The handle already open still queries and takes a Stop, so the
+/// loop goes on without arming: it holds the processes the scan finds and waits
+/// on all of them, and each time that wait exits or wakes
+/// ([`SCM_REQUERY_INTERVAL`]) it looks at the SCM again. Nothing is ended before
+/// the SCM reports STOPPED. If a live state is left with no process alive, the
+/// only event is the SCM's, which cannot be asked for, and the refusal is the
+/// result.
 pub fn settle_stopped<A: StopActor>(actor: &mut A) -> Result<(), SettleError> {
     let mut settle = Settle { actor, refused: None };
     let mut look = settle.observe()?;
@@ -294,8 +308,7 @@ pub fn settle_stopped<A: StopActor>(actor: &mut A) -> Result<(), SettleError> {
             SettleStep::SendStop => settle.stop(look)?,
             SettleStep::AwaitHeldExit => {
                 info!(?look, "stop wait: waiting for a process held past STOPPED");
-                settle.await_held_exits(look.exit_wait())?;
-                Next::Look(settle.observe()?)
+                settle.await_exits_then_look(look.exit_wait())?
             }
             SettleStep::AwaitChange(_) => settle.await_change(step)?,
         };
@@ -331,8 +344,12 @@ impl<A: StopActor> Settle<'_, A> {
         self.actor.hold_scanned().map_err(SettleError::Scan)
     }
 
-    fn await_held_exits(&mut self, wait: ExitWait) -> Result<(), SettleError> {
-        self.actor.await_held_exits(wait).map_err(SettleError::AwaitExit)
+    /// Wait on the held processes as `wait` says, then look. An exit and a wake
+    /// end alike: neither says what state the SCM is in.
+    fn await_exits_then_look(&mut self, wait: ExitWait) -> Result<Next, SettleError> {
+        match self.actor.await_held_exits(wait).map_err(SettleError::AwaitExit)? {
+            AwaitExitsOutcome::AllExited | AwaitExitsOutcome::Woke => Ok(Next::Look(self.observe()?)),
+        }
     }
 
     fn await_callback(&mut self) -> Result<(), SettleError> {
@@ -376,7 +393,7 @@ impl<A: StopActor> Settle<'_, A> {
             return Ok(Next::Look(again));
         }
         match wait {
-            StopWait::HeldProcess => self.await_held_exits(look.exit_wait())?,
+            StopWait::HeldProcess => return self.await_exits_then_look(look.exit_wait()),
             StopWait::StatusChange if armed => self.await_callback()?,
             StopWait::StatusChange => return self.without_arm(),
         }
@@ -403,24 +420,17 @@ impl<A: StopActor> Settle<'_, A> {
     }
 
     /// What the loop does where it would have armed and cannot: hold what the
-    /// scan finds and wait on that, as the look's state says
-    /// ([`Look::has_a_process_to_await`]): outside STOPPED only a process the
-    /// SCM named, STOPPED every held one. With nothing to wait on and the SCM's
-    /// state still lagging, a scan that finds nothing settles the wait if the
-    /// look shows the service's processes gone ([`Look::shows_its_processes_gone`]).
-    /// A scan that finds something, or loses a listed process, scans again.
-    /// With no process ever shown, or only an orphan alive outside STOPPED (no
-    /// Stop is on its way to it and it is not ended before STOPPED), the state
-    /// is left with no event to wait on.
+    /// scan finds and wait on every held process ([`ExitWait`]), then look at
+    /// the SCM again, whether the wait ended or woke. With nothing alive and the
+    /// SCM's state still lagging, a scan that finds nothing settles the wait if
+    /// the look shows the service's processes gone ([`Look::shows_its_processes_gone`]).
+    /// A scan that finds something, or loses a listed process, scans again. With
+    /// no process ever shown, the state is left with no event to wait on.
     fn without_arm(&mut self) -> Result<Next, SettleError> {
         let finding = self.hold_scanned()?;
         let look = self.observe()?;
-        if look.has_a_process_to_await() {
-            self.await_held_exits(look.exit_wait())?;
-            return Ok(Next::Look(self.observe()?));
-        }
         if look.held_alive {
-            return Err(self.no_event());
+            return self.await_exits_then_look(look.exit_wait());
         }
         if look.settle_step().ends_the_wait() {
             return Ok(Next::Look(look));

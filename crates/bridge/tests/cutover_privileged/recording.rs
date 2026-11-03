@@ -143,7 +143,10 @@ impl<S: ServiceSession> StopActor for Recording<'_, S> {
         self.inner.await_callback()
     }
 
-    fn await_held_exits(&mut self, wait: hole_bridge::service_scm::settle::ExitWait) -> std::io::Result<()> {
+    fn await_held_exits(
+        &mut self,
+        wait: hole_bridge::service_scm::settle::ExitWait,
+    ) -> std::io::Result<hole_bridge::service_scm::settle::AwaitExitsOutcome> {
         self.record(Event::AwaitHeldExits);
         self.inner.await_held_exits(wait)
     }

@@ -6,7 +6,7 @@ use crate::disable_record::RecordState;
 use crate::service_scm::call_error::{ScmCall, ScmCallError};
 use crate::service_scm::hold::{Look, ProcessFate};
 use crate::service_scm::scan::ScanFinding;
-use crate::service_scm::settle::ExitWait;
+use crate::service_scm::settle::{AwaitExitsOutcome, ExitWait};
 use crate::service_scm::Observed;
 
 /// A look at a service whose process is held and alive.
@@ -15,7 +15,6 @@ fn running() -> Look {
         observed: Observed::Running,
         fate: ProcessFate::Alive,
         held_alive: true,
-        named_alive: true,
         ever_held: true,
     }
 }
@@ -26,7 +25,6 @@ fn stopped() -> Look {
         observed: Observed::Stopped,
         fate: ProcessFate::Unheld,
         held_alive: false,
-        named_alive: false,
         ever_held: true,
     }
 }
@@ -132,8 +130,9 @@ impl StopActor for FakeSession<'_> {
     fn await_callback(&mut self) -> io::Result<()> {
         self.call("await_callback")
     }
-    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
-        self.call("await_held_exits")
+    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<AwaitExitsOutcome> {
+        self.call("await_held_exits")?;
+        Ok(AwaitExitsOutcome::AllExited)
     }
     fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
         self.call("hold_scanned")?;
@@ -278,7 +277,6 @@ fn each_failure_before_the_delete_restores_and_returns_its_own_variant() {
                         observed: Observed::StopPending,
                         fate: ProcessFate::Unheld,
                         held_alive: false,
-                        named_alive: false,
                         ever_held: false,
                     }],
                 )
@@ -736,14 +734,14 @@ fn a_start_type_write_that_fails_otherwise_is_the_retirements_failure() {
 }
 
 /// The mark lands while the service is starting: the arm is refused, and the
-/// loop waits on the process it holds instead of the SCM's notification.
+/// loop waits on the process it holds instead of the SCM's notification. The
+/// SCM names no process in START_PENDING, so the one it holds is a scan's.
 #[skuld::test]
 fn a_mark_at_the_first_arm_is_waited_out_on_the_held_process() {
     let pending = || Look {
         observed: Observed::StartPending,
-        fate: ProcessFate::Alive,
+        fate: ProcessFate::Unheld,
         held_alive: true,
-        named_alive: true,
         ever_held: true,
     };
     for disposition in [Disposition::StopOnly, Disposition::Deregister] {
@@ -782,7 +780,6 @@ fn a_marked_service_with_nothing_to_wait_on_fails_and_is_never_ok() {
         observed: Observed::Running,
         fate: ProcessFate::Unheld,
         held_alive: false,
-        named_alive: false,
         ever_held: false,
     };
     for disposition in [Disposition::StopOnly, Disposition::Deregister] {
@@ -1109,8 +1106,9 @@ impl StopActor for Model {
     fn await_callback(&mut self) -> io::Result<()> {
         self.step(None, |_| {})
     }
-    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
-        self.step(None, |_| {})
+    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<AwaitExitsOutcome> {
+        self.step(None, |_| {})?;
+        Ok(AwaitExitsOutcome::AllExited)
     }
     fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
         self.step(None, |_| {})?;

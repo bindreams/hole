@@ -1,5 +1,6 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::time::Duration;
 
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
@@ -7,8 +8,8 @@ use windows::Win32::System::Threading::{
 };
 
 use super::{
-    has_exited, open_process, opened_from_token_read, scan_service_processes, ExitWait, HostProcesses,
-    ServiceProcesses, ServiceSid,
+    has_exited, open_process, opened_from_token_read, scan_service_processes, AwaitExitsOutcome, ExitWait,
+    HostProcesses, ServiceProcesses, ServiceSid,
 };
 use crate::disable_record::Stamp;
 use crate::service_scm::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
@@ -219,9 +220,10 @@ fn the_terminating_wait_ends_an_orphan_that_would_not_exit() {
         "the child is up"
     );
 
-    processes
+    let outcome = processes
         .await_exits(ExitWait::TerminateOrphansThenWait)
         .expect("terminate and wait");
+    assert_eq!(outcome, AwaitExitsOutcome::AllExited);
     assert!(
         !processes.holds.any_alive(has_exited).expect("state read"),
         "a held process is still alive after the terminating wait"
@@ -282,19 +284,20 @@ fn the_terminating_wait_waits_on_the_services_own_process_and_ends_only_the_orph
 
     let status = service.release_and_wait();
     assert!(status.success(), "the service's own process was terminated: {status:?}");
-    waiting
+    let outcome = waiting
         .join()
         .expect("the wait did not panic")
         .expect("the wait ends once both are gone");
+    assert_eq!(outcome, AwaitExitsOutcome::AllExited);
     orphan.release_and_wait();
 }
 
-/// Outside STOPPED the wait is on the service's own process only: an orphan a
-/// scan found beside it has no Stop on its way and is not waited out. The wait
-/// returns once the service's process has exited, with the orphan still alive;
-/// the test ends the orphan afterwards.
+/// Outside STOPPED the wait covers every held process, a scan's included, ends
+/// none of them, and wakes when its interval passes with one still alive, so the
+/// caller can look at the SCM again. A wake is not an exit: the processes are
+/// untouched, and the same wait ends with `AllExited` once they have gone.
 #[skuld::test]
-fn the_wait_on_their_own_covers_the_services_process_and_not_an_orphan() {
+fn the_paced_wait_wakes_on_a_live_process_a_scan_found_and_ends_none() {
     // The orphan is spawned first: a child inherits the control sockets of the
     // children spawned before it, which would keep their EOF from arriving.
     let mut orphan = EchoChild::spawn();
@@ -304,25 +307,38 @@ fn the_wait_on_their_own_covers_the_services_process_and_not_an_orphan() {
         .look(&mut NamesChild(service.pid()))
         .expect("hold the named process");
     processes.holds.adopt(orphan.pid(), open_for_waiting(orphan.pid()));
-    let orphan_alive = open_for_waiting(orphan.pid());
+    let interval = Some(Duration::from_millis(1));
 
-    let (done, returned) = std::sync::mpsc::channel();
-    let waiting = std::thread::spawn(move || {
-        let waited = processes.await_exits(ExitWait::OnTheirOwn);
-        let orphan_up = !has_exited(&orphan_alive).expect("state read");
-        done.send(()).expect("the test is listening");
-        (waited, orphan_up)
-    });
-    let status = service.release_and_wait();
-    assert!(
-        status.success(),
-        "the service's own process was not ended by the wait: {status:?}"
+    // Both are alive and held, the orphan only by a scan: the wait wakes.
+    assert_eq!(processes.wait_on_each(interval).expect("wait"), AwaitExitsOutcome::Woke);
+    // The service's own process is the first held, so it is the one that has
+    // to exit for the wait to reach the orphan.
+    assert!(service.release_and_wait().success(), "the service's process was ended");
+    assert_eq!(
+        processes.wait_on_each(interval).expect("wait"),
+        AwaitExitsOutcome::Woke,
+        "the service's process has exited and the orphan has not"
     );
-    returned
-        .recv()
-        .expect("the wait returns once the service's process has exited");
-    orphan.release_and_wait();
-    let (waited, orphan_up) = waiting.join().expect("the wait did not panic");
-    waited.expect("the wait ends");
-    assert!(orphan_up, "the orphan was waited out or ended");
+    assert!(
+        !has_exited(&open_for_waiting(orphan.pid())).expect("state read"),
+        "the paced wait ended the orphan"
+    );
+
+    assert!(orphan.release_and_wait().success(), "the orphan was ended");
+    assert_eq!(
+        processes.wait_on_each(interval).expect("wait"),
+        AwaitExitsOutcome::AllExited
+    );
+}
+
+/// With no processes held there is nothing to wake for.
+#[skuld::test]
+fn a_wait_over_nothing_held_has_every_process_exited() {
+    let processes = ServiceProcesses::default();
+    for interval in [None, Some(Duration::from_millis(1))] {
+        assert_eq!(
+            processes.wait_on_each(interval).expect("wait"),
+            AwaitExitsOutcome::AllExited
+        );
+    }
 }

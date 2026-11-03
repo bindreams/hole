@@ -10,7 +10,6 @@ fn look(observed: Observed, fate: ProcessFate, held_alive: bool) -> Look {
         observed,
         fate,
         held_alive,
-        named_alive: held_alive,
         // A live hold was held.
         ever_held: held_alive,
     }
@@ -22,7 +21,6 @@ fn look_after_holds_exited(observed: Observed, fate: ProcessFate) -> Look {
         observed,
         fate,
         held_alive: false,
-        named_alive: false,
         ever_held: true,
     }
 }
@@ -157,6 +155,8 @@ struct Recording {
     findings: VecDeque<ScanFinding>,
     /// How each wait on the held processes was asked to go.
     exit_waits: Vec<ExitWait>,
+    /// How each wait on the held processes ends, in order. All exited once it runs dry.
+    exit_outcomes: VecDeque<AwaitExitsOutcome>,
 }
 
 impl Recording {
@@ -189,6 +189,11 @@ impl Recording {
 
     fn scan_fails_with(mut self, error: io::Error) -> Self {
         self.scan_error = Some(error);
+        self
+    }
+
+    fn waits_end(mut self, outcomes: Vec<AwaitExitsOutcome>) -> Self {
+        self.exit_outcomes = outcomes.into();
         self
     }
 
@@ -227,10 +232,13 @@ impl StopActor for Recording {
         self.await_callback_error.take().map_or(Ok(()), Err)
     }
 
-    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()> {
+    fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<AwaitExitsOutcome> {
         self.log.push("await_held_exits".into());
         self.exit_waits.push(wait);
-        self.await_exit_error.take().map_or(Ok(()), Err)
+        self.await_exit_error.take().map_or(
+            Ok(self.exit_outcomes.pop_front().unwrap_or(AwaitExitsOutcome::AllExited)),
+            Err,
+        )
     }
 
     fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
@@ -295,6 +303,101 @@ fn only_a_stopped_look_terminates_what_is_held() {
     }
 }
 
+/// Only a service the SCM reports STOPPED has its wait run to the processes' exit
+/// with no wake: every other state is one the SCM may still change, and a service
+/// marked for deletion sends no notification of it.
+#[skuld::test]
+fn only_a_stopped_look_waits_without_waking_for_the_scm() {
+    for (observed, want) in [
+        (Observed::Running, Some(SCM_REQUERY_INTERVAL)),
+        (Observed::StartPending, Some(SCM_REQUERY_INTERVAL)),
+        (Observed::StopPending, Some(SCM_REQUERY_INTERVAL)),
+        (Observed::Stopped, None),
+    ] {
+        for fate in [ProcessFate::Unheld, ProcessFate::Alive, ProcessFate::Exited] {
+            assert_eq!(
+                look(observed, fate, true).exit_wait().requery_interval(),
+                want,
+                "{observed:?} {fate:?}"
+            );
+        }
+    }
+}
+
+/// A marked service's STOP_PENDING with a process a stale id led to (held on a
+/// pending claim, so waited on like the service's own) that never exits: the
+/// wait wakes, the SCM is asked again and still says STOP_PENDING, the wait wakes
+/// again, and the loop ends only when the SCM reports STOPPED, when the orphan is
+/// terminated. No wake is taken for an exit, and nothing is ended before STOPPED.
+#[skuld::test]
+fn a_marked_service_stopping_over_a_claimed_orphan_looks_again_on_each_wake_and_ends_it_at_stopped() {
+    let claimed = look(Observed::StopPending, ProcessFate::Alive, true);
+    let mut actor = Recording::new(vec![
+        pending_over(Observed::StopPending),
+        claimed,
+        claimed,
+        claimed,
+        stopped_over_a_live_hold(),
+        stopped(),
+        stopped(),
+    ])
+    .arm_fails_with(vec![Some(marked())])
+    .waits_end(vec![
+        AwaitExitsOutcome::Woke,
+        AwaitExitsOutcome::Woke,
+        AwaitExitsOutcome::AllExited,
+    ]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(
+        actor.exit_waits,
+        [
+            ExitWait::OnTheirOwn,
+            ExitWait::OnTheirOwn,
+            ExitWait::TerminateOrphansThenWait
+        ],
+        "waited on without ending, until the SCM said STOPPED"
+    );
+    // Two scans before the wake-ups' waits, one that settles at STOPPED.
+    assert_eq!(actor.count("hold_scanned"), 3);
+}
+
+/// A wake with the processes alive is not an exit: the look that follows says
+/// what to do, so a service that reached RUNNING meanwhile is sent its Stop.
+#[skuld::test]
+fn a_wake_while_the_service_starts_is_followed_by_the_stop_when_it_runs() {
+    let mut actor = Recording::new(vec![
+        pending_over(Observed::StartPending),
+        only_an_orphan_alive(Observed::StartPending),
+        running(),
+        stopped(),
+        stopped(),
+    ])
+    .arm_fails_with(vec![Some(marked())])
+    .waits_end(vec![AwaitExitsOutcome::Woke]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(actor.count("control_stop"), 1);
+}
+
+/// A Stop sent into RUNNING over a held process whose wait wakes: the look after
+/// it is the answer, not the wake. A service the SCM now reports STOPPED ends the
+/// wait; nothing waits on the process again.
+#[skuld::test]
+fn a_wake_after_a_stop_is_followed_by_a_look_not_taken_for_an_exit() {
+    let mut actor = Recording::new(vec![running(), stopped(), stopped()]).waits_end(vec![AwaitExitsOutcome::Woke]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(
+        actor.log(),
+        [
+            "observe",
+            "control_stop",
+            "await_held_exits",
+            "observe",
+            "hold_scanned",
+            "observe",
+        ]
+    );
+}
+
 /// The wait the loop asks for follows the state of the look that decided it: a
 /// process held past STOPPED is terminated; the process a Stop was just sent
 /// to, and one held while the SCM refuses arms, are waited out on their own.
@@ -322,73 +425,62 @@ fn the_loop_terminates_what_outlives_stopped_and_waits_out_a_service_that_is_sti
     assert_eq!(actor.exit_waits, [ExitWait::OnTheirOwn]);
 }
 
-/// A look over a process only a scan found, with nothing the SCM named alive.
+/// A look over a process only a scan found, alive: the one the SCM names no id
+/// for while a service starts, or a plugin a crashed bridge left.
 fn only_an_orphan_alive(observed: Observed) -> Look {
     Look {
         observed,
         fate: ProcessFate::Unheld,
         held_alive: true,
-        named_alive: false,
         ever_held: true,
     }
 }
 
-/// The wait a look asks for has something to wait on only among the processes
-/// that wait covers: outside STOPPED the ones the SCM named (it told them to
-/// stop), at STOPPED every held one.
+/// A marked service gets no SCM notification, so a live state over only a
+/// process a scan found is waited on in a paced wait and the SCM is asked
+/// again each time it wakes. Nothing is ended before STOPPED.
 #[skuld::test]
-fn a_look_has_a_process_to_await_only_among_the_ones_its_wait_covers() {
-    for (observed, named_alive, held_alive, want) in [
-        (Observed::Running, true, true, true),
-        (Observed::Running, false, true, false),
-        (Observed::Running, false, false, false),
-        (Observed::StartPending, true, true, true),
-        (Observed::StartPending, false, true, false),
-        (Observed::StopPending, true, true, true),
-        (Observed::StopPending, false, true, false),
-        (Observed::Stopped, false, true, true),
-        (Observed::Stopped, true, true, true),
-        (Observed::Stopped, false, false, false),
-    ] {
-        let look = Look {
-            observed,
-            fate: ProcessFate::Unheld,
-            held_alive,
-            named_alive,
-            ever_held: true,
-        };
-        assert_eq!(
-            look.has_a_process_to_await(),
-            want,
-            "{observed:?} named_alive={named_alive} held_alive={held_alive}"
-        );
-    }
-}
-
-/// A marked service's STOP_PENDING with only an orphan alive has no event to
-/// wait on: the SCM cannot be asked, the orphan is not waited out (it has no
-/// Stop on its way, and nothing here may end it before STOPPED) and the service's
-/// own process is gone. The refusal is the result, as for any live state with
-/// nothing to wait on, and the retirement does not scan in a loop.
-#[skuld::test]
-fn a_marked_service_stopping_over_only_an_orphan_is_the_refusal_not_a_wait_on_the_orphan() {
+fn a_marked_service_pending_over_only_an_orphan_is_waited_on_and_looked_at_again() {
     for pending in [Observed::StopPending, Observed::StartPending] {
         let mut actor = Recording::new(vec![
             pending_over(pending),
             only_an_orphan_alive(pending),
+            stopped_over_a_live_hold(),
             stopped(),
             stopped(),
         ])
         .arm_fails_with(vec![Some(marked())])
         .scans_find(vec![ScanFinding::Alive, ScanFinding::Nothing]);
-        let error = settle_stopped(&mut actor).unwrap_err();
-        assert!(
-            matches!(&error, SettleError::Arm(e) if service_gone(e).is_some()),
-            "{pending:?}: {error:?}"
+        settle_stopped(&mut actor).unwrap();
+        assert_eq!(
+            actor.exit_waits,
+            [ExitWait::OnTheirOwn, ExitWait::TerminateOrphansThenWait],
+            "{pending:?}"
         );
-        assert_eq!(actor.count("await_held_exits"), 0, "{pending:?}");
-        assert_eq!(actor.count("hold_scanned"), 1, "{pending:?}");
     }
+}
+
+/// The service's own process is found by the scan alone while it starts (the
+/// SCM names none in START_PENDING). When it then reaches RUNNING the loop
+/// stops it, instead of failing with the refusal of the arm.
+#[skuld::test]
+fn a_marked_service_that_starts_over_a_scan_found_process_is_then_stopped() {
+    let mut actor = Recording::new(vec![
+        pending_over(Observed::StartPending),
+        only_an_orphan_alive(Observed::StartPending),
+        running(),
+        stopped(),
+        stopped(),
+    ])
+    .arm_fails_with(vec![Some(marked())])
+    .scans_find(vec![ScanFinding::Alive, ScanFinding::Nothing]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(actor.count("control_stop"), 1);
+    assert_eq!(
+        actor.exit_waits,
+        [ExitWait::OnTheirOwn, ExitWait::OnTheirOwn],
+        "the wait while starting, and the wait after the Stop"
+    );
 }
 
 fn pending_over(observed: Observed) -> Look {
@@ -658,11 +750,13 @@ fn no_arm_is_made_after_the_scm_refused_one() {
 #[skuld::test]
 fn a_marked_service_whose_held_processes_have_exited_is_settled_though_the_scm_lags() {
     for lagging in [Observed::StopPending, Observed::StartPending] {
-        let mut actor = Recording::new(vec![
-            look(lagging, ProcessFate::Alive, true),
-            look_after_holds_exited(lagging, ProcessFate::Exited),
-        ])
-        .arm_fails_with(vec![Some(marked())]);
+        // The SCM names no process in START_PENDING, so the one held is a scan's.
+        let held = match lagging {
+            Observed::StartPending => only_an_orphan_alive(lagging),
+            _ => look(lagging, ProcessFate::Alive, true),
+        };
+        let mut actor = Recording::new(vec![held, look_after_holds_exited(lagging, ProcessFate::Exited)])
+            .arm_fails_with(vec![Some(marked())]);
         settle_stopped(&mut actor).unwrap();
         assert_eq!(
             actor.log(),
@@ -812,7 +906,7 @@ fn a_query_that_fails_ends_the_wait() {
         fn await_callback(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
+        fn await_held_exits(&mut self, _: ExitWait) -> io::Result<AwaitExitsOutcome> {
             unreachable!()
         }
         fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
@@ -861,7 +955,7 @@ fn each_failing_act_is_its_own_error_variant() {
         fn await_callback(&mut self) -> io::Result<()> {
             unreachable!()
         }
-        fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
+        fn await_held_exits(&mut self, _: ExitWait) -> io::Result<AwaitExitsOutcome> {
             unreachable!()
         }
         fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
@@ -911,9 +1005,9 @@ impl StopActor for ModelStop {
         unreachable!("a STOPPED service is not armed on")
     }
 
-    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<()> {
+    fn await_held_exits(&mut self, _: ExitWait) -> io::Result<AwaitExitsOutcome> {
         self.0.await_exits();
-        Ok(())
+        Ok(AwaitExitsOutcome::AllExited)
     }
 
     fn hold_scanned(&mut self) -> io::Result<ScanFinding> {
