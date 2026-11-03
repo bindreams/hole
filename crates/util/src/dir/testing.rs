@@ -136,6 +136,15 @@ pub fn as_unprivileged(root: &Path, f: impl FnOnce()) {
     platform::as_unprivileged(root, f);
 }
 
+/// Runs `f` on a new thread whose token is the process token with every privilege removed, and returns what it
+/// returns; a panic in `f` is a panic here. A reader holding backup rights (an elevated runner) reads a file through a
+/// holder that denies sharing, because [`Dir`](super::Dir) opens with backup intent; a test that expects the holder to
+/// refuse reads as this thread. Thread-scoped: the process token and every other thread are untouched.
+#[cfg(windows)]
+pub fn as_unprivileged_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    platform::as_unprivileged_thread(f)
+}
+
 /// A name nothing in a folder the system owns has, removed again when dropped: the place to look for what a
 /// walk wrongly made in that folder.
 pub struct SystemScratch {
@@ -281,9 +290,16 @@ mod platform {
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
 
+    use windows::core::Owned;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{
+        CreateRestrictedToken, DuplicateTokenEx, SecurityImpersonation, TokenImpersonation, DISABLE_MAX_PRIVILEGE,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+    };
     use windows::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_OWNER,
     };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
 
     use super::super::trail::Owner;
 
@@ -344,5 +360,67 @@ mod platform {
     /// `C:\Users\Public`: the system's, and writable by every interactive user.
     pub(super) fn system_scratch() -> PathBuf {
         PathBuf::from(std::env::var_os("PUBLIC").expect("PUBLIC names the shared profile folder"))
+    }
+
+    pub(super) fn as_unprivileged_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+        std::thread::scope(|scope| {
+            let ran = scope
+                .spawn(|| {
+                    let _unprivileged = Impersonation::begin();
+                    f()
+                })
+                .join();
+            ran.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+
+    /// The calling thread runs as a copy of the process token with every privilege removed, until dropped.
+    struct Impersonation;
+
+    impl Impersonation {
+        /// Panics if the token cannot be built or applied: a test of the unprivileged reader has no meaning without it.
+        fn begin() -> Self {
+            // SAFETY: every out-pointer names a live local; each handle is owned and closed on drop.
+            unsafe {
+                let mut process = HANDLE::default();
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
+                    &mut process,
+                )
+                .expect("OpenProcessToken");
+                let process = Owned::new(process);
+
+                let mut restricted = HANDLE::default();
+                CreateRestrictedToken(*process, DISABLE_MAX_PRIVILEGE, None, None, None, &mut restricted)
+                    .expect("CreateRestrictedToken");
+                let restricted = Owned::new(restricted);
+
+                let mut impersonation = HANDLE::default();
+                DuplicateTokenEx(
+                    *restricted,
+                    TOKEN_IMPERSONATE | TOKEN_QUERY,
+                    None,
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &mut impersonation,
+                )
+                .expect("DuplicateTokenEx");
+                let impersonation = Owned::new(impersonation);
+
+                // The thread keeps its own reference to the token; closing ours afterwards is fine.
+                SetThreadToken(None, Some(*impersonation)).expect("SetThreadToken");
+            }
+            Self
+        }
+    }
+
+    impl Drop for Impersonation {
+        fn drop(&mut self) {
+            // SAFETY: a null token stops this thread impersonating.
+            let reverted = unsafe { SetThreadToken(None, None) };
+            // A failed revert leaves the thread restricted; a panic in drop during unwinding aborts, so only report.
+            debug_assert!(reverted.is_ok(), "SetThreadToken(NULL) failed: {reverted:?}");
+        }
     }
 }

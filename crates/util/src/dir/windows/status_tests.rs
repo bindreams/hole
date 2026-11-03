@@ -25,6 +25,11 @@ fn read(dir: &tempfile::TempDir, name: &str) -> io::Result<Vec<u8>> {
     ReadDir::open(dir.path()).unwrap().read(name.as_ref())
 }
 
+/// [`read`] as an unprivileged thread: a reader with backup rights reads through a holder that denies sharing.
+fn read_unprivileged(dir: &tempfile::TempDir, name: &str) -> io::Result<Vec<u8>> {
+    crate::dir::testing::as_unprivileged_thread(|| read(dir, name))
+}
+
 /// The Win32 code of the call that failed, behind the status wrapper.
 fn original_code(err: &io::Error) -> Option<i32> {
     let original = err.get_ref()?.source()?.downcast_ref::<io::Error>()?;
@@ -53,7 +58,7 @@ fn read_of_a_file_held_without_sharing_names_the_ntstatus_of_the_open() {
     let path = put(&dir, "held", b"bytes");
     let _held = held_without_sharing(&path);
 
-    let err = read(&dir, "held").unwrap_err();
+    let err = read_unprivileged(&dir, "held").unwrap_err();
 
     assert_eq!(err.kind(), std::fs::read(&path).unwrap_err().kind(), "{err:?}");
     // STATUS_SHARING_VIOLATION
@@ -68,7 +73,7 @@ fn the_os_code_of_a_status_error_is_in_its_source_and_readers_see_through_the_wr
     let path = put(&dir, "held", b"bytes");
     let _held = held_without_sharing(&path);
 
-    let err = read(&dir, "held").unwrap_err();
+    let err = read_unprivileged(&dir, "held").unwrap_err();
 
     assert_eq!(err.raw_os_error(), None, "{err:?}");
     assert_eq!(original_code(&err), Some(32), "ERROR_SHARING_VIOLATION: {err:?}");

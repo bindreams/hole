@@ -313,7 +313,6 @@ fn load_of_a_held_file_carries_the_ntstatus_in_the_error_and_the_log() {
     use std::os::windows::fs::OpenOptionsExt;
 
     let (subscriber, log) = capture();
-    let _guard = set_default_in_current_thread(subscriber);
     let dir = dir();
     let path = put(
         &dir,
@@ -326,7 +325,11 @@ fn load_of_a_held_file_carries_the_ntstatus_in_the_error_and_the_log() {
         .open(&path)
         .unwrap();
 
-    let loaded = VersionedFile::<NoteV3>::new(dir.path()).load();
+    // As an unprivileged thread: a reader with backup rights reads through the holder. The subscriber is per thread.
+    let loaded = crate::dir::testing::as_unprivileged_thread(|| {
+        let _guard = set_default_in_current_thread(subscriber);
+        VersionedFile::<NoteV3>::new(dir.path()).load()
+    });
 
     // STATUS_SHARING_VIOLATION
     match loaded {
