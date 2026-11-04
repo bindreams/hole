@@ -416,7 +416,7 @@ fn writers() -> Vec<Writer> {
             names: &[lockdown_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, owner| lockdown_state::set_enabled(dir, true, owner),
+            run: |dir, owner| lockdown_state::set_enabled(dir, true, owner).map_err(io::Error::other),
         },
         Writer {
             name: "the lockdown state, cleared",
@@ -424,7 +424,7 @@ fn writers() -> Vec<Writer> {
             names: &[lockdown_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| lockdown_state::clear(dir),
+            run: |dir, _| lockdown_state::clear(dir).map(drop).map_err(io::Error::other),
         },
         Writer {
             name: "the boot-time witness, recorded",

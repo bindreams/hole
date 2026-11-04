@@ -263,7 +263,8 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<Cle
     // the host from.
     crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None)
         .map_err(|e| std::io::Error::other(format!("could not clear the auto-connect candidate: {e}")))?;
-    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)?;
+    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
+        .map_err(|e| std::io::Error::other(format!("could not record the lockdown intent off: {e}")))?;
     // Handed back, never dropped. The intent is now off, so nothing after this
     // will pre-delete a boot-time key or look at one again — see [`unlock`].
     Ok(clearance)
