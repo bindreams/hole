@@ -49,9 +49,6 @@ const GLOBAL_NET_STATE: skuld::Label;
 #[path = "cutover_privileged/arm_probes.rs"]
 mod arm_probes;
 #[cfg(target_os = "windows")]
-#[path = "cutover_privileged/process_list_probe.rs"]
-mod process_list_probe;
-#[cfg(target_os = "windows")]
 #[path = "cutover_privileged/raw_scm.rs"]
 mod raw_scm;
 #[cfg(target_os = "windows")]
