@@ -1,8 +1,6 @@
-use std::fs::File;
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
-use std::path::Path;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
@@ -36,10 +34,6 @@ fn original_code(err: &io::Error) -> Option<i32> {
     original.raw_os_error()
 }
 
-fn held_without_sharing(path: &Path) -> File {
-    std::fs::OpenOptions::new().read(true).share_mode(0).open(path).unwrap()
-}
-
 // A failed open names its NTSTATUS ------------------------------------------------------------------------------------
 
 #[skuld::test]
@@ -56,7 +50,7 @@ fn read_of_a_missing_file_names_the_ntstatus_of_the_open() {
 fn read_of_a_file_held_without_sharing_names_the_ntstatus_of_the_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = put(&dir, "held", b"bytes");
-    let _held = held_without_sharing(&path);
+    let _held = crate::dir::testing::held_without_sharing(&path);
 
     let err = read_unprivileged(&dir, "held").unwrap_err();
 
@@ -71,7 +65,7 @@ fn read_of_a_file_held_without_sharing_names_the_ntstatus_of_the_open() {
 fn the_os_code_of_a_status_error_is_in_its_source_and_readers_see_through_the_wrapper() {
     let dir = tempfile::tempdir().unwrap();
     let path = put(&dir, "held", b"bytes");
-    let _held = held_without_sharing(&path);
+    let _held = crate::dir::testing::held_without_sharing(&path);
 
     let err = read_unprivileged(&dir, "held").unwrap_err();
 

@@ -74,15 +74,9 @@ fn a_marker_held_open_against_readers_reads_as_unreadable() {
     // — the unix equivalent is a permission denial, which root defeats.
     // Pins the unprivileged reader: one holding backup rights reads through the
     // holder and gets `Present`, which is also a claim.
-    use std::os::windows::fs::OpenOptionsExt;
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), &info(7), None).unwrap();
-    let _held = std::fs::OpenOptions::new()
-        .read(true)
-        // Deny every other opener, this process included.
-        .share_mode(0)
-        .open(dir.path().join(MARKER_FILE))
-        .unwrap();
+    let _held = util::dir::testing::held_without_sharing(&dir.path().join(MARKER_FILE));
     let (got, present) = util::dir::testing::as_unprivileged_thread(|| (read(dir.path()), is_present(dir.path())));
     assert!(
         matches!(got, Marker::Unreadable),

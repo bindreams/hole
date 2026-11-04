@@ -310,8 +310,6 @@ fn a_failed_read_logs_the_error_text() {
 #[cfg(windows)]
 #[skuld::test]
 fn load_of_a_held_file_carries_the_ntstatus_in_the_error_and_the_log() {
-    use std::os::windows::fs::OpenOptionsExt;
-
     let (subscriber, log) = capture();
     let dir = dir();
     let path = put(
@@ -319,11 +317,7 @@ fn load_of_a_held_file_carries_the_ntstatus_in_the_error_and_the_log() {
         "note.json",
         br#"{"version":3,"title":"t","tags":[],"pinned":false}"#,
     );
-    let _held = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(0)
-        .open(&path)
-        .unwrap();
+    let _held = crate::dir::testing::held_without_sharing(&path);
 
     // As an unprivileged thread: a reader with backup rights reads through the holder. The subscriber is per thread.
     let loaded = crate::dir::testing::as_unprivileged_thread(|| {

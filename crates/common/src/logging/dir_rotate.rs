@@ -73,8 +73,8 @@ impl DirRotate {
     }
 
     /// Opens the active file (see [`Dir::append_own_file`]: a file at the name that is not the owner's, or has
-    /// another name, is replaced, never written to), and counts what it already holds. A new file is given to `owner`. The first failure to
-    /// open is said once; later ones, and the retry at every write, are silent.
+    /// another name, is replaced, never written to), and counts what it already holds. A new file is given to
+    /// `owner`. The first failure to open is said once; later ones, and the retry at every write, are silent.
     fn open_active(&mut self) {
         match self.dir.append_own_file(&self.name, 0o644, self.owner) {
             Ok(file) => self.file = Some(file),

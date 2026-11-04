@@ -145,6 +145,18 @@ pub fn as_unprivileged_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     platform::as_unprivileged_thread(f)
 }
 
+/// Opens `path` for reading and denies every other opener, this process included, until the file drops. Windows only:
+/// a reader without backup rights then fails to open it with a sharing violation.
+#[cfg(windows)]
+pub fn held_without_sharing(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .unwrap_or_else(|err| panic!("hold {path:?} without sharing: {err}"))
+}
+
 /// A name nothing in a folder the system owns has, removed again when dropped: the place to look for what a
 /// walk wrongly made in that folder.
 pub struct SystemScratch {
@@ -366,7 +378,8 @@ mod platform {
         std::thread::scope(|scope| {
             let ran = scope
                 .spawn(|| {
-                    let _unprivileged = Impersonation::begin();
+                    // The thread ends when `f` returns, and takes its token with it: nothing to revert.
+                    restrict_this_thread();
                     f()
                 })
                 .join();
@@ -374,53 +387,39 @@ mod platform {
         })
     }
 
-    /// The calling thread runs as a copy of the process token with every privilege removed, until dropped.
-    struct Impersonation;
+    /// The calling thread runs as a copy of the process token with every privilege removed.
+    /// Panics if the token cannot be built or applied: a test of the unprivileged reader has no meaning without it.
+    fn restrict_this_thread() {
+        // SAFETY: every out-pointer names a live local; each handle is owned and closed on drop.
+        unsafe {
+            let mut process = HANDLE::default();
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
+                &mut process,
+            )
+            .expect("OpenProcessToken");
+            let process = Owned::new(process);
 
-    impl Impersonation {
-        /// Panics if the token cannot be built or applied: a test of the unprivileged reader has no meaning without it.
-        fn begin() -> Self {
-            // SAFETY: every out-pointer names a live local; each handle is owned and closed on drop.
-            unsafe {
-                let mut process = HANDLE::default();
-                OpenProcessToken(
-                    GetCurrentProcess(),
-                    TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
-                    &mut process,
-                )
-                .expect("OpenProcessToken");
-                let process = Owned::new(process);
+            let mut restricted = HANDLE::default();
+            CreateRestrictedToken(*process, DISABLE_MAX_PRIVILEGE, None, None, None, &mut restricted)
+                .expect("CreateRestrictedToken");
+            let restricted = Owned::new(restricted);
 
-                let mut restricted = HANDLE::default();
-                CreateRestrictedToken(*process, DISABLE_MAX_PRIVILEGE, None, None, None, &mut restricted)
-                    .expect("CreateRestrictedToken");
-                let restricted = Owned::new(restricted);
+            let mut impersonation = HANDLE::default();
+            DuplicateTokenEx(
+                *restricted,
+                TOKEN_IMPERSONATE | TOKEN_QUERY,
+                None,
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut impersonation,
+            )
+            .expect("DuplicateTokenEx");
+            let impersonation = Owned::new(impersonation);
 
-                let mut impersonation = HANDLE::default();
-                DuplicateTokenEx(
-                    *restricted,
-                    TOKEN_IMPERSONATE | TOKEN_QUERY,
-                    None,
-                    SecurityImpersonation,
-                    TokenImpersonation,
-                    &mut impersonation,
-                )
-                .expect("DuplicateTokenEx");
-                let impersonation = Owned::new(impersonation);
-
-                // The thread keeps its own reference to the token; closing ours afterwards is fine.
-                SetThreadToken(None, Some(*impersonation)).expect("SetThreadToken");
-            }
-            Self
-        }
-    }
-
-    impl Drop for Impersonation {
-        fn drop(&mut self) {
-            // SAFETY: a null token stops this thread impersonating.
-            let reverted = unsafe { SetThreadToken(None, None) };
-            // A failed revert leaves the thread restricted; a panic in drop during unwinding aborts, so only report.
-            debug_assert!(reverted.is_ok(), "SetThreadToken(NULL) failed: {reverted:?}");
+            // The thread keeps its own reference to the token; closing ours afterwards is fine.
+            SetThreadToken(None, Some(*impersonation)).expect("SetThreadToken");
         }
     }
 }
