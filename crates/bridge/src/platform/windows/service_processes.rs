@@ -22,7 +22,7 @@ use windows::Win32::System::Threading::{
     INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
-use crate::disable_record::{creation_time_of, Stamp};
+use crate::disable_record::{creation_time_of, has_exited, Stamp};
 use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::service_scm::hold::{Basis, Look, Opened, ProcessHolds, ProcessSource};
 use crate::service_scm::scan::{scan, ListedProcess, ProcessEnumerator, ScanFinding, ScanResult};
@@ -102,21 +102,6 @@ fn opened_from_token_read<P>(
             Ok(Opened::NoSuchProcess)
         }
         Err(error) => Opened::of_failure(basis, error),
-    }
-}
-
-/// Whether `process` has exited: a zero-timeout wait, which reads the process's
-/// state and waits for nothing.
-pub(super) fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
-    let handle = HANDLE(process.as_raw_handle());
-    // SAFETY: `handle` is the live handle `process` owns.
-    let waited = unsafe { WaitForSingleObject(handle, 0) };
-    if waited == WAIT_OBJECT_0 {
-        Ok(true)
-    } else if waited == WAIT_TIMEOUT {
-        Ok(false)
-    } else {
-        Err(ScmCall::WaitForSingleObject.failed_with(&io::Error::last_os_error()))
     }
 }
 

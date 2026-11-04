@@ -43,9 +43,9 @@ pub use change_mark::ChangeKey;
 #[path = "disable_record/stamp.rs"]
 mod stamp;
 #[cfg(windows)]
-pub(crate) use stamp::creation_time_of;
-#[cfg(windows)]
 pub use stamp::Stamp;
+#[cfg(windows)]
+pub(crate) use stamp::{creation_time_of, has_exited};
 
 /// Whether the record is there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

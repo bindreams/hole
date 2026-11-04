@@ -16,9 +16,10 @@ use windows::Win32::System::Services::{
 use windows_service::service::{Service, ServiceAccess};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use super::service_processes::{has_exited, open_process, ServiceProcesses};
+use super::service_processes::{open_process, ServiceProcesses};
 use super::service_sid::ServiceSid;
 use super::{scm_failure, SERVICE_NAME};
+use crate::disable_record::has_exited;
 use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
 use crate::service_scm::hold::{Basis, Look, Opened, ProcessSource, Reading};
 use crate::service_scm::scan::ScanFinding;

@@ -7,18 +7,30 @@
 //! SYSTEM (the cutover child, an installer's custom action), and the GUI is an
 //! unprivileged user: `OpenProcess` is refused for every SYSTEM process there
 //! (measured: `ERROR_ACCESS_DENIED` for `services.exe` and `svchost.exe`, even
-//! for `PROCESS_QUERY_LIMITED_INFORMATION`), so liveness is read from the
-//! system process list (`NtQuerySystemInformation`), which needs no access to
-//! any process.
+//! for `PROCESS_QUERY_LIMITED_INFORMATION`).
+//!
+//! A process that can be opened is running when its object is not signalled
+//! ([`has_exited`]): the object is signalled at exit, which is an edge. The
+//! system process list (`NtQuerySystemInformation`) keeps an exited process
+//! listed for a while after that, with no edge, so it decides only for a
+//! process that cannot be opened, where it is the one source that needs no
+//! access.
 
 use std::io;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
-use windows::Win32::Foundation::{FILETIME, HANDLE, STATUS_INFO_LENGTH_MISMATCH};
-use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetProcessTimes};
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STATUS_INFO_LENGTH_MISMATCH, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess, WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+};
 use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION;
 
-use crate::service_scm::call_error::win32_code_of_hresult;
+use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall};
 
 /// `SystemProcessInformation`.
 const SYSTEM_PROCESS_INFORMATION_CLASS: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(5);
@@ -47,6 +59,21 @@ pub(crate) unsafe fn creation_time_of(process: HANDLE) -> io::Result<u64> {
     unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) }
         .map_err(|e| io::Error::from_raw_os_error(win32_code_of_hresult(e.code().0) as i32))?;
     Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+/// Whether `process` has exited: a zero-timeout wait, which reads the process
+/// object's signalled state and waits for nothing.
+pub(crate) fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
+    let handle = HANDLE(process.as_raw_handle());
+    // SAFETY: `handle` is the live handle `process` owns.
+    let waited = unsafe { WaitForSingleObject(handle, 0) };
+    if waited == WAIT_OBJECT_0 {
+        Ok(true)
+    } else if waited == WAIT_TIMEOUT {
+        Ok(false)
+    } else {
+        Err(ScmCall::WaitForSingleObject.failed_with(&io::Error::last_os_error()))
+    }
 }
 
 /// A process, by id and creation time.
@@ -86,12 +113,29 @@ impl Stamp {
         })
     }
 
-    /// Whether the stamped process is running: listed with this creation time
-    /// and a thread left. A pid listed with another creation time is the OS's
-    /// reuse of it. A process that just exited can still read as running for a
-    /// few reads (measured in CI); a status read repeats on every poll.
+    /// Whether the stamped process is running: it can be opened, has this
+    /// creation time (another is the OS's reuse of the id) and has not exited.
+    /// An id no process has is not running. A process the caller may not open
+    /// is read from the process list ([`Self::of_listed_process`]).
     pub fn is_running(&self) -> io::Result<bool> {
-        Ok(Self::of_listed_process(self.pid)?.is_some_and(|listed| listed.created == self.created))
+        // SAFETY: plain FFI call; no pointer is passed.
+        let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, self.pid) };
+        match opened {
+            Ok(handle) => {
+                // SAFETY: `OpenProcess` returned a new handle this value now owns.
+                let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+                // SAFETY: `process` is the live handle just opened with the query right.
+                let created = unsafe { creation_time_of(HANDLE(process.as_raw_handle())) }?;
+                Ok(created == self.created && !has_exited(&process)?)
+            }
+            Err(error) => match win32_code_of_hresult(error.code().0) {
+                code if code == ERROR_INVALID_PARAMETER.0 => Ok(false),
+                code if code == ERROR_ACCESS_DENIED.0 => {
+                    Ok(Self::of_listed_process(self.pid)?.is_some_and(|listed| listed.created == self.created))
+                }
+                code => Err(io::Error::from_raw_os_error(code as i32)),
+            },
+        }
     }
 
     /// Every live process in the list (one with a thread left; an exited one

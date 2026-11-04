@@ -2348,15 +2348,19 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   in progress. Try again when it finishes." (`InstallGate::ChangeInProgress`,
   also when unattended); `hole bridge status` prints `installed (being changed)` and exits 4. Gone, or the pid now another process's (a different
   creation time), the change was interrupted and the table above decides. A
-  record whose value is not a stamp, or whose process list cannot be read, has
+  record whose value is not a stamp, or whose process cannot be probed, has
   no running changer, so a user is never left waiting on a change that ended.
-  Liveness comes from the system process list (`NtQuerySystemInformation`),
-  not `OpenProcess`: a standard user is refused every SYSTEM process (measured:
-  `ERROR_ACCESS_DENIED` for `services.exe`, `svchost.exe` and the System process,
-  even for `PROCESS_QUERY_LIMITED_INFORMATION`), and the cutover child and an
-  installer's custom actions are SYSTEM. The list holds the creation time in
-  bytes `winternl.h` calls opaque (`Reserved1`, offset 24); a test compares it
-  with `GetProcessTimes`. A lock that cannot be read costs nothing here, since
+  A process that `OpenProcess` opens is running when it has the stamped
+  creation time and its object is not signalled (`has_exited`): the signal at
+  exit is an edge, where the system process list keeps an exited process for a
+  while after it (measured in CI, no edge). A standard user is refused every
+  SYSTEM process (measured: `ERROR_ACCESS_DENIED` for `services.exe`,
+  `svchost.exe` and the System process, even for
+  `PROCESS_QUERY_LIMITED_INFORMATION`), and the cutover child and an installer's
+  custom actions are SYSTEM, so a refused open is read from the system process
+  list (`NtQuerySystemInformation`), which needs no access. The list holds the
+  creation time in bytes `winternl.h` calls opaque (`Reserved1`, offset 24); a
+  test compares it with `GetProcessTimes`. A lock that cannot be read costs nothing here, since
   the GUI never takes it; a start type that cannot be read says nothing is
   disabled, but a running changer is still seen.
   **The change mark** makes the lock-free read exact. The start type and the

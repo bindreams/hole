@@ -109,11 +109,15 @@ fn a_process_that_exited_is_not_running() {
     assert!(stamp.is_running().expect("probe"), "running while the child is up");
 
     child.release_and_wait();
-    // An exited process can stay in the system list for a few reads after its
-    // exit is signalled (Windows has no edge for that), so re-read until it goes.
-    while stamp.is_running().expect("probe") {
-        std::thread::yield_now();
-    }
+    assert!(!stamp.is_running().expect("probe"), "gone once the child exited");
+}
+
+/// An id no process has is not a running process. Ids are multiples of 4, so
+/// this one is never any process's.
+#[skuld::test]
+fn an_id_no_process_has_is_not_running() {
+    let stamp = Stamp { pid: 1, created: 1 };
+    assert!(!stamp.is_running().expect("probe"));
 }
 
 /// The id of a running process with another creation time is a reused id.
