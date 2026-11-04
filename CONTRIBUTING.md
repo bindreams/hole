@@ -2359,8 +2359,10 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   `PROCESS_QUERY_LIMITED_INFORMATION`), and the cutover child and an installer's
   custom actions are SYSTEM, so a refused open is read from the system process
   list (`NtQuerySystemInformation`). A standard user reads it for a SYSTEM process
-  (the privileged lane's standard-user status reads), and for one that has just
-  exited it can still say running. The list holds the
+  (the privileged lane's standard-user status reads). The lag above was seen for
+  a process the reader held a handle to; read as a standard user holding none,
+  after the impersonation switch, a just-stopped SYSTEM process was never listed
+  in 6,512 rounds on the privileged runner (probe at 50d133c91, run 41817171754). The list holds the
   creation time in bytes `winternl.h` calls opaque (`Reserved1`, offset 24); a
   test compares it with `GetProcessTimes`. A lock that cannot be read costs nothing here, since
   the GUI never takes it; a start type that cannot be read says nothing is

@@ -12,9 +12,11 @@
 //! A process that can be opened is running when its object is not signalled
 //! ([`has_exited`]): the object is signalled at exit, which is an edge. The
 //! system process list (`NtQuerySystemInformation`) keeps an exited process
-//! listed for a while after that, with no edge, so it decides only for a
-//! process that cannot be opened, and there it can report a process that has
-//! just exited as running.
+//! listed for a while after that, with no edge (measured for a process the
+//! reader holds a handle to), so it decides only for a process that cannot be
+//! opened. There, read as a standard user holding no handle, right after a SYSTEM
+//! process stopped, it never listed the exited process in 6,512 rounds on the
+//! privileged CI runner (probe at 50d133c91, run 41817171754).
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -116,9 +118,8 @@ impl Stamp {
     /// Whether the stamped process is running: it can be opened, has this
     /// creation time (another is the OS's reuse of the id) and has not exited.
     /// An id no process has is not running. A process the caller may not open
-    /// is read from the process list ([`Self::of_listed_process`]), which keeps
-    /// an exited process listed for a while: for such a process this can report
-    /// one that has just exited as running.
+    /// is read from the process list ([`Self::of_listed_process`]); see the
+    /// module doc for what was measured on that path.
     pub fn is_running(&self) -> io::Result<bool> {
         // SAFETY: plain FFI call; no pointer is passed.
         let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, self.pid) };
