@@ -341,3 +341,23 @@ fn a_wait_over_nothing_held_returns() {
         processes.wait_on_each(interval).expect("wait");
     }
 }
+
+/// With nothing held the paced wait has no process to block on, and still takes
+/// its interval: a caller that looks again straight after would scan and query
+/// the SCM back to back. Without an interval nothing is waited for.
+#[skuld::test]
+fn the_paced_wait_with_nothing_held_takes_its_interval() {
+    const INTERVAL_MILLIS: u32 = 300;
+    let processes = ServiceProcesses::default();
+    // Test of timing: the delay is the behavior under test.
+    let started = std::time::Instant::now();
+    processes.wait_on_each(Some(INTERVAL_MILLIS)).expect("wait");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(INTERVAL_MILLIS.into()),
+        "the paced wait with nothing held returned early: {:?}",
+        started.elapsed()
+    );
+    processes
+        .wait_on_each(None)
+        .expect("nothing held is nothing to wait for");
+}

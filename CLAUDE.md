@@ -258,7 +258,7 @@ before editing; the sections linked below are the authoritative source.
   unbounded by design, no budget (clippy-enforced).
   [→](CONTRIBUTING.md#port-allocation)
 - **No sleeps / timeout-polls for synchronization** — use the codebase's
-  rendezvous primitives; two narrow exception classes only.
+  rendezvous primitives; three narrow exception classes only.
   [→](CONTRIBUTING.md#test-invariants)
 - **Tests use `#[skuld::test]`** with `register!()` per binary; install per-test
   subscribers via `set_default_in_current_thread` and never

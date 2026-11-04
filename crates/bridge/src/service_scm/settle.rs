@@ -137,9 +137,10 @@ impl ProcessFate {
 }
 
 /// How often, in milliseconds, a wait on the held processes asks the SCM again
-/// while the service is not STOPPED. The SCM sends a service marked for deletion no notification, and
-/// no process exit says its state moved, so this only paces re-queries of an SCM
-/// that sends nothing. It is not a return to the sleep-poll `service_scm`
+/// while the service is not STOPPED, with or without a process held. The SCM
+/// sends a service marked for deletion no notification, and no process exit
+/// says its state moved, so this only paces re-queries of an SCM that sends
+/// nothing. It is not a return to the sleep-poll `service_scm`
 /// replaced: nothing is concluded from its expiry, a wake with nothing changed
 /// waits again, and the loop ends only on a state a query reads.
 pub const SCM_REQUERY_MILLIS: u32 = 2_000;
@@ -211,8 +212,10 @@ pub trait StopActor {
     /// Sleep until the armed notification fires.
     fn await_callback(&mut self) -> io::Result<()>;
     /// Wait on the held processes as `wait` says: until every one has exited, or
-    /// until [`ExitWait::requery_millis`] has passed. A return says neither: a
-    /// wake proves nothing about the processes or the SCM, so the caller looks.
+    /// until [`ExitWait::requery_millis`] has passed; with nothing held, an
+    /// interval waits that long and no interval returns at once. A return says
+    /// neither: a wake proves nothing about the processes or the SCM, so the
+    /// caller looks.
     fn await_held_exits(&mut self, wait: ExitWait) -> io::Result<()>;
     /// Scan for the live processes that carry the service's token, other than
     /// the calling one, and hold them. Says what the scan itself found: only
@@ -275,11 +278,11 @@ impl SettleError {
 /// loop goes on without arming: it holds the processes the scan finds and waits
 /// on all of them, and each time that wait exits or wakes
 /// ([`SCM_REQUERY_MILLIS`]) it looks at the SCM again. Nothing is ended before
-/// the SCM reports STOPPED. If a live state is left with no process alive, the
-/// only event is the SCM's, which cannot be asked for, and the refusal is the
-/// result.
+/// the SCM reports STOPPED. With no process ever shown, the wait is one such
+/// interval with nothing held, then a look; the loop ends only on a state a
+/// look reads.
 pub fn settle_stopped<A: StopActor>(actor: &mut A) -> Result<(), SettleError> {
-    let mut settle = Settle { actor, refused: None };
+    let mut settle = Settle { actor, refused: false };
     let mut look = settle.observe()?;
     loop {
         let step = look.settle_step();
@@ -318,9 +321,9 @@ enum Next {
 
 struct Settle<'a, A> {
     actor: &'a mut A,
-    /// The SCM's refusal of an arm because the service is marked for deletion;
-    /// no arm is tried once it is set.
-    refused: Option<io::Error>,
+    /// The SCM refused an arm because the service is marked for deletion; no
+    /// arm is tried once it is set.
+    refused: bool,
 }
 
 impl<A: StopActor> Settle<'_, A> {
@@ -346,7 +349,7 @@ impl<A: StopActor> Settle<'_, A> {
     /// Arm leaving `from`. `Ok(false)` means the SCM refused because the
     /// service is marked for deletion, whose open handle still carries on.
     fn arm_leaving(&mut self, from: Observed) -> Result<bool, SettleError> {
-        if self.refused.is_some() {
+        if self.refused {
             return Ok(false);
         }
         match self.actor.arm_leaving(from) {
@@ -354,7 +357,7 @@ impl<A: StopActor> Settle<'_, A> {
             Err(error) => match service_gone(&error) {
                 Some(gone) if gone.answers_through_an_open_handle() => {
                     warn!(%error, ?gone, "the SCM refused an arm; waiting on the service's processes instead");
-                    self.refused = Some(error);
+                    self.refused = true;
                     Ok(false)
                 }
                 Some(_) | None => Err(SettleError::Arm(error)),
@@ -412,7 +415,9 @@ impl<A: StopActor> Settle<'_, A> {
     /// SCM's state still lagging, a scan that finds nothing settles the wait if
     /// the look shows the service's processes gone ([`Look::shows_its_processes_gone`]).
     /// A scan that finds something, or loses a listed process, scans again. With
-    /// no process ever shown, the state is left with no event to wait on.
+    /// no process ever shown there is nothing to block on, so the wait is one
+    /// [`SCM_REQUERY_MILLIS`] interval with nothing held, and the look after it
+    /// is what decides.
     fn without_arm(&mut self) -> Result<Next, SettleError> {
         let finding = self.hold_scanned()?;
         let look = self.observe()?;
@@ -432,13 +437,7 @@ impl<A: StopActor> Settle<'_, A> {
             );
             return Ok(Next::Settled);
         }
-        Err(self.no_event())
-    }
-
-    /// The result where a live state has nothing to wait on and the SCM cannot be
-    /// asked: its refusal of the arm.
-    fn no_event(&mut self) -> SettleError {
-        SettleError::Arm(self.refused.take().expect("only reached after the SCM refused an arm"))
+        self.await_exits_then_look(look.exit_wait())
     }
 }
 

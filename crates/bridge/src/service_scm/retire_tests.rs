@@ -771,10 +771,11 @@ fn a_mark_at_the_first_arm_is_waited_out_on_the_held_process() {
     }
 }
 
-/// A live state, nothing ever held and no arm possible: no event exists to
-/// wait on, so the retirement fails with the refusal and never reports done.
+/// A live state, nothing ever held and no arm possible: no event exists to wait
+/// on, so the wait paces one interval with nothing held and looks again. The
+/// retirement is neither refused nor done until a look reads STOPPED.
 #[skuld::test]
-fn a_marked_service_with_nothing_to_wait_on_fails_and_is_never_ok() {
+fn a_marked_service_with_nothing_to_wait_on_is_looked_at_again_until_stopped() {
     let unheld_running = || Look {
         observed: Observed::Running,
         fate: ProcessFate::Unheld,
@@ -783,21 +784,25 @@ fn a_marked_service_with_nothing_to_wait_on_fails_and_is_never_ok() {
     };
     for disposition in [Disposition::StopOnly, Disposition::Deregister] {
         let log = Log::default();
-        let mut session = FakeSession::new(&log, vec![unheld_running(), unheld_running()])
+        let mut session = FakeSession::new(&log, vec![unheld_running(), unheld_running(), stopped(), stopped()])
             .failing_with("set_start_type(Disabled)", marked_at_the_start_type_write())
             .failing_with(
                 "arm_leaving(Running)",
                 scm_error(ScmCall::NotifyServiceStatusChange, 1072),
             );
-        let error = retire(&mut session, disposition).expect_err("nothing to wait on is never done");
-        assert!(matches!(error, RetireError::Stop(_)), "{disposition:?}: {error}");
-        assert!(error.to_string().contains("1072"), "{error}");
+        retire(&mut session, disposition).unwrap_or_else(|e| panic!("{disposition:?}: {e}"));
         let logged = logged(&log);
-        assert!(!logged.contains(&"delete".to_owned()), "{logged:?}");
-        assert!(
-            !logged.iter().any(|call| call.starts_with("set_failure_actions")),
-            "{logged:?}"
-        );
+        let stop = logged
+            .iter()
+            .position(|call| call == "control_stop")
+            .expect("a Stop is sent");
+        let paced = logged
+            .iter()
+            .position(|call| call == "await_held_exits")
+            .expect("the wait is paced");
+        assert!(stop < paced, "{disposition:?}: {logged:?}");
+        // Already marked: there is nothing to delete.
+        assert!(!logged.contains(&"delete".to_owned()), "{disposition:?}: {logged:?}");
     }
 }
 

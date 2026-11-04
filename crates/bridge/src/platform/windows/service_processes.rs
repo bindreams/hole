@@ -285,8 +285,16 @@ impl ServiceProcesses {
     }
 
     /// Waits on each held process in turn, for `millis` each, or until it exits
-    /// with `None`. The one place a held process is blocked on.
+    /// with `None`. The one place a held process is blocked on. With nothing
+    /// held an interval is slept whole and `None` returns at once.
     fn wait_on_each(&self, millis: Option<u32>) -> io::Result<()> {
+        if let (Some(millis), 0) = (millis, self.held()) {
+            // Paces a poll that re-checks the SCM's real state on every return,
+            // concludes nothing from the interval and has no cap: with no process
+            // there is no event to block on, and the SCM sends none.
+            std::thread::sleep(std::time::Duration::from_millis(millis.into()));
+            return Ok(());
+        }
         let timeout = millis.unwrap_or(INFINITE);
         for process in self.holds.processes() {
             let handle = HANDLE(process.as_raw_handle());

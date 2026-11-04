@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use super::*;
-use crate::service_scm::call_error::{service_gone, ScmCall, ScmCallError, ServiceGone};
+use crate::service_scm::call_error::{ScmCall, ScmCallError};
 
 // The look table ======================================================================================================
 
@@ -824,19 +824,68 @@ fn a_stopped_service_is_scanned_again_until_a_scan_finds_nothing() {
     assert_eq!(actor.log().last(), Some(&"observe"));
 }
 
-/// A live state with no process to wait on and no arm: the only event left is
-/// the SCM's, which cannot be asked for. The refusal that says why is the result.
+/// Marked and START_PENDING, scanned before the service's process exists (the SCM
+/// sets the state, then creates the process): nothing is held and nothing was
+/// ever held, and the SCM cannot be asked for an event. The wait paces one
+/// interval, looks again and finds RUNNING, so the Stop goes out.
 #[skuld::test]
-fn a_marked_service_with_no_process_to_wait_on_fails_with_the_refusal() {
-    let mut actor = Recording::new(vec![pending(Observed::StopPending), pending(Observed::StopPending)])
-        .arm_fails_with(vec![Some(marked())]);
-    let error = settle_stopped(&mut actor).unwrap_err();
-    let SettleError::Arm(refusal) = &error else {
-        panic!("the arm's refusal is the result: {error:?}")
-    };
-    assert_eq!(service_gone(refusal), Some(ServiceGone::MarkedForDeletion));
+fn a_marked_service_starting_before_its_process_exists_is_looked_at_again_and_then_stopped() {
+    let mut actor = Recording::new(vec![
+        pending(Observed::StartPending),
+        pending(Observed::StartPending),
+        running(),
+        stopped(),
+        stopped(),
+    ])
+    .arm_fails_with(vec![Some(marked())]);
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(
+        actor.log(),
+        [
+            "observe",
+            "arm_leaving(StartPending)",
+            "hold_scanned",
+            "observe",
+            "await_held_exits",
+            "observe",
+            "control_stop",
+            "await_held_exits",
+            "observe",
+            "hold_scanned",
+            "observe"
+        ]
+    );
+    assert_eq!(
+        actor.exit_waits[0],
+        ExitWait::OnTheirOwn,
+        "paced, nothing ended before STOPPED"
+    );
+}
+
+/// Marked and STOP_PENDING whose process had already exited when the first look
+/// opened it: nothing was ever held, the status lags, and the wait paces one
+/// interval and looks again until the SCM says STOPPED. Nothing is refused.
+#[skuld::test]
+fn a_marked_service_stopping_over_a_process_that_already_exited_is_looked_at_again_until_stopped() {
+    let mut actor = Recording::new(vec![
+        pending(Observed::StopPending),
+        pending(Observed::StopPending),
+        pending(Observed::StopPending),
+        pending(Observed::StopPending),
+        stopped(),
+        stopped(),
+    ])
+    .arm_fails_with(vec![Some(marked())]);
+    // The first wake finds it still stopping; the second finds STOPPED.
+    settle_stopped(&mut actor).unwrap();
+    assert_eq!(actor.count("control_stop"), 0);
     assert_eq!(actor.count("await_callback"), 0);
-    assert_eq!(actor.count("await_held_exits"), 0);
+    assert_eq!(
+        actor.exit_waits,
+        [ExitWait::OnTheirOwn, ExitWait::OnTheirOwn],
+        "one paced wait per look that found no change"
+    );
+    assert_eq!(actor.log().last(), Some(&"observe"));
 }
 
 /// Marked, RUNNING over a process no hold could name: the Stop goes without an

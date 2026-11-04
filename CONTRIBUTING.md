@@ -2282,8 +2282,8 @@ state read before its act loses that race, so four rules close it:
   no notification, so there the loop waits on every held process with the wake
   and looks at the SCM each time it returns; a claimed or scanned process that
   never exits holds the loop only until a look reads STOPPED. With nothing alive
-  and nothing ever shown it has no event, and the result is the SCM's refusal
-  of the arm (as for any live state with nothing to wait on).
+  and nothing ever shown there is no process to block on, so the wait is one
+  `SCM_REQUERY_MILLIS` interval with nothing held, then the same look.
 - **A process id the SCM names is a claim; the service SID in the token is the
   identity.** Microsoft documents that the id
   ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks))
@@ -2367,10 +2367,15 @@ and waited out on process handles like any other. What Microsoft documents as 10
   exited) settles the wait once a scan finds nothing.
 - A `DeleteService` that answers 1072 is a success: someone else's delete got
   there first.
-- The one state with no event to wait on is a live or pending state with
-  nothing alive and no arm possible (a process without the service SID, or
-  START_PENDING before its process exists and before a scan finds it). It fails
-  with the refusal, naming the state: retryable, reported, never `Ok`.
+- A live or pending state with nothing alive, nothing ever held and no arm
+  possible (a process without the service SID, START_PENDING before its process
+  exists and before a scan finds it, or STOP_PENDING over a process that
+  exited before it was opened) has no process to block on either. The wait
+  sleeps one `SCM_REQUERY_MILLIS` with nothing held
+  (`ServiceProcesses::wait_on_each`, the one place the empty case is decided)
+  and looks at the SCM again: RUNNING is sent a Stop, a new id is held, STOPPED
+  ends it. Like the wake above it concludes nothing from the interval and has
+  no cap.
 
 **A gone entry** (1060 at open) is stopped as far as the SCM is concerned, so
 only the scan can see a process of it that lingers. `wait_out_survivors` scans,
@@ -3913,11 +3918,15 @@ Spotlight "Hole" must reveal it.
   `#[skuld::test] async fn` builds a current-thread runtime automatically (#302).
 - **No sleeps for synchronization** — `thread::sleep`, `tokio::time::sleep`,
   `browser.pause()`, and any timeout-bounded poll (`waitUntil({ timeout })`,
-  `tokio::time::timeout(d, wait_for_x)`) are forbidden for sync. Two exception
+  `tokio::time::timeout(d, wait_for_x)`) are forbidden for sync. Three exception
   classes, each with a one-line comment naming it: (1) **test-of-timing** (the
-  delay IS the behavior under test) and (2) **external event with graceful
+  delay IS the behavior under test), (2) **external event with graceful
   failure bound** (a remote/out-of-process op that might never succeed; the
-  framework/job timeout is the failure-to-human signal). Use the codebase's
+  framework/job timeout is the failure-to-human signal) and (3) **paced
+  re-check** (a poll of a real state that no event announces, because the OS
+  sends none and there is no handle to block on: every return re-reads the
+  state, nothing is concluded from the interval and there is no cap; the stop
+  wait's `ServiceProcesses::wait_on_each` with nothing held). Use the codebase's
   rendezvous primitives (oneshot, `watch`, `WaitableWriter`, `CancellationToken`,
   `JoinHandle.await`, `tokio::time::pause/advance`) for intra-process sync (#383).
 - **A lost network is not a product defect** — a probe of real egress fails the
