@@ -3535,6 +3535,52 @@ async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
     );
 }
 
+/// The persist's two writes are separate critical sections, so an unblock can
+/// commit between them: the target write sees no unblock, the unblock commits
+/// `Off` and clears the candidate, then the candidate write runs. It must not
+/// set a candidate beside the `Off` target, which `AlwaysConnect` would
+/// reconnect from.
+#[skuld::test]
+async fn an_unblock_between_the_target_and_candidate_writes_leaves_no_candidate() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let state = ipc_state_with_dir(dir.clone());
+    let config = sample_config();
+    let snapshot = state.unblock_generation.load(Ordering::SeqCst);
+
+    write_target_after_start(&dir, None, &config, &state.unblock_generation, snapshot)
+        .expect("the target write must succeed");
+    assert!(
+        matches!(target::load(&dir), Target::Connected { .. }),
+        "step 1 must have seen no unblock and written Connected"
+    );
+
+    let _ = handle_unblock(axum::extract::State(state.clone()))
+        .await
+        .expect("unblock must succeed");
+
+    write_candidate_after_start(
+        &dir,
+        None,
+        &config,
+        Some(StartupBehavior::AlwaysConnect),
+        &state.unblock_generation,
+        snapshot,
+    )
+    .expect("the candidate write must succeed");
+
+    assert_eq!(target::load(&dir), Target::Off);
+    let pref = target::load_startup_preference(&dir);
+    assert!(
+        pref.candidate.is_none(),
+        "the candidate write re-added an auto-connect candidate beside an Off target"
+    );
+    assert_eq!(
+        pref.on_startup,
+        StartupBehavior::AlwaysConnect,
+        "the on_startup push is a preference and stands whatever the unblock did"
+    );
+}
+
 // Status probe placement ==============================================================================================
 
 /// `handle_status` used to reach cover presence through `pm.cover_presence()`

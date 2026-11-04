@@ -627,39 +627,8 @@ async fn persist_after_start<P: Proxy, R: Routing>(
     let generation = Arc::clone(&state.unblock_generation);
     let outcome = tokio::task::spawn_blocking(move || -> Result<(), target::TargetError> {
         if succeeded {
-            let candidate_config = config.clone();
-            let declined = std::sync::atomic::AtomicBool::new(false);
-            let declined_ref = &declined;
-            target::apply(&state_dir, owner, move |current| {
-                if generation.load(std::sync::atomic::Ordering::SeqCst) != unblock_snapshot {
-                    // An unblock committed `Target::Off` after this start
-                    // began. It is the newer intent; leave it standing.
-                    declined_ref.store(true, std::sync::atomic::Ordering::SeqCst);
-                    current
-                } else {
-                    Target::Connected {
-                        config: Box::new(config),
-                    }
-                }
-            })?;
-            // Locked read-modify-write, NOT load-then-save: a concurrent
-            // `handle_unblock` clearing the candidate between the two halves
-            // would be silently re-added here, leaving `Target::Off` beside a
-            // live candidate that `AlwaysConnect` reconnects from — the escape
-            // undone. Sequential with the `target::apply` above, never nested:
-            // both take the same lock, and `flock` is per-open-description, so
-            // nesting would deadlock rather than recurse.
-            target::apply_startup_preference(&state_dir, owner, |pref| {
-                if let Some(on_startup) = on_startup {
-                    pref.on_startup = on_startup;
-                }
-                // The candidate records what actually happened, so it follows
-                // the target's fate. The `on_startup` push is a PREFERENCE,
-                // not a record, so it stands either way.
-                if !declined.load(std::sync::atomic::Ordering::SeqCst) {
-                    pref.candidate = Some(Box::new(candidate_config));
-                }
-            })
+            write_target_after_start(&state_dir, owner, &config, &generation, unblock_snapshot)?;
+            write_candidate_after_start(&state_dir, owner, &config, on_startup, &generation, unblock_snapshot)
         } else if let Some(on_startup) = on_startup {
             target::apply_startup_preference(&state_dir, owner, |pref| {
                 pref.on_startup = on_startup;
@@ -677,6 +646,60 @@ async fn persist_after_start<P: Proxy, R: Routing>(
         }
         Err(e) => error!(error = %e, "target-persistence task panicked"),
     }
+}
+
+/// An unblock committed `Target::Off` after `snapshot` was taken. It is the
+/// newer intent, so a start's write must leave it standing.
+fn unblocked_since(generation: &std::sync::atomic::AtomicU64, snapshot: u64) -> bool {
+    generation.load(std::sync::atomic::Ordering::SeqCst) != snapshot
+}
+
+/// The target half of [`persist_after_start`].
+fn write_target_after_start(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    config: &ProxyConfig,
+    generation: &std::sync::atomic::AtomicU64,
+    unblock_snapshot: u64,
+) -> Result<(), target::TargetError> {
+    target::apply(state_dir, owner, |current| {
+        if unblocked_since(generation, unblock_snapshot) {
+            current
+        } else {
+            Target::Connected {
+                config: Box::new(config.clone()),
+            }
+        }
+    })
+    .map(drop)
+}
+
+/// The startup-preference half of [`persist_after_start`]: a locked
+/// read-modify-write, NOT load-then-save, sequential with (never nested in)
+/// the target write — both take the same lock, and `flock` is per-open-
+/// description, so nesting would deadlock rather than recurse.
+///
+/// The two writes are separate critical sections, so an unblock can commit
+/// between them. The candidate therefore re-decides from the same fact as the
+/// target write, inside its own lock: a candidate set beside an `Off` target is
+/// what `AlwaysConnect` reconnects from, the escape undone. The `on_startup`
+/// push is a PREFERENCE, not a record of what happened, so it stands either way.
+fn write_candidate_after_start(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    config: &ProxyConfig,
+    on_startup: Option<StartupBehavior>,
+    generation: &std::sync::atomic::AtomicU64,
+    unblock_snapshot: u64,
+) -> Result<(), target::TargetError> {
+    target::apply_startup_preference(state_dir, owner, |pref| {
+        if let Some(on_startup) = on_startup {
+            pref.on_startup = on_startup;
+        }
+        if !unblocked_since(generation, unblock_snapshot) {
+            pref.candidate = Some(Box::new(config.clone()));
+        }
+    })
 }
 
 /// Cancel the in-flight start IFF it is the attempt this cancel names, else
