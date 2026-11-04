@@ -1623,6 +1623,7 @@ fn ipc_state_with_persist_gate(
         routing: routing_handle,
         cover_invalidated,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -1803,6 +1804,7 @@ fn ipc_state_with_dir_and_proxy(dir: PathBuf, proxy: MockProxy) -> Arc<IpcState<
         routing: routing_handle,
         cover_invalidated,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -3316,6 +3318,7 @@ fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<Ipc
         routing,
         cover_invalidated,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -3493,23 +3496,19 @@ async fn reload_to_a_different_server_that_fails_is_redacted_in_log_and_response
 /// Start-vs-Stop race, because `handle_stop` takes that same lock and simply
 /// queues. It cannot close Start-vs-Unblock: `handle_unblock` takes NO proxy
 /// lock by design (it must work while a wedged teardown holds one), so it runs
-/// *inside* the start's persist window. The closure ignoring `current` is what
-/// makes that a lost update — the write is unconditional, so it reverts an
-/// unblock that already committed.
+/// *inside* the start's persist window. The start's records must yield to the
+/// unblock's `Off`, while its `on_startup` push (a preference, not a record of
+/// what happened) still lands.
 #[skuld::test]
 async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
     let dir = tempfile::tempdir().unwrap().keep();
     let (state, persist_gate, persist_entered) = ipc_state_with_persist_gate(dir.clone());
 
     let state_a = state.clone();
-    let start = tokio::spawn(async move {
-        handle_start(
-            axum::extract::State(state_a),
-            axum::http::HeaderMap::new(),
-            Json(sample_config()),
-        )
-        .await
-    });
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(ON_STARTUP_HEADER, "always_connect".parse().unwrap());
+    let start =
+        tokio::spawn(async move { handle_start(axum::extract::State(state_a), headers, Json(sample_config())).await });
 
     // Park until the start is known to be inside its persist window.
     persist_entered.await.expect("persist_after_start never entered");
@@ -3528,57 +3527,54 @@ async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
         Target::Off,
         "an Unblock that committed while Start was mid-persist was silently reverted to Connected"
     );
-    assert!(
-        target::load_startup_preference(&dir).candidate.is_none(),
-        "the declined target write still recorded an auto-connect candidate, leaving the two \
-         records disagreeing about what the user last asked for"
-    );
-}
-
-/// The persist's two writes are separate critical sections, so an unblock can
-/// commit between them: the target write sees no unblock, the unblock commits
-/// `Off` and clears the candidate, then the candidate write runs. It must not
-/// set a candidate beside the `Off` target, which `AlwaysConnect` would
-/// reconnect from.
-#[skuld::test]
-async fn an_unblock_between_the_target_and_candidate_writes_leaves_no_candidate() {
-    let dir = tempfile::tempdir().unwrap().keep();
-    let state = ipc_state_with_dir(dir.clone());
-    let config = sample_config();
-    let snapshot = state.unblock_generation.load(Ordering::SeqCst);
-
-    write_target_after_start(&dir, None, &config, &state.unblock_generation, snapshot)
-        .expect("the target write must succeed");
-    assert!(
-        matches!(target::load(&dir), Target::Connected { .. }),
-        "step 1 must have seen no unblock and written Connected"
-    );
-
-    let _ = handle_unblock(axum::extract::State(state.clone()))
-        .await
-        .expect("unblock must succeed");
-
-    write_candidate_after_start(
-        &dir,
-        None,
-        &config,
-        Some(StartupBehavior::AlwaysConnect),
-        &state.unblock_generation,
-        snapshot,
-    )
-    .expect("the candidate write must succeed");
-
-    assert_eq!(target::load(&dir), Target::Off);
     let pref = target::load_startup_preference(&dir);
     assert!(
         pref.candidate.is_none(),
-        "the candidate write re-added an auto-connect candidate beside an Off target"
+        "the declined target write still recorded an auto-connect candidate, leaving the two          records disagreeing about what the user last asked for"
     );
     assert_eq!(
         pref.on_startup,
         StartupBehavior::AlwaysConnect,
         "the on_startup push is a preference and stands whatever the unblock did"
     );
+}
+
+/// The start's target and candidate writes, and the unblock's Off, `set_enabled`
+/// and candidate clear, are each several critical sections, so an unblock
+/// committing between a start's two writes (or a start's pair landing between the
+/// unblock's) leaves `Off` beside a candidate, or `Connected` with its candidate
+/// erased. Both sequences run under `intent_persist`.
+///
+/// Asserted by source, not by interleaving: neither sequence has a point a test
+/// can park at, and an unbounded wait for "the other side has blocked on the
+/// mutex" has no condition to re-check. The guard is `!Send`, so holding it
+/// across an `.await` in either handler already fails to compile.
+#[skuld::test]
+fn the_unblock_and_the_start_persist_run_under_the_intent_persist_mutex() {
+    let src = include_str!("ipc.rs");
+    for item in ["async fn handle_unblock", "async fn persist_after_start"] {
+        let start = src.find(item).unwrap_or_else(|| panic!("{item} must exist in ipc.rs"));
+        let after_start = &src[start + 1..];
+        let end = after_start
+            .find(
+                "
+async fn ",
+            )
+            .or_else(|| {
+                after_start.find(
+                    "
+fn ",
+                )
+            })
+            .map(|i| start + 1 + i)
+            .unwrap_or(src.len());
+        assert!(
+            src[start..end].contains("intent_persist.lock("),
+            "{item} must lock `intent_persist` around its target and candidate writes:
+{}",
+            &src[start..end]
+        );
+    }
 }
 
 // Status probe placement ==============================================================================================
