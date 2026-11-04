@@ -80,7 +80,7 @@ fn the_boot_reap_spares_the_plugin_of_the_boot_auto_connect() {
             "the plugin of the session this boot started must survive the boot reap"
         );
         match plugin_state::load(dir.path()) {
-            plugin_state::Loaded::State(state) => assert_eq!(
+            util::versioned_file::Loaded::Current { value: state, .. } => assert_eq!(
                 state.plugins,
                 vec![session_record],
                 "the state file must hold exactly the live session's record, so its stop can reap it"

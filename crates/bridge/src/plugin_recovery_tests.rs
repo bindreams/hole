@@ -1,4 +1,5 @@
 use super::*;
+use util::versioned_file::UnreadableKind;
 
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 
@@ -115,7 +116,10 @@ fn an_unreadable_state_file_is_kept_for_the_next_start() {
     seed_state_file(dir.path());
 
     reap_loaded(
-        plugin_state::Loaded::Unreadable(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        Loaded::Unreadable {
+            error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            kind: UnreadableKind::File,
+        },
         dir.path(),
     );
 
@@ -126,15 +130,44 @@ fn an_unreadable_state_file_is_kept_for_the_next_start() {
 }
 
 #[skuld::test]
-fn an_unusable_state_file_is_cleared() {
-    let dir = tempfile::tempdir().unwrap();
-    seed_state_file(dir.path());
+fn reap_keeps_a_record_it_cannot_read() {
+    // A newer or corrupt record may name live plugins nobody here can interpret: it is never deleted, and the reap says
+    // so at error level.
+    let cases: [(&str, &[u8]); 2] = [("newer", br#"{"version":3,"plugins":[]}"#), ("corrupt", b"not json")];
+    for (what, bytes) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(plugin_state::STATE_FILE_NAME), bytes).unwrap();
 
-    reap_loaded(plugin_state::Loaded::Unusable, dir.path());
+        let log = captured(|| reap_recorded_plugins(dir.path()));
+
+        assert_eq!(
+            std::fs::read(dir.path().join(plugin_state::STATE_FILE_NAME)).unwrap(),
+            bytes,
+            "{what}: the record was changed"
+        );
+        assert!(
+            log.contains("ERROR") && log.contains("keeping it"),
+            "{what}: the reap must say it kept the record; got:
+{log}"
+        );
+    }
+}
+
+#[skuld::test]
+fn reap_clears_an_obsolete_record() {
+    // Version 1 holds `{pid, start_time_unix_ms}` objects, which can no longer name a process.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(plugin_state::STATE_FILE_NAME),
+        br#"{"version":1,"plugins":[{"pid":1234,"start_time_unix_ms":1700000000000}]}"#,
+    )
+    .unwrap();
+
+    reap_recorded_plugins(dir.path());
 
     assert!(
         !state_file_exists(dir.path()),
-        "an unusable state file must be cleared: nothing in it can name a process"
+        "an obsolete record names no process: it is cleared"
     );
 }
 
@@ -142,7 +175,7 @@ fn an_unusable_state_file_is_cleared() {
 fn an_absent_state_file_leaves_the_directory_untouched() {
     let dir = tempfile::tempdir().unwrap();
 
-    reap_loaded(plugin_state::Loaded::Absent, dir.path());
+    reap_loaded(Loaded::Absent, dir.path());
 
     assert!(
         !state_file_exists(dir.path()),
@@ -177,14 +210,14 @@ fn a_failed_kill_keeps_the_file() {
     // for its own child, so the kill is injected.
     let dir = tempfile::tempdir().unwrap();
     let record = seed_state_file(dir.path());
-    let state = plugin_state::PluginState {
-        version: plugin_state::SCHEMA_VERSION,
-        plugins: vec![record],
-    };
+    let state = plugin_state::PluginState { plugins: vec![record] };
 
-    reap_loaded_with(plugin_state::Loaded::State(state), dir.path(), real_restore, |_| {
-        Err(unassessable())
-    });
+    reap_loaded_with(
+        Loaded::Current { value: state, found: 2 },
+        dir.path(),
+        real_restore,
+        |_| Err(unassessable()),
+    );
 
     assert!(
         state_file_exists(dir.path()),
@@ -206,13 +239,10 @@ fn an_unreadable_boot_session_keeps_the_file_where_a_foreign_record_clears_it() 
     ] {
         let dir = tempfile::tempdir().unwrap();
         let record = seed_state_file(dir.path());
-        let state = plugin_state::PluginState {
-            version: plugin_state::SCHEMA_VERSION,
-            plugins: vec![record],
-        };
+        let state = plugin_state::PluginState { plugins: vec![record] };
 
         reap_loaded_with(
-            plugin_state::Loaded::State(state),
+            Loaded::Current { value: state, found: 2 },
             dir.path(),
             |_| Err(record_error(kind)),
             |_| panic!("a record that did not restore must never reach the kill"),
@@ -241,19 +271,23 @@ fn an_accounted_record_after_an_unaccounted_one_still_keeps_the_file() {
         ..unaccounted.clone()
     };
     let state = plugin_state::PluginState {
-        version: plugin_state::SCHEMA_VERSION,
         plugins: vec![unaccounted, accounted],
     };
 
     let killed = std::sync::Mutex::new(Vec::new());
-    reap_loaded_with(plugin_state::Loaded::State(state), dir.path(), real_restore, |id| {
-        killed.lock().unwrap().push(id.pid());
-        if id.pid() == 4242 {
-            Err(unassessable())
-        } else {
-            Ok(())
-        }
-    });
+    reap_loaded_with(
+        Loaded::Current { value: state, found: 2 },
+        dir.path(),
+        real_restore,
+        |id| {
+            killed.lock().unwrap().push(id.pid());
+            if id.pid() == 4242 {
+                Err(unassessable())
+            } else {
+                Ok(())
+            }
+        },
+    );
 
     assert_eq!(
         *killed.lock().unwrap(),

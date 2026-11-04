@@ -164,6 +164,17 @@ fn marker_info() -> MarkerInfo {
     }
 }
 
+fn plugin_record() -> cosca::identity::ProcessIdRecord {
+    cosca::identity::ProcessIdRecord {
+        version: cosca::identity::RECORD_VERSION,
+        platform: cosca::identity::Platform::Windows,
+        pid: CRASH_PID,
+        token: 1,
+        boot_id: None,
+        pid_ns: None,
+    }
+}
+
 fn route_record() -> route_state::RouteState {
     route_state::RouteState {
         tun_name: "hole-tun".to_owned(),
@@ -361,18 +372,12 @@ fn writers() -> Vec<Writer> {
             run: |dir, _| update_marker::clear(dir),
         },
         Writer {
-            name: "the plugin state, saved",
+            name: "the plugin state, appended",
             sources: &["crates/bridge/src/plugin_state.rs"],
             names: &[crate::plugin_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, owner| {
-                let state = crate::plugin_state::PluginState {
-                    version: crate::plugin_state::SCHEMA_VERSION,
-                    plugins: Vec::new(),
-                };
-                crate::plugin_state::save(dir, &state, owner)
-            },
+            run: |dir, owner| crate::plugin_state::append_record(dir, plugin_record(), owner).map_err(io::Error::other),
         },
         Writer {
             name: "the plugin state, cleared",
@@ -380,7 +385,10 @@ fn writers() -> Vec<Writer> {
             names: &[crate::plugin_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| crate::plugin_state::clear(dir),
+            run: |dir, _| match crate::plugin_state::clear(dir).map_err(io::Error::other)? {
+                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+                _ => Ok(()),
+            },
         },
         Writer {
             name: "the dns state, cleared",
@@ -710,14 +718,8 @@ fn readings() -> Vec<Reading> {
         Reading {
             name: "plugin_state::load",
             file: plugin_state::STATE_FILE_NAME,
-            write_valid: |dir| {
-                let state = plugin_state::PluginState {
-                    version: plugin_state::SCHEMA_VERSION,
-                    plugins: Vec::new(),
-                };
-                plugin_state::save(dir, &state, None).unwrap();
-            },
-            reads_it: |dir| matches!(plugin_state::load(dir), plugin_state::Loaded::State(_)),
+            write_valid: |dir| plugin_state::append_record(dir, plugin_record(), None).unwrap(),
+            reads_it: |dir| matches!(plugin_state::load(dir), util::versioned_file::Loaded::Current { .. }),
         },
         Reading {
             name: "target::load",
@@ -795,10 +797,11 @@ fn no_reader_waits_on_a_fifo_planted_at_its_name() {
 
 const ECHOED_SECRET: &str = "hunter2-SECRET";
 
-/// The warnings `read` logs when `file` in a fresh folder holds a `version` that is a string where a number belongs:
-/// `serde_json`'s own message for that quotes the string.
-fn warnings_for_a_file_that_quotes_a_secret(file: &str, read: fn(&Path)) -> String {
-    warnings_for_a_file(file, &format!(r#"{{"version":"{ECHOED_SECRET}"}}"#), read)
+/// The warnings `read` logs when `file` in a fresh folder is the object `{ <head> "<secret>" }`: `head` ends at a
+/// key whose value is a string where something else belongs, and `serde_json`'s own message for that quotes the
+/// string.
+fn warnings_for_a_file_that_quotes_a_secret(file: &str, head: &str, read: fn(&Path)) -> String {
+    warnings_for_a_file(file, &format!(r#"{{{head}"{ECHOED_SECRET}"}}"#), read)
 }
 
 /// The warnings `read` logs when `file` in a fresh folder holds `content`.
@@ -821,29 +824,36 @@ fn warnings_for_a_file(file: &str, content: &str, read: fn(&Path)) -> String {
     writer.snapshot_string()
 }
 
-/// A reader that logs a parse failure: its name, the file it reads, and a call of it.
-type ParseFailureReader = (&'static str, &'static str, fn(&Path));
+/// A reader that logs a parse failure: its name, the file it reads, the start of a document of that file that puts a
+/// string where it does not belong (a framed file's payload failure keeps a position; its framing has none), and a
+/// call of it.
+type ParseFailureReader = (&'static str, &'static str, &'static str, fn(&Path));
 
 fn parse_failure_readers() -> [ParseFailureReader; 3] {
     use crate::{dns_state, plugin_state};
     [
-        ("update_marker::read", MARKER_FILE, |dir| {
+        ("update_marker::read", MARKER_FILE, r#""version":"#, |dir| {
             let _ = update_marker::read(dir);
         }),
-        ("dns_state::load", dns_state::STATE_FILE_NAME, |dir| {
+        ("dns_state::load", dns_state::STATE_FILE_NAME, r#""version":"#, |dir| {
             let _ = dns_state::load(dir);
         }),
-        ("plugin_state::load", plugin_state::STATE_FILE_NAME, |dir| {
-            let _ = plugin_state::load(dir);
-        }),
+        (
+            "plugin_state::load",
+            plugin_state::STATE_FILE_NAME,
+            r#""version":2,"plugins":"#,
+            |dir| {
+                let _ = plugin_state::load(dir);
+            },
+        ),
     ]
 }
 
 #[skuld::test]
 fn no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse() {
     let mut failures = Vec::new();
-    for (name, file, read) in parse_failure_readers() {
-        let logs = warnings_for_a_file_that_quotes_a_secret(file, read);
+    for (name, file, head, read) in parse_failure_readers() {
+        let logs = warnings_for_a_file_that_quotes_a_secret(file, head, read);
         if logs.contains(ECHOED_SECRET) {
             failures.push(format!("{name} logged the file's content: {logs}"));
         } else if !logs.contains("line 1") {
