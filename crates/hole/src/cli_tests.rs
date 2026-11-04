@@ -271,7 +271,7 @@ fn upgrade_parses_yes_flag() {
 // Tests: bridge_log_watch rotation detection ==========================================================================
 //
 // These exercise the `open_watch_reader` + `file_was_rotated` helpers in
-// isolation. They simulate the rename+recreate sequence that `file-rotate`
+// isolation. They simulate the rename+recreate sequence that `DirRotate`
 // performs on size-based rollover.
 
 #[skuld::test]
@@ -281,7 +281,7 @@ fn file_was_rotated_detects_rename_and_recreate(#[fixture(temp_dir)] dir: &Path)
 
     let (_reader, handle) = super::open_watch_reader(&path).expect("open_watch_reader");
 
-    // Simulate file-rotate: rename current → .1, create a fresh active file.
+    // Simulate `DirRotate`: rename current → .1, create a fresh active file.
     std::fs::rename(&path, dir.join("watched.log.1")).expect("rename watched.log");
     std::fs::write(&path, b"").expect("recreate watched.log");
 
@@ -322,7 +322,7 @@ fn file_was_rotated_reports_false_when_path_missing(#[fixture(temp_dir)] dir: &P
 
     let (_reader, handle) = super::open_watch_reader(&path).expect("open_watch_reader");
 
-    // Simulate the sub-millisecond window in file-rotate between rename and
+    // Simulate the sub-millisecond window in `DirRotate` between rename and
     // recreate: the path is transiently missing. `file_was_rotated` must
     // return Ok(false), not Err, so the watch loop will just retry on the
     // next poll tick.
@@ -1283,4 +1283,35 @@ fn bridge_status_prints_disabled_with_its_own_exit_code() {
         assert_eq!(status_report(Disabled(by)), ("installed (disabled)", 3), "{by:?}");
     }
     assert_eq!(status_report(ChangeInProgress), ("installed (being changed)", 4));
+}
+
+// The state directory the privileged walk judges ======================================================================
+
+/// The walk of `util::dir` refuses a link in the path because the user can plant one. A path resolved before the walk
+/// has no link left to refuse: the user's link to a folder of root's would be accepted, and handed to the user.
+#[skuld::test]
+fn the_state_dir_keeps_the_link_the_walk_must_judge(#[fixture(temp_dir)] temp_dir: &Path) {
+    let root = temp_dir.join("elsewhere");
+    std::fs::create_dir(&root).unwrap();
+    let link = temp_dir.join("state");
+    util::dir::testing::plant_link(&root, &link);
+
+    assert_eq!(super::absolute_state_dir(link.clone()).unwrap(), link);
+}
+
+#[skuld::test]
+fn a_relative_state_dir_is_joined_to_the_cwd_even_when_it_does_not_exist() {
+    let relative = std::path::PathBuf::from("no-such-folder").join("state");
+    let absolute = super::absolute_state_dir(relative.clone()).unwrap();
+
+    assert_eq!(absolute, std::env::current_dir().unwrap().join(relative));
+}
+
+/// An empty path has no absolute form. Falling back to it would hand the privileged walk a path relative to the
+/// service's working directory, which is the thing the function exists to prevent.
+#[skuld::test]
+fn a_state_dir_with_no_absolute_form_is_an_error() {
+    let err = super::absolute_state_dir(std::path::PathBuf::new()).unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }

@@ -107,7 +107,7 @@ jobs:
           save-cache: ${{ matrix.cache-saver == true }}
 
       - id: cargo-binstall
-        uses: cargo-bins/cargo-binstall@v1.26.0
+        uses: cargo-bins/cargo-binstall@v1.26.1
         timeout-minutes: 5
 
       - id: install-nextest
@@ -264,7 +264,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p ci-artifacts
-          cargo nextest archive -p garter -p garter-bin -p galoshes -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p util --archive-file ci-artifacts/tests.tar.zst
+          cargo nextest archive -p garter -p garter-bin -p galoshes -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p util -p file-lock --archive-file ci-artifacts/tests.tar.zst
           df -h .
 
       # `cargo nextest run --archive-file` refuses `-p`; the archive's package
@@ -315,7 +315,7 @@ jobs:
           cargo nextest run \
             --archive-file ci-artifacts/tests.tar.zst \
             --workspace-remap "${{ github.workspace }}" \
-            -E 'package(stepstool) + package(dev-console) + package(xtask) + package(xtask-lib) + package(payload-archive) + package(util)'
+            -E 'package(stepstool) + package(dev-console) + package(xtask) + package(xtask-lib) + package(payload-archive) + package(util) + package(file-lock)'
 
       # Loopback users that precede the Hole build ======================================================================
 

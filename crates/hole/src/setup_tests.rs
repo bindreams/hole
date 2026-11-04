@@ -302,6 +302,43 @@ fn build_elevation_script_output_compiles_and_roundtrips_via_osascript() {
     );
 }
 
+// The socket `bridge uninstall` removes ===============================================================================
+
+/// The socket is in a folder a standard user can add names to (on Windows `%ProgramData%\hole`), and uninstall
+/// removes it elevated: a link the user planted on the way to it must not take the unlink to another folder.
+#[skuld::test]
+fn uninstall_does_not_remove_a_file_through_a_users_link_to_a_system_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = util::dir::testing::SystemScratch::new();
+    let victim = scratch.root().join(scratch.name());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&victim)
+        .unwrap();
+    let link = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+    let result = remove_bridge_socket(&link.join(scratch.name()));
+
+    let survived = victim.exists();
+    let _ = std::fs::remove_file(&victim);
+    let err = result.unwrap_err();
+    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+    assert!(survived, "a file in the system's folder was removed");
+}
+
+#[skuld::test]
+fn uninstall_removes_the_socket_and_answers_ok_for_a_missing_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("hole-bridge.sock");
+    std::fs::write(&path, "stale").unwrap();
+
+    remove_bridge_socket(&path).unwrap();
+    remove_bridge_socket(&path).unwrap();
+
+    assert!(!path.exists());
+}
+
 // `bridge uninstall` orchestration ====================================================================================
 
 // bindreams/hole#1003: uninstalling with a fail-closed cover engaged left the

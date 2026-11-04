@@ -30,6 +30,9 @@ crash-dumps = ["dep:minidump-writer"]
 # crash-child,...`) so plain `cargo build --workspace` does NOT compile the
 # bin and never needs sadness-generator. See bindreams/hole#438 (review M1/M2).
 crash-child = ["dep:sadness-generator"]
+# `crash::write_marker_for`, the handler's marker write without a crash, for a test of what a user can plant in the
+# log directory. Off by default; enable it only under `[dev-dependencies]`.
+test-support = []
 
 [dependencies]
 crash-handler = { workspace = true }
@@ -38,6 +41,10 @@ crash-handler = { workspace = true }
 # unreachable from the [[bin]] under the test build. See review M1/M2.
 sadness-generator = { workspace = true, optional = true }
 tracing = "0.1"
+# `util::dir`: the log directory is the interactive user's while the bridge writes in it as root, so it is opened
+# once, without following a link, and every marker and dump is created, read and removed by a name inside that
+# handle. Apache-2.0 like this crate.
+util = { path = "../util" }
 
 [target.'cfg(windows)'.dependencies]
 # The `.dmp` writer, behind `crash-dumps`. Windows is the only platform with
@@ -45,7 +52,10 @@ tracing = "0.1"
 # and a privacy VPN's process memory holds keys + user traffic, so the fewer
 # builds that link it the better. See bindreams/hole#438 §3/§5.4.
 minidump-writer = { workspace = true, optional = true }
+# `Wdk_*`: `NtCreateFile`, the only call that creates a file relative to a directory handle.
 windows = { version = "0.62", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
@@ -80,6 +90,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # WaitableWriter + tracing_test::set_default_in_current_thread for the
 # sweep-breadcrumb assertion (raw set_default is clippy-banned workspace-wide).
 garter = { path = "../garter", features = ["test-utils"] }
+# `SystemScratch`: a folder the system owns that a test may write in, for a file the folder's owner cannot vouch for.
+util = { path = "../util", features = ["test-support"] }
 
 # The helper bin links sadness-generator, so it only builds when the
 # `crash-child` feature is on. `cargo build --workspace --no-default-features

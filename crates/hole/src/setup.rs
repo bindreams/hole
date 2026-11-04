@@ -617,6 +617,12 @@ fn install_bridge_with<Hold>(
     Ok(())
 }
 
+/// Removes the bridge's socket. It is in a folder a standard user can add names to and this runs elevated, so it is
+/// unlinked through a handle on the folder, not by path ([`hole_bridge::socket::remove`]).
+fn remove_bridge_socket(path: &std::path::Path) -> std::io::Result<()> {
+    hole_bridge::socket::remove(path)
+}
+
 /// Run `bridge uninstall`.
 ///
 /// `keep_covers` leaves every fail-closed cover engaged and the target
@@ -638,7 +644,7 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
             hole_bridge::platform::os::uninstall()?;
 
             // Cosmetic leftovers, not a block: neither can strand the host.
-            let _ = std::fs::remove_file(hole_common::protocol::default_bridge_socket_path());
+            let _ = remove_bridge_socket(&hole_common::protocol::default_bridge_socket_path());
             let _ = hole_bridge::group::delete_group();
 
             cli_log!(info, "bridge uninstalled");

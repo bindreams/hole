@@ -56,6 +56,7 @@ fn main() {
         }
     };
     tombstone::attach(kind, &log_dir);
+    plant_after_attach(kind, &log_dir);
 
     // SAFETY: each raise_* deterministically triggers its fault class and
     // does not return (-> !). This is the entire purpose of this binary.
@@ -77,5 +78,40 @@ fn main() {
             "bus" => sadness_generator::raise_bus(),
             other => panic!("unknown crash class: {other}"),
         }
+    }
+}
+
+/// What a user of the log directory could do between `attach` and a crash, done by the test double itself so the
+/// parent needs no rendezvous with the child. `TOMBSTONE_TEST_PLANT` names it, `TOMBSTONE_TEST_VICTIM` is the file
+/// (`symlink`) or directory (`swap_dir`) the plant points at, and `TOMBSTONE_TEST_MOVED` is where `swap_dir` moves
+/// the log directory to.
+///
+/// - `symlink`: a symlink to the victim at the name the crash marker will take.
+/// - `swap_dir`: the log directory renamed away and a symlink to the victim put at its path.
+fn plant_after_attach(kind: &str, log_dir: &std::path::Path) {
+    let plant = match std::env::var("TOMBSTONE_TEST_PLANT") {
+        Ok(plant) => plant,
+        Err(std::env::VarError::NotPresent) => return,
+        Err(e) => panic!("TOMBSTONE_TEST_PLANT is unreadable: {e}"),
+    };
+    let victim = std::path::PathBuf::from(std::env::var_os("TOMBSTONE_TEST_VICTIM").expect("TOMBSTONE_TEST_VICTIM"));
+    match plant.as_str() {
+        "symlink" => {
+            let marker = log_dir.join(format!("crash-{kind}-{}.marker", std::process::id()));
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&victim, &marker).expect("plant the symlink");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&victim, &marker).expect("plant the symlink");
+        }
+        "swap_dir" => {
+            let moved =
+                std::path::PathBuf::from(std::env::var_os("TOMBSTONE_TEST_MOVED").expect("TOMBSTONE_TEST_MOVED"));
+            std::fs::rename(log_dir, &moved).expect("move the log directory away");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&victim, log_dir).expect("plant the directory symlink");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir(&victim, log_dir).expect("plant the directory symlink");
+        }
+        other => panic!("unknown TOMBSTONE_TEST_PLANT: {other}"),
     }
 }

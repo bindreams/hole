@@ -1,0 +1,41 @@
+error[E0599]: no method named `write_atomic` found for struct `util::dir::ReadDir` in the current scope
+ --> tests/compile_fail/read_dir_cannot_write.rs:8:17
+  |
+8 |     let _ = dir.write_atomic("a".as_ref(), b"x", None, |_| Ok(()));
+  |                 ^^^^^^^^^^^^ method not found in `util::dir::ReadDir`
+
+error[E0599]: no method named `unlink` found for struct `util::dir::ReadDir` in the current scope
+ --> tests/compile_fail/read_dir_cannot_write.rs:9:17
+  |
+9 |     let _ = dir.unlink("a".as_ref());
+  |                 ^^^^^^ method not found in `util::dir::ReadDir`
+
+error[E0599]: no method named `rename` found for struct `util::dir::ReadDir` in the current scope
+  --> tests/compile_fail/read_dir_cannot_write.rs:10:17
+   |
+10 |     let _ = dir.rename("a".as_ref(), "b".as_ref());
+   |                 ^^^^^^
+   |
+help: there is a method `read` with a similar name, but with different arguments
+  --> src/dir/read_dir.rs
+   |
+   |     pub fn read(&self, name: &OsStr) -> io::Result<Vec<u8>> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `link` found for struct `util::dir::ReadDir` in the current scope
+  --> tests/compile_fail/read_dir_cannot_write.rs:11:17
+   |
+11 |     let _ = dir.link("a".as_ref(), "b".as_ref());
+   |                 ^^^^ method not found in `util::dir::ReadDir`
+
+error[E0599]: no method named `open_file` found for struct `util::dir::ReadDir` in the current scope
+  --> tests/compile_fail/read_dir_cannot_write.rs:12:17
+   |
+12 |     let _ = dir.open_file("a".as_ref(), util::dir::OpenFile::Existing);
+   |                 ^^^^^^^^^ method not found in `util::dir::ReadDir`
+
+error[E0599]: no method named `stage` found for struct `util::dir::ReadDir` in the current scope
+  --> tests/compile_fail/read_dir_cannot_write.rs:13:17
+   |
+13 |     let _ = dir.stage("a".as_ref(), b"x", None, |_| Ok(()));
+   |                 ^^^^^ method not found in `util::dir::ReadDir`

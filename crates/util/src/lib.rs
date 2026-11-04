@@ -1,5 +1,8 @@
 //! Small cross-platform utilities shared across the workspace.
 //!
+//! - [`dir`] — a directory opened without following a symlink, and file
+//!   operations by name inside it, for a privileged writer in a directory
+//!   another principal can write.
 //! - [`error_chain`] — an error rendered with every cause in its `source()`
 //!   chain, for log fields.
 //! - [`ownership`] — generic `chown(2)` primitive (macOS; a no-op elsewhere).
@@ -25,6 +28,7 @@
 //! crates without license friction. Nothing here is Hole- or
 //! shadowsocks-specific.
 
+pub mod dir;
 pub mod error_chain;
 pub mod ownership;
 pub mod parse_error;
