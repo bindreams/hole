@@ -1235,9 +1235,9 @@ dependencies = [
 
 [[package]]
 name = "cosca"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b46c6ce2f01276420fe816a6ffc968690ea84c99aef6cc186f5da79916e447f1"
+checksum = "4ba63ea6bb20dd28d6337e203f75fee133435ee858e7822f19496fce57e6a44e"
 dependencies = [
  "event-listener",
  "exacl",
@@ -4218,9 +4218,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libdbus-sys"
