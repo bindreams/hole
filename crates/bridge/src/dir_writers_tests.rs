@@ -396,7 +396,10 @@ fn writers() -> Vec<Writer> {
             names: &[crate::dns_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| crate::dns_state::clear(dir),
+            run: |dir, _| match crate::dns_state::clear(dir).map_err(io::Error::other)? {
+                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+                _ => Ok(()),
+            },
         },
         Writer {
             name: "the dns state, superseded",
@@ -701,17 +704,14 @@ fn readings() -> Vec<Reading> {
             file: dns_state::STATE_FILE_NAME,
             write_valid: |dir| {
                 let state = dns_state::DnsState {
-                    version: dns_state::SCHEMA_VERSION,
                     advertised: Vec::new(),
                     adapters: Vec::new(),
                 };
-                util::dir::write_state_file(
-                    dir,
-                    OsStr::new(dns_state::STATE_FILE_NAME),
-                    &serde_json::to_vec(&state).unwrap(),
-                    None,
-                )
-                .unwrap();
+                dns_state::file(dir)
+                    .update(&util::versioned_file::DefaultPlacement::default(), |_| {
+                        (util::versioned_file::Change::Store(state), ())
+                    })
+                    .unwrap();
             },
             reads_it: |dir| dns_state::load(dir).is_some(),
         },
@@ -835,9 +835,14 @@ fn parse_failure_readers() -> [ParseFailureReader; 3] {
         ("update_marker::read", MARKER_FILE, r#""version":"#, |dir| {
             let _ = update_marker::read(dir);
         }),
-        ("dns_state::load", dns_state::STATE_FILE_NAME, r#""version":"#, |dir| {
-            let _ = dns_state::load(dir);
-        }),
+        (
+            "dns_state::load",
+            dns_state::STATE_FILE_NAME,
+            r#""version":1,"adapters":"#,
+            |dir| {
+                let _ = dns_state::load(dir);
+            },
+        ),
         (
             "plugin_state::load",
             plugin_state::STATE_FILE_NAME,
