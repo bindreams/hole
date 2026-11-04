@@ -108,17 +108,17 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// tell its own `Posture::PendingStart` guard is a zombie the next time
     /// it looks.
     pub cover_invalidated: Arc<std::sync::atomic::AtomicBool>,
-    /// Bumped by `handle_unblock` in `apply_committing`'s `on_commit`: after
-    /// the `Off` save succeeds, under the target lock, so a failed save never
-    /// announces an unblock. `handle_start`/`handle_reload` snapshot it before
-    /// touching the proxy; `persist_after_start` declines the start's records
-    /// if it moved. A counter rather than `cover_invalidated`, which
+    /// Bumped by `handle_unblock` right after its `Off` save succeeds, under
+    /// [`Self::intent_persist`], so a failed save never announces an unblock.
+    /// `handle_start`/`handle_reload` snapshot it before touching the proxy;
+    /// `persist_after_start` re-reads it under `intent_persist` and declines the
+    /// start's records if it moved. Every read is a pre-persist snapshot or sits
+    /// under that mutex. A counter rather than `cover_invalidated`, which
     /// `start_cancellable` consumes: `reload`'s hot-swap path never calls that,
     /// so one stale unblock would wedge every later hot-swap write.
     ///
     /// The compare-and-set half of f745e03c that the proxy lock cannot give,
-    /// because `handle_unblock` deliberately takes no proxy lock. The pair's
-    /// atomicity against the unblock comes from [`Self::intent_persist`].
+    /// because `handle_unblock` deliberately takes no proxy lock.
     pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Orders `persist_after_start`'s target + candidate writes against
     /// `handle_unblock`'s `Off` + `set_enabled` + candidate clear, each a
@@ -834,16 +834,11 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
         // never between the `Off` and the candidate clear, where it would have
         // its newer candidate erased. (A poisoned mutex guards no data.)
         let _ordered = intent_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The bump is the COMMIT hook, not part of the closure, so a failed
-        // `Off` save never announces an unblock and declines in-flight starts.
-        target::apply_committing(
-            &state_dir,
-            owner,
-            |_current| Target::Off,
-            || {
-                generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            },
-        )?;
+        // The bump follows the `?`, so a failed `Off` save never announces an
+        // unblock; the mutex keeps a start from reading the counter between the
+        // save and the bump.
+        target::apply(&state_dir, owner, |_current| Target::Off)?;
+        generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         lockdown_state::set_enabled(&state_dir, false, owner)?;
         // Clear the auto-connect candidate too: `resolve_startup_target` feeds
         // it to `AlwaysConnect` over an `Off` target, so leaving it would let
