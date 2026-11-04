@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 
 use crate::global_net_state_conformance::{
     conformant_membership, group_config, job_list_template, junit_executed_tests, merge_executed, narrow_filter,
-    read_expectation, set_mismatch, set_missing, verify_executed, verify_with, write_expectation, Expectation,
+    read_expectation, set_mismatch, set_missing, unbounded_scm_tests, verify_executed, verify_with, write_expectation,
+    Expectation,
 };
 use crate::manifest::Manifest;
 
@@ -619,6 +620,23 @@ fn conformant_membership_errs_when_neither_side_matched_anything() {
         .expect_err("an empty/empty pass has nothing to verify or record");
     let msg = err.to_string();
     assert!(msg.contains("test-hole") && msg.contains("ANY"), "{msg}");
+}
+
+/// A test of the real-SCM binary the `terminate-after` override does not match
+/// by name has no failure bound.
+#[skuld::test]
+fn a_cutover_privileged_test_outside_the_bounded_prefix_is_reported() {
+    let membership = binmap(&[
+        (
+            "hole-bridge::cutover_privileged",
+            &["cutover_global_net_state_a", "an_unprefixed_scm_test"],
+        ),
+        ("hole-bridge::other", &["unrelated"]),
+    ]);
+    assert_eq!(
+        unbounded_scm_tests(&membership),
+        ["hole-bridge::cutover_privileged: an_unprefixed_scm_test"]
+    );
 }
 
 // ===== verify_with (bindreams/hole#894 / #999, guard 2's orchestration with an injected `list`) ======================
