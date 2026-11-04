@@ -2358,7 +2358,9 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   `svchost.exe` and the System process, even for
   `PROCESS_QUERY_LIMITED_INFORMATION`), and the cutover child and an installer's
   custom actions are SYSTEM, so a refused open is read from the system process
-  list (`NtQuerySystemInformation`), which needs no access. The list holds the
+  list (`NtQuerySystemInformation`). A standard user reads it for a SYSTEM process
+  (the privileged lane's standard-user status reads), and for one that has just
+  exited it can still say running. The list holds the
   creation time in bytes `winternl.h` calls opaque (`Reserved1`, offset 24); a
   test compares it with `GetProcessTimes`. A lock that cannot be read costs nothing here, since
   the GUI never takes it; a start type that cannot be read says nothing is
