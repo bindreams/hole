@@ -20,6 +20,13 @@ pub enum Role {
     LegacyRecord,
     /// The user's own data.
     Config,
+    /// A claim a process makes on a name (the update marker): never stored over
+    /// and removed whatever it holds, and it never blocks a connect.
+    Claim,
+    /// What this bridge did to the OS where an unreadable record must still be
+    /// cleaned up after (a macOS pf record): moved aside, never destroyed
+    /// unread, and it blocks a connect.
+    Cover,
 }
 
 /// What `store` does over a file that cannot be read.
@@ -56,6 +63,10 @@ impl Role {
             (Role::Config, CannotRead::Newer) => StoreOver::Refuse,
             // A corrupt `config.json` is replaced by the next save (owner decision 2026-10-19).
             (Role::Config, CannotRead::Corrupt) => StoreOver::Overwrite,
+            (Role::Claim, CannotRead::Newer) => StoreOver::Refuse,
+            (Role::Claim, CannotRead::Corrupt) => StoreOver::Refuse,
+            (Role::Cover, CannotRead::Newer) => StoreOver::MoveAside,
+            (Role::Cover, CannotRead::Corrupt) => StoreOver::MoveAside,
         }
     }
 
@@ -69,6 +80,10 @@ impl Role {
             (Role::LegacyRecord, CannotRead::Corrupt) => RemoveOver::Keep,
             (Role::Config, CannotRead::Newer) => RemoveOver::Keep,
             (Role::Config, CannotRead::Corrupt) => RemoveOver::Keep,
+            (Role::Claim, CannotRead::Newer) => RemoveOver::Remove,
+            (Role::Claim, CannotRead::Corrupt) => RemoveOver::Remove,
+            (Role::Cover, CannotRead::Newer) => RemoveOver::MoveAside,
+            (Role::Cover, CannotRead::Corrupt) => RemoveOver::MoveAside,
         }
     }
 
@@ -81,6 +96,8 @@ impl Role {
             Role::OsRecord => StoreOver::Refuse,
             Role::LegacyRecord => StoreOver::Refuse,
             Role::Config => StoreOver::MoveAside,
+            Role::Claim => StoreOver::Refuse,
+            Role::Cover => StoreOver::MoveAside,
         }
     }
 
@@ -91,6 +108,8 @@ impl Role {
             Role::OsRecord => RemoveOver::Keep,
             Role::LegacyRecord => RemoveOver::Keep,
             Role::Config => RemoveOver::MoveAside,
+            Role::Claim => RemoveOver::Remove,
+            Role::Cover => RemoveOver::Keep,
         }
     }
 
@@ -112,6 +131,8 @@ impl Role {
             Role::OsRecord => true,
             Role::LegacyRecord => false,
             Role::Config => false,
+            Role::Claim => false,
+            Role::Cover => true,
         }
     }
 
@@ -127,6 +148,10 @@ impl Role {
             (Role::LegacyRecord, CannotRead::Corrupt) => false,
             (Role::Config, CannotRead::Newer) => false,
             (Role::Config, CannotRead::Corrupt) => false,
+            (Role::Claim, CannotRead::Newer) => false,
+            (Role::Claim, CannotRead::Corrupt) => false,
+            (Role::Cover, CannotRead::Newer) => true,
+            (Role::Cover, CannotRead::Corrupt) => true,
         }
     }
 }

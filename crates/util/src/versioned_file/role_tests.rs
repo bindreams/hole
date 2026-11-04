@@ -114,3 +114,34 @@ fn blocks_connect_takes_the_cell_of_its_cause() {
         );
     }
 }
+
+/// The spec's `Claim` column (rev 4, rule 2), cell by cell.
+#[skuld::test]
+fn claim_role_cells_match_the_spec_table() {
+    let role = Role::Claim;
+    for why in [Newer, Corrupt] {
+        assert_eq!(role.on_store(why), StoreOver::Refuse, "on_store {why:?}");
+        assert_eq!(role.on_remove(why), RemoveOver::Remove, "on_remove {why:?}");
+        assert!(
+            !role.unreadable_blocks_connect(why),
+            "unreadable_blocks_connect {why:?}"
+        );
+    }
+    assert_eq!(role.on_store_io_failure(), StoreOver::Refuse);
+    assert_eq!(role.on_remove_io_failure(), RemoveOver::Remove);
+    assert!(!role.io_failure_blocks_connect());
+}
+
+/// The spec's `Cover` column (rev 4, rule 2), cell by cell.
+#[skuld::test]
+fn cover_role_cells_match_the_spec_table() {
+    let role = Role::Cover;
+    for why in [Newer, Corrupt] {
+        assert_eq!(role.on_store(why), StoreOver::MoveAside, "on_store {why:?}");
+        assert_eq!(role.on_remove(why), RemoveOver::MoveAside, "on_remove {why:?}");
+        assert!(role.unreadable_blocks_connect(why), "unreadable_blocks_connect {why:?}");
+    }
+    assert_eq!(role.on_store_io_failure(), StoreOver::MoveAside);
+    assert_eq!(role.on_remove_io_failure(), RemoveOver::Keep);
+    assert!(role.io_failure_blocks_connect());
+}
