@@ -967,18 +967,9 @@ jobs:
       # given rule actually applies to a given dependency — see
       # xtask/src/schemars_pin.rs's module doc for why that's not verified here.
       #
-      # Last, because it swaps Node: the validator is deliberately run on the
-      # newest LTS (the bot that reads this config is always Renovate's latest
-      # release), while every other step uses the Node 24 that `package.json`
-      # pins.
-      - id: setup-node-lts
-        uses: actions/setup-node@v7
-        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.portable-lint == true }}
-        timeout-minutes: 5
-        with:
-          node-version: lts/*
-          check-latest: true
-
+      # Runs on the Node 24 that `package.json` pins, which is what Renovate's
+      # `engines` asks for.
+      #
       # Named explicitly, with --no-global: naming a config file makes the
       # validator treat it as *global* self-hosted config by default, which
       # accepts a different option set and would pass configs Renovate rejects
@@ -986,17 +977,20 @@ jobs:
       # instead. Without a file argument at all, the validator silently skips
       # every default config filename that doesn't exist and exits 0 with only
       # a warning logged, so a renovate.json moved or deleted in a refactor
-      # would pass this job having validated nothing. Unpinned on purpose.
-      # `--strict` makes warnings fatal.
+      # would pass this job having validated nothing. `--strict` makes warnings
+      # fatal.
       - id: renovate-config
         name: Validate .github/renovate.json
-        if: ${{ !cancelled() && steps.setup-node-lts.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.portable-lint == true }}
         timeout-minutes: 10
         shell: bash
+        env:
+          # renovate: datasource=npm depName=renovate
+          RENOVATE_VERSION: "44.209.0"
         run: |
-          # Fetch the validator under retry.
-          .github/scripts/retry.sh npx --yes --package renovate renovate-config-validator --version
-          npx --yes --package renovate renovate-config-validator --strict --no-global .github/renovate.json
+          # Retry covers only the fetch; the validation runs offline, once, so a retry can't mask a config error.
+          .github/scripts/retry.sh npx --yes --package "renovate@${RENOVATE_VERSION}" -- node --version
+          npx --offline --package "renovate@${RENOVATE_VERSION}" renovate-config-validator --strict --no-global .github/renovate.json
 
       # Logs ============================================================================================================
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches files

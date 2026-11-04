@@ -3228,7 +3228,8 @@ and a rerun repeats the platform's whole job.
   A retry must not hide a failure the network did not cause. Each tool's
   deterministic check runs outside the retry where one exists: `uv lock --check --offline`, `prek validate-config`, `npm ci --dry-run --offline` (a lockfile
   out of sync with `package.json` needs a registry lookup, which offline
-  fails), and for cargo `.github/scripts/cargo-fetch.sh`, which retries a
+  fails), `npx --offline` for the Renovate config validator, and for cargo
+  `.github/scripts/cargo-fetch.sh`, which retries a
   plain `cargo fetch` and then compares `Cargo.lock` with what it was, because
   `cargo fetch --locked` exits 101 both for a stale lock and for a lost network
   and the lock check needs the registry index. That check is CI's only: it runs in
