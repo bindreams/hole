@@ -119,7 +119,8 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
         // content is committed to HEAD or the subrepo was already up to date. Say so if the
         // tag-pin fixup below fails.
         ensure_tag_pin_matches(repo_root, subdir, tag).with_context(|| {
-            "git subrepo pull already succeeded and (usually) committed to this branch before \n             this failure — check `git log -1` before assuming nothing happened"
+            "git subrepo pull already succeeded and (usually) committed to this branch before \
+             this failure — check `git log -1` before assuming nothing happened"
                 .to_string()
         })?;
         return Ok(Outcome::Clean {
