@@ -685,7 +685,6 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
         "frontend-build",
         "frontend-check",
         "test-ex-ray-ech",
-        "setup-node-lts",
         "renovate-config",
         "fetch-docs-tools",
     ] {
