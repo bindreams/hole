@@ -1,10 +1,12 @@
+use crate::versioned_file::fixtures::UpdateShortcuts;
+use crate::versioned_file::UpdateOutcome;
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use super::{DefaultPlacement, Placement, Removal, StoreError, VersionedFile};
+use super::{DefaultPlacement, Placement, StoreError, VersionedFile};
 use crate::dir::Dir;
 use crate::versioned_file::fixtures::{
     dir, names, put, unreadable_bytes, ConfigFile, DecisionFile, DroppedFile, LegacyRecordFile, NotAnObject, NoteV3,
@@ -246,7 +248,7 @@ fn os_record_store_and_remove_leave_the_bytes_untouched() {
             err.to_string().contains(&file.path().display().to_string()),
             "the message must name the path: {err}"
         );
-        assert_eq!(file.remove().unwrap(), Removal::Kept, "{cause:?}");
+        assert_eq!(file.remove().unwrap(), UpdateOutcome::Kept, "{cause:?}");
 
         assert_eq!(read(&dir, "os-record.json"), original, "{cause:?}");
         assert_eq!(names(&dir), ["os-record.json"], "{cause:?}");
@@ -269,7 +271,7 @@ fn legacy_record_store_and_remove_leave_the_bytes_untouched() {
             )
             .unwrap_err();
         assert!(matches!(err, StoreError::Unreadable { .. }), "{cause:?}: {err:?}");
-        assert_eq!(file.remove().unwrap(), Removal::Kept, "{cause:?}");
+        assert_eq!(file.remove().unwrap(), UpdateOutcome::Kept, "{cause:?}");
 
         assert_eq!(read(&dir, "legacy-record.json"), original, "{cause:?}");
         assert_eq!(names(&dir), ["legacy-record.json"], "{cause:?}");
@@ -333,7 +335,7 @@ fn config_remove_keeps_a_file_it_cannot_read() {
         let original = put_unreadable::<ConfigFile>(&dir, cause);
         assert_eq!(
             VersionedFile::<ConfigFile>::new(dir.path()).remove().unwrap(),
-            Removal::Kept
+            UpdateOutcome::Kept
         );
         assert_eq!(read(&dir, "config.json"), original);
     }
@@ -349,7 +351,7 @@ fn decision_remove_moves_aside() {
         let removal = file.remove().unwrap();
 
         let backup = dir.path().join("decision.json.unreadable.bak");
-        assert_eq!(removal, Removal::MovedAside(backup), "{cause:?}");
+        assert_eq!(removal, UpdateOutcome::MovedAside(backup), "{cause:?}");
         assert_eq!(read(&dir, "decision.json.unreadable.bak"), original, "{cause:?}");
         assert!(matches!(file.load(), Loaded::Absent), "{cause:?}");
         assert_eq!(names(&dir), ["decision.json.unreadable.bak"], "{cause:?}");
@@ -363,19 +365,19 @@ fn remove_deletes_a_readable_file_and_reports_the_rest() {
     let dir = dir();
     let file = VersionedFile::<NoteV3>::new(dir.path());
 
-    assert_eq!(file.remove().unwrap(), Removal::Absent);
+    assert_eq!(file.remove().unwrap(), UpdateOutcome::Absent);
 
     file.store(&note(), &plain()).unwrap();
-    assert_eq!(file.remove().unwrap(), Removal::Removed);
+    assert_eq!(file.remove().unwrap(), UpdateOutcome::Removed);
     assert!(names(&dir).is_empty());
 
     put(&dir, "note.json", br#"{"version":1,"title":"old"}"#);
-    assert_eq!(file.remove().unwrap(), Removal::Removed, "an older file");
+    assert_eq!(file.remove().unwrap(), UpdateOutcome::Removed, "an older file");
     assert!(names(&dir).is_empty());
 
     let dropped = VersionedFile::<DroppedFile>::new(dir.path());
     put(&dir, "dropped.json", br#"{"version":1,"value":7}"#);
-    assert_eq!(dropped.remove().unwrap(), Removal::Removed, "an obsolete file");
+    assert_eq!(dropped.remove().unwrap(), UpdateOutcome::Removed, "an obsolete file");
     assert!(names(&dir).is_empty());
 }
 

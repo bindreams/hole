@@ -298,6 +298,7 @@ fn writers() -> Vec<Writer> {
             name: "the route record, written",
             sources: &[
                 "crates/util/src/versioned_file/store.rs",
+                "crates/util/src/versioned_file/update.rs",
                 "crates/tun-engine/src/routing/state.rs",
             ],
             names: &[route_state::STATE_FILE_NAME],
@@ -313,7 +314,7 @@ fn writers() -> Vec<Writer> {
             names: &[route_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match route_state::remove(&route_state::file(dir))? {
+            run: |dir, _| match route_state::remove(&route_state::file(dir)).map_err(io::Error::other)? {
                 route_state::Cleared::Kept => Err(io::Error::other(LeftAsItIs)),
                 _ => Ok(()),
             },

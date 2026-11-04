@@ -1,11 +1,13 @@
 //! The order of `store`'s steps, proven by failing each one, plus the backup
 //! names and what a failed read does to them.
 
+use crate::versioned_file::fixtures::UpdateShortcuts;
+use crate::versioned_file::UpdateOutcome;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::{DefaultPlacement, Fs, Removal, StoreError, VersionedFile};
+use super::{DefaultPlacement, Fs, StoreError, VersionedFile};
 use crate::versioned_file::fixtures::{dir, names, put, unreadable_bytes, DecisionFile, NoteV3};
 use crate::versioned_file::CannotRead;
 
@@ -155,7 +157,7 @@ fn remove_and_move_aside_also_take_the_next_free_name() {
 
     assert_eq!(
         removal,
-        Removal::MovedAside(dir.path().join("decision.json.unreadable.2.bak"))
+        UpdateOutcome::MovedAside(dir.path().join("decision.json.unreadable.2.bak"))
     );
     assert_eq!(
         std::fs::read(dir.path().join("decision.json.unreadable.bak")).unwrap(),

@@ -1,13 +1,15 @@
 //! The backups `store`, `remove` and `move_aside` leave, and what they do when
 //! a rename or a delete is refused.
 
+use crate::versioned_file::fixtures::UpdateShortcuts;
+use crate::versioned_file::UpdateOutcome;
 use std::io;
 use std::sync::Arc;
 
 use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
-use super::{DefaultPlacement, Fs, Removal, VersionedFile};
+use super::{DefaultPlacement, Fs, VersionedFile};
 use crate::versioned_file::fixtures::{dir, names, put, unreadable_bytes, DecisionFile};
 use crate::versioned_file::CannotRead;
 
@@ -31,7 +33,7 @@ fn remove_and_move_aside_in_a_missing_directory_find_nothing_and_create_nothing(
     let missing = dir.path().join("not-there");
     let file = VersionedFile::<DecisionFile>::new(&missing);
 
-    assert_eq!(file.remove().unwrap(), Removal::Absent);
+    assert_eq!(file.remove().unwrap(), UpdateOutcome::Absent);
     assert_eq!(file.move_aside().unwrap(), None);
     assert!(!missing.exists(), "a removal must not create the directory");
 }

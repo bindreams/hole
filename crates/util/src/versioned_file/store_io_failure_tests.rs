@@ -4,13 +4,15 @@
 //! bytes aside first. The seam fails the read while the file stays readable on
 //! disk, so each test can compare what is left with what was there.
 
+use crate::versioned_file::fixtures::UpdateShortcuts;
+use crate::versioned_file::UpdateOutcome;
 use std::io;
 use std::sync::Arc;
 
 use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
-use super::{DefaultPlacement, Fs, Removal, StoreError, VersionedFile};
+use super::{DefaultPlacement, Fs, StoreError, VersionedFile};
 use crate::versioned_file::fixtures::{dir, names, put, ConfigFile, DecisionFile, LegacyRecordFile, OsRecordFile};
 use crate::versioned_file::VersionedState;
 
@@ -70,7 +72,7 @@ fn bytes_of(dir: &tempfile::TempDir, name: &str) -> Vec<u8> {
 
 // A role that keeps what it cannot read ===============================================================================
 
-fn store_refuses<S: VersionedState>(value: S) {
+fn store_refuses<S: VersionedState + Clone>(value: S) {
     let (dir, file) = unreadable::<S>(Arc::new(DeniedRead));
 
     let err = file.store(&value, &plain()).unwrap_err();
@@ -97,10 +99,10 @@ fn a_legacy_record_store_refuses_over_an_io_failed_probe() {
     store_refuses(LegacyRecordFile { value: "v".into() });
 }
 
-fn remove_keeps<S: VersionedState>() {
+fn remove_keeps<S: VersionedState + Clone>() {
     let (dir, file) = unreadable::<S>(Arc::new(DeniedRead));
 
-    assert_eq!(file.remove().unwrap(), Removal::Kept, "{}", S::FILE_NAME);
+    assert_eq!(file.remove().unwrap(), UpdateOutcome::Kept, "{}", S::FILE_NAME);
 
     assert_eq!(bytes_of(&dir, S::FILE_NAME), ORIGINAL);
     assert_eq!(names(&dir), [S::FILE_NAME]);
@@ -118,7 +120,7 @@ fn a_legacy_record_remove_keeps_an_io_failed_file() {
 
 // A role that replaces it, after a backup =============================================================================
 
-fn store_links_aside_then_writes<S: VersionedState>(value: S) {
+fn store_links_aside_then_writes<S: VersionedState + Clone>(value: S) {
     let (subscriber, log) = capture();
     let _guard = set_default_in_current_thread(subscriber);
     let (dir, file) = unreadable::<S>(Arc::new(DeniedRead));
@@ -150,7 +152,7 @@ fn a_config_store_links_an_io_failed_file_aside_then_writes() {
     store_links_aside_then_writes(ConfigFile { value: "new".into() });
 }
 
-fn store_fails_when_the_backup_link_fails<S: VersionedState>(value: S) {
+fn store_fails_when_the_backup_link_fails<S: VersionedState + Clone>(value: S) {
     let (dir, file) = unreadable::<S>(Arc::new(DeniedReadAndLink));
 
     let err = file.store(&value, &plain()).unwrap_err();
@@ -170,7 +172,7 @@ fn a_config_store_fails_and_keeps_the_file_when_the_backup_link_fails() {
     store_fails_when_the_backup_link_fails(ConfigFile { value: "new".into() });
 }
 
-fn remove_moves_aside<S: VersionedState>() {
+fn remove_moves_aside<S: VersionedState + Clone>() {
     let (subscriber, log) = capture();
     let _guard = set_default_in_current_thread(subscriber);
     let (dir, file) = unreadable::<S>(Arc::new(DeniedRead));
@@ -178,7 +180,7 @@ fn remove_moves_aside<S: VersionedState>() {
 
     assert_eq!(
         file.remove().unwrap(),
-        Removal::MovedAside(dir.path().join(&backup)),
+        UpdateOutcome::MovedAside(dir.path().join(&backup)),
         "{}",
         S::FILE_NAME
     );
