@@ -1,22 +1,44 @@
 //! Windows-only properties of the stored file: its attributes, and a state
 //! directory whose plain path is `MAX_PATH` or longer.
 
+use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY,
-    FILE_ATTRIBUTE_TEMPORARY,
+    FileBasicInfo, SetFileAttributesW, SetFileInformationByHandle, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO,
 };
 
 use super::{
     no_directory_flush, sync_dir_with, tolerate_missing_directory_flush, CannotRead, DefaultPlacement, Loaded,
     Placement, Removal, VersionedFile,
 };
+use crate::dir::Dir;
 use crate::versioned_file::fixtures::{dir, long_dir, unreadable_bytes, DecisionFile, OsRecordFile};
+
+/// Sets the attributes of the open file (a zero time in `FILE_BASIC_INFO` leaves that time as it is).
+fn set_attributes(file: &File, attributes: u32) -> io::Result<()> {
+    let info = FILE_BASIC_INFO {
+        FileAttributes: attributes,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a valid `FILE_BASIC_INFO` of the size passed and the handle is open for writing attributes.
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileBasicInfo,
+            (&raw const info).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .map_err(io::Error::other)
+}
 
 fn listing(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
@@ -42,16 +64,13 @@ fn attributes(path: &Path) -> u32 {
 }
 
 /// A [`Placement`] that sets `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`
-/// and `FILE_ATTRIBUTE_TEMPORARY` on the temp file: on Windows the attributes
-/// are the file's mode, and `prepare_tmp` is where a placement sets it.
+/// on the temp file: on Windows the attributes are the file's mode, and `prepare_tmp` is
+/// where a placement sets it.
 struct Attributed;
 
 impl Placement for Attributed {
-    fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
-        let wide: Vec<u16> = tmp.as_os_str().encode_wide().chain([0]).collect();
-        let attributes = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_ATTRIBUTE_TEMPORARY;
-        // SAFETY: `wide` is NUL-terminated and outlives the call.
-        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), attributes) }.map_err(io::Error::other)
+    fn prepare_tmp(&self, tmp: &File) -> io::Result<()> {
+        set_attributes(tmp, (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED).0)
     }
 }
 
@@ -110,6 +129,19 @@ fn a_store_over_an_existing_file_keeps_the_attributes_a_placement_set_but_clears
 
     assert_placed_but_not_temporary(file.path());
     assert!(matches!(file.load(), Loaded::Current { value, .. } if value == record("two")));
+}
+
+// Reading =============================================================================================================
+
+#[skuld::test]
+fn load_reads_a_folder_nobody_may_add_to() {
+    // A load asks the folder for nothing a write needs: a machine that tightened its ACL to read-only still reads.
+    let dir = dir();
+    let file = VersionedFile::<OsRecordFile>::new(dir.path());
+    file.store(&record("one"), &DefaultPlacement::default()).unwrap();
+    let _denied = crate::dir::testing::AddDenied::to(dir.path());
+
+    assert!(matches!(file.load(), Loaded::Current { value, .. } if value == record("one")));
 }
 
 // Volumes without a directory flush ===================================================================================
@@ -203,8 +235,10 @@ fn the_directory_flush_tolerates_a_volume_without_one_where_it_is_wired() {
     let dir = dir();
     let os = |code: u32| io::Error::from_raw_os_error(code as i32);
 
-    sync_dir_with(dir.path(), |_| Err(os(ERROR_INVALID_FUNCTION.0))).unwrap();
-    let err = sync_dir_with(dir.path(), |_| Err(os(ERROR_IO_DEVICE.0))).unwrap_err();
+    let handle = Dir::open(dir.path(), false, None).unwrap();
+
+    sync_dir_with(&handle, |_| Err(os(ERROR_INVALID_FUNCTION.0))).unwrap();
+    let err = sync_dir_with(&handle, |_| Err(os(ERROR_IO_DEVICE.0))).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(ERROR_IO_DEVICE.0 as i32));
 }
 
@@ -212,10 +246,8 @@ fn the_directory_flush_tolerates_a_volume_without_one_where_it_is_wired() {
 struct ReadOnly;
 
 impl Placement for ReadOnly {
-    fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
-        let wide: Vec<u16> = tmp.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: `wide` is NUL-terminated and outlives the call.
-        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_READONLY) }.map_err(io::Error::other)
+    fn prepare_tmp(&self, tmp: &File) -> io::Result<()> {
+        set_attributes(tmp, FILE_ATTRIBUTE_READONLY.0)
     }
 }
 

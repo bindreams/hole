@@ -73,6 +73,63 @@ fn connect_nonexistent_fails() {
     });
 }
 
+// The folder of the socket --------------------------------------------------------------------------------------------
+//
+// The socket lives in a folder a standard user can add names to (on Windows the `hole` folder of `%ProgramData%`), and
+// the bridge removes and makes names in it as the system: through a handle on the folder, never through a link the
+// user planted on the way to it.
+
+#[skuld::test]
+fn bind_does_not_make_a_socket_through_a_users_link_to_a_system_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let link = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+    let name = format!("hole-sock-test-{}-linked.sock", std::process::id());
+
+    let result = LocalListener::bind(&link.join(&name));
+
+    let made = std::fs::symlink_metadata(link.join(&name)).is_ok();
+    if made {
+        let _ = std::fs::remove_file(link.join(&name));
+    }
+    let err = result.err().expect("bind went through the link");
+    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+    assert!(!made, "a socket was made in the system's folder");
+}
+
+#[skuld::test]
+fn remove_does_not_remove_a_file_through_a_users_link_to_a_system_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = util::dir::testing::SystemScratch::new();
+    let victim = scratch.root().join(scratch.name());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&victim)
+        .unwrap();
+    let link = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+    let result = remove(&link.join(scratch.name()));
+
+    let survived = victim.exists();
+    let _ = std::fs::remove_file(&victim);
+    let err = result.unwrap_err();
+    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+    assert!(survived, "a file in the system's folder was removed");
+}
+
+#[skuld::test]
+fn remove_removes_a_file_and_answers_ok_for_a_missing_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("hole-bridge.sock");
+    std::fs::write(&path, "stale").unwrap();
+
+    remove(&path).unwrap();
+    remove(&path).unwrap();
+    remove(&tmp.path().join("no-such-folder").join("hole-bridge.sock")).unwrap();
+
+    assert!(!path.exists());
+}
+
 // Security ------------------------------------------------------------------------------------------------------------
 
 /// Verify that `bind_restricted` applies mode 0600 to the socket file.

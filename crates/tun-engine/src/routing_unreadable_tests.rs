@@ -309,7 +309,7 @@ fn the_stale_bypass_clear_acts_on_a_record_that_has_an_unknown_field() {
 struct DeniedRead;
 
 impl util::versioned_file::Fs for DeniedRead {
-    fn read(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+    fn read(&self, _dir: &util::dir::ReadDir, _name: &std::ffi::OsStr) -> std::io::Result<Vec<u8>> {
         Err(std::io::ErrorKind::PermissionDenied.into())
     }
 }
@@ -415,7 +415,7 @@ fn a_checkpoint_over_a_record_whose_read_fails_is_refused() {
 struct DeniedAfterFirstRead(AtomicBool);
 
 impl util::versioned_file::Fs for DeniedAfterFirstRead {
-    fn read(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+    fn read(&self, _dir: &util::dir::ReadDir, _name: &std::ffi::OsStr) -> std::io::Result<Vec<u8>> {
         if self.0.swap(true, Ordering::SeqCst) {
             return Err(std::io::ErrorKind::PermissionDenied.into());
         }

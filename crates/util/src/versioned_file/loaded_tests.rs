@@ -262,7 +262,7 @@ fn load_never_rewrites() {
 struct DeniedFs;
 
 impl Fs for DeniedFs {
-    fn read(&self, _path: &std::path::Path) -> io::Result<Vec<u8>> {
+    fn read(&self, _dir: &crate::dir::ReadDir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 }
@@ -289,7 +289,7 @@ fn load_maps_io_failure_to_unreadable_never_corrupt() {
 fn a_failed_read_logs_the_error_text() {
     struct Fails;
     impl Fs for Fails {
-        fn read(&self, _path: &std::path::Path) -> io::Result<Vec<u8>> {
+        fn read(&self, _dir: &crate::dir::ReadDir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
             Err(io::Error::other("disk on fire"))
         }
     }
@@ -310,23 +310,20 @@ fn a_failed_read_logs_the_error_text() {
 #[cfg(windows)]
 #[skuld::test]
 fn load_of_a_held_file_carries_the_ntstatus_in_the_error_and_the_log() {
-    use std::os::windows::fs::OpenOptionsExt;
-
     let (subscriber, log) = capture();
-    let _guard = set_default_in_current_thread(subscriber);
     let dir = dir();
     let path = put(
         &dir,
         "note.json",
         br#"{"version":3,"title":"t","tags":[],"pinned":false}"#,
     );
-    let _held = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(0)
-        .open(&path)
-        .unwrap();
+    let _held = crate::dir::testing::held_without_sharing(&path);
 
-    let loaded = VersionedFile::<NoteV3>::new(dir.path()).load();
+    // As an unprivileged thread: a reader with backup rights reads through the holder. The subscriber is per thread.
+    let loaded = crate::dir::testing::as_unprivileged_thread(|| {
+        let _guard = set_default_in_current_thread(subscriber);
+        VersionedFile::<NoteV3>::new(dir.path()).load()
+    });
 
     // STATUS_SHARING_VIOLATION
     match loaded {

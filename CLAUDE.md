@@ -227,6 +227,15 @@ before editing; the sections linked below are the authoritative source.
   next connect. The password has a matching `Display`-less `Password` newtype
   and its own asymmetric limits. →
   [CONTRIBUTING.md#server-address-redaction](CONTRIBUTING.md#server-address-redaction)
+- **File lock.** Cross-process file locks use `file_lock::Exclusive`, which
+  never re-permissions a file it did not create or the expected owner does not
+  already own (it replaces a leftover, refuses a symlink or other non-regular
+  file), because the state directory may belong to the interactive user. For the
+  same reason the directory is opened once through handles, a link followed only
+  under the ownership-transition rule (`util::dir::Dir`), and the lock and the
+  state-file writers listed in the section below go through that handle, never
+  back through the path. →
+  [CONTRIBUTING.md#file-lock](CONTRIBUTING.md#file-lock)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
   [CONTRIBUTING.md#logging--diagnostics](CONTRIBUTING.md#logging--diagnostics)
@@ -276,6 +285,16 @@ before editing; the sections linked below are the authoritative source.
   before process exit" precondition that no test could enforce, and closing the
   handle it leaked deleted the rule instead of policing it.
   [→](CONTRIBUTING.md#fail-closed-cover)
+- **Privileged code in a folder a user may own walks through handles** —
+  `util::dir::Dir` (or `ReadDir`, for code that only reads), never a path call.
+  The walk gets the path as given: never `canonicalize` it first, which follows
+  every link with no rule. A link is followed only if the walk never
+  moves from a folder an unprivileged user owns into one somebody else owns (a
+  system-owned link stays trusted, a user's link to their own folder is followed,
+  a user's link into the system's or another account's is refused); the final name
+  is never followed; mode and owner are set through the open file; nothing touches
+  a path after a rename.
+  [→](CONTRIBUTING.md#privileged-code-in-folders-a-user-may-own)
 - **Hole never writes the server address or the password** — no `Display` on
   `ServerAddress` or `Password` (compiler-enforced), `.expose()` is the only
   exit from either, and every `Serialize` type transitively holding one needs
