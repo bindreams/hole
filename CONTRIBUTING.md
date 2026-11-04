@@ -729,8 +729,9 @@ re-derive them.
    and the installer's SID file in the `hole` folder of `%ProgramData%`, to which a standard user can add names (it
    inherits `BUILTIN\Users:(CI)(WD,AD,WEA,WA)`; the installer does not narrow it). The socket's bind and the mode or
    DACL set on it afterwards still name it by path: no platform binds relative to a directory handle. A folder named by
-   `--socket-path` is walked like the default one (a link planted on the way is refused) and no further: Hole does not
-   require the bridge to own it, and the caller vouches for it.
+   `--socket-path` is walked like the default one, so a link is followed only under the ownership-transition rule (one
+   that leads out of a user's own folders is refused), and no further: Hole does not require the bridge to own it, and
+   the caller vouches for it.
 
 1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a
    temp file, before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
@@ -3129,8 +3130,8 @@ checked against it by conformance tests (`cargo xtask bindir-names`).
 - `--service` — register with Windows SCM / macOS launchd (the service installer
   passes this).
 - `--log-dir` / `--state-dir` / `--socket-path` — override defaults.
-  A `--socket-path`'s folder gets the same link walk as the default one (a link planted on the way is refused) and
-  nothing more: Hole does not require the bridge to own it, and the caller vouches for it. The safety work is on the
+  A `--socket-path`'s folder gets the same link walk as the default one (a link is followed only under the
+  ownership-transition rule) and nothing more: Hole does not require the bridge to own it, and the caller vouches for it. The safety work is on the
   default path of a production install.
 - `HOLE_BRIDGE_SOCKET` env var — tells the GUI to connect to a dev bridge socket.
 
