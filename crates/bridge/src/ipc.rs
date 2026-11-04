@@ -108,18 +108,25 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// tell its own `Posture::PendingStart` guard is a zombie the next time
     /// it looks.
     pub cover_invalidated: Arc<std::sync::atomic::AtomicBool>,
-    /// Bumped by `handle_unblock` from INSIDE its `target::apply` closure, so
-    /// the increment is serialised against every other target write by the
-    /// same file lock. `handle_start`/`handle_reload` snapshot it before
-    /// touching the proxy and hand the snapshot to `persist_after_start`,
-    /// which declines its write if the counter moved — the compare-and-set
-    /// half of f745e03c that the proxy lock cannot provide, because
-    /// `handle_unblock` deliberately takes no proxy lock.
+    /// Bumped by `handle_unblock` right after its `Off` save succeeds, under
+    /// [`Self::intent_persist`], so a failed save never announces an unblock.
+    /// `handle_start`/`handle_reload` snapshot it before touching the proxy;
+    /// `persist_after_start` re-reads it under `intent_persist` and declines the
+    /// start's records if it moved. Every read is a pre-persist snapshot or sits
+    /// under that mutex. A counter rather than `cover_invalidated`, which
+    /// `start_cancellable` consumes: `reload`'s hot-swap path never calls that,
+    /// so one stale unblock would wedge every later hot-swap write.
     ///
-    /// A counter rather than `cover_invalidated`: that flag is consumed by
-    /// `start_cancellable`, which `reload`'s hot-swap path never calls, so a
-    /// single stale unblock would wedge every later hot-swap reload's write.
+    /// The compare-and-set half of f745e03c that the proxy lock cannot give,
+    /// because `handle_unblock` deliberately takes no proxy lock.
     pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Orders `persist_after_start`'s target + candidate writes against
+    /// `handle_unblock`'s `Off` + `set_enabled` + candidate clear, each a
+    /// sequence of separate file-lock sections. Held only inside a
+    /// `spawn_blocking` closure, never across an `.await`, and always taken
+    /// before the target file lock. Other candidate writers run under
+    /// `BridgeLiveness` and need no ordering against these two.
+    pub intent_persist: Arc<std::sync::Mutex<()>>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
     pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
     /// This bridge's build version, stamped on every response
@@ -194,6 +201,7 @@ impl IpcServer {
             routing,
             cover_invalidated,
             unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            intent_persist: Arc::new(std::sync::Mutex::new(())),
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
             log_dir,
@@ -599,6 +607,12 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 ///   `ProxyManager::start_cancellable`'s `AlreadyRunning` guard, which
 ///   precedes any config change).
 ///
+/// Invariant: a candidate never sits beside an `Off` target, because
+/// `AlwaysConnect` reconnects from it. The start's records are written under
+/// `intent_persist`, so one reading of `unblock_generation` decides both: if an
+/// unblock committed since the snapshot, neither the target nor the candidate is
+/// written. The `on_startup` push is a preference and stands either way.
+///
 /// Runs in `spawn_blocking`, since both `target::apply` and
 /// `save_startup_preference` are sync (`target::apply`'s lock is a leaf lock
 /// that must never cross an `.await` — see `TargetExclusive`). A failure here
@@ -625,41 +639,13 @@ async fn persist_after_start<P: Proxy, R: Routing>(
     let owner = state.owner;
     let config = config.clone();
     let generation = Arc::clone(&state.unblock_generation);
+    let intent_persist = Arc::clone(&state.intent_persist);
     let outcome = tokio::task::spawn_blocking(move || -> Result<(), target::TargetError> {
+        // The mutex guards no data, so a poisoned one carries no broken invariant.
+        let _ordered = intent_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if succeeded {
-            let candidate_config = config.clone();
-            let declined = std::sync::atomic::AtomicBool::new(false);
-            let declined_ref = &declined;
-            target::apply(&state_dir, owner, move |current| {
-                if generation.load(std::sync::atomic::Ordering::SeqCst) != unblock_snapshot {
-                    // An unblock committed `Target::Off` after this start
-                    // began. It is the newer intent; leave it standing.
-                    declined_ref.store(true, std::sync::atomic::Ordering::SeqCst);
-                    current
-                } else {
-                    Target::Connected {
-                        config: Box::new(config),
-                    }
-                }
-            })?;
-            // Locked read-modify-write, NOT load-then-save: a concurrent
-            // `handle_unblock` clearing the candidate between the two halves
-            // would be silently re-added here, leaving `Target::Off` beside a
-            // live candidate that `AlwaysConnect` reconnects from — the escape
-            // undone. Sequential with the `target::apply` above, never nested:
-            // both take the same lock, and `flock` is per-open-description, so
-            // nesting would deadlock rather than recurse.
-            target::apply_startup_preference(&state_dir, owner, |pref| {
-                if let Some(on_startup) = on_startup {
-                    pref.on_startup = on_startup;
-                }
-                // The candidate records what actually happened, so it follows
-                // the target's fate. The `on_startup` push is a PREFERENCE,
-                // not a record, so it stands either way.
-                if !declined.load(std::sync::atomic::Ordering::SeqCst) {
-                    pref.candidate = Some(Box::new(candidate_config));
-                }
-            })
+            let declined = generation.load(std::sync::atomic::Ordering::SeqCst) != unblock_snapshot;
+            write_start_records(&state_dir, owner, &config, on_startup, declined)
         } else if let Some(on_startup) = on_startup {
             target::apply_startup_preference(&state_dir, owner, |pref| {
                 pref.on_startup = on_startup;
@@ -677,6 +663,36 @@ async fn persist_after_start<P: Proxy, R: Routing>(
         }
         Err(e) => error!(error = %e, "target-persistence task panicked"),
     }
+}
+
+/// The records of a successful start. `declined`: an unblock committed since
+/// the start's snapshot, so the target and candidate are left as it wrote them.
+///
+/// Two locked read-modify-writes, NOT load-then-save, sequential with (never
+/// nested in) each other — both take the same file lock, and `flock` is per-
+/// open-description, so nesting would deadlock rather than recurse.
+fn write_start_records(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    config: &ProxyConfig,
+    on_startup: Option<StartupBehavior>,
+    declined: bool,
+) -> Result<(), target::TargetError> {
+    if declined {
+        debug!("start's target and candidate not written: an unblock committed since its snapshot");
+    } else {
+        target::apply(state_dir, owner, |_| Target::Connected {
+            config: Box::new(config.clone()),
+        })?;
+    }
+    target::apply_startup_preference(state_dir, owner, |pref| {
+        if let Some(on_startup) = on_startup {
+            pref.on_startup = on_startup;
+        }
+        if !declined {
+            pref.candidate = Some(Box::new(config.clone()));
+        }
+    })
 }
 
 /// Cancel the in-flight start IFF it is the attempt this cancel names, else
@@ -811,24 +827,22 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     let state_dir = state.state_dir.clone();
     let owner = state.owner;
     let generation = Arc::clone(&state.unblock_generation);
+    let intent_persist = Arc::clone(&state.intent_persist);
     let persisted = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // The bump is the COMMIT hook, not part of the closure: it must not
-        // announce a write that `save` then failed to make, and it must happen
-        // before the exclusive lock is released so a concurrent
-        // `persist_after_start` cannot observe the committed `Off` without it.
-        target::apply_committing(
-            &state_dir,
-            owner,
-            |_current| Target::Off,
-            || {
-                generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            },
-        )?;
+        // Holds `intent_persist` across all three writes, so a start's target +
+        // candidate pair lands wholly before or wholly after this sequence:
+        // never between the `Off` and the candidate clear, where it would have
+        // its newer candidate erased. (A poisoned mutex guards no data.)
+        let _ordered = intent_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The bump follows the `?`, so a failed `Off` save never announces an
+        // unblock; the mutex keeps a start from reading the counter between the
+        // save and the bump.
+        target::apply(&state_dir, owner, |_current| Target::Off)?;
+        generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         lockdown_state::set_enabled(&state_dir, false, owner)?;
-        // Clear the auto-connect candidate too. `resolve_startup_target` feeds
+        // Clear the auto-connect candidate too: `resolve_startup_target` feeds
         // it to `AlwaysConnect` over an `Off` target, so leaving it would let
-        // the next boot reconnect to the server the user just escaped from —
-        // the escape undone by a record it never touched.
+        // the next boot reconnect to the server the user just escaped from.
         target::apply_startup_preference(&state_dir, owner, |pref| pref.candidate = None)?;
         Ok(())
     })
