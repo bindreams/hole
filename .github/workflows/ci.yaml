@@ -107,7 +107,7 @@ jobs:
           save-cache: ${{ matrix.cache-saver == true }}
 
       - id: cargo-binstall
-        uses: cargo-bins/cargo-binstall@v1.26.0
+        uses: cargo-bins/cargo-binstall@v1.26.1
         timeout-minutes: 5
 
       - id: install-nextest
