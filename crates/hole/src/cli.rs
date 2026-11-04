@@ -133,7 +133,7 @@ impl From<CliTunnelMode> for hole_common::protocol::TunnelMode {
 pub(crate) enum BridgeAction {
     /// Run the bridge (foreground by default)
     Run {
-        /// Override the IPC socket path. Hole does not judge its folder: whoever passes this vouches for it
+        /// Override the IPC socket path. Its folder is walked like the default one (a planted link is refused) and no further: whoever passes this vouches for the folder's owner
         #[arg(long)]
         socket_path: Option<std::path::PathBuf>,
         /// Run as a system service (invoked by SCM/launchd)
