@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, ExitStatus, Output};
 
 use anyhow::{bail, Context, Result};
 
@@ -71,8 +71,7 @@ pub enum Outcome {
 /// line breaks, so a test failure formatting an `Outcome` shows them readably.
 #[derive(Clone)]
 pub struct PullRecord {
-    /// `None` when the process was terminated by a signal.
-    pub exit_code: Option<i32>,
+    pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
 }
@@ -80,7 +79,7 @@ pub struct PullRecord {
 impl PullRecord {
     pub(crate) fn from_output(pull: &Output) -> Self {
         Self {
-            exit_code: pull.status.code(),
+            status: pull.status,
             stdout: String::from_utf8_lossy(&pull.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&pull.stderr).into_owned(),
         }
@@ -89,13 +88,10 @@ impl PullRecord {
 
 impl fmt::Debug for PullRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let code = self
-            .exit_code
-            .map_or_else(|| "none (terminated by a signal)".to_string(), |c| c.to_string());
         write!(
             f,
-            "\ngit subrepo pull exit code: {code}\nstdout:\n{}\nstderr:\n{}",
-            self.stdout, self.stderr
+            "\ngit subrepo pull {}\nstdout:\n{}\nstderr:\n{}",
+            self.status, self.stdout, self.stderr
         )
     }
 }
@@ -415,7 +411,7 @@ fn rev_parse_if_exists(repo_root: &Path, ref_name: &str) -> Result<Option<String
 /// `ensure_no_in_progress_conflict_resolution` already decided, once, at
 /// the top of `run`, to leave alone (re-checking and re-cleaning here would
 /// also race a concurrent, separate `git subrepo pull` invocation).
-fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
+pub(crate) fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
     // `git subrepo pull` does its own internal `git commit` in `repo_root`
     // partway through a real pull (after writing `.gitrepo`'s new `branch =`
     // but before the vendored tree content is fully folded in) — on a
@@ -426,7 +422,7 @@ fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
     // spawns internally) the same way `PREK_ALLOW_NO_CONFIG` is inherited
     // elsewhere in this module — merged with any pre-existing `SKIP` so a
     // developer's own unrelated export isn't silently clobbered.
-    Command::new("git")
+    let pull = Command::new("git")
         .args(["subrepo", "pull", subdir, "-b", tag])
         .current_dir(repo_root)
         .env("SKIP", skip_check_vendoring_integrity())
@@ -434,7 +430,33 @@ fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
         // unexpected outcome.
         .env_remove("GIT_SUBREPO_QUIET")
         .output()
-        .with_context(|| format!("failed to run `git subrepo pull {subdir} -b {tag}`"))
+        .with_context(|| format!("failed to run `git subrepo pull {subdir} -b {tag}`"))?;
+    if pull.status.success() {
+        ensure_pull_landed(repo_root, subdir, &pull)?;
+    }
+    Ok(pull)
+}
+
+/// An exit-0 `git subrepo pull` is believed only if the subrepo's state agrees: after a merge and after
+/// "is up to date" alike, `.gitrepo`'s `commit =` is the commit `refs/subrepo/<subdir>/fetch` names. A pull
+/// that exited 0 having done nothing leaves the ref (set by `fetch_upstream`) ahead of the pin, and the
+/// caller would go on to pin `tag` onto vendored content that never changed.
+pub(crate) fn ensure_pull_landed(repo_root: &Path, subdir: &str, pull: &Output) -> Result<()> {
+    let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
+    let gitrepo =
+        std::fs::read_to_string(&gitrepo_path).with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
+    let pinned = gitrepo_field(&gitrepo, "commit")
+        .with_context(|| format!("{} has no `commit = ` line", gitrepo_path.display()))?;
+    let fetch_ref = format!("refs/subrepo/{subdir}/fetch");
+    let fetched = rev_parse_if_exists(repo_root, &fetch_ref)?;
+    if fetched.as_deref() == Some(pinned.as_str()) {
+        return Ok(());
+    }
+    bail!(
+        "`git subrepo pull {subdir}` exited 0 but did not land: `{subdir}/.gitrepo` pins commit {pinned}, `{fetch_ref}` is {}{:?}",
+        fetched.as_deref().unwrap_or("missing"),
+        PullRecord::from_output(pull)
+    )
 }
 
 /// This module's own repo-root commits (here, `fix_stale_parent`'s parent
