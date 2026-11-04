@@ -2219,9 +2219,10 @@ state read before its act loses that race, so four rules close it:
   listing does not show, which the next listing, taken after its exit, does. The
   listing must be complete: a failed read is returned, never a short list, and the
   System Idle Process (id 0, which is listed and never opens, measured) is left out
-  so it cannot read as vanished on every pass. A process that has exited is not in
-  a later listing (measured, with its handle still held; the list's zero-thread
-  entries are dropped too). A probe checks the creation time of the process it opened against
+  so it cannot read as vanished on every pass. A process that has exited can still be
+  listed with a thread left for a reader that holds its handle (measured in CI,
+  see `Stamp::is_running` further down; zero-thread entries are
+  dropped), so the scan opens it, reads it as exited and counts it `vanished`. A probe checks the creation time of the process it opened against
   the listing's: an id held by a process created at another time is the OS's
   reuse of it, the listed process is gone at its probe (a stranger's token says
   nothing about a child the listed process started), and another scan follows.
@@ -2594,8 +2595,9 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   no running changer, so a user is never left waiting on a change that ended.
   A process that `OpenProcess` opens is running when it has the stamped
   creation time and its object is not signalled (`has_exited`): the signal at
-  exit is an edge, where the system process list keeps an exited process for a
-  while after it (measured in CI, no edge). A standard user is refused every
+  exit is an edge, where the system process list kept an exited process
+  listed, with a thread left, for a reader that held its handle (measured in CI,
+  no edge). A standard user is refused every
   SYSTEM process (measured: `ERROR_ACCESS_DENIED` for `services.exe`,
   `svchost.exe` and the System process, even for
   `PROCESS_QUERY_LIMITED_INFORMATION`), and the cutover child and an installer's
@@ -2604,7 +2606,7 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   (the privileged lane's standard-user status reads). The lag above was seen for
   a process the reader held a handle to; read as a standard user holding none,
   after the impersonation switch, a just-stopped SYSTEM process was never listed
-  in 6,512 rounds on the privileged runner (probe at 50d133c91, run 41817171754). The list holds the
+  with a thread left in about 6,500 rounds on the privileged runner (probe at 50d133c91, run 41817171754). The list holds the
   creation time in bytes `winternl.h` calls opaque (`Reserved1`, offset 24); a
   test compares it with `GetProcessTimes`. A lock that cannot be read costs nothing here, since
   the GUI never takes it; a start type that cannot be read says nothing is

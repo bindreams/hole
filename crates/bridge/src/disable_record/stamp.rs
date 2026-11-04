@@ -11,12 +11,13 @@
 //!
 //! A process that can be opened is running when its object is not signalled
 //! ([`has_exited`]): the object is signalled at exit, which is an edge. The
-//! system process list (`NtQuerySystemInformation`) keeps an exited process
-//! listed for a while after that, with no edge (measured for a process the
-//! reader holds a handle to), so it decides only for a process that cannot be
-//! opened. There, read as a standard user holding no handle, right after a SYSTEM
-//! process stopped, it never listed the exited process in 6,512 rounds on the
-//! privileged CI runner (probe at 50d133c91, run 41817171754).
+//! system process list (`NtQuerySystemInformation`) kept an exited process
+//! listed, with a thread left, with no edge (measured for a reader that held
+//! a handle to it), so it decides only for a process that cannot be opened.
+//! There, read as a standard user holding no handle, right after a SYSTEM
+//! process stopped, it never listed the exited process with a thread left in
+//! about 6,500 rounds on the privileged CI runner (probe at 50d133c91, run
+//! 41817171754).
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
