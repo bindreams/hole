@@ -115,13 +115,11 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     let first = attempt_pull(repo_root, subdir, tag)?;
     if first.status.success() {
         best_effort_clean(repo_root, subdir);
-        // `git subrepo pull` has, in the usual (non-no-op) case, already
-        // committed real vendored content to HEAD by this point — if the
-        // tag-pin fixup below fails, say so, rather than leaving that
-        // already-landed commit an undisclosed side effect.
+        // A pull that exited 0 without landing is `attempt_pull`'s error, so here the vendored
+        // content is committed to HEAD or the subrepo was already up to date. Say so if the
+        // tag-pin fixup below fails.
         ensure_tag_pin_matches(repo_root, subdir, tag).with_context(|| {
-            "git subrepo pull already succeeded and (usually) committed to this branch before \
-             this failure — check `git log -1` before assuming nothing happened"
+            "git subrepo pull already succeeded and (usually) committed to this branch before              this failure — check `git log -1` before assuming nothing happened"
                 .to_string()
         })?;
         return Ok(Outcome::Clean {
@@ -411,7 +409,7 @@ fn rev_parse_if_exists(repo_root: &Path, ref_name: &str) -> Result<Option<String
 /// `ensure_no_in_progress_conflict_resolution` already decided, once, at
 /// the top of `run`, to leave alone (re-checking and re-cleaning here would
 /// also race a concurrent, separate `git subrepo pull` invocation).
-pub(crate) fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
+fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
     // `git subrepo pull` does its own internal `git commit` in `repo_root`
     // partway through a real pull (after writing `.gitrepo`'s new `branch =`
     // but before the vendored tree content is fully folded in) — on a
@@ -441,7 +439,7 @@ pub(crate) fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<
 /// "is up to date" alike, `.gitrepo`'s `commit =` is the commit `refs/subrepo/<subdir>/fetch` names. A pull
 /// that exited 0 having done nothing leaves the ref (set by `fetch_upstream`) ahead of the pin, and the
 /// caller would go on to pin `tag` onto vendored content that never changed.
-pub(crate) fn ensure_pull_landed(repo_root: &Path, subdir: &str, pull: &Output) -> Result<()> {
+fn ensure_pull_landed(repo_root: &Path, subdir: &str, pull: &Output) -> Result<()> {
     let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
     let gitrepo =
         std::fs::read_to_string(&gitrepo_path).with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
@@ -453,7 +451,7 @@ pub(crate) fn ensure_pull_landed(repo_root: &Path, subdir: &str, pull: &Output) 
         return Ok(());
     }
     bail!(
-        "`git subrepo pull {subdir}` exited 0 but did not land: `{subdir}/.gitrepo` pins commit {pinned}, `{fetch_ref}` is {}{:?}",
+        "`git subrepo pull {subdir}` exited 0 but did not land: `{subdir}/.gitrepo` pins commit {pinned}, `{fetch_ref}` is {}; check `git log -1` for anything it committed\n{:?}",
         fetched.as_deref().unwrap_or("missing"),
         PullRecord::from_output(pull)
     )
