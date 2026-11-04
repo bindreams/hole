@@ -725,7 +725,8 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
 /// An absent entry (never registered) is `Ok`: there is nothing here to fail
 /// over. A service marked for deletion by a prior `DeleteService` still opens,
 /// so it is stopped like any other; with nothing to wait on it is looked at
-/// again, paced, until a look reads STOPPED. The cover release that follows carries the real
+/// again, paced, until a look reads STOPPED or every process it showed has
+/// exited. The cover release that follows carries the real
 /// guarantee; it holds the bridge's own liveness lock and refuses outright if a
 /// bridge is still alive.
 pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
