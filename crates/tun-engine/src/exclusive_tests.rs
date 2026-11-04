@@ -127,3 +127,36 @@ fn acquire_blocks_until_the_holder_releases() {
     holder.join().unwrap();
     waiter.join().unwrap();
 }
+
+// RecordLock ==========================================================================================================
+
+#[skuld::test]
+fn record_lock_try_acquire_reports_held_and_free() {
+    static LOCK: RecordLock = RecordLock::new(());
+    let guard = LOCK.acquire();
+    assert!(LOCK.try_acquire().is_none(), "a held lock must report held");
+    drop(guard);
+    assert!(LOCK.try_acquire().is_some(), "a released lock must be acquirable");
+}
+
+#[skuld::test]
+fn record_lock_recovers_from_a_poisoned_holder() {
+    static LOCK: RecordLock = RecordLock::new(());
+    let _ = std::thread::spawn(|| {
+        let _guard = LOCK.acquire();
+        panic!("poison the record lock");
+    })
+    .join();
+    assert!(
+        LOCK.try_acquire().is_some(),
+        "a record lock guards a file, not an invariant a panic can break: poison must not propagate"
+    );
+    drop(LOCK.acquire());
+}
+
+#[skuld::test]
+fn record_lock_guards_its_value() {
+    static LOCK: RecordLock<std::collections::BTreeMap<u8, u8>> = RecordLock::new(std::collections::BTreeMap::new());
+    LOCK.acquire().insert(1, 2);
+    assert_eq!(LOCK.acquire().get(&1), Some(&2));
+}

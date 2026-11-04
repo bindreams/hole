@@ -69,7 +69,7 @@
 //!   path that does not run through `super::sweep_with_witness`, because the
 //!   guard carries no `state_dir` to write to. It fires when an engage COMMITS
 //!   (so the record is already `Armed`) and a later fatal phase of the same
-//!   start fails, unwinding `ProxyManager`'s locally-owned guard; an ordinary
+//!   start fails, or a release overtakes the engage, unwinding the guard; an ordinary
 //!   disconnect is unaffected, since that releases through
 //!   `Routing::release_all_covers` first and drops an already-swept cover. The
 //!   twins were genuinely watched going, so this is an OVER-report: the record
@@ -77,6 +77,9 @@
 //!   that `state_dir` names the two twin keys. Safe direction, and the same
 //!   one this file has always failed in — but not the same claim as "only a
 //!   non-sweep cause leaves a stale record", which is why it is spelled out.
+//! - **A disarm is dropped when an engage records during the sweep.** The sweep's
+//!   proof covers the twins it deleted, not the one just armed, so the record
+//!   stays `Armed` and the next sweep disarms it. Over-report, the safe direction.
 //! - Other causes with the same shape and no fix here at all: an external FWPM
 //!   delete, a firewall reset, an image restore. No sweep ever held the
 //!   evidence, so nothing could have copied it — which is the case
@@ -98,12 +101,22 @@
 //!   very twins go, and keeps reporting. Over-report, the same direction as
 //!   `Cover::drop` above.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::ArmingWitness;
+use crate::exclusive::RecordLock;
+
+/// Serializes every read-modify-write of the record in this process, and holds
+/// the per-`state_dir` arm epoch: how many engages have recorded a twin since
+/// this process started. A leaf lock: see [`RecordLock`].
+///
+/// The epoch exists because a value comparison cannot tell an engage that
+/// re-armed an `Armed` record from no engage at all.
+static STATE: RecordLock<BTreeMap<PathBuf, u64>> = RecordLock::new(BTreeMap::new());
 
 /// Schema version. A mismatched file classifies [`ArmingWitness::Unreadable`]
 /// — which REPORTS — rather than being discarded as absence: losing the record
@@ -200,6 +213,9 @@ fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> std::io::Re
 /// proved only where the hazard lives is proved nowhere else.
 #[cfg(any(target_os = "windows", test, feature = "test-utils"))]
 pub(crate) fn record_armed(state_dir: &Path, owner: Option<(u32, u32)>) {
+    let mut epochs = STATE.acquire();
+    // Bumped even if the write below fails.
+    *epochs.entry(state_dir.to_path_buf()).or_insert(0) += 1;
     write_or_warn(state_dir, true, owner);
 }
 
@@ -246,17 +262,18 @@ pub(crate) enum WitnessUpdate {
 
 /// The record's next value, or `None` when nothing needs writing.
 ///
-/// Pure, and a table rather than a condition spread over the write site,
-/// because the two rules that matter are both about which CURRENT values a
-/// write may land on: an `Arm` never rewrites an existing `Armed` (pointless
-/// I/O that can only fail), and a `Disarm` never writes `false` over `Unset`
-/// or `Disarmed` — the first would litter every host that never armed a twin
-/// with a file saying so, on every `release-covers` it ever runs.
-fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
+/// Pure, and a table rather than a condition spread over the write site. An `Arm` never rewrites an existing `Armed` (pointless I/O that can
+/// only fail), a `Disarm` never writes `false` over `Unset` or `Disarmed` (the
+/// first would litter every host that never armed a twin with a file saying
+/// so, on every `release-covers` it ever runs), and a `Disarm` never lands when
+/// `epoch_moved`: an engage recorded a twin after the sweep's snapshot, and the
+/// sweep's proof covers only the twins it deleted.
+fn next_record(current: ArmingWitness, update: WitnessUpdate, epoch_moved: bool) -> Option<bool> {
     match update {
         WitnessUpdate::Leave => None,
         // Already recorded; rewriting it would only risk an I/O failure.
         WitnessUpdate::Arm => (current != ArmingWitness::Armed).then_some(true),
+        WitnessUpdate::Disarm if epoch_moved => None,
         // `Unset` is a host with no file and nothing outstanding — writing
         // `false` there would litter every host that never armed a twin.
         // `Unreadable` IS written, because a corrupt file reports forever
@@ -265,9 +282,44 @@ fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
     }
 }
 
-/// Apply a sweep's [`WitnessUpdate`] to the record it was folded against.
-pub(crate) fn apply(state_dir: &Path, current: ArmingWitness, update: WitnessUpdate, owner: Option<(u32, u32)>) {
-    if let Some(armed) = next_record(current, update) {
+/// What a sweep read before it deleted anything: the record, and the arm epoch
+/// [`apply`] later compares to learn whether an engage recorded in between.
+#[derive(Debug)]
+pub(crate) struct Snapshot {
+    pub(crate) witness: ArmingWitness,
+    epoch: u64,
+}
+
+/// Read the record and the epoch as one consistent pair.
+pub(crate) fn snapshot(state_dir: &Path) -> Snapshot {
+    let epochs = STATE.acquire();
+    Snapshot {
+        witness: load(state_dir),
+        epoch: epochs.get(state_dir).copied().unwrap_or(0),
+    }
+}
+
+/// Apply a sweep's [`WitnessUpdate`], decided against the record as it is NOW
+/// and the epoch as it was at `since`; the read and the write are one critical
+/// section, so no engage can record between them.
+pub(crate) fn apply(state_dir: &Path, since: Snapshot, update: WitnessUpdate, owner: Option<(u32, u32)>) {
+    apply_with(state_dir, since, update, owner, || {});
+}
+
+/// [`apply`] with a hook that runs inside the critical section, between the
+/// read and the write: the one place a test can observe the lock held.
+fn apply_with(
+    state_dir: &Path,
+    since: Snapshot,
+    update: WitnessUpdate,
+    owner: Option<(u32, u32)>,
+    in_section: impl FnOnce(),
+) {
+    let epochs = STATE.acquire();
+    let fresh = load(state_dir);
+    let epoch_moved = epochs.get(state_dir).copied().unwrap_or(0) != since.epoch;
+    in_section();
+    if let Some(armed) = next_record(fresh, update, epoch_moved) {
         write_or_warn(state_dir, armed, owner);
     }
 }

@@ -21,6 +21,12 @@ pub enum RoutingError {
     /// the log, not a toast; use [`RoutingError::redacted`] for a toast.
     #[error("{}", state_unreadable(&path.display()))]
     StateUnreadable { path: PathBuf },
+    /// A release removed or claimed a cover's record while an engage was
+    /// installing that cover, or began during the install, so the engage backed
+    /// out and the host is as the release left it. Not a failure of the cover:
+    /// the user asked to be let out.
+    #[error("the fail-closed cover was released while it was being engaged, and was backed out")]
+    SupersededByRelease,
 }
 
 fn state_unreadable(record: &dyn std::fmt::Display) -> String {
@@ -39,11 +45,24 @@ impl RoutingError {
             RoutingError::Gateway(_) => self.to_string(),
             RoutingError::RouteSetup(_) => self.to_string(),
             RoutingError::StateUnreadable { .. } => state_unreadable(&crate::routing::state::STATE_FILE_NAME),
+            RoutingError::SupersededByRelease => self.to_string(),
+        }
+    }
+
+    /// Whether this error means the user's release ended the engage, so the
+    /// start that made it is cancelled: never run uncovered, never retried with
+    /// another engage.
+    pub fn cancels_the_start(&self) -> bool {
+        match self {
+            RoutingError::Gateway(_) => false,
+            RoutingError::RouteSetup(_) => false,
+            RoutingError::StateUnreadable { .. } => false,
+            RoutingError::SupersededByRelease => true,
         }
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 impl RoutingError {
     /// A state file under `what` could not be written. The toast text names the
     /// error's kind only (`tempfile`'s error text names the path); the full

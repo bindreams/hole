@@ -23,7 +23,7 @@ fn save_load_roundtrip() {
         version: SCHEMA_VERSION,
         plugins: vec![synthetic(1234, 1000), synthetic(5678, 2000)],
     };
-    save(dir.path(), &state, None).unwrap();
+    save_with(dir.path(), &state, None, None, &RealOwnership).unwrap();
     let Loaded::State(loaded) = load(dir.path()) else {
         panic!("saved state must load as State");
     };
@@ -146,22 +146,22 @@ fn wire_form_pins_the_token_as_a_decimal_string() {
 }
 
 #[skuld::test]
-fn clear_removes_file() {
+fn remove_file_removes_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let state = PluginState {
         version: SCHEMA_VERSION,
         plugins: vec![synthetic(1, 1)],
     };
-    save(dir.path(), &state, None).unwrap();
+    save_with(dir.path(), &state, None, None, &RealOwnership).unwrap();
     assert!(dir.path().join(STATE_FILE_NAME).exists());
-    clear(dir.path()).unwrap();
+    remove_file(dir.path()).unwrap();
     assert!(!dir.path().join(STATE_FILE_NAME).exists());
 }
 
 #[skuld::test]
-fn clear_tolerates_missing_file() {
+fn remove_file_tolerates_a_missing_file() {
     let dir = tempfile::tempdir().unwrap();
-    clear(dir.path()).unwrap();
+    remove_file(dir.path()).unwrap();
 }
 
 #[skuld::test]
@@ -172,7 +172,7 @@ fn save_creates_missing_dir() {
         version: SCHEMA_VERSION,
         plugins: vec![],
     };
-    save(&nested, &state, None).unwrap();
+    save_with(&nested, &state, None, None, &RealOwnership).unwrap();
     assert!(nested.join(STATE_FILE_NAME).exists());
 }
 
@@ -233,4 +233,293 @@ fn an_unreadable_append_writes_nothing_and_reports_the_error() {
         vec![first],
         "a failed read must write nothing: the prior record was dropped"
     );
+}
+
+// Concurrent writers ==================================================================================================
+
+fn loaded_plugins(dir: &std::path::Path) -> Vec<ProcessIdRecord> {
+    match load(dir) {
+        Loaded::State(s) => s.plugins,
+        other => panic!("expected a loadable state, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn append_holds_the_plugin_lock_across_load_and_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut held_inside = false;
+    append_record_with(dir.path(), synthetic(1, 1), None, || {
+        held_inside = lock_is_held();
+    })
+    .unwrap();
+    assert!(
+        held_inside,
+        "the load, the push and the save must be one critical section"
+    );
+}
+
+#[skuld::test]
+fn remove_accounted_holds_the_plugin_lock_while_rewriting() {
+    let dir = tempfile::tempdir().unwrap();
+    append_record(dir.path(), synthetic(1, 1), None).unwrap();
+    let mut held_inside = false;
+    remove_accounted_with(dir.path(), &[synthetic(1, 1)], None, &RealOwnership, || {
+        held_inside = lock_is_held();
+    })
+    .unwrap();
+    assert!(held_inside);
+}
+
+#[skuld::test]
+fn an_append_then_a_removal_keeps_the_appended_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir.path(), r1.clone(), None).unwrap();
+    append_record(dir.path(), r2.clone(), None).unwrap();
+    remove_accounted(dir.path(), &[r1], None).unwrap();
+    assert_eq!(loaded_plugins(dir.path()), vec![r2]);
+}
+
+#[skuld::test]
+fn a_removal_then_an_append_does_not_resurrect_the_removed_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir.path(), r1.clone(), None).unwrap();
+    remove_accounted(dir.path(), &[r1], None).unwrap();
+    assert!(
+        !dir.path().join(STATE_FILE_NAME).exists(),
+        "the file goes when no record remains"
+    );
+    append_record(dir.path(), r2.clone(), None).unwrap();
+    assert_eq!(loaded_plugins(dir.path()), vec![r2]);
+}
+
+#[skuld::test]
+fn remove_accounted_drops_exactly_the_accounted_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2, r3) = (synthetic(1, 1), synthetic(2, 2), synthetic(3, 3));
+    for r in [&r1, &r2, &r3] {
+        append_record(dir.path(), r.clone(), None).unwrap();
+    }
+    remove_accounted(dir.path(), &[r1, r3.clone()], None).unwrap();
+    assert_eq!(loaded_plugins(dir.path()), vec![r2.clone()]);
+
+    // A record the file does not hold is not an error and removes nothing.
+    remove_accounted(dir.path(), &[r3], None).unwrap();
+    assert_eq!(loaded_plugins(dir.path()), vec![r2]);
+}
+
+#[skuld::test]
+fn remove_accounted_over_an_absent_file_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    remove_accounted(dir.path(), &[synthetic(1, 1)], None).unwrap();
+    assert!(!dir.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
+fn remove_accounted_leaves_a_file_it_cannot_read_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    unreadable_fixture(dir.path());
+    remove_accounted(dir.path(), &[synthetic(1, 1)], None).expect_err("an unreadable file cannot be edited");
+    assert!(dir.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
+fn clear_if_unusable_clears_only_an_unusable_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(STATE_FILE_NAME), b"{not json").unwrap();
+    clear_if_unusable(dir.path()).unwrap();
+    assert!(!dir.path().join(STATE_FILE_NAME).exists());
+
+    append_record(dir.path(), synthetic(1, 1), None).unwrap();
+    clear_if_unusable(dir.path()).unwrap();
+    assert_eq!(
+        loaded_plugins(dir.path()),
+        vec![synthetic(1, 1)],
+        "a file that has become usable since the caller looked is not worthless"
+    );
+
+    let absent = tempfile::tempdir().unwrap();
+    clear_if_unusable(absent.path()).unwrap();
+}
+
+#[skuld::test]
+fn load_holds_the_plugin_lock_while_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut held_inside = false;
+    let _ = load_with(dir.path(), || {
+        held_inside = lock_is_held();
+    });
+    assert!(
+        held_inside,
+        "a read must not interleave with an append's rename-replace"
+    );
+}
+
+// Rewrite ownership ===================================================================================================
+
+type Owner = Option<(u32, u32)>;
+
+/// Answers `existing` for the state file's owner and records every chown, plus
+/// the file's bytes at the moment its owner was read.
+struct Recording {
+    existing: Option<(u32, u32)>,
+    chowns: std::cell::RefCell<Vec<(std::path::PathBuf, Owner)>>,
+    bytes_when_read: std::cell::RefCell<Option<Vec<u8>>>,
+}
+
+impl Recording {
+    fn new(existing: Option<(u32, u32)>) -> Self {
+        Self {
+            existing,
+            chowns: Default::default(),
+            bytes_when_read: Default::default(),
+        }
+    }
+
+    fn state_file_chowns(&self, dir: &std::path::Path) -> Vec<Option<(u32, u32)>> {
+        let file = dir.join(STATE_FILE_NAME);
+        self.chowns
+            .borrow()
+            .iter()
+            .filter(|(p, _)| *p == file)
+            .map(|(_, o)| *o)
+            .collect()
+    }
+}
+
+impl Ownership for Recording {
+    fn owner_of(&self, path: &std::path::Path) -> Option<(u32, u32)> {
+        *self.bytes_when_read.borrow_mut() = std::fs::read(path).ok();
+        self.existing
+    }
+
+    fn chown(&self, path: &std::path::Path, owner: Option<(u32, u32)>) {
+        self.chowns.borrow_mut().push((path.to_path_buf(), owner));
+    }
+}
+
+fn two_records(dir: &std::path::Path) -> (ProcessIdRecord, ProcessIdRecord) {
+    let (r1, r2) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir, r1.clone(), None).unwrap();
+    append_record(dir, r2.clone(), None).unwrap();
+    (r1, r2)
+}
+
+#[skuld::test]
+fn a_rewrite_without_a_requested_owner_keeps_the_files_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let rec = Recording::new(Some((501, 20)));
+    remove_accounted_with(dir.path(), &[r1], None, &rec, || {}).unwrap();
+    assert_eq!(rec.state_file_chowns(dir.path()), vec![Some((501, 20))]);
+}
+
+#[skuld::test]
+fn an_append_with_no_requested_owner_leaves_the_file_owned_by_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _) = two_records(dir.path());
+    let rec = Recording::new(Some((501, 20)));
+    append_loaded_with(load(dir.path()), dir.path(), synthetic(3, 3), None, &rec).unwrap();
+    assert_eq!(rec.state_file_chowns(dir.path()), vec![None]);
+    assert!(
+        rec.bytes_when_read.borrow().is_none(),
+        "an append must not look up the replaced file's owner"
+    );
+}
+
+#[skuld::test]
+fn the_files_owner_is_read_before_the_rewrite_replaces_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let before = std::fs::read(dir.path().join(STATE_FILE_NAME)).unwrap();
+    let rec = Recording::new(Some((501, 20)));
+    remove_accounted_with(dir.path(), &[r1], None, &rec, || {}).unwrap();
+    assert_eq!(rec.bytes_when_read.borrow().as_deref(), Some(before.as_slice()));
+}
+
+#[skuld::test]
+fn a_requested_owner_wins_over_the_files_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let rec = Recording::new(Some((501, 20)));
+    remove_accounted_with(dir.path(), &[r1], Some((7, 8)), &rec, || {}).unwrap();
+    assert_eq!(rec.state_file_chowns(dir.path()), vec![Some((7, 8))]);
+}
+
+#[skuld::test]
+fn a_file_with_no_known_owner_and_no_request_is_not_chowned_to_anyone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let rec = Recording::new(None);
+    remove_accounted_with(dir.path(), &[r1], None, &rec, || {}).unwrap();
+    assert_eq!(rec.state_file_chowns(dir.path()), vec![None]);
+}
+
+#[skuld::test]
+fn only_the_requested_owner_reaches_the_state_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, _) = two_records(dir.path());
+    let rec = Recording::new(Some((501, 20)));
+    remove_accounted_with(dir.path(), &[r1], None, &rec, || {}).unwrap();
+    let dir_chowns: Vec<_> = rec
+        .chowns
+        .borrow()
+        .iter()
+        .filter(|(p, _)| p == dir.path())
+        .map(|(_, o)| *o)
+        .collect();
+    assert_eq!(
+        dir_chowns,
+        vec![None],
+        "the directory is not handed to the file's owner"
+    );
+}
+
+// Swallowed outcomes are logged =======================================================================================
+
+/// Capture this crate's log at `DEBUG` and above while `body` runs.
+fn captured(body: impl FnOnce()) -> String {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = crate::test_support::log_capture::VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        body();
+    }
+    writer.snapshot_string()
+}
+
+#[skuld::test]
+fn clear_if_unusable_reports_a_file_it_could_not_read_and_keeps_it() {
+    // A directory where the file belongs: the read fails with something other
+    // than "not found", so the file is neither classified nor discarded.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(STATE_FILE_NAME)).unwrap();
+
+    let log = captured(|| clear_if_unusable(dir.path()).unwrap());
+
+    assert!(dir.path().join(STATE_FILE_NAME).exists(), "an unreadable file is kept");
+    assert!(
+        log.contains("WARN") && log.contains("could not be read"),
+        "the read failure must not vanish: {log}"
+    );
+}
+
+#[skuld::test]
+fn remove_accounted_says_why_it_removed_nothing_from_a_file_that_is_gone_or_unusable() {
+    let absent = tempfile::tempdir().unwrap();
+    let log = captured(|| remove_accounted(absent.path(), &[synthetic(1, 1)], None).unwrap());
+    assert!(log.contains("DEBUG") && log.contains("no plugin state file"), "{log}");
+
+    let unusable = tempfile::tempdir().unwrap();
+    std::fs::write(unusable.path().join(STATE_FILE_NAME), b"{not json").unwrap();
+    let log = captured(|| remove_accounted(unusable.path(), &[synthetic(1, 1)], None).unwrap());
+    assert!(log.contains("DEBUG") && log.contains("unusable"), "{log}");
 }

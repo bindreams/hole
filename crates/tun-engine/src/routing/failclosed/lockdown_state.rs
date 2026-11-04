@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::exclusive::RecordLock;
+
 /// Schema version. [`load`] discards a mismatched file rather than risk a
 /// corrupt recovery (same policy as the route/failclosed state files).
 pub const SCHEMA_VERSION: u32 = 1;
@@ -25,13 +27,19 @@ pub struct LockdownState {
     pub enabled: bool,
 }
 
+/// Serializes every read-modify-write of the intent file in this process, so an
+/// Unblock's write and a start's promotion cannot interleave. A leaf lock: see
+/// [`RecordLock`].
+static LOCK: RecordLock = RecordLock::new(());
+
 fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
 }
 
 /// Atomically persist `state` (temp file + same-dir rename, `sync_all`
-/// before persist). Creates `state_dir`.
-pub fn save(state_dir: &Path, state: &LockdownState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+/// before persist). Creates `state_dir`. Private: a write outside [`update`]
+/// would bypass [`LOCK`].
+fn save(state_dir: &Path, state: &LockdownState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     util::ownership::chown_if_some(state_dir, owner);
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -83,6 +91,16 @@ impl Intent {
     /// update-consent gate.
     pub fn installs_standing_cover(self) -> bool {
         matches!(self, Intent::On)
+    }
+
+    /// "May a start that just honoured an adopted cover record the kill switch
+    /// as armed?" — `Unset | Unreadable`. `On` needs no write, and `Off` is the
+    /// user's explicit choice: an adopted claim is never proof it still stands.
+    pub fn admits_adoption_promotion(self) -> bool {
+        match self {
+            Intent::Unset | Intent::Unreadable => true,
+            Intent::On | Intent::Off => false,
+        }
     }
 }
 
@@ -141,8 +159,21 @@ pub fn load_enabled(state_dir: &Path) -> bool {
     load_intent(state_dir).reads_armed()
 }
 
-/// Last-writer-wins absolute set. Persists `enabled` under the current schema.
-pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+/// One critical section over the intent file: classify it, let `decide` pick a
+/// value from what is on disk right now, write the value if there is one.
+/// Returns what `decide` returned.
+///
+/// `decide` runs under [`LOCK`], a leaf lock: it must only compute (no I/O
+/// beyond this file, no other lock, no firewall call).
+pub fn update(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    decide: impl FnOnce(Intent) -> Option<bool>,
+) -> std::io::Result<Option<bool>> {
+    let _guard = LOCK.acquire();
+    let Some(enabled) = decide(load_intent(state_dir)) else {
+        return Ok(None);
+    };
     save(
         state_dir,
         &LockdownState {
@@ -150,7 +181,21 @@ pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -
             enabled,
         },
         owner,
-    )
+    )?;
+    Ok(Some(enabled))
+}
+
+/// Last-writer-wins absolute set. Persists `enabled` under the current schema.
+pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+    update(state_dir, owner, |_| Some(enabled)).map(|_| ())
+}
+
+/// Record the kill switch as armed iff no explicit intent is recorded
+/// ([`Intent::admits_adoption_promotion`]); the check and the write are one
+/// critical section, so a concurrent [`set_enabled`] is never overwritten.
+/// `true` when it wrote.
+pub fn promote_unrecorded(state_dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<bool> {
+    update(state_dir, owner, |i| i.admits_adoption_promotion().then_some(true)).map(|w| w.is_some())
 }
 
 /// Delete the state file; tolerates absence.

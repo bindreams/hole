@@ -31,7 +31,7 @@ pub const RESOLVER_PERMIT_PORT: u16 = 443;
 /// `release_all`'s doc for why that distinction is load-bearing. Generic and
 /// declared here (not per-platform) so both macOS state modules share one
 /// reader shape.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum StateFile<T> {
     /// No file — no cover of this kind was ever engaged (or a prior release
     /// already cleared it).
@@ -76,13 +76,61 @@ impl<T> StateFile<T> {
     }
 }
 
+/// A persisted pf cover record, which names the `pfctl -E` token it holds.
+#[cfg(any(target_os = "macos", test))]
+pub trait PfRecord {
+    fn pf_token(&self) -> &str;
+    /// Whether a release has claimed the record (see [`pf_claim`]).
+    fn releasing(&self) -> bool;
+    /// The same record, claimed (`true`) or live again (`false`).
+    fn with_releasing(&self, releasing: bool) -> Self
+    where
+        Self: Sized;
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl<T: PfRecord> StateFile<T> {
+    /// The token the record names: a `Present` record's, or what an `Unusable`
+    /// one could still be read for. `None` for `Absent` and for a record that
+    /// yielded no token.
+    pub fn pf_token(&self) -> Option<&str> {
+        match self {
+            StateFile::Absent => None,
+            StateFile::Present(record) => Some(record.pf_token()),
+            StateFile::Unusable { pf_token } => pf_token.as_deref(),
+        }
+    }
+}
+
+/// What `failclosed_state::swap` and `lockdown_pf_state::swap` did.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swap {
+    /// The record still held what the caller read, and now holds the new value.
+    Applied,
+    /// The record changed since the caller read it, so nothing was written. The
+    /// only writers are an engage and a release: this one lost to a release (or
+    /// a later engage), and the caller backs out. Writing from the older view
+    /// would resurrect a record the release cleared, or stack a second one on a
+    /// host the release already restored.
+    Superseded,
+}
+
 // macOS persists its pf enable token; Windows recovers WFP filters by fixed
-// GUID and needs no state.
-#[cfg(target_os = "macos")]
+// GUID and needs no state. Compiled for every platform's TESTS, because the
+// compare-and-set the two records implement is platform-free and a rule proved
+// only where the hazard lives is proved nowhere else.
+#[cfg(any(target_os = "macos", test))]
 pub mod failclosed_state;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod lockdown_pf_state;
+
+#[cfg(any(target_os = "macos", test))]
+pub mod pf_claim;
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod dropped_tokens;
 
 pub mod luid;
 pub use luid::{LuidResolver, SystemLuidResolver};
@@ -90,6 +138,12 @@ pub use luid::{LuidResolver, SystemLuidResolver};
 pub mod lockdown_state;
 
 pub mod boottime_witness;
+
+pub mod release_epoch;
+pub use release_epoch::{begin_release, watch_releases, ReleaseInFlight, ReleaseWatch};
+
+#[cfg(test)]
+mod ownership_double;
 
 // Compiled out of a macOS PRODUCTION build — Windows' boot-time twin read-back
 // is its only caller — but kept for every lane's TESTS, because the rule it
@@ -113,6 +167,15 @@ pub(crate) mod platform;
 #[cfg(target_os = "macos")]
 #[path = "failclosed/macos.rs"]
 mod platform;
+
+// The pf cover's sequencing (engage, back-out, release, recovery) runs over
+// injected `pfctl` and record seams, so its tests build on every host. This is
+// the same module as `platform` above, compiled a second time for test builds
+// on hosts that have no `pfctl`: a race between an engage and a release is
+// proved where the tests run, not only on the macOS legs.
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "failclosed/macos.rs"]
+mod pf_on_any_host;
 
 /// RAII guard for an engaged fail-closed cover. Dropping it disengages the
 /// cover (Windows: delete the WFP filters by GUID; macOS: restore
@@ -152,9 +215,18 @@ pub fn engage(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    Ok(Cover {
-        _inner: platform::engage(server_ip, resolver_ip, state_dir, owner)?,
-    })
+    let inner = release_epoch::engage_within_watch(state_dir, |watch| {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = watch;
+            platform::engage(server_ip, resolver_ip, state_dir, owner)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            platform::engage(server_ip, resolver_ip, state_dir, owner, watch)
+        }
+    })?;
+    Ok(Cover { _inner: inner })
 }
 
 /// Sweep a transient cover left behind by a crashed run. Idempotent — a no-op
@@ -195,16 +267,19 @@ pub fn engage_lockdown(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    #[cfg(target_os = "windows")]
-    let inner = {
-        let luid = resolver.resolve(tun_name)?;
-        platform::engage_lockdown(server_ip, luid, app_ids, state_dir, owner)?
-    };
-    #[cfg(target_os = "macos")]
-    let inner = {
-        let _ = (resolver, app_ids);
-        platform::engage_lockdown(server_ip, tun_name, state_dir, owner)?
-    };
+    let inner = release_epoch::engage_within_watch(state_dir, |watch| {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = watch;
+            let luid = resolver.resolve(tun_name)?;
+            platform::engage_lockdown(server_ip, luid, app_ids, state_dir, owner)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (resolver, app_ids);
+            platform::engage_lockdown(server_ip, tun_name, state_dir, owner, watch)
+        }
+    })?;
     Ok(Cover { _inner: inner })
 }
 
@@ -410,8 +485,9 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
 ///    warning on failure and do not fail the call. A cover's state-file clear
 ///    is different: it is *skipped* whenever that cover's replacement ruleset
-///    did not confirm, because the file is the cover's only record — clearing
-///    it after an unconfirmed restore would make the next call read a clean
+///    did not confirm (on macOS the record then stays as the tombstone the
+///    release claimed it with), because the file is the cover's only record —
+///    clearing it after an unconfirmed restore would make the next call read a clean
 ///    host while the block persists (a manufactured, permanent lockout).
 ///
 /// Windows keeps no cover state file at all: the filter set is compiled-in
@@ -985,14 +1061,17 @@ fn sweep_with_witness(
     owner: Option<(u32, u32)>,
     sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
-    let witness = boottime_witness::load(state_dir);
-    let SweepOutcome { clearance, failure } = sweep(witness);
+    // Announced before the sweep's first firewall call, held through the
+    // witness write: an engage that overlaps any of it backs out.
+    let _release = release_epoch::begin_release(state_dir);
+    let snapshot = boottime_witness::snapshot(state_dir);
+    let SweepOutcome { clearance, failure } = sweep(snapshot.witness);
     // The record is written from what the sweep OBSERVED, before its failure
     // reaches the caller. A failing sweep is not an unobservant one: this
     // codebase's own sweeps issue every delete before inspecting any code, so
     // `Err` arrives after the sibling's delete already succeeded — see
     // [`SweepOutcome`].
-    boottime_witness::apply(state_dir, witness, clearance.witness_update(), owner);
+    boottime_witness::apply(state_dir, snapshot, clearance.witness_update(), owner);
     match failure {
         Some(e) => Err(e),
         None => Ok(clearance),

@@ -213,6 +213,9 @@ struct MockRouting {
     /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
     /// probe. Defaults to `Absent`.
     cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
+    /// Whether a release was in flight on `state_dir` when `release_all_covers`
+    /// ran: the Unblock must announce itself before its first firewall call.
+    saw_release_in_flight: Arc<AtomicBool>,
 }
 
 impl MockRouting {
@@ -224,6 +227,7 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
+            saw_release_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -242,6 +246,7 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
+            saw_release_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -253,6 +258,7 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
+            saw_release_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -336,6 +342,9 @@ impl Routing for MockRouting {
 
     fn release_all_covers(&self) -> Result<(), RoutingError> {
         self.release_all_calls.fetch_add(1, Ordering::SeqCst);
+        if tun_engine::routing::failclosed::watch_releases(&self.state_dir).is_err() {
+            self.saw_release_in_flight.store(true, Ordering::SeqCst);
+        }
         if self.fail_release.load(Ordering::SeqCst) {
             return Err(crate::test_support::mock_gateway_failure());
         }
@@ -1094,6 +1103,157 @@ fn lockdown_off_releases_covers_through_the_same_path() {
         handle.abort();
         let _ = handle.await;
     });
+}
+
+/// The IPC state over `routing`, with `dir` as both the routing's and the IPC's state
+/// dir, as in production.
+fn ipc_state_over(routing: MockRouting, dir: PathBuf) -> Arc<IpcState<MockProxy, MockRouting>> {
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.clone());
+    let proxy = Arc::new(Mutex::new(pm));
+    let (routing_handle, cover_invalidated) = {
+        let guard = proxy.try_lock().unwrap();
+        (guard.routing_handle(), guard.cover_invalidation_handle())
+    };
+    Arc::new(IpcState {
+        proxy,
+        routing: routing_handle,
+        cover_invalidated,
+        unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
+        version: "test".to_string(),
+        log_dir: dir.clone(),
+        state_dir: dir,
+        owner: None,
+        persist_gate: None,
+        persist_entered: std::sync::Mutex::new(None),
+    })
+}
+
+#[skuld::test]
+async fn an_unblock_is_a_release_in_flight_before_its_first_firewall_call() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(dir.clone());
+    let saw = Arc::clone(&routing.saw_release_in_flight);
+    let state = ipc_state_over(routing, dir.clone());
+    let watch = tun_engine::routing::failclosed::watch_releases(&dir).unwrap();
+
+    let _ = super::handle_unblock(axum::extract::State(state)).await.unwrap();
+
+    assert!(
+        saw.load(Ordering::SeqCst),
+        "a start's watch must refuse to open from the moment the release begins"
+    );
+    assert!(watch.check().is_err(), "a start that was already underway is overtaken");
+    assert!(
+        tun_engine::routing::failclosed::watch_releases(&dir).is_ok(),
+        "and the release ends with the Unblock"
+    );
+}
+
+#[skuld::test]
+async fn an_unblock_whose_release_fails_still_ends_its_release() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(dir.clone());
+    routing.fail_release.store(true, Ordering::SeqCst);
+    let state = ipc_state_over(routing, dir.clone());
+
+    let result = super::handle_unblock(axum::extract::State(state)).await;
+
+    assert!(result.is_err());
+    assert!(
+        tun_engine::routing::failclosed::watch_releases(&dir).is_ok(),
+        "a failed Unblock must not leave every later start refused"
+    );
+}
+
+/// The release spans the persisted `Off` as well as the firewall call, even when the
+/// client goes away and hyper drops the handler future at the persist's `.await`.
+/// The persist is held at the target file's lock, so it cannot end before the
+/// assertions run; dropping the runtime is what joins it.
+#[skuld::test]
+fn a_dropped_unblock_handler_future_does_not_end_the_release_before_the_persist() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use tun_engine::routing::failclosed::watch_releases;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = ipc_state_over(MockRouting::new(dir.path().to_owned()), dir.path().to_owned());
+
+    // Declared first, dropped last: dropping it joins the persist, which waits on `holder`, which
+    // waits on `let_go_tx`. A failed assertion drops `let_go_tx` first and unblocks the chain.
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (let_go_tx, let_go_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn({
+        let dir = dir.path().to_owned();
+        move || {
+            target::apply(&dir, None, |current| {
+                entered_tx.send(()).unwrap();
+                let _ = let_go_rx.recv();
+                current
+            })
+        }
+    });
+    entered_rx.recv().unwrap();
+
+    runtime.block_on(async {
+        let mut handler = Box::pin(super::handle_unblock(axum::extract::State(state)));
+        let polled = handler.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(matches!(polled, Poll::Pending), "the persist is waiting on the lock");
+    });
+
+    assert!(
+        watch_releases(dir.path()).is_err(),
+        "the handler future is gone, but the persist it spawned is not done: the release is still in flight"
+    );
+
+    let_go_tx.send(()).unwrap();
+    holder.join().unwrap().unwrap();
+    drop(runtime);
+    assert!(
+        watch_releases(dir.path()).is_ok(),
+        "and it ends with the persist, not before and not never"
+    );
+}
+
+/// The release is announced before the first firewall call, and the guard moves into
+/// the persist's closure so nothing the handler future does can end it early.
+#[skuld::test]
+fn the_unblock_handler_hands_its_release_to_the_persist() {
+    let src = include_str!("ipc.rs");
+    let start = src.find("async fn handle_unblock").expect("handle_unblock must exist");
+    let body = &src[start
+        ..src[start..]
+            .find(
+                "
+}",
+            )
+            .map(|i| start + i)
+            .expect("the handler ends")];
+
+    let begin = body
+        .find("let release = ")
+        .expect("the guard must be a named binding, not `_`");
+    let released = body.find("release_all_covers()").expect("the handler releases covers");
+    let spawn = body.find("spawn_blocking").expect("the persist runs off-thread");
+    let moved = body
+        .find("let _release = release;")
+        .expect("the persist's closure must take the guard");
+    let persist = body
+        .find("lockdown_state::set_enabled")
+        .expect("the handler persists the intent");
+    assert!(
+        begin < released,
+        "the release is announced before the first firewall call"
+    );
+    assert!(
+        spawn < moved && moved < persist,
+        "the closure owns the guard through the persist"
+    );
+    assert!(
+        !body.contains("drop(release"),
+        "the guard ends with the closure, not at a call in the handler"
+    );
 }
 
 /// Seam guard with the sibling teardown item: `handle_unblock` must consume
