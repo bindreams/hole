@@ -3530,7 +3530,7 @@ async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
     let pref = target::load_startup_preference(&dir);
     assert!(
         pref.candidate.is_none(),
-        "the declined target write still recorded an auto-connect candidate, leaving the two          records disagreeing about what the user last asked for"
+        "the declined target write still recorded an auto-connect candidate, leaving the two records disagreeing about what the user last asked for"
     );
     assert_eq!(
         pref.on_startup,
@@ -3547,32 +3547,29 @@ async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
 ///
 /// Asserted by source, not by interleaving: neither sequence has a point a test
 /// can park at, and an unbounded wait for "the other side has blocked on the
-/// mutex" has no condition to re-check. The guard is `!Send`, so holding it
-/// across an `.await` in either handler already fails to compile.
+/// mutex" has no condition to re-check. In each function the guard must be bound
+/// (`let _ =` drops it at once) and taken before the first write.
 #[skuld::test]
 fn the_unblock_and_the_start_persist_run_under_the_intent_persist_mutex() {
     let src = include_str!("ipc.rs");
-    for item in ["async fn handle_unblock", "async fn persist_after_start"] {
-        let start = src.find(item).unwrap_or_else(|| panic!("{item} must exist in ipc.rs"));
-        let after_start = &src[start + 1..];
-        let end = after_start
-            .find(
-                "
-async fn ",
-            )
-            .or_else(|| {
-                after_start.find(
-                    "
-fn ",
-                )
-            })
-            .map(|i| start + 1 + i)
-            .unwrap_or(src.len());
+    let ordering_sites = regex::Regex::new(
+        r"\bintent_persist\.lock\(|\btarget::apply\(|\bwrite_start_records\(|\bapply_startup_preference\(|\bset_enabled\(",
+    )
+    .unwrap();
+    let sites = crate::reconciler::reconciler_tests::call_sites_by_function(src, &ordering_sites);
+    for function in ["handle_unblock", "persist_after_start"] {
+        let in_function: Vec<&str> = sites
+            .iter()
+            .filter(|(name, line)| name == function && !line.starts_with("//"))
+            .map(|(_, line)| line.as_str())
+            .collect();
         assert!(
-            src[start..end].contains("intent_persist.lock("),
-            "{item} must lock `intent_persist` around its target and candidate writes:
-{}",
-            &src[start..end]
+            in_function.len() > 1,
+            "{function} must hold the lock and write under it: {in_function:?}"
+        );
+        assert!(
+            in_function[0].starts_with("let _ordered = intent_persist.lock("),
+            "{function} must bind the `intent_persist` guard before its first write: {in_function:?}"
         );
     }
 }
