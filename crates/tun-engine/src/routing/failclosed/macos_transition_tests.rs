@@ -126,7 +126,7 @@ impl<I: EngageOps> EngageOps for PublishOnCommit<'_, I> {
     fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
         self.inner.enable_capture_token()
     }
-    fn save_transient(&mut self, st: &state::FailClosedState) -> Result<(), RoutingError> {
+    fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError> {
         self.inner.save_transient(st)
     }
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
