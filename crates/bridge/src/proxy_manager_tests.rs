@@ -3859,11 +3859,12 @@ mod self_test {
         });
     }
 
-    /// An Unblock still in flight when the install returns has not said what it did. The start is cancelled, and the
-    /// cover it just installed is held as the pending cover, not dropped: if the release changes nothing, the host
-    /// stays blocked and a retry reuses the cover; if it changes something, the cover is gone and nothing reports it.
+    /// An Unblock still in flight when the install returns has not said what it did, and its deletes may already
+    /// have run before the install: the start cannot tell a cover that stands from one the release left live and
+    /// unreported. It cancels and drops the cover it just installed, as under a release that ended with a change;
+    /// the intent is still on, so the next start installs again.
     #[skuld::test]
-    fn an_unblock_in_flight_after_the_cover_install_cancels_the_start_and_keeps_the_cover() {
+    fn an_unblock_in_flight_after_the_cover_install_cancels_the_start_and_drops_the_cover() {
         rt().block_on(async {
             let (mut pm, cfg, st, dir) = covered_gate_setup(false);
             st.release_during_next_install(dir.path(), true);
@@ -3875,55 +3876,56 @@ mod self_test {
 
             assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
             assert_eq!(pm.last_error(), None, "a cancelled start records no failure");
-            assert!(
-                pm.blocked_until_connected(),
-                "the cover is kept while the release is in doubt"
+            assert!(!pm.blocked_until_connected(), "a dropped cover is not held");
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "the cover this start installed is dropped, not kept for the release to decide"
             );
-            assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 0);
             assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst), 1);
 
-            // The release failed before it deleted anything: the cover stands, and a retry reuses it.
+            // Whatever the release then reports, no cover is held, and the retry installs its own.
             for release in st.releases_in_flight.lock().unwrap().drain(..) {
                 release.changed_nothing();
             }
-            assert!(pm.blocked_until_connected());
+            assert!(!pm.blocked_until_connected());
             let err = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(!matches!(err, ProxyError::Cancelled), "{err:?}");
+            assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst), 2);
             assert_eq!(
-                st.cover_engage_attempts.load(Ordering::SeqCst),
+                st.cover_disengage_calls.load(Ordering::SeqCst),
                 1,
-                "the retry reuses the kept cover"
+                "the first cover is not dropped twice"
             );
-            assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 0);
         });
     }
 
-    /// The same start, but the release that was in flight ends with a change: the cover it held is gone, so the
-    /// posture stops reporting it, and the next start drops the guard.
+    /// The same start, but the release that was in flight then ends with a change: nothing is left held or live
+    /// that the status could miss.
     #[skuld::test]
-    fn a_cover_kept_under_an_unblock_that_then_changes_something_is_dropped() {
+    fn an_unblock_in_flight_after_the_cover_install_that_then_changes_something_leaves_no_cover() {
         rt().block_on(async {
             let (mut pm, cfg, st, dir) = covered_gate_setup(false);
             st.release_during_next_install(dir.path(), true);
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
-            assert!(pm.blocked_until_connected());
 
             st.end_releases();
 
-            assert!(
-                !pm.blocked_until_connected(),
-                "a release took the cover: the status is not blocked"
-            );
-            // The next start reaps the guard before it reads anything, then engages its own cover.
+            assert!(!pm.blocked_until_connected());
+            assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 1);
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
-            assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "no stale guard to reap"
+            );
             assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst), 2);
             assert!(pm.blocked_until_connected());
         });
@@ -4206,6 +4208,32 @@ mod self_test {
                 2,
                 "both covers are gone"
             );
+        });
+    }
+
+    #[skuld::test]
+    fn an_unblock_in_flight_after_a_repairs_restore_engage_cancels_the_start_and_drops_that_cover() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, resolver, dir) = repair_setup().await;
+            st.fail_cover_for_resolvers.lock().unwrap().insert(Some(resolver));
+            st.release_during_install(dir.path(), true, 1);
+            let before = st.cover_engage_attempts.load(Ordering::SeqCst);
+            let disengaged = st.cover_disengage_calls.load(Ordering::SeqCst);
+
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert!(!pm.blocked_until_connected(), "the restored cover is dropped, not held");
+            assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst) - before, 2);
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst) - disengaged,
+                2,
+                "the held cover the repair released, and the restored one the release left in doubt"
+            );
+            st.end_releases();
         });
     }
 

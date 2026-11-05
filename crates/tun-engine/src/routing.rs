@@ -1522,7 +1522,9 @@ where
     // touches that permit.
     lockdown_recover(decision.action, tun_name_hint.as_deref());
 
-    // Sweep any transient fail-closed cover left by a crashed update cutover.
+    // Sweep any transient fail-closed cover left by a bridge that crashed holding one. Only a bridge up to
+    // 0.6.0 engages one (no current start does, and the update cutover never has), so this is for the leftovers
+    // of an older bridge.
     // Runs UNCONDITIONALLY (outside the route-state guard above): a crash can
     // leave a cover engaged with the routes already torn down, so there is no
     // bridge-routes.json, yet the cover persists. The cover is keyed
