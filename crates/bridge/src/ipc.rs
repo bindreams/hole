@@ -117,8 +117,8 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// `start_cancellable` consumes: `reload`'s hot-swap path never calls that,
     /// so one stale unblock would wedge every later hot-swap write.
     ///
-    /// The compare-and-set half of f745e03c that the proxy lock cannot give,
-    /// because `handle_unblock` deliberately takes no proxy lock.
+    /// The compare-and-set the proxy lock cannot give, because `handle_unblock`
+    /// deliberately takes no proxy lock.
     pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Orders `persist_after_start`'s target + candidate writes against
     /// `handle_unblock`'s `Off` + `set_enabled` + candidate clear, each a

@@ -4289,11 +4289,8 @@ tracing::warn!(error = &e as &dyn std::error::Error, "what failed");
   inner error as `#[source]` and writes `#[error("{0}")]`, never `transparent`: that forwards `source()` past the inner
   value, so `find` and `raw_os_error` cannot reach it (test-enforced). Until such a variant gets text of its own, a
   logged chain shows the inner text twice.
-- **Reading a chain in code.** [`util::error`](crates/util/src/error.rs) has two walks. `chain` follows `source()`
-  only; it is what the renderer prints. `links` also descends an `io::Error` through `get_ref`, because
-  `io::Error::other(e)` keeps `e` out of `source()` while its `Display` shows it. `find::<T>` and `raw_os_error` are
-  predicates over `links`: a typed cause or an OS code is found wherever the wrapping put it. Do not write a
-  `source()` loop by hand.
+- **Reading a chain in code.** Use [`util::error`](crates/util/src/error.rs) (`chain`, `links`, `find`, `raw_os_error`);
+  do not write a `source()` loop by hand.
 - **A value that is not an error stays as it is.** Third-party types with no `std::error::Error` impl and a `String`
   made from an error are logged as they are; text a user reads (a dialog, a toast) is written from `user_message()` or
   the type's `Display`, never from the log field.

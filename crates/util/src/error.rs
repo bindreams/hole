@@ -3,12 +3,6 @@
 //! Two walks, because `io::Error` hides its payload from `source()`: it
 //! delegates to the payload's own `source()`, so `io::Error::other(typed)`
 //! skips `typed` itself.
-//!
-//! - [`chain`] follows `source()` only: the error and what caused it. An
-//!   `io::Error`'s `Display` is its payload's, so the payload is rendered once.
-//! - [`links`] visits every cause once: an `io::Error` descends through
-//!   [`io::Error::get_ref`] (its payload), any other error through `source()`.
-//!   [`find`] and [`raw_os_error`] are predicates over it.
 
 use std::io;
 
