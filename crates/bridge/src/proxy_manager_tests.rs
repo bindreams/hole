@@ -244,6 +244,8 @@ pub(crate) struct MockRoutingState {
     /// `install_lockdown`: a release (the tray's Unblock) landing during the
     /// install.
     on_install: std::sync::Mutex<Option<(u32, InstallHook)>>,
+    /// Runs once, when the next [`MockCover`] is dropped.
+    on_cover_drop: std::sync::Mutex<Option<InstallHook>>,
     /// Releases a test left in flight (guards held until the test ends).
     releases_in_flight: std::sync::Mutex<Vec<tun_engine::routing::failclosed::ReleaseInFlight>>,
     /// `install` excludes any [`RouteId`] in this set from the persisted
@@ -287,6 +289,7 @@ impl Default for MockRoutingState {
             supersede_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
             cover_engage_attempts: AtomicU32::new(0),
             on_install: std::sync::Mutex::new(None),
+            on_cover_drop: std::sync::Mutex::new(None),
             releases_in_flight: std::sync::Mutex::new(Vec::new()),
             fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_teardown_installed: std::sync::Mutex::new(None),
@@ -335,6 +338,14 @@ impl MockRoutingState {
                 }
             }),
         ));
+    }
+
+    /// Arrange for an Unblock to run to its end as the next [`MockCover`] is dropped.
+    fn unblock_during_next_cover_drop(&self, state_dir: &std::path::Path) {
+        let dir = state_dir.to_path_buf();
+        *self.on_cover_drop.lock().unwrap() = Some(Box::new(move || {
+            tun_engine::routing::failclosed::begin_release(&dir).about_to_delete();
+        }));
     }
 
     /// End every release a test left in flight.
@@ -628,6 +639,10 @@ pub(crate) struct MockCover {
 
 impl Drop for MockCover {
     fn drop(&mut self) {
+        let hook = self.state.on_cover_drop.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         if self.lockdown {
             self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
             self.state.teardown_order.lock().unwrap().push("lockdown");
@@ -3912,6 +3927,38 @@ mod self_test {
             let err = pm.reload(&cfg).await.unwrap_err();
 
             assert!(!matches!(err, ProxyError::Cancelled), "{err:?}");
+        });
+    }
+
+    #[skuld::test]
+    fn an_unblock_that_completes_as_the_start_consumes_the_invalidated_cover_cancels_the_start() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected());
+            // The Unblock's own order: flag the held cover, then release it.
+            pm.cover_invalidation_handle()
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            st.unblock_during_next_cover_drop(dir.path());
+            let engaged = st.cover_engage_attempts.load(Ordering::SeqCst);
+
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(err, ProxyError::Cancelled),
+                "the Unblock ran inside this start, after the start saw the flag: {err:?}"
+            );
+            assert_eq!(
+                st.cover_engage_attempts.load(Ordering::SeqCst),
+                engaged,
+                "and the start installs nothing over it"
+            );
+            assert!(!pm.blocked_until_connected());
         });
     }
 

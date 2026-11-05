@@ -852,6 +852,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::AlreadyRunning);
         }
 
+        // Opened first: before the invalidation flag below is read and before this start
+        // reads anything an Unblock writes (the intent, the target). An Unblock that
+        // begins after this point supersedes the start where it commits to a cover. A
+        // start that installs no cover (an uncovered one, a reload without a standing
+        // cover expected) is never refused by it.
+        let release_watch = self.state_dir.as_deref().map(watch_releases);
+
         // A lock-free `handle_unblock` may have released every OS-level
         // cover while this manager wasn't holding the lock. Any
         // `PendingStart` we're still carrying is now a zombie: the OS
@@ -865,12 +872,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if self.cover_invalidated.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.posture.take_pending();
         }
-
-        // Opened before this start reads anything an Unblock writes (the intent, the
-        // target). An Unblock that begins after this point supersedes the start where it
-        // commits to a cover. A start that installs no cover (an uncovered one, a reload
-        // without a standing cover expected) is never refused by it.
-        let release_watch = self.state_dir.as_deref().map(watch_releases);
 
         // A (re)start supersedes any prior out-of-band death — clear the death
         // reason regardless of this attempt's outcome.
