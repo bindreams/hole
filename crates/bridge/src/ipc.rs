@@ -813,15 +813,13 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Announced before the first firewall call and held through the persist
-    // below: a start that opened its release watch earlier, or that begins now,
-    // is cancelled instead of installing a cover this Unblock would then leave
-    // behind with the intent `Off`. Takes no lock a start holds. The persist's
-    // closure owns the guard: hyper drops this future when the client goes
-    // away, and the persist runs on regardless.
-    // The Unblock moves two counters: the release epoch, when the sweep inside
-    // `release_all_covers` marks its own guard just before its first delete (an Unblock
-    // that fails before the firewall supersedes no start), and `unblock_generation` at
-    // the `Off` commit below.
+    // below. A start that opened its release watch earlier is superseded when
+    // this guard ends, unless the Unblock changed nothing; while it is in
+    // flight, a start that commits to a cover is cancelled. Takes no lock a
+    // start holds. The persist's closure owns the guard: hyper drops this
+    // future when the client goes away, and the persist runs on regardless.
+    // The Unblock moves two counters: the release epoch (when a guard ends) and
+    // `unblock_generation` at the `Off` commit below.
     let release = tun_engine::routing::failclosed::begin_release(&state.state_dir);
 
     // Invalidate any transient cover guard a concurrent, lock-holding
@@ -842,6 +840,8 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     // two bespoke `must_release` expressions used to carry.
     if let Err(e) = state.routing.release_all_covers() {
         error!(error = &e as &dyn std::error::Error, "unblock: release failed");
+        // The sweep's own guard carries what it did to the firewall; this one has changed nothing else.
+        release.changed_nothing();
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

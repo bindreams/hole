@@ -107,7 +107,7 @@ pub mod lockdown_state;
 pub mod boottime_witness;
 
 pub mod release_epoch;
-pub use release_epoch::{begin_release, watch_releases, ReleaseInFlight, ReleaseWatch};
+pub use release_epoch::{begin_release, watch_releases, Overtaken, ReleaseInFlight, ReleaseWatch};
 
 // Compiled out of a macOS PRODUCTION build — Windows' boot-time twin read-back
 // is its only caller — but kept for every lane's TESTS, because the rule it
@@ -363,8 +363,8 @@ pub fn reclaim_stale_tun_permit(tun_name: &str) {
 /// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
 /// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
 pub fn disengage_lockdown(state_dir: &Path) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(state_dir, None, |witness, release| {
-        platform::disengage_lockdown(state_dir, witness, release)
+    sweep_with_witness(state_dir, None, |witness| {
+        platform::disengage_lockdown(state_dir, witness)
     })
 }
 
@@ -439,9 +439,7 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or
 /// version-skewed and nothing to erase — only GUID sweeps run there.
 pub fn release_all(state_dir: &Path) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(state_dir, None, |witness, release| {
-        platform::release_all(state_dir, witness, release)
-    })
+    sweep_with_witness(state_dir, None, |witness| platform::release_all(state_dir, witness))
 }
 
 // Release clearance ===================================================================================================
@@ -1006,21 +1004,28 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 fn sweep_with_witness(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
-    sweep: impl FnOnce(ArmingWitness, &release_epoch::ReleaseInFlight) -> SweepOutcome,
+    sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
     // Announced before the sweep's first firewall call, held through the
-    // witness write: an engage that overlaps any of it backs out. The sweep
-    // marks it just before its first delete; one that fails earlier supersedes
-    // nothing.
+    // witness write: an engage that overlaps any of it backs out. It supersedes
+    // by default; only a sweep that reports it never reached the firewall
+    // changed nothing.
     let release = release_epoch::begin_release(state_dir);
     let snapshot = boottime_witness::snapshot(state_dir);
-    let SweepOutcome { clearance, failure } = sweep(snapshot.witness, &release);
+    let SweepOutcome {
+        clearance,
+        failure,
+        unreached,
+    } = sweep(snapshot.witness);
     // The record is written from what the sweep OBSERVED, before its failure
     // reaches the caller. A failing sweep is not an unobservant one: this
     // codebase's own sweeps issue every delete before inspecting any code, so
     // `Err` arrives after the sibling's delete already succeeded — see
     // [`SweepOutcome`].
     boottime_witness::apply(state_dir, snapshot, clearance.witness_update(), owner);
+    if unreached {
+        release.changed_nothing();
+    }
     match failure {
         Some(e) => Err(e),
         None => Ok(clearance),
@@ -1045,6 +1050,8 @@ fn sweep_with_witness(
 pub(crate) struct SweepOutcome {
     clearance: Clearance,
     failure: Option<RoutingError>,
+    /// The sweep failed before its first firewall call, so the host is as it was.
+    unreached: bool,
 }
 
 impl SweepOutcome {
@@ -1053,6 +1060,7 @@ impl SweepOutcome {
         Self {
             clearance,
             failure: None,
+            unreached: false,
         }
     }
 
@@ -1064,6 +1072,18 @@ impl SweepOutcome {
         Self {
             clearance,
             failure: Some(error),
+            unreached: false,
+        }
+    }
+
+    /// The sweep failed before its first firewall call (the engine would not open), so it changed nothing:
+    /// its release supersedes no install. `clearance` is the empty fold.
+    #[cfg(any(test, target_os = "windows"))]
+    pub(crate) fn unreached(clearance: Clearance, error: RoutingError) -> Self {
+        Self {
+            clearance,
+            failure: Some(error),
+            unreached: true,
         }
     }
 

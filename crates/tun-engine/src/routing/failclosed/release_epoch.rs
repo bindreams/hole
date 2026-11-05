@@ -4,18 +4,20 @@
 //! A release (the tray's Unblock, `bridge unlock`, a cover sweep) must never
 //! block on a start that is wedged, so it cannot take a lock the engage holds.
 //! It announces itself instead: [`begin_release`] counts it in flight BEFORE the
-//! release touches the firewall, and the release calls
-//! [`ReleaseInFlight::about_to_delete`] just before its first delete, which moves
-//! an epoch. A release that fails before then changed nothing and supersedes
-//! nothing; the type, not its callers, owns what "superseded" means.
+//! release touches the firewall. When the guard ends it moves an epoch, so a
+//! release SUPERSEDES by default; the one opt-out is
+//! [`ReleaseInFlight::changed_nothing`], for a release that failed before it
+//! changed anything. The guard and the watch own all of this: no caller marks,
+//! flags or taints anything.
 //!
 //! An install opens a [`ReleaseWatch`] when it starts and checks it where it
-//! commits to a cover and after it installs. A check fails while any release is
-//! in flight, marked or not, and after any release marked itself since the watch
-//! opened. A watch opened while a release was in flight is failed for good: the
-//! install may have read state that release was still writing. An install's
-//! record writes check the watch inside their critical section, so no write
-//! lands once a release has begun.
+//! commits to a cover and after it installs. [`ReleaseWatch::check`] answers
+//! with one verdict: clear, [`Overtaken::Superseded`] (a release ended with a
+//! change since the watch opened) or [`Overtaken::InDoubt`] (a release is in
+//! flight and has not said what it did). What an install does with a cover it
+//! holds is decided once, on that verdict. An install's record writes check the
+//! watch inside their critical section, so no write lands once a release has
+//! begun.
 //!
 //! The epoch orders an engage against ANY release: the tray's Unblock holds its guard through its persisted
 //! `Off`, a sweep through its witness write. It does not decide what a start records; that is the user's
@@ -26,19 +28,31 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::error::RoutingError;
 
-/// One `state_dir`'s release count. Atomics, so that a watch can be checked while
-/// a record lock is held without taking a second lock.
+/// One `state_dir`'s release count. Both fields move under one lock, so a reader sees them together and no
+/// read order can miss a release that began and ended between two reads. The lock is a leaf: nothing is called
+/// while it is held, so a watch can be checked inside a record update.
 #[derive(Debug, Default)]
 struct Slot {
-    /// Releases that marked themselves since the process started.
-    epoch: AtomicU64,
+    state: Mutex<SlotState>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SlotState {
+    /// Releases that ended with a change since the process started.
+    epoch: u64,
     /// Releases begun and not yet ended.
-    in_flight: AtomicUsize,
+    in_flight: usize,
+}
+
+impl Slot {
+    /// A poisoned lock is recovered: nothing under it can be left half-updated.
+    fn state(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Per-`state_dir` slots. A leaf lock: only the map lives under it, and a slot is cloned out before anything is
@@ -54,75 +68,97 @@ fn slot(state_dir: &Path) -> Arc<Slot> {
 #[must_use = "the release is in flight only while this guard is alive"]
 pub struct ReleaseInFlight {
     slot: Arc<Slot>,
+    /// Cleared only by [`Self::changed_nothing`].
+    supersedes: bool,
 }
 
 /// Announce a release. Call it BEFORE the first firewall call, and hold the
 /// guard until everything the release must be ordered against is done (for the
-/// tray's Unblock: through the persisted `Off`). It supersedes an install only
-/// once [`ReleaseInFlight::about_to_delete`] is called.
+/// tray's Unblock: through the persisted `Off`). It supersedes every watch
+/// opened before it ends, unless consumed by [`ReleaseInFlight::changed_nothing`].
 pub fn begin_release(state_dir: &Path) -> ReleaseInFlight {
     let slot = slot(state_dir);
-    slot.in_flight.fetch_add(1, Ordering::SeqCst);
-    ReleaseInFlight { slot }
+    slot.state().in_flight += 1;
+    ReleaseInFlight { slot, supersedes: true }
 }
 
 impl ReleaseInFlight {
-    /// Mark the release as touching the firewall. Call it just before the
-    /// first delete is attempted; a partial failure after it still counts. May
-    /// be called again, before each delete.
-    pub fn about_to_delete(&self) {
-        self.slot.epoch.fetch_add(1, Ordering::SeqCst);
+    /// End a release that failed before it changed anything an install could have raced: it supersedes
+    /// nothing. Consumes the guard, so no later step can still claim to have changed something.
+    pub fn changed_nothing(mut self) {
+        self.supersedes = false;
     }
 }
 
 impl Drop for ReleaseInFlight {
     fn drop(&mut self) {
-        let before = self.slot.in_flight.fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(before > 0, "a release guard outlived its own count");
+        let mut state = self.slot.state();
+        debug_assert!(state.in_flight > 0, "a release guard outlived its own count");
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if self.supersedes {
+            state.epoch += 1;
+        }
+    }
+}
+
+/// Why a release stops an install, as [`ReleaseWatch::check`] reports it. What each means for a cover the
+/// install holds is the caller's one decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overtaken {
+    /// A release ended with a change since the watch opened: the cover it names is gone or going.
+    Superseded,
+    /// A release is in flight and has not said what it did: the install must stop, and nothing it holds is
+    /// known to be gone.
+    InDoubt,
+}
+
+impl std::fmt::Display for Overtaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Overtaken::Superseded => f.write_str("a release ended since the install began"),
+            Overtaken::InDoubt => f.write_str("a release is in flight"),
+        }
     }
 }
 
 /// An install's view of the releases when it opened.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReleaseWatch {
     slot: Arc<Slot>,
     epoch: u64,
-    /// A release was in flight when the watch opened.
-    opened_during_a_release: bool,
 }
 
 /// Open a watch when an install starts, before it reads any state a release
 /// writes. Never refuses: whether a release stops the install is decided by
 /// [`ReleaseWatch::check`], where the install commits to a cover.
-///
-/// The epoch is read first, then the in-flight count: a release that marks
-/// itself before the epoch read and is still in flight after it is counted.
 pub fn watch_releases(state_dir: &Path) -> ReleaseWatch {
     let slot = slot(state_dir);
-    let epoch = slot.epoch.load(Ordering::SeqCst);
-    let opened_during_a_release = slot.in_flight.load(Ordering::SeqCst) > 0;
-    ReleaseWatch {
-        slot,
-        epoch,
-        opened_during_a_release,
-    }
+    let epoch = slot.state().epoch;
+    ReleaseWatch { slot, epoch }
 }
 
 impl ReleaseWatch {
-    /// Fails if a release is in flight, or was when the watch opened, or marked
-    /// itself since: the install it guards may have raced it. Takes no lock, so a
-    /// record write can check it inside its own critical section.
+    /// `Ok` if no release has overtaken the install this watch guards. An epoch that moved since the watch
+    /// opened is [`Overtaken::Superseded`] even while another release is in flight; a release in flight with
+    /// the epoch unmoved is [`Overtaken::InDoubt`]. A watch opened during a release that then ends with a
+    /// change is superseded by it, which covers an install that read state the release was still writing.
     ///
-    /// The in-flight count is read before the epoch: a release that began, marked
-    /// and ended between the two reads is seen by the epoch.
-    pub fn check(&self) -> Result<(), RoutingError> {
-        if self.opened_during_a_release
-            || self.slot.in_flight.load(Ordering::SeqCst) > 0
-            || self.slot.epoch.load(Ordering::SeqCst) != self.epoch
-        {
-            return Err(RoutingError::SupersededByRelease);
+    /// Takes no lock but the slot's leaf one, so a record write can check it inside its own critical section.
+    pub fn check(&self) -> Result<(), Overtaken> {
+        let state = *self.slot.state();
+        if state.epoch != self.epoch {
+            return Err(Overtaken::Superseded);
+        }
+        if state.in_flight > 0 {
+            return Err(Overtaken::InDoubt);
         }
         Ok(())
+    }
+}
+
+impl From<Overtaken> for RoutingError {
+    fn from(verdict: Overtaken) -> Self {
+        RoutingError::SupersededByRelease(verdict)
     }
 }
 

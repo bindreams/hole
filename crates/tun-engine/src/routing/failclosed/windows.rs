@@ -238,7 +238,6 @@ use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
-use super::release_epoch::ReleaseInFlight;
 use super::RESOLVER_PERMIT_PORT;
 use super::{ArmingWitness, Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, SweepOutcome};
 use crate::error::RoutingError;
@@ -2216,7 +2215,7 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
 /// engine open but not the write — would leave the kill switch engaged while
 /// the intent reads "off", with nothing left to reconcile it. The macOS arm
 /// has always propagated its `pfctl` failures; this is the same rule.
-pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness, release: &ReleaseInFlight) -> SweepOutcome {
+pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
     let swept = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -2224,8 +2223,6 @@ pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness, release: &R
         if rc != ERROR_SUCCESS.0 {
             return disengage_verdict(Some(rc), &[], witness);
         }
-        // The engine is open: the deletes below are the release's first contact with the firewall.
-        release.about_to_delete();
         // Every delete is ISSUED before any code is inspected, matching
         // `release_all`: a short-circuit would leave a later lockdown filter
         // installed because an earlier one failed. The KEY rides along with
@@ -2262,7 +2259,7 @@ pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness, release: &R
 /// refused the delete".
 fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witness: ArmingWitness) -> SweepOutcome {
     if let Some(rc) = open_failure {
-        return SweepOutcome::failed(
+        return SweepOutcome::unreached(
             // The empty fold, not a discarded one: no delete was issued, so
             // there is no observation to carry.
             Clearance::from_observations(&[], witness),
@@ -2352,13 +2349,13 @@ unsafe fn delete_all(engine: HANDLE) {
 /// that this call can see — but it is only *proof of absence* for a
 /// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
 /// two lets the MSI delete `hole.exe` over a key it never observed.
-pub fn release_all(_state_dir: &Path, witness: ArmingWitness, release: &ReleaseInFlight) -> SweepOutcome {
+pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
     unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return SweepOutcome::failed(
+            return SweepOutcome::unreached(
                 // The empty fold: nothing was issued, so nothing was observed.
                 Clearance::from_observations(&[], witness),
                 RoutingError::RouteSetup(format!(
@@ -2366,9 +2363,6 @@ pub fn release_all(_state_dir: &Path, witness: ArmingWitness, release: &ReleaseI
                 )),
             );
         }
-
-        // The engine is open: the deletes below are the release's first contact with the firewall.
-        release.about_to_delete();
 
         // One pass, both folds: each key carries its lifetime out of the
         // sweep list, so the failure verdict and the clearance are derived

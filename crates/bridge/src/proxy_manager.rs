@@ -1089,7 +1089,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         });
                     }
                     // Superseded by a release: cancel, neither run uncovered nor engage again.
-                    Err(e) if e.cancels_the_start() => return Err(self.cancelled_start()),
+                    Err(e) if e.overtaken_by_release().is_some() => return Err(self.cancelled_start()),
                     Err(e) => {
                         if let Some((old_permit, original_pin)) = repair_fallback {
                             match self.routing.install_failclosed_cover(server_ip, old_permit) {
@@ -1131,7 +1131,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                     }
                                     self.last_error = Some(e.to_string());
                                 }
-                                Err(e2) if e2.cancels_the_start() => return Err(self.cancelled_start()),
+                                Err(e2) if e2.overtaken_by_release().is_some() => return Err(self.cancelled_start()),
                                 Err(e2) => {
                                     warn!(
                                         error = &e as &dyn std::error::Error,
@@ -2320,7 +2320,9 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
 /// The caller drops the cover it holds on `Err`.
 fn overtaken_by_release(watch: Option<&ReleaseWatch>) -> Result<(), ProxyError> {
     match watch {
-        Some(watch) => watch.check().map_err(ProxyError::from),
+        Some(watch) => watch
+            .check()
+            .map_err(|verdict| ProxyError::from(tun_engine::RoutingError::from(verdict))),
         None => Ok(()),
     }
 }

@@ -349,10 +349,12 @@ impl Routing for MockRouting {
             self.saw_release_in_flight.store(true, Ordering::SeqCst);
         }
         // As `failclosed::release_all`: a sweep that fails before the firewall supersedes nothing.
+        let release = tun_engine::routing::failclosed::begin_release(&self.state_dir);
         if self.fail_release.load(Ordering::SeqCst) {
+            release.changed_nothing();
             return Err(crate::test_support::mock_gateway_failure());
         }
-        tun_engine::routing::failclosed::begin_release(&self.state_dir).about_to_delete();
+        drop(release);
         Ok(())
     }
 
