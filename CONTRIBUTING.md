@@ -4286,9 +4286,10 @@ tracing::warn!(error = &e as &dyn std::error::Error, "what failed");
   `garter-bin` install prints the same field as `error=<Display> error.sources=[..]`, so the call site is the same there.
 - **The type rule.** A variant's `Display` names what this layer failed to do and never formats its `source()`; a cause
   is `#[source]` or `#[from]`. A `Display` that includes its cause prints it twice. A wrapper variant exposes its
-  inner error as `#[source]` and writes `#[error("{0}")]`, never `transparent`: that forwards `source()` past the inner
-  value, so `find` and `raw_os_error` cannot reach it (test-enforced). Until such a variant gets text of its own, a
-  logged chain shows the inner text twice.
+  inner error as its `source()` and is never `#[error(transparent)]`, which forwards `source()` past the inner value so
+  `find` and `raw_os_error` cannot reach it. The same `Display` target applies to a wrapper; the `#[error("{0}")]`
+  wrappers are the transitional exception, and a logged chain shows their inner text twice until they get text of
+  their own.
 - **Reading a chain in code.** Use [`util::error`](crates/util/src/error.rs) (`chain`, `links`, `find`, `raw_os_error`);
   do not write a `source()` loop by hand.
 - **A value that is not an error stays as it is.** Third-party types with no `std::error::Error` impl and a `String`
