@@ -515,7 +515,6 @@ pub(crate) async fn serve_until_signal(
 #[cfg(test)]
 fn test_marker() -> hole_common::update_marker::MarkerInfo {
     hole_common::update_marker::MarkerInfo {
-        version: hole_common::update_marker::MARKER_VERSION,
         driver: cosca::identity::ProcessId::current()
             .to_record()
             .expect("persist this process's identity"),

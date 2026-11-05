@@ -30,6 +30,7 @@ pub(crate) mod refusing_connector;
 pub(crate) mod skuld_fixtures;
 pub(crate) mod socks5_client;
 pub(crate) mod socks5_dns_upstream;
+pub(crate) mod target_records;
 pub(crate) mod udp_echo;
 
 /// The cause text inside [`mock_gateway_failure`].

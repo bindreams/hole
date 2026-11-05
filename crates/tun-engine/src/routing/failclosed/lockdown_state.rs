@@ -1,34 +1,48 @@
 //! Persisted lockdown INTENT (the standing kill switch's enabled bool),
 //! bridge-owned and system-wide. Distinct from `bridge-failclosed.json`
 //! (which records the transient cover's pf token): this file records what the
-//! user *wants*, surviving bridge restarts and crashes. Modeled on
-//! `failclosed_state.rs`: schema version, atomic save, load-None-on-mismatch.
+//! user *wants*, surviving bridge restarts and crashes. A `VersionedFile` of
+//! role `Decision`.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-
-/// Schema version. [`load`] discards a mismatched file rather than risk a
-/// corrupt recovery (same policy as the route/failclosed state files).
-pub const SCHEMA_VERSION: u32 = 1;
+use util::versioned_file::{
+    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, VersionedFile, VersionedState,
+};
 
 /// Filename under `state_dir`.
 pub const STATE_FILE_NAME: &str = "bridge-lockdown.json";
 
 /// Persisted lockdown intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LockdownState {
-    pub version: u32,
     /// Whether the standing kill switch is enabled.
     pub enabled: bool,
 }
 
-/// Atomically persist `state` (temp file + same-dir rename, `sync_all`
-/// before persist). Creates `state_dir`.
-pub fn save(state_dir: &Path, state: &LockdownState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
+impl Schema for LockdownState {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+/// The user's latest decision: one this release cannot read is backed up, then replaced, and never blocks a connect.
+impl VersionedState for LockdownState {
+    const FILE_NAME: &'static str = STATE_FILE_NAME;
+    const ROLE: Role = Role::Decision;
+}
+
+util::assert_contiguous!(LockdownState);
+
+/// The intent file. Every read and write of it goes through this type.
+pub type LockdownFile = VersionedFile<LockdownState>;
+
+pub fn file(state_dir: &Path) -> LockdownFile {
+    VersionedFile::new(state_dir)
 }
 
 /// What `bridge-lockdown.json` says about the standing kill switch. A closed
@@ -73,41 +87,22 @@ impl Intent {
     }
 }
 
-/// The one read+parse of the intent file. `Ok` is a file that parsed at the
-/// current schema; `Err` carries the [`Intent`] its failure classifies to, so
-/// [`load`] and [`load_intent`] share a single reader (and a single set of
-/// `warn!` lines) instead of drifting apart.
+/// The one reading of the intent file. `Ok` is a file that parsed at the current schema; `Err` carries the [`Intent`]
+/// its failure classifies to, so [`load`] and [`load_intent`] share a single reader (and a single set of `warn!`
+/// lines) instead of drifting apart.
 fn read_state(state_dir: &Path) -> Result<LockdownState, Intent> {
-    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Intent::Unset),
-        Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), file = STATE_FILE_NAME, "lockdown-state read failed");
-            return Err(Intent::Unreadable);
-        }
-    };
-    match serde_json::from_slice::<LockdownState>(&bytes) {
-        Ok(s) if s.version == SCHEMA_VERSION => Ok(s),
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = SCHEMA_VERSION,
-                "lockdown-state schema mismatch, discarding"
-            );
-            Err(Intent::Unreadable)
-        }
-        Err(e) => {
-            // The error quotes the file, which the user may have put there: keep its position, not its text.
-            let e = util::parse_error::ParseFailure::from(&e);
-            tracing::warn!(error = %e, file = STATE_FILE_NAME, "lockdown-state parse failed");
-            Err(Intent::Unreadable)
-        }
+    match file(state_dir).observe().loaded {
+        Loaded::Current { value, .. } => Ok(value),
+        Loaded::Absent => Err(Intent::Unset),
+        Loaded::Obsolete { .. } => Err(Intent::Unreadable),
+        Loaded::Newer { .. } => Err(Intent::Unreadable),
+        Loaded::Corrupt { .. } => Err(Intent::Unreadable),
+        Loaded::Unreadable { .. } => Err(Intent::Unreadable),
     }
 }
 
-/// Load the intent, or `None` on absent/corrupt/unknown-field/version
-/// mismatch (logs at `warn`). Use [`load_intent`] where the *reason* for a
-/// `None` matters.
+/// Load the intent, or `None` on absent/corrupt/newer/obsolete (the read logs at `warn`). Use [`load_intent`] where
+/// the *reason* for a `None` matters.
 pub fn load(state_dir: &Path) -> Option<LockdownState> {
     read_state(state_dir).ok()
 }
@@ -129,21 +124,14 @@ pub fn load_enabled(state_dir: &Path) -> bool {
     load_intent(state_dir).reads_armed()
 }
 
-/// Last-writer-wins absolute set. Persists `enabled` under the current schema.
-pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    save(
-        state_dir,
-        &LockdownState {
-            version: SCHEMA_VERSION,
-            enabled,
-        },
-        owner,
-    )
-}
-
-/// Delete the state file; tolerates absence.
-pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
+/// Last-writer-wins absolute set, atomic, creating `state_dir`. A file this release cannot read is backed up beside
+/// it first.
+pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement { owner }, |_| {
+            (Change::Store(LockdownState { enabled }), ())
+        })
+        .map(|_| ())
 }
 
 #[cfg(test)]

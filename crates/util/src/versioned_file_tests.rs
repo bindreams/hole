@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{DefaultPlacement, Loaded, Obsolete, Role, Schema, VersionedFile, VersionedState};
+use super::{Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, VersionedFile, VersionedState};
 
 // The current schema of the file. Version 1 has nothing before it, so its
 // `Prev` is `Obsolete<0>` and its `upgrade` is `match prev {}`. A later version
@@ -32,15 +32,17 @@ crate::assert_contiguous!(Layout);
 fn an_os_record_is_stored_and_loaded_back() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = VersionedFile::<Layout>::new(dir.path());
-    file.store(
-        &Layout {
-            plugin_dir: "plugins".into(),
-        },
-        &DefaultPlacement::default(),
-    )
+    file.update(&DefaultPlacement::default(), |_| {
+        (
+            Change::Store(Layout {
+                plugin_dir: "plugins".into(),
+            }),
+            (),
+        )
+    })
     .expect("store");
 
-    match file.load() {
+    match file.observe().loaded {
         Loaded::Current { value, found: 1 } => assert_eq!(
             value,
             Layout {

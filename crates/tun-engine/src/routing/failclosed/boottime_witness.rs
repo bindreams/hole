@@ -101,69 +101,69 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use util::versioned_file::{
+    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, VersionedFile, VersionedState,
+};
 
 use super::ArmingWitness;
-
-/// Schema version. A mismatched file classifies [`ArmingWitness::Unreadable`]
-/// — which REPORTS — rather than being discarded as absence: losing the record
-/// is not evidence that nothing was armed.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// Filename under `state_dir`.
 pub const STATE_FILE_NAME: &str = "bridge-boottime.json";
 
 /// The persisted record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BootTimeState {
-    version: u32,
     /// Whether a boot-time twin is outstanding on this host: armed at some
     /// point and never since watched being removed.
     armed: bool,
 }
 
-/// Classify the record. Never collapses a failure into a recorded value — see
-/// [`ArmingWitness`], whose whole point is that "no file" and "a file I could
-/// not read" are different findings.
-pub fn load(state_dir: &Path) -> ArmingWitness {
-    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ArmingWitness::Unset,
-        Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), file = STATE_FILE_NAME, "boot-time witness read failed");
-            return ArmingWitness::Unreadable;
-        }
-    };
-    match serde_json::from_slice::<BootTimeState>(&bytes) {
-        Ok(s) if s.version == SCHEMA_VERSION && s.armed => ArmingWitness::Armed,
-        Ok(s) if s.version == SCHEMA_VERSION => ArmingWitness::Disarmed,
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = SCHEMA_VERSION,
-                "boot-time witness schema mismatch"
-            );
-            ArmingWitness::Unreadable
-        }
-        Err(e) => {
-            // The error quotes the file, which the user may have put there: keep its position, not its text.
-            let e = util::parse_error::ParseFailure::from(&e);
-            tracing::warn!(error = %e, file = STATE_FILE_NAME, "boot-time witness parse failed");
-            ArmingWitness::Unreadable
-        }
+impl Schema for BootTimeState {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
     }
 }
 
-/// Atomically persist `armed` (temp file + same-dir rename, `sync_all` before
-/// persist), the same write shape `lockdown_state` uses. Creates `state_dir`.
-fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    let state = BootTimeState {
-        version: SCHEMA_VERSION,
-        armed,
-    };
-    let json =
-        serde_json::to_vec_pretty(&state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
+/// A decision, not an OS record: a file this release cannot read is backed up and replaced. It must never read as
+/// "nothing armed" ([`load`]), and a sweep that watched the twin go may write over it.
+impl VersionedState for BootTimeState {
+    const FILE_NAME: &'static str = STATE_FILE_NAME;
+    const ROLE: Role = Role::Decision;
+}
+
+util::assert_contiguous!(BootTimeState);
+
+fn file(state_dir: &Path) -> VersionedFile<BootTimeState> {
+    VersionedFile::new(state_dir)
+}
+
+/// Classify the record. Never collapses a failure into a recorded value — see
+/// [`ArmingWitness`], whose whole point is that "no file" and "a file I could
+/// not read" are different findings. A version this release does not know is
+/// `Unreadable` — which REPORTS — rather than discarded as absence: losing the
+/// record is not evidence that nothing was armed.
+pub fn load(state_dir: &Path) -> ArmingWitness {
+    match file(state_dir).observe().loaded {
+        Loaded::Absent => ArmingWitness::Unset,
+        Loaded::Current { value, .. } if value.armed => ArmingWitness::Armed,
+        Loaded::Current { .. } => ArmingWitness::Disarmed,
+        Loaded::Obsolete { .. } => ArmingWitness::Unreadable,
+        Loaded::Newer { .. } => ArmingWitness::Unreadable,
+        Loaded::Corrupt { .. } => ArmingWitness::Unreadable,
+        Loaded::Unreadable { .. } => ArmingWitness::Unreadable,
+    }
+}
+
+/// Atomically persist `armed`, creating `state_dir`. A record this release cannot read is backed up beside it first.
+fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement { owner }, |_| {
+            (Change::Store(BootTimeState { armed }), ())
+        })
+        .map(|_| ())
 }
 
 /// Record that a twin is outstanding on this host.

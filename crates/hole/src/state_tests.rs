@@ -1,7 +1,7 @@
 use super::*;
 use crate::bridge_client::ClientError;
 use hole_common::protocol::{BridgeResponse, StartError};
-use hole_common::update_marker::{Marker, MarkerInfo, MARKER_VERSION};
+use hole_common::update_marker::{Marker, MarkerInfo};
 
 fn sample_marker() -> MarkerInfo {
     marker_naming(
@@ -12,10 +12,7 @@ fn sample_marker() -> MarkerInfo {
 }
 
 fn marker_naming(driver: cosca::identity::ProcessIdRecord) -> MarkerInfo {
-    MarkerInfo {
-        version: MARKER_VERSION,
-        driver,
-    }
+    MarkerInfo { driver }
 }
 
 // CutoverDecision =====================================================================================================
@@ -507,7 +504,7 @@ fn link_with(path: PathBuf, dir: &std::path::Path, a: cosca::identity::Liveness)
 
 /// Write the sample cutover marker into `dir`.
 fn marker_in(dir: &std::path::Path) {
-    hole_common::update_marker::write(dir, &sample_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir, &sample_marker(), None).unwrap();
 }
 
 /// A liveness stub that reports the driver dead AND sweeps the marker as a side
@@ -918,7 +915,7 @@ fn commit_update_failed_applies_a_lockdown_change() {
 #[skuld::test]
 async fn real_live_driver_holds_via_send() {
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &sample_marker(), None).unwrap();
     let link = super::BridgeLink::with_service_log_dir_and_liveness(
         "/nonexistent/socket".into(),
         dir.path().to_path_buf(),
@@ -945,7 +942,7 @@ async fn real_dead_driver_unmasks_once() {
     let record = id.to_record().expect("persist the child's identity");
     child.wait().unwrap(); // dead; `child` (handle) kept in scope below → zombie
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &marker_naming(record), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &marker_naming(record), None).unwrap();
     let link = super::BridgeLink::with_service_log_dir_and_liveness(
         "/nonexistent/socket".into(),
         dir.path().to_path_buf(),

@@ -30,6 +30,7 @@ use tower::ServiceExt;
 use tracing::warn;
 use tracing::{debug, error, info};
 use util::error_chain::error_chain;
+use util::versioned_file::{CreateOutcome, StoreError};
 
 // IPC state ===========================================================================================================
 
@@ -122,9 +123,9 @@ pub struct IpcState<P: Proxy, R: Routing> {
     pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Orders `persist_after_start`'s target + candidate writes against
     /// `handle_unblock`'s `Off` + `set_enabled` + candidate clear, each a
-    /// sequence of separate file-lock sections. Held only inside a
+    /// sequence of separate record-lock sections. Held only inside a
     /// `spawn_blocking` closure, never across an `.await`, and always taken
-    /// before the target file lock. Other candidate writers run under
+    /// before a record lock. Other candidate writers run under
     /// `BridgeLiveness` and need no ordering against these two.
     pub intent_persist: Arc<std::sync::Mutex<()>>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
@@ -614,8 +615,8 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 /// written. The `on_startup` push is a preference and stands either way.
 ///
 /// Runs in `spawn_blocking`, since both `target::apply` and
-/// `save_startup_preference` are sync (`target::apply`'s lock is a leaf lock
-/// that must never cross an `.await` — see `TargetExclusive`). A failure here
+/// `apply_startup_preference` are sync (the record locks they take are leaf
+/// locks that must never cross an `.await`). A failure here
 /// is logged, never surfaced as a start failure: the tunnel's own outcome is
 /// already decided by the time this runs, and a metadata-write hiccup must
 /// not retroactively turn an established connection into a reported failure.
@@ -640,7 +641,7 @@ async fn persist_after_start<P: Proxy, R: Routing>(
     let config = config.clone();
     let generation = Arc::clone(&state.unblock_generation);
     let intent_persist = Arc::clone(&state.intent_persist);
-    let outcome = tokio::task::spawn_blocking(move || -> Result<(), target::TargetError> {
+    let outcome = tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
         // The mutex guards no data, so a poisoned one carries no broken invariant.
         let _ordered = intent_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if succeeded {
@@ -669,15 +670,15 @@ async fn persist_after_start<P: Proxy, R: Routing>(
 /// the start's snapshot, so the target and candidate are left as it wrote them.
 ///
 /// Two locked read-modify-writes, NOT load-then-save, sequential with (never
-/// nested in) each other — both take the same file lock, and `flock` is per-
-/// open-description, so nesting would deadlock rather than recurse.
+/// nested in) each other: each is a `VersionedFile::update`, whose per-path lock
+/// is a leaf.
 fn write_start_records(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
     config: &ProxyConfig,
     on_startup: Option<StartupBehavior>,
     declined: bool,
-) -> Result<(), target::TargetError> {
+) -> Result<(), StoreError> {
     if declined {
         debug!("start's target and candidate not written: an unblock committed since its snapshot");
     } else {
@@ -959,7 +960,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     let app_dest: Option<std::path::PathBuf> = None;
 
     // Marker FIRST — the atomic single-occupancy CLAIM, BEFORE resolving or
-    // touching the shared private staging dir. `write_new` is `create-new`: two
+    // touching the shared private staging dir. `claim` is `create-new`: two
     // concurrent requests cannot both win (the 409 read-check above is only a
     // fast-path; this is the race-free guard), so ONLY the marker-winner ever
     // stages a payload. A loser 409s here and never touches the shared staging
@@ -968,7 +969,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // verify/use TOCTOU via a privileged write on the loser's behalf.
     // `current()` is infallible; only PERSISTING it can fail, and only where
     // this host cannot describe its own boot session (Linux with /proc
-    // unmounted). Fail BEFORE `write_new`, so a failure leaves no claimed
+    // unmounted). Fail BEFORE `claim`, so a failure leaves no claimed
     // cutover.
     let driver = match cosca::identity::ProcessId::current().to_record() {
         Ok(record) => record,
@@ -982,16 +983,24 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         }
     };
     let marker = build_cutover_marker(driver);
-    if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker, state.owner) {
-        let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
-            (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
-        } else {
-            (
+    match hole_common::update_marker::claim(log_dir, &marker, state.owner) {
+        Ok(CreateOutcome::Created) => {}
+        Ok(CreateOutcome::Taken) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    message: "a cutover is already in progress".to_string(),
+                }),
+            ));
+        }
+        Err(e) => {
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("cutover marker write failed: {e}"),
-            )
-        };
-        return Err((code, Json(ErrorResponse { message })));
+                Json(ErrorResponse {
+                    message: format!("cutover marker write failed: {e}"),
+                }),
+            ));
+        }
     }
 
     // Stage the caller-supplied payload into a bridge-private, non-attacker-
@@ -1502,7 +1511,7 @@ pub fn installer_user_sid_dir() -> std::path::PathBuf {
 /// The SID the installer left in `dir`, as text. `NotFound` for a missing file or folder.
 #[cfg(target_os = "windows")]
 pub(crate) fn read_installer_user_sid(dir: &Path) -> std::io::Result<String> {
-    let bytes = util::dir::read_state_file(dir, INSTALLER_USER_SID_FILE.as_ref())?;
+    let bytes = util::dir::ReadDir::open(dir)?.read_vouched(INSTALLER_USER_SID_FILE.as_ref())?;
     String::from_utf8(bytes)
         .map(|sid| sid.trim().to_owned())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "the installer SID file is not text"))
@@ -1523,7 +1532,7 @@ pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
             return None;
         }
     };
-    if let Err(e) = util::dir::remove_state_file(dir, INSTALLER_USER_SID_FILE.as_ref()) {
+    if let Err(e) = crate::socket::remove_name(dir, INSTALLER_USER_SID_FILE.as_ref()) {
         warn!(error = %e, "could not remove the installer user SID file");
     }
     if !is_valid_sid_string(&sid) {
@@ -1537,7 +1546,8 @@ pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
 /// by name through a handle: a link a user planted at the name is replaced and what it leads to is left alone.
 #[cfg(target_os = "windows")]
 pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result<()> {
-    util::dir::write_state_file(dir, INSTALLER_USER_SID_FILE.as_ref(), sid.as_bytes(), None)
+    util::dir::Dir::open(dir, true, None)?
+        .write_atomic(INSTALLER_USER_SID_FILE.as_ref(), sid.as_bytes(), None, |_| Ok(()))
 }
 
 /// Set up IPC access control so that the current interactive user can
@@ -1705,10 +1715,7 @@ fn apply_socket_permissions(path: &Path) {
 /// Build the cutover marker; extracted so the driver-identity mapping is
 /// unit-testable.
 fn build_cutover_marker(driver: cosca::identity::ProcessIdRecord) -> hole_common::update_marker::MarkerInfo {
-    hole_common::update_marker::MarkerInfo {
-        version: hole_common::update_marker::MARKER_VERSION,
-        driver,
-    }
+    hole_common::update_marker::MarkerInfo { driver }
 }
 
 #[cfg(test)]
