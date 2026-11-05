@@ -443,7 +443,7 @@ fn writers() -> Vec<Writer> {
                 // It writes only where nothing is recorded, and leaves what it cannot read as it found it.
                 match lockdown_state::promote_unrecorded(dir, owner).map_err(io::Error::other)? {
                     lockdown_state::PromoteOutcome::Wrote => Ok(()),
-                    lockdown_state::PromoteOutcome::Declined(intent) => match intent {
+                    lockdown_state::PromoteOutcome::Declined => match lockdown_state::load_intent(dir) {
                         lockdown_state::Intent::Unreadable => Err(io::Error::other(LeftAsItIs)),
                         lockdown_state::Intent::On | lockdown_state::Intent::Off | lockdown_state::Intent::Unset => {
                             Ok(())
