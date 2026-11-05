@@ -11,6 +11,10 @@
 //! writes check the watch inside their critical section, so no write lands once a
 //! release has begun.
 //!
+//! The epoch orders an engage against ANY release: the tray's Unblock holds its guard through its persisted
+//! `Off`, a sweep through its witness write. It does not decide what a start records; that is the user's
+//! decision to be Off, which only the tray's Unblock makes and the bridge's `unblock_generation` carries.
+//!
 //! In-process only: another bridge, or `hole bridge unlock` run from a shell,
 //! is not ordered by this.
 

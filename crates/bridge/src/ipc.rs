@@ -119,6 +119,11 @@ pub struct IpcState<P: Proxy, R: Routing> {
     ///
     /// The compare-and-set the proxy lock cannot give, because `handle_unblock`
     /// deliberately takes no proxy lock.
+    ///
+    /// This is the user's decision to be Off, not "a release began": it decides whether a start or reload may record
+    /// `Connected` and its candidate, and only the tray's Unblock moves it. A `ReleaseWatch`
+    /// cannot stand in for it: any release moves the release epoch (a sweep, `bridge unlock`), and a start must still
+    /// record its target after one of those.
     pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Orders `persist_after_start`'s target + candidate writes against
     /// `handle_unblock`'s `Off` + `set_enabled` + candidate clear, each a
@@ -559,7 +564,8 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // since single-occupancy (the 409 above) will not admit the next start
     // until `in_flight` clears below, after this persist has completed.
     // Snapshot BEFORE the proxy lock: any unblock from here on is concurrent
-    // with this start and must win the target write.
+    // with this start and must win the target write. It reads the user's decision
+    // to be Off (`unblock_generation`), not the release epoch, which any sweep moves.
     let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let result = {
         let mut pm = state.proxy.lock().await;
@@ -806,6 +812,16 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
 async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Announced before the first firewall call and held through the persist
+    // below: a start that opened its release watch earlier, or that begins now,
+    // is cancelled instead of installing a cover this Unblock would then leave
+    // behind with the intent `Off`. Takes no lock a start holds. The persist's
+    // closure owns the guard: hyper drops this future when the client goes
+    // away, and the persist runs on regardless.
+    // The Unblock moves two counters: the release epoch here, at its start, and
+    // `unblock_generation` at the `Off` commit below.
+    let release = tun_engine::routing::failclosed::begin_release(&state.state_dir);
+
     // Invalidate any transient cover guard a concurrent, lock-holding
     // `start_cancellable` may still be tracking internally — set
     // unconditionally, a no-op if nothing is tracked, reachable without
@@ -841,6 +857,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     let generation = Arc::clone(&state.unblock_generation);
     let intent_persist = Arc::clone(&state.intent_persist);
     let persisted = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _release = release;
         // Holds `intent_persist` across all three writes, so a start's target +
         // candidate pair lands wholly before or wholly after this sequence:
         // never between the `Off` and the candidate clear, where it would have
@@ -1216,6 +1233,7 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     // would otherwise put the configured address in clear into both
     // `bridge.log` and this handler's error body.
     hole_common::logging::redact_arm::arm_server(&config.server);
+    // The user's decision to be Off (`unblock_generation`), as in `handle_start`; not the release epoch.
     let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let mut pm = state.proxy.lock().await;
     let result = pm.reload(&config).await;
