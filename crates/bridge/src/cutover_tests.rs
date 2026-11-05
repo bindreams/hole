@@ -177,12 +177,11 @@ fn the_marker_stays_only_for_a_cutover_a_new_bridge_will_sweep() {
     let marker_after = |result: std::io::Result<CutoverOutcome>| {
         let dir = tempfile::tempdir().unwrap();
         let m = hole_common::update_marker::MarkerInfo {
-            version: hole_common::update_marker::MARKER_VERSION,
             driver: cosca::identity::ProcessId::current()
                 .to_record()
                 .expect("persist this process's identity"),
         };
-        hole_common::update_marker::write(dir.path(), &m, None).unwrap();
+        hole_common::update_marker::claim(dir.path(), &m, None).unwrap();
         settle_marker(&result, dir.path());
         hole_common::update_marker::is_present(dir.path())
     };
@@ -876,12 +875,11 @@ mod child_and_lock {
 
     fn write_marker(dir: &std::path::Path) {
         let info = hole_common::update_marker::MarkerInfo {
-            version: hole_common::update_marker::MARKER_VERSION,
             driver: cosca::identity::ProcessId::current()
                 .to_record()
                 .expect("persist this process's identity"),
         };
-        hole_common::update_marker::write(dir, &info, None).unwrap();
+        hole_common::update_marker::claim(dir, &info, None).unwrap();
     }
 
     /// Holder first: the holder waits for the child's exit (the join) while the

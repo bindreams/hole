@@ -240,7 +240,7 @@ fn a_bootout_that_succeeded_asks_launchd_nothing() {
 #[skuld::test]
 fn post_bind_sweep_clears_marker() {
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &super::test_marker(), None).unwrap();
     sweep_marker(dir.path());
     assert!(!hole_common::update_marker::is_present(dir.path()));
     sweep_marker(dir.path()); // idempotent: absent marker is a no-op

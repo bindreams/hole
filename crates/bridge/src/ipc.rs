@@ -30,7 +30,7 @@ use tower::ServiceExt;
 use tracing::warn;
 use tracing::{debug, error, info};
 use util::error_chain::error_chain;
-use util::versioned_file::StoreError;
+use util::versioned_file::{CreateOutcome, StoreError};
 
 // IPC state ===========================================================================================================
 
@@ -960,7 +960,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     let app_dest: Option<std::path::PathBuf> = None;
 
     // Marker FIRST — the atomic single-occupancy CLAIM, BEFORE resolving or
-    // touching the shared private staging dir. `write_new` is `create-new`: two
+    // touching the shared private staging dir. `claim` is `create-new`: two
     // concurrent requests cannot both win (the 409 read-check above is only a
     // fast-path; this is the race-free guard), so ONLY the marker-winner ever
     // stages a payload. A loser 409s here and never touches the shared staging
@@ -969,7 +969,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // verify/use TOCTOU via a privileged write on the loser's behalf.
     // `current()` is infallible; only PERSISTING it can fail, and only where
     // this host cannot describe its own boot session (Linux with /proc
-    // unmounted). Fail BEFORE `write_new`, so a failure leaves no claimed
+    // unmounted). Fail BEFORE `claim`, so a failure leaves no claimed
     // cutover.
     let driver = match cosca::identity::ProcessId::current().to_record() {
         Ok(record) => record,
@@ -983,16 +983,24 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         }
     };
     let marker = build_cutover_marker(driver);
-    if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker, state.owner) {
-        let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
-            (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
-        } else {
-            (
+    match hole_common::update_marker::claim(log_dir, &marker, state.owner) {
+        Ok(CreateOutcome::Created) => {}
+        Ok(CreateOutcome::Taken) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    message: "a cutover is already in progress".to_string(),
+                }),
+            ));
+        }
+        Err(e) => {
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("cutover marker write failed: {e}"),
-            )
-        };
-        return Err((code, Json(ErrorResponse { message })));
+                Json(ErrorResponse {
+                    message: format!("cutover marker write failed: {e}"),
+                }),
+            ));
+        }
     }
 
     // Stage the caller-supplied payload into a bridge-private, non-attacker-
@@ -1706,10 +1714,7 @@ fn apply_socket_permissions(path: &Path) {
 /// Build the cutover marker; extracted so the driver-identity mapping is
 /// unit-testable.
 fn build_cutover_marker(driver: cosca::identity::ProcessIdRecord) -> hole_common::update_marker::MarkerInfo {
-    hole_common::update_marker::MarkerInfo {
-        version: hole_common::update_marker::MARKER_VERSION,
-        driver,
-    }
+    hole_common::update_marker::MarkerInfo { driver }
 }
 
 #[cfg(test)]

@@ -1,11 +1,11 @@
 use super::*;
-use util::dir::testing::{plant_link, user_dir, SystemScratch};
+use util::dir::testing::{plant_link, runner_is_the_system, user_dir, SystemScratch};
+use util::versioned_file::CreateOutcome;
 
 /// A marker naming a chosen pid. Synthetic, so a test can pick the pid it
 /// discriminates on; inert data, so a `Windows` record builds on every host.
 fn info(pid: u32) -> MarkerInfo {
     MarkerInfo {
-        version: MARKER_VERSION,
         driver: cosca::identity::ProcessIdRecord {
             version: cosca::identity::RECORD_VERSION,
             platform: cosca::identity::Platform::Windows,
@@ -36,7 +36,7 @@ fn absent_reads_as_absent() {
 fn valid_reads_as_present() {
     let dir = tempfile::tempdir().unwrap();
     let info = info(4242);
-    write(dir.path(), &info, None).unwrap();
+    assert_eq!(claim(dir.path(), &info, None).unwrap(), CreateOutcome::Created);
 
     let Marker::Present(got) = read(dir.path()) else {
         panic!("a marker written at the current version must read as Present");
@@ -75,7 +75,7 @@ fn a_marker_held_open_against_readers_reads_as_unreadable() {
     // Pins the unprivileged reader: one holding backup rights reads through the
     // holder and gets `Present`, which is also a claim.
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), &info(7), None).unwrap();
+    claim(dir.path(), &info(7), None).unwrap();
     let _held = util::dir::testing::held_without_sharing(&dir.path().join(MARKER_FILE));
     let (got, present) = util::dir::testing::as_unprivileged_thread(|| (read(dir.path()), is_present(dir.path())));
     assert!(
@@ -141,9 +141,8 @@ fn is_present_is_false_for_an_indeterminate_marker() {
 #[skuld::test]
 fn an_unknown_version_marker_reads_as_unreadable() {
     let dir = tempfile::tempdir().unwrap();
-    // The CURRENT shape with an unknown version, so it parses and the version
-    // guard is what rejects it. A body of the OTHER schema's field set would be
-    // refused by `deny_unknown_fields` first and would test nothing.
+    // The CURRENT shape with an unknown version, so the version guard is what
+    // rejects it, not a parse failure.
     let future = serde_json::json!({
         "version": 99,
         "driver": {"v": 1, "platform": "windows", "pid": 7, "token": "133700000000000000"},
@@ -156,12 +155,91 @@ fn an_unknown_version_marker_reads_as_unreadable() {
     assert!(!dir.path().join(MARKER_FILE).exists());
 }
 
+#[skuld::test]
+fn claim_is_an_atomic_single_occupancy_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = info(1);
+    // First claim wins and the full content is readable (never a partial file).
+    assert_eq!(claim(dir.path(), &first, None).unwrap(), CreateOutcome::Created);
+    assert_eq!(present(dir.path()), first);
+
+    // A second claim loses (the race-free 409 guard) and does not overwrite the
+    // first claim's content.
+    let other = info(9999);
+    assert_eq!(claim(dir.path(), &other, None).unwrap(), CreateOutcome::Taken);
+    assert_eq!(present(dir.path()).driver.pid, 1);
+
+    // No leftover temp file from either the win or the lost claim.
+    assert_eq!(listing(dir.path()), [MARKER_FILE], "no stray temp after a claim");
+
+    // After a clear, the claim is available again.
+    clear(dir.path()).unwrap();
+    assert_eq!(claim(dir.path(), &other, None).unwrap(), CreateOutcome::Created);
+    assert_eq!(present(dir.path()).driver.pid, 9999);
+}
+
+#[skuld::test]
+fn claim_over_any_existing_file_is_taken() {
+    let newer = br#"{"version":99,"driver":{}}"#.as_slice();
+    for existing in [b"not json".as_slice(), newer] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(MARKER_FILE), existing).unwrap();
+
+        assert_eq!(claim(dir.path(), &info(1), None).unwrap(), CreateOutcome::Taken);
+
+        assert_eq!(std::fs::read(dir.path().join(MARKER_FILE)).unwrap(), existing);
+    }
+}
+
+#[skuld::test]
+fn clear_removes_a_marker_it_cannot_read() {
+    let newer = br#"{"version":99,"driver":{}}"#.as_slice();
+    for unreadable in [b"not json".as_slice(), newer] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(MARKER_FILE), unreadable).unwrap();
+        assert!(is_present(dir.path()), "guard: it is a claim before the clear");
+
+        clear(dir.path()).unwrap();
+
+        assert!(listing(dir.path()).is_empty());
+    }
+}
+
+#[skuld::test]
+fn a_marker_with_a_second_name_is_an_unreadable_claim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    let state = tmp.path().join("state");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    claim(&real, &info(4242), None).unwrap();
+    std::fs::hard_link(real.join(MARKER_FILE), state.join(MARKER_FILE)).unwrap();
+
+    // The system refuses a file it owns that has a second name; a user reads its own.
+    match runner_is_the_system() {
+        true => {
+            assert!(matches!(read(&state), Marker::Unreadable), "{:?}", read(&state));
+            assert!(is_present(&state), "a refused name is still a cutover claim");
+        }
+        false => assert_eq!(present(&state), info(4242)),
+    }
+}
+
+#[skuld::test]
+fn a_marker_written_by_the_previous_release_reads_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let previous = r#"{"version":3,"driver":{"v":1,"platform":"windows","pid":4242,"token":"133700000000000000"}}"#;
+    std::fs::write(dir.path().join(MARKER_FILE), previous).unwrap();
+
+    assert_eq!(present(dir.path()), info(4242));
+}
+
 #[cfg(unix)]
 #[skuld::test]
-fn marker_mode_is_world_readable() {
+fn claim_writes_mode_0644() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), &info(1), None).unwrap();
+    claim(dir.path(), &info(1), None).unwrap();
     let mode = std::fs::metadata(dir.path().join(MARKER_FILE))
         .unwrap()
         .permissions()
@@ -169,62 +247,17 @@ fn marker_mode_is_world_readable() {
     assert_eq!(mode & 0o777, 0o644, "root bridge must write a GUI-readable marker");
 }
 
-#[skuld::test]
-fn write_new_is_an_atomic_single_occupancy_claim() {
-    let dir = tempfile::tempdir().unwrap();
-    let first = info(1);
-    // First claim wins and the full content is readable (never a partial file).
-    write_new(dir.path(), &first, None).unwrap();
-    assert_eq!(present(dir.path()), first);
-
-    // A second claim loses with AlreadyExists (the race-free 409 guard) and does
-    // not overwrite the first claim's content.
-    let other = info(9999);
-    let err = write_new(dir.path(), &other, None).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-    assert_eq!(present(dir.path()).driver.pid, 1);
-
-    // No leftover temp file from either the win or the lost claim.
-    let leftover = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
-    assert!(!leftover, "no stray .tmp after write_new");
-
-    // After a clear, the claim is available again.
-    clear(dir.path()).unwrap();
-    write_new(dir.path(), &other, None).unwrap();
-    assert_eq!(present(dir.path()).driver.pid, 9999);
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn write_new_marker_mode_is_world_readable() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    write_new(dir.path(), &info(1), None).unwrap();
-    let mode = std::fs::metadata(dir.path().join(MARKER_FILE))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o644, "the claimed marker must be GUI-readable too");
-}
-
 // The cross-uid proof that `owner` reaches the PUBLISHED marker inode (through
-// rename for `write` and hard_link for `write_new`) needs real root to give the
-// file to another uid; a self-chown here would be vacuous (the temp is already
+// the hard link of `claim`) needs real root to give the file to another uid; a self-chown here would be vacuous (the temp is already
 // self-owned). It rides the root lane in
 // `crates/hole/tests/elevated_ownership_privileged.rs`.
 
 #[skuld::test]
 fn stamp_driver_replaces_the_driver_and_leaves_a_readable_marker() {
-    // "the version was preserved" is not asserted: with two fields left and
-    // every other version unreadable, `version == MARKER_VERSION` is the only
-    // value the file can carry, so it cannot distinguish preserved from
-    // recomputed. Re-readability can: a stamp that wrote a wrong version or a
+    // Re-readability pins the version: a stamp that wrote a wrong version or a
     // malformed body reads `Unreadable`.
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), &info(111), None).unwrap();
+    claim(dir.path(), &info(111), None).unwrap();
 
     let stamped = info(222).driver;
     stamp_driver(dir.path(), &stamped).unwrap();
@@ -237,20 +270,26 @@ fn stamp_driver_replaces_the_driver_and_leaves_a_readable_marker() {
 
 #[skuld::test]
 fn wire_form_v3() {
-    // This file crosses a privilege boundary and a version boundary; its bytes
-    // are a contract. `staged_marker` writes compact JSON, so the file's bytes
-    // and this string are the same thing.
+    // This file crosses a privilege boundary and a version boundary; its keys are a contract with the previous
+    // release, which declares `deny_unknown_fields`: exactly `version` and `driver`.
+    let dir = tempfile::tempdir().unwrap();
+    claim(dir.path(), &info(4242), None).unwrap();
+
+    let bytes = std::fs::read(dir.path().join(MARKER_FILE)).unwrap();
+    let on_disk: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
     assert_eq!(
-        serde_json::to_string(&info(4242)).unwrap(),
-        r#"{"version":3,"driver":{"v":1,"platform":"windows","pid":4242,"token":"133700000000000000"}}"#
+        on_disk,
+        serde_json::json!({
+            "version": 3,
+            "driver": {"v": 1, "platform": "windows", "pid": 4242, "token": "133700000000000000"},
+        })
     );
 }
 
 #[skuld::test]
 fn a_v2_marker_reads_as_unreadable() {
-    // Rejected through the `deny_unknown_fields` PARSE arm, not the version
-    // guard: the v2 field set is unknown to the v3 shape. The guard keeps its
-    // own test, `an_unknown_version_marker_reads_as_unreadable`.
+    // At the schema's floor: a version this release deliberately does not read.
     let dir = tempfile::tempdir().unwrap();
     let v2 = serde_json::json!({
         "version": 2,
@@ -265,14 +304,28 @@ fn a_v2_marker_reads_as_unreadable() {
 }
 
 #[skuld::test]
-fn stamp_driver_errs_when_the_marker_is_absent() {
-    // Pins [`stamp_driver`]'s contract: nothing but `Present` may be stamped.
-    let dir = tempfile::tempdir().unwrap();
-    let result = stamp_driver(dir.path(), &info(1).driver);
+fn stamp_driver_refuses_anything_but_a_present_marker() {
+    // Pins [`stamp_driver`]'s contract: nothing but `Present` may be stamped, and a refusal leaves the file as it was.
+    let newer = br#"{"version":99,"driver":{}}"#.as_slice();
+    let absent = tempfile::tempdir().unwrap();
     assert!(
-        result.is_err(),
-        "a marker that could not be read must fail the stamp, not be warned past"
+        stamp_driver(absent.path(), &info(1).driver).is_err(),
+        "an absent marker must fail the stamp"
     );
+    assert!(listing(absent.path()).is_empty(), "the stamp must not create a marker");
+
+    for unreadable in [b"not json".as_slice(), newer] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(MARKER_FILE), unreadable).unwrap();
+
+        assert!(
+            stamp_driver(dir.path(), &info(1).driver).is_err(),
+            "a marker that could not be read must fail the stamp, not be warned past"
+        );
+
+        assert_eq!(std::fs::read(dir.path().join(MARKER_FILE)).unwrap(), unreadable);
+        assert_eq!(listing(dir.path()), [MARKER_FILE]);
+    }
 }
 
 #[skuld::test]
@@ -336,14 +389,13 @@ fn listing(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[skuld::test]
-fn writing_through_a_link_to_a_folder_the_system_owns_is_refused_and_writes_nothing_there() {
+fn claiming_through_a_link_to_a_folder_the_system_owns_is_refused_and_writes_nothing_there() {
     let root = tempfile::tempdir().unwrap();
     let scratch = SystemScratch::new();
     let (logs, marker) = log_dir_linked_to_the_system(root.path(), &scratch);
     let before = marker.exists();
 
-    assert!(write(&logs, &info(1), None).is_err());
-    assert!(write_new(&logs, &info(2), None).is_err());
+    assert!(claim(&logs, &info(1), None).is_err());
 
     assert_eq!(marker.exists(), before, "a marker was written in the system's folder");
 }
@@ -362,26 +414,26 @@ fn clearing_through_a_link_to_a_folder_the_system_owns_removes_nothing_there() {
 }
 
 #[skuld::test]
-fn writing_below_a_link_to_a_folder_the_system_owns_creates_nothing_there() {
+fn claiming_below_a_link_to_a_folder_the_system_owns_creates_nothing_there() {
     let root = tempfile::tempdir().unwrap();
     let scratch = SystemScratch::new();
     let link = root.path().join("hole");
     plant_link(scratch.root(), &link);
 
-    assert!(write(&link.join(scratch.name()).join("logs"), &info(1), None).is_err());
+    assert!(claim(&link.join(scratch.name()).join("logs"), &info(1), None).is_err());
 
     assert!(!scratch.path().exists(), "something was made in the system's folder");
 }
 
 #[skuld::test]
-fn writing_and_clearing_through_a_users_link_to_the_users_folder_work() {
+fn claiming_and_clearing_through_a_users_link_to_the_users_folder_work() {
     let root = tempfile::tempdir().unwrap();
     let real = root.path().join("real");
     user_dir(&real);
     let logs = root.path().join("logs");
     plant_link(&real, &logs);
 
-    write(&logs, &info(1), None).unwrap();
+    claim(&logs, &info(1), None).unwrap();
     assert_eq!(present(&real).driver.pid, 1);
     clear(&logs).unwrap();
 
@@ -389,11 +441,11 @@ fn writing_and_clearing_through_a_users_link_to_the_users_folder_work() {
 }
 
 #[skuld::test]
-fn write_creates_the_log_dir_when_it_is_missing() {
+fn claim_creates_the_log_dir_when_it_is_missing() {
     let root = tempfile::tempdir().unwrap();
     let logs = root.path().join("hole").join("logs");
 
-    write(&logs, &info(1), None).unwrap();
+    claim(&logs, &info(1), None).unwrap();
 
     assert_eq!(present(&logs).driver.pid, 1);
     assert_eq!(listing(&logs), [MARKER_FILE], "no temp left behind");
@@ -423,7 +475,7 @@ fn clear_does_not_remove_a_directory_at_the_marker_path() {
 
 #[cfg(unix)]
 #[skuld::test]
-fn the_marker_goes_to_the_owner_by_either_publisher_when_the_os_allows() {
+fn the_marker_goes_to_the_owner_when_the_os_allows() {
     use std::os::unix::fs::MetadataExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -436,12 +488,8 @@ fn the_marker_goes_to_the_owner_by_either_publisher_when_the_os_allows() {
     // The directory is the owner's too, as the bridge makes it before writing; a root-owned one is refused.
     std::os::unix::fs::chown(dir.path(), Some(foreign), None).ok();
 
-    write(dir.path(), &info(1), owner).unwrap();
-    assert_eq!(owner_of_marker() == foreign, allowed, "write");
-
-    clear(dir.path()).unwrap();
-    write_new(dir.path(), &info(2), owner).unwrap();
-    assert_eq!(owner_of_marker() == foreign, allowed, "write_new");
+    claim(dir.path(), &info(1), owner).unwrap();
+    assert_eq!(owner_of_marker() == foreign, allowed);
 }
 
 // A name the user planted ---------------------------------------------------------------------------------------------
@@ -451,7 +499,9 @@ fn the_marker_goes_to_the_owner_by_either_publisher_when_the_os_allows() {
 fn marker_reader() -> util::dir::testing::Reader<'static> {
     util::dir::testing::Reader {
         file: MARKER_FILE,
-        write_valid: &|dir| write(dir, &info(4242), None).unwrap(),
+        write_valid: &|dir| {
+            claim(dir, &info(4242), None).unwrap();
+        },
         reads_it: &|dir| matches!(read(dir), Marker::Present(_)),
     }
 }
@@ -473,7 +523,7 @@ fn a_symlink_at_the_marker_claims_no_cutover() {
     let tmp = tempfile::tempdir().unwrap();
     let real = tmp.path().join("real");
     std::fs::create_dir(&real).unwrap();
-    write(&real, &info(4242), None).unwrap();
+    claim(&real, &info(4242), None).unwrap();
     let state = tmp.path().join("state");
     std::fs::create_dir(&state).unwrap();
     #[cfg(unix)]
@@ -490,7 +540,7 @@ fn a_symlink_at_the_marker_claims_no_cutover() {
 #[skuld::test]
 fn a_marker_in_a_folder_nobody_may_add_to_is_still_read() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), &info(4242), None).unwrap();
+    claim(tmp.path(), &info(4242), None).unwrap();
     let _denied = util::dir::testing::AddDenied::to(tmp.path());
 
     assert_eq!(present(tmp.path()), info(4242));

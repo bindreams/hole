@@ -43,8 +43,8 @@ fn nobody() -> (u32, u32) {
     unsafe { ((*pw).pw_uid, (*pw).pw_gid) }
 }
 
-/// The cutover-marker `owner` must land on the PUBLISHED inode for BOTH writers:
-/// `write` (temp → rename) and `write_new` (temp → hard_link). Drives the real
+/// The cutover-marker `owner` must land on the PUBLISHED inode: `claim` stages a
+/// temp file and publishes it by hard link. Drives the real
 /// `hole_common::update_marker` path to a FIXED foreign uid (`nobody`), so the
 /// assertion fails if the chown is dropped or moved off the published inode.
 /// Under root the chown succeeds and the marker is `nobody`-owned; unprivileged,
@@ -53,11 +53,10 @@ fn nobody() -> (u32, u32) {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn cutover_marker_is_chowned_to_owner_under_root() {
-    use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE, MARKER_VERSION};
+    use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE};
     use std::os::unix::fs::MetadataExt;
 
     let info = || MarkerInfo {
-        version: MARKER_VERSION,
         driver: cosca::identity::ProcessId::current()
             .to_record()
             .expect("persist this process's identity"),
@@ -66,25 +65,11 @@ fn cutover_marker_is_chowned_to_owner_under_root() {
     let (nuid, ngid) = nobody();
     let me = unsafe { libc::getuid() };
 
-    // write (rename publish).
     let d = tempfile::tempdir().unwrap();
-    update_marker::write(d.path(), &info(), Some((nuid, ngid))).unwrap();
+    update_marker::claim(d.path(), &info(), Some((nuid, ngid))).unwrap();
     let owner = std::fs::metadata(d.path().join(MARKER_FILE)).unwrap().uid();
     if root {
-        assert_eq!(owner, nuid, "root: write must chown the published marker to owner");
-    } else {
-        assert_eq!(
-            owner, me,
-            "unprivileged: foreign chown is swallowed, marker stays self-owned"
-        );
-    }
-
-    // write_new (hard_link publish), via a fresh dir so the claim is unclaimed.
-    let d = tempfile::tempdir().unwrap();
-    update_marker::write_new(d.path(), &info(), Some((nuid, ngid))).unwrap();
-    let owner = std::fs::metadata(d.path().join(MARKER_FILE)).unwrap().uid();
-    if root {
-        assert_eq!(owner, nuid, "root: write_new must chown the claimed marker to owner");
+        assert_eq!(owner, nuid, "root: claim must chown the claimed marker to owner");
     } else {
         assert_eq!(
             owner, me,

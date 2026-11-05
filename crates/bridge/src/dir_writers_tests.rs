@@ -22,13 +22,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use hole_common::logging::dir_rotate::DirRotate;
-use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE, MARKER_VERSION};
+use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE};
 use tun_engine::routing::state as route_state;
 use util::dir::testing::{plant_link, user_dir};
 use util::dir::{Dir, Refusal};
 
 use crate::target::{self, Target};
-use util::versioned_file::StoreError;
+use util::versioned_file::{CreateOutcome, StoreError};
 
 mod scan;
 
@@ -152,7 +152,6 @@ const CRASH_MARKER_NAME: &str = "crash-bridge-4242.marker";
 
 fn marker_info() -> MarkerInfo {
     MarkerInfo {
-        version: MARKER_VERSION,
         driver: cosca::identity::ProcessIdRecord {
             version: cosca::identity::RECORD_VERSION,
             platform: cosca::identity::Platform::Windows,
@@ -339,20 +338,15 @@ fn writers() -> Vec<Writer> {
             run: |dir, owner| target::save(dir, &Target::Off, owner).map_err(io::Error::other),
         },
         Writer {
-            name: "the update marker, written",
-            sources: &["crates/common/src/update_marker.rs"],
-            names: &[MARKER_FILE],
-            at_a_planted_name: AtAPlantedName::Replaces,
-            runs_here: true,
-            run: |dir, owner| update_marker::write(dir, &marker_info(), owner),
-        },
-        Writer {
             name: "the update marker, claimed",
-            sources: &[],
+            sources: &["crates/common/src/update_marker.rs"],
             names: &[MARKER_FILE],
             at_a_planted_name: AtAPlantedName::ClaimedElsewhere,
             runs_here: true,
-            run: |dir, owner| update_marker::write_new(dir, &marker_info(), owner),
+            run: |dir, owner| match update_marker::claim(dir, &marker_info(), owner).map_err(io::Error::other)? {
+                CreateOutcome::Created => Ok(()),
+                CreateOutcome::Taken => Err(io::ErrorKind::AlreadyExists.into()),
+            },
         },
         Writer {
             name: "the update marker, cleared",
@@ -726,7 +720,9 @@ fn readings() -> Vec<Reading> {
         Reading {
             name: "update_marker::read",
             file: MARKER_FILE,
-            write_valid: |dir| update_marker::write(dir, &marker_info(), None).unwrap(),
+            write_valid: |dir| {
+                update_marker::claim(dir, &marker_info(), None).unwrap();
+            },
             reads_it: |dir| matches!(update_marker::read(dir), update_marker::Marker::Present(_)),
         },
     ]
@@ -815,7 +811,7 @@ type ParseFailureReader = (&'static str, &'static str, &'static str, fn(&Path));
 fn parse_failure_readers() -> [ParseFailureReader; 3] {
     use crate::{dns_state, plugin_state};
     [
-        ("update_marker::read", MARKER_FILE, r#""version":"#, |dir| {
+        ("update_marker::read", MARKER_FILE, r#""version":3,"driver":"#, |dir| {
             let _ = update_marker::read(dir);
         }),
         (
@@ -850,21 +846,6 @@ fn no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse() {
     }
 
     assert!(failures.is_empty(), "{failures:#?}");
-}
-
-#[skuld::test]
-fn the_update_marker_logs_no_fragment_of_a_marker_with_a_secret_field() {
-    // `deny_unknown_fields`: serde's message for an unknown field quotes the field's name.
-    let content = format!(r#"{{"version":3,"{ECHOED_SECRET}":1}}"#);
-    let logs = warnings_for_a_file(MARKER_FILE, &content, |dir| {
-        let _ = update_marker::read(dir);
-    });
-
-    assert!(
-        !logs.contains(ECHOED_SECRET),
-        "the marker reader logged the file's content: {logs}"
-    );
-    assert!(logs.contains("line 1"), "the warning lost its position: {logs}");
 }
 
 /// The `serde_json` functions that parse a document into a type.

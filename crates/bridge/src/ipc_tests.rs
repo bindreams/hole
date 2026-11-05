@@ -1159,10 +1159,9 @@ fn update_apply_with_existing_marker_is_409() {
     rt().block_on(async {
         let path = test_socket_path("update-apply-409");
         let log_dir = tempfile::tempdir().unwrap().keep();
-        hole_common::update_marker::write(
+        hole_common::update_marker::claim(
             &log_dir,
             &hole_common::update_marker::MarkerInfo {
-                version: hole_common::update_marker::MARKER_VERSION,
                 driver: cosca::identity::ProcessId::current()
                     .to_record()
                     .expect("persist this process's identity"),
@@ -3217,7 +3216,6 @@ fn socket_removed_on_drop() {
 fn build_cutover_marker_carries_this_processs_identity() {
     let me = cosca::identity::ProcessId::current();
     let m = super::build_cutover_marker(me.to_record().expect("persist this process's identity"));
-    assert_eq!(m.version, hole_common::update_marker::MARKER_VERSION);
     assert_eq!(
         cosca::identity::ProcessId::try_from(&m.driver).expect("the marker's driver must restore"),
         me,
