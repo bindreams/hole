@@ -39,9 +39,11 @@ use super::named_event::NamedEvent;
 use super::{scm_deletion, scm_probe, GLOBAL_NET_STATE, TUN};
 
 /// How long the SCM waits before it restarts S, and C. C's is the longer, so
-/// that S's action is due well before the control's restart is up.
-const S_RESTART_DELAY: Duration = Duration::from_secs(5);
-const C_RESTART_DELAY: Duration = Duration::from_secs(15);
+/// that S's action is due well before the control's restart is up. S's must
+/// outlast the event-log read before the disable (measured ~6 s on a loaded
+/// runner); a loss is rerun, not failed.
+const S_RESTART_DELAY: Duration = Duration::from_secs(30);
+const C_RESTART_DELAY: Duration = Duration::from_secs(40);
 
 /// A throwaway auto-start service running the helper, under its own name so it
 /// can run beside another. Deleted on drop, once its process is gone.
