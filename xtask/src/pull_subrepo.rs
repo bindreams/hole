@@ -115,9 +115,7 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     let first = attempt_pull(repo_root, subdir, tag)?;
     if first.status.success() {
         best_effort_clean(repo_root, subdir);
-        // A pull that exited 0 without landing is `attempt_pull`'s error, so here the vendored
-        // content is committed to HEAD or the subrepo was already up to date. Say so if the
-        // tag-pin fixup below fails.
+        // The pull has already committed to HEAD (or was a no-op); say so if the tag-pin fixup fails.
         ensure_tag_pin_matches(repo_root, subdir, tag).with_context(|| {
             "git subrepo pull already succeeded and (usually) committed to this branch before \
              this failure — check `git log -1` before assuming nothing happened"
@@ -436,26 +434,36 @@ fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
     Ok(pull)
 }
 
-/// An exit-0 `git subrepo pull` is believed only if the subrepo's state agrees: after a merge and after
-/// "is up to date" alike, `.gitrepo`'s `commit =` is the commit `refs/subrepo/<subdir>/fetch` names. A pull
-/// that exited 0 having done nothing leaves the ref (set by `fetch_upstream`) ahead of the pin, and the
-/// caller would go on to pin `tag` onto vendored content that never changed.
-fn ensure_pull_landed(repo_root: &Path, subdir: &str, pull: &Output) -> Result<()> {
-    let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
-    let gitrepo =
-        std::fs::read_to_string(&gitrepo_path).with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
-    let pinned = gitrepo_field(&gitrepo, "commit")
-        .with_context(|| format!("{} has no `commit = ` line", gitrepo_path.display()))?;
+/// After an exit-0 pull (merge or "up to date"), HEAD's `.gitrepo` `commit =` equals
+/// `refs/subrepo/<subdir>/fetch` and `subdir` has no uncommitted tracked changes. A ref ahead of the pin
+/// means the pull did nothing; a pin only on disk or in the index means it stopped before its commit. Either
+/// way the caller would pin `tag` onto vendored content that never landed.
+pub(crate) fn ensure_pull_landed(repo_root: &Path, subdir: &str, pull: &Output) -> Result<()> {
+    let gitrepo_rel = format!("{subdir}/.gitrepo");
+    let committed = run_git(repo_root, &["show", &format!("HEAD:{gitrepo_rel}")])
+        .with_context(|| format!("failed to read `{gitrepo_rel}` at HEAD"))?;
+    let pinned = gitrepo_field(&committed, "commit")
+        .with_context(|| format!("`{gitrepo_rel}` at HEAD has no `commit = ` line"))?;
     let fetch_ref = format!("refs/subrepo/{subdir}/fetch");
     let fetched = rev_parse_if_exists(repo_root, &fetch_ref)?;
-    if fetched.as_deref() == Some(pinned.as_str()) {
-        return Ok(());
+    if fetched.as_deref() != Some(pinned.as_str()) {
+        bail!(
+            "`git subrepo pull {subdir}` exited 0 but did not land: HEAD's `{gitrepo_rel}` pins commit {pinned}, `{fetch_ref}` is {}; check `git log -1` for anything it committed\n{:?}",
+            fetched.as_deref().unwrap_or("missing"),
+            PullRecord::from_output(pull)
+        );
     }
-    bail!(
-        "`git subrepo pull {subdir}` exited 0 but did not land: `{subdir}/.gitrepo` pins commit {pinned}, `{fetch_ref}` is {}; check `git log -1` for anything it committed\n{:?}",
-        fetched.as_deref().unwrap_or("missing"),
-        PullRecord::from_output(pull)
-    )
+    let uncommitted = run_git(
+        repo_root,
+        &["status", "--porcelain", "--untracked-files=no", "--", subdir],
+    )?;
+    if !uncommitted.is_empty() {
+        bail!(
+            "`git subrepo pull {subdir}` exited 0 but left uncommitted changes under `{subdir}`:\n{uncommitted}\n{:?}",
+            PullRecord::from_output(pull)
+        );
+    }
+    Ok(())
 }
 
 /// This module's own repo-root commits (here, `fix_stale_parent`'s parent

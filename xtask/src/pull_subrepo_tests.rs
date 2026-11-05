@@ -522,9 +522,6 @@ fn a_nonexistent_tag_stops_the_run_at_the_fetch_phase() {
     assert!(format!("{err:#}").contains("does not exist upstream"), "{err:#}");
 }
 
-// An exit-0 `git subrepo pull` is believed only if the subrepo's state agrees: `.gitrepo`'s `commit =`
-// must be the commit `refs/subrepo/<subdir>/fetch` names.
-
 fn gitrepo_commit(fx: &Fixture) -> String {
     let gitrepo = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
     pull_subrepo::gitrepo_field(&gitrepo, "commit").expect("`.gitrepo` has a `commit =` line")
@@ -561,17 +558,46 @@ fn an_up_to_date_pull_is_accepted() {
     assert_eq!(gitrepo_commit(&fx), pinned);
 }
 
-/// Asserts `err` is the "exited 0 but did not land" error naming the pin and the fetch ref, and that
-/// `.gitrepo` is still what the pull committed.
-fn assert_pull_did_not_land(err: &anyhow::Error, fx: &Fixture, pin: &str, fetch_ref_at: &str) {
+fn assert_pull_did_not_land(err: &anyhow::Error, pin: &str, fetch_ref_at: &str) {
     let shown = format!("{err:#}");
     assert!(shown.contains("exited 0 but did not land"), "{shown}");
     for expected in ["refs/subrepo/vendor/fetch", pin, fetch_ref_at] {
         assert!(shown.contains(expected), "{expected} missing from {shown}");
     }
-    let on_disk = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
-    let committed = git_output(&fx.downstream, &["show", "HEAD:vendor/.gitrepo"]);
-    assert_eq!(on_disk, committed, "the check must not touch the pin");
+}
+
+/// The failed check ended the run: HEAD is still `git subrepo pull`'s own commit, so no tag-pin fixup followed it.
+fn assert_no_commit_followed_the_pull(fx: &Fixture) {
+    let subject = git_output(&fx.downstream, &["log", "-1", "--format=%s"]);
+    assert!(subject.starts_with("git subrepo pull"), "{subject}");
+}
+
+fn exit_0_pull() -> Output {
+    Output {
+        status: exit_status(0),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
+/// `git subrepo pull`'s `subrepo:commit` up to, but not including, its final `git commit`: the upstream tree
+/// and the new pin are staged, HEAD has not moved.
+fn stage_the_fold_in_without_committing(fx: &Fixture) {
+    let repo = &fx.downstream;
+    pull_subrepo::fetch_upstream(repo, "vendor", "v2").unwrap();
+    let gitrepo = std::fs::read_to_string(repo.join("vendor/.gitrepo")).unwrap();
+    git(repo, &["rm", "-r", "-q", "vendor"]);
+    git(
+        repo,
+        &["read-tree", "--prefix=vendor", "-u", "refs/subrepo/vendor/fetch"],
+    );
+    std::fs::write(repo.join("vendor/.gitrepo"), gitrepo).unwrap();
+    let fetched = git_output(repo, &["rev-parse", "refs/subrepo/vendor/fetch"]);
+    git(
+        repo,
+        &["config", "--file", "vendor/.gitrepo", "subrepo.commit", fetched.trim()],
+    );
+    git(repo, &["add", "-f", "vendor/.gitrepo"]);
 }
 
 #[skuld::test]
@@ -582,10 +608,10 @@ fn a_first_pull_that_exits_0_with_the_fetch_ref_behind_the_pin_is_an_error() {
 
     let err = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect_err("the pull did not land");
 
-    // The pull's merge commit is HEAD; its `.gitrepo` pin is what the check compared against.
     let pin = gitrepo_commit(&fx);
     assert_ne!(pin, v1);
-    assert_pull_did_not_land(&err, &fx, &pin, &v1);
+    assert_pull_did_not_land(&err, &pin, &v1);
+    assert_no_commit_followed_the_pull(&fx);
 }
 
 #[skuld::test]
@@ -599,9 +625,105 @@ fn a_stale_parent_retry_that_exits_0_with_the_fetch_ref_behind_the_pin_is_an_err
 
     let pin = gitrepo_commit(&fx);
     assert_ne!(pin, v1);
-    assert_pull_did_not_land(&err, &fx, &pin, &v1);
+    assert_pull_did_not_land(&err, &pin, &v1);
+    assert_no_commit_followed_the_pull(&fx);
     assert!(
         format!("{err:#}").contains("parent-realignment commit"),
         "the retry's disclosure is missing: {err:#}"
     );
+}
+
+// `ensure_pull_landed`, called directly. A pull cannot be driven to these states through `attempt_pull`
+// without a stand-in for `git subrepo`: where the real pull stopped in #1183 is unknown, and its stages that
+// exit 0 early are not reachable from a fixture.
+
+/// The measured failure of #1183: the fetch ref is ahead of the committed pin and nothing merged.
+#[skuld::test]
+fn a_fetch_ref_ahead_of_the_committed_pin_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    let v1 = gitrepo_commit(&fx);
+    pull_subrepo::fetch_upstream(&fx.downstream, "vendor", "v2").unwrap();
+    let v2 = git_output(&fx.downstream, &["rev-parse", "refs/subrepo/vendor/fetch"]);
+    assert_ne!(v1, v2.trim());
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("a pull that merged nothing did not land");
+
+    assert_pull_did_not_land(&err, &v1, v2.trim());
+}
+
+/// A pull that stopped after staging its fold-in has the new pin on disk and in the index, but not in HEAD.
+#[skuld::test]
+fn a_fold_in_staged_but_not_committed_did_not_land() {
+    let fx = Fixture::build(ConflictKind::None);
+    let v1 = gitrepo_commit(&fx);
+    stage_the_fold_in_without_committing(&fx);
+    let v2 = gitrepo_commit(&fx);
+    assert_ne!(v1, v2, "the fixture must have moved the on-disk pin");
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("a staged, uncommitted fold-in did not land");
+
+    assert_pull_did_not_land(&err, &v1, &v2);
+}
+
+/// The pin agrees, but the subrepo's tracked files carry changes HEAD does not.
+#[skuld::test]
+fn uncommitted_tracked_changes_under_the_subrepo_did_not_land() {
+    let fx = Fixture::build(ConflictKind::None);
+    pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("the merge")
+        .expect_clean();
+    std::fs::write(fx.downstream.join("vendor/other.txt"), "staged, not committed\n").unwrap();
+    git(&fx.downstream, &["add", "vendor/other.txt"]);
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("uncommitted changes under the subrepo did not land");
+
+    let shown = format!("{err:#}");
+    assert!(shown.contains("uncommitted"), "{shown}");
+    assert!(shown.contains("vendor/other.txt"), "{shown}");
+}
+
+#[skuld::test]
+fn a_missing_fetch_ref_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    git(&fx.downstream, &["update-ref", "-d", "refs/subrepo/vendor/fetch"]);
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("a pull with no fetch ref to compare against did not land");
+
+    let shown = format!("{err:#}");
+    assert!(shown.contains("refs/subrepo/vendor/fetch"), "{shown}");
+    assert!(shown.contains("missing"), "{shown}");
+}
+
+#[skuld::test]
+fn a_committed_gitrepo_without_a_commit_line_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    let gitrepo = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
+    let without_commit: String = gitrepo
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("commit ="))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(fx.downstream.join("vendor/.gitrepo"), without_commit).unwrap();
+    git(&fx.downstream, &["commit", "-a", "-q", "-m", "test: drop the pin"]);
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("a `.gitrepo` with no pin cannot show the pull landed");
+
+    assert!(format!("{err:#}").contains("no `commit = ` line"), "{err:#}");
+}
+
+#[skuld::test]
+fn a_gitrepo_missing_from_head_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    git(&fx.downstream, &["rm", "-q", "vendor/.gitrepo"]);
+    git(&fx.downstream, &["commit", "-q", "-m", "test: drop .gitrepo"]);
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("with no committed `.gitrepo` there is no pin to compare");
+
+    assert!(format!("{err:#}").contains("vendor/.gitrepo"), "{err:#}");
 }
