@@ -1176,6 +1176,24 @@ async fn an_unblock_whose_release_fails_still_ends_its_release() {
     );
 }
 
+/// The firewall was released before the persist failed, so the Unblock changed something: it supersedes by default.
+#[skuld::test]
+async fn an_unblock_whose_persist_fails_still_supersedes_a_start_that_began_before_it() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    // A directory at the target record's name: the `Off` save cannot land.
+    std::fs::create_dir(dir.join(target::STATE_FILE_NAME)).unwrap();
+    let state = ipc_state_over(MockRouting::new(dir.clone()), dir.clone());
+    let watch = tun_engine::routing::failclosed::watch_releases(&dir);
+
+    let result = super::handle_unblock(axum::extract::State(state)).await;
+
+    assert!(result.is_err(), "the persist must fail for this test to mean anything");
+    assert_eq!(
+        watch.check(),
+        Err(tun_engine::routing::failclosed::Overtaken::Superseded)
+    );
+}
+
 /// The release spans the persisted `Off` as well as the firewall call, even when the
 /// client goes away and hyper drops the handler future at the persist's `.await`.
 /// The persist is held at the target file's lock, so it cannot end before the
