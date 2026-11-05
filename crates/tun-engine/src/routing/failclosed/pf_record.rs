@@ -83,12 +83,14 @@ pub fn sweep_clear<R: PfRecord>(current: &StateFile<R>, token: Option<&str>) -> 
     }
 }
 
-/// Whether `current` is a record naming `token` (`None`: an unusable file that yielded none).
+/// Whether `current` is a record naming `token` (`None`: an unusable file that yielded none). A record that could not
+/// be read names nothing.
 pub fn names<R: PfRecord>(current: &StateFile<R>, token: Option<&str>) -> bool {
     match current {
         StateFile::Absent => false,
-        StateFile::Unreadable => current.pf_token() == token,
-        StateFile::Unusable { .. } | StateFile::Present(_) => current.pf_token() == token,
+        StateFile::Unreadable => false,
+        StateFile::Unusable { .. } => current.pf_token() == token,
+        StateFile::Present(_) => current.pf_token() == token,
     }
 }
 

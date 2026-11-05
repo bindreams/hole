@@ -1829,8 +1829,8 @@ fn release_all_logs_every_failed_token_drop_instead_of_discarding_it() {
     }
     let log = writer.snapshot();
     for site in [
-        "pfctl -X failed releasing the transient cover's pf refcount during release_all",
-        "pfctl -X failed releasing the standing cover's pf refcount during release_all",
+        "pfctl -X failed releasing the transient failclosed-state pf refcount",
+        "pfctl -X failed releasing the standing lockdown-pf-state pf refcount",
     ] {
         assert!(
             log.contains(site),
