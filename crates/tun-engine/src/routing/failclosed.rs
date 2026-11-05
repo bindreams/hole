@@ -304,7 +304,10 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Pat
             match disengage_lockdown(state_dir) {
                 Ok(_clearance_is_persisted_not_reported_at_startup) => {}
                 Err(e) => {
-                    tracing::warn!(error = %util::error_chain::error_chain(&e), "lockdown sweep could not disengage the cover")
+                    tracing::warn!(
+                        error = &e as &dyn std::error::Error,
+                        "lockdown sweep could not disengage the cover"
+                    )
                 }
             }
         }

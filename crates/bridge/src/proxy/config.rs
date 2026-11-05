@@ -78,7 +78,7 @@ pub enum ProxyError {
     InvalidPluginName(String),
     #[error("proxy runtime error: {0}")]
     Runtime(#[from] std::io::Error),
-    /// Gateway failure; log with `util::error_chain`.
+    /// Gateway failure; log it as an error value.
     #[error("gateway detection failed: {0}")]
     Gateway(#[source] tun_engine::gateway::GatewayError),
     /// Private DoH bootstrap could not resolve the proxy server's hostname and
@@ -216,7 +216,7 @@ pub enum ProxyError {
     /// an IPC message reaches a GUI toast verbatim.
     #[error("the network was unblocked, but the kill-switch setting could not be saved")]
     LockdownIntentNotPersisted {
-        /// Why the save failed: for the log (via `util::error_chain`), never the toast.
+        /// Why the save failed: for the log (as the error's `source()`), never the toast.
         #[source]
         source: Box<ProxyError>,
     },

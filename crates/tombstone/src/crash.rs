@@ -196,7 +196,10 @@ impl HandlerState {
     fn open_or_none(kind: &'static str, log_dir: &Path) -> HandlerState {
         HandlerState::open(kind, std::process::id(), log_dir).unwrap_or_else(|e| {
             // The error carries no path: a refusal names what it refused, an OS error its code.
-            tracing::warn!(error = %e, "tombstone: the log directory was not opened, a crash will leave no marker");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "tombstone: the log directory was not opened, a crash will leave no marker"
+            );
             HandlerState::new(kind, None, OsStr::new(""))
         })
     }
@@ -735,7 +738,10 @@ pub fn attach(kind: &'static str, log_dir: &Path) {
             let _ = CRASH_HANDLER.set(handler);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "tombstone: failed to attach crash handler");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "tombstone: failed to attach crash handler"
+            );
         }
     }
 }
@@ -862,7 +868,10 @@ pub fn sweep(log_dir: &Path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
             // The error carries no path: a refusal names what it refused, an OS error its code.
-            tracing::warn!(error = %e, "tombstone: the log directory was not opened, its crash markers were not swept");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "tombstone: the log directory was not opened, its crash markers were not swept"
+            );
             return;
         }
     };

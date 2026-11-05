@@ -211,7 +211,7 @@ pub(crate) fn persist_intended_enabled(
     }
     config.enabled = enabled;
     if let Err(e) = store.save(&config) {
-        warn!(error = %util::error_chain::error_chain(&e), path = %store.path().display(), "failed to persist intended enabled state");
+        warn!(error = &e as &dyn std::error::Error, path = %store.path().display(), "failed to persist intended enabled state");
     }
 }
 
@@ -280,7 +280,10 @@ fn unblock_dialog_message(response: &Result<BridgeResponse, crate::bridge_client
             Some(message.clone())
         }
         Err(e) => {
-            error!(error = %util::error_chain::error_chain(e), "tray: unblock could not reach or understand the bridge");
+            error!(
+                error = e as &dyn std::error::Error,
+                "tray: unblock could not reach or understand the bridge"
+            );
             Some(UNBLOCK_UNREACHABLE_MESSAGE.to_string())
         }
         Ok(other) => {
@@ -481,12 +484,18 @@ fn sync_autostart_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
                 Ok(enabled) => enabled,
                 Err(e) => {
                     // Unreadable state renders as unchecked; detail to gui.log.
-                    warn!(error = %util::error_chain::error_chain(&e), "failed to check autostart state during menu sync");
+                    warn!(
+                        error = &e as &dyn std::error::Error,
+                        "failed to check autostart state during menu sync"
+                    );
                     false
                 }
             };
             if let Err(e) = check.set_checked(is_enabled) {
-                warn!(error = %util::error_chain::error_chain(&e), "failed to sync autostart checkmark");
+                warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to sync autostart checkmark"
+                );
             }
         }
     }
@@ -571,19 +580,22 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
                 // (clippy.toml bans it everywhere else).
                 #[allow(clippy::disallowed_methods)]
                 if let Err(e) = tray.set_menu(Some(menu)) {
-                    warn!(error = %util::error_chain::error_chain(&e), "failed to set tray menu");
+                    warn!(error = &e as &dyn std::error::Error, "failed to set tray menu");
                 }
             }
-            Err(e) => warn!(error = %util::error_chain::error_chain(&e), "failed to rebuild tray menu"),
+            Err(e) => warn!(error = &e as &dyn std::error::Error, "failed to rebuild tray menu"),
         }
         // `true` mirrors the build-time `icon_as_template(true)`; on
         // non-macOS this falls back to plain `set_icon` (see #469).
         if let Err(e) = tray.set_icon_with_as_template(Some(tray_icons::tray_image(snap.running.into())), true) {
-            warn!(error = %util::error_chain::error_chain(&e), "failed to set tray icon");
+            warn!(error = &e as &dyn std::error::Error, "failed to set tray icon");
         }
     });
     if let Err(e) = dispatched {
-        warn!(error = %util::error_chain::error_chain(&e), "failed to dispatch tray menu rebuild");
+        warn!(
+            error = &e as &dyn std::error::Error,
+            "failed to dispatch tray menu rebuild"
+        );
     }
 }
 
@@ -912,7 +924,7 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
                 Err(e) => {
                     // Full detail (may embed the executable path) goes to
                     // gui.log; the dialog gets the PII-free summary.
-                    error!("{error}", error = util::error_chain::error_chain(&e));
+                    error!(error = &e as &dyn std::error::Error, "autostart toggle failed");
                     let message = e.user_message();
                     let app_handle = app.clone();
                     // spawn_blocking: blocking_show must not run on the main
@@ -992,7 +1004,7 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
                         Some("Unexpected response from bridge".to_string())
                     }
                     Err(e) => {
-                        error!(error = %util::error_chain::error_chain(e), "tray: SetLockdown failed");
+                        error!(error = e as &dyn std::error::Error, "tray: SetLockdown failed");
                         Some(format!("Failed to connect to bridge: {e}"))
                     }
                 };
@@ -1031,10 +1043,7 @@ pub(crate) async fn handle_uninstall_helper(app: AppHandle) {
     let exe = match crate::setup::bridge_binary_path() {
         Ok(p) => p,
         Err(e) => {
-            error!(
-                "cannot resolve binary path: {error}",
-                error = util::error_chain::error_chain(&e)
-            );
+            error!(error = &e as &dyn std::error::Error, "cannot resolve binary path");
             return;
         }
     };
@@ -1052,14 +1061,14 @@ pub(crate) async fn handle_uninstall_helper(app: AppHandle) {
             info!("user cancelled uninstall elevation");
         }
         Ok(Err(e)) => {
-            error!("uninstall failed: {error}", error = util::error_chain::error_chain(&e));
+            error!(error = &e as &dyn std::error::Error, "uninstall failed");
             app.dialog()
                 .message(format!("Uninstall failed: {e}"))
                 .title("Error")
                 .blocking_show();
         }
         Err(e) => {
-            error!("spawn_blocking failed: {e}");
+            error!(error = &e as &dyn std::error::Error, "spawn_blocking failed");
         }
     }
 }
@@ -1096,10 +1105,7 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
     let download_dir = match tempfile::TempDir::with_prefix("hole-update-") {
         Ok(d) => d,
         Err(e) => {
-            error!(
-                "failed to create temp dir: {error}",
-                error = util::error_chain::error_chain(&e)
-            );
+            error!(error = &e as &dyn std::error::Error, "failed to create temp dir");
             return;
         }
     };
@@ -1114,7 +1120,7 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
     match download_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            error!("download failed: {error}", error = util::error_chain::error_chain(&e));
+            error!(error = &e as &dyn std::error::Error, "download failed");
             app.dialog()
                 .message(format!("Download failed: {e}"))
                 .title("Update Error")
@@ -1122,7 +1128,7 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
             return;
         }
         Err(e) => {
-            error!("download task panicked: {e}");
+            error!(error = &e as &dyn std::error::Error, "download task panicked");
             return;
         }
     }
@@ -1137,10 +1143,7 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
     let (sha256sums, sha256sums_minisig) = match manifest_result {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
-            error!(
-                "manifest fetch failed: {error}",
-                error = util::error_chain::error_chain(&e)
-            );
+            error!(error = &e as &dyn std::error::Error, "manifest fetch failed");
             app.dialog()
                 .message(format!("Update verification failed: {e}"))
                 .title("Update Error")
@@ -1148,7 +1151,7 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
             return;
         }
         Err(e) => {
-            error!("manifest fetch task panicked: {e}");
+            error!(error = &e as &dyn std::error::Error, "manifest fetch task panicked");
             return;
         }
     };
@@ -1171,10 +1174,7 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
     match verify_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            error!(
-                "verification failed: {error}",
-                error = util::error_chain::error_chain(&e)
-            );
+            error!(error = &e as &dyn std::error::Error, "verification failed");
             app.dialog()
                 .message(format!("Update verification failed: {e}"))
                 .title("Update Error")
@@ -1182,7 +1182,7 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
             return;
         }
         Err(e) => {
-            error!("verify task panicked: {e}");
+            error!(error = &e as &dyn std::error::Error, "verify task panicked");
             return;
         }
     }
@@ -1239,10 +1239,7 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
                 .blocking_show();
         }
         Err(e) => {
-            error!(
-                "update apply failed: {error}",
-                error = util::error_chain::error_chain(&e)
-            );
+            error!(error = &e as &dyn std::error::Error, "update apply failed");
             app.dialog()
                 .message(format!("Update failed: {e}"))
                 .title("Update Error")
@@ -1263,7 +1260,7 @@ pub(crate) async fn handle_collect_logs(app: AppHandle) {
             return;
         }
         Err(e) => {
-            error!("collect logs task panicked: {e}");
+            error!(error = &e as &dyn std::error::Error, "collect logs task panicked");
             return;
         }
     };
@@ -1335,7 +1332,7 @@ pub(crate) async fn handle_check_for_updates(app: AppHandle) {
                 .blocking_show();
         }
         Err(e) => {
-            error!("update check task panicked: {e}");
+            error!(error = &e as &dyn std::error::Error, "update check task panicked");
         }
     }
 }
@@ -1417,7 +1414,10 @@ fn build_dashboard(app: &AppHandle, dashboard: &hole::dashboard::DashboardWindow
                         .state::<hole::dashboard::DashboardWindow>()
                         .forget(generation);
                     if let Err(e) = close_window.remove_menu() {
-                        warn!(error = %util::error_chain::error_chain(&e), "failed to remove dashboard window menu on close");
+                        warn!(
+                            error = &e as &dyn std::error::Error,
+                            "failed to remove dashboard window menu on close"
+                        );
                     }
                 }
             });
@@ -1425,7 +1425,7 @@ fn build_dashboard(app: &AppHandle, dashboard: &hole::dashboard::DashboardWindow
             crate::platform::show_dock_icon(app);
         }
         Err(e) => {
-            error!(error = %util::error_chain::error_chain(&e), "failed to open dashboard window");
+            error!(error = &e as &dyn std::error::Error, "failed to open dashboard window");
             dashboard.forget(generation);
         }
     }
@@ -1467,10 +1467,7 @@ pub async fn cancel_proxy(state: tauri::State<'_, AppState>, attempt_id: String)
             Err("Unexpected response from bridge".into())
         }
         Err(e) => {
-            error!(
-                "failed to send cancel: {error}",
-                error = util::error_chain::error_chain(&e)
-            );
+            error!(error = &e as &dyn std::error::Error, "failed to send cancel");
             Err(format!("Failed to cancel: {e}"))
         }
     }
@@ -1487,7 +1484,7 @@ pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
     crate::autostart::is_enabled(&*app.autolaunch()).map_err(|e| {
         // Full detail (may embed the executable path) → gui.log; the dashboard
         // toast gets only the PII-free summary.
-        error!("{error}", error = util::error_chain::error_chain(&e));
+        error!(error = &e as &dyn std::error::Error, "autostart state read failed");
         e.user_message().to_string()
     })
 }
@@ -1500,7 +1497,7 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt;
     let manager = app.autolaunch();
     crate::autostart::set(&*manager, enabled).map_err(|e| {
-        error!("{error}", error = util::error_chain::error_chain(&e));
+        error!(error = &e as &dyn std::error::Error, "autostart set failed");
         e.user_message().to_string()
     })?;
     // A successful flip must re-derive the tray checkmark from live OS state, or
@@ -1512,8 +1509,8 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
     // so a failed read-back falls back to it rather than lying.
     Ok(crate::autostart::is_enabled(&*manager).unwrap_or_else(|e| {
         warn!(
-            "autostart read-back after set failed: {error}",
-            error = util::error_chain::error_chain(&e)
+            error = &e as &dyn std::error::Error,
+            "autostart read-back after set failed"
         );
         enabled
     }))
@@ -1546,7 +1543,10 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
             let snap = rx.borrow_and_update().clone();
             rebuild_tray_menu(&app);
             if let Err(e) = app.emit("proxy-state-changed", snap) {
-                warn!(error = %util::error_chain::error_chain(&e), "failed to emit proxy-state-changed");
+                warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to emit proxy-state-changed"
+                );
             }
         }
     });

@@ -31,10 +31,10 @@ pub fn start_update_checker(app: AppHandle, on_update_found: impl Fn(&AppHandle,
                     debug!("no update available");
                 }
                 Ok(Err(e)) => {
-                    warn!(error = %util::error_chain::error_chain(&e), "update check failed");
+                    warn!(error = &e as &dyn std::error::Error, "update check failed");
                 }
                 Err(e) => {
-                    warn!(error = %e, "update check task panicked");
+                    warn!(error = &e as &dyn std::error::Error, "update check task panicked");
                 }
             }
 

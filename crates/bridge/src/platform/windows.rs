@@ -95,7 +95,7 @@ windows_service::define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_arguments: Vec<OsString>) {
     if let Err(e) = run_service() {
-        error!(error = %util::error_chain::error_chain(&*e), "service failed");
+        error!(error = &*e, "service failed");
     }
 }
 
@@ -266,10 +266,16 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // Capture WFP + NDIS state after recovery; see
         // `diagnostics::{wfp,ndis}`.
         if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::wfp::log_snapshot("startup")).await {
-            tracing::warn!(error = %e, "wfp startup snapshot task panicked");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "wfp startup snapshot task panicked"
+            );
         }
         if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::ndis::log_snapshot("startup")).await {
-            tracing::warn!(error = %e, "ndis startup snapshot task panicked");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "ndis startup snapshot task panicked"
+            );
         }
 
         // Always-on ETW consumer, held for the service's run lifetime; Drop
@@ -278,7 +284,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let etw_guard = match crate::diagnostics::etw::start_consumer() {
             Ok(g) => Some(g),
             Err(e) => {
-                tracing::error!(error = %util::error_chain::error_chain(&e), "etw consumer failed to start");
+                tracing::error!(error = &e as &dyn std::error::Error, "etw consumer failed to start");
                 None
             }
         };
@@ -286,7 +292,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // Returns once the connection tasks are gone, so the proxy manager's
         // last handle is the one dropped in `DropResources`.
         if let Err(e) = server.run_until(shutdown.cancelled()).await {
-            error!(error = %util::error_chain::error_chain(&e), "IPC server error");
+            error!(error = &e as &dyn std::error::Error, "IPC server error");
         }
         info!("shutdown signal received");
 
@@ -307,7 +313,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     if let Err(e) = &run_result {
-        error!(error = %util::error_chain::error_chain(&**e), "bridge runtime error");
+        error!(error = &**e, "bridge runtime error");
     }
 
     // Dropping the runtime joins blocking tasks, so `Stopped` follows it. Report
@@ -342,7 +348,7 @@ where
     async fn repairs(&mut self) {
         // A failure never stops this start (see `run_startup_repairs`).
         if let Err(e) = tokio::task::spawn_blocking(registration::run_startup_repairs).await {
-            warn!(error = %e, "startup repairs task panicked");
+            warn!(error = &e as &dyn std::error::Error, "startup repairs task panicked");
         }
     }
 
@@ -352,7 +358,7 @@ where
         let state_dir = self.state_dir.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir)).await
         {
-            tracing::warn!(error = %e, "recover_dns_config task panicked");
+            tracing::warn!(error = &e as &dyn std::error::Error, "recover_dns_config task panicked");
         }
     }
 
@@ -379,7 +385,7 @@ where
         // (C:\ProgramData\hole\logs), NOT state_dir.
         let log_dir = self.log_dir.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir)).await {
-            tracing::warn!(error = %e, "crash sweep task panicked");
+            tracing::warn!(error = &e as &dyn std::error::Error, "crash sweep task panicked");
         }
     }
 
@@ -387,7 +393,7 @@ where
         // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
         // (it fails while an old process still maps the renamed inode).
         if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
-            tracing::warn!(error = %e, "old-binary sweep task panicked");
+            tracing::warn!(error = &e as &dyn std::error::Error, "old-binary sweep task panicked");
         }
     }
 }
@@ -424,7 +430,10 @@ fn stopped_status(exit_code: u32) -> ServiceStatus {
 /// from->to schema bump across the cutover cannot strand it.
 pub(crate) fn sweep_marker(log_dir: &Path) {
     if let Err(e) = hole_common::update_marker::clear(log_dir) {
-        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear update-in-progress marker");
+        tracing::warn!(
+            error = &e as &dyn std::error::Error,
+            "failed to clear update-in-progress marker"
+        );
     }
 }
 
@@ -474,7 +483,7 @@ pub(crate) fn sweep_old_binaries(install_dir: &Path) {
     let entries = match std::fs::read_dir(install_dir) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), dir = %install_dir.display(), "old-binary sweep: read_dir failed");
+            tracing::warn!(error = &e as &dyn std::error::Error, dir = %install_dir.display(), "old-binary sweep: read_dir failed");
             return;
         }
     };
@@ -486,7 +495,7 @@ pub(crate) fn sweep_old_binaries(install_dir: &Path) {
         }
         if let Err(e) = std::fs::remove_file(entry.path()) {
             // Still mapped by a live process — expected; a later start retries.
-            tracing::debug!(error = %util::error_chain::error_chain(&e), file = %name, "old-binary sweep: still mapped, deferring");
+            tracing::debug!(error = &e as &dyn std::error::Error, file = %name, "old-binary sweep: still mapped, deferring");
         }
     }
 }
@@ -799,7 +808,10 @@ pub fn disabled_state() -> DisabledState {
         Ok(Some(session)) => session,
         Ok(None) => return DisabledState::NotDisabled,
         Err(e) => {
-            warn!(error = %e, "could not open the service to read whether it is disabled");
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "could not open the service to read whether it is disabled"
+            );
             return DisabledState::NotDisabled;
         }
     };

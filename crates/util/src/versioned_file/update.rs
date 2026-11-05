@@ -9,7 +9,6 @@ use super::loaded::{CannotRead, Loaded, UnreadableKind};
 use super::store::encode;
 use super::{Placement, RemoveOver, StoreError, StoreOver, VersionedFile, VersionedState};
 use crate::dir::{Dir, EntryKind, ReadDir};
-use crate::error_chain::error_chain;
 
 /// One read of the file plus the generation it was taken at.
 #[derive(Debug)]
@@ -286,10 +285,18 @@ impl<S: VersionedState> VersionedFile<S> {
     /// caller could do nothing about. The directory is flushed even when `after_publish` failed.
     fn finalize(&self, place: &dyn Placement, dir: &Dir) {
         if let Err(e) = place.after_publish(dir, self.file_name()) {
-            tracing::warn!(file = S::FILE_NAME, error = %error_chain(&e), "a state file was published, but its after-publish step failed");
+            tracing::warn!(
+                file = S::FILE_NAME,
+                error = &e as &dyn std::error::Error,
+                "a state file was published, but its after-publish step failed"
+            );
         }
         if let Err(e) = place.sync_dir(dir) {
-            tracing::warn!(file = S::FILE_NAME, error = %error_chain(&e), "a state file was published, but its directory could not be flushed");
+            tracing::warn!(
+                file = S::FILE_NAME,
+                error = &e as &dyn std::error::Error,
+                "a state file was published, but its directory could not be flushed"
+            );
         }
     }
 

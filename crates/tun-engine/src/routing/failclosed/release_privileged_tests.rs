@@ -569,7 +569,10 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
             );
         }
         Ok(out) => tracing::debug!("pfctl -X {token} after the sweep: {}", describe_output(&out)),
-        Err(e) => tracing::warn!("pfctl -X {token} could not be spawned: {e}"),
+        Err(e) => tracing::warn!(
+            error = &e as &dyn std::error::Error,
+            "pfctl -X {token} could not be spawned"
+        ),
     };
 
     let token = permit_scenario(

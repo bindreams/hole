@@ -182,7 +182,10 @@ impl Proxy for ShadowsocksProxy {
             match &result {
                 Ok(()) => warn!("shadowsocks server task returned Ok — expected to run forever"),
                 Err(e) => {
-                    error!(error = %util::error_chain::error_chain(e), "shadowsocks server task exited with error")
+                    error!(
+                        error = e as &dyn std::error::Error,
+                        "shadowsocks server task exited with error"
+                    )
                 }
             }
             result

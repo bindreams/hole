@@ -215,7 +215,10 @@ pub fn pick_and_import(app: &AppHandle) {
                     // one must too, or the picker just closes and nothing
                     // visibly happens.
                     Err(e) => {
-                        warn!(error = %util::error_chain::error_chain(&e), "import: picked file has no filesystem path");
+                        warn!(
+                            error = &e as &dyn std::error::Error,
+                            "import: picked file has no filesystem path"
+                        );
                         show_failure(
                             &app,
                             &FailureMessage {
@@ -259,7 +262,10 @@ pub fn import_and_report(app: &AppHandle, paths: &[PathBuf]) {
     // Best-effort: the servers are already persisted, so a dashboard that
     // misses this just shows them on its next config load.
     if let Err(e) = app.emit(EVENT_SERVERS_IMPORTED, &outcome) {
-        warn!(error = %util::error_chain::error_chain(&e), "import: failed to announce the imported servers");
+        warn!(
+            error = &e as &dyn std::error::Error,
+            "import: failed to announce the imported servers"
+        );
     }
 }
 
@@ -285,7 +291,10 @@ pub fn import_dropped_files(app: AppHandle, paths: Vec<PathBuf>) {
         // is awaited rather than dropped so a panic is reported, not lost.
         let done = tauri::async_runtime::spawn_blocking(move || import_and_report(&app, &paths));
         if let Err(e) = done.await {
-            warn!(error = %util::error_chain::error_chain(&e), "import: dropped-file import failed");
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "import: dropped-file import failed"
+            );
         }
     });
 }

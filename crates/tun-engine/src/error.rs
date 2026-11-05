@@ -10,7 +10,7 @@ use crate::gateway::GatewayError;
 /// table manipulation.
 #[derive(Debug, Error)]
 pub enum RoutingError {
-    /// Gateway failure; log with `util::error_chain`.
+    /// Gateway failure; log it as an error value, so its `source()` chain is rendered.
     #[error("gateway detection failed: {0}")]
     Gateway(#[source] GatewayError),
     #[error("route setup failed: {0}")]
@@ -50,7 +50,7 @@ impl RoutingError {
     /// error goes to the log.
     pub(crate) fn state_write_failed(what: &str, e: &util::versioned_file::StoreError) -> Self {
         use util::versioned_file::StoreError;
-        tracing::error!(error = %util::error_chain::error_chain(e), "{what} could not be written");
+        tracing::error!(error = e as &dyn std::error::Error, "{what} could not be written");
         let kind = match e {
             StoreError::Io(e) => e.kind(),
             StoreError::Encode(_) => std::io::ErrorKind::InvalidData,
@@ -79,11 +79,11 @@ pub(crate) enum CheckpointFailure {
 /// Why `setup_routes` stopped.
 #[derive(Debug, Error)]
 pub(crate) enum SetupFailure {
-    #[error(transparent)]
-    Command(RouteCommandError),
+    #[error("{0}")]
+    Command(#[source] RouteCommandError),
     /// The record of the next command could not be written, so it did not run.
-    #[error(transparent)]
-    Checkpoint(CheckpointFailure),
+    #[error("{0}")]
+    Checkpoint(#[source] CheckpointFailure),
 }
 
 impl From<SetupFailure> for RoutingError {

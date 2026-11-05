@@ -88,6 +88,8 @@ impl std::fmt::Display for StartError {
     }
 }
 
+impl std::error::Error for StartError {}
+
 /// A parsed sitrep control event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]

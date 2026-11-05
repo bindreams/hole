@@ -98,7 +98,10 @@ fn opened_from_token_read<P>(
         Ok(true) => Ok(Opened::Service(process)),
         Ok(false) => Ok(Opened::NotTheService),
         Err(error) if has_exited(&process)? => {
-            tracing::debug!(%error, "the token of a process that has exited cannot be read");
+            tracing::debug!(
+                error = &error as &dyn std::error::Error,
+                "the token of a process that has exited cannot be read"
+            );
             Ok(Opened::NoSuchProcess)
         }
         Err(error) => Opened::of_failure(basis, error),
@@ -214,7 +217,10 @@ fn enable_debug_privilege() {
         })
     };
     if let Err(error) = enabled {
-        warn!(%error, "SeDebugPrivilege could not be enabled; terminating a process of another principal may be refused");
+        warn!(
+            error = &error as &dyn std::error::Error,
+            "SeDebugPrivilege could not be enabled; terminating a process of another principal may be refused"
+        );
     }
 }
 
