@@ -459,7 +459,7 @@ pub(crate) fn ensure_pull_landed(repo_root: &Path, subdir: &str, pull: &Output) 
     )?;
     if !uncommitted.is_empty() {
         bail!(
-            "`git subrepo pull {subdir}` exited 0 but left uncommitted changes under `{subdir}`:\n{uncommitted}\n{:?}",
+            "`git subrepo pull {subdir}` exited 0 but left uncommitted changes under `{subdir}`; check `git log -1` for anything it committed:\n{uncommitted}\n{:?}",
             PullRecord::from_output(pull)
         );
     }

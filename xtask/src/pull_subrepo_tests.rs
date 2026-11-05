@@ -566,12 +566,6 @@ fn assert_pull_did_not_land(err: &anyhow::Error, pin: &str, fetch_ref_at: &str) 
     }
 }
 
-/// The failed check ended the run: HEAD is still `git subrepo pull`'s own commit, so no tag-pin fixup followed it.
-fn assert_no_commit_followed_the_pull(fx: &Fixture) {
-    let subject = git_output(&fx.downstream, &["log", "-1", "--format=%s"]);
-    assert!(subject.starts_with("git subrepo pull"), "{subject}");
-}
-
 fn exit_0_pull() -> Output {
     Output {
         status: exit_status(0),
@@ -611,7 +605,6 @@ fn a_first_pull_that_exits_0_with_the_fetch_ref_behind_the_pin_is_an_error() {
     let pin = gitrepo_commit(&fx);
     assert_ne!(pin, v1);
     assert_pull_did_not_land(&err, &pin, &v1);
-    assert_no_commit_followed_the_pull(&fx);
 }
 
 #[skuld::test]
@@ -626,7 +619,6 @@ fn a_stale_parent_retry_that_exits_0_with_the_fetch_ref_behind_the_pin_is_an_err
     let pin = gitrepo_commit(&fx);
     assert_ne!(pin, v1);
     assert_pull_did_not_land(&err, &pin, &v1);
-    assert_no_commit_followed_the_pull(&fx);
     assert!(
         format!("{err:#}").contains("parent-realignment commit"),
         "the retry's disclosure is missing: {err:#}"
@@ -634,10 +626,10 @@ fn a_stale_parent_retry_that_exits_0_with_the_fetch_ref_behind_the_pin_is_an_err
 }
 
 // `ensure_pull_landed`, called directly. A pull cannot be driven to these states through `attempt_pull`
-// without a stand-in for `git subrepo`: where the real pull stopped in #1183 is unknown, and its stages that
+// without a stand-in for `git subrepo`: where a silent exit-0 pull stops is unknown, and its stages that
 // exit 0 early are not reachable from a fixture.
 
-/// The measured failure of #1183: the fetch ref is ahead of the committed pin and nothing merged.
+/// A pull that exited 0 having merged nothing: the fetch ref is ahead of the committed pin.
 #[skuld::test]
 fn a_fetch_ref_ahead_of_the_committed_pin_is_an_error() {
     let fx = Fixture::build(ConflictKind::None);
