@@ -784,7 +784,8 @@ fn disengage_with(token: Option<&str>, adopting: bool, ops: &mut dyn PfOps) {
             "pf ruleset restore failed during cover disengage"
         );
         tracing::warn!(
-            "leaving failclosed-state file in place: the /etc/pf.conf restore did not confirm — clearing it              now would make the next sweep read a clean host while the block persists"
+            "leaving failclosed-state file in place: the /etc/pf.conf restore did not confirm — clearing it \
+             now would make the next sweep read a clean host while the block persists"
         );
         return;
     }
@@ -849,7 +850,8 @@ fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, o
         }
         StateFile::Unreadable => {
             tracing::warn!(
-                "failclosed-state file could not be read; recovering the cover anyway — an unreadable                  record is not evidence there is no cover to clear"
+                "failclosed-state file could not be read; recovering the cover anyway — an unreadable \
+                 record is not evidence there is no cover to clear"
             );
             ops.restore(None, adopting);
         }
@@ -1244,7 +1246,9 @@ pub(crate) trait PfOps {
 /// [`settle`], so every sweep discloses the same leak the same way.
 fn warn_unsalvageable_token(what: &str) {
     tracing::warn!(
-        "{what} file is unusable and no pf token could be read out of it — a pf enable refcount          may be leaked (pf then stays enabled over the canonical /etc/pf.conf, which blocks          nothing, and a reboot resets it)"
+        "{what} file is unusable and no pf token could be read out of it — a pf enable refcount \
+         may be leaked (pf then stays enabled over the canonical /etc/pf.conf, which blocks \
+         nothing, and a reboot resets it)"
     );
 }
 
@@ -1363,7 +1367,8 @@ pub(crate) fn release_all_with(
         }
         StateFile::Unreadable => {
             tracing::warn!(
-                "transient failclosed-state file could not be read; restoring the default ruleset anyway —                  an unreadable record is not evidence there is no cover to clear"
+                "transient failclosed-state file could not be read; restoring the default ruleset anyway — \
+                 an unreadable record is not evidence there is no cover to clear"
             );
             let restored = ops.reload_default();
             finish_release(ops, Record::Transient, None, restored).err()
@@ -1388,12 +1393,14 @@ pub(crate) fn release_all_with(
                     Ok(()) => {
                         tracing::warn!(
                             error = &snapshot_err as &dyn std::error::Error,
-                            "captured pf snapshot could not load; fell back to the default ruleset —                              the host's captured pf rules could not be restored"
+                            "captured pf snapshot could not load; fell back to the default ruleset — \
+                             the host's captured pf rules could not be restored"
                         );
                         Ok(())
                     }
                     Err(fallback_err) => Err(RoutingError::RouteSetup(format!(
-                        "snapshot restore failed ({snapshot_err}); default-ruleset fallback also failed                          ({fallback_err})"
+                        "snapshot restore failed ({snapshot_err}); default-ruleset fallback also failed \
+                         ({fallback_err})"
                     ))),
                 },
             };
@@ -1401,14 +1408,16 @@ pub(crate) fn release_all_with(
         }
         StateFile::Unusable { pf_token } => {
             tracing::warn!(
-                "standing lockdown-pf-state file is unusable; no snapshot to restore, falling back to                  the default ruleset"
+                "standing lockdown-pf-state file is unusable; no snapshot to restore, falling back to \
+                 the default ruleset"
             );
             let restored = ops.reload_default();
             finish_release(ops, Record::Standing, pf_token.as_deref(), restored).err()
         }
         StateFile::Unreadable => {
             tracing::warn!(
-                "standing lockdown-pf-state file could not be read; no snapshot to restore, falling back to                  the default ruleset"
+                "standing lockdown-pf-state file could not be read; no snapshot to restore, falling back to \
+                 the default ruleset"
             );
             let restored = ops.reload_default();
             finish_release(ops, Record::Standing, None, restored).err()

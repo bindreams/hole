@@ -326,7 +326,8 @@ fn an_externally_released_cover_is_not_silently_reused() {
         assert_eq!(
             st.cover_disengage_calls.load(Ordering::SeqCst),
             1,
-            "the dropped zombie's stamp is stale, so its drop deletes nothing; only the retry's own              successful-connect release disengages"
+            "the dropped zombie's stamp is stale, so its drop deletes nothing; only the retry's own \
+             successful-connect release disengages"
         );
         assert_eq!(
             st.cover_engage_calls.load(Ordering::SeqCst),
