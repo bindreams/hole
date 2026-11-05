@@ -4265,6 +4265,32 @@ rewriting files in a user-writable directory is an attack surface. The support
 bundle is scrubbed on collection instead, and its `REDACTION.txt` states the
 three residuals plainly.
 
+### Logging an error
+
+An error reaches a log as a value, in one form:
+
+```rust
+tracing::warn!(error = &e as &dyn std::error::Error, "what failed");
+```
+
+- **Boxed and borrowed.** `Box<dyn Error + Send + Sync>` and `anyhow::Error` pass as `error = &*b`. When `e` is already
+  a reference, cast it without the extra `&` (`error = e as &dyn std::error::Error`): `&&T` is not `'static`.
+- **The message never interpolates the error** (`{e}`, `%e`, `?e`): the field carries it, and the message would print
+  its first link a second time. The message names what failed.
+- **The renderer.** `YamlFormat` renders an error field as a YAML list of its `source()` chain, outermost first, each
+  link's `Display` as one item (a multi-line `Display` stays one item). The stock formatter that `galoshes` and
+  `garter-bin` install prints the same field as `error=<Display> error.sources=[..]`, so the call site is the same there.
+- **The type rule.** A variant's `Display` names what this layer failed to do and never formats its `source()`; a cause
+  is `#[source]` or `#[from]`. A `Display` that includes its cause prints it twice.
+- **Reading a chain in code.** [`util::error`](crates/util/src/error.rs) has two walks. `chain` follows `source()`
+  only; it is what the renderer prints. `links` also descends an `io::Error` through `get_ref`, because
+  `io::Error::other(e)` keeps `e` out of `source()` while its `Display` shows it. `find::<T>` and `raw_os_error` are
+  predicates over `links`: a typed cause or an OS code is found wherever the wrapping put it. Do not write a
+  `source()` loop by hand.
+- **A value that is not an error stays as it is.** Third-party types with no `std::error::Error` impl and a `String`
+  made from an error are logged as they are; text a user reads (a dialog, a toast) is written from `user_message()` or
+  the type's `Display`, never from the log field.
+
 ### Logging directives (HOLE_BRIDGE_LOG)
 
 `HOLE_BRIDGE_LOG` takes a comma-separated list of `tracing` directives (default
