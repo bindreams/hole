@@ -3,6 +3,10 @@
 //! Two walks, because `io::Error` hides its payload from `source()`: it
 //! delegates to the payload's own `source()`, so `io::Error::other(typed)`
 //! skips `typed` itself.
+//!
+//! The walks reach only what each error exposes: a dependency's
+//! `#[error(transparent)]` wrapper hides its inner error (`cosca::error::Error::Io`
+//! does), and no walk here can see past it.
 
 use std::io;
 
