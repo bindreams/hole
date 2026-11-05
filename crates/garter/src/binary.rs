@@ -898,7 +898,10 @@ pub(crate) trait PluginTree {
 /// profile): `waitid(WNOWAIT)` where that exists, and `pidfd_error` otherwise. Either way the root stays unreaped.
 #[cfg(target_os = "linux")]
 async fn watch_exit_without_pidfd(pid: u32, pidfd_error: cosca::error::Error) -> Result<(), cosca::error::Error> {
-    tracing::debug!("the pidfd exit watch is unavailable ({pidfd_error}); watching the exit with waitid");
+    tracing::debug!(
+        error = &pidfd_error as &dyn std::error::Error,
+        "the pidfd exit watch is unavailable; watching the exit with waitid"
+    );
     crate::exit_watch::wait_exit_without_reaping(pid)
         .await
         .map_err(cosca::error::Error::Io)
@@ -1350,7 +1353,7 @@ async fn finish_plugin(
         Ok(()) => return end_plugin(plugin, tree, stdout, stderr).await,
         Err(refusal) => refusal,
     };
-    tracing::warn!(plugin = %plugin, "failed to kill the plugin's root: {refusal}");
+    tracing::warn!(plugin = %plugin, error = &refusal as &dyn std::error::Error, "failed to kill the plugin's root");
     drain_readers_after_exit(plugin, tree, stdout, stderr).await;
     if root_has_exited(plugin, tree).await {
         if let Err(e) = reap_root(tree).await {

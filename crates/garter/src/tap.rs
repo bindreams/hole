@@ -523,7 +523,8 @@ async fn stop_inner(
         Err(je) if je.is_cancelled() => {}
         Err(je) => tracing::warn!(
             plugin = %plugin_name,
-            "plugin tap: the inner task panicked while it was being stopped: {je}"
+            error = &je as &dyn std::error::Error,
+            "plugin tap: the inner task panicked while it was being stopped"
         ),
     }
 }
