@@ -5,8 +5,6 @@
 //!   another principal can write.
 //! - [`error`] — walks over an error's causes (`chain`, `links`) and
 //!   predicates over them (`find`, `raw_os_error`).
-//! - [`error_chain`] — an error rendered with every cause in its `source()`
-//!   chain, for log fields.
 //! - [`ownership`] — generic `chown(2)` primitive (macOS; a no-op elsewhere).
 //! - [`parse_error`] — content-safe classification of a `serde_json` parse
 //!   failure, so an error that quotes its input never reaches a log.
@@ -32,7 +30,6 @@
 
 pub mod dir;
 pub mod error;
-pub mod error_chain;
 pub mod ownership;
 pub mod parse_error;
 pub mod port_alloc;
