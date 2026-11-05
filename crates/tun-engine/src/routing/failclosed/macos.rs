@@ -414,12 +414,20 @@ impl Cover {
     /// `Drop` is the whole operation — unlike Windows, which must close its
     /// FWPM engine handle here.
     pub(crate) fn detach(self) {
-        std::mem::forget(self);
+        self.skip_drop();
     }
 
     /// Disengage this cover under `lock`; a stale install disengages nothing (its token is already dropped).
     pub(crate) fn release(self, lock: &CoverLock) {
         self.stamp.release(lock, || self.disengage());
+        self.skip_drop();
+    }
+
+    /// Consume the guard without running `Drop`'s disengage. The heap fields are emptied first: `forget` alone
+    /// would leak the token and the state dir for the life of the process.
+    fn skip_drop(mut self) {
+        drop(std::mem::take(&mut self.token));
+        drop(std::mem::take(&mut self.state_dir));
         std::mem::forget(self);
     }
 
