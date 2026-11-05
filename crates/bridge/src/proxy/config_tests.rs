@@ -430,7 +430,9 @@ fn an_unreadable_route_record_reaches_the_toast_as_its_file_name_only() {
 /// let out, so the start is cancelled and no failure toast follows.
 #[skuld::test]
 fn a_cover_released_while_engaging_cancels_the_start() {
-    let err = ProxyError::from(tun_engine::RoutingError::SupersededByRelease);
+    let err = ProxyError::from(tun_engine::RoutingError::SupersededByRelease(
+        tun_engine::routing::failclosed::Overtaken::Superseded,
+    ));
 
     assert!(matches!(err, ProxyError::Cancelled), "{err:?}");
     assert_eq!(

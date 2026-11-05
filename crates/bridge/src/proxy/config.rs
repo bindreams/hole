@@ -291,7 +291,7 @@ impl From<tun_engine::RoutingError> for ProxyError {
             tun_engine::RoutingError::RouteSetup(s) => ProxyError::RouteSetup(s),
             // The path is in the bridge log (tun-engine logged it); the toast names the file only.
             tun_engine::RoutingError::StateUnreadable { .. } => ProxyError::RouteSetup(e.redacted()),
-            tun_engine::RoutingError::SupersededByRelease => ProxyError::Cancelled,
+            tun_engine::RoutingError::SupersededByRelease(_) => ProxyError::Cancelled,
         }
     }
 }

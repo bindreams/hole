@@ -332,7 +332,6 @@ impl MockRoutingState {
             skip,
             Box::new(move || {
                 let release = tun_engine::routing::failclosed::begin_release(&dir);
-                release.about_to_delete();
                 if in_flight {
                     state.releases_in_flight.lock().unwrap().push(release);
                 }
@@ -344,7 +343,7 @@ impl MockRoutingState {
     fn unblock_during_next_cover_drop(&self, state_dir: &std::path::Path) {
         let dir = state_dir.to_path_buf();
         *self.on_cover_drop.lock().unwrap() = Some(Box::new(move || {
-            tun_engine::routing::failclosed::begin_release(&dir).about_to_delete();
+            drop(tun_engine::routing::failclosed::begin_release(&dir));
         }));
     }
 
@@ -543,7 +542,9 @@ impl Routing for MockRouting {
             .unwrap()
             .contains(&resolver_ip)
         {
-            return Err(RoutingError::SupersededByRelease);
+            return Err(RoutingError::SupersededByRelease(
+                tun_engine::routing::failclosed::Overtaken::Superseded,
+            ));
         }
         if self
             .state
@@ -3969,7 +3970,7 @@ mod self_test {
             let state_dir = dir.path().to_path_buf();
             *st.on_install.lock().unwrap() = Some((
                 0,
-                Box::new(move || drop(tun_engine::routing::failclosed::begin_release(&state_dir))),
+                Box::new(move || tun_engine::routing::failclosed::begin_release(&state_dir).changed_nothing()),
             ));
 
             let err = pm
@@ -3989,7 +3990,7 @@ mod self_test {
     fn an_unblock_that_ended_before_the_start_began_does_not_cancel_it() {
         rt().block_on(async {
             let (mut pm, cfg, st, dir) = covered_gate_setup(false);
-            tun_engine::routing::failclosed::begin_release(dir.path()).about_to_delete();
+            drop(tun_engine::routing::failclosed::begin_release(dir.path()));
 
             let err = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())

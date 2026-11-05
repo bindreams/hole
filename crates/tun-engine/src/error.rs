@@ -25,8 +25,10 @@ pub enum RoutingError {
     /// installing that cover, or began during the install, so the engage backed
     /// out and the host is as the release left it. Not a failure of the cover:
     /// the user asked to be let out.
+    ///
+    /// Carries why the release stopped the engage, so a caller that holds a cover decides once, on the verdict.
     #[error("the fail-closed cover was released while it was being engaged, and was backed out")]
-    SupersededByRelease,
+    SupersededByRelease(crate::routing::failclosed::Overtaken),
 }
 
 fn state_unreadable(record: &dyn std::fmt::Display) -> String {
@@ -45,19 +47,19 @@ impl RoutingError {
             RoutingError::Gateway(_) => self.to_string(),
             RoutingError::RouteSetup(_) => self.to_string(),
             RoutingError::StateUnreadable { .. } => state_unreadable(&crate::routing::state::STATE_FILE_NAME),
-            RoutingError::SupersededByRelease => self.to_string(),
+            RoutingError::SupersededByRelease(_) => self.to_string(),
         }
     }
 
-    /// Whether this error means the user's release ended the engage, so the
-    /// start that made it is cancelled: never run uncovered, never retried with
-    /// another engage.
-    pub fn cancels_the_start(&self) -> bool {
+    /// The verdict, if this error means a release ended the engage: the start
+    /// that made it is cancelled, never run uncovered, never retried with another
+    /// engage.
+    pub fn overtaken_by_release(&self) -> Option<crate::routing::failclosed::Overtaken> {
         match self {
-            RoutingError::Gateway(_) => false,
-            RoutingError::RouteSetup(_) => false,
-            RoutingError::StateUnreadable { .. } => false,
-            RoutingError::SupersededByRelease => true,
+            RoutingError::Gateway(_) => None,
+            RoutingError::RouteSetup(_) => None,
+            RoutingError::StateUnreadable { .. } => None,
+            RoutingError::SupersededByRelease(verdict) => Some(*verdict),
         }
     }
 }
