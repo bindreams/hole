@@ -4,9 +4,9 @@
 //! delegates to the payload's own `source()`, so `io::Error::other(typed)`
 //! skips `typed` itself.
 //!
-//! The walks reach only what each error exposes: a dependency's
-//! `#[error(transparent)]` wrapper hides its inner error (`cosca::error::Error::Io`
-//! does), and no walk here can see past it.
+//! The walks reach only what each error exposes through `source()` (and, for
+//! [`links`], an `io::Error`'s payload). An inner error a type does not expose
+//! is invisible to every walk here, as to [`find`] and [`raw_os_error`].
 
 use std::io;
 

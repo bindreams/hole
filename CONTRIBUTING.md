@@ -4291,9 +4291,7 @@ tracing::warn!(error = &e as &dyn std::error::Error, "what failed");
   wrappers are the transitional exception, and a logged chain shows their inner text twice until they get text of
   their own.
 - **Reading a chain in code.** Use [`util::error`](crates/util/src/error.rs) (`chain`, `links`, `find`, `raw_os_error`);
-  do not write a `source()` loop by hand. A dependency's transparent wrapper hides its inner error from these walks:
-  `cosca::error::Error::Io` does until bindreams/cosca#912, so `raw_os_error` and `find` miss an `io::Error` behind
-  `garter::Error::Cosca`.
+  do not write a `source()` loop by hand. What the walks reach is stated in the module doc.
 - **A value that is not an error stays as it is.** Third-party types with no `std::error::Error` impl and a `String`
   made from an error are logged as they are; text a user reads (a dialog, a toast) is written from `user_message()` or
   the type's `Display`, never from the log field.
