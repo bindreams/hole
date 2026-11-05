@@ -1,4 +1,4 @@
-//! The generation and the path lock: what `observe` pairs, what moves the generation, and where a failed read failed.
+//! The generation and the path lock: what `observe` pairs, that every write attempt moves the generation exactly once, and where a failed read failed.
 
 use std::ffi::OsStr;
 use std::io;
@@ -8,9 +8,11 @@ use std::sync::Arc;
 
 use super::is_locked;
 use crate::dir::ReadDir;
-use crate::versioned_file::fixtures::{dir, put, ClaimFile, DecisionFile};
+use crate::versioned_file::fixtures::{dir, names, put, ClaimFile, CoverFile, DecisionFile};
 use crate::versioned_file::store::Fs;
-use crate::versioned_file::{Change, DefaultPlacement, Loaded, StoreError, UnreadableKind, VersionedFile};
+use crate::versioned_file::{
+    Change, DefaultPlacement, Loaded, StoreError, UnreadableKind, UpdateOutcome, VersionedFile,
+};
 
 fn plain() -> DefaultPlacement {
     DefaultPlacement::default()
@@ -74,16 +76,14 @@ fn generation_moves_for_a_remove_and_for_a_move_aside() {
 }
 
 #[skuld::test]
-fn generation_is_unchanged_by_keep_and_by_a_refusal() {
+fn generation_is_unchanged_by_keep() {
     let dir = dir();
     put(&dir, "claim.json", br#"{"version":99,"value":"theirs"}"#);
     let file = VersionedFile::<ClaimFile>::new(dir.path());
     let before = file.observe().generation;
 
     file.update(&plain(), |_| (Change::Keep, ())).unwrap();
-    let refused = file.update(&plain(), |_| (Change::Store(ClaimFile { value: "v".into() }), ()));
 
-    assert!(matches!(refused, Err(StoreError::Unreadable { .. })), "{refused:?}");
     assert_eq!(file.observe().generation, before);
 }
 
@@ -196,6 +196,97 @@ fn a_panicking_decide_leaves_the_file_usable() {
         file.observe().loaded,
         Loaded::Current { value: DecisionFile { ref value }, .. } if value == "before"
     ));
+}
+
+// Moves once per write attempt ----------------------------------------------------------------------------------------
+
+/// Each input moves the generation by exactly one, measured by two reads around the write.
+fn moves_once<S: crate::versioned_file::VersionedState, R>(
+    file: &VersionedFile<S>,
+    place: &dyn crate::versioned_file::Placement,
+    decide: impl FnOnce(&crate::versioned_file::Observed<S>) -> (Change<S>, R),
+) -> Result<(R, crate::versioned_file::UpdateOutcome), StoreError> {
+    let before = file.observe().generation;
+    let result = file.update(place, decide);
+    assert_eq!(file.observe().generation, before.next(), "{:?}", result.as_ref().err());
+    result
+}
+
+#[skuld::test]
+fn next_is_the_generation_after_one_write() {
+    // A Store over an absent file.
+    let absent = dir();
+    let file = VersionedFile::<CoverFile>::new(absent.path());
+    moves_once(&file, &plain(), |_| {
+        (Change::Store(CoverFile { value: "v".into() }), ())
+    })
+    .unwrap();
+
+    // A Store over a newer and over a corrupt record: the backup path, which links before it publishes.
+    for bytes in [&br#"{"version":99,"value":"theirs"}"#[..], &b"{ not json"[..]] {
+        let dir = dir();
+        put(&dir, "cover.json", bytes);
+        let file = VersionedFile::<CoverFile>::new(dir.path());
+        moves_once(&file, &plain(), |_| {
+            (Change::Store(CoverFile { value: "v".into() }), ())
+        })
+        .unwrap();
+        assert!(
+            names(&dir).iter().any(|n| n.ends_with(".bak")),
+            "guard: the backup path ran"
+        );
+    }
+
+    // A Remove over a current file.
+    let current = dir();
+    let file = VersionedFile::<DecisionFile>::new(current.path());
+    store(&file, "a").unwrap();
+    moves_once(&file, &plain(), |_| (Change::Remove, ())).unwrap();
+}
+
+#[skuld::test]
+fn a_directory_that_cannot_be_opened_still_moves_the_generation() {
+    let root = dir();
+    let state = crate::dir::testing::state_dir_linked_to_a_system_folder(root.path());
+    let file = VersionedFile::<DecisionFile>::new(&state);
+
+    let result = moves_once(&file, &plain(), |_| (Change::Keep, ()));
+
+    assert!(result.is_err(), "guard: the open failed");
+}
+
+#[skuld::test]
+fn a_refused_store_moves_the_generation() {
+    let dir = dir();
+    put(&dir, "claim.json", br#"{"version":99,"value":"theirs"}"#);
+    let file = VersionedFile::<ClaimFile>::new(dir.path());
+
+    let refused = moves_once(&file, &plain(), |_| {
+        (Change::Store(ClaimFile { value: "v".into() }), ())
+    });
+
+    assert!(matches!(refused, Err(StoreError::Unreadable { .. })), "{refused:?}");
+}
+
+#[skuld::test]
+fn a_remove_over_a_missing_directory_moves_the_generation() {
+    let root = dir();
+    let file = VersionedFile::<DecisionFile>::new(&root.path().join("not-there"));
+
+    let outcome = moves_once(&file, &plain(), |_| (Change::Remove, ())).unwrap();
+
+    assert_eq!(outcome.1, UpdateOutcome::Absent);
+}
+
+#[skuld::test]
+fn a_remove_the_role_keeps_moves_the_generation() {
+    let dir = dir();
+    put(&dir, "cover.json", br#"{"version":1,"value":"v"}"#);
+    let file = VersionedFile::<CoverFile>::with_fs(dir.path(), Arc::new(DeniedRead));
+
+    let outcome = moves_once(&file, &plain(), |_| (Change::Remove, ())).unwrap();
+
+    assert_eq!(outcome.1, UpdateOutcome::Kept);
 }
 
 // Where a read failed -------------------------------------------------------------------------------------------------

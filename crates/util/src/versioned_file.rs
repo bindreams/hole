@@ -64,7 +64,7 @@ pub use loaded::{CannotRead, Loaded, Raw, UnreadableKind, WhyUnreadable};
 pub use role::{RemoveOver, Role, StoreOver};
 #[cfg(feature = "test-support")]
 pub use store::Fs;
-pub use store::{DefaultPlacement, Placement, StoreError, VersionedFile};
+pub use store::{DefaultPlacement, KeepOwner, Placement, StoreError, VersionedFile};
 pub use update::{Change, CreateOutcome, Observed, UpdateOutcome};
 
 #[cfg(test)]

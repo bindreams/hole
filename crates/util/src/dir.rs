@@ -217,6 +217,13 @@ impl Dir {
         platform::id_of(&self.file, name).map(|id| id.map(FileId))
     }
 
+    /// The `(uid, gid)` that owns `name` right now, or `None` if there is nothing there. A symlink is itself, never
+    /// what it points at. Windows has no such pair and answers `None`.
+    pub fn owner_of(&self, name: &OsStr) -> io::Result<Option<(u32, u32)>> {
+        single_component(name)?;
+        platform::ids_of(&self.file, name)
+    }
+
     /// What `name` is right now, or `None` if there is nothing.
     pub fn kind_of(&self, name: &OsStr) -> io::Result<Option<EntryKind>> {
         single_component(name)?;

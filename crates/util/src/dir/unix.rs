@@ -38,6 +38,7 @@ pub(super) struct Meta {
     pub dev: u64,
     pub ino: u64,
     pub uid: u32,
+    pub gid: u32,
     pub mode: u32,
 }
 
@@ -111,6 +112,7 @@ fn meta_of(st: &libc::stat) -> Meta {
         dev: st.st_dev as u64,
         ino: st.st_ino as u64,
         uid: st.st_uid,
+        gid: st.st_gid,
         mode: u32::from(st.st_mode),
     }
 }
@@ -383,6 +385,14 @@ pub(super) fn id_of(dir: &File, name: &OsStr) -> io::Result<Option<FileId>> {
     }
 }
 
+pub(super) fn ids_of(dir: &File, name: &OsStr) -> io::Result<Option<(u32, u32)>> {
+    match fstatat_nofollow(dir.as_raw_fd(), &cstr(name)?) {
+        Ok(meta) => Ok(Some((meta.uid, meta.gid))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 pub(super) fn kind_of(dir: &File, name: &OsStr) -> io::Result<Option<EntryKind>> {
     match fstatat_nofollow(dir.as_raw_fd(), &cstr(name)?) {
         Ok(meta) => Ok(Some(meta.kind())),
@@ -515,7 +525,14 @@ pub(super) fn secure_dir(dir: &File, owner: Option<(u32, u32)>, mode: Option<u32
 }
 
 pub(super) fn seal(file: &File, owner: Option<(u32, u32)>) -> io::Result<()> {
-    chown_best_effort(file, owner);
+    // A file already owned as asked is left alone: `fchown` to the owner it has is not needed.
+    let already = match owner {
+        Some((uid, gid)) => fstat(file.as_raw_fd()).is_ok_and(|meta| (meta.uid, meta.gid) == (uid, gid)),
+        None => false,
+    };
+    if !already {
+        chown_best_effort(file, owner);
+    }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 

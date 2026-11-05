@@ -682,6 +682,11 @@ pub(super) fn id_of(dir: &File, name: &OsStr) -> io::Result<Option<FileId>> {
     }
 }
 
+/// No unix ids; see [`secure_dir`].
+pub(super) fn ids_of(_dir: &File, _name: &OsStr) -> io::Result<Option<(u32, u32)>> {
+    Ok(None)
+}
+
 pub(super) fn kind_of(dir: &File, name: &OsStr) -> io::Result<Option<EntryKind>> {
     classify(dir, &wide(name)?)
 }

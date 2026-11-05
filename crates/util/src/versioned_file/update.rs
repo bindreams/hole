@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
 
-use super::generation::{self, Generation, Held};
+use super::generation::{self, Generation};
 use super::loaded::{CannotRead, Loaded, UnreadableKind};
 use super::store::encode;
 use super::{Placement, RemoveOver, StoreError, StoreOver, VersionedFile, VersionedState};
@@ -177,9 +177,13 @@ impl<S: VersionedState> VersionedFile<S> {
     /// 2. `decide`. A [`Change::Store`] value is encoded now; one that would not read back is
     ///    [`StoreError::Encode`] and nothing is touched.
     /// 3. [`step`] turns the change and what was read into an action. A refusal touches nothing.
-    /// 4. The generation moves, then the action runs. A failure before the rename leaves the original at its name;
-    ///    once the rename has happened the result is `Ok`, and a failed `after_publish` or directory flush is logged
-    ///    at warn.
+    /// 4. The action runs. A failure before the rename leaves the original at its name; once the rename has happened
+    ///    the result is `Ok`, and a failed `after_publish` or directory flush is logged at warn.
+    ///
+    /// The generation moves once, here and nowhere else: when the directory fails to open (anything but a missing
+    /// one), and when `decide` returns anything but [`Change::Keep`], before the encode, a refusal or any I/O. An
+    /// attempt that then fails or does nothing has still moved it, so a reader that compared generations cannot
+    /// mistake it for no write.
     ///
     /// The directory is opened once without following a symlink and every step names a file inside that handle.
     ///
@@ -196,7 +200,10 @@ impl<S: VersionedState> VersionedFile<S> {
         let dir = match self.open_dir(place, false) {
             Ok(dir) => Some(dir),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                held.bump();
+                return Err(e.into());
+            }
         };
         let loaded = match &dir {
             None => Loaded::Absent,
@@ -211,6 +218,9 @@ impl<S: VersionedState> VersionedFile<S> {
         };
 
         let (change, result) = decide(&observed);
+        if !matches!(change, Change::Keep) {
+            held.bump();
+        }
         let bytes = match &change {
             Change::Store(value) => Some(encode(value)?),
             Change::Keep | Change::Remove | Change::MoveAside => None,
@@ -220,49 +230,36 @@ impl<S: VersionedState> VersionedFile<S> {
             Step::Refuse(refusal) => return Err(refusal),
             Step::Write { back_up } => {
                 let bytes = bytes.expect("a write step comes from a Store");
-                self.write(&mut held, place, dir, &bytes, back_up)?;
+                self.write(place, dir, &bytes, back_up)?;
                 UpdateOutcome::Stored
             }
             Step::Delete => match dir {
                 None => UpdateOutcome::Absent,
-                Some(dir) => {
-                    held.bump();
-                    match self.fs.remove_file(&dir, self.file_name()) {
-                        Ok(()) => UpdateOutcome::Removed,
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => UpdateOutcome::Absent,
-                        Err(e) => return Err(e.into()),
-                    }
-                }
+                Some(dir) => match self.fs.remove_file(&dir, self.file_name()) {
+                    Ok(()) => UpdateOutcome::Removed,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => UpdateOutcome::Absent,
+                    Err(e) => return Err(e.into()),
+                },
             },
             Step::MoveAside => match dir {
                 None => UpdateOutcome::Absent,
-                Some(dir) => {
-                    held.bump();
-                    match self.move_aside_in(&dir)? {
-                        Some(backup) => UpdateOutcome::MovedAside(backup),
-                        None => UpdateOutcome::Absent,
-                    }
-                }
+                Some(dir) => match self.move_aside_in(&dir)? {
+                    Some(backup) => UpdateOutcome::MovedAside(backup),
+                    None => UpdateOutcome::Absent,
+                },
             },
         };
         Ok((result, outcome))
     }
 
-    fn write(
-        &self,
-        held: &mut Held,
-        place: &dyn Placement,
-        dir: Option<Dir>,
-        bytes: &[u8],
-        back_up: bool,
-    ) -> Result<(), StoreError> {
-        held.bump();
+    fn write(&self, place: &dyn Placement, dir: Option<Dir>, bytes: &[u8], back_up: bool) -> Result<(), StoreError> {
         let dir = match dir {
             Some(dir) => dir,
             None => self.open_dir(place, true)?,
         };
+        let owner = place.file_owner(&dir, self.file_name())?;
         place.prepare_dir(&dir)?;
-        let staged = dir.stage(self.file_name(), bytes, place.owner(), |tmp| place.prepare_tmp(tmp))?;
+        let staged = dir.stage(self.file_name(), bytes, owner, |tmp| place.prepare_tmp(tmp))?;
         let backup = match back_up {
             true => self.link_to_free_backup(&dir)?,
             false => None,
