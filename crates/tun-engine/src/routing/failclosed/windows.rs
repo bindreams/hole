@@ -1307,7 +1307,8 @@ fn first_delete_failure(codes: &[(&'static str, u32)]) -> Option<RoutingError> {
 /// WFP-backed cover guard. Drop deletes the filters it installed by GUID, while its install is the latest
 /// ([`InstallStamp`]); the stamp's [`CoverKind`] selects the GUID set.
 pub struct Cover {
-    engine: HANDLE,
+    /// `None` once `release` or `detach` has taken and closed the engine, which makes `Drop` a no-op.
+    engine: Option<HANDLE>,
     stamp: InstallStamp,
 }
 
@@ -1444,7 +1445,10 @@ pub fn engage(
         })();
 
         match result {
-            Ok(stamp) => Ok(Cover { engine, stamp }),
+            Ok(stamp) => Ok(Cover {
+                engine: Some(engine),
+                stamp,
+            }),
             Err(e) => {
                 let _ = FwpmTransactionAbort0(engine);
                 let _ = FwpmEngineClose0(engine);
@@ -1544,7 +1548,10 @@ pub fn engage_lockdown(
             Ok(stamp)
         })();
         match result {
-            Ok(stamp) => Ok(Cover { engine, stamp }),
+            Ok(stamp) => Ok(Cover {
+                engine: Some(engine),
+                stamp,
+            }),
             Err(e) => {
                 let _ = FwpmTransactionAbort0(engine);
                 let _ = FwpmEngineClose0(engine);
@@ -1958,17 +1965,18 @@ impl Cover {
     /// That is what lets a LONG-LIVED caller keep the host covered without
     /// leaking a handle per call: `std::mem::forget` alone, which this
     /// replaces, leaked one on every armed reload for the life of the process.
-    pub(crate) fn detach(self) {
-        // SAFETY: `self.engine` is a live FWPM engine handle owned solely by
-        // this guard, and `self` is consumed here, so it cannot be closed twice.
+    pub(crate) fn detach(mut self) {
+        let engine = self.engine.take().expect("a live cover holds its engine");
+        // SAFETY: `engine` is a live FWPM engine handle owned solely by this
+        // guard, and taking it from `self` leaves `Drop` nothing to close, so
+        // it cannot be closed twice.
         unsafe {
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let rc = FwpmEngineClose0(self.engine);
+            let rc = FwpmEngineClose0(engine);
             if rc != ERROR_SUCCESS.0 {
                 tracing::warn!("FwpmEngineClose0 failed while detaching a cover: 0x{rc:08x}");
             }
         }
-        std::mem::forget(self);
     }
 }
 
@@ -2015,11 +2023,11 @@ impl Cover {
     }
 
     /// Delete this cover under `lock`, then close the engine. A stale install deletes nothing but still closes it.
-    pub(crate) fn release(self, lock: &CoverLock) {
-        let (engine, kind) = (self.engine, self.stamp.kind());
+    pub(crate) fn release(mut self, lock: &CoverLock) {
+        let engine = self.engine.take().expect("a live cover holds its engine");
+        let kind = self.stamp.kind();
         self.stamp.release(lock, || Self::delete_filters(engine, kind));
         Self::close_engine(engine);
-        std::mem::forget(self);
     }
 
     pub(crate) fn is_current(&self) -> bool {
@@ -2029,7 +2037,10 @@ impl Cover {
 
 impl Drop for Cover {
     fn drop(&mut self) {
-        let (engine, kind) = (self.engine, self.stamp.kind());
+        let Some(engine) = self.engine.take() else {
+            return;
+        };
+        let kind = self.stamp.kind();
         self.stamp.release_on_drop(|| Self::delete_filters(engine, kind));
         Self::close_engine(engine);
     }

@@ -399,9 +399,15 @@ fn enable_pf_capture_token() -> Result<String, RoutingError> {
 /// pf-backed cover guard. Drop disengages per its stamp's [`CoverKind`], while its install is the latest
 /// ([`InstallStamp`]): the transient cover restores `/etc/pf.conf`; the lockdown cover restores the snapshot.
 pub struct Cover {
+    /// `None` once `release` or `detach` has consumed the claim, which makes `Drop` a no-op.
+    held: Option<Held>,
+    stamp: InstallStamp,
+}
+
+/// What a live [`Cover`] must hand to its disengage.
+struct Held {
     token: String,
     state_dir: std::path::PathBuf,
-    stamp: InstallStamp,
 }
 
 impl Cover {
@@ -413,30 +419,24 @@ impl Cover {
     /// Leaving pf enabled is precisely what detaching means, so skipping
     /// `Drop` is the whole operation — unlike Windows, which must close its
     /// FWPM engine handle here.
-    pub(crate) fn detach(self) {
-        self.skip_drop();
+    pub(crate) fn detach(mut self) {
+        self.held = None;
     }
 
     /// Disengage this cover under `lock`; a stale install disengages nothing (its token is already dropped).
-    pub(crate) fn release(self, lock: &CoverLock) {
-        self.stamp.release(lock, || self.disengage());
-        self.skip_drop();
-    }
-
-    /// Consume the guard without running `Drop`'s disengage. The heap fields are emptied first: `forget` alone
-    /// would leak the token and the state dir for the life of the process.
-    fn skip_drop(mut self) {
-        drop(std::mem::take(&mut self.token));
-        drop(std::mem::take(&mut self.state_dir));
-        std::mem::forget(self);
+    pub(crate) fn release(mut self, lock: &CoverLock) {
+        let held = self.held.take().expect("a live cover holds its claim");
+        self.stamp.release(lock, || held.disengage(self.stamp.kind()));
     }
 
     pub(crate) fn is_current(&self) -> bool {
         self.stamp.is_current()
     }
+}
 
-    fn disengage(&self) {
-        match self.stamp.kind() {
+impl Held {
+    fn disengage(&self, kind: CoverKind) {
+        match kind {
             // A user-stop drop never has a standing cover being adopted.
             CoverKind::Transient => disengage(Some(&self.token), &self.state_dir, false),
             CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
@@ -568,8 +568,10 @@ pub fn engage(
     let state_dir = lock.state_dir();
     let token = engage_with(server_ip, resolver_ip, &mut RealEngageOps { state_dir, owner })?;
     Ok(Cover {
-        token,
-        state_dir: state_dir.to_owned(),
+        held: Some(Held {
+            token,
+            state_dir: state_dir.to_owned(),
+        }),
         stamp: lock.stamp_install(CoverKind::Transient),
     })
 }
@@ -704,7 +706,9 @@ fn engage_with(
 
 impl Drop for Cover {
     fn drop(&mut self) {
-        self.stamp.release_on_drop(|| self.disengage());
+        if let Some(held) = self.held.take() {
+            self.stamp.release_on_drop(|| held.disengage(self.stamp.kind()));
+        }
     }
 }
 
@@ -1030,8 +1034,10 @@ pub fn engage_lockdown(
     }
 
     Ok(Cover {
-        token,
-        state_dir: state_dir.to_owned(),
+        held: Some(Held {
+            token,
+            state_dir: state_dir.to_owned(),
+        }),
         stamp: lock.stamp_install(CoverKind::Lockdown),
     })
 }
