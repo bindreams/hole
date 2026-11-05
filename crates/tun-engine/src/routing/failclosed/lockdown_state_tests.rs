@@ -239,7 +239,10 @@ fn promote_declines_over_a_recorded_off_and_on() {
     for (enabled, want) in [(false, Intent::Off), (true, Intent::On)] {
         let tmp = tempfile::tempdir().unwrap();
         set_enabled(tmp.path(), enabled, None).unwrap();
-        assert_eq!(promote_unrecorded(tmp.path(), None).unwrap(), PromoteOutcome::Declined);
+        assert_eq!(
+            promote_unrecorded(tmp.path(), None).unwrap(),
+            PromoteOutcome::Declined(want)
+        );
         assert_eq!(load_intent(tmp.path()), want, "a recorded value is never rewritten");
     }
 }
@@ -254,11 +257,14 @@ fn promote_writes_over_unset_only() {
 #[skuld::test]
 fn promote_over_a_read_that_fails_declines_and_leaves_the_name_alone() {
     // A directory at the name: the read fails with something other than "not found", so the intent is unknown, not
-    // unset. Declining is `Ok(Declined)`, not a refusal, and nothing is written or backed up.
+    // unset. Declining is `Ok(Declined(Unreadable))`, not a refusal, and nothing is written or backed up.
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join(STATE_FILE_NAME)).unwrap();
 
-    assert_eq!(promote_unrecorded(tmp.path(), None).unwrap(), PromoteOutcome::Declined);
+    assert_eq!(
+        promote_unrecorded(tmp.path(), None).unwrap(),
+        PromoteOutcome::Declined(Intent::Unreadable)
+    );
 
     assert!(tmp.path().join(STATE_FILE_NAME).is_dir());
     assert_eq!(

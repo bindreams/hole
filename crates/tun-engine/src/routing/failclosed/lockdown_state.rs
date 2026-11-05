@@ -149,8 +149,8 @@ pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -
 pub enum PromoteOutcome {
     /// Nothing was recorded: the kill switch is now recorded as armed.
     Wrote,
-    /// The record was left as it is: something is recorded, or it could not be read.
-    Declined,
+    /// The record was left as it is, and this is the intent it classified as (never [`Intent::Unset`]).
+    Declined(Intent),
 }
 
 /// Record the kill switch as armed iff nothing is recorded ([`Intent::admits_adoption_promotion`]); the read and the
@@ -158,10 +158,11 @@ pub enum PromoteOutcome {
 pub fn promote_unrecorded(state_dir: &Path, owner: Option<(u32, u32)>) -> Result<PromoteOutcome, StoreError> {
     file(state_dir)
         .update(&DefaultPlacement { owner }, |now| {
-            if Intent::of(&now.loaded).admits_adoption_promotion() {
+            let intent = Intent::of(&now.loaded);
+            if intent.admits_adoption_promotion() {
                 (Change::Store(LockdownState { enabled: true }), PromoteOutcome::Wrote)
             } else {
-                (Change::Keep, PromoteOutcome::Declined)
+                (Change::Keep, PromoteOutcome::Declined(intent))
             }
         })
         .map(|(outcome, _)| outcome)

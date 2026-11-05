@@ -1488,7 +1488,7 @@ where
     // held and must not clobber it. The recover action keeps the host fail-closed
     // (Adopt) or disengages (Sweep).
     let presence = lockdown_present();
-    let decision = decide_cover_recovery(lockdown_intent, presence);
+    let mut decision = decide_cover_recovery(lockdown_intent, presence);
     // Repair BEFORE acting, so a crash in between leaves an intent that reads
     // armed. Only an unset intent is repaired, decided over the CURRENT file inside
     // the write (`promote_unrecorded`): the read above may be stale, and an
@@ -1499,11 +1499,16 @@ where
     // `promote_adopted_claim`). Re-deriving it on a LATER start is not a
     // fallback — once the cover is torn down the measurement reads `Absent`.
     if decision.record_intent_on {
-        if let Err(e) = failclosed::lockdown_state::promote_unrecorded(state_dir, owner) {
-            warn!(
+        match failclosed::lockdown_state::promote_unrecorded(state_dir, owner) {
+            Ok(failclosed::lockdown_state::PromoteOutcome::Wrote) => {}
+            // The read above was stale: decide the action, and so the adopted claim, from the intent the update saw.
+            Ok(failclosed::lockdown_state::PromoteOutcome::Declined(seen)) => {
+                decision = decide_cover_recovery(seen, presence);
+            }
+            Err(e) => warn!(
                 error = &e as &dyn std::error::Error,
                 "could not repair the lockdown intent over a measured live cover"
-            );
+            ),
         }
     }
     let adopt = matches!(decision.action, CoverRecovery::Adopt);
