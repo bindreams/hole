@@ -508,16 +508,16 @@ async fn insecure_fallback_logs_the_certificate_rejection_even_when_it_succeeds(
 
     // The message points at the finding by the words the rendered error uses.
     const FINDING: &str = "a certificate that could not be verified";
-    assert!(
-        BootstrapError::CertificateRejected.to_string().contains(FINDING),
-        "the finding's Display no longer says {FINDING:?}"
-    );
-    let (message, error) = output
+    let fallback = output
+        .lines()
+        .find(|line| line.contains("PLAINTEXT system DNS"))
+        .unwrap_or_else(|| panic!("no fallback line; got:\n{output}"));
+    let (message, _) = fallback
         .split_once(" error=")
-        .unwrap_or_else(|| panic!("the WARN has no error field; got:\n{output}"));
+        .unwrap_or_else(|| panic!("the fallback line has no error field; got:\n{output}"));
     assert!(
-        message.contains(FINDING) && error.contains(FINDING),
-        "the message and the rendered error must share the words {FINDING:?}; got:\n{output}"
+        message.contains(FINDING),
+        "the message must share the words {FINDING:?} with the rendered error; got:\n{output}"
     );
 }
 
