@@ -29,14 +29,17 @@ impl std::fmt::Debug for Raw {
 /// the next `store`.
 #[derive(Debug)]
 pub enum Loaded<S> {
-    /// No file (`ErrorKind::NotFound` only).
+    /// No file: `ErrorKind::NotFound`, or a read that failed on a name found gone when it was examined.
     Absent,
     /// The read failed with an I/O error. Says nothing about the bytes, so it
     /// is not [`CannotRead`]: no rule that moves or refuses a file by what it
-    /// holds may fire on it. `store` and `remove` give it a cell of its own
+    /// holds may fire on it. A store and a remove give it a cell of its own
     /// per role (`Role::on_store_io_failure`, `Role::on_remove_io_failure`),
-    /// and none of them destroys the file.
-    Unreadable(std::io::Error),
+    /// and none of them destroys the file. `kind` says where the read failed.
+    Unreadable {
+        error: std::io::Error,
+        kind: UnreadableKind,
+    },
     /// Not JSON, a bad `version`, or the wrong shape for that version.
     Corrupt { failure: ParseFailure, raw: Raw },
     /// At or below the chain's floor: dropped on purpose.
@@ -47,6 +50,19 @@ pub enum Loaded<S> {
     /// Read into the current schema; `found < S::VERSION` means it was
     /// migrated in memory.
     Current { value: S, found: u32 },
+}
+
+/// Where a read that failed with an I/O error failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadableKind {
+    /// The directory did not open.
+    Directory,
+    /// The name holds something that is not a regular file (a link, a directory, a FIFO).
+    NotAFile,
+    /// A regular file whose read failed.
+    File,
+    /// The read failed and the name could not be examined afterwards.
+    Unprobed,
 }
 
 /// The owner's two causes for a file a release cannot read.
@@ -93,7 +109,7 @@ impl<S> Loaded<S> {
             Loaded::Current { value, .. } => Ok(Some(value)),
             Loaded::Absent => Ok(None),
             Loaded::Obsolete { .. } => Ok(None),
-            Loaded::Unreadable(e) => Err(WhyUnreadable::ReadFailed(e.kind())),
+            Loaded::Unreadable { error, .. } => Err(WhyUnreadable::ReadFailed(error.kind())),
             Loaded::Newer { .. } => Err(WhyUnreadable::CannotRead(CannotRead::Newer)),
             Loaded::Corrupt { .. } => Err(WhyUnreadable::CannotRead(CannotRead::Corrupt)),
         }
@@ -107,7 +123,7 @@ impl<S> Loaded<S> {
             // No file: nothing to read.
             Loaded::Absent => None,
             // The read failed; the bytes are unknown, not unreadable.
-            Loaded::Unreadable(_) => None,
+            Loaded::Unreadable { .. } => None,
             // Read and dropped on purpose by the chain's floor.
             Loaded::Obsolete { .. } => None,
             // Read.
@@ -119,15 +135,19 @@ impl<S> Loaded<S> {
 impl<S: VersionedState> Loaded<S> {
     /// Classifies one read of `S`'s file. Logs a `warn!` for each unusual
     /// outcome and a `debug!` for a migrated one: name, versions and cause,
-    /// never a value.
-    pub(crate) fn from_read(read: std::io::Result<Vec<u8>>) -> Self {
+    /// never a value. `at` says where a read that failed (other than by a
+    /// missing file) failed, or `None` when the name turned out not to be there; it is asked only then.
+    pub(crate) fn from_read(read: std::io::Result<Vec<u8>>, at: impl FnOnce() -> Option<UnreadableKind>) -> Self {
         let file = S::FILE_NAME;
         let bytes = match read {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Absent,
             Err(e) => {
                 tracing::warn!(file, kind = ?e.kind(), error = %error_chain(&e), "state file could not be read");
-                return Loaded::Unreadable(e);
+                return match at() {
+                    Some(kind) => Loaded::Unreadable { error: e, kind },
+                    None => Loaded::Absent,
+                };
             }
         };
         let version = match frame::read_version(&bytes, S::UNVERSIONED_AS) {

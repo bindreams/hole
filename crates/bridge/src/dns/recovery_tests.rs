@@ -5,13 +5,16 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::Mutex;
 
 use super::*;
+use crate::dns_state::DnsState;
 #[cfg(target_os = "windows")]
 use crate::dns_state::{DnsPrior, DnsPriorAdapter};
-use crate::dns_state::{DnsState, SCHEMA_VERSION};
 
 fn write_state(dir: &std::path::Path, state: &DnsState) {
-    let json = serde_json::to_vec_pretty(state).unwrap();
-    std::fs::write(dir.join(dns_state::STATE_FILE_NAME), json).unwrap();
+    dns_state::file(dir)
+        .update(&util::versioned_file::DefaultPlacement::default(), |_| {
+            (util::versioned_file::Change::Store(state.clone()), ())
+        })
+        .unwrap();
 }
 
 // MockBackend (Windows) ===============================================================================================
@@ -129,7 +132,6 @@ fn recover_clears_state_file_with_no_adapters() {
     // no-op restore still clears the file.
     let dir = tempfile::tempdir().unwrap();
     let state = DnsState {
-        version: SCHEMA_VERSION,
         advertised: vec![v4((1, 1, 1, 1))],
         adapters: Vec::new(),
     };
@@ -166,7 +168,6 @@ fn recover_dns_config_restores_a_pre_846_file() {
         v6: DnsPrior::None,
     };
     let state = DnsState {
-        version: SCHEMA_VERSION,
         advertised: advertised.clone(),
         adapters: vec![prior.clone()],
     };
@@ -217,7 +218,6 @@ fn recover_dns_config_supersedes_when_restore_family_fails() {
         v6: DnsPrior::None,
     };
     let state = DnsState {
-        version: SCHEMA_VERSION,
         advertised: advertised.clone(),
         adapters: vec![prior.clone()],
     };
@@ -271,7 +271,6 @@ fn recover_dns_config_skips_an_adapter_that_moved_on() {
         v6: DnsPrior::None,
     };
     let state = DnsState {
-        version: SCHEMA_VERSION,
         advertised: advertised.clone(),
         adapters: vec![prior.clone()],
     };
@@ -317,7 +316,7 @@ fn recover_dns_config_preserves_a_file_with_no_advertised_evidence() {
     let dir = tempfile::tempdir().unwrap();
     // A file with NO `advertised` key loads as `[]` — no sound evidence.
     let json = serde_json::json!({
-        "version": SCHEMA_VERSION,
+        "version": 1,
         "adapters": [{
             "id": { "kind": "windows_alias", "value": "Ethernet" },
             "name_at_capture": "Ethernet",
@@ -373,7 +372,6 @@ fn recover_dns_config_never_evaluates_the_same_file_twice() {
         v6: DnsPrior::None,
     };
     let state = DnsState {
-        version: SCHEMA_VERSION,
         advertised: advertised.clone(),
         adapters: vec![prior],
     };
@@ -429,7 +427,6 @@ fn restore_gate_is_per_family() {
         },
     };
     let state = DnsState {
-        version: SCHEMA_VERSION,
         advertised,
         adapters: vec![prior.clone()],
     };

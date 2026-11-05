@@ -397,11 +397,8 @@ fn an_indeterminate_presence_reports_doing_nothing() {
 #[skuld::test]
 fn disengage_lockdown_drops_the_token_salvaged_from_an_unusable_record() {
     let dir = tempfile::tempdir().unwrap();
-    let skewed = format!(
-        r#"{{"version":{},"pf_token":"9","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":true}}"#,
-        lockdown_state::SCHEMA_VERSION + 1
-    );
-    std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), &skewed).unwrap();
+    let skewed = r#"{"version":2,"pf_token":"9","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":true}"#;
+    std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), skewed).unwrap();
 
     let file = lockdown_state::load_presence(dir.path());
     assert!(
@@ -797,7 +794,6 @@ impl RecoverOps for RecordingRecoverOps {
 /// A recorded transient cover holding `token`.
 fn recorded_cover(token: &str) -> state::FailClosedState {
     state::FailClosedState {
-        version: state::SCHEMA_VERSION,
         pf_token: token.to_owned(),
         pf_was_enabled: false,
     }
@@ -883,8 +879,8 @@ fn a_pf_token_is_salvaged_from_unusable_bytes_only_when_one_is_really_there() {
     assert_eq!(
         token(r#"{"version":99,"pf_token":"7","pf_was_enabled":false,"future_field":1}"#),
         Some("7".to_owned()),
-        "a version skew and an unknown field are exactly what `deny_unknown_fields` + the version \
-         check reject, and exactly where the token is still readable"
+        "a version skew and an unknown field are exactly where the record is unusable and the token \
+         is still readable"
     );
     assert_eq!(token("not json at all"), None);
     assert_eq!(token(r#"{"version":1}"#), None);
@@ -895,17 +891,14 @@ fn a_pf_token_is_salvaged_from_unusable_bytes_only_when_one_is_really_there() {
 /// A rolled-back bridge's sweep, driven from persisted bytes through the REAL
 /// [`state::load_presence`] into [`recover_cover_with`] — so `Unusable` is
 /// pinned to a payload rather than hand-constructed at the seam. The payload is
-/// a record one [`state::SCHEMA_VERSION`] ahead, which this binary classifies as
+/// a record one schema version ahead, which this binary classifies as
 /// `Unusable`.
 #[skuld::test]
 fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(state::STATE_FILE_NAME);
-    let newer = format!(
-        r#"{{"version":{},"pf_token":"7","pf_was_enabled":false}}"#,
-        state::SCHEMA_VERSION + 1
-    );
-    std::fs::write(&path, &newer).unwrap();
+    let newer = r#"{"version":2,"pf_token":"7","pf_was_enabled":false}"#;
+    std::fs::write(&path, newer).unwrap();
 
     let file = state::load_presence(dir.path());
     assert!(
@@ -1490,7 +1483,6 @@ impl PfOps for RecordingPfOps {
 
 fn transient_state() -> state::FailClosedState {
     state::FailClosedState {
-        version: state::SCHEMA_VERSION,
         pf_token: "111".into(),
         pf_was_enabled: false,
     }
@@ -1498,7 +1490,6 @@ fn transient_state() -> state::FailClosedState {
 
 fn standing_state() -> lockdown_state::LockdownPfState {
     lockdown_state::LockdownPfState {
-        version: lockdown_state::SCHEMA_VERSION,
         pf_token: "222".into(),
         main_snapshot: String::new(),
         nat_snapshot: String::new(),

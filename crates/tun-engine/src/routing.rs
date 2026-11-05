@@ -965,7 +965,7 @@ where
 ///
 /// A record that became unreadable since the sweep read it is refused, not
 /// replaced. The failure `setup_routes` sees carries no path (it reaches a
-/// toast); the full error, path included, is logged here.
+/// toast); the error is logged here with the record's file name.
 fn checkpoint_installed(
     persisted: &mut state::RouteState,
     record_file: &state::RouteFile,
@@ -987,38 +987,32 @@ fn checkpoint_installed_with(
     let prev = std::mem::replace(&mut persisted.installed, ids.to_vec());
     match write(persisted) {
         Ok(()) => Ok(()),
-        // The record on disk already lists `ids`: the checkpoint landed, only its
-        // durability is unconfirmed. Treating it as a failure would leave disk
-        // listing routes memory says were never installed, and a recovery from
-        // that record would delete routes Hole never installed.
-        Err(StoreError::PublishedNotFinalized(e)) => {
-            warn!(path = %record.display(), error = %util::error_chain::error_chain(&e), "route record replaced, but not known durable");
-            Ok(())
-        }
         Err(e) => {
             persisted.installed = prev;
-            Err(checkpoint_failure(e))
+            Err(checkpoint_failure(e, record))
         }
     }
 }
 
-/// The failure `setup_routes` sees for a checkpoint that did not land.
-fn checkpoint_failure(e: StoreError) -> CheckpointFailure {
+/// The failure `setup_routes` sees for a checkpoint that did not land. `record` is the record's path; the log names
+/// its file only.
+fn checkpoint_failure(e: StoreError, record: &Path) -> CheckpointFailure {
     match e {
         StoreError::Io(e) => {
             error!(error = %util::error_chain::error_chain(&e), "route record could not be written");
             CheckpointFailure::Io { kind: e.kind() }
         }
-        StoreError::Unreadable { path, cause } => {
-            error!(path = %path.display(), %cause, "route record cannot be read; the checkpoint is refused");
-            CheckpointFailure::RecordUnreadable { path }
+        StoreError::Unreadable { file, cause } => {
+            error!(file = %file.to_string_lossy(), %cause, "route record cannot be read; the checkpoint is refused");
+            CheckpointFailure::RecordUnreadable {
+                path: record.to_owned(),
+            }
         }
-        StoreError::ReadFailed { path, kind } => {
-            error!(path = %path.display(), ?kind, "route record cannot be read; the checkpoint is refused");
-            CheckpointFailure::RecordUnreadable { path }
-        }
-        StoreError::PublishedNotFinalized(_) => {
-            unreachable!("a published checkpoint is not a failure: see `checkpoint_installed`")
+        StoreError::ReadFailed { file, kind } => {
+            error!(file = %file.to_string_lossy(), ?kind, "route record cannot be read; the checkpoint is refused");
+            CheckpointFailure::RecordUnreadable {
+                path: record.to_owned(),
+            }
         }
         StoreError::Encode(what) => {
             error!(what, "route record could not be encoded");

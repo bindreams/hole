@@ -440,8 +440,8 @@ pub(super) fn rename_noreplace(dir: &File, from: &OsStr, to: &OsStr) -> io::Resu
 }
 
 /// The kernel or the filesystem does not offer `renameat2` with the flag. `EPERM` is not among these: it is a
-/// refusal of this rename (a sticky directory, a security module), and the caller's hard-link fallback is allowed
-/// where the rename was not and would leave its backup when the delete that follows is refused.
+/// refusal of this rename (a sticky directory, a security module), not a filesystem without the flag, and the
+/// "filesystem has no no-replace rename" error built from `Unsupported` would misname it.
 #[cfg(target_os = "linux")]
 pub(super) fn renameat2_unavailable(errno: i32) -> bool {
     matches!(errno, libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)

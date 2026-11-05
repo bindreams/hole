@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use crate::proxy_manager::proxy_manager_tests::{MockProxy, MockRouting};
 use crate::proxy_manager::ProxyState;
 use crate::test_support::rt;
+use crate::test_support::target_records;
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{CoverRecovery, Recovery};
 
@@ -271,7 +272,7 @@ fn a_persisted_connected_target_reconciles_at_startup_with_no_gui() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-        target::save(dir.path(), &connectable(), None).unwrap();
+        target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
         let state = routing.state();
@@ -303,7 +304,7 @@ fn a_persisted_connected_target_reconciles_at_startup_with_no_gui() {
 fn a_persisted_off_target_starts_nothing() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        target::save(dir.path(), &Target::Off, None).unwrap();
+        target_records::save(dir.path(), &Target::Off, None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
         let state = routing.state();
@@ -339,7 +340,7 @@ fn startup_recovery_runs_before_reconciliation() {
         // cover to engage here. If `reconcile_once` read the target before
         // recovery recorded that claim (or recovery never ran first, as
         // startup must guarantee), this would stay `Hold`, not `Engage`.
-        target::save(dir.path(), &connectable(), None).unwrap();
+        target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
         let state = routing.state();
@@ -377,9 +378,9 @@ fn reconcile_once_honours_a_do_not_connect_startup_preference() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         // The user was connected when the machine went down...
-        target::save(dir.path(), &connectable(), None).unwrap();
+        target_records::save(dir.path(), &connectable(), None).unwrap();
         // ...but had pushed "do not connect on startup" before that.
-        target::save_startup_preference(
+        target_records::save_startup_preference(
             dir.path(),
             &target::StartupPreference {
                 on_startup: hole_common::config::StartupBehavior::DoNotConnect,
@@ -413,10 +414,10 @@ fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate(
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         // Nothing persisted (a fresh install, or a prior explicit stop)...
-        target::save(dir.path(), &Target::Off, None).unwrap();
+        target_records::save(dir.path(), &Target::Off, None).unwrap();
         // ...but the GUI pushed AlwaysConnect with the last-connected config
         // as the candidate to substitute (R8/Task 4's `candidate`).
-        target::save_startup_preference(
+        target_records::save_startup_preference(
             dir.path(),
             &target::StartupPreference {
                 on_startup: hole_common::config::StartupBehavior::AlwaysConnect,
@@ -681,7 +682,7 @@ fn a_cancelled_boot_reconcile_abandons_the_start() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-        target::save(dir.path(), &connectable(), None).unwrap();
+        target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
@@ -1002,7 +1003,7 @@ fn a_failed_boot_connect_leaves_the_host_reachable() {
         // Kill switch OFF — the only case where the transient cover decides
         // the outcome. With it on, the standing cover governs instead.
         lockdown_state::set_enabled(dir.path(), false, None).unwrap();
-        target::save(dir.path(), &connectable(), None).unwrap();
+        target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
         let state = routing.state();
@@ -1029,7 +1030,7 @@ fn a_failed_boot_connect_leaves_the_host_reachable() {
 #[skuld::test]
 async fn a_failed_boot_connect_logs_the_cause_chain() {
     let dir = tempfile::tempdir().unwrap();
-    target::save(dir.path(), &connectable(), None).unwrap();
+    target_records::save(dir.path(), &connectable(), None).unwrap();
     let routing = MockRouting::failing_gateway(dir.path().to_path_buf());
     let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
     let proxy = Arc::new(Mutex::new(pm));

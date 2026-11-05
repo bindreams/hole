@@ -20,9 +20,17 @@ pub enum Role {
     LegacyRecord,
     /// The user's own data.
     Config,
+    /// A claim a process makes on a name (the update marker): a store is refused
+    /// over a file this release cannot read, and a remove takes it whatever it
+    /// holds. It never blocks a connect.
+    Claim,
+    /// What this bridge did to the OS where an unreadable record must still be
+    /// cleaned up after (a macOS pf record): moved aside, never destroyed
+    /// unread, and it blocks a connect.
+    Cover,
 }
 
-/// What `store` does over a file that cannot be read.
+/// What a [`Change::Store`](super::Change::Store) does over a file that cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOver {
     /// Back it up, then write.
@@ -33,7 +41,7 @@ pub enum StoreOver {
     Overwrite,
 }
 
-/// What `remove` does to a file that cannot be read.
+/// What a [`Change::Remove`](super::Change::Remove) does to a file that cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveOver {
     /// Back it up, then remove the original.
@@ -54,8 +62,12 @@ impl Role {
             (Role::LegacyRecord, CannotRead::Newer) => StoreOver::Refuse,
             (Role::LegacyRecord, CannotRead::Corrupt) => StoreOver::Refuse,
             (Role::Config, CannotRead::Newer) => StoreOver::Refuse,
-            // A corrupt `config.json` is replaced by the next save (owner decision 2026-10-19).
+            // A corrupt `config.json` is replaced by the next save.
             (Role::Config, CannotRead::Corrupt) => StoreOver::Overwrite,
+            (Role::Claim, CannotRead::Newer) => StoreOver::Refuse,
+            (Role::Claim, CannotRead::Corrupt) => StoreOver::Refuse,
+            (Role::Cover, CannotRead::Newer) => StoreOver::MoveAside,
+            (Role::Cover, CannotRead::Corrupt) => StoreOver::MoveAside,
         }
     }
 
@@ -69,10 +81,14 @@ impl Role {
             (Role::LegacyRecord, CannotRead::Corrupt) => RemoveOver::Keep,
             (Role::Config, CannotRead::Newer) => RemoveOver::Keep,
             (Role::Config, CannotRead::Corrupt) => RemoveOver::Keep,
+            (Role::Claim, CannotRead::Newer) => RemoveOver::Remove,
+            (Role::Claim, CannotRead::Corrupt) => RemoveOver::Remove,
+            (Role::Cover, CannotRead::Newer) => RemoveOver::MoveAside,
+            (Role::Cover, CannotRead::Corrupt) => RemoveOver::MoveAside,
         }
     }
 
-    /// What `store` does over a file whose read failed with an I/O error. The
+    /// What a store does over a file whose read failed with an I/O error. The
     /// bytes were never seen, so no role replaces them without a backup: a link
     /// needs no read.
     pub fn on_store_io_failure(self) -> StoreOver {
@@ -81,16 +97,20 @@ impl Role {
             Role::OsRecord => StoreOver::Refuse,
             Role::LegacyRecord => StoreOver::Refuse,
             Role::Config => StoreOver::MoveAside,
+            Role::Claim => StoreOver::Refuse,
+            Role::Cover => StoreOver::MoveAside,
         }
     }
 
-    /// What `remove` does to a file whose read failed with an I/O error.
+    /// What a remove does to a file whose read failed with an I/O error.
     pub fn on_remove_io_failure(self) -> RemoveOver {
         match self {
             Role::Decision => RemoveOver::MoveAside,
             Role::OsRecord => RemoveOver::Keep,
             Role::LegacyRecord => RemoveOver::Keep,
             Role::Config => RemoveOver::MoveAside,
+            Role::Claim => RemoveOver::Remove,
+            Role::Cover => RemoveOver::Keep,
         }
     }
 
@@ -112,6 +132,8 @@ impl Role {
             Role::OsRecord => true,
             Role::LegacyRecord => false,
             Role::Config => false,
+            Role::Claim => false,
+            Role::Cover => true,
         }
     }
 
@@ -127,6 +149,10 @@ impl Role {
             (Role::LegacyRecord, CannotRead::Corrupt) => false,
             (Role::Config, CannotRead::Newer) => false,
             (Role::Config, CannotRead::Corrupt) => false,
+            (Role::Claim, CannotRead::Newer) => false,
+            (Role::Claim, CannotRead::Corrupt) => false,
+            (Role::Cover, CannotRead::Newer) => true,
+            (Role::Cover, CannotRead::Corrupt) => true,
         }
     }
 }

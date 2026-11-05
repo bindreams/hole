@@ -236,7 +236,7 @@ fn a_folder_that_can_only_be_read_is_read_from() {
     std::fs::write(tmp.path().join("state.json"), b"{}").unwrap();
     let _denied = AddDenied::to(tmp.path());
 
-    let read = crate::dir::read_state_file(tmp.path(), "state.json".as_ref());
+    let read = ReadDir::open(tmp.path()).and_then(|dir| dir.read_vouched("state.json".as_ref()));
 
     assert_eq!(read.unwrap(), b"{}");
 }
