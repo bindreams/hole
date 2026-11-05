@@ -909,7 +909,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Err(e) => {
                     self.last_error = Some(e.to_string());
                     // No IP: this start engaged no cover. The presence is the probe's read at this moment, logged as
-                    // measured (a standing cover recovery adopted reads as present).
+                    // measured.
                     warn!(
                         error = &e as &dyn std::error::Error,
                         ?coverage,
