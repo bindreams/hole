@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use super::{frame, CannotRead, Chain, ChainError, VersionedState};
 use crate::dir::{Dir, EntryKind, ReadDir, Staged};
-use crate::error_chain::error_chain;
 use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
@@ -279,7 +278,7 @@ impl<S: VersionedState> VersionedFile<S> {
             tracing::warn!(
                 file = S::FILE_NAME,
                 backup = %backup.to_string_lossy(),
-                error = %error_chain(&e),
+                error = &e as &dyn std::error::Error,
                 "a write failed after its backup was made, and the backup could not be removed"
             );
         }

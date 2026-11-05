@@ -76,11 +76,11 @@ impl ConfigStore {
         if let Some(r) = &recovery {
             match &r.backup {
                 Ok(bak) => error!(
-                    path = %r.path.display(), error = %r.error, backup = %bak.display(),
+                    path = %r.path.display(), error = &r.error as &dyn std::error::Error, backup = %bak.display(),
                     "config file unreadable; quarantined to backup, starting with defaults"
                 ),
                 Err(bak_err) => error!(
-                    path = %r.path.display(), error = %r.error, backup_error = %bak_err,
+                    path = %r.path.display(), error = &r.error as &dyn std::error::Error, backup_error = bak_err as &dyn std::error::Error,
                     "config file unreadable and backup failed; saving disabled for this session"
                 ),
             }
@@ -164,7 +164,10 @@ fn quarantine(path: &Path, contents: Option<&str>, now: OffsetDateTime) -> Resul
     let Some(contents) = contents else {
         return Err(rename_err);
     };
-    warn!(error = %rename_err, "rename to backup failed; attempting copy fallback");
+    warn!(
+        error = &rename_err as &dyn std::error::Error,
+        "rename to backup failed; attempting copy fallback"
+    );
 
     // `create_new` is an atomic claim of the name, so this loop is race-free.
     loop {
@@ -178,7 +181,7 @@ fn quarantine(path: &Path, contents: Option<&str>, now: OffsetDateTime) -> Resul
                 }
                 if let Err(e) = fs::remove_file(path) {
                     warn!(
-                        path = %path.display(), error = %e,
+                        path = %path.display(), error = &e as &dyn std::error::Error,
                         "backed up corrupt config by copy, but could not remove the original; \
                          it may be re-quarantined on next start"
                     );

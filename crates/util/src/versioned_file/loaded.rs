@@ -1,7 +1,6 @@
 //! The outcome of reading a versioned file.
 
 use super::{frame, Chain, ChainError, VersionedState};
-use crate::error_chain::error_chain;
 use crate::parse_error::ParseFailure;
 
 /// The bytes of a file that was not interpreted, kept so a caller can still
@@ -143,7 +142,7 @@ impl<S: VersionedState> Loaded<S> {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Absent,
             Err(e) => {
-                tracing::warn!(file, kind = ?e.kind(), error = %error_chain(&e), "state file could not be read");
+                tracing::warn!(file, kind = ?e.kind(), error = &e as &dyn std::error::Error, "state file could not be read");
                 return match at() {
                     Some(kind) => Loaded::Unreadable { error: e, kind },
                     None => Loaded::Absent,
