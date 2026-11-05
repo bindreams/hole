@@ -450,7 +450,7 @@ impl ChainPlugin for TapPlugin {
                 Step::Continue => continue,
                 Step::Break => break,
                 Step::AcceptFailed(e) => {
-                    tracing::warn!(plugin = %plugin_name, error = %e, "plugin tap: accept failed");
+                    tracing::warn!(plugin = %plugin_name, error = &e as &dyn std::error::Error, "plugin tap: accept failed");
                     drop(listener);
                     connections.abort_all();
                     while connections.join_next().await.is_some() {}
@@ -517,7 +517,8 @@ async fn stop_inner(
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::debug!(
             plugin = %plugin_name,
-            "plugin tap: the inner ended with {e} while the start failure was being reported"
+            error = &e as &dyn std::error::Error,
+            "plugin tap: the inner ended with an error while the start failure was being reported"
         ),
         Err(je) if je.is_cancelled() => {}
         Err(je) => tracing::warn!(
@@ -671,7 +672,7 @@ async fn handle_tap_connection(
         Err(e) => {
             tracing::warn!(
                 tap_conn_id = conn_id,
-                error = %e,
+                error = &e as &dyn std::error::Error,
                 "plugin tap: inner connect failed"
             );
             return;

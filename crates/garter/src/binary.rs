@@ -348,7 +348,7 @@ impl ChainPlugin for BinaryPlugin {
                     }
                     Ok(None) => break, // EOF
                     Err(e) => {
-                        tracing::debug!(plugin = %plugin_name, "log reader error: {e}");
+                        tracing::debug!(plugin = %plugin_name, error = &e as &dyn std::error::Error, "log reader error");
                         break;
                     }
                 }
@@ -378,7 +378,7 @@ impl ChainPlugin for BinaryPlugin {
                             }
                             Ok(None) => break, // EOF
                             Err(e) => {
-                                tracing::debug!(plugin = %plugin_name, "log reader error: {e}");
+                                tracing::debug!(plugin = %plugin_name, error = &e as &dyn std::error::Error, "log reader error");
                                 break;
                             }
                         }
@@ -499,7 +499,7 @@ impl ReadinessProbes {
         };
         for probe in tasks {
             if let Err(e) = probe.await {
-                tracing::warn!(plugin = %self.plugin, "a readiness probe did not end normally: {e}");
+                tracing::warn!(plugin = %self.plugin, error = &e as &dyn std::error::Error, "a readiness probe did not end normally");
             }
         }
     }
@@ -571,11 +571,13 @@ async fn hold_reported_failure(
     match held {
         Some(_) => tracing::warn!(
             plugin = %plugin,
-            "the plugin reported a start failure after its readiness was already decided; ignored: {error}"
+            error = &error as &dyn std::error::Error,
+            "the plugin reported a start failure after its readiness was already decided; ignored"
         ),
         None => tracing::debug!(
             plugin = %plugin,
-            "the plugin reported another start failure after its readiness was already decided; ignored: {error}"
+            error = &error as &dyn std::error::Error,
+            "the plugin reported another start failure after its readiness was already decided; ignored"
         ),
     }
 }
@@ -781,7 +783,7 @@ pub(crate) fn spawn_sitrep_stdout_reader(
                 }
                 Ok(None) => break, // EOF
                 Err(e) => {
-                    tracing::debug!(plugin = %plugin_name, "log reader error: {e}");
+                    tracing::debug!(plugin = %plugin_name, error = &e as &dyn std::error::Error, "log reader error");
                     break;
                 }
             }
@@ -1160,7 +1162,8 @@ async fn supervise(
             Err(e) => {
                 tracing::warn!(
                     plugin = %plugin,
-                    "the plugin's exit cannot be watched ({e}); reaping it before killing its tree"
+                    error = &e as &dyn std::error::Error,
+                    "the plugin's exit cannot be watched; reaping it before killing its tree"
                 );
                 tokio::select! {
                     biased;
@@ -1188,7 +1191,7 @@ async fn root_has_exited(plugin: &str, tree: &impl PluginTree) -> bool {
     match tree.wait_root_exit_within(std::time::Duration::ZERO).await {
         Ok(exited) => exited,
         Err(e) => {
-            tracing::warn!(plugin = %plugin, "could not read whether the plugin's root has exited: {e}");
+            tracing::warn!(plugin = %plugin, error = &e as &dyn std::error::Error, "could not read whether the plugin's root has exited");
             false
         }
     }
@@ -1302,7 +1305,7 @@ async fn watch_root_exit_within(plugin: &str, tree: &impl PluginTree, grace: std
     match tree.wait_root_exit_within(grace).await {
         Ok(exited) => exited,
         Err(e) => {
-            tracing::warn!(plugin = %plugin, "could not watch the plugin exit during shutdown: {e}");
+            tracing::warn!(plugin = %plugin, error = &e as &dyn std::error::Error, "could not watch the plugin exit during shutdown");
             false
         }
     }
@@ -1325,7 +1328,7 @@ pub(crate) async fn shut_plugin_down(
     let exited_within_grace = match tree.terminate() {
         Ok(()) => watch_root_exit_within(plugin, tree, grace).await,
         Err(e) => {
-            tracing::debug!(plugin = %plugin, "could not ask the plugin to exit: {e}");
+            tracing::debug!(plugin = %plugin, error = &e as &dyn std::error::Error, "could not ask the plugin to exit");
             false
         }
     };
@@ -1351,7 +1354,7 @@ async fn finish_plugin(
     drain_readers_after_exit(plugin, tree, stdout, stderr).await;
     if root_has_exited(plugin, tree).await {
         if let Err(e) = reap_root(tree).await {
-            tracing::warn!(plugin = %plugin, "failed to reap the plugin's root: {e}");
+            tracing::warn!(plugin = %plugin, error = &e as &dyn std::error::Error, "failed to reap the plugin's root");
         }
     }
     Err(refusal)
@@ -1383,20 +1386,22 @@ pub(crate) async fn drain_readers_after_exit(
                     // A known platform gap (bindreams/hole#1124), so not worth a warning on every take-down.
                     Err(e @ cosca::error::Error::Unsupported { .. }) => tracing::debug!(
                         plugin = %plugin,
-                        "the plugin's process tree drain cannot be observed here ({e}); its output is waited for at most {READER_EOF_BOUND:?} instead"
+                        error = &e as &dyn std::error::Error,
+                        "the plugin's process tree drain cannot be observed here; its output is waited for at most {READER_EOF_BOUND:?} instead"
                     ),
                     Err(e) => tracing::warn!(
                         plugin = %plugin,
-                        "the plugin's process tree drain cannot be observed ({e}); its output is waited for at most {READER_EOF_BOUND:?} instead"
+                        error = &e as &dyn std::error::Error,
+                        "the plugin's process tree drain cannot be observed; its output is waited for at most {READER_EOF_BOUND:?} instead"
                     ),
                 }
             }
         }
         Err(e) if containment.can_teardown() => {
-            tracing::warn!(plugin = %plugin, "failed to kill the plugin's process tree: {e}");
+            tracing::warn!(plugin = %plugin, error = &e as &dyn std::error::Error, "failed to kill the plugin's process tree");
         }
         // A nested or uncontained child has no tree of its own to kill.
-        Err(e) => tracing::debug!(plugin = %plugin, "no process tree to kill: {e}"),
+        Err(e) => tracing::debug!(plugin = %plugin, error = &e as &dyn std::error::Error, "no process tree to kill"),
     }
     wait_for_readers(plugin, stdout, stderr).await;
 }
