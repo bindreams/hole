@@ -450,7 +450,7 @@ fn a_record_names_a_token_in_every_state_it_can_be_in() {
 }
 
 #[skuld::test]
-fn naming_matches_any_record_with_the_token_and_an_unusable_one_with_none() {
+fn naming_matches_any_record_with_the_token_and_an_unusable_one_with_none_but_never_an_unread_one() {
     assert!(names(&present("1"), Some("1")));
     assert!(!names(&present("1"), Some("2")));
     assert!(!names(&present("1"), None));
@@ -459,6 +459,8 @@ fn naming_matches_any_record_with_the_token_and_an_unusable_one_with_none() {
     assert!(!names(&unusable(None), Some("1")));
     assert!(!names(&absent(), Some("1")));
     assert!(!names(&absent(), None));
+    assert!(!names(&unreadable(), None));
+    assert!(!names(&unreadable(), Some("1")));
 }
 
 #[skuld::test]
