@@ -471,7 +471,7 @@ impl Drop for Staged<'_> {
             // a user may own. Gone already is fine.
             match platform::unlink(&self.dir.file, &self.temp_name) {
                 Err(err) if err.kind() != io::ErrorKind::NotFound => {
-                    tracing::warn!(error = %err, temp = %self.temp_name.to_string_lossy(), "a temporary file was left behind");
+                    tracing::warn!(error = &err as &dyn std::error::Error, temp = %self.temp_name.to_string_lossy(), "a temporary file was left behind");
                 }
                 _ => {}
             }

@@ -190,7 +190,10 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
                     }
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
-                    tracing::debug!(error = %e, "yamux inbound stream error (connection ended)");
+                    tracing::debug!(
+                        error = &e as &dyn std::error::Error,
+                        "yamux inbound stream error (connection ended)"
+                    );
                     return std::task::Poll::Ready(());
                 }
                 std::task::Poll::Ready(None) => {
@@ -564,12 +567,14 @@ pub(crate) async fn connect_retrying(addr: SocketAddr, shutdown: &CancellationTo
                 match (addr.ip().is_loopback(), attempt) {
                     // A loopback sibling a beat late is normal startup: log once,
                     // then stay quiet at the tight cadence (no log storm).
-                    (true, 0) => tracing::debug!(%addr, error = %e, "peer not up yet, retrying"),
+                    (true, 0) => {
+                        tracing::debug!(%addr, error = &e as &dyn std::error::Error, "peer not up yet, retrying")
+                    }
                     (true, _) => {}
                     // A routable peer may be genuinely down: warn each attempt
                     // (the backoff throttles this to at most ~one line per 30 s).
                     (false, _) => {
-                        tracing::warn!(%addr, error = %e, delay_ms = delay.as_millis(), "connection failed, retrying")
+                        tracing::warn!(%addr, error = &e as &dyn std::error::Error, delay_ms = delay.as_millis(), "connection failed, retrying")
                     }
                 }
                 tokio::select! {
@@ -611,13 +616,13 @@ async fn run_udp_association(
             return;
         }
         Err(e) => {
-            tracing::warn!(peer = %peer, error = %e, "failed to open yamux stream for UDP");
+            tracing::warn!(peer = %peer, error = &e as &dyn std::error::Error, "failed to open yamux stream for UDP");
             let _ = cleanup_tx.send((peer, generation)).await;
             return;
         }
     };
     if let Err(e) = write_tag(&mut stream, StreamTag::Udp).await {
-        tracing::warn!(peer = %peer, error = %e, "failed to write UDP tag");
+        tracing::warn!(peer = %peer, error = &e as &dyn std::error::Error, "failed to write UDP tag");
         let _ = cleanup_tx.send((peer, generation)).await;
         return;
     }
@@ -662,7 +667,7 @@ async fn run_udp_association(
                 acc.push(&read_buf[..n]);
                 while let Some(payload) = acc.next_frame() {
                     if let Err(e) = udp_socket.send_to(&payload, peer).await {
-                        tracing::debug!(peer = %peer, error = %e, "failed to send UDP reply to local peer");
+                        tracing::debug!(peer = %peer, error = &e as &dyn std::error::Error, "failed to send UDP reply to local peer");
                     }
                 }
             }
@@ -727,7 +732,7 @@ pub(crate) fn driver_panicked(result: std::result::Result<(), tokio::task::JoinE
     match task_panic(result) {
         None => false,
         Some(e) => {
-            tracing::error!(error = %e, "yamux driver task panicked");
+            tracing::error!(error = &e as &dyn std::error::Error, "yamux driver task panicked");
             true
         }
     }
@@ -841,7 +846,7 @@ pub(crate) async fn run_client_session(
                 let (tcp_stream, _peer) = match accept {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::debug!(error = %e, "local tcp accept error; continuing");
+                        tracing::debug!(error = &e as &dyn std::error::Error, "local tcp accept error; continuing");
                         tokio::task::yield_now().await;
                         continue;
                     }
@@ -851,11 +856,11 @@ pub(crate) async fn run_client_session(
                     match open_stream(&open_tx).await {
                         Ok(mut yamux_stream) => {
                             if let Err(e) = write_tag(&mut yamux_stream, StreamTag::Tcp).await {
-                                tracing::warn!(error = %e, "failed to write TCP tag");
+                                tracing::warn!(error = &e as &dyn std::error::Error, "failed to write TCP tag");
                                 return;
                             }
                             if let Err(e) = relay_tcp(yamux_stream, tcp_stream).await {
-                                tracing::debug!(error = %e, "tcp relay ended");
+                                tracing::debug!(error = &*e, "tcp relay ended");
                             }
                         }
                         // A closed connection is expected reconnect-window churn (the
@@ -864,7 +869,7 @@ pub(crate) async fn run_client_session(
                         Err(yamux::ConnectionError::Closed) => {
                             tracing::debug!("failed to open yamux stream for TCP: connection closed")
                         }
-                        Err(e) => tracing::warn!(error = %e, "failed to open yamux stream for TCP"),
+                        Err(e) => tracing::warn!(error = &e as &dyn std::error::Error, "failed to open yamux stream for TCP"),
                     }
                 });
             }
@@ -874,7 +879,7 @@ pub(crate) async fn run_client_session(
                 let (n, peer) = match recv {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::debug!(error = %e, "local udp recv error; continuing");
+                        tracing::debug!(error = &e as &dyn std::error::Error, "local udp recv error; continuing");
                         tokio::task::yield_now().await;
                         continue;
                     }
@@ -1111,7 +1116,7 @@ where
                 match accept {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::debug!(error = %e, "server accept error; continuing");
+                        tracing::debug!(error = &e as &dyn std::error::Error, "server accept error; continuing");
                         tokio::task::yield_now().await;
                         continue;
                     }
@@ -1152,7 +1157,7 @@ pub(crate) fn connection_task_fatal(joined: std::result::Result<(), tokio::task:
     match task_panic(joined) {
         None => false,
         Some(e) => {
-            tracing::error!(error = %e, "yamux connection task panicked");
+            tracing::error!(error = &e as &dyn std::error::Error, "yamux connection task panicked");
             true
         }
     }
@@ -1167,7 +1172,10 @@ pub(crate) fn connection_task_fatal(joined: std::result::Result<(), tokio::task:
 /// and overwrite the system defaults with zeros.
 pub(crate) fn enable_keepalive(tcp: &TcpStream) {
     if let Err(e) = socket2::SockRef::from(tcp).set_keepalive(true) {
-        tracing::debug!(error = %e, "could not enable TCP keepalive on the accepted connection");
+        tracing::debug!(
+            error = &e as &dyn std::error::Error,
+            "could not enable TCP keepalive on the accepted connection"
+        );
     }
 }
 
@@ -1220,7 +1228,7 @@ pub(crate) async fn serve_driven_connection(
         // surfaces on stderr through the default hook rather than escalating.
         tokio::spawn(async move {
             if let Err(e) = handle_inbound_stream(stream, remote).await {
-                tracing::debug!(error = %e, "inbound stream handler ended");
+                tracing::debug!(error = &*e, "inbound stream handler ended");
             }
         });
     }
@@ -1230,7 +1238,7 @@ pub(crate) async fn serve_driven_connection(
     tracing::info!(peer = %peer, "underlying connection closed");
 
     if let Some(e) = panic {
-        tracing::error!(error = %e, "yamux driver task panicked");
+        tracing::error!(error = &e as &dyn std::error::Error, "yamux driver task panicked");
         std::panic::resume_unwind(e.into_panic());
     }
 }

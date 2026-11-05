@@ -59,7 +59,10 @@ async fn reap_leftover_plugins(state_dir: &Path) {
     let state_dir = state_dir.to_path_buf();
     if let Err(e) = tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir)).await
     {
-        tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
+        tracing::warn!(
+            error = &e as &dyn std::error::Error,
+            "reap_recorded_plugins task panicked"
+        );
     }
 }
 

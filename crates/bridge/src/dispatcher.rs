@@ -45,9 +45,9 @@ pub enum DriverExit {
 /// of a flattened `io::Error` whose type information is already gone.
 #[derive(Debug, thiserror::Error)]
 pub enum DispatcherStartError {
-    #[error(transparent)]
+    #[error("{0}")]
     Device(#[from] tun_engine::DeviceError),
-    #[error(transparent)]
+    #[error("{0}")]
     Io(#[from] std::io::Error),
 }
 
@@ -61,7 +61,7 @@ pub(crate) async fn drain(handle: &mut JoinHandle<()>) -> DriverExit {
         Err(e) if e.is_cancelled() => DriverExit::Aborted,
         Err(e) if e.is_panic() => DriverExit::Panicked,
         Err(e) => {
-            warn!("Dispatcher driver join error: {e}");
+            warn!(error = &e as &dyn std::error::Error, "Dispatcher driver join error");
             DriverExit::Panicked
         }
     }

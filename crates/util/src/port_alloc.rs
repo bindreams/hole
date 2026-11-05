@@ -187,7 +187,7 @@ async fn probe_bind(addr: SocketAddr, transport: Protocols) -> io::Result<u16> {
             result = "err",
             kind = ?e.kind(),
             code = ?e.raw_os_error(),
-            error = %e,
+            error = e as &dyn std::error::Error,
             "probe_bind"
         ),
     }
@@ -298,7 +298,7 @@ fn emit_retry_log(attempt: u64, ip: IpAddr, protocols: Protocols, err: &io::Erro
         attempt = attempt,
         ip = %ip,
         protocols = %protocols,
-        error = %err,
+        error = err as &dyn std::error::Error,
         "{}", msg
     );
     if is_log_milestone(attempt) {
@@ -307,7 +307,7 @@ fn emit_retry_log(attempt: u64, ip: IpAddr, protocols: Protocols, err: &io::Erro
             attempt = attempt,
             ip = %ip,
             protocols = %protocols,
-            error = %err,
+            error = err as &dyn std::error::Error,
             "{} (milestone)", msg
         );
     }

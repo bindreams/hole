@@ -23,6 +23,10 @@
 //! `<ts> <level> <span>{<fields>}: <target>: <message>`. Chained for nested
 //! spans (outer-first).
 //!
+//! An error-valued field (`error = &e as &dyn std::error::Error`) renders as a
+//! YAML list of the error's `Display` and each `source()` after it, outermost
+//! first; an error without a source is a one-element list.
+//!
 //! Multi-line messages are promoted from inline into the mapping as the
 //! `message` key so `yaml_serde` can render them as a block scalar.
 //!
@@ -112,8 +116,8 @@ impl Visit for Collector {
     }
 
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
-        // Match the default formatter: render errors via Display, not Debug.
-        self.record_value(field, Value::String(value.to_string()));
+        let links = util::error::chain(value).map(|link| Value::String(link.to_string()));
+        self.record_value(field, Value::Sequence(links.collect()));
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {

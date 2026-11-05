@@ -100,7 +100,10 @@ impl Held {
         });
         if let (true, Some(change)) = (outermost, &change) {
             if let Err(error) = change.begin(&Stamp::current()) {
-                warn!(%error, "could not mark the service as being changed; a status read may see the change half done");
+                warn!(
+                    error = &error as &dyn std::error::Error,
+                    "could not mark the service as being changed; a status read may see the change half done"
+                );
             }
         }
         Held {
@@ -120,7 +123,10 @@ impl Held {
     pub fn mark_again(&self) {
         let Some(change) = &self.change else { return };
         if let Err(error) = change.begin(&Stamp::current()) {
-            warn!(%error, "could not mark the new service as being changed; a status read may see the change half done");
+            warn!(
+                error = &error as &dyn std::error::Error,
+                "could not mark the new service as being changed; a status read may see the change half done"
+            );
         }
     }
 }
@@ -139,7 +145,10 @@ impl Drop for Held {
         });
         if let (true, Some(change)) = (outermost, &self.change) {
             if let Err(error) = change.end(&Stamp::current()) {
-                warn!(%error, "could not mark the service's change as ended; a status read may take it for one in progress");
+                warn!(
+                    error = &error as &dyn std::error::Error,
+                    "could not mark the service's change as ended; a status read may take it for one in progress"
+                );
             }
         }
         // SAFETY: this thread took the mutex through `self.mutex`, and a mutex
@@ -147,7 +156,10 @@ impl Drop for Held {
         // the `SYNCHRONIZE` the handle was opened with.
         let released = unsafe { ReleaseMutex(self.mutex.0) };
         if let Err(error) = &released {
-            warn!(%error, "ReleaseMutex failed on the start-type lock this thread holds");
+            warn!(
+                error = error as &dyn std::error::Error,
+                "ReleaseMutex failed on the start-type lock this thread holds"
+            );
         }
         debug_assert!(released.is_ok(), "ReleaseMutex failed on a lock this thread holds");
     }

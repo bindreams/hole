@@ -67,9 +67,10 @@ async fn serve_until_signal_returns_when_signal_fires() {
 // `ensure_stopped`'s absent-job classification ========================================================================
 //
 // The macOS half of #1003's "stop, then deregister" rule, and the mirror of
-// windows.rs's `stop_error_is_absent`. Both platforms answer the same question
-// — does the service manager still have a job for this label? — and both must
-// answer it BY CAUSE, about the world the stop left.
+// the Windows `ServiceGone` classification (`service_scm/call_error.rs`). Both
+// platforms answer the same question — does the service manager still have a
+// job for this label? — and both must answer it BY CAUSE, about the world the
+// stop left.
 
 #[skuld::test]
 fn launchd_answers_no_such_service_for_a_label_it_does_not_know() {

@@ -688,7 +688,7 @@ pub(crate) fn record_exit(
                 plugin = %name,
                 exit_code,
                 killed,
-                error = %e,
+                error = &e as &dyn std::error::Error,
                 "exited with error"
             );
             if first_error.is_none() {
@@ -697,7 +697,7 @@ pub(crate) fn record_exit(
             shutdown.cancel();
         }
         Err(join_err) => {
-            tracing::error!(error = %join_err, "plugin task panicked");
+            tracing::error!(error = &join_err as &dyn std::error::Error, "plugin task panicked");
             if first_error.is_none() {
                 *first_error = Some(crate::Error::Chain(format!("plugin panicked: {join_err}")));
             }

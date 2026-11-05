@@ -361,7 +361,7 @@ pub async fn resolve_via_doh_with(
     let failure = worst.unwrap_or(BootstrapError::NoAnswer);
     if !dns.allow_insecure_bootstrap {
         tracing::warn!(
-            ?failure,
+            error = &failure as &dyn std::error::Error,
             resolvers = dns.servers.len(),
             "secure DNS bootstrap failed; refusing to resolve the proxy address (dns.allow_insecure_bootstrap is off)"
         );
@@ -377,11 +377,11 @@ pub async fn resolve_via_doh_with(
     // consequence rather than flagging it — a reader of this line is the entire
     // audience for it.
     tracing::warn!(
-        ?failure,
+        error = &failure as &dyn std::error::Error,
         resolvers = dns.servers.len(),
         "secure DNS bootstrap failed; resolving the proxy address over PLAINTEXT system DNS instead \
-         (dns.allow_insecure_bootstrap is on). A CertificateRejected finding here means the proxy \
-         address was resolved over the same network path that presented an untrusted certificate."
+         (dns.allow_insecure_bootstrap is on). If the error reports a certificate that could not be \
+         verified, the proxy address was resolved over the same network path that presented it."
     );
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 0))
         .await

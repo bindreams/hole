@@ -905,7 +905,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         // cover can engage: the block-until-connected intent falls open
                         // here — logged so the gap is visible, not silent.
                         if covered {
-                            warn!(error = %util::error_chain::error_chain(&e), "covered start could not resolve the server; host NOT blocked (no IP to permit)");
+                            warn!(
+                                error = &e as &dyn std::error::Error,
+                                "covered start could not resolve the server; host NOT blocked (no IP to permit)"
+                            );
                         }
                     }
                     return Err(e);
@@ -1087,14 +1090,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                     // dials, not a stall risk.
                                     if matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes) {
                                         warn!(
-                                            error = %util::error_chain::error_chain(&e),
+                                            error = &e as &dyn std::error::Error,
                                             "failed to engage the corrected fail-closed cover; restored the \
                                              PREVIOUS permit instead of leaving the host open — ex-ray's ECH \
                                              fetch may still stall against the now-stale permit"
                                         );
                                     } else {
                                         warn!(
-                                            error = %util::error_chain::error_chain(&e),
+                                            error = &e as &dyn std::error::Error,
                                             ?old_permit,
                                             "failed to engage the corrected fail-closed cover; restored the \
                                              PREVIOUS permit instead of leaving the host open — the fail-closed \
@@ -1105,8 +1108,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                 }
                                 Err(e2) => {
                                     warn!(
-                                        error = %util::error_chain::error_chain(&e),
-                                        restore_error = %util::error_chain::error_chain(&e2),
+                                        error = &e as &dyn std::error::Error,
+                                        restore_error = &e2 as &dyn std::error::Error,
                                         "failed to engage BOTH the corrected and the previous fail-closed \
                                          cover; host NOT blocked, proceeding open"
                                     );
@@ -1114,7 +1117,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                 }
                             }
                         } else {
-                            warn!(error = %util::error_chain::error_chain(&e), "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open");
+                            warn!(error = &e as &dyn std::error::Error, "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open");
                             self.last_error = Some(e.to_string());
                         }
                     }
@@ -1279,7 +1282,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             warn!(
                 server = %token_for(&config.server.id),
                 server_kind = server_kind(config.server.server.expose()),
-                error = %util::error_chain::error_chain(e),
+                error = e as &dyn std::error::Error,
                 "DoH bootstrap resolution failed"
             )
         })?)
@@ -1479,7 +1482,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         ),
                         Ok(Err(e)) => error!(
                             port,
-                            error = %util::error_chain::error_chain(&e),
+                            error = &e as &dyn std::error::Error,
                             os_code = ?e.raw_os_error(),
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "in-bridge self-test connect failed"
@@ -1674,7 +1677,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             // reading, so losing it degrades the report — WARN,
                             // or the downgrade is invisible at the default level.
                             Err(e) => {
-                                warn!(error = %util::error_chain::error_chain(&e), "reachability probe task did not complete; its verdict is unavailable");
+                                warn!(
+                                    error = &e as &dyn std::error::Error,
+                                    "reachability probe task did not complete; its verdict is unavailable"
+                                );
                                 None
                             }
                         },
@@ -2099,7 +2105,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 match self.routing.release_all_covers() {
                     Ok(()) => self.set_standing_cover_adopted(false),
                     Err(e) => tracing::warn!(
-                        error = %util::error_chain::error_chain(&e),
+                        error = &e as &dyn std::error::Error,
                         "lockdown cover release could not be confirmed; keeping the escape visible"
                     ),
                 }
@@ -2140,13 +2146,16 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             Ok(Ok(new_target)) => new_target,
             Ok(Err(e)) => {
                 tracing::error!(
-                    error = %util::error_chain::error_chain(&e),
+                    error = &e as &dyn std::error::Error,
                     "failed to persist target after session event; reading current disk state instead of guessing"
                 );
                 self.state_dir.as_deref().map(target::load).unwrap_or(Target::Off)
             }
             Err(e) => {
-                tracing::error!(error = %e, "target-persistence task panicked; treating target as unreadable");
+                tracing::error!(
+                    error = &e as &dyn std::error::Error,
+                    "target-persistence task panicked; treating target as unreadable"
+                );
                 Target::Unreadable
             }
         }
@@ -2298,7 +2307,10 @@ fn promote_adopted_claim(state_dir: Option<&std::path::Path>, owner: Option<(u32
         return;
     }
     if let Err(e) = lockdown_state::set_enabled(dir, true, owner) {
-        warn!(error = %util::error_chain::error_chain(&e), "lockdown: could not persist the adopted kill switch; it will not survive this run");
+        warn!(
+            error = &e as &dyn std::error::Error,
+            "lockdown: could not persist the adopted kill switch; it will not survive this run"
+        );
     }
 }
 
@@ -2338,7 +2350,10 @@ fn lockdown_app_ids(config: &ProxyConfig) -> Vec<std::path::PathBuf> {
             // missing exe path narrows but does not break the cover. Warn so a
             // bug report carries the shrunken-permit-set signal.
             Err(e) => {
-                warn!(error = %util::error_chain::error_chain(&e), "lockdown: current_exe() failed; bridge App-ID permit omitted")
+                warn!(
+                    error = &e as &dyn std::error::Error,
+                    "lockdown: current_exe() failed; bridge App-ID permit omitted"
+                )
             }
         }
         ids

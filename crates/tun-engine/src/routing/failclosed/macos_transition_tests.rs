@@ -588,7 +588,11 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                             pfctl(&["-X", &old.token], None, BestEffortPhase::RecoverCover),
                             "pfctl -X",
                         ) {
-                            tracing::warn!(error = %e, iteration = i, "pfctl -X failed retiring the old cover's refcount mid-transition");
+                            tracing::warn!(
+                                error = &e as &dyn std::error::Error,
+                                iteration = i,
+                                "pfctl -X failed retiring the old cover's refcount mid-transition"
+                            );
                             old_x_failures += 1;
                         }
                         old.detach();
@@ -778,10 +782,16 @@ fn macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage() {
             // unreferenced enable token with no logged trace of why the
             // restore failed.
             if let Err(e) = pfctl_status(pfctl(&["-f", PFCONF], None, BestEffortPhase::RecoverCover), "pfctl -f") {
-                tracing::warn!(error = %e, "pf ruleset restore failed unwinding the HostPfStandIn test fixture");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "pf ruleset restore failed unwinding the HostPfStandIn test fixture"
+                );
             }
             if let Err(e) = pfctl_status(pfctl(&["-X", &self.0], None, BestEffortPhase::RecoverCover), "pfctl -X") {
-                tracing::warn!(error = %e, "pfctl -X failed unwinding the HostPfStandIn test fixture");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "pfctl -X failed unwinding the HostPfStandIn test fixture"
+                );
             }
         }
     }

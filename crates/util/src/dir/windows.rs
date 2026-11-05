@@ -817,7 +817,7 @@ pub(super) fn link(dir: &File, existing: &OsStr, new: &OsStr) -> io::Result<()> 
 }
 
 fn posix_rename_unsupported(err: &io::Error) -> bool {
-    let Some(code) = crate::error_chain::raw_os_error(err) else {
+    let Some(code) = crate::error::raw_os_error(err) else {
         return false;
     };
     [ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION]
