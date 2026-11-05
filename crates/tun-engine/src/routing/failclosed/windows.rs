@@ -2296,7 +2296,6 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witne
                 "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
                  cover could not be disengaged"
             )),
-            &[],
         );
     }
     let codes: Vec<(&'static str, u32)> = swept.iter().map(|(k, code)| (k.label, *code)).collect();
@@ -2306,10 +2305,7 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witne
     // delete above was issued before any code was read, so a failure verdict
     // does not make the observations beside it any less real (#1010 F1).
     let clearance = Clearance::from_observations(&observations(swept), witness);
-    match first_delete_failure(&codes) {
-        Some(e) => SweepOutcome::failed(clearance, e, &[]),
-        None => SweepOutcome::completed(clearance, &[CoverKind::Lockdown]),
-    }
+    SweepOutcome::per_kind(clearance, [(CoverKind::Lockdown, first_delete_failure(&codes))])
 }
 
 pub fn recover_cover(_state_dir: &Path, adopting: bool) {
@@ -2422,8 +2418,7 @@ pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
 
 /// `release_all`'s verdict, pure and separated from the FFI as [`disengage_verdict`] is. The failure is the first
 /// refused delete (lockdown keys first); the clearance is folded from every key either way (#1010 F1, see
-/// [`disengage_verdict`]). A kind is released when none of ITS keys' deletes failed, whatever the other kind's did,
-/// so a held guard of the kind that is gone stops deleting and one of the kind that is not still retries.
+/// [`disengage_verdict`]).
 fn release_all_verdict(
     open_failure: Option<u32>,
     lockdown: &[(SweptKey, u32)],
@@ -2437,27 +2432,20 @@ fn release_all_verdict(
             RoutingError::RouteSetup(format!(
                 "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so nothing could have been deleted"
             )),
-            &[],
         );
     }
     let labelled = |swept: &[(SweptKey, u32)]| -> Vec<(&'static str, u32)> {
         swept.iter().map(|(k, code)| (k.label, *code)).collect()
     };
-    let lockdown_failure = first_delete_failure(&labelled(lockdown));
-    let transient_failure = first_delete_failure(&labelled(transient));
-    let all: Vec<(SweptKey, u32)> = lockdown.iter().chain(transient).cloned().collect();
-    let clearance = Clearance::from_observations(&observations(&all), witness);
-    let mut released = Vec::new();
-    if lockdown_failure.is_none() {
-        released.push(CoverKind::Lockdown);
-    }
-    if transient_failure.is_none() {
-        released.push(CoverKind::Transient);
-    }
-    match lockdown_failure.or(transient_failure) {
-        Some(e) => SweepOutcome::failed(clearance, e, &released),
-        None => SweepOutcome::completed(clearance, &released),
-    }
+    let mut observed = observations(lockdown);
+    observed.extend(observations(transient));
+    SweepOutcome::per_kind(
+        Clearance::from_observations(&observed, witness),
+        [
+            (CoverKind::Lockdown, first_delete_failure(&labelled(lockdown))),
+            (CoverKind::Transient, first_delete_failure(&labelled(transient))),
+        ],
+    )
 }
 
 // Boot-time read-back =================================================================================================

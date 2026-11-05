@@ -62,7 +62,7 @@ fn sweep(state_dir: &Path, observations: &[KeyObservation]) -> Clearance {
 /// [`sweep`] under a lock the caller already holds.
 fn sweep_under(lock: &CoverLock, observations: &[KeyObservation]) -> Clearance {
     super::super::sweep_with_witness(lock, None, |witness| {
-        SweepOutcome::completed(Clearance::from_observations(observations, witness), &[])
+        SweepOutcome::per_kind(Clearance::from_observations(observations, witness), [])
     })
     .expect("the sweep body cannot fail")
 }
@@ -90,7 +90,6 @@ fn failing_sweep(state_dir: &Path, observations: &[KeyObservation]) -> RoutingEr
         SweepOutcome::failed(
             Clearance::from_observations(observations, witness),
             RoutingError::RouteSetup("the firewall refused one of the deletes".into()),
-            &[],
         )
     })
     .expect_err("the sweep body failed")

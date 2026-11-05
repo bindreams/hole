@@ -1066,24 +1066,37 @@ pub(crate) struct SweepOutcome {
 }
 
 impl SweepOutcome {
-    /// Every delete was issued and answered, and none failed. `released` names the cover kinds the sweep covers.
-    pub(crate) fn completed(clearance: Clearance, released: &[CoverKind]) -> Self {
+    /// A sweep that answered for each cover kind it swept: `kinds` pairs a kind with the first error its own
+    /// deletes met. A kind is released iff its entry is `None`, whatever the other kinds did, so a held guard of a
+    /// kind that is gone stops deleting and one of a kind that is not still retries. The failure reported is the
+    /// first `Some`, in the order given. `clearance` is folded from what the sweep DID observe, failed or not.
+    pub(crate) fn per_kind(
+        clearance: Clearance,
+        kinds: impl IntoIterator<Item = (CoverKind, Option<RoutingError>)>,
+    ) -> Self {
+        let mut released = Vec::new();
+        let mut failure = None;
+        for (kind, error) in kinds {
+            match error {
+                None => released.push(kind),
+                Some(e) => failure = failure.or(Some(e)),
+            }
+        }
         Self {
             clearance,
-            failure: None,
-            released: released.to_vec(),
+            failure,
+            released,
         }
     }
 
-    /// The sweep failed. `clearance` is folded from what it DID observe, which
-    /// is a complete observation set for a sweep that issued every delete
-    /// before reading any code, and the empty fold for one that never reached
-    /// the firewall at all.
-    pub(crate) fn failed(clearance: Clearance, error: RoutingError, released: &[CoverKind]) -> Self {
+    /// The sweep failed with no cover kind attributable and released nothing. `clearance` is the empty fold for a
+    /// sweep that never reached the firewall at all.
+    #[cfg(any(test, target_os = "windows"))]
+    pub(crate) fn failed(clearance: Clearance, error: RoutingError) -> Self {
         Self {
             clearance,
             failure: Some(error),
-            released: released.to_vec(),
+            released: Vec::new(),
         }
     }
 

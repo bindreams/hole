@@ -1071,10 +1071,8 @@ pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> S
     // `Unusable` to `None` here would hide the salvaged `pf_token` that
     // [`disengage_lockdown_with`] hands `pfctl -X`.
     let (presence, file) = lockdown_presence_and_state(state_dir);
-    match disengage_lockdown_with(presence, file, &mut RealPfOps { state_dir }) {
-        Ok(()) => SweepOutcome::completed(Clearance::proven(), &[CoverKind::Lockdown]),
-        Err(e) => SweepOutcome::failed(Clearance::proven(), e, &[]),
-    }
+    let error = disengage_lockdown_with(presence, file, &mut RealPfOps { state_dir }).err();
+    SweepOutcome::per_kind(Clearance::proven(), [(CoverKind::Lockdown, error)])
 }
 
 /// `disengage_lockdown`'s sequencing, with presence and the [`PfOps`] seam
@@ -1417,19 +1415,13 @@ pub(crate) fn release_all_with(
         }
     }
 
-    // A cover is released when ITS block confirmed, whatever the other block did: the sweep reports the kinds
-    // whose stamps it takes, and a held guard of the other kind still retries.
-    let mut released = Vec::new();
-    if transient_err.is_none() {
-        released.push(CoverKind::Transient);
-    }
-    if standing_err.is_none() {
-        released.push(CoverKind::Lockdown);
-    }
-    match transient_err.or(standing_err) {
-        Some(e) => SweepOutcome::failed(Clearance::proven(), e, &released),
-        None => SweepOutcome::completed(Clearance::proven(), &released),
-    }
+    SweepOutcome::per_kind(
+        Clearance::proven(),
+        [
+            (CoverKind::Transient, transient_err),
+            (CoverKind::Lockdown, standing_err),
+        ],
+    )
 }
 
 /// Production [`PfOps`]: maps each method onto the existing `pfctl` helper,
