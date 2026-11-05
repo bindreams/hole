@@ -866,18 +866,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             self.posture.take_pending();
         }
 
-        // Opened before this start decides anything from state an Unblock writes
-        // (the intent, the target), and checked after every cover it installs: an
-        // Unblock that begins in between is not undone by a cover installed after
-        // its release, and the start reports `Cancelled`. Refused outright while
-        // an Unblock is in flight.
-        let release_watch = match self.state_dir.as_deref().map(watch_releases).transpose() {
-            Ok(watch) => watch,
-            Err(e) => {
-                debug_assert!(e.cancels_the_start());
-                return Err(self.cancelled_start());
-            }
-        };
+        // Opened before this start reads anything an Unblock writes (the intent, the
+        // target). An Unblock that begins after this point supersedes the start where it
+        // commits to a cover. A start that installs no cover (an uncovered one, a reload
+        // without a standing cover expected) is never refused by it.
+        let release_watch = self.state_dir.as_deref().map(watch_releases);
 
         // A (re)start supersedes any prior out-of-band death — clear the death
         // reason regardless of this attempt's outcome.
@@ -999,6 +992,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // file resolves to NOT STANDING — the fail-SAFE direction (we engage,
         // blocking not leaking).
         let lockdown_on = self.standing_cover_expected();
+
+        // The point where this start commits to a cover: to install the standing one, to
+        // engage a transient one, or to reuse the one a failed start held. A release in
+        // flight, or one that reached the firewall since the watch opened, refuses it. The
+        // held cover goes with the start: the release has taken it or is taking it, and
+        // keeping it would report a host as blocked that the release is opening.
+        if (covered || lockdown_on) && overtaken_by_release(release_watch.as_ref()).is_err() {
+            return Err(self.cancelled_start());
+        }
 
         // A held cover's resolver_permit is fixed at engage time; re-engage
         // whenever this attempt's fresh derivation DIFFERS from what the
@@ -2313,8 +2315,8 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
     }
 }
 
-/// `Cancelled` if a release began since `watch` opened. The caller drops the cover
-/// it just installed on `Err`.
+/// `Cancelled` if a release is in flight or reached the firewall since `watch` opened.
+/// The caller drops the cover it holds on `Err`.
 fn overtaken_by_release(watch: Option<&ReleaseWatch>) -> Result<(), ProxyError> {
     match watch {
         Some(watch) => watch.check().map_err(ProxyError::from),
