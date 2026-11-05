@@ -42,17 +42,6 @@ impl Coverage {
     }
 }
 
-impl CoverPlan {
-    /// Whether the plan expects a cover to hold the host while the start runs.
-    pub fn expects_cover(self) -> bool {
-        match self {
-            CoverPlan::Engage { .. } => true,
-            CoverPlan::HandToLockdown => true,
-            CoverPlan::FailOpen => false,
-        }
-    }
-}
-
 #[cfg(test)]
 #[path = "coverage_tests.rs"]
 mod coverage_tests;

@@ -908,17 +908,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Err(ProxyError::Cancelled) => return Err(self.cancelled_start()),
                 Err(e) => {
                     self.last_error = Some(e.to_string());
-                    // A covered start expects a cover over the host, but with no IP there is no transient
-                    // cover to engage, and a standing one arrives only at `routing.install`. Only the measured
-                    // presence says whether one already holds the host; the intent does not.
-                    if coverage.plan(self.standing_cover_expected()).expects_cover()
-                        && !self.cover_presence().is_present()
-                    {
-                        warn!(
-                            error = &e as &dyn std::error::Error,
-                            "covered start could not resolve the server; host NOT blocked (no IP to permit)"
-                        );
-                    }
+                    // No IP means no transient cover to engage; a standing one arrives only at `routing.install`.
+                    // The presence is the probe's read at this moment, logged as measured.
+                    warn!(
+                        error = &e as &dyn std::error::Error,
+                        ?coverage,
+                        cover_presence = ?self.cover_presence(),
+                        "could not resolve the server; this start engaged no cover"
+                    );
                     return Err(e);
                 }
             },
