@@ -392,6 +392,47 @@ fn a_record_that_cannot_be_read_is_replaced_by_a_sweep_that_watched_the_twin_go(
     );
 }
 
+fn backup_of(state: &tempfile::TempDir) -> std::path::PathBuf {
+    state.path().join(format!("{}.unreadable.bak", super::STATE_FILE_NAME))
+}
+
+#[skuld::test]
+fn disarm_over_a_corrupt_witness_backs_it_up_and_clears_the_report() {
+    let state = dir();
+    std::fs::write(state.path().join(super::STATE_FILE_NAME), b"{ not json").expect("write");
+
+    let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
+
+    assert!(c.leftover_keys().is_empty(), "{:?}", c.leftover_keys());
+    assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
+    assert_eq!(std::fs::read(backup_of(&state)).expect("backup"), b"{ not json");
+}
+
+#[skuld::test]
+fn arm_over_a_newer_witness_keeps_a_backup() {
+    let state = dir();
+    let newer: &[u8] = br#"{"version": 99, "armed": false}"#;
+    std::fs::write(state.path().join(super::STATE_FILE_NAME), newer).expect("write");
+
+    // An unproven twin beside a live cover: the sweep arms the record.
+    let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_not_found()]);
+
+    assert_eq!(c.leftover_keys(), [TWIN]);
+    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
+    assert_eq!(std::fs::read(backup_of(&state)).expect("backup"), newer);
+}
+
+#[skuld::test]
+fn a_witness_with_a_stray_field_still_reads() {
+    let state = dir();
+    std::fs::write(
+        state.path().join(super::STATE_FILE_NAME),
+        br#"{"version": 1, "armed": true, "stray": 1}"#,
+    )
+    .expect("write");
+    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
+}
+
 #[skuld::test]
 fn a_record_that_says_not_armed_is_re_armed_rather_than_left_alone() {
     // The one cell above that actually writes over an existing file, driven
@@ -402,7 +443,7 @@ fn a_record_that_says_not_armed_is_re_armed_rather_than_left_alone() {
     let state = dir();
     std::fs::write(
         state.path().join(super::STATE_FILE_NAME),
-        format!(r#"{{"version": {}, "armed": false}}"#, super::SCHEMA_VERSION),
+        r#"{"version": 1, "armed": false}"#,
     )
     .expect("write");
     assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
