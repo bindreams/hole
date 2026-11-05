@@ -6541,17 +6541,26 @@ fn promote_adopted_claim_does_not_clobber_a_recorded_off() {
 }
 
 #[skuld::test]
-fn promote_adopted_claim_arms_an_unset_or_unreadable_intent() {
+fn promote_adopted_claim_arms_an_unset_intent() {
     let unset = tempfile::tempdir().unwrap();
     promote_adopted_claim(Some(unset.path()), None);
     assert_eq!(lockdown_state::load_intent(unset.path()), lockdown_state::Intent::On);
+}
 
+#[skuld::test]
+fn promote_adopted_claim_leaves_an_unreadable_intent_as_it_is() {
+    // A newer schema may hold the user's `Off`; the promotion must not turn it into `On`.
     let unreadable = tempfile::tempdir().unwrap();
-    std::fs::write(unreadable.path().join(lockdown_state::STATE_FILE_NAME), b"{not json").unwrap();
+    let path = unreadable.path().join(lockdown_state::STATE_FILE_NAME);
+    let bytes: &[u8] = br#"{"version":2,"enabled":false}"#;
+    std::fs::write(&path, bytes).unwrap();
+
     promote_adopted_claim(Some(unreadable.path()), None);
+
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert_eq!(
         lockdown_state::load_intent(unreadable.path()),
-        lockdown_state::Intent::On
+        lockdown_state::Intent::Unreadable
     );
 }
 

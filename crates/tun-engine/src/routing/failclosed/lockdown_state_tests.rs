@@ -187,17 +187,28 @@ fn load_enabled_is_the_reads_armed_fold() {
 
 // promote_unrecorded --------------------------------------------------------------------------------------------------
 
-/// Each recorded intent the promotion can meet, planted as bytes, with whether it must write and what the file reads
-/// as afterwards. `On` and `Off` are recorded decisions and stay as they are.
+/// Each intent the promotion can meet, planted as bytes, with whether it must write and what the file reads as
+/// afterwards. Only an absent file is promoted: a recorded `On` or `Off` is a decision, and a file this release cannot
+/// read may hold one (a newer or obsolete `enabled: false` is a user's `Off`).
 #[skuld::test]
 fn update_decides_on_the_classified_intent_and_writes_only_some() {
     let cases: [(&str, Option<&[u8]>, bool, Intent); 6] = [
         ("unset", None, true, Intent::On),
         ("on", Some(br#"{"version":1,"enabled":true}"#), false, Intent::On),
         ("off", Some(br#"{"version":1,"enabled":false}"#), false, Intent::Off),
-        ("corrupt", Some(b"{not json"), true, Intent::On),
-        ("newer", Some(br#"{"version":2,"enabled":false}"#), true, Intent::On),
-        ("obsolete", Some(br#"{"version":0,"enabled":false}"#), true, Intent::On),
+        ("corrupt", Some(b"{not json"), false, Intent::Unreadable),
+        (
+            "newer",
+            Some(br#"{"version":2,"enabled":false}"#),
+            false,
+            Intent::Unreadable,
+        ),
+        (
+            "obsolete",
+            Some(br#"{"version":0,"enabled":false}"#),
+            false,
+            Intent::Unreadable,
+        ),
     ];
     for (what, planted, wrote, after) in cases {
         let tmp = tempfile::tempdir().unwrap();
@@ -230,15 +241,27 @@ fn promote_declines_over_a_recorded_off_and_on() {
 }
 
 #[skuld::test]
-fn promote_writes_over_unset_and_unreadable() {
+fn promote_writes_over_unset_only() {
     let unset = tempfile::tempdir().unwrap();
     assert!(promote_unrecorded(unset.path(), None).unwrap());
     assert_eq!(load_intent(unset.path()), Intent::On);
+}
 
-    let unreadable = tempfile::tempdir().unwrap();
-    write_raw(unreadable.path(), b"{not json");
-    assert!(promote_unrecorded(unreadable.path(), None).unwrap());
-    assert_eq!(load_intent(unreadable.path()), Intent::On);
+#[skuld::test]
+fn promote_over_a_read_that_fails_declines_and_leaves_the_name_alone() {
+    // A directory at the name: the read fails with something other than "not found", so the intent is unknown, not
+    // unset. Declining is `Ok(false)`, not a refusal, and nothing is written or backed up.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(STATE_FILE_NAME)).unwrap();
+
+    assert!(!promote_unrecorded(tmp.path(), None).unwrap());
+
+    assert!(tmp.path().join(STATE_FILE_NAME).is_dir());
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        1,
+        "nothing was written beside it"
+    );
 }
 
 #[skuld::test]
@@ -260,7 +283,7 @@ fn promote_then_unblock_leaves_off() {
 #[skuld::test]
 fn admits_adoption_promotion_is_exhaustive_per_variant() {
     assert!(Intent::Unset.admits_adoption_promotion());
-    assert!(Intent::Unreadable.admits_adoption_promotion());
+    assert!(!Intent::Unreadable.admits_adoption_promotion());
     assert!(!Intent::On.admits_adoption_promotion());
     assert!(!Intent::Off.admits_adoption_promotion());
 }

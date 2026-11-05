@@ -58,7 +58,8 @@ pub enum Intent {
     /// No file at all (`ErrorKind::NotFound`): a fresh install, a wiped or
     /// recreated state dir, or a second bridge's own `--state-dir`.
     Unset,
-    /// A file exists but the read, the JSON parse, or the version check failed.
+    /// A file exists but the read, the JSON parse, or the version check failed. It may hold the user's `Off`
+    /// (a newer or obsolete schema, a garbled write), so nothing but the user's own setter writes over it.
     Unreadable,
 }
 
@@ -86,12 +87,13 @@ impl Intent {
         matches!(self, Intent::On)
     }
 
-    /// "May a start that just honoured an adopted cover record the kill switch as armed?" — `Unset | Unreadable`.
-    /// `On` needs no write, and `Off` is the user's explicit choice: an adopted claim is never proof it still stands.
+    /// "May a start that just honoured an adopted cover record the kill switch as armed?" — `Unset` only.
+    /// `On` needs no write, `Off` is the user's explicit choice, and an adopted claim is never proof it still stands.
+    /// `Unreadable` already reads armed, and a write over it could turn a user's `Off` into `On`.
     pub fn admits_adoption_promotion(self) -> bool {
         match self {
-            Intent::Unset | Intent::Unreadable => true,
-            Intent::On | Intent::Off => false,
+            Intent::Unset => true,
+            Intent::Unreadable | Intent::On | Intent::Off => false,
         }
     }
 
@@ -142,8 +144,8 @@ pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -
         .map(|_| ())
 }
 
-/// Record the kill switch as armed iff no explicit intent is recorded ([`Intent::admits_adoption_promotion`]); the
-/// read and the write are one update, so a concurrent [`set_enabled`] is never overwritten. `true` when it wrote.
+/// Record the kill switch as armed iff nothing is recorded ([`Intent::admits_adoption_promotion`]); the read and the
+/// write are one update, so a concurrent [`set_enabled`] is never overwritten. `true` when it wrote.
 pub fn promote_unrecorded(state_dir: &Path, owner: Option<(u32, u32)>) -> Result<bool, StoreError> {
     file(state_dir)
         .update(&DefaultPlacement { owner }, |now| {
