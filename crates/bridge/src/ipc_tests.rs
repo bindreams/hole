@@ -342,7 +342,10 @@ impl Routing for MockRouting {
 
     fn release_all_covers(&self) -> Result<(), RoutingError> {
         self.release_all_calls.fetch_add(1, Ordering::SeqCst);
-        if tun_engine::routing::failclosed::watch_releases(&self.state_dir).is_err() {
+        if tun_engine::routing::failclosed::watch_releases(&self.state_dir)
+            .check()
+            .is_err()
+        {
             self.saw_release_in_flight.store(true, Ordering::SeqCst);
         }
         // As `failclosed::release_all`: a sweep that fails before the firewall supersedes nothing.
@@ -1139,7 +1142,7 @@ async fn an_unblock_is_a_release_in_flight_before_its_first_firewall_call() {
     let routing = MockRouting::new(dir.clone());
     let saw = Arc::clone(&routing.saw_release_in_flight);
     let state = ipc_state_over(routing, dir.clone());
-    let watch = tun_engine::routing::failclosed::watch_releases(&dir).unwrap();
+    let watch = tun_engine::routing::failclosed::watch_releases(&dir);
 
     let _ = super::handle_unblock(axum::extract::State(state)).await.unwrap();
 
@@ -1149,7 +1152,7 @@ async fn an_unblock_is_a_release_in_flight_before_its_first_firewall_call() {
     );
     assert!(watch.check().is_err(), "a start that was already underway is overtaken");
     assert!(
-        tun_engine::routing::failclosed::watch_releases(&dir).is_ok(),
+        tun_engine::routing::failclosed::watch_releases(&dir).check().is_ok(),
         "and the release ends with the Unblock"
     );
 }
@@ -1160,13 +1163,13 @@ async fn an_unblock_whose_release_fails_still_ends_its_release() {
     let routing = MockRouting::new(dir.clone());
     routing.fail_release.store(true, Ordering::SeqCst);
     let state = ipc_state_over(routing, dir.clone());
-    let watch = tun_engine::routing::failclosed::watch_releases(&dir).unwrap();
+    let watch = tun_engine::routing::failclosed::watch_releases(&dir);
 
     let result = super::handle_unblock(axum::extract::State(state)).await;
 
     assert!(result.is_err());
     assert!(
-        tun_engine::routing::failclosed::watch_releases(&dir).is_ok(),
+        tun_engine::routing::failclosed::watch_releases(&dir).check().is_ok(),
         "a failed Unblock must not leave every later start refused"
     );
     assert!(
@@ -1212,7 +1215,7 @@ fn a_dropped_unblock_handler_future_does_not_end_the_release_before_the_persist(
     });
 
     assert!(
-        watch_releases(dir.path()).is_err(),
+        watch_releases(dir.path()).check().is_err(),
         "the handler future is gone, but the persist it spawned is not done: the release is still in flight"
     );
 
@@ -1220,7 +1223,7 @@ fn a_dropped_unblock_handler_future_does_not_end_the_release_before_the_persist(
     holder.join().unwrap().unwrap();
     drop(runtime);
     assert!(
-        watch_releases(dir.path()).is_ok(),
+        watch_releases(dir.path()).check().is_ok(),
         "and it ends with the persist, not before and not never"
     );
 }

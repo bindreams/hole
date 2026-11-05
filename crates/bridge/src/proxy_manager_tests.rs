@@ -3885,6 +3885,60 @@ mod self_test {
     }
 
     #[skuld::test]
+    fn an_uncovered_start_proceeds_while_an_unblock_is_in_flight() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+            let _release = tun_engine::routing::failclosed::begin_release(dir.path());
+
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(
+                !matches!(err, ProxyError::Cancelled),
+                "a start that installs no cover has nothing for the Unblock to undo: {err:?}"
+            );
+            assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[skuld::test]
+    fn a_reload_proceeds_while_an_unblock_is_in_flight() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, dir) = covered_gate_setup(false);
+            let _release = tun_engine::routing::failclosed::begin_release(dir.path());
+
+            let err = pm.reload(&cfg).await.unwrap_err();
+
+            assert!(!matches!(err, ProxyError::Cancelled), "{err:?}");
+        });
+    }
+
+    #[skuld::test]
+    fn a_release_that_fails_before_the_firewall_does_not_cancel_the_start_it_overlapped() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+            let state_dir = dir.path().to_path_buf();
+            *st.on_install.lock().unwrap() = Some((
+                0,
+                Box::new(move || drop(tun_engine::routing::failclosed::begin_release(&state_dir))),
+            ));
+
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(
+                !matches!(err, ProxyError::Cancelled),
+                "a release that never reached the firewall changed nothing the start installed: {err:?}"
+            );
+            assert!(pm.blocked_until_connected(), "the start keeps its cover");
+        });
+    }
+
+    #[skuld::test]
     fn an_unblock_that_ended_before_the_start_began_does_not_cancel_it() {
         rt().block_on(async {
             let (mut pm, cfg, st, dir) = covered_gate_setup(false);

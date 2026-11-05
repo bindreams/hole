@@ -9,11 +9,13 @@
 //! an epoch. A release that fails before then changed nothing and supersedes
 //! nothing; the type, not its callers, owns what "superseded" means.
 //!
-//! An install opens a [`ReleaseWatch`] before it installs and checks it after. A
-//! check fails while any release is in flight, marked or not, and after any
-//! release marked itself since the watch opened. A watch cannot open at all while
-//! a release is in flight. An install's record writes check the watch inside
-//! their critical section, so no write lands once a release has begun.
+//! An install opens a [`ReleaseWatch`] when it starts and checks it where it
+//! commits to a cover and after it installs. A check fails while any release is
+//! in flight, marked or not, and after any release marked itself since the watch
+//! opened. A watch opened while a release was in flight is failed for good: the
+//! install may have read state that release was still writing. An install's
+//! record writes check the watch inside their critical section, so no write
+//! lands once a release has begun.
 //!
 //! The epoch orders an engage against ANY release: the tray's Unblock holds its guard through its persisted
 //! `Off`, a sweep through its witness write. It does not decide what a start records; that is the user's
@@ -80,33 +82,44 @@ impl Drop for ReleaseInFlight {
     }
 }
 
-/// An install's view of the epoch when it opened.
+/// An install's view of the releases when it opened.
 #[derive(Debug)]
 pub struct ReleaseWatch {
     slot: Arc<Slot>,
     epoch: u64,
+    /// A release was in flight when the watch opened.
+    opened_during_a_release: bool,
 }
 
-/// Open a watch before installing a cover. Refuses while a release is in
-/// flight: nothing may be installed over it.
-pub fn watch_releases(state_dir: &Path) -> Result<ReleaseWatch, RoutingError> {
+/// Open a watch when an install starts, before it reads any state a release
+/// writes. Never refuses: whether a release stops the install is decided by
+/// [`ReleaseWatch::check`], where the install commits to a cover.
+///
+/// The epoch is read first, then the in-flight count: a release that marks
+/// itself before the epoch read and is still in flight after it is counted.
+pub fn watch_releases(state_dir: &Path) -> ReleaseWatch {
     let slot = slot(state_dir);
     let epoch = slot.epoch.load(Ordering::SeqCst);
-    if slot.in_flight.load(Ordering::SeqCst) > 0 {
-        return Err(RoutingError::SupersededByRelease);
+    let opened_during_a_release = slot.in_flight.load(Ordering::SeqCst) > 0;
+    ReleaseWatch {
+        slot,
+        epoch,
+        opened_during_a_release,
     }
-    Ok(ReleaseWatch { slot, epoch })
 }
 
 impl ReleaseWatch {
-    /// Fails if a release is in flight, or marked itself since the watch opened:
-    /// the install it guards may have raced it. Takes no lock, so a record write
-    /// can check it inside its own critical section.
+    /// Fails if a release is in flight, or was when the watch opened, or marked
+    /// itself since: the install it guards may have raced it. Takes no lock, so a
+    /// record write can check it inside its own critical section.
     ///
     /// The in-flight count is read before the epoch: a release that began, marked
     /// and ended between the two reads is seen by the epoch.
     pub fn check(&self) -> Result<(), RoutingError> {
-        if self.slot.in_flight.load(Ordering::SeqCst) > 0 || self.slot.epoch.load(Ordering::SeqCst) != self.epoch {
+        if self.opened_during_a_release
+            || self.slot.in_flight.load(Ordering::SeqCst) > 0
+            || self.slot.epoch.load(Ordering::SeqCst) != self.epoch
+        {
             return Err(RoutingError::SupersededByRelease);
         }
         Ok(())
