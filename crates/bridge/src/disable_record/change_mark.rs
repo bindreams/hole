@@ -17,7 +17,8 @@
 //! while the mark says none does. A reinstall deletes the key and the count with
 //! it, so the count alone repeats; the at-rest value adds the ending holder's
 //! stamp (one process) and a per-process `seq` (two changes that process ends
-//! at the same count).
+//! at the same count). A bare `<n>`, which earlier builds wrote at rest, is
+//! still read: it seeds the count and names no holder.
 //! The mark sits in the service's key, which an unprivileged user can read and
 //! no user can write.
 
@@ -66,8 +67,10 @@ impl ChangeKey {
     }
 
     /// What the value holds now, and whether the process it names runs. A
-    /// missing key or value, or one that cannot be read, is no mark (the
-    /// latter warns), so the reader is never kept from an answer.
+    /// missing key or value, or one that cannot be read or is not a string, is
+    /// no mark (the latter two warn); a string whose count does not parse is
+    /// the mark but names no holder, and warns. The reader is never kept from
+    /// an answer.
     pub fn read(&self) -> ChangeMark {
         let raw = match self.raw() {
             Ok(raw) => raw,
@@ -76,6 +79,9 @@ impl ChangeKey {
                 None
             }
         };
+        if raw.as_deref().is_some_and(|value| leading_count(value).is_none()) {
+            warn!("the service's change mark is unreadable; counting it as a mark that names no holder");
+        }
         let holder = raw.as_deref().and_then(holder_of).map(|stamp| {
             let running = stamp.is_running();
             if let Err(error) = &running {
@@ -117,10 +123,9 @@ impl ChangeKey {
     fn raw(&self) -> Result<Option<String>, windows::core::Error> {
         let answer = self.open(KEY_QUERY_VALUE.0).and_then(|key| key.get_value(VALUE));
         match answer {
-            Ok(value) => Ok(Some(String::try_from(value).unwrap_or_else(|error| {
-                warn!(%error, "the service's change mark is not a string; counting it as empty");
-                String::new()
-            }))),
+            Ok(value) => Ok(String::try_from(value)
+                .inspect_err(|error| warn!(%error, "the service's change mark is not a string; counting it as unset"))
+                .ok()),
             Err(error) if missing(&error) => Ok(None),
             Err(error) => Err(error),
         }
@@ -136,23 +141,28 @@ fn at_rest(count: u64, holder: &Stamp, seq: u64) -> String {
     format!("{count}/{}/{seq}", holder.encode())
 }
 
-/// The count `value` starts with; 0 for a value that is not one, which warns
-/// unless the value is empty (no mark yet).
-fn counted(value: &str) -> u64 {
-    let count = value.split([':', '/']).next().unwrap_or_default();
-    count.parse().unwrap_or_else(|_| {
-        if !value.is_empty() {
-            warn!("the service's change mark is unreadable; its count restarts");
-        }
-        0
-    })
+/// The count a value starts with (the field before the first `:` or `/`) and
+/// the rest of the value from that separator on; `None` when there is no count.
+fn leading_count(value: &str) -> Option<(u64, &str)> {
+    let end = value.find([':', '/']).unwrap_or(value.len());
+    Some((value[..end].parse().ok()?, &value[end..]))
 }
 
-/// The holder a value names, if it names one.
+/// The count `value` starts with; 0 for a value with none, which warns.
+fn counted(value: &str) -> u64 {
+    leading_count(value).map_or_else(
+        || {
+            warn!("the service's change mark is unreadable; its count restarts");
+            0
+        },
+        |(count, _)| count,
+    )
+}
+
+/// The holder a value names, if it names one: only `<n>:<stamp>` does.
 fn holder_of(value: &str) -> Option<Stamp> {
-    let (count, stamp) = value.split_once(':')?;
-    count.parse::<u64>().ok()?;
-    Stamp::decode(stamp)
+    let (_, rest) = leading_count(value)?;
+    Stamp::decode(rest.strip_prefix(':')?)
 }
 
 /// A key of the test's own under HKCU, standing in for the service's key (HKLM

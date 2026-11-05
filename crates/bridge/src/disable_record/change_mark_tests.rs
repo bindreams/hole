@@ -91,52 +91,91 @@ fn a_value_that_is_not_a_mark_names_no_holder() {
     ScratchChangeKey::assert_at_rest(&key.get_string(VALUE).expect("replaced"), 1, &Stamp::current());
 }
 
-/// What `body` logs, with the subscriber installed on this thread only.
-fn logged(body: impl FnOnce()) -> String {
-    use garter::test_utils::WaitableWriter;
-    use garter::tracing_test::set_default_in_current_thread;
-
-    let writer = WaitableWriter::new();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer.clone())
-        .with_ansi(false)
-        .finish();
-    {
-        let _guard = set_default_in_current_thread(subscriber);
-        body();
-    }
-    writer.snapshot()
+/// How many warnings `body` logs.
+fn warnings(body: impl FnOnce()) -> usize {
+    garter::tracing_test::captured(body).matches("WARN").count()
 }
 
-/// A stored value whose count does not parse restarts the count, and says so
-/// without quoting the value; a missing value is the first change, not an error.
+/// A stored value whose count does not parse restarts the count on a write and
+/// says so once, without quoting the value.
 #[skuld::test]
-fn an_unreadable_stored_mark_warns_and_a_missing_one_is_silent() {
-    let (scratch, key) = ScratchChangeKey::created("unreadable-warns");
-    key.set_string(VALUE, "secret-text").expect("write");
-    let log = logged(|| scratch.mark().begin(&Stamp::current()).expect("begin"));
-    assert!(log.contains("WARN"), "{log:?}");
-    assert!(!log.contains("secret-text"), "{log:?}");
+fn writing_over_an_unreadable_mark_warns_once_and_restarts_the_count() {
+    for text in ["", "secret-text", ":1:2", "-1:1:2"] {
+        let (scratch, key) = ScratchChangeKey::created("unreadable-write");
+        key.set_string(VALUE, text).expect("write");
+        let log = garter::tracing_test::captured(|| scratch.mark().begin(&Stamp::current()).expect("begin"));
+        assert_eq!(log.matches("WARN").count(), 1, "{text:?}: {log:?}");
+        assert!(!log.contains("secret-text"), "{log:?}");
+        assert!(
+            key.get_string(VALUE).expect("the value").starts_with("1:"),
+            "{text:?}: the count restarted"
+        );
+    }
+}
+
+/// A value of the wrong type is no mark: one warning on a write, and the count
+/// starts at the first change.
+#[skuld::test]
+fn writing_over_a_value_of_the_wrong_type_warns_once() {
+    let (scratch, key) = ScratchChangeKey::created("wrong-type-write");
+    key.set_u32(VALUE, 7).expect("write");
+    let log = garter::tracing_test::captured(|| scratch.mark().begin(&Stamp::current()).expect("begin"));
+    assert_eq!(log.matches("WARN").count(), 1, "{log:?}");
     assert!(
-        key.get_string(VALUE).expect("the value").starts_with("1:"),
+        key.get_string(VALUE).expect("replaced").starts_with("1:"),
         "the count restarted"
     );
-
-    let (scratch, _key) = ScratchChangeKey::created("missing-silent");
-    let log = logged(|| scratch.mark().begin(&Stamp::current()).expect("begin"));
-    assert!(!log.contains("WARN"), "{log:?}");
 }
 
-/// A value of the wrong type is read as an empty mark, and says so, as every
-/// other failed read of the mark does.
+/// A missing value or key is the first change, not an error.
 #[skuld::test]
-fn a_value_of_the_wrong_type_is_read_as_empty_and_warned_about() {
-    let (scratch, key) = ScratchChangeKey::created("wrong-type");
+fn a_missing_mark_is_silent_to_write_and_to_read() {
+    let (scratch, _key) = ScratchChangeKey::created("missing-silent");
+    let mark = scratch.mark();
+    assert_eq!(warnings(|| assert_eq!(mark.read(), ChangeMark::new(None, None))), 0);
+    assert_eq!(warnings(|| mark.begin(&Stamp::current()).expect("begin")), 0);
+
+    let no_key = ScratchChangeKey::named("missing-key");
+    let mark = no_key.mark();
+    assert_eq!(warnings(|| assert_eq!(mark.read(), ChangeMark::new(None, None))), 0);
+    assert_eq!(warnings(|| mark.begin(&Stamp::current()).expect("begin")), 0);
+}
+
+/// A stored string whose count does not parse is kept as the mark, names no
+/// holder, and is warned about once per read, without quoting it.
+#[skuld::test]
+fn reading_an_unreadable_mark_warns_once_and_keeps_the_string() {
+    for text in ["", "secret-text", ":1:2", "-1:1:2"] {
+        let (scratch, key) = ScratchChangeKey::created("unreadable-read");
+        key.set_string(VALUE, text).expect("write");
+        let mut mark = None;
+        let log = garter::tracing_test::captured(|| mark = Some(scratch.mark().read()));
+        assert_eq!(mark, Some(ChangeMark::new(Some(text.to_owned()), None)), "{text:?}");
+        assert_eq!(log.matches("WARN").count(), 1, "{text:?}: {log:?}");
+        assert!(!log.contains("secret-text"), "{log:?}");
+    }
+}
+
+/// A readable mark that names no holder (a bare count, an at-rest value) is not
+/// an unreadable one.
+#[skuld::test]
+fn reading_a_mark_with_a_count_is_silent() {
+    for text in ["7", "7/1:2/3"] {
+        let (scratch, key) = ScratchChangeKey::created("readable-read");
+        key.set_string(VALUE, text).expect("write");
+        assert_eq!(warnings(|| drop(scratch.mark().read())), 0, "{text:?}");
+    }
+}
+
+/// A value of the wrong type is no mark, and warned about once per read.
+#[skuld::test]
+fn a_value_of_the_wrong_type_is_read_as_no_mark_and_warned_about() {
+    let (scratch, key) = ScratchChangeKey::created("wrong-type-read");
     key.set_u32(VALUE, 7).expect("write");
     let mut mark = None;
-    let log = logged(|| mark = Some(scratch.mark().read()));
-    assert_eq!(mark, Some(ChangeMark::new(Some(String::new()), None)));
-    assert!(log.contains("WARN"), "{log:?}");
+    let log = garter::tracing_test::captured(|| mark = Some(scratch.mark().read()));
+    assert_eq!(mark, Some(ChangeMark::new(None, None)));
+    assert_eq!(log.matches("WARN").count(), 1, "{log:?}");
 }
 
 /// No key is no service: nothing to mark, and a key made here would outlive it.

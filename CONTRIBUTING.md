@@ -2635,11 +2635,12 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   [`change_mark.rs`](crates/bridge/src/disable_record/change_mark.rs)) when its
   outermost hold on a thread begins, `<n>:<pid>:<creation>`, and again when that
   hold ends, `<n>/<pid>:<creation>/<seq>` (`n` counts transitions; the nested
-  holds of a change's own steps are no transition). The ending value is unique
-  per completed change (stamp of the ending holder plus a per-process `seq`),
-  since a reinstall resets `n`; see `change_mark.rs`. `display` reads the
-  mark, the start type, the record and the mark again, and goes again unless
-  the two marks are equal; a mark that names a running holder is `InChange` too, so a holder that stamps
+  holds of a change's own steps are no transition). The ending value adds the
+  ending holder's stamp and a per-process `seq` to `n`, because `n` alone
+  repeats: a reinstall deletes the key and `n` starts over; see
+  `change_mark.rs`. `display` reads the mark, the start type, the record and
+  the mark again, and goes again unless the two marks are equal; a mark that
+  names a running holder is `InChange` too, so a holder that stamps
   nothing (an administrator-disabled service's hardening, a first install, the
   failure-actions repair) is seen as well. A holder that crashed leaves its mark
   naming a dead process, which reads as no holder and does not change, so the
