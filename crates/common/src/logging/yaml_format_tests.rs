@@ -215,6 +215,52 @@ fn multiline_message_promotes_to_key() {
     );
 }
 
+/// The strings of the sequence under `key` in the YAML block of a captured event: drops the header line and the
+/// two-space nest prefix, parses the rest as a mapping.
+fn error_items(out: &str, key: &str) -> Vec<String> {
+    let body: String = out
+        .lines()
+        .skip(1)
+        .map(|line| {
+            format!(
+                "{}
+",
+                line.strip_prefix("  ").unwrap_or(line)
+            )
+        })
+        .collect();
+    let map: Mapping = yaml_serde::from_str(&body).unwrap_or_else(|e| {
+        panic!(
+            "not YAML ({e}):
+{out}"
+        )
+    });
+    let seq = map.get(key).and_then(Value::as_sequence).unwrap_or_else(|| {
+        panic!(
+            "no sequence under `{key}`:
+{out}"
+        )
+    });
+    seq.iter()
+        .map(|v| {
+            v.as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "non-string item {v:?}:
+{out}"
+                    )
+                })
+                .to_owned()
+        })
+        .collect()
+}
+
+fn log_error(error: &(dyn std::error::Error + 'static)) -> String {
+    run_with_subscriber(false, || {
+        tracing::error!(err = error, "boom");
+    })
+}
+
 #[skuld::test]
 fn record_error_uses_display_not_debug() {
     // Build an error whose Display and Debug differ, then log it.
@@ -227,20 +273,52 @@ fn record_error_uses_display_not_debug() {
     }
     impl std::error::Error for MyErr {}
 
-    let out = run_with_subscriber(false, || {
-        let e = MyErr;
-        let r: &(dyn std::error::Error + 'static) = &e;
-        tracing::error!(err = r, "boom");
-    });
-    // Key must be `err`, value must be the Display string, unquoted, on its
-    // own indented line.
-    assert!(
-        out.contains("  err: display-text\n"),
-        "expected indented `err: display-text` line, got:\n{out}"
-    );
+    let out = log_error(&MyErr);
+    // One link: a one-element list holding the Display string.
+    assert_eq!(error_items(&out, "err"), ["display-text"], "{out}");
     assert!(
         !out.contains("MyErr"),
-        "did not expect Debug text `MyErr` in output, got:\n{out}"
+        "did not expect Debug text `MyErr` in output, got:
+{out}"
+    );
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("outer")]
+struct Outer(#[source] Middle);
+
+#[derive(Debug, thiserror::Error)]
+#[error("middle")]
+struct Middle(#[source] std::io::Error);
+
+#[skuld::test]
+fn record_error_renders_every_link_outermost_first() {
+    let out = log_error(&Outer(Middle(std::io::Error::other("root cause"))));
+    assert_eq!(error_items(&out, "err"), ["outer", "middle", "root cause"], "{out}");
+}
+
+#[skuld::test]
+fn record_error_renders_an_io_error_wrapping_a_typed_payload_once() {
+    // An `io::Error`'s Display is its payload's: the payload is one item, not two.
+    #[derive(Debug, thiserror::Error)]
+    #[error("payload")]
+    struct Payload(#[source] std::io::Error);
+
+    let out = log_error(&std::io::Error::other(Payload(std::io::Error::other("root"))));
+    assert_eq!(error_items(&out, "err"), ["payload", "root"], "{out}");
+}
+
+#[skuld::test]
+fn record_error_keeps_a_multiline_link_as_one_item() {
+    let out = log_error(&std::io::Error::other(
+        "line1
+line2",
+    ));
+    assert_eq!(
+        error_items(&out, "err"),
+        ["line1
+line2"],
+        "{out}"
     );
 }
 
