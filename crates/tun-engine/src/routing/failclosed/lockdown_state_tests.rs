@@ -216,7 +216,11 @@ fn update_decides_on_the_classified_intent_and_writes_only_some() {
             write_raw(tmp.path(), bytes);
         }
 
-        assert_eq!(promote_unrecorded(tmp.path(), None).unwrap(), wrote, "{what}");
+        assert_eq!(
+            promote_unrecorded(tmp.path(), None).unwrap() == PromoteOutcome::Wrote,
+            wrote,
+            "{what}"
+        );
 
         assert_eq!(load_intent(tmp.path()), after, "{what}");
         if !wrote {
@@ -235,7 +239,10 @@ fn promote_declines_over_a_recorded_off_and_on() {
     for (enabled, want) in [(false, Intent::Off), (true, Intent::On)] {
         let tmp = tempfile::tempdir().unwrap();
         set_enabled(tmp.path(), enabled, None).unwrap();
-        assert!(!promote_unrecorded(tmp.path(), None).unwrap());
+        assert_eq!(
+            promote_unrecorded(tmp.path(), None).unwrap(),
+            PromoteOutcome::Declined(want)
+        );
         assert_eq!(load_intent(tmp.path()), want, "a recorded value is never rewritten");
     }
 }
@@ -243,18 +250,21 @@ fn promote_declines_over_a_recorded_off_and_on() {
 #[skuld::test]
 fn promote_writes_over_unset_only() {
     let unset = tempfile::tempdir().unwrap();
-    assert!(promote_unrecorded(unset.path(), None).unwrap());
+    assert_eq!(promote_unrecorded(unset.path(), None).unwrap(), PromoteOutcome::Wrote);
     assert_eq!(load_intent(unset.path()), Intent::On);
 }
 
 #[skuld::test]
 fn promote_over_a_read_that_fails_declines_and_leaves_the_name_alone() {
     // A directory at the name: the read fails with something other than "not found", so the intent is unknown, not
-    // unset. Declining is `Ok(false)`, not a refusal, and nothing is written or backed up.
+    // unset. Declining is `Ok(Declined(Unreadable))`, not a refusal, and nothing is written or backed up.
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join(STATE_FILE_NAME)).unwrap();
 
-    assert!(!promote_unrecorded(tmp.path(), None).unwrap());
+    assert_eq!(
+        promote_unrecorded(tmp.path(), None).unwrap(),
+        PromoteOutcome::Declined(Intent::Unreadable)
+    );
 
     assert!(tmp.path().join(STATE_FILE_NAME).is_dir());
     assert_eq!(

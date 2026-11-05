@@ -544,6 +544,22 @@ fn clear_obsolete_reports_a_file_it_could_not_read_and_keeps_it() {
 }
 
 #[skuld::test]
+fn remove_accounted_logs_the_error_of_a_failed_read() {
+    let dir = tempfile::tempdir().unwrap();
+    plant_unreadable(dir.path());
+
+    let log = captured(|| {
+        remove_accounted(dir.path(), &[synthetic(1, 1)]).unwrap();
+    });
+
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WARN") && l.contains("nothing to remove") && l.contains("error=")),
+        "the I/O error must reach the log, not just the fact of a failed read: {log}"
+    );
+}
+
+#[skuld::test]
 fn remove_accounted_says_why_it_removed_nothing_from_a_file_that_is_gone_or_unusable() {
     let absent = tempfile::tempdir().unwrap();
     let log = captured(|| {

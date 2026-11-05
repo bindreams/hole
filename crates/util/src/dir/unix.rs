@@ -347,7 +347,7 @@ pub(super) fn is_vouched_for(dir: &File, file: &File) -> io::Result<bool> {
     })
 }
 
-/// What `fstat` says about a file opened to append to; the only input to [`trusted_appender`].
+/// What `fstat` says about a file: the only input to [`trusted_appender`] and [`ids_of`]'s refusals.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Facts {
     pub regular: bool,
@@ -356,11 +356,18 @@ pub(super) struct Facts {
     pub links: u64,
 }
 
+impl Facts {
+    /// A regular file with no other name. A second name is what a hard link a user planted adds, and a write
+    /// through one name changes the file at the other.
+    pub(super) fn is_a_regular_file_with_one_name(self) -> bool {
+        self.regular && self.links == 1
+    }
+}
+
 /// Whether a file found at a log's name is one a privileged writer may append to: a regular file with no other name
-/// (a second name is what a hard link a user planted adds) that `owner` owns. With no `owner`, no ownership is
-/// expected and any such file will do.
+/// that `owner` owns. With no `owner`, no ownership is expected and any such file will do.
 pub(super) fn trusted_appender(facts: Facts, owner: Option<(u32, u32)>) -> bool {
-    facts.regular && facts.links == 1 && owner.is_none_or(|(uid, _)| facts.uid == uid)
+    facts.is_a_regular_file_with_one_name() && owner.is_none_or(|(uid, _)| facts.uid == uid)
 }
 
 pub(super) fn is_own_file(file: &File, owner: Option<(u32, u32)>) -> io::Result<bool> {
@@ -396,7 +403,7 @@ pub(super) fn ids_of(dir: &File, name: &OsStr) -> io::Result<Option<(u32, u32)>>
                 uid: meta.uid,
                 links: meta.links,
             };
-            match (trusted_appender(facts, None), facts.regular) {
+            match (facts.is_a_regular_file_with_one_name(), facts.regular) {
                 (true, _) => Ok(Some((meta.uid, meta.gid))),
                 (false, false) => Err(Refusal::NotRegular.into_io_error()),
                 (false, true) => Err(Refusal::ForeignFile.into_io_error()),

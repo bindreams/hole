@@ -123,8 +123,11 @@ pub(crate) fn remove_accounted(
                 tracing::warn!("the plugin state file is corrupt: kept, nothing to remove");
                 (Change::Keep, ())
             }
-            Loaded::Unreadable { .. } => {
-                tracing::warn!("the plugin state file is unreadable: kept, nothing to remove");
+            Loaded::Unreadable { error, .. } => {
+                tracing::warn!(
+                    error = error as &dyn std::error::Error,
+                    "the plugin state file is unreadable: kept, nothing to remove"
+                );
                 (Change::Keep, ())
             }
             // Names no process at all, so no record of the caller's is in it.
