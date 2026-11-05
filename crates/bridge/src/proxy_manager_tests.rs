@@ -564,7 +564,8 @@ impl Routing for MockRouting {
         if self.state.fail_release.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock release_all_covers failure".into()));
         }
-        // Unconditional clear, mirroring `failclosed::release_all`: a completed sweep outdates every guard.
+        // All or nothing: the mock answers with the table's stated outcome and never models a sweep that
+        // releases one kind and fails the other. A success outdates every guard; a failure outdates none.
         *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
         lock.outdate_stamps(CoverKind::Transient);
         lock.outdate_stamps(CoverKind::Lockdown);

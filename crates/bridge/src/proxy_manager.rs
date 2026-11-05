@@ -2137,8 +2137,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         "lockdown cover release could not be confirmed; keeping the escape visible"
                     ),
                 }
-                // After a confirmed release this guard is stale and deletes nothing; after a failed one it is
-                // current and retries its own deletes.
+                // After a confirmed release this guard is stale and deletes nothing. After a failed one it may be
+                // either: a sweep that released only its kind has outdated it, one that released only the other kind
+                // leaves it current to retry its own deletes. Either way `Err` keeps the adopted claim set, so the
+                // escape stays visible while any kind is held.
                 if let Some(c) = cover {
                     c.release(lock);
                 }
