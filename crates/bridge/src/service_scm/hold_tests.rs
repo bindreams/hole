@@ -810,21 +810,6 @@ fn an_undetermined_outcome_for_an_id_the_scm_named_is_a_contract_violation() {
 
 // A live process that fails the SID check =============================================================================
 
-/// Runs `f` under a per-test subscriber and returns what it logged.
-fn logged_during(f: impl FnOnce()) -> String {
-    use garter::test_utils::WaitableWriter;
-    use garter::tracing_test::set_default_in_current_thread;
-
-    let writer = WaitableWriter::new();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = set_default_in_current_thread(subscriber);
-    f();
-    writer.snapshot()
-}
-
 /// In RUNNING the id is documented valid, so a live process there that is not
 /// the service's means nothing of the service will be waited on: said once,
 /// with the id and the state.
@@ -833,7 +818,7 @@ fn a_valid_state_process_that_fails_the_sid_check_is_logged_with_its_pid_and_sta
     let log = Log::default();
     let mut source = Script::new(&log, steady(Observed::Running, 4242));
     source.strangers.push(4242);
-    let logged = logged_during(|| {
+    let logged = garter::tracing_test::captured(|| {
         look_of(&mut source);
     });
     assert!(logged.contains("WARN"), "{logged:?}");
@@ -849,7 +834,7 @@ fn a_may_be_invalid_state_process_that_fails_the_sid_check_logs_nothing() {
         let log = Log::default();
         let mut source = Script::new(&log, steady(pending, 4242));
         source.strangers.push(4242);
-        let logged = logged_during(|| {
+        let logged = garter::tracing_test::captured(|| {
             look_of(&mut source);
         });
         assert_eq!(logged, "", "{pending:?}");
