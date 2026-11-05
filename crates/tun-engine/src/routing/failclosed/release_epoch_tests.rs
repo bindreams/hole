@@ -107,3 +107,34 @@ fn check_runs_inside_a_record_update() {
 
     assert!(checked);
 }
+
+// The sweeps ==========================================================================================================
+
+use super::super::{sweep_with_witness, Clearance, SweepOutcome};
+
+#[skuld::test]
+fn every_sweep_runs_as_a_release_in_flight() {
+    // `release_all` and `disengage_lockdown` both go through `sweep_with_witness`,
+    // so a sweep is announced before its closure makes its first firewall call.
+    let d = dir();
+    let watch = watch_releases(d.path()).unwrap();
+    let mut announced = false;
+    let _clearance = sweep_with_witness(d.path(), None, |_| {
+        announced = is_superseded(&watch_releases(d.path()));
+        SweepOutcome::completed(Clearance::proven())
+    })
+    .unwrap();
+    assert!(announced);
+    assert!(is_superseded(&watch.check()));
+    assert!(watch_releases(d.path()).is_ok(), "and it ends with the sweep");
+}
+
+#[skuld::test]
+fn a_failing_sweep_ends_its_release_too() {
+    let d = dir();
+    let result = sweep_with_witness(d.path(), None, |_| {
+        SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("the sweep failed".into()))
+    });
+    assert!(result.is_err());
+    assert!(watch_releases(d.path()).is_ok());
+}
