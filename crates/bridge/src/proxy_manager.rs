@@ -310,12 +310,14 @@ struct BlockedStart<C> {
 }
 
 impl<C> BlockedStart<C> {
-    /// Whether the cover is still the OS's: the ONE place a held or just-installed cover meets the release
-    /// verdict, so every read, keep and drop of one asks this and nothing else matches on the verdict.
+    /// Whether a HELD cover is still the OS's: the ONE place a cover held from an earlier attempt meets the
+    /// release verdict, so every read, keep and drop of one asks this and nothing else matches on the verdict.
     ///
     /// A release that ended with a change since the installing start opened its watch took the cover: the OS
     /// objects it claims to hold are gone, so nothing may trust or report it. A release still in flight has not
-    /// said what it did, so the cover stays held until it does.
+    /// said what it did, so the cover stays held until it does: it passed its own post-install check, so any
+    /// release in flight began after the install and its deletes are still to come. A cover installed by the
+    /// current start is not asked this; it is dropped on any verdict (see `start_cancellable`).
     fn stands(&self) -> bool {
         match self.watch.check() {
             Ok(()) => true,
@@ -326,7 +328,7 @@ impl<C> BlockedStart<C> {
 }
 
 /// Why a start ended in [`ProxyError::Cancelled`]. A user cancel drops the held cover; a release that overtook the
-/// start leaves the cover to [`BlockedStart::stands`].
+/// start drops a held cover that no longer stands ([`BlockedStart::stands`]).
 #[derive(Debug, Clone, Copy)]
 enum StartCancel {
     /// The user, or the start's own token, cancelled it.
@@ -1100,8 +1102,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
                 match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
-                        // Held before the verdict is read: a release that took the cover is reaped by the
-                        // cancel below, one still in flight leaves it held.
+                        // Any verdict drops the fresh cover: a release in flight may already have run its
+                        // deletes before this install, so keeping the cover could strand a live block no
+                        // status reports.
+                        if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
+                            drop(cover);
+                            return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
+                        }
                         self.posture.hold_pending(BlockedStart {
                             cover,
                             host: config.server.server.expose().to_string(),
@@ -1110,9 +1117,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             resolver_permit: ech_resolver_permit,
                             watch: covered_watch(release_watch.as_ref()),
                         });
-                        if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
-                            return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
-                        }
                     }
                     Err(e) => {
                         // Superseded by a release: cancel, neither run uncovered nor engage again.
@@ -1122,6 +1126,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         if let Some((old_permit, original_pin)) = repair_fallback {
                             match self.routing.install_failclosed_cover(server_ip, old_permit) {
                                 Ok(cover) => {
+                                    if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
+                                        drop(cover);
+                                        return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
+                                    }
                                     self.posture.hold_pending(BlockedStart {
                                         cover,
                                         host: config.server.server.expose().to_string(),
@@ -1130,9 +1138,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                         resolver_permit: old_permit,
                                         watch: covered_watch(release_watch.as_ref()),
                                     });
-                                    if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
-                                        return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
-                                    }
                                     // The restored permit is stale either way, but which
                                     // direction it's stale in depends on whether the fetch
                                     // this attempt needs an ECH resolver at all: widening
@@ -1313,9 +1318,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     }
 
     /// The one exit of a cancelled start, whether the user or a release cancelled it, early or late. A user cancel
-    /// drops the held cover; after a release the cover is dropped only if it no longer stands
-    /// ([`BlockedStart::stands`]), so one a release in flight has not yet taken stays held. A cancel records no
-    /// `last_error`.
+    /// drops the held cover; after a release a HELD cover is dropped only if it no longer stands
+    /// ([`BlockedStart::stands`]), so one a release in flight has not yet taken stays held. A cover this start just
+    /// installed never reaches here held: the install sites drop it on any verdict. A cancel records no `last_error`.
     fn cancelled_start(&mut self, reason: StartCancel) -> ProxyError {
         match reason {
             StartCancel::Requested => drop(self.posture.take_pending()),
@@ -1375,6 +1380,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    before `R::Installed`; disengages the standing cover (only `Some`
     ///    when intent is on and engage already succeeded). On the fail-FATAL
     ///    engage `?` it is never constructed, so only `R::Installed` tears down.
+    ///    A release that overtakes the start right after the install, in flight
+    ///    or ended, drops it too: a failed start drops its standing cover, no exception.
     ///
     /// Per-phase cancellation strategy:
     /// - **Phase 1 (plugin chain)**: the bridge cancel is threaded into
@@ -1890,6 +1897,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let lockdown = if standing_cover_expected {
             match routing.install_lockdown(server_ip, &tun_identity, &app_ids) {
                 Ok(cover) => {
+                    // One read; any verdict drops the fresh cover (never `disarm`): a release in flight may
+                    // have run its deletes before this install, and the intent is still on, so the next start
+                    // installs again. A held cover is never decided this way (`BlockedStart::stands`).
                     if let Err(verdict) = overtaken_by_release(release_watch) {
                         drop(cover);
                         if let Some(mut d) = dispatcher.take() {

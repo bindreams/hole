@@ -19,6 +19,14 @@
 //! watch inside their critical section, so no write lands once a release has
 //! begun.
 //!
+//! An engage is ordered by checking AFTER the install and dropping the cover it
+//! just installed on any verdict, so no lock spans an OS call. A release that
+//! begins after the check does its deletes after the install and takes the
+//! cover; one that began before it is either in flight or ended, and either way
+//! the fresh cover cannot be told from one the release left live and unreported.
+//! Only a cover held from an EARLIER attempt, whose deletes are still to come,
+//! is kept under a release in flight.
+//!
 //! The epoch orders an engage against ANY release: the tray's Unblock holds its guard through its persisted
 //! `Off`, a sweep through its witness write. It does not decide what a start records; that is the user's
 //! decision to be Off, which only the tray's Unblock makes and the bridge's `unblock_generation` carries.
@@ -142,6 +150,8 @@ impl ReleaseWatch {
     /// opened is [`Overtaken::Superseded`] even while another release is in flight; a release in flight with
     /// the epoch unmoved is [`Overtaken::InDoubt`]. A watch opened during a release that then ends with a
     /// change is superseded by it, which covers an install that read state the release was still writing.
+    ///
+    /// A cover installed before an `Err` is dropped, never kept.
     ///
     /// Takes no lock but the slot's leaf one, so a record write can check it inside its own critical section.
     pub fn check(&self) -> Result<(), Overtaken> {
