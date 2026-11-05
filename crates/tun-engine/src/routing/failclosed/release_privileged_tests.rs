@@ -10,8 +10,8 @@
 //! and clearing through `Routing::release_all_covers` — proving both the
 //! `failclosed::release_all` facade and the trait delegation in one pass.
 //!
-//! `CoverGuard::disarm` is `mem::forget`: after it there is no guard anywhere
-//! to remove what a test installed, so a failing assertion between `disarm`
+//! `CoverGuard::disarm` consumes the guard and empties it, so its `Drop` disengages
+//! nothing: after it there is no guard anywhere to remove what a test installed, so a failing assertion between `disarm`
 //! and the `release_all_covers` call under test would leave a system-wide
 //! block-all in force with nothing to remove it. Every test that calls
 //! `disarm` installs [`ReleaseOnDrop`] FIRST, so a panic (or an early return

@@ -341,15 +341,22 @@ fn a_sweep_with_nothing_to_delete_makes_an_earlier_stamp_stale() {
     assert!(!stamp.is_current());
 }
 
-/// A sweep of both kinds that fails reports which kind it released. That kind's guard must stop deleting (its OS
-/// objects are gone, a delete would hit whatever replaced them); the other kind's guard stays current and retries.
-/// Returns `(transient_current, lockdown_current)`.
-fn stamps_after_a_failed_sweep_that_released(released: &[CoverKind]) -> (bool, bool) {
+/// Stamps of both kinds, then a sweep that fails with `outcome`. Returns `(transient_current, lockdown_current)`:
+/// a kind the outcome released must stop deleting (its OS objects are gone, a delete would hit whatever replaced
+/// them); the other kind's guard stays current and retries.
+fn stamps_after_a_failed_sweep(outcome: impl FnOnce() -> SweepOutcome) -> (bool, bool) {
     let d = dir();
     let lock = CoverLock::acquire(d.path());
     let transient = lock.stamp_install(CoverKind::Transient);
     let lockdown = lock.stamp_install(CoverKind::Lockdown);
-    let result = sweep_with_witness(&lock, None, |_| {
+    let result = sweep_with_witness(&lock, None, |_| outcome());
+    assert!(result.is_err());
+    (transient.is_current(), lockdown.is_current())
+}
+
+/// [`stamps_after_a_failed_sweep`] for a sweep that failed on every kind it did not list as released.
+fn stamps_after_a_failed_sweep_that_released(released: &[CoverKind]) -> (bool, bool) {
+    stamps_after_a_failed_sweep(|| {
         let outcome_of = |kind| {
             let error =
                 (!released.contains(&kind)).then(|| RoutingError::RouteSetup("one kind could not be released".into()));
@@ -359,9 +366,7 @@ fn stamps_after_a_failed_sweep_that_released(released: &[CoverKind]) -> (bool, b
             Clearance::proven(),
             [outcome_of(CoverKind::Transient), outcome_of(CoverKind::Lockdown)],
         )
-    });
-    assert!(result.is_err());
-    (transient.is_current(), lockdown.is_current())
+    })
 }
 
 #[skuld::test]
@@ -389,19 +394,13 @@ fn a_sweep_that_released_neither_kind_outdates_neither_stamp() {
 fn a_sweep_that_failed_to_open_the_firewall_outdates_no_stamp() {
     // `SweepOutcome::failed` attributes no kind: the firewall was never reached, so every held guard still owns
     // its cover and retries.
-    let d = dir();
-    let lock = CoverLock::acquire(d.path());
-    let transient = lock.stamp_install(CoverKind::Transient);
-    let lockdown = lock.stamp_install(CoverKind::Lockdown);
-    let result = sweep_with_witness(&lock, None, |_| {
+    let current = stamps_after_a_failed_sweep(|| {
         SweepOutcome::failed(
             Clearance::proven(),
             RoutingError::RouteSetup("the engine did not open".into()),
         )
     });
-    assert!(result.is_err());
-    assert!(transient.is_current());
-    assert!(lockdown.is_current());
+    assert_eq!(current, (true, true));
 }
 
 #[skuld::test]

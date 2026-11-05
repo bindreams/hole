@@ -625,8 +625,8 @@ impl MockCover {
         if lockdown {
             state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
             state.teardown_order.lock().unwrap().push("lockdown");
-            // Mirrors the real OS: an actual disengage (not `disarm`, which
-            // `mem::forget`s this guard and never runs `Drop`) is what a
+            // Mirrors the real OS: an actual disengage (not `disarm`, after which
+            // the real guard's `Drop` disengages nothing) is what a
             // subsequent `lockdown_cover_presence` probe would no longer find
             // — UNLESS this Drop's own disengage attempt is simulated as
             // failing to confirm too (`fail_lockdown_disengage_on_drop`).
@@ -647,9 +647,10 @@ impl Drop for MockCover {
 }
 
 impl tun_engine::routing::CoverGuard for MockCover {
-    /// Mirror `failclosed::Cover::disarm`: consume the guard without running
-    /// `Drop`, so the disengage counter does NOT move — the cutover persists the
-    /// cover instead of disengaging it.
+    /// Mirror `failclosed::Cover::disarm`: consume the guard so it disengages
+    /// nothing and the disengage counter does NOT move — the cutover persists the
+    /// cover instead of disengaging it. The mock holds nothing to empty, so it
+    /// skips its `Drop` outright.
     fn disarm(self) {
         std::mem::forget(self);
     }
