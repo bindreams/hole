@@ -3209,8 +3209,9 @@ of flashing Disconnected while it is set, the bridge shutdown disarms the cover
 while it is set, and it is the PR3 banner source. It is cleared unconditionally
 (remove-by-name, never parse-then-clear) on the next bridge's post-bind sweep.
 Every write, the clear and the read go through the log directory's no-follow `Dir`
-handle (a temp file staged and sealed through its own handle, then renamed or, for
-the single-occupancy claim, hard-linked). The read is the same for the GUI as the
+handle (a temp file staged and sealed through its own handle, then renamed; the
+single-occupancy claim renames without replacing, and hard-links only where the
+filesystem has no such rename). The read is the same for the GUI as the
 user and for the bridge as root: the bridge reads it in a log directory a user may
 own, where a FIFO planted at the name must not be waited for. A link or a FIFO at
 the name reads as `Marker::Indeterminate`, a claim of no cutover.

@@ -44,7 +44,7 @@ fn nobody() -> (u32, u32) {
 }
 
 /// The cutover-marker `owner` must land on the PUBLISHED inode: `claim` stages a
-/// temp file and publishes it by hard link. Drives the real
+/// temp file and publishes it by a no-replace rename. Drives the real
 /// `hole_common::update_marker` path to a FIXED foreign uid (`nobody`), so the
 /// assertion fails if the chown is dropped or moved off the published inode.
 /// Under root the chown succeeds and the marker is `nobody`-owned; unprivileged,
