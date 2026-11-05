@@ -641,9 +641,13 @@ fields"): the version is the only compatibility signal. For the lockdown intent,
 
 `Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
 lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
-the path, and logging the error with `%e` or `?e` cannot put a username in
-`bridge.log` (which the support bundle collects). `Refused::path()` is the one way
-out; a caller that wants it chooses a sink that may hold a path (`gui.log`), never
+the path. `Refused` has no `source()`, and the `InvalidData` `io::Error` that holds it
+delegates to it, so logging that error as `error = &e as &dyn std::error::Error`
+([Logging an error](#logging-an-error)) renders one link, `refusing to lock: <reason>`.
+The reason is a fixed sentence or a uid, never a name or a path: the directory's
+refusal is folded into that `Display`, not a link of its own. That cannot put a username in
+`bridge.log` (which the support bundle collects), also when a caller's error holds it as
+a `#[source]`. `Refused::path()` is the one way out; a caller that wants it chooses a sink that may hold a path (`gui.log`), never
 the bridge log or the bundle.
 
 ### Privileged code in folders a user may own
