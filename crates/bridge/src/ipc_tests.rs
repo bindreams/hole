@@ -345,9 +345,11 @@ impl Routing for MockRouting {
         if tun_engine::routing::failclosed::watch_releases(&self.state_dir).is_err() {
             self.saw_release_in_flight.store(true, Ordering::SeqCst);
         }
+        // As `failclosed::release_all`: a sweep that fails before the firewall supersedes nothing.
         if self.fail_release.load(Ordering::SeqCst) {
             return Err(crate::test_support::mock_gateway_failure());
         }
+        tun_engine::routing::failclosed::begin_release(&self.state_dir).about_to_delete();
         Ok(())
     }
 
@@ -1158,6 +1160,7 @@ async fn an_unblock_whose_release_fails_still_ends_its_release() {
     let routing = MockRouting::new(dir.clone());
     routing.fail_release.store(true, Ordering::SeqCst);
     let state = ipc_state_over(routing, dir.clone());
+    let watch = tun_engine::routing::failclosed::watch_releases(&dir).unwrap();
 
     let result = super::handle_unblock(axum::extract::State(state)).await;
 
@@ -1165,6 +1168,10 @@ async fn an_unblock_whose_release_fails_still_ends_its_release() {
     assert!(
         tun_engine::routing::failclosed::watch_releases(&dir).is_ok(),
         "a failed Unblock must not leave every later start refused"
+    );
+    assert!(
+        watch.check().is_ok(),
+        "and one that never reached the firewall supersedes no start"
     );
 }
 

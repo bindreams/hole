@@ -12,6 +12,13 @@ fn is_superseded<T>(r: &Result<T, RoutingError>) -> bool {
     matches!(r, Err(RoutingError::SupersededByRelease))
 }
 
+/// A release that has reached the firewall: begun, then marked just before its first delete.
+fn deleting(d: &Path) -> ReleaseInFlight {
+    let release = begin_release(d);
+    release.about_to_delete();
+    release
+}
+
 #[skuld::test]
 fn a_watch_with_no_release_since_checks_ok() {
     let d = dir();
@@ -20,22 +27,35 @@ fn a_watch_with_no_release_since_checks_ok() {
 }
 
 #[skuld::test]
-fn a_release_that_began_and_ended_after_the_watch_fails_its_check() {
+fn a_release_that_deleted_and_ended_after_the_watch_fails_its_check() {
     let d = dir();
     let watch = watch_releases(d.path()).unwrap();
-    drop(begin_release(d.path()));
+    drop(deleting(d.path()));
     assert!(
         is_superseded(&watch.check()),
-        "the release is over, but it ran inside the window"
+        "the release is over, but it deleted inside the window"
     );
 }
 
 #[skuld::test]
-fn a_release_still_in_flight_fails_the_check() {
+fn a_release_that_ended_before_touching_the_firewall_does_not_fail_the_check() {
     let d = dir();
     let watch = watch_releases(d.path()).unwrap();
-    let _release = begin_release(d.path());
-    assert!(is_superseded(&watch.check()));
+    drop(begin_release(d.path()));
+    assert!(
+        watch.check().is_ok(),
+        "a release that failed before its first delete changed nothing the install could have raced"
+    );
+}
+
+#[skuld::test]
+fn a_release_still_in_flight_fails_the_check_marked_or_not() {
+    let d = dir();
+    let watch = watch_releases(d.path()).unwrap();
+    let release = begin_release(d.path());
+    assert!(is_superseded(&watch.check()), "begun, not yet marked");
+    release.about_to_delete();
+    assert!(is_superseded(&watch.check()), "marked");
 }
 
 #[skuld::test]
@@ -50,7 +70,7 @@ fn a_watch_cannot_open_while_a_release_is_in_flight() {
 #[skuld::test]
 fn a_watch_opened_after_a_release_ended_is_not_failed_by_it() {
     let d = dir();
-    drop(begin_release(d.path()));
+    drop(deleting(d.path()));
     let watch = watch_releases(d.path()).unwrap();
     assert!(watch.check().is_ok());
 }
@@ -87,7 +107,7 @@ fn a_release_is_in_flight_until_its_guard_drops_even_on_an_unwind() {
 fn the_epoch_is_per_state_dir() {
     let (a, b) = (dir(), dir());
     let watch_a = watch_releases(a.path()).unwrap();
-    let _release_b = begin_release(b.path());
+    let _release_b = deleting(b.path());
     assert!(watch_a.check().is_ok(), "a release in B does not touch a watch on A");
     assert!(watch_releases(a.path()).is_ok());
     assert!(is_superseded(&watch_releases(b.path())));
@@ -119,8 +139,9 @@ fn every_sweep_runs_as_a_release_in_flight() {
     let d = dir();
     let watch = watch_releases(d.path()).unwrap();
     let mut announced = false;
-    let _clearance = sweep_with_witness(d.path(), None, |_| {
+    let _clearance = sweep_with_witness(d.path(), None, |_, release| {
         announced = is_superseded(&watch_releases(d.path()));
+        release.about_to_delete();
         SweepOutcome::completed(Clearance::proven())
     })
     .unwrap();
@@ -130,9 +151,23 @@ fn every_sweep_runs_as_a_release_in_flight() {
 }
 
 #[skuld::test]
+fn a_sweep_that_failed_before_the_firewall_supersedes_nothing() {
+    let d = dir();
+    let watch = watch_releases(d.path()).unwrap();
+    let result = sweep_with_witness(d.path(), None, |_, _| {
+        SweepOutcome::failed(
+            Clearance::proven(),
+            RoutingError::RouteSetup("the engine would not open".into()),
+        )
+    });
+    assert!(result.is_err());
+    assert!(watch.check().is_ok());
+}
+
+#[skuld::test]
 fn a_failing_sweep_ends_its_release_too() {
     let d = dir();
-    let result = sweep_with_witness(d.path(), None, |_| {
+    let result = sweep_with_witness(d.path(), None, |_, _| {
         SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("the sweep failed".into()))
     });
     assert!(result.is_err());

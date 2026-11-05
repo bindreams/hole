@@ -818,8 +818,10 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     // behind with the intent `Off`. Takes no lock a start holds. The persist's
     // closure owns the guard: hyper drops this future when the client goes
     // away, and the persist runs on regardless.
-    // The Unblock moves two counters: the release epoch here, at its start, and
-    // `unblock_generation` at the `Off` commit below.
+    // The Unblock moves two counters: the release epoch, when the sweep inside
+    // `release_all_covers` marks its own guard just before its first delete (an Unblock
+    // that fails before the firewall supersedes no start), and `unblock_generation` at
+    // the `Off` commit below.
     let release = tun_engine::routing::failclosed::begin_release(&state.state_dir);
 
     // Invalidate any transient cover guard a concurrent, lock-holding

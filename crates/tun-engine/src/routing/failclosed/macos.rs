@@ -68,6 +68,7 @@ use util::versioned_file::{StoreError, UpdateOutcome};
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
+use super::release_epoch::ReleaseInFlight;
 use super::Clearance;
 use super::StateFile;
 use super::SweepOutcome;
@@ -1040,7 +1041,15 @@ pub fn engage_lockdown(
 /// survive a reboot at all — so every macOS cover key is
 /// [`super::KeyLifetime::Persistent`] and a disengage has nothing to leave
 /// unproven.
-pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> SweepOutcome {
+///
+/// `release` is the sweep's own in-flight release, marked by the first `pfctl` that changes the ruleset.
+pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness, release: &ReleaseInFlight) -> SweepOutcome {
+    disengage_lockdown_marking(state_dir, Some(release))
+}
+
+/// [`disengage_lockdown`] for a caller that is not a release the epoch orders (the `Drop` wrapper): `None` marks
+/// nothing.
+fn disengage_lockdown_marking(state_dir: &Path, release: Option<&ReleaseInFlight>) -> SweepOutcome {
     // `Clearance::proven` on both arms: this platform has no boot-time key
     // class, so a macOS disengage carries nothing for the record to learn
     // from whether it succeeded or failed. The failing arm's clearance is
@@ -1053,7 +1062,7 @@ pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> S
     // `Unusable` to `None` here would hide the salvaged `pf_token` that
     // [`disengage_lockdown_with`] hands `pfctl -X`.
     let (presence, file) = lockdown_presence_and_state(state_dir);
-    match disengage_lockdown_with(presence, file, &mut RealPfOps { state_dir }) {
+    match disengage_lockdown_with(presence, file, &mut RealPfOps { state_dir, release }) {
         Ok(()) => SweepOutcome::completed(Clearance::proven()),
         Err(e) => SweepOutcome::failed(Clearance::proven(), e),
     }
@@ -1169,10 +1178,7 @@ fn lockdown_presence_and_state(
 /// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
 /// no caller to surface an error to.
 fn lockdown_disengage(state_dir: &Path) {
-    // `Unset`: this platform arms no boot-time key
-    // ([`STANDING_COVER_ARMS_BOOT_TIME`]), so there is never a record to
-    // consult and the argument is inert.
-    match disengage_lockdown(state_dir, super::ArmingWitness::Unset).into_result() {
+    match disengage_lockdown_marking(state_dir, None).into_result() {
         // Always `Clearance::proven` on macOS, and `Drop` has no reader for
         // it either way.
         Ok(_clearance_is_unconditional_here) => {}
@@ -1419,6 +1425,16 @@ pub(crate) fn release_all_with(
 /// converting a non-success exit status into `Err`.
 struct RealPfOps<'a> {
     state_dir: &'a Path,
+    /// Marked before each `pfctl` that changes the ruleset or the enable refcount.
+    release: Option<&'a ReleaseInFlight>,
+}
+
+impl RealPfOps<'_> {
+    fn about_to_delete(&self) {
+        if let Some(release) = self.release {
+            release.about_to_delete();
+        }
+    }
 }
 
 /// Production [`EngageOps`]: the same mapping for the engage layer, one
@@ -1528,6 +1544,7 @@ fn pfctl_status(out: Result<std::process::Output, RoutingError>, what: &str) -> 
 
 impl PfOps for RealPfOps<'_> {
     fn reload_default(&mut self) -> Result<(), RoutingError> {
+        self.about_to_delete();
         pfctl_status(
             pfctl(&["-f", PFCONF], None, BestEffortPhase::RecoverCover),
             "pf default-ruleset reload",
@@ -1535,6 +1552,7 @@ impl PfOps for RealPfOps<'_> {
     }
 
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
+        self.about_to_delete();
         pfctl_status(
             pfctl(&["-f", "-"], Some(text.as_bytes()), BestEffortPhase::RecoverCover),
             "pf ruleset load",
@@ -1542,6 +1560,7 @@ impl PfOps for RealPfOps<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.about_to_delete();
         pfctl_status(pfctl(&["-X", token], None, BestEffortPhase::RecoverCover), "pfctl -X")
     }
 
@@ -1577,13 +1596,14 @@ fn cleared(what: &str, result: Result<UpdateOutcome, StoreError>) -> Result<(), 
 /// release can leave unproven. macOS's own "`Ok` over a still-blocked host" residual is a
 /// different one (an entirely absent state file, clause 1) and is not what
 /// this type tracks.
-pub fn release_all(state_dir: &Path, _witness: super::ArmingWitness) -> SweepOutcome {
+pub fn release_all(state_dir: &Path, _witness: super::ArmingWitness, release: &ReleaseInFlight) -> SweepOutcome {
     let transient = state::load_presence(state_dir);
     let standing = lockdown_state::load_presence(state_dir);
     // Both arms `Clearance::proven`, for the reason `disengage_lockdown`
     // gives: no boot-time key class here, so nothing a failure could have
     // observed and withheld.
-    match release_all_with(transient, standing, &mut RealPfOps { state_dir }) {
+    let release = Some(release);
+    match release_all_with(transient, standing, &mut RealPfOps { state_dir, release }) {
         Ok(()) => SweepOutcome::completed(Clearance::proven()),
         Err(e) => SweepOutcome::failed(Clearance::proven(), e),
     }

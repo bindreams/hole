@@ -329,6 +329,7 @@ impl MockRoutingState {
             skip,
             Box::new(move || {
                 let release = tun_engine::routing::failclosed::begin_release(&dir);
+                release.about_to_delete();
                 if in_flight {
                     state.releases_in_flight.lock().unwrap().push(release);
                 }
@@ -3887,7 +3888,7 @@ mod self_test {
     fn an_unblock_that_ended_before_the_start_began_does_not_cancel_it() {
         rt().block_on(async {
             let (mut pm, cfg, st, dir) = covered_gate_setup(false);
-            drop(tun_engine::routing::failclosed::begin_release(dir.path()));
+            tun_engine::routing::failclosed::begin_release(dir.path()).about_to_delete();
 
             let err = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
