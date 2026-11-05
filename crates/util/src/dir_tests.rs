@@ -1022,6 +1022,52 @@ fn a_claim_never_gives_the_file_a_second_name() {
     assert_eq!(seen, Some(vec![name("marker")]));
 }
 
+/// The link path is reached only on a filesystem with no no-replace rename, which no test box has, so these call it
+/// directly (after the handle is closed, as `claim_with` does).
+#[skuld::test]
+fn a_claim_by_link_leaves_the_file_under_the_final_name_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let mut staged = dir.stage(&name("marker"), b"first", None, |_| Ok(())).unwrap();
+    drop(staged.temp.take());
+
+    staged.claim_by_link(Dir::unlink).unwrap();
+
+    assert_eq!(names(tmp.path()), vec![name("marker")]);
+    assert_eq!(std::fs::read(tmp.path().join("marker")).unwrap(), b"first");
+}
+
+/// A marker that keeps two names is read as a planted link, so a claim that cannot drop the temp name is not made.
+#[skuld::test]
+fn a_claim_by_link_whose_temp_name_cannot_be_removed_is_not_made() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let mut staged = dir.stage(&name("marker"), b"first", None, |_| Ok(())).unwrap();
+    drop(staged.temp.take());
+    let temp_name = staged.temp_name.clone();
+    let asked = std::cell::RefCell::new(Vec::new());
+
+    let err = staged
+        .claim_by_link(|dir, victim| {
+            asked.borrow_mut().push(victim.to_owned());
+            if victim == temp_name {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            dir.unlink(victim)
+        })
+        .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(*asked.borrow(), vec![temp_name.clone(), name("marker")]);
+    assert_eq!(names(tmp.path()), vec![temp_name], "the file has one name, not two");
+    drop(staged);
+    assert_eq!(
+        names(tmp.path()),
+        Vec::<OsString>::new(),
+        "the staged drop still removes the temp name"
+    );
+}
+
 #[skuld::test]
 fn a_failed_protect_leaves_no_staged_file() {
     let tmp = tempfile::tempdir().unwrap();

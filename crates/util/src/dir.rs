@@ -447,8 +447,9 @@ impl Staged<'_> {
     /// replace: two claims of one name cannot both win, a reader never sees a partial file, and the file never has
     /// a second name.
     ///
-    /// Where the platform or filesystem has no such rename (`Unsupported`) the claim is a hard link and the temp name
-    /// is removed when `self` is dropped, so the file has two names until then, and for good if that removal fails.
+    /// Where the platform or filesystem has no such rename (`Unsupported`) the claim is a hard link and then an
+    /// unlink of the temp name: the file has two names between the two calls, and if the unlink fails the claim is
+    /// undone and the error returned.
     pub fn claim(self) -> io::Result<()> {
         self.claim_with(|| {})
     }
@@ -459,10 +460,30 @@ impl Staged<'_> {
         drop(self.temp.take());
         match self.dir.rename_noreplace(&self.temp_name, &self.name) {
             Ok(()) => self.pending = false,
-            Err(err) if err.kind() == io::ErrorKind::Unsupported => self.dir.link(&self.temp_name, &self.name)?,
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => self.claim_by_link(Dir::unlink)?,
             Err(err) => return Err(err),
         }
         after_claim();
+        Ok(())
+    }
+
+    /// The claim where there is no no-replace rename: a hard link, then the temp name is unlinked at once. If that
+    /// cannot be done the final name is unlinked too and the error returned, since a file with two names reads as a
+    /// planted link to a vouched read; the temp name stays `pending` for `Drop` to retry.
+    fn claim_by_link(&mut self, unlink: impl Fn(&Dir, &OsStr) -> io::Result<()>) -> io::Result<()> {
+        self.dir.link(&self.temp_name, &self.name)?;
+        match unlink(self.dir, &self.temp_name) {
+            Ok(()) => {}
+            // Gone already: the file has the one name.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                if let Err(undo) = unlink(self.dir, &self.name) {
+                    tracing::warn!(error = %undo, "a claim that could not be completed could not be undone");
+                }
+                return Err(err);
+            }
+        }
+        self.pending = false;
         Ok(())
     }
 }
@@ -473,7 +494,7 @@ impl Drop for Staged<'_> {
         drop(self.temp.take());
         if self.pending {
             // The caller already has its answer, so a failure is logged, not returned: the name stays in a folder
-            // a user may own, and after a `claim` it is a second link to the published file. Gone already is fine.
+            // a user may own. Gone already is fine.
             match platform::unlink(&self.dir.file, &self.temp_name) {
                 Err(err) if err.kind() != io::ErrorKind::NotFound => {
                     tracing::warn!(error = %err, temp = %self.temp_name.to_string_lossy(), "a temporary file was left behind");
