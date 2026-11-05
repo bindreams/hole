@@ -4,7 +4,7 @@
 //! a plugin chain starts and reads it back on startup to reap processes leaked
 //! by a previous crashed run. Mirrors the `routing::state` crash-recovery
 //! pattern. `plugin_recovery` owns the reap and is the only component allowed
-//! to delete the file.
+//! to remove records from the file.
 //!
 //! A record pairs the pid with the kernel's own start token, so a recycled pid
 //! never restores to the recorded process — see `cosca::identity`.
@@ -12,7 +12,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use util::versioned_file::{
-    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
+    Change, DefaultPlacement, KeepOwner, Loaded, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile,
+    VersionedState,
 };
 
 // Types ===============================================================================================================
@@ -87,10 +88,59 @@ pub fn load(state_dir: &Path) -> Loaded<PluginState> {
     file(state_dir).observe().loaded
 }
 
-/// Deletes the record. One this release cannot read is kept ([`UpdateOutcome::Kept`]).
-pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
+/// Removes exactly the `accounted` records, and the file when none remain.
+///
+/// The caller loaded the file earlier and settled those records (killed, gone, or unrestorable here); the file may
+/// have grown since, and what grew is not the caller's to touch. The rewrite keeps the file's owner and never
+/// chowns the directory. A record this release cannot read is kept ([`UpdateOutcome::Kept`]) and a missing one has
+/// nothing to remove ([`UpdateOutcome::Absent`]).
+pub(crate) fn remove_accounted(
+    state_dir: &Path,
+    accounted: &[cosca::identity::ProcessIdRecord],
+) -> Result<UpdateOutcome, StoreError> {
+    let outcome = file(state_dir)
+        .update(&KeepOwner, |observed| match &observed.loaded {
+            Loaded::Current { value, .. } => {
+                let mut state = value.clone();
+                state.plugins.retain(|r| !accounted.contains(r));
+                if state.plugins.is_empty() {
+                    (Change::Remove, ())
+                } else if state.plugins.len() == value.plugins.len() {
+                    (Change::Keep, ())
+                } else {
+                    (Change::Store(state), ())
+                }
+            }
+            // Nothing of the caller's to edit: the role keeps what it cannot read, and a missing file is `Absent`.
+            Loaded::Absent | Loaded::Newer { .. } | Loaded::Corrupt { .. } | Loaded::Unreadable { .. } => {
+                (Change::Remove, ())
+            }
+            // Names no process at all, so no record of the caller's is in it.
+            Loaded::Obsolete { .. } => (Change::Keep, ()),
+        })
+        .map(|((), outcome)| outcome)?;
+    match outcome {
+        UpdateOutcome::Absent => tracing::debug!("no plugin state file: nothing to remove"),
+        UpdateOutcome::Kept => tracing::debug!("the plugin state file is unusable: nothing to remove"),
+        _ => {}
+    }
+    Ok(outcome)
+}
+
+/// Deletes the record iff it is still obsolete. The caller classified it earlier; an append may have rewritten it
+/// with live records since, and one this release cannot read is left alone.
+pub(crate) fn clear_obsolete(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
     file(state_dir)
-        .update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
+        .update(&DefaultPlacement::default(), |observed| match &observed.loaded {
+            Loaded::Obsolete { .. } => (Change::Remove, ()),
+            Loaded::Unreadable { .. } => {
+                tracing::warn!("the plugin state file could not be read, so it is kept rather than discarded");
+                (Change::Keep, ())
+            }
+            Loaded::Absent | Loaded::Current { .. } | Loaded::Newer { .. } | Loaded::Corrupt { .. } => {
+                (Change::Keep, ())
+            }
+        })
         .map(|((), outcome)| outcome)
 }
 
