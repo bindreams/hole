@@ -32,13 +32,21 @@
 //! - created within `[t0, t1]`: the order is unknowable, so it is no
 //!   measurement either: rerun.
 //!
-//! The OS's creation stamp may lag the true time (tick clock against the
-//! precise one) but is never ahead of it, and `t1` is never behind it, so an
-//! error moves a restart into the window or before `t0`, toward a rerun, and
-//! never toward a verdict. The restarted instance is alive when it is read (the
-//! helper exits only when killed, and only teardown kills it), so no creation
-//! time recorded by the helper is needed; an instance the list does not have
-//! fails the probe.
+//! Two residuals can turn a lost race into a FALSIFIED, never into a silent
+//! pass. The creation time is when the process was created, not when the SCM
+//! decided to restart: a restart decided just before `t0` can be created after
+//! `t1`. And `t0`, `t1` and the creation stamp are wall-clock readings, so a
+//! clock step between them reorders them. Nothing the SCM's API exposes places
+//! its decision, so no design of this probe removes the first; the window is
+//! one `ChangeServiceConfigW` call against a restart delay of 30 s. A FALSIFIED
+//! is therefore read against the `t0`, `t1` and creation time the probe prints.
+//!
+//! The restarted instance is alive when it is read (the helper exits only when
+//! killed, and only teardown kills it), so no creation time recorded by the
+//! helper is needed; an instance the list does not have fails the probe. S's
+//! restarted instance signals S's own event like C's: a restart seen in S's
+//! state before the instance has logged its pid is awaited on that event, then
+//! placed.
 
 use std::ffi::OsString;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -110,13 +118,18 @@ impl DisableWindow {
         }
     }
 
-    /// `t0`, `t1` and `created` for a log line, with `created` in milliseconds
+    /// `t0` and `t1` for a log line.
+    fn describe_window(self) -> String {
+        format!("t0 {}, t1 {} (FILETIME, 100 ns)", self.before, self.after)
+    }
+
+    /// The window and `created` for a log line, with `created` in milliseconds
     /// from `t0`.
     fn describe(self, created: u64) -> String {
         let from_t0_ms = (i128::from(created) - i128::from(self.before)) / 10_000;
         format!(
-            "t0 {}, t1 {} (FILETIME, 100 ns), restarted instance created {created} ({from_t0_ms} ms from t0)",
-            self.before, self.after
+            "{}, restarted instance created {created} ({from_t0_ms} ms from t0)",
+            self.describe_window()
         )
     }
 }
@@ -395,11 +408,6 @@ mod system_log {
     }
 }
 
-/// How many times the helper logged a start: one line per process.
-fn starts_in(pid_log: &std::path::Path) -> usize {
-    left_behind::logged(pid_log).len()
-}
-
 /// SCM event 7031: the service ended unexpectedly and a corrective action is
 /// taken, which the SCM writes once it has queued the restart.
 const CORRECTIVE_ACTION_EVENT: u32 = 7031;
@@ -446,6 +454,9 @@ enum AttemptOutcome {
 /// each attempt is independent, and an environment that loses every one is
 /// bounded by the nextest terminate-after on these tests.
 fn run_probe(variant: Variant) {
+    // Once per test: a service left by an attempt's own failed teardown is not an
+    // earlier run's.
+    assert_no_leftover_probe_services();
     for attempt in 1u32.. {
         match restart_probe(variant, attempt) {
             AttemptOutcome::Measured => return,
@@ -475,7 +486,6 @@ fn scm_entries_dump(display_name: &str) -> String {
 /// the attempt, and each display name closes in `]`, so no name is a prefix of
 /// another.
 fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
-    assert_no_leftover_probe_services();
     let name = variant.name();
     let id = format!(
         "{name}-{:08x}-{attempt:08x}-{:016x}",
@@ -513,7 +523,8 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
     c.start();
     c_running.wait();
     let (s_pid, c_pid) = (s.process_id(), c.process_id());
-    // The next signal of C's event is its restarted instance's.
+    // The next signal of each event is its restarted instance's.
+    s_running.reset();
     c_running.reset();
 
     let log = system_log::Watch::open();
@@ -532,26 +543,28 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
     eprintln!("P1 {name}: S disabled; killed C (process {c_pid}); waiting for C's restarted instance");
     c_running.wait();
 
-    let (s_state, s_starts, c_starts) = (s.state(), starts_in(&s_log), starts_in(&c_log));
+    // The state is read before the log, so a restart the state shows is never
+    // missing from the log for longer than its helper's start: the helper logs
+    // its pid before it signals the event.
+    let s_state = s.state();
+    let mut s_pids = left_behind::logged(&s_log);
+    if s_state != ServiceState::Stopped && s_pids.len() <= 1 {
+        s_running.wait();
+        s_pids = left_behind::logged(&s_log);
+    }
+    let (s_starts, c_starts) = (s_pids.len(), left_behind::logged(&c_log).len());
     let restarted = s_starts > 1 || s_state != ServiceState::Stopped;
     let timing_line = match (disable_window, restarted) {
         (None, _) => String::from("S disabled before the crash, no timing read"),
         (Some(window), false) => format!(
-            "no restarted instance of S, disable written between t0 {} and t1 {}",
-            window.before, window.after
+            "no restarted instance of S, disable written at {}",
+            window.describe_window()
         ),
         (Some(window), true) => {
-            // S has a restarted instance in the log only if it logged one: a
-            // restart caught before its helper logged cannot be placed.
-            let restarted_pid = left_behind::logged(&s_log)
+            let restarted_pid = *s_pids
                 .last()
-                .copied()
                 .filter(|_| s_starts > 1)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "S is {s_state:?} but its pid log names one process: its restarted instance cannot be placed"
-                    )
-                });
+                .unwrap_or_else(|| panic!("S's restarted instance signalled its event but logged no pid: {s_pids:?}"));
             let created = creation_time_of(restarted_pid);
             let timing_line = window.describe(created);
             let loss = match window.timing_of(created) {
