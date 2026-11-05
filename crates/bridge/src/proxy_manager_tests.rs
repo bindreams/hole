@@ -3977,6 +3977,7 @@ mod self_test {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             let routing = pm.routing_handle();
             routing.release_all_covers(&routing.lock_covers()).unwrap();
+            pm.unblock_generation_handle().fetch_add(1, Ordering::SeqCst);
 
             let err = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
@@ -3985,10 +3986,82 @@ mod self_test {
 
             assert!(
                 !matches!(err, ProxyError::Cancelled),
-                "a release that finished before this start began has nothing to do with it: {err:?}"
+                "an Unblock that finished before this start began is not an input: the start is a fresh decision: {err:?}"
             );
             assert!(pm.blocked_until_connected(), "the covered start holds its cover");
             assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// A querier that runs a hook once, at its first query, then answers as `inner` does: lets a test land an
+    /// Unblock in the window between a start's entry and its cover section (the resolve is the one `.await`).
+    struct HookQuerier {
+        inner: CountingQuerier,
+        hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DohQuerier for HookQuerier {
+        async fn query(&self, server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            if let Some(hook) = self.hook.lock().unwrap().take() {
+                hook();
+            }
+            self.inner.query(server, wire).await
+        }
+    }
+
+    /// An Unblock that begins after the start took its snapshot and ends before the start reaches its cover
+    /// section is not an input the section can ignore: intent `Off` reads the same before and after it, so the
+    /// section would engage a block-until-connected cover the user had just released. The start installs no
+    /// transient cover and proceeds uncovered, as an uncovered start does.
+    #[skuld::test]
+    fn a_covered_start_with_an_unblock_between_its_entry_and_the_lock_installs_nothing() {
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let generation = pm.unblock_generation_handle();
+            let routing = pm.routing_handle();
+            pm.set_bootstrap_querier_for_test(Arc::new(HookQuerier {
+                inner: CountingQuerier {
+                    host: "proxy.example".into(),
+                    ip: closed.ip(),
+                    queries: AtomicU32::new(0),
+                },
+                hook: std::sync::Mutex::new(Some(Box::new(move || {
+                    // The Unblock, as `handle_unblock` runs it: release under the lock, then announce.
+                    routing.release_all_covers(&routing.lock_covers()).unwrap();
+                    generation.fetch_add(1, Ordering::SeqCst);
+                }))),
+            }));
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = None;
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
+
+            let result = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+
+            assert_eq!(
+                st.release_all_calls.load(Ordering::SeqCst),
+                1,
+                "guard: the Unblock ran during the resolve"
+            );
+            assert!(
+                !matches!(result, Err(ProxyError::Cancelled)),
+                "the start proceeds uncovered: {result:?}"
+            );
+            assert_eq!(
+                st.cover_engage_attempts.load(Ordering::SeqCst),
+                0,
+                "no transient cover is installed after an Unblock that ran since the start began"
+            );
+            assert!(!pm.blocked_until_connected());
         });
     }
 
