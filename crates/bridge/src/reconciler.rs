@@ -321,12 +321,24 @@ pub async fn reconcile_once<P, R, D>(
     cancel: &CancellationToken,
 ) where
     P: Proxy,
-    R: Routing,
+    R: Routing + 'static,
     D: Dns,
 {
-    let pref = target::load_startup_preference(state_dir);
+    // X first, then the cover lock (the order is `state.proxy` -> cover lock). The startup preference is read under
+    // the lock, in the same section that applies it: an Unblock that landed between a read and the apply would
+    // otherwise have its `Off` overwritten from the candidate it cleared, and the boot would reconnect to the
+    // server the user just escaped.
+    let mut pm = proxy.lock().await;
+    let routing = pm.routing_handle();
     let state_dir_owned = state_dir.to_path_buf();
     let target = match tokio::task::spawn_blocking(move || {
+        let lock = routing.lock_covers();
+        assert_eq!(
+            lock.state_dir(),
+            state_dir_owned,
+            "the startup target is resolved under the cover lock of its own state dir"
+        );
+        let pref = target::load_startup_preference(&state_dir_owned);
         target::apply(&state_dir_owned, owner, move |current| {
             target::resolve_startup_target(current, pref.on_startup, pref.candidate)
         })
@@ -350,7 +362,6 @@ pub async fn reconcile_once<P, R, D>(
         }
     };
 
-    let mut pm = proxy.lock().await;
     let intent = pm.effective_lockdown_intent();
     let presence = pm.cover_presence();
     let session_live = pm.state() == ProxyState::Running;
@@ -365,15 +376,25 @@ pub async fn reconcile_once<P, R, D>(
             // message and not the evidence (the sweep persists the boot-time
             // witness before returning).
             Phase::Cover(CoverStep::Release) => {
-                // A sync section: the cover lock is never held across an `.await`.
+                // A sync section: the cover lock is never held across an `.await`. The tunnel phase may have run
+                // since the decision above (`step_order` puts a release after it), and an Unblock may have landed,
+                // so the intent, presence and target are read again under the lock and the release happens only if
+                // it is still due.
                 let released = {
                     let routing = pm.routing_handle();
                     let lock = routing.lock_covers();
-                    routing.release_all_covers(&lock)
+                    let intent = pm.effective_lockdown_intent();
+                    let presence = routing.lockdown_cover_presence();
+                    let target = target::load(state_dir);
+                    match cover_step(intent, presence, &target) {
+                        CoverStep::Release => Some(routing.release_all_covers(&lock)),
+                        CoverStep::Hold | CoverStep::Engage => None,
+                    }
                 };
                 match released {
-                    Ok(()) => pm.set_standing_cover_adopted(false),
-                    Err(error) => {
+                    None => tracing::debug!("reconcile_once: the stray standing cover is no longer due for release"),
+                    Some(Ok(())) => pm.set_standing_cover_adopted(false),
+                    Some(Err(error)) => {
                         tracing::warn!(
                             error = &error as &dyn std::error::Error,
                             "reconcile_once: failed to release a stray standing cover"

@@ -100,30 +100,16 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// WITHOUT taking `proxy.lock()` — the escape must work even while a
     /// teardown wedges that lock.
     pub routing: Arc<R>,
-    /// Bumped by `handle_unblock` right after its `Off` save succeeds, under
-    /// [`Self::intent_persist`], so a failed save never announces an unblock.
-    /// `handle_start`/`handle_reload` snapshot it before touching the proxy;
-    /// `persist_after_start` re-reads it under `intent_persist` and declines the
-    /// start's records if it moved. Every read is a pre-persist snapshot or sits
-    /// under that mutex. A counter, not a flag a start consumes: `reload`'s hot-swap
-    /// path would never consume it, so one stale unblock would wedge every later
-    /// hot-swap write.
+    /// Bumped by `handle_unblock` right after its `Off` save succeeds, under the cover lock, so a failed save never
+    /// announces an unblock. `handle_start`/`handle_reload` snapshot it before touching the proxy;
+    /// `persist_after_start` re-reads it under the cover lock and declines the start's records if it moved. Every
+    /// read is a pre-persist snapshot or sits under that lock. A counter, not a flag a start consumes: `reload`'s
+    /// hot-swap path would never consume it, so one stale unblock would wedge every later hot-swap write.
     ///
-    /// The compare-and-set the proxy lock cannot give, because `handle_unblock`
-    /// deliberately takes no proxy lock.
-    ///
-    /// This is the persisted `Off` the start reads, not "a release ended": it decides whether a start or reload may
-    /// record `Connected` and its candidate, and only the tray's Unblock moves it. The release epoch, which every
-    /// guard that ends moves unless it changed nothing, cannot stand in for it: a sweep or `bridge unlock` moves
-    /// the epoch too, and a start must still record its target after one of those.
+    /// The compare-and-set the proxy lock cannot give, because `handle_unblock` deliberately takes no proxy lock.
+    /// It is the persisted `Off` the start reads: it decides whether a start or reload may record `Connected` and
+    /// its candidate, and only the tray's Unblock moves it.
     pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Orders `persist_after_start`'s target + candidate writes against
-    /// `handle_unblock`'s `Off` + `set_enabled` + candidate clear, each a
-    /// sequence of separate record-lock sections. Held only inside a
-    /// `spawn_blocking` closure, never across an `.await`, and always taken
-    /// before a record lock. Other candidate writers run under
-    /// `BridgeLiveness` and need no ordering against these two.
-    pub intent_persist: Arc<std::sync::Mutex<()>>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
     pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
     /// This bridge's build version, stamped on every response
@@ -197,7 +183,6 @@ impl IpcServer {
             proxy,
             routing,
             unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            intent_persist: Arc::new(std::sync::Mutex::new(())),
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
             log_dir,
@@ -556,7 +541,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // until `in_flight` clears below, after this persist has completed.
     // Snapshot BEFORE the proxy lock: any unblock from here on is concurrent
     // with this start and must win the target write. It reads the user's decision
-    // to be Off (`unblock_generation`), not the release epoch, which any sweep moves.
+    // to be Off (`unblock_generation`).
     let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let result = {
         let mut pm = state.proxy.lock().await;
@@ -611,10 +596,9 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 ///   precedes any config change).
 ///
 /// Invariant: a candidate never sits beside an `Off` target, because
-/// `AlwaysConnect` reconnects from it. The start's records are written under
-/// `intent_persist`, so one reading of `unblock_generation` decides both: if an
-/// unblock committed since the snapshot, neither the target nor the candidate is
-/// written. The `on_startup` push is a preference and stands either way.
+/// `AlwaysConnect` reconnects from it. The start's records are written under the cover lock, which the tray's
+/// Unblock holds through its release and its own records, so one reading of `unblock_generation` decides both: if
+/// an unblock committed since the snapshot, neither the target nor the candidate is written. The `on_startup` push is a preference and stands either way.
 ///
 /// Runs in `spawn_blocking`, since both `target::apply` and
 /// `apply_startup_preference` are sync (the record locks they take are leaf
@@ -622,7 +606,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 /// is logged, never surfaced as a start failure: the tunnel's own outcome is
 /// already decided by the time this runs, and a metadata-write hiccup must
 /// not retroactively turn an established connection into a reported failure.
-async fn persist_after_start<P: Proxy, R: Routing>(
+async fn persist_after_start<P: Proxy, R: Routing + 'static>(
     state: &IpcState<P, R>,
     config: &ProxyConfig,
     on_startup: Option<StartupBehavior>,
@@ -642,10 +626,16 @@ async fn persist_after_start<P: Proxy, R: Routing>(
     let owner = state.owner;
     let config = config.clone();
     let generation = Arc::clone(&state.unblock_generation);
-    let intent_persist = Arc::clone(&state.intent_persist);
+    let routing = Arc::clone(&state.routing);
     let outcome = tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
-        // The mutex guards no data, so a poisoned one carries no broken invariant.
-        let _ordered = intent_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The same lock the tray's Unblock holds through its release and its records: a start's target + candidate
+        // pair lands wholly before or wholly after them.
+        let lock = routing.lock_covers();
+        assert_eq!(
+            lock.state_dir(),
+            state_dir,
+            "the start's records are written under the cover lock of their own state dir"
+        );
         if succeeded {
             let declined = generation.load(std::sync::atomic::Ordering::SeqCst) != unblock_snapshot;
             write_start_records(&state_dir, owner, &config, on_startup, declined)
@@ -804,80 +794,57 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
 async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Announced before the first firewall call and held through the persist
-    // below. While it is in flight a start that commits to a cover (a covered
-    // start, or one with the standing cover expected) is cancelled; uncovered
-    // starts and reloads proceed, having nothing for the Unblock to undo. When
-    // the guard ends it supersedes every start whose watch opened earlier and
-    // every cover a start held, unless the Unblock changed nothing. Takes no
-    // lock a start holds. The persist's closure owns the guard: hyper drops this
-    // future when the client goes away, and the persist runs on regardless.
-    // The Unblock moves two counters: the release epoch (when a guard ends) and
-    // `unblock_generation` at the `Off` commit below.
-    let release = tun_engine::routing::failclosed::begin_release(&state.state_dir);
-
-    // Unconditional, with no presence probe in front of it.
-    // `release_all_covers` is documented idempotent, so a check here would be
-    // check-then-act on an operation that needs none — and at the escape
-    // hatch a stale `Absent` is the one wrong answer that matters. Sharing
-    // that rule with `turn_lockdown_off` is what removes the discrepancy the
-    // two bespoke `must_release` expressions used to carry.
-    let released = {
-        let lock = state.routing.lock_covers();
-        state.routing.release_all_covers(&lock)
-    };
-    if let Err(e) = released {
-        error!(error = &e as &dyn std::error::Error, "unblock: release failed");
-        // The sweep's own guard carries what it did to the firewall; this one has changed nothing else.
-        release.changed_nothing();
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                message: "the network could not be fully unblocked".into(),
-            }),
-        ));
-    }
-
-    // Only once the release above is confirmed (or confirmed unneeded) does
-    // the record move: recording target/intent off before a FAILED release
-    // would delete the user's only retry affordance — the tray still
-    // offering Unblock — while the host stays held closed.
+    // One section under the cover lock: the release and the records that say so, release first. A start that
+    // begins meanwhile waits for it and then decides from the persisted `Off`; an engage in flight finishes before
+    // the release deletes. A failed release returns before any record is written, and the lock is dropped with
+    // the closure. The closure owns the lock: hyper drops this future when the client goes away, and the section
+    // runs on regardless.
+    let routing = Arc::clone(&state.routing);
     let state_dir = state.state_dir.clone();
     let owner = state.owner;
     let generation = Arc::clone(&state.unblock_generation);
-    let intent_persist = Arc::clone(&state.intent_persist);
-    let routing = Arc::clone(&state.routing);
-    let persisted = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _release = release;
-        // Holds `intent_persist` across all three writes, so a start's target +
-        // candidate pair lands wholly before or wholly after this sequence:
-        // never between the `Off` and the candidate clear, where it would have
-        // its newer candidate erased. (A poisoned mutex guards no data.)
-        let _ordered = intent_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The bump follows the `?`, so a failed `Off` save never announces an
-        // unblock; the mutex keeps a start from reading the counter between the
-        // save and the bump.
-        target::apply(&state_dir, owner, |_current| Target::Off)?;
-        generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // The release above ran under its own lock section; the persist takes the lock again for the record write.
+    let outcome = tokio::task::spawn_blocking(move || -> Result<(), UnblockFailure> {
         let lock = routing.lock_covers();
         assert_eq!(
             lock.state_dir(),
             state_dir,
             "the unblock persists under the cover lock of its own state dir"
         );
-        lockdown_state::set_enabled(&lock, false, owner)?;
-        drop(lock);
-        // Clear the auto-connect candidate too: `resolve_startup_target` feeds
-        // it to `AlwaysConnect` over an `Off` target, so leaving it would let
-        // the next boot reconnect to the server the user just escaped from.
-        target::apply_startup_preference(&state_dir, owner, |pref| pref.candidate = None)?;
-        Ok(())
+        // Unconditional, with no presence probe in front of it. `release_all_covers` is documented idempotent,
+        // so a check here would be check-then-act on an operation that needs none — and at the escape hatch a
+        // stale `Absent` is the one wrong answer that matters. Sharing that rule with `turn_lockdown_off` is
+        // what removes the discrepancy the two bespoke `must_release` expressions used to carry.
+        routing.release_all_covers(&lock).map_err(UnblockFailure::Release)?;
+
+        // Only once the release above is confirmed (or confirmed unneeded) does the record move: recording
+        // target/intent off before a FAILED release would delete the user's only retry affordance — the tray
+        // still offering Unblock — while the host stays held closed.
+        let persist = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // The bump follows the `?`, so a failed `Off` save never announces an unblock.
+            target::apply(&state_dir, owner, |_current| Target::Off)?;
+            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            lockdown_state::set_enabled(&lock, false, owner)?;
+            // Clear the auto-connect candidate too: `resolve_startup_target` feeds it to `AlwaysConnect` over an
+            // `Off` target, so leaving it would let the next boot reconnect to the server the user just escaped
+            // from.
+            target::apply_startup_preference(&state_dir, owner, |pref| pref.candidate = None)?;
+            Ok(())
+        };
+        persist().map_err(UnblockFailure::Persist)
     })
     .await;
-    match persisted {
+    match outcome {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => {
+        Ok(Err(UnblockFailure::Release(e))) => {
+            error!(error = &e as &dyn std::error::Error, "unblock: release failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: "the network could not be fully unblocked".into(),
+                }),
+            ));
+        }
+        Ok(Err(UnblockFailure::Persist(e))) => {
             error!(error = &*e, "unblock: failed to persist target/intent off");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -899,6 +866,14 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
 
     info!("unblock: cover released if the presence called for it, target off, intent off");
     Ok(Json(EmptyResponse {}))
+}
+
+/// Why an Unblock did not complete, in the order its steps run.
+enum UnblockFailure {
+    /// The release failed: nothing was recorded.
+    Release(tun_engine::RoutingError),
+    /// The release was confirmed, but a record write failed.
+    Persist(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// PII-free 500 body for a failed `turn_lockdown_off`. Never formats the
@@ -1232,7 +1207,7 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     // would otherwise put the configured address in clear into both
     // `bridge.log` and this handler's error body.
     hole_common::logging::redact_arm::arm_server(&config.server);
-    // The user's decision to be Off (`unblock_generation`), as in `handle_start`; not the release epoch.
+    // The user's decision to be Off (`unblock_generation`), as in `handle_start`.
     let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let mut pm = state.proxy.lock().await;
     let result = pm.reload(&config).await;
