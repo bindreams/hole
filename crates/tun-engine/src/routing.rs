@@ -1490,15 +1490,16 @@ where
     let presence = lockdown_present();
     let decision = decide_cover_recovery(lockdown_intent, presence);
     // Repair BEFORE acting, so a crash in between leaves an intent that reads
-    // armed. Only an unset intent is repaired: an unreadable one already reads
-    // armed and may hold the user's `Off`. A failed write costs
+    // armed. Only an unset intent is repaired, decided over the CURRENT file inside
+    // the write (`promote_unrecorded`): the read above may be stale, and an
+    // unreadable intent already reads armed and may hold the user's `Off`. A failed write costs
     // the persisted preference, never the action or the escape: this run's
     // adopted-cover claim carries the escape, and the bridge retries the write
     // the moment it honours that claim with a real cover install (see
     // `promote_adopted_claim`). Re-deriving it on a LATER start is not a
     // fallback — once the cover is torn down the measurement reads `Absent`.
     if decision.record_intent_on {
-        if let Err(e) = failclosed::lockdown_state::set_enabled(state_dir, true, owner) {
+        if let Err(e) = failclosed::lockdown_state::promote_unrecorded(state_dir, owner) {
             warn!(
                 error = &e as &dyn std::error::Error,
                 "could not repair the lockdown intent over a measured live cover"

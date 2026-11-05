@@ -1814,6 +1814,31 @@ fn recover_records_the_intent_before_acting_on_it() {
     );
 }
 
+/// The intent read said `Unset`, but an `Off` landed before the repair wrote: the repair's own read-and-write is one
+/// update over the CURRENT intent, so the user's `Off` survives it.
+#[skuld::test]
+fn recover_does_not_overwrite_an_off_that_lands_between_its_read_and_its_write() {
+    let dir = tempfile::tempdir().unwrap();
+    failclosed::lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+    let decision = recover_routes_with(
+        dir.path(),
+        None,
+        Some("hole-tun"),
+        |_, _c, _p| Ok(()),
+        |_d, _a| {},
+        Intent::Unset,
+        || Live,
+        |_action, _tun_name| {},
+    );
+
+    assert!(decision.record_intent_on, "the stale read still asked for the repair");
+    assert_eq!(
+        failclosed::lockdown_state::load_intent(dir.path()),
+        Intent::Off,
+        "the user's Off is never turned into On"
+    );
+}
+
 /// An unreadable record may hold the user's `Off` (a newer or garbled schema): the cover is adopted and the
 /// record is left exactly as it is.
 #[skuld::test]
