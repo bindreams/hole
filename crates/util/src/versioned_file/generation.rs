@@ -14,8 +14,10 @@ use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 pub struct Generation(u64);
 
 impl Generation {
-    /// The generation right after one write of this process.
-    pub fn next(self) -> Generation {
+    /// The generation right after one write of this process: what the tests that count a write's bumps compare
+    /// against. Production code only compares generations for equality.
+    #[cfg(test)]
+    pub(super) fn next(self) -> Generation {
         Generation(self.0 + 1)
     }
 }
