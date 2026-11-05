@@ -244,8 +244,7 @@ impl<S: VersionedState> VersionedFile<S> {
         io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "the filesystem of {} has no no-replace rename, which {} needs",
-                self.dir.display(),
+                "the filesystem holding {} has no no-replace rename, which it needs",
                 S::FILE_NAME
             ),
         )

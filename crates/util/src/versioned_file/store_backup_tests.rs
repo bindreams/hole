@@ -104,10 +104,10 @@ fn move_aside_logs_the_backup_it_makes() {
     assert!(log.contains("decision.json.unreadable.bak"), "{log}");
 }
 
-/// A filesystem with no no-replace rename is an error that names the directory and says why; nothing is moved and no
+/// A filesystem with no no-replace rename is an error that names the file and says why; nothing is moved and no
 /// backup is made, since a link and a delete would race the writers the rename exists to exclude.
 #[skuld::test]
-fn without_a_no_clobber_rename_move_aside_fails_naming_the_directory_and_moves_nothing() {
+fn without_a_no_clobber_rename_move_aside_fails_naming_the_file_and_moves_nothing() {
     let dir = dir();
     let original = unreadable_bytes(CannotRead::Newer);
     put(&dir, "decision.json", original);
@@ -118,7 +118,8 @@ fn without_a_no_clobber_rename_move_aside_fails_naming_the_directory_and_moves_n
 
     assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     let text = err.to_string();
-    assert!(text.contains(&dir.path().display().to_string()), "{text}");
+    assert!(text.contains("decision.json"), "{text}");
+    assert!(!text.contains(&dir.path().display().to_string()), "{text}");
     assert!(text.contains("no-replace rename"), "{text}");
     assert_eq!(read(&dir, "decision.json"), original, "the original is still there");
     assert_eq!(names(&dir), ["decision.json"], "no backup");
@@ -127,14 +128,18 @@ fn without_a_no_clobber_rename_move_aside_fails_naming_the_directory_and_moves_n
 /// `create_new` has no `Fs` seam for its claim, so the error it returns where the claim's rename answers `Unsupported`
 /// is checked where it is made.
 #[skuld::test]
-fn the_error_for_a_filesystem_with_no_noreplace_rename_names_the_directory() {
+fn the_error_for_a_filesystem_with_no_noreplace_rename_names_the_file_not_the_directory() {
     let dir = dir();
 
     let err = VersionedFile::<DecisionFile>::new(dir.path()).no_noreplace_rename();
 
     assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     let text = err.to_string();
-    assert!(text.contains(&dir.path().display().to_string()), "{text}");
+    assert!(
+        text.contains(<DecisionFile as crate::versioned_file::VersionedState>::FILE_NAME),
+        "{text}"
+    );
+    assert!(!text.contains(&dir.path().display().to_string()), "{text}");
     assert!(text.contains("no-replace rename"), "{text}");
 }
 
