@@ -363,8 +363,8 @@ pub fn reclaim_stale_tun_permit(tun_name: &str) {
 /// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
 /// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
 pub fn disengage_lockdown(state_dir: &Path) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(state_dir, None, |witness| {
-        platform::disengage_lockdown(state_dir, witness)
+    sweep_with_witness(state_dir, None, |witness, release| {
+        platform::disengage_lockdown(state_dir, witness, release)
     })
 }
 
@@ -439,7 +439,9 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or
 /// version-skewed and nothing to erase — only GUID sweeps run there.
 pub fn release_all(state_dir: &Path) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(state_dir, None, |witness| platform::release_all(state_dir, witness))
+    sweep_with_witness(state_dir, None, |witness, release| {
+        platform::release_all(state_dir, witness, release)
+    })
 }
 
 // Release clearance ===================================================================================================
@@ -1004,13 +1006,15 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 fn sweep_with_witness(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
-    sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
+    sweep: impl FnOnce(ArmingWitness, &release_epoch::ReleaseInFlight) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
     // Announced before the sweep's first firewall call, held through the
-    // witness write: an engage that overlaps any of it backs out.
-    let _release = release_epoch::begin_release(state_dir);
+    // witness write: an engage that overlaps any of it backs out. The sweep
+    // marks it just before its first delete; one that fails earlier supersedes
+    // nothing.
+    let release = release_epoch::begin_release(state_dir);
     let snapshot = boottime_witness::snapshot(state_dir);
-    let SweepOutcome { clearance, failure } = sweep(snapshot.witness);
+    let SweepOutcome { clearance, failure } = sweep(snapshot.witness, &release);
     // The record is written from what the sweep OBSERVED, before its failure
     // reaches the caller. A failing sweep is not an unobservant one: this
     // codebase's own sweeps issue every delete before inspecting any code, so

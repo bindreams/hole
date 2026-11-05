@@ -3,13 +3,17 @@
 //!
 //! A release (the tray's Unblock, `bridge unlock`, a cover sweep) must never
 //! block on a start that is wedged, so it cannot take a lock the engage holds.
-//! It announces itself instead: [`begin_release`] bumps an epoch BEFORE the
-//! release touches the firewall. An install opens a [`ReleaseWatch`] before it
-//! installs and checks it after; a release that began in between moved the
-//! epoch, so the install backs out and the host stays as the release left it.
-//! A watch cannot open at all while a release is in flight. An install's record
-//! writes check the watch inside their critical section, so no write lands once a
-//! release has begun.
+//! It announces itself instead: [`begin_release`] counts it in flight BEFORE the
+//! release touches the firewall, and the release calls
+//! [`ReleaseInFlight::about_to_delete`] just before its first delete, which moves
+//! an epoch. A release that fails before then changed nothing and supersedes
+//! nothing; the type, not its callers, owns what "superseded" means.
+//!
+//! An install opens a [`ReleaseWatch`] before it installs and checks it after. A
+//! check fails while any release is in flight, marked or not, and after any
+//! release marked itself since the watch opened. A watch cannot open at all while
+//! a release is in flight. An install's record writes check the watch inside
+//! their critical section, so no write lands once a release has begun.
 //!
 //! The epoch orders an engage against ANY release: the tray's Unblock holds its guard through its persisted
 //! `Off`, a sweep through its witness write. It does not decide what a start records; that is the user's
@@ -29,7 +33,7 @@ use crate::error::RoutingError;
 /// a record lock is held without taking a second lock.
 #[derive(Debug, Default)]
 struct Slot {
-    /// Releases begun on this `state_dir` since the process started.
+    /// Releases that marked themselves since the process started.
     epoch: AtomicU64,
     /// Releases begun and not yet ended.
     in_flight: AtomicUsize,
@@ -52,16 +56,21 @@ pub struct ReleaseInFlight {
 
 /// Announce a release. Call it BEFORE the first firewall call, and hold the
 /// guard until everything the release must be ordered against is done (for the
-/// tray's Unblock: through the persisted `Off`).
-///
-/// In flight first, epoch second; [`watch_releases`] reads them the other way
-/// round. A watch that reads the epoch before this moves it is failed by its
-/// check; one that reads it after finds the release in flight.
+/// tray's Unblock: through the persisted `Off`). It supersedes an install only
+/// once [`ReleaseInFlight::about_to_delete`] is called.
 pub fn begin_release(state_dir: &Path) -> ReleaseInFlight {
     let slot = slot(state_dir);
     slot.in_flight.fetch_add(1, Ordering::SeqCst);
-    slot.epoch.fetch_add(1, Ordering::SeqCst);
     ReleaseInFlight { slot }
+}
+
+impl ReleaseInFlight {
+    /// Mark the release as touching the firewall. Call it just before the
+    /// first delete is attempted; a partial failure after it still counts. May
+    /// be called again, before each delete.
+    pub fn about_to_delete(&self) {
+        self.slot.epoch.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Drop for ReleaseInFlight {
@@ -90,11 +99,14 @@ pub fn watch_releases(state_dir: &Path) -> Result<ReleaseWatch, RoutingError> {
 }
 
 impl ReleaseWatch {
-    /// Fails if a release began since the watch opened, whether or not it has
-    /// ended: the install it guards may have raced it. Takes no lock, so a
-    /// record write can check it inside its own critical section.
+    /// Fails if a release is in flight, or marked itself since the watch opened:
+    /// the install it guards may have raced it. Takes no lock, so a record write
+    /// can check it inside its own critical section.
+    ///
+    /// The in-flight count is read before the epoch: a release that began, marked
+    /// and ended between the two reads is seen by the epoch.
     pub fn check(&self) -> Result<(), RoutingError> {
-        if self.slot.epoch.load(Ordering::SeqCst) != self.epoch {
+        if self.slot.in_flight.load(Ordering::SeqCst) > 0 || self.slot.epoch.load(Ordering::SeqCst) != self.epoch {
             return Err(RoutingError::SupersededByRelease);
         }
         Ok(())

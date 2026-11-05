@@ -56,7 +56,7 @@ fn twin_removed() -> KeyObservation {
 /// Run one sweep against `state_dir`'s record, exactly as `release_all` and
 /// `disengage_lockdown` do — consult, fold, write back.
 fn sweep(state_dir: &Path, observations: &[KeyObservation]) -> Clearance {
-    super::super::sweep_with_witness(state_dir, None, |witness| {
+    super::super::sweep_with_witness(state_dir, None, |witness, _| {
         SweepOutcome::completed(Clearance::from_observations(observations, witness))
     })
     .expect("the sweep body cannot fail")
@@ -66,7 +66,7 @@ fn sweep(state_dir: &Path, observations: &[KeyObservation]) -> Clearance {
 /// failing code among them — the shape both Windows sweeps have, where no
 /// code is inspected until all of them are in.
 fn failing_sweep(state_dir: &Path, observations: &[KeyObservation]) -> RoutingError {
-    super::super::sweep_with_witness(state_dir, None, |witness| {
+    super::super::sweep_with_witness(state_dir, None, |witness, _| {
         SweepOutcome::failed(
             Clearance::from_observations(observations, witness),
             RoutingError::RouteSetup("the firewall refused one of the deletes".into()),
@@ -395,7 +395,7 @@ fn an_engage_that_commits_during_a_disarming_sweep_stays_recorded() {
     let state = dir();
     super::record_armed(state.path(), None);
 
-    let c = super::super::sweep_with_witness(state.path(), None, |witness| {
+    let c = super::super::sweep_with_witness(state.path(), None, |witness, _| {
         super::record_armed(state.path(), None);
         SweepOutcome::completed(Clearance::from_observations(
             &[sibling(KeyOutcome::Removed), twin_removed()],
@@ -422,7 +422,7 @@ fn an_engage_in_another_state_dir_does_not_veto_a_sweeps_disarm() {
     let (a, b) = (dir(), dir());
     super::record_armed(a.path(), None);
 
-    let c = super::super::sweep_with_witness(a.path(), None, |witness| {
+    let c = super::super::sweep_with_witness(a.path(), None, |witness, _| {
         super::record_armed(b.path(), None);
         SweepOutcome::completed(Clearance::from_observations(
             &[sibling(KeyOutcome::Removed), twin_removed()],
@@ -455,7 +455,7 @@ fn a_disarm_dropped_for_a_concurrent_engage_is_made_by_the_next_sweep() {
     // clear: the next sweep snapshots the moved generation and disarms normally.
     let state = dir();
     super::record_armed(state.path(), None);
-    let _ = super::super::sweep_with_witness(state.path(), None, |witness| {
+    let _ = super::super::sweep_with_witness(state.path(), None, |witness, _| {
         super::record_armed(state.path(), None);
         SweepOutcome::completed(Clearance::from_observations(
             &[sibling(KeyOutcome::Removed), twin_removed()],
@@ -485,7 +485,7 @@ fn a_failing_sweep_with_a_concurrent_engage_stays_armed() {
     // witness update is generation-checked like any other.
     let state = dir();
     super::record_armed(state.path(), None);
-    super::super::sweep_with_witness(state.path(), None, |witness| {
+    super::super::sweep_with_witness(state.path(), None, |witness, _| {
         super::record_armed(state.path(), None);
         SweepOutcome::failed(
             Clearance::from_observations(&[sibling(KeyOutcome::Removed), twin_removed()], witness),
@@ -499,7 +499,7 @@ fn a_failing_sweep_with_a_concurrent_engage_stays_armed() {
 #[skuld::test]
 fn an_engage_during_an_arming_sweep_changes_nothing() {
     let state = dir();
-    let c = super::super::sweep_with_witness(state.path(), None, |witness| {
+    let c = super::super::sweep_with_witness(state.path(), None, |witness, _| {
         super::record_armed(state.path(), None);
         SweepOutcome::completed(Clearance::from_observations(
             &[sibling(KeyOutcome::Removed), twin_not_found()],
@@ -518,7 +518,7 @@ fn a_concurrent_sweeps_arm_also_drops_a_disarm_taken_from_an_older_snapshot() {
     let state = dir();
     std::fs::write(state.path().join(super::STATE_FILE_NAME), b"{ not json").expect("write");
 
-    let _clearance = super::super::sweep_with_witness(state.path(), None, |witness| {
+    let _clearance = super::super::sweep_with_witness(state.path(), None, |witness, _| {
         assert_eq!(witness, ArmingWitness::Unreadable, "guard: A read the corrupt record");
         let b = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_not_found()]);
         assert_eq!(b.leftover_keys(), [TWIN], "guard: B armed the record");
@@ -542,7 +542,7 @@ fn an_engage_whose_directory_open_fails_still_drops_the_disarm() {
     std::fs::create_dir(&state).expect("state dir");
     super::record_armed(&state, None);
 
-    let _clearance = super::super::sweep_with_witness(&state, None, |witness| {
+    let _clearance = super::super::sweep_with_witness(&state, None, |witness, _| {
         let aside = root.path().join("aside");
         std::fs::rename(&state, &aside).expect("move the state dir aside");
         let link = util::dir::testing::state_dir_linked_to_a_system_folder(root.path());
