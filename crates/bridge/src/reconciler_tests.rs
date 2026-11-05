@@ -957,6 +957,81 @@ fn cover_presence_is_never_compared_against_a_variant() {
     );
 }
 
+/// A held or just-installed cover meets the release verdict in one place: `BlockedStart::stands`. A start that
+/// matched on `Overtaken` at its own site (drop it on `Superseded`, keep it on `InDoubt`) re-derived that answer
+/// per site, and each site that forgot one variant was a finding: the post-install checks, the status read, the
+/// zombie check and the cancel exit each had their own copy. Constructing or forwarding a verdict is fine; deciding
+/// from one is forbidden outside the enum's own file and `stands`.
+#[skuld::test]
+fn a_covers_release_verdict_is_decided_in_one_method() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let definition = "crates/tun-engine/src/routing/failclosed/release_epoch.rs";
+    let decider = "crates/bridge/src/proxy_manager.rs";
+    let mut offenders: Vec<String> = Vec::new();
+
+    for entry in walkdir::WalkDir::new(workspace.join("crates")) {
+        let entry = entry.expect("failed to walk crates/");
+        let path = entry.path();
+        if !entry.file_type().is_file() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(&workspace)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with("_tests.rs") || rel == definition {
+            continue;
+        }
+        if path
+            .components()
+            .any(|c| c.as_os_str() == "test_support" || c.as_os_str() == "target")
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+        let sanctioned = if rel == decider {
+            method_lines(&text, "fn stands(")
+        } else {
+            0..0
+        };
+        for (idx, line) in code_lines(&text) {
+            if sanctioned.contains(&idx) {
+                continue;
+            }
+            if line.contains("Overtaken::") && line_decides(line) {
+                offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "the release verdict decided outside `BlockedStart::stands`:\n  {}\n\
+         Ask `stands()` (or `Posture::pending`/`reap_taken`, which ask it). A site that matches on \
+         `Overtaken` re-derives which verdict keeps a cover, and forgets one.",
+        offenders.join("\n  ")
+    );
+}
+
+/// The line indices of the item whose header contains `header`, from that line to the brace that closes it.
+fn method_lines(text: &str, header: &str) -> std::ops::Range<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.contains(header))
+        .unwrap_or_else(|| panic!("no `{header}` in the decider's source"));
+    let mut depth = 0i32;
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if depth == 0 && line.contains('}') {
+            return start..idx + 1;
+        }
+    }
+    panic!("`{header}` is never closed");
+}
+
 /// The guards are only worth having if they FAIL on the shapes that slipped
 /// past earlier versions. Asserted directly against the predicate rather than
 /// by mutating real sources, so a regression in `line_decides` cannot hide
