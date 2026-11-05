@@ -57,24 +57,6 @@ impl Fs for FailsPublish {
     }
 }
 
-/// A platform without a no-clobber rename, whose `remove_file` then fails.
-struct NoRenameAndNoDelete;
-
-impl Fs for NoRenameAndNoDelete {
-    fn rename_noreplace(
-        &self,
-        _dir: &crate::dir::Dir,
-        _from: &std::ffi::OsStr,
-        _to: &std::ffi::OsStr,
-    ) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-
-    fn remove_file(&self, _dir: &crate::dir::Dir, _name: &std::ffi::OsStr) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::PermissionDenied))
-    }
-}
-
 struct NoRename;
 
 impl Fs for NoRename {
@@ -122,42 +104,38 @@ fn move_aside_logs_the_backup_it_makes() {
     assert!(log.contains("decision.json.unreadable.bak"), "{log}");
 }
 
+/// A filesystem with no no-replace rename is an error that names the directory and says why; nothing is moved and no
+/// backup is made, since a link and a delete would race the writers the rename exists to exclude.
 #[skuld::test]
-fn without_a_no_clobber_rename_move_aside_links_then_removes() {
+fn without_a_no_clobber_rename_move_aside_fails_naming_the_directory_and_moves_nothing() {
     let dir = dir();
     let original = unreadable_bytes(CannotRead::Newer);
     put(&dir, "decision.json", original);
 
-    let moved = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(NoRename))
-        .move_aside()
-        .unwrap();
-
-    let backup = moved.expect("a file to move");
-    assert_eq!(backup, dir.path().join("decision.json.unreadable.bak"));
-    assert_eq!(std::fs::read(&backup).unwrap(), original);
-    assert_eq!(names(&dir), ["decision.json.unreadable.bak"]);
-}
-
-#[skuld::test]
-fn a_failed_delete_after_the_link_leaves_a_logged_backup() {
-    let (subscriber, log) = capture();
-    let _guard = set_default_in_current_thread(subscriber);
-    let dir = dir();
-    let original = unreadable_bytes(CannotRead::Newer);
-    put(&dir, "decision.json", original);
-
-    let err = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(NoRenameAndNoDelete))
+    let err = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(NoRename))
         .move_aside()
         .unwrap_err();
 
-    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    let text = err.to_string();
+    assert!(text.contains(&dir.path().display().to_string()), "{text}");
+    assert!(text.contains("no-replace rename"), "{text}");
     assert_eq!(read(&dir, "decision.json"), original, "the original is still there");
-    assert_eq!(read(&dir, "decision.json.unreadable.bak"), original);
-    assert!(
-        log.snapshot().contains("decision.json.unreadable.bak"),
-        "{}",
-        log.snapshot()
-    );
+    assert_eq!(names(&dir), ["decision.json"], "no backup");
+}
+
+/// `create_new` has no `Fs` seam for its claim, so the error it returns where the claim's rename answers `Unsupported`
+/// is checked where it is made.
+#[skuld::test]
+fn the_error_for_a_filesystem_with_no_noreplace_rename_names_the_directory() {
+    let dir = dir();
+
+    let err = VersionedFile::<DecisionFile>::new(dir.path()).no_noreplace_rename();
+
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    let text = err.to_string();
+    assert!(text.contains(&dir.path().display().to_string()), "{text}");
+    assert!(text.contains("no-replace rename"), "{text}");
 }
 
 /// A refusal of the rename itself, as a sticky directory or a security module

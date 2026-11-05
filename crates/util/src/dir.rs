@@ -59,7 +59,7 @@
 //! follows a symlink at the name: a link is renamed, linked or removed as
 //! itself, and reading or appending through one is an error. [`Dir::stage`]
 //! writes a complete temp file that [`Staged::publish`] renames over a name or
-//! [`Staged::claim`] links to a free one; [`Dir::write_atomic`] is the two in one.
+//! [`Staged::claim`] renames to a free one; [`Dir::write_atomic`] is the two in one.
 //! On Windows a file that is read or appended shares everything with other
 //! handles, delete included, and a replace or an unlink has POSIX semantics where
 //! the volume has them (Windows 10 1607, NTFS), so an open reader neither blocks
@@ -445,11 +445,8 @@ impl Staged<'_> {
 
     /// Gives the temp file the final name if that is free (`AlreadyExists` otherwise), by one rename that refuses to
     /// replace: two claims of one name cannot both win, a reader never sees a partial file, and the file never has
-    /// a second name.
-    ///
-    /// Where the platform or filesystem has no such rename (`Unsupported`) the claim is a hard link and then an
-    /// unlink of the temp name: the file has two names between the two calls, and if the unlink fails the claim is
-    /// undone and the error returned.
+    /// a second name. Where the platform or filesystem has no such rename the error is `Unsupported`; nothing is
+    /// claimed, and the temp name is removed on drop.
     pub fn claim(self) -> io::Result<()> {
         self.claim_with(|| {})
     }
@@ -458,32 +455,9 @@ impl Staged<'_> {
     pub(crate) fn claim_with(mut self, after_claim: impl FnOnce()) -> io::Result<()> {
         // Closed first: Windows renames a name only once no handle without delete sharing is open on it.
         drop(self.temp.take());
-        match self.dir.rename_noreplace(&self.temp_name, &self.name) {
-            Ok(()) => self.pending = false,
-            Err(err) if err.kind() == io::ErrorKind::Unsupported => self.claim_by_link(Dir::unlink)?,
-            Err(err) => return Err(err),
-        }
-        after_claim();
-        Ok(())
-    }
-
-    /// The claim where there is no no-replace rename: a hard link, then the temp name is unlinked at once. If that
-    /// cannot be done the final name is unlinked too and the error returned, since a file with two names reads as a
-    /// planted link to a vouched read; the temp name stays `pending` for `Drop` to retry.
-    fn claim_by_link(&mut self, unlink: impl Fn(&Dir, &OsStr) -> io::Result<()>) -> io::Result<()> {
-        self.dir.link(&self.temp_name, &self.name)?;
-        match unlink(self.dir, &self.temp_name) {
-            Ok(()) => {}
-            // Gone already: the file has the one name.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                if let Err(undo) = unlink(self.dir, &self.name) {
-                    tracing::warn!(error = %undo, "a claim that could not be completed could not be undone");
-                }
-                return Err(err);
-            }
-        }
+        self.dir.rename_noreplace(&self.temp_name, &self.name)?;
         self.pending = false;
+        after_claim();
         Ok(())
     }
 }

@@ -218,8 +218,9 @@ impl<S: VersionedState> VersionedFile<S> {
     /// whatever the role: the caller has decided. `None` when there is no file, and then nothing is made. Never replaces
     /// a backup that exists, and logs the one it makes.
     ///
-    /// The move is one rename that refuses to replace, so the file backed up is the file moved. Where the platform or
-    /// filesystem has no such rename it is a hard link and then a delete; the path lock does not cover another process.
+    /// The move is one rename that refuses to replace, so the file backed up is the file moved. A filesystem with no
+    /// such rename is an `Unsupported` error ([`Self::no_noreplace_rename`]): a link and a delete would leave the file
+    /// under two names, and the path lock does not cover another process.
     pub(super) fn move_aside_in(&self, dir: &Dir) -> io::Result<Option<PathBuf>> {
         let mut attempt = 1u64;
         loop {
@@ -231,22 +232,23 @@ impl<S: VersionedState> VersionedFile<S> {
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(e) if e.kind() == io::ErrorKind::Unsupported => return self.move_aside_by_link(dir),
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => return Err(self.no_noreplace_rename()),
                 Err(e) => return Err(e),
             }
         }
     }
 
-    fn move_aside_by_link(&self, dir: &Dir) -> io::Result<Option<PathBuf>> {
-        let Some(backup) = self.link_to_free_backup(dir)? else {
-            return Ok(None);
-        };
-        match self.fs.remove_file(dir, self.file_name()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        Ok(Some(self.dir.join(backup)))
+    /// The error where the directory's filesystem has no rename that refuses to replace (`Unsupported` from
+    /// [`Dir::rename_noreplace`]): the claim and the move-aside need it, and neither falls back to a second name.
+    pub(super) fn no_noreplace_rename(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "the filesystem of {} has no no-replace rename, which {} needs",
+                self.dir.display(),
+                S::FILE_NAME
+            ),
+        )
     }
 
     pub(super) fn file_name(&self) -> &OsStr {

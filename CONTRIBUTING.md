@@ -726,9 +726,9 @@ re-derive them.
    (a rename moves the inode), so it is read. What the user could learn from it is limited by the readers, below.
    This holds for the files read with
    `read_vouched`, which are published by rename (the update marker's claim by a rename that refuses to replace) and
-   so have one name; `ReadDir::read` does not have it, and is for a file that has a second name by design. Only
-   where a filesystem has no such rename is the claim a hard link, and the marker has two names until the temp name is
-   removed.
+   so have one name; `ReadDir::read` does not have it, and is for a file that has a second name by design. A
+   filesystem with no such rename fails the claim, and the move-aside of an unreadable record, with an error naming
+   the directory; neither falls back to a hard link, which would leave the file under two names.
 
 1. **Remove and move aside through the handle too.** A state file is removed by `VersionedFile::update` with `Change::Remove` and
    moved aside by `Change::MoveAside` or `Dir::rename_noreplace` (`dns_state::supersede`), never `std::fs::remove_file` or `rename` on a

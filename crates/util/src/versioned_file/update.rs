@@ -286,9 +286,9 @@ impl<S: VersionedState> VersionedFile<S> {
 
     /// Publishes `value` as a new file only if the name is free, whatever else is there: a file this release cannot
     /// read is `Taken` too. A rename that refuses to replace is what makes it atomic, across processes and without
-    /// a lock, a reader never sees a partial file, and the file never has a second name. (Where the filesystem has
-    /// no such rename the claim is a hard link, and the file has two names until the temp name is removed; see
-    /// [`crate::dir::Staged::claim`].) Does not move the generation.
+    /// a lock, a reader never sees a partial file, and the file never has a second name. A filesystem with no such
+    /// rename is an `Unsupported` error that names the directory, and nothing is claimed. Does not move the
+    /// generation.
     pub fn create_new(&self, value: &S, place: &dyn Placement) -> Result<CreateOutcome, StoreError> {
         let bytes = encode(value)?;
         let dir = self.open_dir(place, true)?;
@@ -297,6 +297,7 @@ impl<S: VersionedState> VersionedFile<S> {
         match staged.claim() {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(CreateOutcome::Taken),
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => return Err(self.no_noreplace_rename().into()),
             Err(e) => return Err(e.into()),
         }
         self.finalize(place, &dir);
