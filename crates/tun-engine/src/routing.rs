@@ -1576,7 +1576,7 @@ pub trait CoverGuard {
     /// never delete a newer cover's filters or drop a pf token a sweep already dropped.
     fn release(self, lock: &failclosed::CoverLock);
 
-    /// Whether this guard still owns the cover: no later install of its kind, and no completed sweep of it, has
+    /// Whether this guard still owns the cover: no later install of its kind, and no sweep that released it, has
     /// happened since it was installed. A lock-free read, so a report (status) may call it; a decision must read
     /// it inside the section that acts on it, under the lock.
     fn is_current(&self) -> bool;
@@ -1757,9 +1757,9 @@ pub trait Routing: Send + Sync {
     ///
     /// Takes the cover lock as proof that no other cover mutation runs: a release decides and acts as one section
     /// (see [`failclosed::CoverLock`]), and a guard held from before it releases nothing afterwards, because a
-    /// completed sweep outdates every guard's stamp. An implementation that completes calls
-    /// `outdate_stamps` for both cover kinds, as [`failclosed::release_all`] does; one that fails leaves them, so
-    /// a held guard's drop retries.
+    /// sweep outdates the stamps of each cover kind it released. An implementation calls `outdate_stamps` for the
+    /// kinds whose release completed, as [`failclosed::release_all`] does, even when the other kind's release
+    /// failed; a kind whose release failed keeps its stamps, so a held guard's drop retries.
     fn release_all_covers(&self, lock: &failclosed::CoverLock) -> Result<(), RoutingError>;
 
     /// Take the cover lock for this provider's own state directory: the one every cover method above takes as its

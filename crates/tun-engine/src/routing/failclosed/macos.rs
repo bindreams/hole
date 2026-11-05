@@ -1064,8 +1064,8 @@ pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> S
     // [`disengage_lockdown_with`] hands `pfctl -X`.
     let (presence, file) = lockdown_presence_and_state(state_dir);
     match disengage_lockdown_with(presence, file, &mut RealPfOps { state_dir }) {
-        Ok(()) => SweepOutcome::completed(Clearance::proven()),
-        Err(e) => SweepOutcome::failed(Clearance::proven(), e),
+        Ok(()) => SweepOutcome::completed(Clearance::proven(), &[CoverKind::Lockdown]),
+        Err(e) => SweepOutcome::failed(Clearance::proven(), e, &[]),
     }
 }
 
@@ -1261,14 +1261,16 @@ fn warn_unsalvageable_token(what: &str) {
 /// injected [`PfOps`] so it is table-tested without touching pf. See
 /// `failclosed::release_all`'s doc for the contract this implements.
 ///
-/// One `first_err` accumulator, two blocks, no `?` — a `?` would short-circuit
-/// the block that had not run yet.
+/// One error accumulator per cover, two blocks, no `?` — a `?` would
+/// short-circuit the block that had not run yet. Each block's failure decides
+/// only its own cover's release; the transient one is reported first.
 pub(crate) fn release_all_with(
     transient: StateFile<state::FailClosedState>,
     standing: StateFile<lockdown_state::LockdownPfState>,
     ops: &mut dyn PfOps,
-) -> Result<(), RoutingError> {
-    let mut first_err: Option<RoutingError> = None;
+) -> SweepOutcome {
+    let mut transient_err: Option<RoutingError> = None;
+    let mut standing_err: Option<RoutingError> = None;
 
     // Block 1 — transient cover. A reload failure is recorded but does NOT
     // stop block 2: the standing cover is the one that blocks indefinitely
@@ -1291,7 +1293,7 @@ pub(crate) fn release_all_with(
                         );
                     }
                 }
-                Err(e) => first_err = Some(e),
+                Err(e) => transient_err = Some(e),
             }
         }
         StateFile::Unusable { pf_token } => {
@@ -1312,7 +1314,7 @@ pub(crate) fn release_all_with(
                         );
                     }
                 }
-                Err(e) => first_err = Some(e),
+                Err(e) => transient_err = Some(e),
             }
         }
     }
@@ -1340,11 +1342,7 @@ pub(crate) fn release_all_with(
                         );
                     }
                 }
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
+                Err(e) => standing_err = Some(e),
             }
         }
         StateFile::Present(st) => {
@@ -1381,11 +1379,7 @@ pub(crate) fn release_all_with(
                         );
                     }
                 }
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
+                Err(e) => standing_err = Some(e),
             }
         }
         StateFile::Unusable { pf_token } => {
@@ -1410,18 +1404,23 @@ pub(crate) fn release_all_with(
                         );
                     }
                 }
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
+                Err(e) => standing_err = Some(e),
             }
         }
     }
 
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
+    // A cover is released when ITS block confirmed, whatever the other block did: the sweep reports the kinds
+    // whose stamps it takes, and a held guard of the other kind still retries.
+    let mut released = Vec::new();
+    if transient_err.is_none() {
+        released.push(CoverKind::Transient);
+    }
+    if standing_err.is_none() {
+        released.push(CoverKind::Lockdown);
+    }
+    match transient_err.or(standing_err) {
+        Some(e) => SweepOutcome::failed(Clearance::proven(), e, &released),
+        None => SweepOutcome::completed(Clearance::proven(), &released),
     }
 }
 
@@ -1593,10 +1592,7 @@ pub fn release_all(state_dir: &Path, _witness: super::ArmingWitness) -> SweepOut
     // Both arms `Clearance::proven`, for the reason `disengage_lockdown`
     // gives: no boot-time key class here, so nothing a failure could have
     // observed and withheld.
-    match release_all_with(transient, standing, &mut RealPfOps { state_dir }) {
-        Ok(()) => SweepOutcome::completed(Clearance::proven()),
-        Err(e) => SweepOutcome::failed(Clearance::proven(), e),
-    }
+    release_all_with(transient, standing, &mut RealPfOps { state_dir })
 }
 
 #[cfg(test)]

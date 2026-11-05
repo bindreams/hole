@@ -173,8 +173,8 @@ impl crate::routing::CoverGuard for Cover {
 /// `state_dir` is where macOS persists its enable token for crash recovery
 /// (unused on Windows), taken from `lock`. On failure the host is left uncovered.
 ///
-/// The returned guard is stamped by `lock`: it releases only while no later install or completed sweep of the
-/// transient cover has happened ([`CoverLock::stamp_install`]).
+/// The returned guard is stamped by `lock`: it releases only while no later install of the transient cover
+/// and no sweep that released it has happened ([`CoverLock::stamp_install`]).
 pub fn engage(
     lock: &CoverLock,
     server_ip: IpAddr,
@@ -378,7 +378,7 @@ pub fn reclaim_stale_tun_permit(tun_name: &str) {
 /// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
 /// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
 pub fn disengage_lockdown(lock: &CoverLock) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(lock, None, &[CoverKind::Lockdown], |witness| {
+    sweep_with_witness(lock, None, |witness| {
         platform::disengage_lockdown(lock.state_dir(), witness)
     })
 }
@@ -454,9 +454,7 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or
 /// version-skewed and nothing to erase — only GUID sweeps run there.
 pub fn release_all(lock: &CoverLock) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(lock, None, &[CoverKind::Transient, CoverKind::Lockdown], |witness| {
-        platform::release_all(lock.state_dir(), witness)
-    })
+    sweep_with_witness(lock, None, |witness| platform::release_all(lock.state_dir(), witness))
 }
 
 // Release clearance ===================================================================================================
@@ -1021,27 +1019,28 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 fn sweep_with_witness(
     lock: &CoverLock,
     owner: Option<(u32, u32)>,
-    swept: &[CoverKind],
     sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
     let state_dir = lock.state_dir();
-    let SweepOutcome { clearance, failure } = sweep(boottime_witness::load(state_dir));
+    let SweepOutcome {
+        clearance,
+        failure,
+        released,
+    } = sweep(boottime_witness::load(state_dir));
     // The record is written from what the sweep OBSERVED, before its failure
     // reaches the caller. A failing sweep is not an unobservant one: this
     // codebase's own sweeps issue every delete before inspecting any code, so
     // `Err` arrives after the sibling's delete already succeeded — see
     // [`SweepOutcome`].
     boottime_witness::apply(state_dir, clearance.witness_update(), owner);
+    // A kind the sweep released took what its held guards hold, whatever the other kind did. A kind it did not
+    // keeps its stamps, so a guard's drop still retries what the sweep could not delete.
+    for kind in &released {
+        lock.outdate_stamps(*kind);
+    }
     match failure {
         Some(e) => Err(e),
-        None => {
-            // Only a sweep that completed took what a held guard holds. A failed one leaves the stamps, so the
-            // guard's drop still retries its deletes.
-            for kind in swept {
-                lock.outdate_stamps(*kind);
-            }
-            Ok(clearance)
-        }
+        None => Ok(clearance),
     }
 }
 
@@ -1063,14 +1062,16 @@ fn sweep_with_witness(
 pub(crate) struct SweepOutcome {
     clearance: Clearance,
     failure: Option<RoutingError>,
+    released: Vec<CoverKind>,
 }
 
 impl SweepOutcome {
-    /// Every delete was issued and answered, and none failed.
-    pub(crate) fn completed(clearance: Clearance) -> Self {
+    /// Every delete was issued and answered, and none failed. `released` names the cover kinds the sweep covers.
+    pub(crate) fn completed(clearance: Clearance, released: &[CoverKind]) -> Self {
         Self {
             clearance,
             failure: None,
+            released: released.to_vec(),
         }
     }
 
@@ -1078,10 +1079,11 @@ impl SweepOutcome {
     /// is a complete observation set for a sweep that issued every delete
     /// before reading any code, and the empty fold for one that never reached
     /// the firewall at all.
-    pub(crate) fn failed(clearance: Clearance, error: RoutingError) -> Self {
+    pub(crate) fn failed(clearance: Clearance, error: RoutingError, released: &[CoverKind]) -> Self {
         Self {
             clearance,
             failure: Some(error),
+            released: released.to_vec(),
         }
     }
 
@@ -1090,6 +1092,12 @@ impl SweepOutcome {
     #[cfg(test)]
     pub(crate) fn clearance(&self) -> &Clearance {
         &self.clearance
+    }
+
+    /// The cover kinds whose release this sweep completed, whether or not it also failed.
+    #[cfg(test)]
+    pub(crate) fn released(&self) -> &[CoverKind] {
+        &self.released
     }
 
     /// Collapse into the `Result` a caller with no record to update wants.

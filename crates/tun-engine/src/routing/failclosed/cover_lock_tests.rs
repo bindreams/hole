@@ -306,12 +306,12 @@ fn a_sweep_holds_the_lock_while_it_runs() {
     // panic, so nothing inside a sweep can re-enter.
     let d = dir();
     let lock = CoverLock::acquire(d.path());
-    let reentered = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
+    let reentered = sweep_with_witness(&lock, None, |_| {
         let attempt = catch_unwind(AssertUnwindSafe(|| {
             CoverLock::acquire(d.path()).state_dir().to_path_buf()
         }));
         assert!(attempt.is_err());
-        SweepOutcome::completed(Clearance::proven())
+        SweepOutcome::completed(Clearance::proven(), &[CoverKind::Lockdown])
     });
     assert!(reentered.is_ok());
 }
@@ -321,8 +321,8 @@ fn a_sweep_that_completes_makes_an_earlier_stamp_stale() {
     let d = dir();
     let lock = CoverLock::acquire(d.path());
     let stamp = lock.stamp_install(CoverKind::Lockdown);
-    let _clearance = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
-        SweepOutcome::completed(Clearance::proven())
+    let _clearance = sweep_with_witness(&lock, None, |_| {
+        SweepOutcome::completed(Clearance::proven(), &[CoverKind::Lockdown])
     })
     .unwrap();
     assert!(!stamp.is_current());
@@ -334,8 +334,8 @@ fn a_sweep_with_nothing_to_delete_makes_an_earlier_stamp_stale() {
     let d = dir();
     let lock = CoverLock::acquire(d.path());
     let stamp = lock.stamp_install(CoverKind::Transient);
-    let result = sweep_with_witness(&lock, None, &[CoverKind::Transient], |_| {
-        SweepOutcome::completed(Clearance::proven())
+    let result = sweep_with_witness(&lock, None, |_| {
+        SweepOutcome::completed(Clearance::proven(), &[CoverKind::Transient])
     });
     assert!(result.is_ok());
     assert!(!stamp.is_current());
@@ -346,8 +346,12 @@ fn a_sweep_that_failed_after_reaching_the_firewall_leaves_a_stamp_current() {
     let d = dir();
     let lock = CoverLock::acquire(d.path());
     let stamp = lock.stamp_install(CoverKind::Lockdown);
-    let result = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
-        SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("a delete failed".into()))
+    let result = sweep_with_witness(&lock, None, |_| {
+        SweepOutcome::failed(
+            Clearance::proven(),
+            RoutingError::RouteSetup("a delete failed".into()),
+            &[],
+        )
     });
     assert!(result.is_err());
     assert!(
@@ -356,13 +360,57 @@ fn a_sweep_that_failed_after_reaching_the_firewall_leaves_a_stamp_current() {
     );
 }
 
+/// A sweep of both kinds that fails reports which kind it released. That kind's guard must stop deleting (its OS
+/// objects are gone, a delete would hit whatever replaced them); the other kind's guard stays current and retries.
+/// Returns `(transient_current, lockdown_current)`.
+fn stamps_after_a_failed_sweep_that_released(released: &[CoverKind]) -> (bool, bool) {
+    let d = dir();
+    let lock = CoverLock::acquire(d.path());
+    let transient = lock.stamp_install(CoverKind::Transient);
+    let lockdown = lock.stamp_install(CoverKind::Lockdown);
+    let result = sweep_with_witness(&lock, None, |_| {
+        SweepOutcome::failed(
+            Clearance::proven(),
+            RoutingError::RouteSetup("one kind could not be released".into()),
+            released,
+        )
+    });
+    assert!(result.is_err());
+    (transient.is_current(), lockdown.is_current())
+}
+
+#[skuld::test]
+fn a_failed_sweep_outdates_the_stamp_of_the_kind_it_released() {
+    assert_eq!(
+        stamps_after_a_failed_sweep_that_released(&[CoverKind::Transient]),
+        (false, true)
+    );
+}
+
+#[skuld::test]
+fn a_failed_sweep_outdates_the_lockdown_stamp_when_only_the_lockdown_was_released() {
+    assert_eq!(
+        stamps_after_a_failed_sweep_that_released(&[CoverKind::Lockdown]),
+        (true, false)
+    );
+}
+
+#[skuld::test]
+fn a_sweep_that_released_neither_kind_outdates_neither_stamp() {
+    assert_eq!(stamps_after_a_failed_sweep_that_released(&[]), (true, true));
+}
+
 #[skuld::test]
 fn a_failing_sweep_releases_the_lock() {
     let d = dir();
     {
         let lock = CoverLock::acquire(d.path());
-        let result = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
-            SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("the sweep failed".into()))
+        let result = sweep_with_witness(&lock, None, |_| {
+            SweepOutcome::failed(
+                Clearance::proven(),
+                RoutingError::RouteSetup("the sweep failed".into()),
+                &[],
+            )
         });
         assert!(result.is_err());
     }
