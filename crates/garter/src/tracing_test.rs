@@ -12,6 +12,8 @@
 //! wrapper that performs the runtime-flavor check before delegating to
 //! `tracing::subscriber::set_default`. Workspace-wide clippy
 //! `disallowed_methods` rules force all callers through this helper.
+//! [`captured`] (behind `test-utils`) builds on it for the common case of
+//! running a closure and reading what it logged.
 //!
 //! **Limitation.** If the helper is invoked from a sync context that
 //! later enters a multi-thread `block_on`, the check cannot see the
@@ -52,4 +54,26 @@ where
     }
     #[allow(clippy::disallowed_methods)] // canonical wrapper — see module doc
     tracing::subscriber::set_default(subscriber)
+}
+
+/// Runs `body` with a plain-text `fmt` subscriber installed on this thread
+/// only, and returns what it logged at INFO and above (`fmt`'s default level).
+/// The subscriber is gone before the snapshot is taken.
+///
+/// # Panics
+///
+/// As [`set_default_in_current_thread`]: when called from inside a
+/// multi-thread tokio runtime.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn captured(body: impl FnOnce()) -> String {
+    let writer = crate::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .finish();
+    {
+        let _guard = set_default_in_current_thread(subscriber);
+        body();
+    }
+    writer.snapshot()
 }

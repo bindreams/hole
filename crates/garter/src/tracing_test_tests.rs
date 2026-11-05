@@ -41,7 +41,7 @@ impl<'a> MakeWriter<'a> for VecWriter {
     }
 }
 
-fn captured(writer: &VecWriter) -> String {
+fn written(writer: &VecWriter) -> String {
     String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned()
 }
 
@@ -74,9 +74,9 @@ fn helper_passes_on_current_thread_runtime() {
         let _g = set_default_in_current_thread(build_subscriber(writer.clone()));
         tracing::info!("event_on_test_thread");
         assert!(
-            captured(&writer).contains("event_on_test_thread"),
+            written(&writer).contains("event_on_test_thread"),
             "expected event captured; got:\n{}",
-            captured(&writer),
+            written(&writer),
         );
     });
 }
@@ -87,9 +87,9 @@ fn helper_passes_in_sync_context() {
     let _g = set_default_in_current_thread(build_subscriber(writer.clone()));
     tracing::info!("sync_event");
     assert!(
-        captured(&writer).contains("sync_event"),
+        written(&writer).contains("sync_event"),
         "expected event captured; got:\n{}",
-        captured(&writer),
+        written(&writer),
     );
 }
 
@@ -120,7 +120,7 @@ fn helper_silently_passes_when_called_before_block_on() {
     });
 
     assert!(
-        !captured(&writer).contains("from_spawned_task"),
+        !written(&writer).contains("from_spawned_task"),
         "limitation regression: helper called before block_on cannot protect; \
          spawned event must be lost as expected for documentation purposes",
     );
@@ -156,15 +156,15 @@ fn raw_set_default_on_multi_thread_loses_spawned_events() {
     });
 
     assert!(
-        captured(&writer).contains("from_test_thread"),
+        written(&writer).contains("from_test_thread"),
         "control: test-thread event should be captured; got:\n{}",
-        captured(&writer),
+        written(&writer),
     );
     assert!(
-        !captured(&writer).contains("from_spawned_task_should_be_lost"),
+        !written(&writer).contains("from_spawned_task_should_be_lost"),
         "demonstration: raw set_default + multi-thread + spawn must lose \
          the spawned event (the helper would have panicked instead). Captured:\n{}",
-        captured(&writer),
+        written(&writer),
     );
 }
 
@@ -188,8 +188,8 @@ fn helper_inside_current_thread_block_on_captures_spawned_events() {
     });
 
     assert!(
-        captured(&writer).contains("from_spawned_on_ct"),
+        written(&writer).contains("from_spawned_on_ct"),
         "happy path: helper + current-thread + spawn must capture; got:\n{}",
-        captured(&writer),
+        written(&writer),
     );
 }
