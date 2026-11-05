@@ -5,8 +5,8 @@
 //! restart action cannot be canceled ... The service must be explicitly
 //! disabled to prevent it from restarting"). This probe can only FALSIFY that
 //! answer: a restart that happens is read off a positive event (the service's
-//! start count, its state), while a restart that does not happen has no event
-//! to read, and no verdict below claims one from the absence.
+//! start count), while a restart that does not happen has no event to read, and
+//! no verdict below claims one from the absence.
 //!
 //! Two services, S (disabled) and C (the control), run the same helper with a
 //! restart-on-failure action. S is crashed, then C. C's restarted instance
@@ -17,18 +17,33 @@
 //! SCM queued it. S's disable is written either while its restart is queued
 //! (variant `queued`) or before the crash (variant `running`).
 //!
+//! In the `running` variant any restart of S is a falsification.
+//!
 //! The `queued` variant needs the disable to land before the SCM's restart
 //! timer fires, which the test cannot guarantee: only the SCM runs that timer.
-//! S's state is read just BEFORE the disable is written: S not STOPPED then
-//! means the restart had already fired, so the attempt is abandoned and rerun
-//! on fresh services, never reported as a verdict. A restart after that read
-//! counts as a restart of a disabled service and fails loudly, even if it fell
-//! in the instant before the disable; the RESULT line carries the state before
-//! and after the disable and the SCM's entries for S, which tell the two apart.
+//! No read of S's state can place a restart against the disable (the disable
+//! writes no event, and a state read leaves the restart on the other side of it
+//! open), so the restart is placed by when it happened. The system time is read
+//! just before the disable is written (`t0`) and just after it returns (`t1`),
+//! and the creation time of S's restarted instance is read from the process
+//! list, by the last process id in S's pid log:
+//! - created before `t0`: the timer fired first, nothing was measured: rerun;
+//! - created after `t1`: the SCM started a disabled service: FALSIFIED;
+//! - created within `[t0, t1]`: the order is unknowable, so it is no
+//!   measurement either: rerun.
+//!
+//! The OS's creation stamp may lag the true time (tick clock against the
+//! precise one) but is never ahead of it, and `t1` is never behind it, so an
+//! error moves a restart into the window or before `t0`, toward a rerun, and
+//! never toward a verdict. The restarted instance is alive when it is read (the
+//! helper exits only when killed, and only teardown kills it), so no creation
+//! time recorded by the helper is needed; an instance the list does not have
+//! fails the probe.
 
 use std::ffi::OsString;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use hole_bridge::disable_record::Stamp;
 use windows::core::PCWSTR;
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, ENUM_SERVICE_TYPE, SC_HANDLE, SERVICE_DISABLED, SERVICE_ERROR, SERVICE_NO_CHANGE,
@@ -41,15 +56,104 @@ use windows_service::service::{
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::named_event::NamedEvent;
-use super::{scm_deletion, scm_probe, GLOBAL_NET_STATE, TUN};
+use super::{left_behind, scm_deletion, scm_probe, GLOBAL_NET_STATE, TUN};
 
 /// How long the SCM waits before it restarts S, and C. C's is the longer, and C
 /// is killed only after the read of S's queued restart, so S's action is due
-/// well before the control's restart is up. S's must outlast the event-log read
-/// before the disable (measured ~6 s on a loaded runner); a loss is rerun, not
-/// failed.
+/// well before the control's restart is up. A longer one for S makes a lost
+/// race rarer (the event-log read before the disable measured ~6 s on a loaded
+/// runner); a loss is rerun, not failed.
 const S_RESTART_DELAY: Duration = Duration::from_secs(30);
 const C_RESTART_DELAY: Duration = Duration::from_secs(40);
+
+/// What a probe service's name starts with, by role. A killed run skips
+/// teardown and leaves its services behind (`assert_no_leftover_probe_services`).
+const S_NAME_PREFIX: &str = "HoleProbeS-";
+const C_NAME_PREFIX: &str = "HoleProbeC-";
+
+/// The system time as a `FILETIME`: 100 ns ticks since 1601, the unit the OS
+/// stamps a process's creation in.
+fn filetime_now() -> u64 {
+    const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the system time is after 1970");
+    UNIX_EPOCH_AS_FILETIME + (since_epoch.as_nanos() / 100) as u64
+}
+
+/// When a disable was written: the system time read just before the write
+/// (`before`) and just after it returned (`after`), as `FILETIME`s.
+#[derive(Clone, Copy)]
+struct DisableWindow {
+    before: u64,
+    after: u64,
+}
+
+/// When a restart happened, against a disable's [`DisableWindow`].
+enum RestartTiming {
+    /// Before the write began: the disable met no queued restart.
+    Before,
+    /// Inside the write: which came first cannot be told.
+    During,
+    /// After the write returned: the restart ignored the disable.
+    After,
+}
+
+impl DisableWindow {
+    fn timing_of(self, created: u64) -> RestartTiming {
+        if created < self.before {
+            RestartTiming::Before
+        } else if created > self.after {
+            RestartTiming::After
+        } else {
+            RestartTiming::During
+        }
+    }
+
+    /// `t0`, `t1` and `created` for a log line, with `created` in milliseconds
+    /// from `t0`.
+    fn describe(self, created: u64) -> String {
+        let from_t0_ms = (i128::from(created) - i128::from(self.before)) / 10_000;
+        format!(
+            "t0 {}, t1 {} (FILETIME, 100 ns), restarted instance created {created} ({from_t0_ms} ms from t0)",
+            self.before, self.after
+        )
+    }
+}
+
+/// The creation time of the live process `pid`, from the process list.
+fn creation_time_of(pid: u32) -> u64 {
+    Stamp::of_listed_process(pid)
+        .expect("read the process list")
+        .unwrap_or_else(|| panic!("the restarted instance (process {pid}) is not in the process list"))
+        .created()
+}
+
+/// Fails if a probe service from an earlier run is still registered. A run the
+/// nextest terminate-after killed skips `ProbeService::drop`, leaving an
+/// AutoStart LocalSystem service that restarts on failure, and nothing else
+/// would notice: the names are new each attempt. Detection only; the test
+/// deletes only what it created.
+fn assert_no_leftover_probe_services() {
+    let services = windows_registry::LOCAL_MACHINE
+        .open(r"SYSTEM\CurrentControlSet\Services")
+        .expect("open HKLM\\SYSTEM\\CurrentControlSet\\Services");
+    let leftovers: Vec<String> = services
+        .keys()
+        .expect("list the registered services")
+        .filter(|name| {
+            let name = name.to_ascii_lowercase();
+            [S_NAME_PREFIX, C_NAME_PREFIX]
+                .iter()
+                .any(|prefix| name.starts_with(&prefix.to_ascii_lowercase()))
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "probe services of an earlier run are still registered: {leftovers:?}. Each is AutoStart, runs as LocalSystem \
+         and restarts on failure. Remove each with `sc stop <name>` and `sc delete <name>`, then rerun"
+    );
+}
 
 /// A throwaway auto-start service running the helper, under its own name so it
 /// can run beside another. Deleted on drop, once its process is gone.
@@ -88,7 +192,7 @@ impl ProbeService {
                     | ServiceAccess::DELETE
                     | ServiceAccess::CHANGE_CONFIG,
             )
-            .unwrap_or_else(|e| panic!("create the probe service {name} (a leftover of a killed run?): {e}"));
+            .unwrap_or_else(|e| panic!("create the probe service {name}: {e}"));
         service
             .update_failure_actions(ServiceFailureActions {
                 reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
@@ -138,8 +242,10 @@ impl ProbeService {
             .start_type
     }
 
-    /// `SERVICE_DISABLED`, and nothing else changed.
-    fn disable(&self) {
+    /// `SERVICE_DISABLED`, and nothing else changed. Returns when the write was
+    /// made, bracketed by the system time.
+    fn disable(&self) -> DisableWindow {
+        let before = filetime_now();
         // SAFETY: the handle is the live one `handle()` owns; every pointer is
         // null or `None`, which with `SERVICE_NO_CHANGE` leaves that setting alone.
         unsafe {
@@ -158,6 +264,10 @@ impl ProbeService {
             )
         }
         .expect("disable the probe service");
+        DisableWindow {
+            before,
+            after: filetime_now(),
+        }
     }
 }
 
@@ -287,7 +397,7 @@ mod system_log {
 
 /// How many times the helper logged a start: one line per process.
 fn starts_in(pid_log: &std::path::Path) -> usize {
-    std::fs::read_to_string(pid_log).unwrap_or_default().lines().count()
+    left_behind::logged(pid_log).len()
 }
 
 /// SCM event 7031: the service ended unexpectedly and a corrective action is
@@ -317,31 +427,18 @@ impl Variant {
             Variant::Running => true,
         }
     }
-
-    /// Whether the disable is still to meet the variant's scenario, given S's
-    /// state read just before it is written. A `queued` disable meets a queued
-    /// restart only if S is still STOPPED, so one that reads otherwise lost the
-    /// race with the timer. A `running` disable precedes the crash by
-    /// construction: a restarted S there is a restart of a disabled service,
-    /// not a lost race.
-    fn disable_meets_its_scenario(self, state_before_disable: ServiceState) -> bool {
-        match self {
-            Variant::Queued => state_before_disable == ServiceState::Stopped,
-            Variant::Running => true,
-        }
-    }
 }
 
 /// How one attempt of a probe ended.
 enum AttemptOutcome {
     /// The scenario held and the verdict was asserted.
     Measured,
-    /// The SCM restarted S before the disable was written; nothing was measured.
+    /// S's restart was created before the disable was written, or too close to
+    /// it to tell which came first (`DisableWindow`): the disable did not meet
+    /// a queued restart, so nothing was measured.
     RaceLost {
-        /// S's state, read just before the disable was due.
-        state_before_disable: ServiceState,
-        /// The SCM's log entries naming S, as `scm_entries_dump` writes them.
-        scm_entries: String,
+        /// What was read, for the one line printed per lost attempt.
+        evidence: String,
     },
 }
 
@@ -349,19 +446,15 @@ enum AttemptOutcome {
 /// each attempt is independent, and an environment that loses every one is
 /// bounded by the nextest terminate-after on these tests.
 fn run_probe(variant: Variant) {
-    for attempt in 1.. {
-        match restart_probe(variant) {
+    for attempt in 1u32.. {
+        match restart_probe(variant, attempt) {
             AttemptOutcome::Measured => return,
-            AttemptOutcome::RaceLost {
-                state_before_disable,
-                scm_entries,
-            } => eprintln!(
-                "P1 {}: attempt {attempt} lost the race with the SCM's restart timer: \
-                 S was {state_before_disable:?} when its disable was due, so its restart had already fired; \
-                 rerunning. \
-                 SCM log entries naming S, newest first: {scm_entries}",
-                variant.name()
-            ),
+            AttemptOutcome::RaceLost { evidence } => {
+                eprintln!(
+                    "P1 {}: attempt {attempt} measured nothing, rerunning: {evidence}",
+                    variant.name()
+                )
+            }
         }
     }
 }
@@ -377,13 +470,18 @@ fn scm_entries_dump(display_name: &str) -> String {
 
 /// One attempt, on services and events named for it: the SCM log keeps every
 /// earlier attempt's and run's entries, which a name any of them used would
-/// read as this one's. The id (variant, a random nonce, fixed-width) is unique
-/// to the attempt, and each display name closes in `]`, so no name is a prefix
-/// of another.
-fn restart_probe(variant: Variant) -> AttemptOutcome {
-    use rand::RngExt;
+/// read as this one's. The id (variant, test process id, attempt, and the
+/// system time at the attempt's start, the last three fixed-width) is unique to
+/// the attempt, and each display name closes in `]`, so no name is a prefix of
+/// another.
+fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
+    assert_no_leftover_probe_services();
     let name = variant.name();
-    let id = format!("{name}-{:016x}", rand::rng().random::<u64>());
+    let id = format!(
+        "{name}-{:08x}-{attempt:08x}-{:016x}",
+        std::process::id(),
+        filetime_now()
+    );
     let dir = tempfile::tempdir().unwrap();
     let (s_log, c_log) = (dir.path().join("s.log"), dir.path().join("c.log"));
     // `NamedEvent` appends the process id to the tag, so the tag ends in a separator.
@@ -398,13 +496,13 @@ fn restart_probe(variant: Variant) -> AttemptOutcome {
         ]
     };
     let s = ProbeService::create(
-        format!("HoleProbeS-{id}"),
+        format!("{S_NAME_PREFIX}{id}"),
         format!("Hole probe S [{id}]"),
         arguments(&s_log, &s_running),
         S_RESTART_DELAY,
     );
     let c = ProbeService::create(
-        format!("HoleProbeC-{id}"),
+        format!("{C_NAME_PREFIX}{id}"),
         format!("Hole probe C [{id}]"),
         arguments(&c_log, &c_running),
         C_RESTART_DELAY,
@@ -419,18 +517,9 @@ fn restart_probe(variant: Variant) -> AttemptOutcome {
     c_running.reset();
 
     let log = system_log::Watch::open();
-    // Reads S's state, then disables it unless that read shows the variant's
-    // scenario already lost: a disable written after the restart fired measures
-    // nothing.
-    let disable_s = || -> Result<ServiceState, ServiceState> {
-        let state_before_disable = s.state();
-        if !variant.disable_meets_its_scenario(state_before_disable) {
-            return Err(state_before_disable);
-        }
+    if variant.disables_before_the_crash() {
         s.disable();
-        Ok(state_before_disable)
-    };
-    let disabled_before_the_crash = variant.disables_before_the_crash().then(&disable_s);
+    }
     scm_probe::terminate_process(s_pid);
     eprintln!("P1 {name}: killed S (process {s_pid}); waiting for the SCM to log that it queued S's restart");
     log.wait_until(|| {
@@ -438,27 +527,57 @@ fn restart_probe(variant: Variant) -> AttemptOutcome {
             .iter()
             .any(|entry| entry.event_id == CORRECTIVE_ACTION_EVENT)
     });
-    let state_before_disable = match disabled_before_the_crash.unwrap_or_else(disable_s) {
-        Ok(state) => state,
-        Err(state_before_disable) => {
-            return AttemptOutcome::RaceLost {
-                state_before_disable,
-                scm_entries: scm_entries_dump(&s.display_name),
-            }
-        }
-    };
-    let state_after_disable = s.state();
+    let disable_window = (!variant.disables_before_the_crash()).then(|| s.disable());
     scm_probe::terminate_process(c_pid);
     eprintln!("P1 {name}: S disabled; killed C (process {c_pid}); waiting for C's restarted instance");
     c_running.wait();
 
     let (s_state, s_starts, c_starts) = (s.state(), starts_in(&s_log), starts_in(&c_log));
     let restarted = s_starts > 1 || s_state != ServiceState::Stopped;
+    let timing_line = match (disable_window, restarted) {
+        (None, _) => String::from("S disabled before the crash, no timing read"),
+        (Some(window), false) => format!(
+            "no restarted instance of S, disable written between t0 {} and t1 {}",
+            window.before, window.after
+        ),
+        (Some(window), true) => {
+            // S has a restarted instance in the log only if it logged one: a
+            // restart caught before its helper logged cannot be placed.
+            let restarted_pid = left_behind::logged(&s_log)
+                .last()
+                .copied()
+                .filter(|_| s_starts > 1)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "S is {s_state:?} but its pid log names one process: its restarted instance cannot be placed"
+                    )
+                });
+            let created = creation_time_of(restarted_pid);
+            let timing_line = window.describe(created);
+            let loss = match window.timing_of(created) {
+                RestartTiming::Before => {
+                    Some("S's restart was created before the disable began: the SCM's timer fired first")
+                }
+                RestartTiming::During => {
+                    Some("S's restart was created while the disable was being written: which came first is unknowable")
+                }
+                RestartTiming::After => None,
+            };
+            if let Some(loss) = loss {
+                return AttemptOutcome::RaceLost {
+                    evidence: format!(
+                        "{loss}; {timing_line}; SCM log entries naming S, newest first: {}",
+                        scm_entries_dump(&s.display_name)
+                    ),
+                };
+            }
+            timing_line
+        }
+    };
     eprintln!(
-        "P1 {name} RESULT: S's start type read back {:?}; S state before the disable was \
-         written {state_before_disable:?}, after {state_after_disable:?}; \
-         S state when C's restarted instance was up {s_state:?}; S starts {s_starts} (1 is the original); \
-         C starts {c_starts} (2 is the original and its restart). \
+        "P1 {name} RESULT: S's start type read back {:?}; {timing_line}; S state when C's restarted instance was up \
+         (read after the crash and the log wait, not at the disable) {s_state:?}; S starts {s_starts} (1 is the \
+         original); C starts {c_starts} (2 is the original and its restart). \
          SCM log entries naming S, newest first: {}",
         s.start_type(),
         scm_entries_dump(&s.display_name)
