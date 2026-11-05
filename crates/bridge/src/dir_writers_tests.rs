@@ -407,6 +407,18 @@ fn writers() -> Vec<Writer> {
             run: |dir, owner| lockdown_state::set_enabled(dir, true, owner).map_err(io::Error::other),
         },
         Writer {
+            name: "the lockdown state, promoted",
+            sources: &["crates/tun-engine/src/routing/failclosed/lockdown_state.rs"],
+            names: &[lockdown_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| {
+                lockdown_state::promote_unrecorded(dir, owner)
+                    .map(drop)
+                    .map_err(io::Error::other)
+            },
+        },
+        Writer {
             name: "the boot-time witness, recorded",
             sources: &["crates/tun-engine/src/routing/failclosed/boottime_witness.rs"],
             names: &[boottime_witness::STATE_FILE_NAME],

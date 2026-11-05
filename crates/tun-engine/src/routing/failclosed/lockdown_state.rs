@@ -85,36 +85,44 @@ impl Intent {
     pub fn installs_standing_cover(self) -> bool {
         matches!(self, Intent::On)
     }
-}
 
-/// The one reading of the intent file. `Ok` is a file that parsed at the current schema; `Err` carries the [`Intent`]
-/// its failure classifies to, so [`load`] and [`load_intent`] share a single reader (and a single set of `warn!`
-/// lines) instead of drifting apart.
-fn read_state(state_dir: &Path) -> Result<LockdownState, Intent> {
-    match file(state_dir).observe().loaded {
-        Loaded::Current { value, .. } => Ok(value),
-        Loaded::Absent => Err(Intent::Unset),
-        Loaded::Obsolete { .. } => Err(Intent::Unreadable),
-        Loaded::Newer { .. } => Err(Intent::Unreadable),
-        Loaded::Corrupt { .. } => Err(Intent::Unreadable),
-        Loaded::Unreadable { .. } => Err(Intent::Unreadable),
+    /// "May a start that just honoured an adopted cover record the kill switch as armed?" — `Unset | Unreadable`.
+    /// `On` needs no write, and `Off` is the user's explicit choice: an adopted claim is never proof it still stands.
+    pub fn admits_adoption_promotion(self) -> bool {
+        match self {
+            Intent::Unset | Intent::Unreadable => true,
+            Intent::On | Intent::Off => false,
+        }
+    }
+
+    /// The one classification of a read of the intent file: a recorded value, nothing there, or a failure that is
+    /// never collapsed into either.
+    pub fn of(loaded: &Loaded<LockdownState>) -> Intent {
+        match loaded {
+            Loaded::Current { value, .. } if value.enabled => Intent::On,
+            Loaded::Current { .. } => Intent::Off,
+            Loaded::Absent => Intent::Unset,
+            Loaded::Obsolete { .. } => Intent::Unreadable,
+            Loaded::Newer { .. } => Intent::Unreadable,
+            Loaded::Corrupt { .. } => Intent::Unreadable,
+            Loaded::Unreadable { .. } => Intent::Unreadable,
+        }
     }
 }
 
 /// Load the intent, or `None` on absent/corrupt/newer/obsolete (the read logs at `warn`). Use [`load_intent`] where
 /// the *reason* for a `None` matters.
 pub fn load(state_dir: &Path) -> Option<LockdownState> {
-    read_state(state_dir).ok()
+    match file(state_dir).observe().loaded {
+        Loaded::Current { value, .. } => Some(value),
+        _ => None,
+    }
 }
 
 /// Classify the intent file. Never collapses a failure into a recorded value —
 /// see [`Intent`] and its two folds.
 pub fn load_intent(state_dir: &Path) -> Intent {
-    match read_state(state_dir) {
-        Ok(s) if s.enabled => Intent::On,
-        Ok(_) => Intent::Off,
-        Err(i) => i,
-    }
+    Intent::of(&file(state_dir).observe().loaded)
 }
 
 /// Convenience: [`Intent::reads_armed`] over [`load_intent`]. An absent file is
@@ -132,6 +140,20 @@ pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -
             (Change::Store(LockdownState { enabled }), ())
         })
         .map(|_| ())
+}
+
+/// Record the kill switch as armed iff no explicit intent is recorded ([`Intent::admits_adoption_promotion`]); the
+/// read and the write are one update, so a concurrent [`set_enabled`] is never overwritten. `true` when it wrote.
+pub fn promote_unrecorded(state_dir: &Path, owner: Option<(u32, u32)>) -> Result<bool, StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement { owner }, |now| {
+            if Intent::of(&now.loaded).admits_adoption_promotion() {
+                (Change::Store(LockdownState { enabled: true }), true)
+            } else {
+                (Change::Keep, false)
+            }
+        })
+        .map(|(wrote, _)| wrote)
 }
 
 #[cfg(test)]

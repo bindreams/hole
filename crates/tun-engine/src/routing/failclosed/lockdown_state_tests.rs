@@ -184,3 +184,83 @@ fn load_enabled_is_the_reads_armed_fold() {
         "a corrupt file reads as ARMED — it is not consent to disarm"
     );
 }
+
+// promote_unrecorded --------------------------------------------------------------------------------------------------
+
+/// Each recorded intent the promotion can meet, planted as bytes, with whether it must write and what the file reads
+/// as afterwards. `On` and `Off` are recorded decisions and stay as they are.
+#[skuld::test]
+fn update_decides_on_the_classified_intent_and_writes_only_some() {
+    let cases: [(&str, Option<&[u8]>, bool, Intent); 6] = [
+        ("unset", None, true, Intent::On),
+        ("on", Some(br#"{"version":1,"enabled":true}"#), false, Intent::On),
+        ("off", Some(br#"{"version":1,"enabled":false}"#), false, Intent::Off),
+        ("corrupt", Some(b"{not json"), true, Intent::On),
+        ("newer", Some(br#"{"version":2,"enabled":false}"#), true, Intent::On),
+        ("obsolete", Some(br#"{"version":0,"enabled":false}"#), true, Intent::On),
+    ];
+    for (what, planted, wrote, after) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        if let Some(bytes) = planted {
+            write_raw(tmp.path(), bytes);
+        }
+
+        assert_eq!(promote_unrecorded(tmp.path(), None).unwrap(), wrote, "{what}");
+
+        assert_eq!(load_intent(tmp.path()), after, "{what}");
+        if !wrote {
+            let kept = std::fs::read(tmp.path().join(STATE_FILE_NAME)).unwrap();
+            assert_eq!(
+                Some(kept.as_slice()),
+                planted,
+                "{what}: a recorded intent is not rewritten"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn promote_declines_over_a_recorded_off_and_on() {
+    for (enabled, want) in [(false, Intent::Off), (true, Intent::On)] {
+        let tmp = tempfile::tempdir().unwrap();
+        set_enabled(tmp.path(), enabled, None).unwrap();
+        assert!(!promote_unrecorded(tmp.path(), None).unwrap());
+        assert_eq!(load_intent(tmp.path()), want, "a recorded value is never rewritten");
+    }
+}
+
+#[skuld::test]
+fn promote_writes_over_unset_and_unreadable() {
+    let unset = tempfile::tempdir().unwrap();
+    assert!(promote_unrecorded(unset.path(), None).unwrap());
+    assert_eq!(load_intent(unset.path()), Intent::On);
+
+    let unreadable = tempfile::tempdir().unwrap();
+    write_raw(unreadable.path(), b"{not json");
+    assert!(promote_unrecorded(unreadable.path(), None).unwrap());
+    assert_eq!(load_intent(unreadable.path()), Intent::On);
+}
+
+#[skuld::test]
+fn unblock_then_promote_leaves_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    set_enabled(tmp.path(), false, None).unwrap();
+    promote_unrecorded(tmp.path(), None).unwrap();
+    assert_eq!(load_intent(tmp.path()), Intent::Off);
+}
+
+#[skuld::test]
+fn promote_then_unblock_leaves_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    promote_unrecorded(tmp.path(), None).unwrap();
+    set_enabled(tmp.path(), false, None).unwrap();
+    assert_eq!(load_intent(tmp.path()), Intent::Off);
+}
+
+#[skuld::test]
+fn admits_adoption_promotion_is_exhaustive_per_variant() {
+    assert!(Intent::Unset.admits_adoption_promotion());
+    assert!(Intent::Unreadable.admits_adoption_promotion());
+    assert!(!Intent::On.admits_adoption_promotion());
+    assert!(!Intent::Off.admits_adoption_promotion());
+}
