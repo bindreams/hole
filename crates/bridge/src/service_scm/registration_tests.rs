@@ -68,25 +68,10 @@ fn replacing_a_registration_retires_the_old_one_by_the_same_rule() {
     assert_eq!(drops.load(Ordering::SeqCst), 1, "a settled predecessor is freed");
 }
 
-/// Runs `f` under a per-test subscriber and returns what it logged.
-fn logged_during(f: impl FnOnce()) -> String {
-    use garter::test_utils::WaitableWriter;
-    use garter::tracing_test::set_default_in_current_thread;
-
-    let writer = WaitableWriter::new();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = set_default_in_current_thread(subscriber);
-    f();
-    writer.snapshot()
-}
-
 #[skuld::test]
 fn dropping_an_unsettled_registration_logs_the_leak() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let log = logged_during(|| drop(Registration::new(Probe::new(false, &drops))));
+    let log = garter::tracing_test::captured(|| drop(Registration::new(Probe::new(false, &drops))));
     assert!(log.contains("leak"), "no leak logged: {log:?}");
     assert!(log.contains("Probe"), "the leaked type is not named: {log:?}");
 }
@@ -94,7 +79,7 @@ fn dropping_an_unsettled_registration_logs_the_leak() {
 #[skuld::test]
 fn dropping_a_settled_registration_logs_nothing() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let log = logged_during(|| drop(Registration::new(Probe::new(true, &drops))));
+    let log = garter::tracing_test::captured(|| drop(Registration::new(Probe::new(true, &drops))));
     assert_eq!(log, "");
 }
 

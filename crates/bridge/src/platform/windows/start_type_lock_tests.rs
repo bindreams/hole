@@ -292,8 +292,8 @@ fn every_hold_by_every_thread_changes_the_mark_twice() {
                 .expect("the thread");
         });
     }
-    let raw = scratch.mark().read();
-    assert_eq!(raw, ChangeMark::new(Some("8".to_string()), None));
+    ScratchChangeKey::assert_at_rest(&scratch.stored(), 8, &Stamp::current());
+    assert_eq!(scratch.mark().read().holder(), None);
 }
 
 /// No service yet (the first install): there is no key to mark, and the hold
