@@ -860,7 +860,7 @@ pub(crate) async fn run_client_session(
                                 return;
                             }
                             if let Err(e) = relay_tcp(yamux_stream, tcp_stream).await {
-                                tracing::debug!(error = &*e as &dyn std::error::Error, "tcp relay ended");
+                                tracing::debug!(error = &*e, "tcp relay ended");
                             }
                         }
                         // A closed connection is expected reconnect-window churn (the
@@ -1228,7 +1228,7 @@ pub(crate) async fn serve_driven_connection(
         // surfaces on stderr through the default hook rather than escalating.
         tokio::spawn(async move {
             if let Err(e) = handle_inbound_stream(stream, remote).await {
-                tracing::debug!(error = &*e as &dyn std::error::Error, "inbound stream handler ended");
+                tracing::debug!(error = &*e, "inbound stream handler ended");
             }
         });
     }
