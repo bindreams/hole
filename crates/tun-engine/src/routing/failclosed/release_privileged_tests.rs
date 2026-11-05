@@ -588,7 +588,7 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
     cover.disarm();
 
     // Corrupt Hole's own state file — not a system file — so the real
-    // `load_presence` reads it as `Unusable`, not `Present`.
+    // `pf_record::read` reads it as `Unusable`, not `Present`.
     std::fs::write(dir.path().join(super::lockdown_pf_state::STATE_FILE_NAME), b"not json").unwrap();
 
     routing
