@@ -56,11 +56,10 @@ fn the_boottime_witness_is_not_written_through_a_symlinked_state_directory() {
 #[skuld::test]
 #[cfg(target_os = "macos")]
 fn failclosed_state_is_not_written_through_a_symlinked_state_directory() {
-    use super::failclosed_state::{save, FailClosedState, SCHEMA_VERSION, STATE_FILE_NAME};
+    use super::failclosed_state::{save, FailClosedState, STATE_FILE_NAME};
     let (_tmp, scratch, state_dir) = state_dir_linked_to_the_system();
     let before = present(&scratch, &[STATE_FILE_NAME]);
     let state = FailClosedState {
-        version: SCHEMA_VERSION,
         pf_token: "1".into(),
         pf_was_enabled: true,
     };
@@ -77,11 +76,10 @@ fn failclosed_state_is_not_written_through_a_symlinked_state_directory() {
 #[skuld::test]
 #[cfg(target_os = "macos")]
 fn lockdown_pf_state_is_not_written_through_a_symlinked_state_directory() {
-    use super::lockdown_pf_state::{save, LockdownPfState, SCHEMA_VERSION, STATE_FILE_NAME};
+    use super::lockdown_pf_state::{save, LockdownPfState, STATE_FILE_NAME};
     let (_tmp, scratch, state_dir) = state_dir_linked_to_the_system();
     let before = present(&scratch, &[STATE_FILE_NAME]);
     let state = LockdownPfState {
-        version: SCHEMA_VERSION,
         pf_token: "1".into(),
         main_snapshot: String::new(),
         nat_snapshot: String::new(),
@@ -159,15 +157,10 @@ fn pf_readers() -> Vec<(&'static str, Reader<'static>)> {
             Reader {
                 file: failclosed_state::STATE_FILE_NAME,
                 write_valid: &|dir| {
-                    let state = failclosed_state::FailClosedState {
-                        version: failclosed_state::SCHEMA_VERSION,
-                        pf_token: "1".into(),
-                        pf_was_enabled: true,
-                    };
                     write_state(
                         dir,
                         failclosed_state::STATE_FILE_NAME,
-                        &serde_json::to_vec(&state).unwrap(),
+                        br#"{"version":1,"pf_token":"1","pf_was_enabled":true}"#,
                     );
                 },
                 reads_it: &|dir| matches!(failclosed_state::load_presence(dir), StateFile::Present(_)),
@@ -178,17 +171,10 @@ fn pf_readers() -> Vec<(&'static str, Reader<'static>)> {
             Reader {
                 file: lockdown_pf_state::STATE_FILE_NAME,
                 write_valid: &|dir| {
-                    let state = lockdown_pf_state::LockdownPfState {
-                        version: lockdown_pf_state::SCHEMA_VERSION,
-                        pf_token: "1".into(),
-                        main_snapshot: String::new(),
-                        nat_snapshot: String::new(),
-                        main_snapshot_captured: false,
-                    };
                     write_state(
                         dir,
                         lockdown_pf_state::STATE_FILE_NAME,
-                        &serde_json::to_vec(&state).unwrap(),
+                        br#"{"version":1,"pf_token":"1","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":false}"#,
                     );
                 },
                 reads_it: &|dir| matches!(lockdown_pf_state::load_presence(dir), StateFile::Present(_)),
@@ -291,7 +277,7 @@ fn parse_failure_readers() -> Vec<ParseFailureReader> {
         readers.push((
             "failclosed_state::load_presence",
             failclosed_state::STATE_FILE_NAME,
-            r#""version":"#,
+            r#""version":1,"pf_token":"1","pf_was_enabled":"#,
             |dir| {
                 let _ = failclosed_state::load_presence(dir);
             },
@@ -299,7 +285,7 @@ fn parse_failure_readers() -> Vec<ParseFailureReader> {
         readers.push((
             "lockdown_pf_state::load_presence",
             lockdown_pf_state::STATE_FILE_NAME,
-            r#""version":"#,
+            r#""version":1,"pf_token":"1","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":"#,
             |dir| {
                 let _ = lockdown_pf_state::load_presence(dir);
             },

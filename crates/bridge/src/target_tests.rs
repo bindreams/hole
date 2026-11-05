@@ -1002,8 +1002,7 @@ fn the_state_file_writers_never_chown_chmod_or_rename_by_path() {
             .filter(|(_, line)| !line.trim_start().starts_with("//"))
             .collect();
         assert!(
-            code.iter()
-                .any(|(_, line)| line.contains(".update(") || line.contains("write_state_file(")),
+            code.iter().any(|(_, line)| line.contains(".update(")),
             "{writer} no longer writes through the directory handle"
         );
         for (idx, line) in code {

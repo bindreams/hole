@@ -63,6 +63,7 @@ use std::path::Path;
 use super::super::{run_capturing, BestEffortPhase, FatalPhase, Phase};
 use crate::error::RoutingError;
 use util::system_tool::SystemTool;
+use util::versioned_file::{StoreError, UpdateOutcome};
 // `macos.rs` is mounted as `mod platform` under `failclosed`, so `super` is the
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
@@ -603,7 +604,6 @@ fn engage_with(
     //    `bridge-failclosed.json` and the last fallible step, so a failed save
     //    leaves no partial file for a later sweep to act on.
     let st = state::FailClosedState {
-        version: state::SCHEMA_VERSION,
         pf_token: token.clone(),
         pf_was_enabled: was_enabled,
     };
@@ -765,7 +765,7 @@ fn disengage(token: Option<&str>, state_dir: &Path, adopting: bool) {
         ),
     }
     if restore_confirmed(adopting, &reload) {
-        if let Err(e) = state::clear(state_dir) {
+        if let Err(e) = cleared("failclosed-state", state::clear(state_dir)) {
             tracing::warn!(error = %util::error_chain::error_chain(&e), "failclosed-state clear failed during cover disengage");
         }
     } else {
@@ -800,7 +800,7 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// opposite facts. `Absent` is "no cover was ever engaged". `Unusable` is
 /// Hole's own unreconciled record that one WAS engaged and never confirmed
 /// released — a corrupt file, a truncated write, or a version skew (a rollback
-/// across a bumped [`state::SCHEMA_VERSION`]). Collapsing it would leave a
+/// across a bumped schema version). Collapsing it would leave a
 /// crashed covered run's `block out all` on the host with the automatic sweep
 /// declining to act, and only the manual `bridge unlock` left to escape — the
 /// same conflation `release_all_with` already refuses to make.
@@ -890,7 +890,6 @@ fn persist_baseline(
     lockdown_state::save(
         state_dir,
         &lockdown_state::LockdownPfState {
-            version: lockdown_state::SCHEMA_VERSION,
             pf_token: token.to_owned(),
             main_snapshot: if captured { main_snapshot } else { String::new() },
             nat_snapshot: nat_snapshot.clone(),
@@ -949,7 +948,6 @@ pub fn engage_lockdown(
             let st = persisted.expect("Reenable implies persisted state");
             let token = enable_pf_capture_token()?;
             let fresh = lockdown_state::LockdownPfState {
-                version: lockdown_state::SCHEMA_VERSION,
                 pf_token: token.clone(),
                 main_snapshot: st.main_snapshot,
                 nat_snapshot: st.nat_snapshot.clone(),
@@ -1516,13 +1514,22 @@ impl PfOps for RealPfOps<'_> {
     }
 
     fn clear_transient(&mut self) -> Result<(), RoutingError> {
-        state::clear(self.state_dir)
-            .map_err(|e| RoutingError::RouteSetup(format!("failclosed-state clear failed: {e}")))
+        cleared("failclosed-state", state::clear(self.state_dir))
     }
 
     fn clear_standing(&mut self) -> Result<(), RoutingError> {
-        lockdown_state::clear(self.state_dir)
-            .map_err(|e| RoutingError::RouteSetup(format!("lockdown-pf-state clear failed: {e}")))
+        cleared("lockdown-pf-state", lockdown_state::clear(self.state_dir))
+    }
+}
+
+/// A state record's clear as a best-effort step's result: a record whose read failed is kept, which is a failed clear.
+fn cleared(what: &str, result: Result<UpdateOutcome, StoreError>) -> Result<(), RoutingError> {
+    match result {
+        Ok(UpdateOutcome::Kept) => Err(RoutingError::RouteSetup(format!(
+            "{what} could not be read and was left in place"
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) => Err(RoutingError::RouteSetup(format!("{what} clear failed: {e}"))),
     }
 }
 

@@ -199,11 +199,10 @@ fn macos_writers() -> Vec<Writer> {
             runs_here: true,
             run: |dir, owner| {
                 let state = failclosed_state::FailClosedState {
-                    version: failclosed_state::SCHEMA_VERSION,
                     pf_token: "0".to_owned(),
                     pf_was_enabled: false,
                 };
-                failclosed_state::save(dir, &state, owner)
+                failclosed_state::save(dir, &state, owner).map_err(io::Error::other)
             },
         },
         Writer {
@@ -212,7 +211,10 @@ fn macos_writers() -> Vec<Writer> {
             names: &[failclosed_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| failclosed_state::clear(dir),
+            run: |dir, _| match failclosed_state::clear(dir).map_err(io::Error::other)? {
+                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+                _ => Ok(()),
+            },
         },
         Writer {
             name: "the pf lockdown state, saved",
@@ -222,13 +224,12 @@ fn macos_writers() -> Vec<Writer> {
             runs_here: true,
             run: |dir, owner| {
                 let state = lockdown_pf_state::LockdownPfState {
-                    version: lockdown_pf_state::SCHEMA_VERSION,
                     pf_token: "0".to_owned(),
                     main_snapshot: String::new(),
                     nat_snapshot: String::new(),
                     main_snapshot_captured: true,
                 };
-                lockdown_pf_state::save(dir, &state, owner)
+                lockdown_pf_state::save(dir, &state, owner).map_err(io::Error::other)
             },
         },
         Writer {
@@ -237,7 +238,10 @@ fn macos_writers() -> Vec<Writer> {
             names: &[lockdown_pf_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| lockdown_pf_state::clear(dir),
+            run: |dir, _| match lockdown_pf_state::clear(dir).map_err(io::Error::other)? {
+                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+                _ => Ok(()),
+            },
         },
     ]
 }

@@ -8,6 +8,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use crate::error::RoutingError;
+use util::versioned_file::Loaded;
 
 /// The one port the resolver permit ever needs: `doh_url_for_ip` in
 /// `hole_bridge::dns::ech` never constructs a URL with any other port
@@ -73,6 +74,21 @@ impl<T> StateFile<T> {
             .and_then(|v| v.get("pf_token")?.as_str().map(str::to_owned))
             .filter(|t| !t.is_empty());
         Self::Unusable { pf_token }
+    }
+}
+
+/// The fold of a read into the sweep's trichotomy: a record that is not `Current` keeps whatever token its bytes
+/// still hold, and a read that failed has no bytes.
+impl<T> From<Loaded<T>> for StateFile<T> {
+    fn from(loaded: Loaded<T>) -> Self {
+        match loaded {
+            Loaded::Current { value, .. } => StateFile::Present(value),
+            Loaded::Absent => StateFile::Absent,
+            Loaded::Obsolete { raw, .. } => StateFile::unusable(raw.as_bytes()),
+            Loaded::Newer { raw, .. } => StateFile::unusable(raw.as_bytes()),
+            Loaded::Corrupt { raw, .. } => StateFile::unusable(raw.as_bytes()),
+            Loaded::Unreadable { .. } => StateFile::Unusable { pf_token: None },
+        }
     }
 }
 
@@ -1088,6 +1104,11 @@ mod facade_tests;
 #[cfg(test)]
 #[path = "failclosed/state_symlink_tests.rs"]
 mod state_symlink_tests;
+
+// Not platform-gated: the fold of a read into `StateFile` is platform-free.
+#[cfg(test)]
+#[path = "failclosed/state_file_tests.rs"]
+mod state_file_tests;
 
 // Deliberately NOT platform-gated. The clearance fold is the decision the
 // uninstall gate reads, and the key class it exists for is Windows-only — so
