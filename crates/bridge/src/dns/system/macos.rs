@@ -197,7 +197,11 @@ fn log_flush_step(tool: SystemTool, outcome: io::Result<std::process::ExitStatus
         Ok(status) if status.success() => {}
         Ok(status) => tracing::warn!(tool = tool.name(), %status, "DNS cache flush step exited unsuccessfully"),
         Err(error) => {
-            tracing::warn!(tool = tool.name(), error = %util::error_chain::error_chain(&error), "DNS cache flush step failed to run")
+            tracing::warn!(
+                tool = tool.name(),
+                error = &error as &dyn std::error::Error,
+                "DNS cache flush step failed to run"
+            )
         }
     }
 }
@@ -323,7 +327,7 @@ impl SteeringHandle for tun_engine::dns_steer::Steering {
         let inner = *self;
         let key = inner.key().to_string();
         inner.withdraw().map_err(|e| {
-            tracing::warn!(key = %key, error = %util::error_chain::error_chain(&e), "dns_steer: withdraw failed");
+            tracing::warn!(key = %key, error = &e as &dyn std::error::Error, "dns_steer: withdraw failed");
             io::Error::other(e)
         })
     }

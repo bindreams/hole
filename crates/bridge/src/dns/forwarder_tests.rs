@@ -650,38 +650,22 @@ async fn throttle_logs_first_n_then_suppresses() {
 // Error-chain errno extraction ========================================================================================
 
 #[skuld::test]
-fn first_os_errno_walks_nested_io_error() {
-    // Simulate the tokio-rustls shape: outer io::Error wrapping an
-    // inner io::Error that carries a raw_os_error (as rustls would from
-    // a real ECONNRESET on the underlying stream).
-    let inner = io::Error::from_raw_os_error(10054); // WSAECONNRESET
-    let outer = io::Error::other(inner);
-    assert_eq!(first_os_errno(&outer), Some(10054));
+fn upstream_err_records_the_os_errno_of_a_nested_io_error() {
+    // The tokio-rustls shape: an outer io::Error wrapping an inner one that carries the
+    // errno of a real ECONNRESET on the underlying stream.
+    let source = io::Error::other(io::Error::from_raw_os_error(10054)); // WSAECONNRESET
+    assert_eq!(UpstreamErr::new(UpstreamLayer::Io, source).os_errno, Some(10054));
 }
 
 #[skuld::test]
-fn first_os_errno_returns_none_for_pure_custom_error() {
-    // tokio-rustls's `tls handshake eof` is a Custom error with no
-    // inner raw_os_error — represents a graceful FIN, not an RST.
-    let e = io::Error::new(io::ErrorKind::UnexpectedEof, "tls handshake eof");
-    assert_eq!(first_os_errno(&e), None);
+fn upstream_err_has_no_os_errno_for_a_custom_error() {
+    // tokio-rustls's `tls handshake eof` is a Custom error with no inner errno:
+    // a graceful FIN, not an RST.
+    let source = io::Error::new(io::ErrorKind::UnexpectedEof, "tls handshake eof");
+    assert_eq!(UpstreamErr::new(UpstreamLayer::Tls, source).os_errno, None);
 }
 
-// Rustls-error extraction + cause classification ======================================================================
-
-#[skuld::test]
-fn first_rustls_error_found_through_tokio_rustls_wrapper() {
-    // tokio-rustls's exact wrap shape — see first_rustls_error's doc.
-    let inner = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
-    let outer = io::Error::new(io::ErrorKind::InvalidData, inner.clone());
-    assert_eq!(first_rustls_error(&outer), Some(&inner));
-}
-
-#[skuld::test]
-fn first_rustls_error_is_none_for_plain_socket_error() {
-    let e = io::Error::from_raw_os_error(10054); // WSAECONNRESET
-    assert_eq!(first_rustls_error(&e), None);
-}
+// Cause classification ================================================================================================
 
 #[skuld::test]
 fn cause_of_tls_layer_with_a_trust_chain_rejection_is_certificate_rejected() {
@@ -1121,7 +1105,7 @@ mod typed_error_logs {
     }
 
     /// A connect error whose own text omits its cause still has that cause in
-    /// `caused_by`: it is reachable only through `source()`.
+    /// `caused_by.sources`: it is reachable only through `source()`.
     #[skuld::test]
     async fn upstream_failure_log_names_a_cause_only_source_carries() {
         let writer = VecWriter::new();
@@ -1144,8 +1128,8 @@ mod typed_error_logs {
 
         let output = writer.snapshot_string();
         assert!(
-            output.contains(&format!("-> {}", crate::test_support::MOCK_ROOT_CAUSE)),
-            "caused_by must carry the root cause after ` -> `; got:
+            output.contains(&format!("caused_by.sources=[{}]", crate::test_support::MOCK_ROOT_CAUSE)),
+            "caused_by.sources must carry the root cause; got:
 {output}"
         );
     }

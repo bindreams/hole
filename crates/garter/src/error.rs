@@ -1,6 +1,6 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error(transparent)]
+    #[error("{0}")]
     Io(#[from] std::io::Error),
 
     #[error("plugin '{name}' exited with code {code}")]
@@ -27,10 +27,10 @@ pub enum Error {
     MalformedOptions(#[from] crate::sip003::MalformedOptions),
 
     /// Subprocess management — spawning a plugin under containment, signalling it,
-    /// tearing its tree down. Transparent rather than flattened into
+    /// tearing its tree down. Typed rather than flattened into
     /// [`Error::Chain`]: a caller that needs the distinction should read the type,
     /// not parse a message back into one.
-    #[error(transparent)]
+    #[error("{0}")]
     Cosca(#[from] cosca::error::Error),
 }
 

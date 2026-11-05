@@ -94,7 +94,10 @@ pub(crate) async fn open_probe(open_tx: &mpsc::Sender<OpenStreamReply>, nonce: u
             return None;
         }
         Err(e) => {
-            tracing::warn!(error = %e, "failed to open the keepalive substream");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "failed to open the keepalive substream"
+            );
             return None;
         }
     };
@@ -103,11 +106,19 @@ pub(crate) async fn open_probe(open_tx: &mpsc::Sender<OpenStreamReply>, nonce: u
     request[0] = StreamTag::Keepalive.to_byte();
     request[1..].copy_from_slice(&nonce.to_be_bytes());
     if let Err(e) = stream.write_all(&request).await {
-        tracing::debug!(nonce, error = %e, "keepalive probe could not be written");
+        tracing::debug!(
+            nonce,
+            error = &e as &dyn std::error::Error,
+            "keepalive probe could not be written"
+        );
         return None;
     }
     if let Err(e) = stream.flush().await {
-        tracing::debug!(nonce, error = %e, "keepalive probe could not be flushed");
+        tracing::debug!(
+            nonce,
+            error = &e as &dyn std::error::Error,
+            "keepalive probe could not be flushed"
+        );
         return None;
     }
     Some(stream)
@@ -132,7 +143,11 @@ async fn elicit(open_tx: &mpsc::Sender<OpenStreamReply>, nonce: u64) {
     match stream.read(&mut sink).await {
         Ok(0) => tracing::debug!(nonce, "keepalive probe substream ended"),
         Ok(_) => {}
-        Err(e) => tracing::debug!(nonce, error = %e, "keepalive probe read failed"),
+        Err(e) => tracing::debug!(
+            nonce,
+            error = &e as &dyn std::error::Error,
+            "keepalive probe read failed"
+        ),
     }
 }
 

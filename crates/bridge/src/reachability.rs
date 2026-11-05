@@ -132,7 +132,10 @@ pub async fn probe_server_reachability(
     let transport = match classify_transport(plugin, plugin_opts, host) {
         Ok(t) => t,
         Err(e) => {
-            debug!(error = %util::error_chain::error_chain(&e), "malformed SS_PLUGIN_OPTIONS in reachability probe");
+            debug!(
+                error = &e as &dyn std::error::Error,
+                "malformed SS_PLUGIN_OPTIONS in reachability probe"
+            );
             return ReachabilityVerdict::Inconclusive;
         }
     };
@@ -231,7 +234,10 @@ async fn first_flight_tls(stream: TcpStream, sni: &str) -> ReachabilityVerdict {
     let name = match ServerName::try_from(sni.to_string()) {
         Ok(n) => n,
         Err(e) => {
-            debug!(error = %util::error_chain::error_chain(&e), sni, "reachability probe: unparseable SNI");
+            debug!(
+                error = &e as &dyn std::error::Error,
+                sni, "reachability probe: unparseable SNI"
+            );
             return ReachabilityVerdict::Inconclusive;
         }
     };
@@ -339,7 +345,7 @@ async fn probe_quic(host: &str, port: u16, sni: &str) -> ReachabilityVerdict {
     let mut ep = match Endpoint::client(bind.parse().unwrap()) {
         Ok(e) => e,
         Err(e) => {
-            debug!(error = %util::error_chain::error_chain(&e), "quic probe: endpoint bind failed");
+            debug!(error = &e as &dyn std::error::Error, "quic probe: endpoint bind failed");
             return ReachabilityVerdict::Inconclusive;
         }
     };
@@ -348,7 +354,7 @@ async fn probe_quic(host: &str, port: u16, sni: &str) -> ReachabilityVerdict {
     let qcc = match quinn::crypto::rustls::QuicClientConfig::try_from(tls) {
         Ok(c) => c,
         Err(e) => {
-            debug!(error = %util::error_chain::error_chain(&e), "quic probe: client config failed");
+            debug!(error = &e as &dyn std::error::Error, "quic probe: client config failed");
             return ReachabilityVerdict::Inconclusive;
         }
     };
@@ -356,7 +362,7 @@ async fn probe_quic(host: &str, port: u16, sni: &str) -> ReachabilityVerdict {
     let connecting = match ep.connect(addr, sni) {
         Ok(c) => c,
         Err(e) => {
-            debug!(error = %util::error_chain::error_chain(&e), "quic probe: connect setup failed");
+            debug!(error = &e as &dyn std::error::Error, "quic probe: connect setup failed");
             return ReachabilityVerdict::Inconclusive;
         }
     };

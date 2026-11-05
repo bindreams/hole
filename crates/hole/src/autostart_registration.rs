@@ -109,7 +109,10 @@ pub fn migrate(app_name: &str, flag: &str) -> std::io::Result<Outcome> {
         Err(e) => {
             // Present but not a string: a foreign or corrupted write. Nothing of
             // ours to edit, but loud enough to tell apart from plain absence.
-            tracing::warn!(error = %util::error_chain::error_chain(&e), "autostart Run value is not readable as a string");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "autostart Run value is not readable as a string"
+            );
             None
         }
     };

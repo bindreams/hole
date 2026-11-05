@@ -30,8 +30,8 @@ pub(crate) fn spawn_default() {
         .map(|_| ())
         .unwrap_or_else(|e| {
             tracing::warn!(
-                "could not spawn orphan-sweep thread: {error}",
-                error = util::error_chain::error_chain(&e)
+                error = &e as &dyn std::error::Error,
+                "could not spawn orphan-sweep thread"
             );
         });
 }
@@ -54,9 +54,9 @@ pub(crate) fn sweep(dir: &Path, max_age: Duration, max_delete: usize) -> usize {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
-                "orphan_sweep: read_dir({}) failed: {error}",
-                dir.display(),
-                error = util::error_chain::error_chain(&e)
+                error = &e as &dyn std::error::Error,
+                "orphan_sweep: read_dir({}) failed",
+                dir.display()
             );
             return 0;
         }
@@ -93,9 +93,9 @@ pub(crate) fn sweep(dir: &Path, max_age: Duration, max_delete: usize) -> usize {
         };
         if let Err(e) = result {
             tracing::warn!(
-                "orphan_sweep: failed to remove {}: {error}",
-                path.display(),
-                error = util::error_chain::error_chain(&e)
+                error = &e as &dyn std::error::Error,
+                "orphan_sweep: failed to remove {}",
+                path.display()
             );
             continue;
         }

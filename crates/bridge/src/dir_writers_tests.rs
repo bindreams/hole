@@ -99,23 +99,17 @@ impl std::error::Error for LeftAsItIs {}
 /// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's, a
 /// versioned file's decision to leave a file it cannot read as it is, or the update marker's refusal to stamp one.
 fn is_a_refusal(err: &io::Error) -> bool {
-    let mut current = err.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static));
-    while let Some(error) = current {
+    util::error::links(err).any(|link| {
         let versioned_file_left_it = matches!(
-            error.downcast_ref::<StoreError>(),
+            link.downcast_ref::<StoreError>(),
             Some(StoreError::Unreadable { .. } | StoreError::ReadFailed { .. })
         );
-        if error.downcast_ref::<Refusal>().is_some()
-            || error.downcast_ref::<file_lock::Refused>().is_some()
-            || error.downcast_ref::<LeftAsItIs>().is_some()
-            || error.downcast_ref::<update_marker::NoMarkerToStamp>().is_some()
+        link.downcast_ref::<Refusal>().is_some()
+            || link.downcast_ref::<file_lock::Refused>().is_some()
+            || link.downcast_ref::<LeftAsItIs>().is_some()
+            || link.downcast_ref::<update_marker::NoMarkerToStamp>().is_some()
             || versioned_file_left_it
-        {
-            return true;
-        }
-        current = error.source();
-    }
-    false
+    })
 }
 
 /// What the folder shows after a writer ran at a planted name.
@@ -621,6 +615,20 @@ fn no_writer_changes_the_file_a_planted_name_leads_to() {
             }
         }
     }
+}
+
+#[skuld::test]
+fn a_store_writer_below_a_state_directory_that_is_a_link_is_refused_with_a_refusal() {
+    let writer = writers_here()
+        .into_iter()
+        .find(|writer| writer.name == "the route record, written")
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+    let err = (writer.run)(&state, owner()).unwrap_err();
+
+    assert!(is_a_refusal(&err), "not a refusal: {err:?}");
 }
 
 // What a made folder does to the next run -----------------------------------------------------------------------------

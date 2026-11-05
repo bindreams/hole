@@ -102,7 +102,7 @@ fn default_net_query_failed(default_net_error: String) -> GatewayError {
 
 /// The OS index of the default interface `name`, which `default-net` reported
 /// at `default_net_index`. A failed lookup is logged with that index, as the
-/// Windows path does: the error's `Display` omits it, and `error_chain` renders
+/// Windows path does: the error's `Display` omits it, and a logged error chain renders
 /// `Display` only.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn index_or_unavailable(
@@ -113,7 +113,7 @@ fn index_or_unavailable(
     lookup(name).map_err(|source| {
         warn!(
             interface_index = default_net_index,
-            error = %util::error_chain::error_chain(&source),
+            error = &source as &dyn std::error::Error,
             "the default interface's name does not resolve to an OS index"
         );
         GatewayError::InterfaceNameUnavailable {

@@ -63,7 +63,10 @@ impl RecordKey {
             Ok(value) => Read::Present(String::try_from(value).ok().and_then(|text| Stamp::decode(&text))),
             Err(error) if missing(&error) => Read::Absent,
             Err(error) => {
-                warn!(%error, "could not read whether a change disabled the service; counting it as present");
+                warn!(
+                    error = &error as &dyn std::error::Error,
+                    "could not read whether a change disabled the service; counting it as present"
+                );
                 Read::Present(None)
             }
         }
@@ -87,7 +90,10 @@ impl RecordKey {
             Read::Present(Some(stamp)) => {
                 let running = stamp.is_running();
                 if let Err(error) = &running {
-                    warn!(%error, "could not tell whether the process changing the service is running; counting it as gone");
+                    warn!(
+                        error = error as &dyn std::error::Error,
+                        "could not tell whether the process changing the service is running; counting it as gone"
+                    );
                 }
                 Some(Changer::of(running))
             }
