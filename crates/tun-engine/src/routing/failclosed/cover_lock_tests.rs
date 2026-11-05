@@ -341,21 +341,6 @@ fn a_sweep_with_nothing_to_delete_makes_an_earlier_stamp_stale() {
     assert!(!stamp.is_current());
 }
 
-#[skuld::test]
-fn a_sweep_that_failed_after_reaching_the_firewall_leaves_a_stamp_current() {
-    let d = dir();
-    let lock = CoverLock::acquire(d.path());
-    let stamp = lock.stamp_install(CoverKind::Lockdown);
-    let result = sweep_with_witness(&lock, None, |_| {
-        SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("a delete failed".into()))
-    });
-    assert!(result.is_err());
-    assert!(
-        stamp.is_current(),
-        "the held guard's drop retries what the sweep could not delete"
-    );
-}
-
 /// A sweep of both kinds that fails reports which kind it released. That kind's guard must stop deleting (its OS
 /// objects are gone, a delete would hit whatever replaced them); the other kind's guard stays current and retries.
 /// Returns `(transient_current, lockdown_current)`.

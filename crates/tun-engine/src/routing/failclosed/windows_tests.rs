@@ -1046,7 +1046,7 @@ fn a_release_all_whose_deletes_failed_for_both_kinds_releases_neither() {
 
 #[skuld::test]
 fn a_release_all_that_found_nothing_to_delete_releases_both_kinds() {
-    let outcome = release_verdict_over(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0);
+    let outcome = release_verdict_over(FWP_E_FILTER_NOT_FOUND_DWORD, FWP_E_FILTER_NOT_FOUND_DWORD);
     assert_eq!(outcome.released(), [CoverKind::Lockdown, CoverKind::Transient]);
     assert!(outcome.into_result().is_ok());
 }
