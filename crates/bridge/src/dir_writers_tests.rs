@@ -144,7 +144,6 @@ struct Writer {
 }
 
 const LOCK_NAME: &str = "writers.lock";
-const STATE_NAME: &str = "state.json";
 const LOG_NAME: &str = "bridge.log";
 const LOG_ROTATED_NAME: &str = "bridge.log.1";
 const LOG_FALLBACK_NAME: &str = "bridge.log.1.fallback";
@@ -303,14 +302,6 @@ fn writers() -> Vec<Writer> {
             run: |dir, owner| file_lock::Exclusive::acquire(&dir.join(LOCK_NAME), owner).map(drop),
         },
         Writer {
-            name: "write_state_file",
-            sources: &["crates/util/src/dir.rs"],
-            names: &[STATE_NAME],
-            at_a_planted_name: AtAPlantedName::Replaces,
-            runs_here: true,
-            run: |dir, owner| util::dir::write_state_file(dir, OsStr::new(STATE_NAME), b"{}", owner),
-        },
-        Writer {
             name: "the route record, written",
             sources: &[
                 "crates/util/src/versioned_file/store.rs",
@@ -434,7 +425,8 @@ fn writers() -> Vec<Writer> {
         },
         Writer {
             name: "the socket, bound",
-            sources: &["crates/bridge/src/socket.rs"],
+            // `dir.rs`: `make_dir_and_free_name`, which the bind makes its room with.
+            sources: &["crates/bridge/src/socket.rs", "crates/util/src/dir.rs"],
             names: &[SOCKET_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
@@ -1179,7 +1171,7 @@ fn no_privileged_state_code_reads_a_file_by_path() {
 
     assert!(
         hits.is_empty(),
-        "a privileged read opens a file by path: use `util::dir::read_state_file` (or a `Dir`), or add the file to BY_PATH_ALLOWED with the reason: {hits:#?}"
+        "a privileged read opens a file by path: use `ReadDir::read_vouched` (or `VersionedFile::observe`), or add the file to BY_PATH_ALLOWED with the reason: {hits:#?}"
     );
 }
 
@@ -1203,7 +1195,7 @@ fn the_by_path_scan_tells_a_read_from_a_comment() {
         ["std::fs::File::open"]
     );
     assert!(by_path_reads("    // `std::fs::read(path)` is what this replaces").is_empty());
-    assert!(by_path_reads("util::dir::read_state_file(dir, name)").is_empty());
+    assert!(by_path_reads("util::dir::ReadDir::open(dir)?.read_vouched(name)").is_empty());
 }
 
 #[skuld::test]
@@ -1618,8 +1610,6 @@ fn sources_in(dir: &Path, found: &mut Vec<PathBuf>) {
 /// write or remove through `util::dir`, or write a versioned file, which stages through one.
 const WRITES_A_DIR: &[&str] = &[
     "Dir::open*",
-    "write_state_file",
-    "remove_state_file",
     "make_dir_and_free_name",
     "VersionedFile::new",
     ".append_own_file",
@@ -1649,8 +1639,8 @@ fn every_file_that_opens_a_dir_has_a_row() {
         .filter(|path| opens_a_dir(&std::fs::read_to_string(path).unwrap()))
         .map(|path| path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
         .collect();
-    // `util::dir` itself is a source file of the walk, not a user of it, but `write_state_file` lives in `dir.rs`:
-    // the scan skips the folder `dir/` and keeps `dir.rs`.
+    // `util::dir` itself is a source file of the walk, not a user of it, but `make_dir_and_free_name` lives in
+    // `dir.rs`: the scan skips the folder `dir/` and keeps `dir.rs`.
     opening.sort();
     let mut listed: Vec<String> = writers()
         .iter()
@@ -1667,27 +1657,25 @@ fn every_file_that_opens_a_dir_has_a_row() {
 
 #[skuld::test]
 fn the_completeness_scan_sees_every_way_to_write_into_a_state_directory() {
-    assert!(opens_a_dir("util::dir::write_state_file(dir, name, bytes, owner)"));
-    assert!(opens_a_dir(
-        "use util::dir::write_state_file;
-write_state_file(dir, name, bytes, owner)?;"
-    ));
-    assert!(opens_a_dir("util::dir::remove_state_file(dir, name)"));
     assert!(opens_a_dir("util::dir::make_dir_and_free_name(dir, name)"));
+    assert!(opens_a_dir(
+        "use util::dir::make_dir_and_free_name;
+make_dir_and_free_name(dir, name)?;"
+    ));
     assert!(opens_a_dir("VersionedFile::<State>::new(dir)"));
     assert!(opens_a_dir(
         "let dir = util::dir::Dir::open_as(path, true, owner, caller)?;"
     ));
     assert!(opens_a_dir("dir.write_atomic(name, bytes, owner, |_| Ok(()))"));
     // A function named as a value, or a type reached through an alias.
-    assert!(opens_a_dir("names.iter().for_each(util::dir::remove_state_file);"));
-    assert!(opens_a_dir("let w = util::dir::write_state_file;"));
+    assert!(opens_a_dir("names.iter().for_each(util::dir::make_dir_and_free_name);"));
+    assert!(opens_a_dir("let w = util::dir::make_dir_and_free_name;"));
     assert!(opens_a_dir(
         "type D = util::dir::Dir;
 let dir = D::open(path, true, None)?;"
     ));
     // Reading a state file writes nothing.
-    assert!(!opens_a_dir("util::dir::read_state_file(dir, name)"));
+    assert!(!opens_a_dir("util::dir::ReadDir::open(dir)?.read_vouched(name)"));
 }
 
 #[skuld::test]
@@ -2252,7 +2240,7 @@ let f = ufs::lchown;"
     assert_eq!(sites("dir.unlink(name)?;"), 0);
     assert_eq!(sites("dir.rename(from, to)?;"), 0);
     assert_eq!(sites("self.fs.remove_file(&dir, name)"), 0);
-    assert_eq!(sites("util::dir::remove_state_file(dir, name)?;"), 0);
+    assert_eq!(sites("crate::socket::remove_name(dir, name)?;"), 0);
     assert_eq!(sites("fs::read_dir(path)?;"), 0);
     assert_eq!(
         sites(

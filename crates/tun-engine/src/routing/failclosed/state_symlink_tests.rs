@@ -118,7 +118,10 @@ use util::dir::testing::{planted_name_is_not_read, PlantedName, Reader};
 
 #[cfg(target_os = "macos")]
 fn write_state(dir: &std::path::Path, name: &str, json: &[u8]) {
-    util::dir::write_state_file(dir, std::ffi::OsStr::new(name), json, None).unwrap();
+    util::dir::Dir::open(dir, true, None)
+        .unwrap()
+        .write_atomic(std::ffi::OsStr::new(name), json, None, |_| Ok(()))
+        .unwrap();
 }
 
 /// The readers by name, and what each reports of a valid file.

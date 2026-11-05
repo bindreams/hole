@@ -192,7 +192,7 @@ fn create_new_takes_no_lock_and_leaves_the_generation() {
 // observe -------------------------------------------------------------------------------------------------------------
 
 /// A second name for a file is read only when the folder's owner can vouch for it. A test cannot make a file the
-/// system owns without being the system, so the case is stated for any runner (as `read_state_file`'s is).
+/// system owns without being the system, so the case is stated for any runner (as `read_vouched`'s is).
 #[skuld::test]
 fn observe_applies_the_vouched_file_rule() {
     let dir = dir();

@@ -463,113 +463,37 @@ fn write_atomic_replaces_a_hard_link_by_name_and_leaves_the_other_name_alone() {
     assert_eq!(std::fs::read(tmp.path().join("state.json")).unwrap(), b"new");
 }
 
-// write_state_file ====================================================================================================
+// read_vouched ========================================================================================================
 
-#[skuld::test]
-fn write_state_file_creates_the_directory_and_writes_the_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = tmp.path().join("hole").join("state");
-
-    write_state_file(&state, &name("bridge-x.json"), b"{}", None).unwrap();
-
-    assert_eq!(std::fs::read(state.join("bridge-x.json")).unwrap(), b"{}");
-    assert_eq!(names(&state), vec![name("bridge-x.json")]);
+/// The whole file `file` in `dir`, read the way a privileged state reader opens its folder.
+fn read_vouched(dir: &Path, file: &OsStr) -> io::Result<Vec<u8>> {
+    ReadDir::open(dir)?.read_vouched(file)
 }
 
 #[skuld::test]
-fn write_state_file_refuses_a_link_to_a_folder_the_system_owns_and_writes_nothing_there() {
-    let tmp = tempfile::tempdir().unwrap();
-    let scratch = SystemScratch::new();
-    let state = tmp.path().join("state");
-    plant_link(scratch.root(), &state);
-    let file = format!("{}.json", scratch.path().display());
-
-    let err = write_state_file(&state, OsStr::new(&file), b"{}", None).unwrap_err();
-
-    assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink));
-    assert!(
-        !Path::new(&file).exists(),
-        "a state file was written in the system's folder"
-    );
-}
-
-// remove_state_file ===================================================================================================
-
-#[skuld::test]
-fn remove_state_file_removes_the_file_and_only_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("bridge-x.json"), b"{}").unwrap();
-    std::fs::write(tmp.path().join("bridge-y.json"), b"{}").unwrap();
-
-    remove_state_file(tmp.path(), &name("bridge-x.json")).unwrap();
-
-    assert_eq!(names(tmp.path()), vec![name("bridge-y.json")]);
-}
-
-#[skuld::test]
-fn remove_state_file_answers_ok_for_a_missing_file_and_for_a_missing_directory() {
-    let tmp = tempfile::tempdir().unwrap();
-
-    remove_state_file(tmp.path(), &name("bridge-x.json")).unwrap();
-    remove_state_file(&tmp.path().join("no-such-dir"), &name("bridge-x.json")).unwrap();
-
-    assert!(names(tmp.path()).is_empty(), "something was made");
-}
-
-#[skuld::test]
-fn remove_state_file_removes_a_symlink_at_the_name_and_not_what_it_points_at() {
-    let tmp = tempfile::tempdir().unwrap();
-    let target = tmp.path().join("target");
-    std::fs::write(&target, b"keep").unwrap();
-    let state = tmp.path().join("state");
-    std::fs::create_dir(&state).unwrap();
-    plant_file_symlink(&target, &state.join("bridge-x.json"));
-
-    remove_state_file(&state, &name("bridge-x.json")).unwrap();
-
-    assert!(names(&state).is_empty());
-    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
-}
-
-#[skuld::test]
-fn remove_state_file_refuses_a_link_to_a_folder_the_system_owns() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = testing::state_dir_linked_to_a_system_folder(tmp.path());
-
-    let err = remove_state_file(&state, &name("bridge-x.json")).unwrap_err();
-
-    assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink));
-}
-
-// read_state_file =====================================================================================================
-
-#[skuld::test]
-fn read_state_file_returns_the_bytes_of_the_file() {
+fn read_vouched_returns_the_bytes_of_the_file() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("bridge-x.json"), b"{\"a\":1}").unwrap();
 
-    assert_eq!(
-        read_state_file(tmp.path(), &name("bridge-x.json")).unwrap(),
-        b"{\"a\":1}"
-    );
+    assert_eq!(read_vouched(tmp.path(), &name("bridge-x.json")).unwrap(), b"{\"a\":1}");
 }
 
 #[skuld::test]
-fn read_state_file_answers_not_found_for_a_missing_file_and_for_a_missing_directory() {
+fn read_vouched_answers_not_found_for_a_missing_file_and_for_a_missing_directory() {
     let tmp = tempfile::tempdir().unwrap();
 
     assert_eq!(
-        kind(read_state_file(tmp.path(), &name("absent.json"))),
+        kind(read_vouched(tmp.path(), &name("absent.json"))),
         Some(io::ErrorKind::NotFound)
     );
     assert_eq!(
-        kind(read_state_file(&tmp.path().join("no-such-dir"), &name("x.json"))),
+        kind(read_vouched(&tmp.path().join("no-such-dir"), &name("x.json"))),
         Some(io::ErrorKind::NotFound)
     );
 }
 
 #[skuld::test]
-fn read_state_file_does_not_read_through_a_symlink_at_the_name() {
+fn read_vouched_does_not_read_through_a_symlink_at_the_name() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     std::fs::create_dir(&state).unwrap();
@@ -578,33 +502,33 @@ fn read_state_file_does_not_read_through_a_symlink_at_the_name() {
     std::fs::write(&target, b"{\"theirs\":true}").unwrap();
     plant_file_symlink(&target, &state.join("bridge-x.json"));
 
-    let result = read_state_file(&state, &name("bridge-x.json"));
+    let result = read_vouched(&state, &name("bridge-x.json"));
 
     assert!(result.is_err(), "read through a symlink: {result:?}");
 }
 
 #[skuld::test]
-fn read_state_file_does_not_read_through_a_link_in_the_directory_path_that_the_rule_refuses() {
+fn read_vouched_does_not_read_through_a_link_in_the_directory_path_that_the_rule_refuses() {
     let tmp = tempfile::tempdir().unwrap();
     // The user's link to a folder the system owns.
     let state = tmp.path().join("state");
     plant_link(SystemScratch::new().root(), &state);
 
-    let err = read_state_file(&state, &name("bridge-x.json")).unwrap_err();
+    let err = read_vouched(&state, &name("bridge-x.json")).unwrap_err();
 
     assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink));
 }
 
 #[cfg(unix)]
 #[skuld::test]
-fn read_state_file_refuses_a_fifo_at_the_name_and_does_not_block() {
+fn read_vouched_refuses_a_fifo_at_the_name_and_does_not_block() {
     use std::os::unix::ffi::OsStrExt;
     let tmp = tempfile::tempdir().unwrap();
     let fifo = std::ffi::CString::new(tmp.path().join("bridge-x.json").as_os_str().as_bytes()).unwrap();
     // SAFETY: `fifo` is a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
-    let err = read_state_file(tmp.path(), &name("bridge-x.json")).unwrap_err();
+    let err = read_vouched(tmp.path(), &name("bridge-x.json")).unwrap_err();
 
     assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular));
 }
@@ -613,12 +537,12 @@ fn read_state_file_refuses_a_fifo_at_the_name_and_does_not_block() {
 // files a test makes belong to whoever runs it, and the system's are refused a second name.
 
 #[skuld::test]
-fn read_state_file_reads_a_second_name_for_a_file_unless_the_runner_is_the_system() {
+fn read_vouched_reads_a_second_name_for_a_file_unless_the_runner_is_the_system() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("victim"), b"theirs").unwrap();
     std::fs::hard_link(tmp.path().join("victim"), tmp.path().join("bridge-x.json")).unwrap();
 
-    let read = read_state_file(tmp.path(), &name("bridge-x.json"));
+    let read = read_vouched(tmp.path(), &name("bridge-x.json"));
 
     match super::testing::runner_is_the_system() {
         true => {
