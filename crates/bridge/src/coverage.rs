@@ -21,7 +21,8 @@ pub enum Coverage {
 pub enum CoverPlan {
     /// Engage the transient cover, or keep the held one, comparing the Unblock count to `unblock_snapshot`.
     Engage { unblock_snapshot: u64 },
-    /// A standing lockdown cover holds the host (or takes over at connect): release the held transient cover.
+    /// A standing lockdown cover holds the host or takes over at connect, so the held transient cover is released:
+    /// engaging both would, on macOS, clobber the singular pf ruleset.
     HandToLockdown,
     /// A manual connect or reload: release the held transient cover; the host is fail-open by design.
     FailOpen,
@@ -30,9 +31,6 @@ pub enum CoverPlan {
 impl Coverage {
     /// The start's plan for the transient cover, given whether a standing lockdown cover is expected (see
     /// `ProxyManager::standing_cover_expected`).
-    ///
-    /// A covered start engages the transient cover unless the standing one is expected: engaging both would, on
-    /// macOS, clobber the singular pf ruleset.
     pub fn plan(self, standing_cover_expected: bool) -> CoverPlan {
         match self {
             Coverage::Covered { unblock_snapshot } if !standing_cover_expected => {
@@ -45,12 +43,11 @@ impl Coverage {
 }
 
 impl CoverPlan {
-    /// Whether the plan relies on the transient cover to block the host, so a start that cannot engage it leaves
-    /// the host unblocked.
-    pub fn needs_transient_cover(self) -> bool {
+    /// Whether the plan expects a cover to hold the host while the start runs.
+    pub fn expects_cover(self) -> bool {
         match self {
             CoverPlan::Engage { .. } => true,
-            CoverPlan::HandToLockdown => false,
+            CoverPlan::HandToLockdown => true,
             CoverPlan::FailOpen => false,
         }
     }
