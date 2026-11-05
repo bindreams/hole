@@ -17,7 +17,7 @@ pub(super) fn dump(what: &str) {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
             ),
-            Err(e) => tracing::warn!("{what}: `{shown}` could not run: {e}"),
+            Err(e) => tracing::warn!(error = &e as &dyn std::error::Error, "{what}: `{shown}` could not run"),
         }
     }
 }
