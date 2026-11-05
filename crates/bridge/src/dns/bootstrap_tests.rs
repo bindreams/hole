@@ -505,6 +505,20 @@ async fn insecure_fallback_logs_the_certificate_rejection_even_when_it_succeeds(
         output.contains("error=a secure DNS resolver presented a certificate that could not be verified"),
         "the WARN must name the finding the fallback is proceeding past; got:\n{output}"
     );
+
+    // The message points at the finding by the words the rendered error uses.
+    const FINDING: &str = "a certificate that could not be verified";
+    assert!(
+        BootstrapError::CertificateRejected.to_string().contains(FINDING),
+        "the finding's Display no longer says {FINDING:?}"
+    );
+    let (message, error) = output
+        .split_once(" error=")
+        .unwrap_or_else(|| panic!("the WARN has no error field; got:\n{output}"));
+    assert!(
+        message.contains(FINDING) && error.contains(FINDING),
+        "the message and the rendered error must share the words {FINDING:?}; got:\n{output}"
+    );
 }
 
 #[skuld::test]
