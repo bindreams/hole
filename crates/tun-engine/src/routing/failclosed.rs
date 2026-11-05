@@ -58,10 +58,9 @@ impl<T> StateFile<T> {
     /// [`StateFile::Unusable`] for a record whose BYTES we hold, salvaging its
     /// `pf_token` if one can still be read out of them.
     ///
-    /// Deliberately lenient where the typed deserialize was strict: a
-    /// `serde_json::Value` walk ignores the schema version, unknown fields
-    /// (`deny_unknown_fields` is what makes a forward-compatible write
-    /// unreadable in the first place), and every sibling field being wrong. One
+    /// Deliberately lenient where the typed deserialize is strict: a
+    /// `serde_json::Value` walk ignores the schema version, a field of the
+    /// wrong type, and every sibling field being wrong. One
     /// implementation for both macOS state files, since both persist a
     /// `pf_token` and both reach this variant by the same routes.
     ///

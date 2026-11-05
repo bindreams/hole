@@ -29,7 +29,7 @@ impl std::fmt::Debug for Raw {
 /// the next `store`.
 #[derive(Debug)]
 pub enum Loaded<S> {
-    /// No file (`ErrorKind::NotFound` only).
+    /// No file: `ErrorKind::NotFound`, or a read that failed on a name found gone when it was examined.
     Absent,
     /// The read failed with an I/O error. Says nothing about the bytes, so it
     /// is not [`CannotRead`]: no rule that moves or refuses a file by what it
@@ -61,6 +61,8 @@ pub enum UnreadableKind {
     NotAFile,
     /// A regular file whose read failed.
     File,
+    /// The read failed and the name could not be examined afterwards.
+    Unprobed,
 }
 
 /// The owner's two causes for a file a release cannot read.
@@ -134,15 +136,18 @@ impl<S: VersionedState> Loaded<S> {
     /// Classifies one read of `S`'s file. Logs a `warn!` for each unusual
     /// outcome and a `debug!` for a migrated one: name, versions and cause,
     /// never a value. `at` says where a read that failed (other than by a
-    /// missing file) failed; it is asked only then.
-    pub(crate) fn from_read(read: std::io::Result<Vec<u8>>, at: impl FnOnce() -> UnreadableKind) -> Self {
+    /// missing file) failed, or `None` when the name turned out not to be there; it is asked only then.
+    pub(crate) fn from_read(read: std::io::Result<Vec<u8>>, at: impl FnOnce() -> Option<UnreadableKind>) -> Self {
         let file = S::FILE_NAME;
         let bytes = match read {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Absent,
             Err(e) => {
                 tracing::warn!(file, kind = ?e.kind(), error = %error_chain(&e), "state file could not be read");
-                return Loaded::Unreadable { error: e, kind: at() };
+                return match at() {
+                    Some(kind) => Loaded::Unreadable { error: e, kind },
+                    None => Loaded::Absent,
+                };
             }
         };
         let version = match frame::read_version(&bytes, S::UNVERSIONED_AS) {

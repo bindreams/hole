@@ -1,13 +1,15 @@
 //! The one read (`observe`), the one write path (`update`) and the atomic claim (`create_new`) of a state file.
 
+use std::ffi::OsStr;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::generation::{self, Generation, Held};
 use super::loaded::{CannotRead, Loaded, UnreadableKind};
 use super::store::encode;
 use super::{Placement, RemoveOver, StoreError, StoreOver, VersionedFile, VersionedState};
 use crate::dir::{Dir, EntryKind, ReadDir};
+use crate::error_chain::error_chain;
 
 /// One read of the file plus the generation it was taken at.
 #[derive(Debug)]
@@ -66,21 +68,21 @@ enum Step {
 }
 
 /// The one place a `(Role, Change, Loaded)` becomes an action.
-fn step<S: VersionedState>(change: &Change<S>, loaded: &Loaded<S>, path: &Path) -> Step {
+fn step<S: VersionedState>(change: &Change<S>, loaded: &Loaded<S>, file: &OsStr) -> Step {
     match change {
         Change::Keep => Step::Nothing(UpdateOutcome::Unchanged),
         Change::MoveAside => Step::MoveAside,
-        Change::Store(_) => store_step(loaded, path),
+        Change::Store(_) => store_step(loaded, file),
         Change::Remove => remove_step(loaded),
     }
 }
 
-fn store_step<S: VersionedState>(loaded: &Loaded<S>, path: &Path) -> Step {
+fn store_step<S: VersionedState>(loaded: &Loaded<S>, file: &OsStr) -> Step {
     let (over, refusal) = match loaded {
         Loaded::Unreadable { error, .. } => (
             S::ROLE.on_store_io_failure(),
             StoreError::ReadFailed {
-                path: path.to_owned(),
+                file: file.to_owned(),
                 kind: error.kind(),
             },
         ),
@@ -93,14 +95,14 @@ fn store_step<S: VersionedState>(loaded: &Loaded<S>, path: &Path) -> Step {
         Loaded::Newer { .. } => (
             S::ROLE.on_store(CannotRead::Newer),
             StoreError::Unreadable {
-                path: path.to_owned(),
+                file: file.to_owned(),
                 cause: CannotRead::Newer,
             },
         ),
         Loaded::Corrupt { .. } => (
             S::ROLE.on_store(CannotRead::Corrupt),
             StoreError::Unreadable {
-                path: path.to_owned(),
+                file: file.to_owned(),
                 cause: CannotRead::Corrupt,
             },
         ),
@@ -143,7 +145,7 @@ impl<S: VersionedState> VersionedFile<S> {
         let held = generation::lock(&self.path);
         let loaded = match ReadDir::open(&self.dir) {
             Ok(dir) => self.read_through(&dir),
-            Err(err) => Loaded::from_read(Err(err), || UnreadableKind::Directory),
+            Err(err) => Loaded::from_read(Err(err), || Some(UnreadableKind::Directory)),
         };
         Observed {
             loaded,
@@ -151,12 +153,16 @@ impl<S: VersionedState> VersionedFile<S> {
         }
     }
 
-    /// One read through `dir`. When it fails, the one look at the name says whether it holds a regular file.
+    /// One read through `dir`. When it fails, the one look at the name says whether it holds a regular file, nothing
+    /// (the file is [`Loaded::Absent`]), or could not be examined.
     fn read_through(&self, dir: &ReadDir) -> Loaded<S> {
         let name = self.file_name();
-        Loaded::from_read(self.fs.read(dir, name), || match dir.kind_of(name) {
-            Ok(Some(EntryKind::Symlink | EntryKind::Directory | EntryKind::Other)) => UnreadableKind::NotAFile,
-            Ok(Some(EntryKind::File) | None) | Err(_) => UnreadableKind::File,
+        Loaded::from_read(self.fs.read(dir, name), || match self.fs.kind_of(dir, name) {
+            Ok(Some(EntryKind::Symlink | EntryKind::Directory | EntryKind::Other)) => Some(UnreadableKind::NotAFile),
+            Ok(Some(EntryKind::File)) => Some(UnreadableKind::File),
+            // The name is gone: the read failed on a file that was removed meanwhile.
+            Ok(None) => None,
+            Err(_) => Some(UnreadableKind::Unprobed),
         })
     }
 
@@ -173,8 +179,8 @@ impl<S: VersionedState> VersionedFile<S> {
     ///    mode, owner and ACL set through its own handle by `place`), backs the old file up as
     ///    `<name>.unreadable[.N].bak` by hard link if the role says so, and renames the temp over the name. A
     ///    failure before the rename leaves the original at its name, so a decision file is never absent between its
-    ///    backup and its replacement. Once the rename has happened the value is stored: a failure after it is
-    ///    [`StoreError::PublishedNotFinalized`], not `Io`.
+    ///    backup and its replacement. Once the rename has happened the write is complete and the result is `Ok`: a
+    ///    failure of `after_publish` or of the directory flush after it is logged at warn.
     ///
     /// The lock is in-process. Another process writing the same file is the caller's to exclude (for the bridge's
     /// state files: `BridgeLiveness`). The directory is opened once without following a symlink and every step names
@@ -205,7 +211,7 @@ impl<S: VersionedState> VersionedFile<S> {
             None => Loaded::Absent,
             Some(dir) => match dir.reader() {
                 Ok(reader) => self.read_through(&reader),
-                Err(err) => Loaded::from_read(Err(err), || UnreadableKind::Directory),
+                Err(err) => Loaded::from_read(Err(err), || Some(UnreadableKind::Directory)),
             },
         };
         let observed = Observed {
@@ -218,7 +224,7 @@ impl<S: VersionedState> VersionedFile<S> {
             Change::Store(value) => Some(encode(value)?),
             Change::Keep | Change::Remove | Change::MoveAside => None,
         };
-        let outcome = match step(&change, &observed.loaded, &self.path) {
+        let outcome = match step(&change, &observed.loaded, self.file_name()) {
             Step::Nothing(outcome) => outcome,
             Step::Refuse(refusal) => return Err(refusal),
             Step::Write { back_up } => {
@@ -270,20 +276,27 @@ impl<S: VersionedState> VersionedFile<S> {
             self.link_to_free_backup(&dir)?;
         }
         self.fs.publish(staged)?;
-        self.finalize(place, &dir)
+        self.finalize(place, &dir);
+        Ok(())
     }
 
-    /// The directory is flushed even when `after_publish` failed: the rename happened either way. The first failure
-    /// is the one reported.
-    fn finalize(&self, place: &dyn Placement, dir: &Dir) -> Result<(), StoreError> {
-        let finalized = place.after_publish(dir, self.file_name());
-        let flushed = place.sync_dir(dir);
-        finalized.and(flushed).map_err(StoreError::PublishedNotFinalized)
+    /// What follows a publish. The file is already at its name, so nothing here can fail the write: the caller acts
+    /// on what is on disk, and the only thing a failed flush costs is durability across a power loss, which the
+    /// caller could do nothing about. The directory is flushed even when `after_publish` failed.
+    fn finalize(&self, place: &dyn Placement, dir: &Dir) {
+        if let Err(e) = place.after_publish(dir, self.file_name()) {
+            tracing::warn!(file = S::FILE_NAME, error = %error_chain(&e), "a state file was published, but its after-publish step failed");
+        }
+        if let Err(e) = place.sync_dir(dir) {
+            tracing::warn!(file = S::FILE_NAME, error = %error_chain(&e), "a state file was published, but its directory could not be flushed");
+        }
     }
 
     /// Publishes `value` as a new file only if the name is free, whatever else is there: a file this release cannot
-    /// read is `Taken` too. The hard link is what makes it atomic, across processes and without a lock, and a
-    /// reader never sees a partial file. Does not move the generation.
+    /// read is `Taken` too. A rename that refuses to replace is what makes it atomic, across processes and without
+    /// a lock, a reader never sees a partial file, and the file never has a second name. (Where the filesystem has
+    /// no such rename the claim is a hard link, and the file has two names until the temp name is removed; see
+    /// [`crate::dir::Staged::claim`].) Does not move the generation.
     pub fn create_new(&self, value: &S, place: &dyn Placement) -> Result<CreateOutcome, StoreError> {
         let bytes = encode(value)?;
         let dir = self.open_dir(place, true)?;
@@ -294,7 +307,7 @@ impl<S: VersionedState> VersionedFile<S> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(CreateOutcome::Taken),
             Err(e) => return Err(e.into()),
         }
-        self.finalize(place, &dir)?;
+        self.finalize(place, &dir);
         Ok(CreateOutcome::Created)
     }
 

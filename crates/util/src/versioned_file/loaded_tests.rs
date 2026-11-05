@@ -297,6 +297,7 @@ fn a_failed_read_logs_the_error_text() {
     let (subscriber, log) = capture();
     let _guard = set_default_in_current_thread(subscriber);
     let dir = dir();
+    put(&dir, "note.json", b"{}");
 
     let loaded = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(Fails)).load();
 

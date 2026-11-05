@@ -235,6 +235,52 @@ fn observe_says_a_regular_file_failed_to_read() {
     assert_eq!(unreadable_kind(&observed.loaded), UnreadableKind::File);
 }
 
+/// A read that fails and a name that is gone by the time it is examined: the file is not there.
+struct VanishesAfterFailedRead {
+    path: PathBuf,
+}
+
+impl Fs for VanishesAfterFailedRead {
+    fn read(&self, _dir: &ReadDir, _name: &OsStr) -> io::Result<Vec<u8>> {
+        std::fs::remove_file(&self.path).unwrap();
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
+#[skuld::test]
+fn observe_says_a_name_that_vanished_after_a_failed_read_is_absent() {
+    let dir = dir();
+    let path = put(&dir, "decision.json", br#"{"version":1,"value":"v"}"#);
+
+    let observed =
+        VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(VanishesAfterFailedRead { path })).observe();
+
+    assert!(matches!(observed.loaded, Loaded::Absent), "{:?}", observed.loaded);
+}
+
+/// A read that fails and a name that cannot be examined.
+struct CannotBeProbed;
+
+impl Fs for CannotBeProbed {
+    fn read(&self, _dir: &ReadDir, _name: &OsStr) -> io::Result<Vec<u8>> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+
+    fn kind_of(&self, _dir: &ReadDir, _name: &OsStr) -> io::Result<Option<crate::dir::EntryKind>> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
+#[skuld::test]
+fn observe_says_a_name_that_cannot_be_examined_after_a_failed_read_is_unprobed() {
+    let dir = dir();
+    put(&dir, "decision.json", br#"{"version":1,"value":"v"}"#);
+
+    let observed = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(CannotBeProbed)).observe();
+
+    assert_eq!(unreadable_kind(&observed.loaded), UnreadableKind::Unprobed);
+}
+
 #[skuld::test]
 fn observe_says_the_name_holds_something_that_is_not_a_file() {
     let dir = dir();

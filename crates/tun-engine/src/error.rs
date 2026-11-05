@@ -52,7 +52,7 @@ impl RoutingError {
         use util::versioned_file::StoreError;
         tracing::error!(error = %util::error_chain::error_chain(e), "{what} could not be written");
         let kind = match e {
-            StoreError::Io(e) | StoreError::PublishedNotFinalized(e) => e.kind(),
+            StoreError::Io(e) => e.kind(),
             StoreError::Encode(_) => std::io::ErrorKind::InvalidData,
             // The pf records' role replaces what it cannot read, so no store of theirs is refused.
             StoreError::Unreadable { .. } | StoreError::ReadFailed { .. } => {

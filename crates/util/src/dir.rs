@@ -443,10 +443,27 @@ impl Staged<'_> {
         Ok(())
     }
 
-    /// Gives the temp file the final name if that is free (`AlreadyExists` otherwise), by a hard link, then removes
-    /// the temp name. Two claims of one name cannot both win, and a reader never sees a partial file.
+    /// Gives the temp file the final name if that is free (`AlreadyExists` otherwise), by one rename that refuses to
+    /// replace: two claims of one name cannot both win, a reader never sees a partial file, and the file never has
+    /// a second name.
+    ///
+    /// Where the platform or filesystem has no such rename (`Unsupported`) the claim is a hard link and the temp name
+    /// is removed when `self` is dropped, so the file has two names until then, and for good if that removal fails.
     pub fn claim(self) -> io::Result<()> {
-        self.dir.link(&self.temp_name, &self.name)
+        self.claim_with(|| {})
+    }
+
+    /// [`Self::claim`] with `after_claim` run right after the name is taken, before the staged value is dropped.
+    pub(crate) fn claim_with(mut self, after_claim: impl FnOnce()) -> io::Result<()> {
+        // Closed first: Windows renames a name only once no handle without delete sharing is open on it.
+        drop(self.temp.take());
+        match self.dir.rename_noreplace(&self.temp_name, &self.name) {
+            Ok(()) => self.pending = false,
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => self.dir.link(&self.temp_name, &self.name)?,
+            Err(err) => return Err(err),
+        }
+        after_claim();
+        Ok(())
     }
 }
 

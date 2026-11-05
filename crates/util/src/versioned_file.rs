@@ -15,7 +15,8 @@
 //! the one that goes with its bytes. The lock is a leaf: nothing is acquired while it is held, and the `decide`
 //! closure of an `update` does no I/O. It does not exclude another process; for the bridge's state files that is
 //! `BridgeLiveness`, held by the running bridge and by every CLI that writes state.
-//! [`VersionedFile::create_new`] takes no lock: the hard link that publishes the file is atomic across processes.
+//! [`VersionedFile::create_new`] takes no lock: the rename that publishes the file (refusing to replace) is atomic
+//! across processes.
 //!
 //! `observe` needs no exclusion from other processes, on Windows too: a write replaces the file with POSIX semantics,
 //! so a reader that has it open neither fails nor makes the write fail. That holds for a reader that opens the file

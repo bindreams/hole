@@ -20,8 +20,9 @@ pub enum Role {
     LegacyRecord,
     /// The user's own data.
     Config,
-    /// A claim a process makes on a name (the update marker): never stored over
-    /// and removed whatever it holds, and it never blocks a connect.
+    /// A claim a process makes on a name (the update marker): a store is refused
+    /// over a file this release cannot read, and a remove takes it whatever it
+    /// holds. It never blocks a connect.
     Claim,
     /// What this bridge did to the OS where an unreadable record must still be
     /// cleaned up after (a macOS pf record): moved aside, never destroyed
@@ -29,7 +30,7 @@ pub enum Role {
     Cover,
 }
 
-/// What `store` does over a file that cannot be read.
+/// What a [`Change::Store`](super::Change::Store) does over a file that cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOver {
     /// Back it up, then write.
@@ -40,7 +41,7 @@ pub enum StoreOver {
     Overwrite,
 }
 
-/// What `remove` does to a file that cannot be read.
+/// What a [`Change::Remove`](super::Change::Remove) does to a file that cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveOver {
     /// Back it up, then remove the original.
@@ -87,7 +88,7 @@ impl Role {
         }
     }
 
-    /// What `store` does over a file whose read failed with an I/O error. The
+    /// What a store does over a file whose read failed with an I/O error. The
     /// bytes were never seen, so no role replaces them without a backup: a link
     /// needs no read.
     pub fn on_store_io_failure(self) -> StoreOver {
@@ -101,7 +102,7 @@ impl Role {
         }
     }
 
-    /// What `remove` does to a file whose read failed with an I/O error.
+    /// What a remove does to a file whose read failed with an I/O error.
     pub fn on_remove_io_failure(self) -> RemoveOver {
         match self {
             Role::Decision => RemoveOver::MoveAside,

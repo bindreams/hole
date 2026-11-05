@@ -631,6 +631,14 @@ file this release cannot read, and the file's role decides what happens to it.
 it. The log directory (`hole_common::logging::init_dual`, with `DirRotate`) is
 written through the same `Dir`.
 
+A write that reached the rename is complete: a failure of the directory flush after it is logged at warn and the call
+is `Ok`, because the caller acts on what is on disk. A refusal (`StoreError::Unreadable`, `ReadFailed`) names the file,
+never its directory. Every state file reader ignores a field it does not know (the owner's rule, "readers ignore unknown
+fields"): the version is the only compatibility signal. For the lockdown intent, the boot-time witness,
+`bridge-failclosed.json` and `bridge-lockdown-pf.json` that changed with `VersionedFile`, which replaced
+`deny_unknown_fields`: `{"version":1,"enabled":false,"stray":1}` now reads as the intent Off, where it was
+`Unreadable` (which keeps a standing cover at boot).
+
 `Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
 lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
 the path, and logging the error with `%e` or `?e` cannot put a username in
@@ -717,8 +725,10 @@ re-derive them.
    about ownership: a file the system owns that the user moved into the folder keeps its owner and its one link
    (a rename moves the inode), so it is read. What the user could learn from it is limited by the readers, below.
    This holds for the files read with
-   `read_vouched`, which are published by rename and so have one name; `ReadDir::read` does not have it, and is for
-   a file that has a second name by design.
+   `read_vouched`, which are published by rename (the update marker's claim by a rename that refuses to replace) and
+   so have one name; `ReadDir::read` does not have it, and is for a file that has a second name by design. Only
+   where a filesystem has no such rename is the claim a hard link, and the marker has two names until the temp name is
+   removed.
 
 1. **Remove and move aside through the handle too.** A state file is removed by `VersionedFile::update` with `Change::Remove` and
    moved aside by `Change::MoveAside` or `Dir::rename_noreplace` (`dns_state::supersede`), never `std::fs::remove_file` or `rename` on a

@@ -78,8 +78,8 @@ fn store_refuses<S: VersionedState + Clone>(value: S) {
     let err = file.store(&value, &plain()).unwrap_err();
 
     match &err {
-        StoreError::ReadFailed { path, kind } => {
-            assert_eq!(path, file.path(), "{}", S::FILE_NAME);
+        StoreError::ReadFailed { file: name, kind } => {
+            assert_eq!(name, S::FILE_NAME);
             assert_eq!(*kind, io::ErrorKind::PermissionDenied);
         }
         other => panic!("{}: {other:?}", S::FILE_NAME),

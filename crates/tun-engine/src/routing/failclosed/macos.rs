@@ -601,8 +601,10 @@ fn engage_with(
     //    fail-CLOSED leak hiding behind a path whose traffic verdict is
     //    fail-open. The refcount is the ONLY thing stranded: `save` is
     //    temp file + rename, and the rename is both the sole writer of
-    //    `bridge-failclosed.json` and the last fallible step, so a failed save
-    //    leaves no partial file for a later sweep to act on.
+    //    `bridge-failclosed.json` and the last step whose failure fails the
+    //    save (a directory flush that fails after it is logged, and the save is
+    //    `Ok`), so a failed save leaves no partial file for a later sweep to
+    //    act on.
     let st = state::FailClosedState {
         pf_token: token.clone(),
         pf_was_enabled: was_enabled,

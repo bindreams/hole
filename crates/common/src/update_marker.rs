@@ -26,9 +26,8 @@ use util::versioned_file::{
 /// finds it by this constant, not by enumeration.
 pub const MARKER_FILE: &str = "update-in-progress.json";
 
-/// What [`read`] found. Unlike `plugin_state::Loaded`'s sibling variant,
-/// `Unreadable` carries no reason: every reader treats "present but
-/// unidentifiable" the same way, so the reason is logged where it is detected.
+/// What [`read`] found. `Unreadable` carries no reason: every reader treats
+/// "present but unidentifiable" the same way, so the reason is logged where it is detected.
 #[derive(Debug)]
 pub enum Marker {
     Absent,
@@ -36,11 +35,11 @@ pub enum Marker {
     /// that could not be opened, an unparseable body, or a version this build
     /// does not know. A cutover claim either way.
     Unreadable,
-    /// Whether a marker exists could not be established: the existence probe
-    /// failed, or it found something that is not a regular file. NOT a claim —
-    /// neither a failed read nor a directory is evidence a marker is there — so
-    /// readers pass it through rather than report a cutover they could never
-    /// retract.
+    /// Whether a marker exists could not be established: the directory did not
+    /// open, the name holds something that is not a regular file, or the name
+    /// could not be examined after a failed read. NOT a claim — none of these is
+    /// evidence a marker is there — so readers pass it through rather than
+    /// report a cutover they could never retract.
     Indeterminate,
     Present(MarkerInfo),
 }
@@ -65,8 +64,8 @@ impl Schema for MarkerInfo {
     }
 }
 
-/// A claim on the name: never stored over, whatever it holds, and removed by name whatever it holds, so a schema bump
-/// across the cutover never strands it.
+/// A claim on the name: a store is refused over a marker this release cannot read, and a remove takes it whatever it
+/// holds, so a schema bump across the cutover never strands it.
 impl VersionedState for MarkerInfo {
     const FILE_NAME: &'static str = MARKER_FILE;
     const ROLE: Role = Role::Claim;
@@ -143,7 +142,12 @@ pub fn claim(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> Re
 /// or SYSTEM in a log directory a user may own, where a link or a FIFO planted at
 /// the name must be neither followed nor waited for.
 pub fn read(log_dir: &Path) -> Marker {
-    match marker_file(log_dir).observe().loaded {
+    marker_of(marker_file(log_dir).observe().loaded)
+}
+
+/// What a read of the marker file means: the one place a [`Loaded`] becomes a [`Marker`].
+fn marker_of(loaded: Loaded<MarkerInfo>) -> Marker {
+    match loaded {
         Loaded::Absent => Marker::Absent,
         Loaded::Current { value, .. } => Marker::Present(value),
         Loaded::Obsolete { .. } => Marker::Unreadable,
@@ -163,6 +167,8 @@ pub fn read(log_dir: &Path) -> Marker {
             }
             // The file is there and could not be read (a Windows sharing violation): a claim.
             UnreadableKind::File => Marker::Unreadable,
+            // The read failed and the name could not be examined: no evidence a marker is there.
+            UnreadableKind::Unprobed => Marker::Indeterminate,
         },
     }
 }

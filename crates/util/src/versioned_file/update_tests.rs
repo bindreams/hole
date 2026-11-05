@@ -6,7 +6,7 @@ use std::sync::{mpsc, Barrier};
 
 use crate::versioned_file::fixtures::{dir, names, put, ClaimFile, Counter, DecisionFile, WithFloat};
 use crate::versioned_file::{
-    Change, CreateOutcome, DefaultPlacement, Loaded, StoreError, UpdateOutcome, VersionedFile,
+    Change, CreateOutcome, DefaultPlacement, Loaded, Placement, StoreError, UpdateOutcome, VersionedFile,
 };
 
 fn plain() -> DefaultPlacement {
@@ -147,6 +147,24 @@ fn create_new_leaves_no_temp_file_and_a_readable_claim() {
     assert!(matches!(file.observe().loaded, Loaded::Current { .. }));
 }
 
+/// The claim is held once the name is taken; a directory flush that fails after it changes nothing the caller can act on.
+#[skuld::test]
+fn create_new_whose_directory_flush_fails_is_still_created() {
+    struct FailsFlush;
+    impl Placement for FailsFlush {
+        fn sync_dir(&self, _dir: &crate::dir::Dir) -> std::io::Result<()> {
+            Err(std::io::Error::other("directory flush went wrong"))
+        }
+    }
+    let dir = dir();
+    let file = VersionedFile::<ClaimFile>::new(dir.path());
+
+    let got = file.create_new(&ClaimFile { value: "v".into() }, &FailsFlush).unwrap();
+
+    assert_eq!(got, CreateOutcome::Created);
+    assert!(matches!(file.observe().loaded, Loaded::Current { .. }));
+}
+
 #[skuld::test]
 fn create_new_makes_a_missing_directory() {
     let root = dir();
@@ -160,7 +178,7 @@ fn create_new_makes_a_missing_directory() {
     assert!(root.path().join("logs").join("claim.json").is_file());
 }
 
-/// `create_new` neither waits for the path lock nor moves the generation: its atomicity is the hard link.
+/// `create_new` neither waits for the path lock nor moves the generation: its atomicity is the rename that refuses to replace.
 #[skuld::test]
 fn create_new_takes_no_lock_and_leaves_the_generation() {
     let dir = dir();

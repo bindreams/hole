@@ -1,8 +1,8 @@
 //! Persisted lockdown INTENT (the standing kill switch's enabled bool),
 //! bridge-owned and system-wide. Distinct from `bridge-failclosed.json`
 //! (which records the transient cover's pf token): this file records what the
-//! user *wants*, surviving bridge restarts and crashes. Modeled on
-//! `failclosed_state.rs`; a `VersionedFile` of role `Decision`.
+//! user *wants*, surviving bridge restarts and crashes. A `VersionedFile` of
+//! role `Decision`.
 
 use std::path::Path;
 

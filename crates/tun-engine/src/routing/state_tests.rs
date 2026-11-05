@@ -228,7 +228,7 @@ fn save_over_a_record_whose_read_fails_is_refused_and_leaves_it() {
     let err = write(&file_whose_reads_fail(dir.path()), &sample_ipv4(), None).expect_err("must refuse");
 
     assert!(
-        matches!(&err, StoreError::ReadFailed { path: p, kind } if *p == path && *kind == std::io::ErrorKind::PermissionDenied),
+        matches!(&err, StoreError::ReadFailed { file, kind } if *file == STATE_FILE_NAME && *kind == std::io::ErrorKind::PermissionDenied),
         "{err:?}"
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);

@@ -213,10 +213,11 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 ///
 /// Refuses outright against a live bridge instance (#840): a running bridge
 /// already reconciles the target itself, and racing it from an unrelated CLI
-/// invocation is exactly the two-writer hazard `BridgeLiveness` exists
-/// to prevent: the state files' own locks are in-process only. The in-app
-/// "Unblock Network" action is the live-bridge equivalent, so refusal names it as the alternative. The exclusion is
-/// structural, not a point-in-time probe: see [`unlock_with`].
+/// invocation is exactly the two-writer hazard `BridgeLiveness` exists to
+/// prevent: the state files' own locks are in-process only. The in-app
+/// "Unblock Network" action is the live-bridge equivalent, so refusal names it
+/// as the alternative. The exclusion is structural, not a point-in-time probe:
+/// see [`unlock_with`].
 /// **`Ok` is qualified, and the caller must surface it.** The returned
 /// [`Clearance`] is what the disengage could not prove — on Windows, the two
 /// boot-time twins on any boot where no bridge engaged. This is the ONE

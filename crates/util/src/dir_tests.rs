@@ -1006,6 +1006,22 @@ fn claiming_publishes_a_free_name_and_loses_to_a_taken_one() {
     assert_eq!(names(tmp.path()), vec![name("marker")], "no temp left behind");
 }
 
+/// A reader that runs the instant a claim lands must find the file under one name: a vouched read refuses a
+/// system-owned file that has a second one.
+#[skuld::test]
+fn a_claim_never_gives_the_file_a_second_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let mut seen = None;
+
+    dir.stage(&name("marker"), b"first", None, |_| Ok(()))
+        .unwrap()
+        .claim_with(|| seen = Some(names(tmp.path())))
+        .unwrap();
+
+    assert_eq!(seen, Some(vec![name("marker")]));
+}
+
 #[skuld::test]
 fn a_failed_protect_leaves_no_staged_file() {
     let tmp = tempfile::tempdir().unwrap();

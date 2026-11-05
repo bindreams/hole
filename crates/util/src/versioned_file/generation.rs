@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
-/// How many writes this process has made to one path through `update`: equal values mean no write in between.
+/// How many writes this process has made to one path through `update`: equal values mean no write in between. A
+/// `create_new` does not move it (a claim is made across processes and nothing compares its generation).
 ///
 /// Per path, process-wide, and moved by every write attempt (a write, a remove, a move aside), under the path's
 /// lock and before the attempt, so one that fails still moves it.

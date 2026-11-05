@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{frame, CannotRead, Chain, ChainError, VersionedState};
-use crate::dir::{Dir, ReadDir, Staged};
+use crate::dir::{Dir, EntryKind, ReadDir, Staged};
 use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
@@ -30,6 +30,11 @@ pub trait Fs: Send + Sync {
     /// The vouched read: a file the folder's owner cannot vouch for is refused (`Refusal::ForeignFile`).
     fn read(&self, dir: &ReadDir, name: &OsStr) -> io::Result<Vec<u8>> {
         dir.read_vouched(name)
+    }
+
+    /// What the name holds, asked once after a read of it failed.
+    fn kind_of(&self, dir: &ReadDir, name: &OsStr) -> io::Result<Option<EntryKind>> {
+        dir.kind_of(name)
     }
 
     fn hard_link(&self, dir: &Dir, original: &OsStr, link: &OsStr) -> io::Result<()> {
@@ -145,23 +150,19 @@ impl Placement for DefaultPlacement {
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The file on disk is newer or corrupt and its role refuses to replace it.
-    /// The text carries the full path: fine for the bridge log, but redact it
-    /// before it reaches a toast.
-    #[error("{} cannot be read ({cause}); it is left as it is", path.display())]
-    Unreadable { path: PathBuf, cause: CannotRead },
+    /// The text names the file, never its directory: a state directory can sit
+    /// in a user's profile.
+    #[error("{} cannot be read ({cause}); it is left as it is", file.to_string_lossy())]
+    Unreadable { file: OsString, cause: CannotRead },
     /// The read failed with an I/O error and the role refuses to replace a file
-    /// it could not read. The text carries the full path, like
+    /// it could not read. The text names the file only, like
     /// [`Unreadable`](Self::Unreadable).
-    #[error("{} could not be read ({kind}); it is left as it is", path.display())]
-    ReadFailed { path: PathBuf, kind: io::ErrorKind },
+    #[error("{} could not be read ({kind}); it is left as it is", file.to_string_lossy())]
+    ReadFailed { file: OsString, kind: io::ErrorKind },
     /// The value cannot be framed, or would not read back as `S`. The reason
     /// is a fixed label, never content; the error's category is logged.
     #[error("cannot encode the state file: {0}")]
     Encode(&'static str),
-    /// The new file is already in place, but a step after the rename failed:
-    /// the value IS stored, though not known to be durable or finalized.
-    #[error("the state file was replaced, but finishing the write failed: {0}")]
-    PublishedNotFinalized(io::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
 }

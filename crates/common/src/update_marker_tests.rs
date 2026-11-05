@@ -225,6 +225,31 @@ fn a_marker_with_a_second_name_is_an_unreadable_claim() {
     }
 }
 
+/// Only a regular file that is there and could not be read is a claim: a directory that did not open, a name that is not
+/// a file, and a name that could not be examined establish no cutover.
+#[skuld::test]
+fn a_failed_read_is_a_claim_only_when_the_name_is_known_to_hold_a_file() {
+    let unreadable = |kind| Loaded::Unreadable {
+        error: io::Error::from(io::ErrorKind::PermissionDenied),
+        kind,
+    };
+
+    assert!(matches!(
+        marker_of(unreadable(UnreadableKind::File)),
+        Marker::Unreadable
+    ));
+    for kind in [
+        UnreadableKind::Directory,
+        UnreadableKind::NotAFile,
+        UnreadableKind::Unprobed,
+    ] {
+        assert!(
+            matches!(marker_of(unreadable(kind)), Marker::Indeterminate),
+            "{kind:?} is not a claim"
+        );
+    }
+}
+
 /// A regular file whose read fails is a claim (`UnreadableKind::File`), as opposed to a name that is not a file.
 /// A runner that ignores mode bits (root) reads it, so the case states both outcomes.
 #[cfg(unix)]
@@ -271,7 +296,7 @@ fn claim_writes_mode_0644() {
 }
 
 // The cross-uid proof that `owner` reaches the PUBLISHED marker inode (through
-// the hard link of `claim`) needs real root to give the file to another uid; a self-chown here would be vacuous (the temp is already
+// the rename of `claim`) needs real root to give the file to another uid; a self-chown here would be vacuous (the temp is already
 // self-owned). It rides the root lane in
 // `crates/hole/tests/elevated_ownership_privileged.rs`.
 
