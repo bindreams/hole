@@ -2643,7 +2643,10 @@ fn confinement_failure_aborts_the_start() {
                     "could not confine DNS to the tunnel: could not reach the firewall",
                     "the toast text must not change"
                 );
-                let chain = util::error_chain::error_chain(&e).to_string();
+                let chain = util::error::chain(&e)
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(": ");
                 assert!(
                     chain.contains("mock confine failure"),
                     "the log line must carry the OS cause: {chain}"

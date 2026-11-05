@@ -173,9 +173,17 @@ mod windows {
         if let Err(e) = &outcome {
             let pid = child.id();
             if let Err(ke) = child.kill() {
-                tracing::warn!(pid, error = %util::error_chain::error_chain(&ke), "failed to kill the suspended cutover child after a pre-resume failure");
+                tracing::warn!(
+                    pid,
+                    error = &ke as &dyn std::error::Error,
+                    "failed to kill the suspended cutover child after a pre-resume failure"
+                );
             }
-            tracing::warn!(pid, error = %util::error_chain::error_chain(e), "cutover child pre-resume failure; child killed");
+            tracing::warn!(
+                pid,
+                error = e as &dyn std::error::Error,
+                "cutover child pre-resume failure; child killed"
+            );
         }
         outcome
     }
@@ -384,9 +392,15 @@ mod macos {
         let Err(e) = result else {
             return;
         };
-        tracing::error!(error = %util::error_chain::error_chain(&e), "macOS cutover failed before restart; clearing marker");
+        tracing::error!(
+            error = &e as &dyn std::error::Error,
+            "macOS cutover failed before restart; clearing marker"
+        );
         if let Err(ce) = hole_common::update_marker::clear(log_dir) {
-            tracing::warn!(error = %util::error_chain::error_chain(&ce), "failed to clear cutover marker on error path");
+            tracing::warn!(
+                error = &ce as &dyn std::error::Error,
+                "failed to clear cutover marker on error path"
+            );
         }
     }
 }

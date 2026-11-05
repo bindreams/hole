@@ -1105,7 +1105,7 @@ mod typed_error_logs {
     }
 
     /// A connect error whose own text omits its cause still has that cause in
-    /// `caused_by`: it is reachable only through `source()`.
+    /// `caused_by.sources`: it is reachable only through `source()`.
     #[skuld::test]
     async fn upstream_failure_log_names_a_cause_only_source_carries() {
         let writer = VecWriter::new();
@@ -1128,8 +1128,8 @@ mod typed_error_logs {
 
         let output = writer.snapshot_string();
         assert!(
-            output.contains(&format!("-> {}", crate::test_support::MOCK_ROOT_CAUSE)),
-            "caused_by must carry the root cause after ` -> `; got:
+            output.contains(&format!("caused_by.sources=[{}]", crate::test_support::MOCK_ROOT_CAUSE)),
+            "caused_by.sources must carry the root cause; got:
 {output}"
         );
     }

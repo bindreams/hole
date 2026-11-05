@@ -849,7 +849,7 @@ impl DnsForwarder {
                     udp_sent = ?e.udp_sent,
                     udp_received = ?e.udp_received,
                     os_errno = ?e.os_errno,
-                    caused_by = %util::error_chain::error_chain(&e.source),
+                    caused_by = &e.source as &dyn std::error::Error,
                     "upstream failed"
                 );
             }

@@ -29,7 +29,6 @@ use tower::ServiceExt;
 #[allow(unused_imports)]
 use tracing::warn;
 use tracing::{debug, error, info};
-use util::error_chain::error_chain;
 use util::versioned_file::{CreateOutcome, StoreError};
 
 // IPC state ===========================================================================================================
@@ -281,7 +280,7 @@ impl IpcServer {
             // Reap completed tasks to avoid unbounded memory growth
             while let Some(result) = tasks.try_join_next() {
                 if let Err(e) = result {
-                    error!(error = %e, "connection handler panicked");
+                    error!(error = &e as &dyn std::error::Error, "connection handler panicked");
                 }
             }
 
@@ -294,13 +293,13 @@ impl IpcServer {
                         let router = self.router.clone();
                         tasks.spawn(async move {
                             if let Err(e) = serve_connection(TokioIo::new(stream), router).await {
-                                debug!(error = %util::error_chain::error_chain(&e), "HTTP connection ended");
+                                debug!(error = &e as &dyn std::error::Error, "HTTP connection ended");
                             }
                             info!("IPC client disconnected");
                         });
                     }
                     Err(e) => {
-                        error!(error = %util::error_chain::error_chain(&e), "failed to accept IPC connection");
+                        error!(error = &e as &dyn std::error::Error, "failed to accept IPC connection");
                     }
                 },
             }
@@ -385,7 +384,10 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         let mut pm = state.proxy.lock().await;
         if let Some(event) = pm.check_health() {
             if let Err(e) = pm.stop_with(event).await {
-                tracing::error!(error = %error_chain(&e), "error tearing down proxy after a failed health check");
+                tracing::error!(
+                    error = &e as &dyn std::error::Error,
+                    "error tearing down proxy after a failed health check"
+                );
             }
         }
         StatusResponse {
@@ -425,7 +427,10 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     let presence = tokio::task::spawn_blocking(move || routing.lockdown_cover_presence())
         .await
         .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "cover-presence probe task panicked");
+            tracing::error!(
+                error = &e as &dyn std::error::Error,
+                "cover-presence probe task panicked"
+            );
             // The lean every escape-offering site treats like `live`, never
             // like `absent`: a probe that did not complete knows nothing.
             CoverPresence::Unreachable
@@ -582,7 +587,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
         Err(e) => {
             // AlreadyRunning is success-equivalent GUI-side; Cancelled is user-asked.
             if !matches!(e, ProxyError::Cancelled | ProxyError::AlreadyRunning) {
-                error!(error = %error_chain(&e), "proxy start failed");
+                error!(error = &e as &dyn std::error::Error, "proxy start failed");
             }
             Err(StartHandlerError::Failed(redact_outgoing((&e).into())))
         }
@@ -660,9 +665,12 @@ async fn persist_after_start<P: Proxy, R: Routing>(
     match outcome {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            error!(error = %util::error_chain::error_chain(&e), "failed to persist target/startup-preference after start")
+            error!(
+                error = &e as &dyn std::error::Error,
+                "failed to persist target/startup-preference after start"
+            )
         }
-        Err(e) => error!(error = %e, "target-persistence task panicked"),
+        Err(e) => error!(error = &e as &dyn std::error::Error, "target-persistence task panicked"),
     }
 }
 
@@ -747,7 +755,10 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
                 Ok(Json(EmptyResponse {}))
             }
             Err(e) => {
-                error!(error = %error_chain(&e), "failed to turn the kill switch off");
+                error!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to turn the kill switch off"
+                );
                 Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -763,7 +774,7 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
             Ok(Json(EmptyResponse {}))
         }
         Err(e) => {
-            error!(error = %error_chain(&e), "failed to set lockdown intent");
+            error!(error = &e as &dyn std::error::Error, "failed to set lockdown intent");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { message: e.to_string() }),
@@ -812,7 +823,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     // that rule with `turn_lockdown_off` is what removes the discrepancy the
     // two bespoke `must_release` expressions used to carry.
     if let Err(e) = state.routing.release_all_covers() {
-        error!(error = %error_chain(&e), "unblock: release failed");
+        error!(error = &e as &dyn std::error::Error, "unblock: release failed");
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -851,7 +862,10 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     match persisted {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            error!(error = %error_chain(&*e), "unblock: failed to persist target/intent off");
+            error!(
+                error = &*e as &dyn std::error::Error,
+                "unblock: failed to persist target/intent off"
+            );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -860,7 +874,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
             ));
         }
         Err(e) => {
-            error!(error = %e, "unblock: persist task panicked");
+            error!(error = &e as &dyn std::error::Error, "unblock: persist task panicked");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -893,7 +907,7 @@ fn unblock_error_message(e: &ProxyError) -> String {
 /// path-bearing detail to bridge.log (an IPC message reaches a GUI toast
 /// verbatim, so it must not carry a filesystem path).
 fn extraction_failure(detail: &(dyn std::error::Error + 'static)) -> (StatusCode, String) {
-    error!(error = %error_chain(detail), "update extraction failed");
+    error!(error = detail as &dyn std::error::Error, "update extraction failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         "update extraction failed".to_string(),
@@ -1015,7 +1029,10 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         Ok(d) => d,
         Err(e) => {
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to clear cutover marker on error path"
+                );
             }
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1046,7 +1063,10 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         Ok(Ok(copy)) => copy,
         Ok(Err(StageError::Verify(e))) => {
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to clear cutover marker on error path"
+                );
             }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
@@ -1058,7 +1078,10 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         }
         Ok(Err(StageError::Io(e))) => {
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to clear cutover marker on error path"
+                );
             }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
@@ -1070,7 +1093,10 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         }
         Err(e) => {
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to clear cutover marker on error path"
+                );
             }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
@@ -1095,20 +1121,32 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         Ok(Err(e)) => {
             let (code, message) = extraction_failure(&e);
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to clear cutover marker on error path"
+                );
             }
             if let Err(e) = std::fs::remove_dir_all(&private_dir) {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to remove private update dir on error path");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to remove private update dir on error path"
+                );
             }
             return Err((code, Json(ErrorResponse { message })));
         }
         Err(e) => {
             let (code, message) = extraction_failure(&e);
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to clear cutover marker on error path"
+                );
             }
             if let Err(e) = std::fs::remove_dir_all(&private_dir) {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to remove private update dir on error path");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to remove private update dir on error path"
+                );
             }
             return Err((code, Json(ErrorResponse { message })));
         }
@@ -1120,7 +1158,10 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // task that SIGTERMs THIS process only after this 200 is on the wire.
     if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version, app_dest.as_deref(), log_dir) {
         if let Err(e) = hole_common::update_marker::clear(log_dir) {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear cutover marker on error path");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "failed to clear cutover marker on error path"
+            );
         }
         let _ = std::fs::remove_dir_all(&private_dir);
         return Err((
@@ -1158,7 +1199,7 @@ async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(
     match pm.stop().await {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {
-            error!(error = %error_chain(&e), "proxy stop failed");
+            error!(error = &e as &dyn std::error::Error, "proxy stop failed");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { message: e.to_string() }),
@@ -1194,7 +1235,7 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     match result {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {
-            error!(error = %error_chain(&e), "proxy reload failed");
+            error!(error = &e as &dyn std::error::Error, "proxy reload failed");
             // Same reason as `handle_start`'s: the config is armed above, so
             // this covers a plain toString of the error, but an embedded
             // address can still arrive from outside Hole (e.g. garter's
@@ -1221,7 +1262,10 @@ async fn handle_metrics<P: Proxy + 'static, R: Routing + 'static>(
     let mut pm = state.proxy.lock().await;
     if let Some(event) = pm.check_health() {
         if let Err(e) = pm.stop_with(event).await {
-            tracing::error!(error = %error_chain(&e), "error tearing down proxy after a failed health check");
+            tracing::error!(
+                error = &e as &dyn std::error::Error,
+                "error tearing down proxy after a failed health check"
+            );
         }
     }
     let filter = if pm.state() == ProxyState::Running {
@@ -1274,7 +1318,10 @@ async fn handle_diagnostics<P: Proxy + 'static, R: Routing + 'static>(
     let network = match pm.default_route() {
         Ok(_) => "ok".to_string(),
         Err(e) => {
-            warn!(error = %error_chain(&e), "diagnostics: the default-route probe failed");
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "diagnostics: the default-route probe failed"
+            );
             "error".to_string()
         }
     };
@@ -1485,10 +1532,7 @@ fn apply_socket_permissions(path: &Path) {
     let extra_refs: Vec<&str> = extra_sids.iter().map(|s| s.as_str()).collect();
     let sddl = build_sddl(&extra_refs);
     if let Err(e) = set_dacl_from_sddl(path, &sddl, false) {
-        warn!(
-            "failed to set socket permissions: {error}",
-            error = util::error_chain::error_chain(&e)
-        );
+        warn!(error = &e as &dyn std::error::Error, "failed to set socket permissions");
     }
 }
 
@@ -1528,12 +1572,18 @@ pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
         Ok(sid) => sid,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            warn!(error = %e, "could not read the installer user SID file; ignoring it");
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "could not read the installer user SID file; ignoring it"
+            );
             return None;
         }
     };
     if let Err(e) = crate::socket::remove_name(dir, INSTALLER_USER_SID_FILE.as_ref()) {
-        warn!(error = %e, "could not remove the installer user SID file");
+        warn!(
+            error = &e as &dyn std::error::Error,
+            "could not remove the installer user SID file"
+        );
     }
     if !is_valid_sid_string(&sid) {
         warn!("the installer user SID file does not hold a SID; ignoring it");
@@ -1618,8 +1668,8 @@ pub fn build_sddl(extra_sids: &[&str]) -> String {
         }
         Err(e) => {
             warn!(
-                "'hole' group not found ({error}), IPC restricted to admin-only",
-                error = util::error_chain::error_chain(&e)
+                error = &e as &dyn std::error::Error,
+                "'hole' group not found, IPC restricted to admin-only"
             );
             base.to_string()
         }
@@ -1656,7 +1706,10 @@ fn apply_socket_permissions(path: &Path) {
     let c_path = match CString::new(path_str) {
         Ok(p) => p,
         Err(e) => {
-            warn!("invalid socket path for permissions: {e}");
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "invalid socket path for permissions"
+            );
             return;
         }
     };

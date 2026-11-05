@@ -356,7 +356,11 @@ impl<A: StopActor> Settle<'_, A> {
             Ok(()) => Ok(true),
             Err(error) => match service_gone(&error) {
                 Some(gone) if gone.answers_through_an_open_handle() => {
-                    warn!(%error, ?gone, "the SCM refused an arm; waiting on the service's processes instead");
+                    warn!(
+                        error = &error as &dyn std::error::Error,
+                        ?gone,
+                        "the SCM refused an arm; waiting on the service's processes instead"
+                    );
                     self.refused = true;
                     Ok(false)
                 }

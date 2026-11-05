@@ -333,7 +333,10 @@ pub(crate) fn harden<S: ServiceSession>(session: &mut S) -> Result<Hardened, Ret
         return Err(RetireError::Harden(error));
     }
     if let Err(error) = session.set_failure_actions(FailureActions::None) {
-        warn!(%error, "could not turn restart-on-failure off; the disabled start type still stops a restart");
+        warn!(
+            error = &error as &dyn std::error::Error,
+            "could not turn restart-on-failure off; the disabled start type still stops a restart"
+        );
     }
     Ok(Hardened::Disabled(hardening))
 }
@@ -351,12 +354,18 @@ pub(crate) fn restore_hardened<S: ServiceSession>(session: &mut S, hardened: &Ha
 /// install sweeps a record over a service that is not Disabled.
 pub(super) fn clear_record<S: StartConfig>(session: &mut S) {
     if let Err(error) = session.clear_record() {
-        warn!(%error, "could not clear the record that the uninstall disabled the service");
+        warn!(
+            error = &error as &dyn std::error::Error,
+            "could not clear the record that the uninstall disabled the service"
+        );
     }
 }
 
 fn marked(error: &io::Error) -> Hardened {
-    info!(%error, "the service is marked for deletion; stopping it through the open handle");
+    info!(
+        error = error as &dyn std::error::Error,
+        "the service is marked for deletion; stopping it through the open handle"
+    );
     Hardened::Marked
 }
 
@@ -367,10 +376,16 @@ fn marked(error: &io::Error) -> Hardened {
 /// failure is a warning.
 fn restore<S: ServiceSession>(session: &mut S, hardening: Hardening) {
     if let Err(error) = session.set_failure_actions(FailureActions::Restart) {
-        warn!(%error, "could not put restart-on-failure back");
+        warn!(
+            error = &error as &dyn std::error::Error,
+            "could not put restart-on-failure back"
+        );
     }
     if let Err(error) = session.set_start_type(hardening.restored()) {
-        warn!(%error, "could not put the start type back");
+        warn!(
+            error = &error as &dyn std::error::Error,
+            "could not put the start type back"
+        );
         return;
     }
     if hardening.ours {

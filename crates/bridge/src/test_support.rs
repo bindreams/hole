@@ -59,7 +59,7 @@ impl std::error::Error for CauseOmitted {
 }
 
 /// An `io::Error` whose `Display` omits `root_cause`; it is reachable only
-/// through `source()`, which is where `util::error_chain` finds it.
+/// through `source()`, which is where `util::error::chain` finds it.
 pub(crate) fn io_error_hiding(root_cause: &str) -> std::io::Error {
     std::io::Error::other(CauseOmitted {
         root: std::io::Error::other(root_cause.to_owned()),

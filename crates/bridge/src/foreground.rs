@@ -63,7 +63,10 @@ pub(crate) fn shutdown_signal() -> impl std::future::Future<Output = ()> {
                 }
             }
             Err(e) => {
-                tracing::error!(error = %util::error_chain::error_chain(&e), "failed to install SIGTERM handler; Ctrl+C only");
+                tracing::error!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to install SIGTERM handler; Ctrl+C only"
+                );
                 let _ = tokio::signal::ctrl_c().await;
                 tracing::info!("shutdown signal (SIGINT) received");
             }
@@ -77,7 +80,10 @@ pub(crate) fn shutdown_signal() -> impl std::future::Future<Output = ()> {
                 }
             }
             Err(e) => {
-                tracing::error!(error = %util::error_chain::error_chain(&e), "failed to install CTRL_BREAK handler; Ctrl+C only");
+                tracing::error!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to install CTRL_BREAK handler; Ctrl+C only"
+                );
                 let _ = tokio::signal::ctrl_c().await;
                 tracing::info!("shutdown signal (Ctrl+C) received");
             }
@@ -98,11 +104,15 @@ async fn notify_ready(spec: &str) {
         Ok(mut conn) => {
             use tokio::io::AsyncWriteExt as _;
             if let Err(e) = conn.write_all(format!("{token}\n").as_bytes()).await {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "ready-notify write failed");
+                tracing::warn!(error = &e as &dyn std::error::Error, "ready-notify write failed");
             }
             let _ = conn.shutdown().await;
         }
-        Err(e) => tracing::warn!(error = %util::error_chain::error_chain(&e), addr, "ready-notify connect failed"),
+        Err(e) => tracing::warn!(
+            error = &e as &dyn std::error::Error,
+            addr,
+            "ready-notify connect failed"
+        ),
     }
 }
 
@@ -128,7 +138,10 @@ pub(crate) fn shutdown_reason(marker_present: bool) -> crate::target::SessionEve
 /// service-path `platform::{macos,windows}::sweep_marker`.
 fn sweep_marker(log_dir: &Path) {
     if let Err(e) = hole_common::update_marker::clear(log_dir) {
-        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear update-in-progress marker");
+        tracing::warn!(
+            error = &e as &dyn std::error::Error,
+            "failed to clear update-in-progress marker"
+        );
     }
 }
 
@@ -192,7 +205,7 @@ async fn run_inner(
     let state_dir_dns = state_dir.to_path_buf();
     if let Err(e) = tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir_dns)).await
     {
-        tracing::warn!(error = %e, "recover_dns_config task panicked");
+        tracing::warn!(error = &e as &dyn std::error::Error, "recover_dns_config task panicked");
     }
 
     // Root cancellation token for this process, created BEFORE reconciliation
@@ -232,10 +245,16 @@ async fn run_inner(
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::wfp::log_snapshot("startup")).await {
-            tracing::warn!(error = %e, "wfp startup snapshot task panicked");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "wfp startup snapshot task panicked"
+            );
         }
         if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::ndis::log_snapshot("startup")).await {
-            tracing::warn!(error = %e, "ndis startup snapshot task panicked");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "ndis startup snapshot task panicked"
+            );
         }
     }
 
@@ -249,7 +268,7 @@ async fn run_inner(
     let _etw_guard = match crate::diagnostics::etw::start_consumer() {
         Ok(g) => Some(g),
         Err(e) => {
-            tracing::error!(error = %util::error_chain::error_chain(&e), "etw consumer failed to start");
+            tracing::error!(error = &e as &dyn std::error::Error, "etw consumer failed to start");
             None
         }
     };
@@ -262,7 +281,7 @@ async fn run_inner(
     // bridge.log, NOT in state_dir.
     let log_dir_sweep = log_dir.to_path_buf();
     if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
-        tracing::warn!(error = %e, "crash sweep task panicked");
+        tracing::warn!(error = &e as &dyn std::error::Error, "crash sweep task panicked");
     }
 
     // Cutover-marker parity with the service paths: once this bridge has bound it
@@ -271,13 +290,13 @@ async fn run_inner(
     // GUI-readable cutover marker (`hole_common::update_marker`).
     let log_dir_marker = log_dir.to_path_buf();
     if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
-        tracing::warn!(error = %e, "marker sweep task panicked");
+        tracing::warn!(error = &e as &dyn std::error::Error, "marker sweep task panicked");
     }
 
     tokio::select! {
         result = server.run() => {
             if let Err(e) = result {
-                tracing::error!(error = %util::error_chain::error_chain(&e), "IPC server error");
+                tracing::error!(error = &e as &dyn std::error::Error, "IPC server error");
             }
         }
         _ = shutdown.cancelled() => {}
@@ -291,7 +310,10 @@ async fn run_inner(
     let mut pm = proxy_shutdown.lock().await;
     let event = shutdown_reason(hole_common::update_marker::is_present(log_dir));
     if let Err(e) = pm.stop_with(event).await {
-        tracing::error!(error = %util::error_chain::error_chain(&e), "error stopping proxy during shutdown");
+        tracing::error!(
+            error = &e as &dyn std::error::Error,
+            "error stopping proxy during shutdown"
+        );
     }
 
     Ok(())
