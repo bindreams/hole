@@ -2630,7 +2630,7 @@ fn classify_twin_readback(views: &[Result<Vec<FilterRecord>, u32>], key: GUID) -
 /// Those filters are NOT orphaned: nothing treats the `Err` as "no cover
 /// installed", the next start probes the OS via [`lockdown_cover_presence`],
 /// reads `Live` off the fixed GUIDs, and `decide_cover_recovery` yields
-/// `Adopt`, with `record_intent_on` repairing `bridge-lockdown.json`.
+/// `Adopt` (over an intent nobody recorded it also repairs `bridge-lockdown.json`, through `record_intent_on`).
 ///
 /// **What it is NOT is what an aborted `install_lockdown` does.** That claim
 /// held only where a cover ALREADY existed. Over a clean host on a FIRST

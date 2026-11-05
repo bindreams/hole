@@ -1232,8 +1232,9 @@ impl CoverPresence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recovery {
     pub action: CoverRecovery,
-    /// Repair the intent file to `enabled: true` before acting. Grounded in a
-    /// positive OS measurement only — see rule 4.
+    /// Repair an unset intent file to `enabled: true` before acting. Grounded
+    /// in a positive OS measurement only, and never over an unreadable record
+    /// — see rule 4.
     pub record_intent_on: bool,
     /// Echoes the `presence` this decision was made from. `action == Adopt`
     /// alone is not evidence the OS confirmed a live cover — it also covers
@@ -1252,7 +1253,7 @@ pub struct Recovery {
 /// 1. [`CoverPresence::Absent`] and [`CoverPresence::Unreachable`] always yield `Noop` with `record_intent_on = false`.
 /// 2. `Sweep` requires [`Intent::Off`](failclosed::lockdown_state::Intent::Off) and an actionable presence (`Live | Recorded | Indeterminate`). It is the only action that removes protection, and the only one that mutates the OS at all.
 /// 3. `Adopt` requires an actionable presence and an intent of `On`, `Unreadable`, or `Unset` — with `Unset` additionally requiring positive evidence (`Live | Recorded`), because an unknown intent plus an unusable OS answer is no evidence in any direction.
-/// 4. `record_intent_on` requires `Presence::Live` and an intent of `Unset` or `Unreadable`. The write is grounded in a positive OS measurement, never inferred.
+/// 4. `record_intent_on` requires `Presence::Live` and an intent of `Unset`. The write is grounded in a positive OS measurement, never inferred, and never over an `Unreadable` record: it already reads armed, and it may hold the user's `Off`, which a write would turn into `On`.
 ///
 /// The match is exhaustive on both axes with no wildcard, so a new variant of
 /// either is a compile error rather than a silently inherited answer.
@@ -1281,7 +1282,7 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
         (I::Unset, P::Absent) => (Noop, false),
         (I::Unset, P::Unreachable) => (Noop, false),
 
-        (I::Unreadable, P::Live) => (Adopt, true),
+        (I::Unreadable, P::Live) => (Adopt, false),
         (I::Unreadable, P::Recorded) => (Adopt, false),
         (I::Unreadable, P::Indeterminate) => (Adopt, false),
         (I::Unreadable, P::Absent) => (Noop, false),
@@ -1489,7 +1490,8 @@ where
     let presence = lockdown_present();
     let decision = decide_cover_recovery(lockdown_intent, presence);
     // Repair BEFORE acting, so a crash in between leaves an intent that reads
-    // armed rather than one the next start would sweep on. A failed write costs
+    // armed. Only an unset intent is repaired: an unreadable one already reads
+    // armed and may hold the user's `Off`. A failed write costs
     // the persisted preference, never the action or the escape: this run's
     // adopted-cover claim carries the escape, and the bridge retries the write
     // the moment it honours that claim with a real cover install (see

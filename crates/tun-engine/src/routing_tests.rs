@@ -1571,7 +1571,7 @@ const RECOVERY_TABLE: [(Intent, CoverPresence, CoverRecovery, bool); 20] = [
     (Intent::Unset, Indeterminate, Noop, false),
     (Intent::Unset, Absent, Noop, false),
     (Intent::Unset, Unreachable, Noop, false),
-    (Intent::Unreadable, Live, Adopt, true),
+    (Intent::Unreadable, Live, Adopt, false),
     (Intent::Unreadable, Recorded, Adopt, false),
     (Intent::Unreadable, Indeterminate, Adopt, false),
     (Intent::Unreadable, Absent, Noop, false),
@@ -1620,15 +1620,34 @@ fn cover_recovery_sweeps_only_on_an_explicit_off_intent() {
 #[skuld::test]
 fn cover_recovery_records_intent_only_on_a_live_cover() {
     // The repair write is grounded in a positive OS measurement, never
-    // inferred from a state file or from an unusable answer.
+    // inferred from a state file or from an unusable answer, and only over an
+    // intent nobody recorded: the same answer `promote_unrecorded` gives.
     for intent in [Intent::On, Intent::Off, Intent::Unset, Intent::Unreadable] {
         for presence in [Live, Recorded, Indeterminate, Absent, Unreachable] {
-            let expected = presence == Live && matches!(intent, Intent::Unset | Intent::Unreadable);
+            let expected = presence == Live && intent == Intent::Unset;
             assert_eq!(
                 decide_cover_recovery(intent, presence).record_intent_on,
                 expected,
                 "({intent:?}, {presence:?}) record_intent_on must be {expected}"
             );
+        }
+    }
+}
+
+#[skuld::test]
+fn cover_recovery_writes_only_where_the_starts_promotion_would() {
+    for intent in [Intent::On, Intent::Off, Intent::Unset, Intent::Unreadable] {
+        for presence in [Live, Recorded, Indeterminate, Absent, Unreachable] {
+            if decide_cover_recovery(intent, presence).record_intent_on {
+                assert_eq!(
+                    presence, Live,
+                    "({intent:?}, {presence:?}) writes without a measured cover"
+                );
+                assert!(
+                    intent.admits_adoption_promotion(),
+                    "({intent:?}, {presence:?}) writes over an intent the promotion declines"
+                );
+            }
         }
     }
 }
@@ -1795,19 +1814,38 @@ fn recover_records_the_intent_before_acting_on_it() {
     );
 }
 
+/// An unreadable record may hold the user's `Off` (a newer or garbled schema): the cover is adopted and the
+/// record is left exactly as it is.
 #[skuld::test]
-fn recover_repairs_an_unreadable_intent_over_a_live_cover() {
+fn recover_adopts_a_live_cover_and_leaves_an_unreadable_intent_untouched() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join(failclosed::lockdown_state::STATE_FILE_NAME),
-        b"{corrupt",
-    )
-    .unwrap();
+    let path = dir.path().join(failclosed::lockdown_state::STATE_FILE_NAME);
+    let garbled = b"{corrupt";
+    std::fs::write(&path, garbled).unwrap();
     let (decision, acted) = recover_over(dir.path(), Live);
 
     assert_eq!(acted, Some(Adopt));
-    assert!(decision.record_intent_on);
-    assert_eq!(failclosed::lockdown_state::load_intent(dir.path()), Intent::On);
+    assert!(!decision.record_intent_on);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        garbled,
+        "not one byte of it is rewritten"
+    );
+    assert_eq!(failclosed::lockdown_state::load_intent(dir.path()), Intent::Unreadable);
+}
+
+/// A read that fails (a directory at the name) classifies `Unreadable` as well, and is left alone.
+#[skuld::test]
+fn recover_leaves_an_intent_whose_read_fails_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(failclosed::lockdown_state::STATE_FILE_NAME);
+    std::fs::create_dir(&path).unwrap();
+    let (decision, acted) = recover_over(dir.path(), Live);
+
+    assert_eq!(acted, Some(Adopt));
+    assert!(!decision.record_intent_on);
+    assert!(path.is_dir(), "the name still holds what it held");
+    assert_eq!(failclosed::lockdown_state::load_intent(dir.path()), Intent::Unreadable);
 }
 
 #[skuld::test]
