@@ -489,20 +489,23 @@ pub(crate) fn fn_decl_re() -> regex::Regex {
 /// above a call site cannot change what the guard sees — the property
 /// `the_sanctioned_caller_guard_survives_line_shifts` pins.
 pub(crate) fn call_sites_by_function(text: &str, pattern: &regex::Regex) -> Vec<(String, String)> {
-    let decl = fn_decl_re();
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
-        if !pattern.is_match(line) {
-            continue;
+        if pattern.is_match(line) {
+            out.push((enclosing_fn(&lines, idx), line.trim().to_string()));
         }
-        let name = (0..=idx)
-            .rev()
-            .find_map(|i| decl.captures(lines[i]).map(|c| c[1].to_string()))
-            .unwrap_or_else(|| "<no enclosing fn>".to_string());
-        out.push((name, line.trim().to_string()));
     }
     out
+}
+
+/// The name of the function whose declaration is the nearest at or above `lines[idx]`.
+fn enclosing_fn(lines: &[&str], idx: usize) -> String {
+    let decl = fn_decl_re();
+    (0..=idx)
+        .rev()
+        .find_map(|i| decl.captures(lines[i]).map(|c| c[1].to_string()))
+        .unwrap_or_else(|| "<no enclosing fn>".to_string())
 }
 
 /// Every form the cover release is reachable through: the `Routing` trait
@@ -853,10 +856,8 @@ fn session_event_policy_lives_on_the_type_not_at_call_sites() {
 
 /// The same rule for [`crate::coverage::Coverage`] and the [`crate::coverage::CoverPlan`] it yields: whether a
 /// start engages, hands over or releases the transient cover is decided once, by `Coverage::plan`, and a call
-/// site that matched a `Coverage` variant would make its own decision (the resolve-failure warning did, and was
-/// false under a standing cover). `CoverPlan` carries per-variant policy too, asked through its methods; the one
-/// sanctioned `match` is the dispatch in `ProxyManager::start_cancellable`, and each of its arms must appear
-/// exactly once.
+/// site that matched a `Coverage` variant would make its own decision. `CoverPlan` has no methods; the one
+/// sanctioned `match` on it is the dispatch in `ProxyManager::start_cancellable`, each arm exactly once.
 #[skuld::test]
 fn coverage_policy_lives_on_the_type_not_at_call_sites() {
     let offenders = decisions_outside(&["coverage.rs"], "Coverage::");
@@ -867,31 +868,42 @@ fn coverage_policy_lives_on_the_type_not_at_call_sites() {
         offenders.join("\n  ")
     );
 
-    const DISPATCH_ARMS: [&str; 3] = [
-        "CoverPlan::Engage { unblock_snapshot } => {",
-        "CoverPlan::HandToLockdown => {",
-        "CoverPlan::FailOpen => {",
-    ];
-    let mut offenders = decisions_outside(&["coverage.rs"], "CoverPlan::");
-    for arm in DISPATCH_ARMS {
-        let sanctioned = offenders
-            .iter()
-            .position(|o| o.contains("proxy_manager.rs:") && o.ends_with(&format!(": {arm}")));
-        match sanctioned {
-            Some(i) => {
-                offenders.remove(i);
-            }
-            None => offenders.push(format!("the dispatch arm `{arm}` is not in `proxy_manager.rs`")),
-        }
-    }
+    // `proxy_manager.rs` is scanned apart: its `CoverPlan` decisions must be exactly the dispatch arms, each once,
+    // inside `start_cancellable`. A moved or duplicated arm, or a decision elsewhere in the file, is an offender.
+    let offenders = decisions_outside(&["coverage.rs", "proxy_manager.rs"], "CoverPlan::");
     assert!(
         offenders.is_empty(),
-        "per-variant CoverPlan policy decided outside `coverage.rs` and the one dispatch match in \
-         `start_cancellable`:\n  {}\n\
+        "per-variant CoverPlan policy decided outside `coverage.rs` and the one dispatch match in          `start_cancellable`:
+  {}
          Add a method to `CoverPlan` (one exhaustive match) and ask it instead.",
-        offenders.join("\n  ")
+        offenders.join("
+  ")
+    );
+
+    let text = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/proxy_manager.rs"))
+        .expect("failed to read proxy_manager.rs");
+    let lines: Vec<&str> = text.lines().collect();
+    let mut found: Vec<(String, String)> = code_lines(&text)
+        .filter(|(_, l)| l.contains("CoverPlan::") && line_decides(l))
+        .map(|(i, l)| (enclosing_fn(&lines, i), l.trim().to_string()))
+        .collect();
+    let mut want: Vec<(String, String)> = DISPATCH_ARMS
+        .iter()
+        .map(|arm| ("start_cancellable".to_string(), (*arm).to_string()))
+        .collect();
+    found.sort();
+    want.sort();
+    assert_eq!(
+        found, want,
+        "the `CoverPlan` decisions in `proxy_manager.rs` must be the dispatch arms, once each, in `start_cancellable`"
     );
 }
+
+const DISPATCH_ARMS: [&str; 3] = [
+    "CoverPlan::Engage { unblock_snapshot } => {",
+    "CoverPlan::HandToLockdown => {",
+    "CoverPlan::FailOpen => {",
+];
 
 /// Every non-test line of `crates/bridge/src` that names `token` and decides from it ([`line_decides`]), outside
 /// the `sanctioned` files (paths relative to `src/`).

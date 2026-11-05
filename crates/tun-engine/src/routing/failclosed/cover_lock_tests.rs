@@ -191,15 +191,21 @@ fn is_current_follows_install_and_outdate() {
 }
 
 #[skuld::test]
-fn a_cover_released_with_the_lock_deletes_once() {
+fn a_stamp_is_held_under_its_own_dirs_lock() {
     let d = dir();
     let lock = CoverLock::acquire(d.path());
     let stamp = lock.stamp_install(CoverKind::Transient);
-    let mut deleted = 0;
 
-    stamp.release_on_drop(|| deleted += 1);
+    stamp.assert_held_under(&lock);
+}
 
-    assert_eq!(deleted, 1);
+#[skuld::test(should_panic = "released under the lock of its own state dir")]
+fn a_stamp_is_not_held_under_another_dirs_lock() {
+    let (d, other) = (dir(), dir());
+    let stamp = CoverLock::acquire(d.path()).stamp_install(CoverKind::Transient);
+    let wrong = CoverLock::acquire(other.path());
+
+    stamp.assert_held_under(&wrong);
 }
 
 #[skuld::test]
