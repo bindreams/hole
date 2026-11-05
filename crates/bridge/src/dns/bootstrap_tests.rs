@@ -502,7 +502,7 @@ async fn insecure_fallback_logs_the_certificate_rejection_even_when_it_succeeds(
         "the WARN must state the consequence, not just flag it; got:\n{output}"
     );
     assert!(
-        output.contains("CertificateRejected"),
+        output.contains("error=a secure DNS resolver presented a certificate that could not be verified"),
         "the WARN must name the finding the fallback is proceeding past; got:\n{output}"
     );
 }

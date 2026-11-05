@@ -383,7 +383,11 @@ impl<A: StopActor> Settle<'_, A> {
             if again.settle_step().is_a_stop_the_service_takes() {
                 return Err(SettleError::Stop(refused));
             }
-            info!(?again, error = %refused, "stop wait: the Stop was refused, but the service is no longer running");
+            info!(
+                ?again,
+                error = &refused as &dyn std::error::Error,
+                "stop wait: the Stop was refused, but the service is no longer running"
+            );
             return Ok(Next::Look(again));
         }
         match wait {
