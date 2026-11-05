@@ -11,7 +11,7 @@
 // "Bridge cancellation contract" carve-out).
 #![allow(clippy::disallowed_methods)]
 
-use super::proxy_manager_tests::{rt, test_config, MockProxy, MockRouting, MockRoutingState};
+use super::proxy_manager_tests::{covered_now, rt, test_config, MockProxy, MockRouting, MockRoutingState};
 use super::*;
 use crate::proxy::ProxyError;
 use std::sync::atomic::Ordering;
@@ -40,15 +40,9 @@ async fn covered_start_holding_the_cover(
     cfg.dns.enabled = true;
     cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
-    pm.start_cancellable(
-        &cfg,
-        Coverage::Covered {
-            unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-        },
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await
-    .unwrap_err();
+    pm.start_cancellable(&cfg, covered_now(&pm), tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap_err();
     assert!(
         pm.blocked_until_connected(),
         "setup: the failed covered start must hold the cover"
@@ -325,7 +319,7 @@ fn an_externally_released_cover_is_not_silently_reused() {
         // attempt succeeds all the way through instead of failing again.
         let cfg = test_config();
 
-        pm.start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, tokio_util::sync::CancellationToken::new())
+        pm.start_cancellable(&cfg, covered_now(&pm), tokio_util::sync::CancellationToken::new())
             .await
             .expect("the superseded zombie must not block a fresh, successful retry");
 

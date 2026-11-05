@@ -145,8 +145,8 @@ pub struct Cover {
 }
 
 impl crate::routing::CoverGuard for Cover {
-    /// Persist the underlying filters without disengaging: consumes the guard so
-    /// its `Drop` does not run. The filters are persistent-by-design, so leaving
+    /// Persist the underlying filters without disengaging: consumes the guard and
+    /// empties what it holds, so its `Drop` disengages nothing. The filters are persistent-by-design, so leaving
     /// them in force across a cutover restart is exactly correct — the new
     /// bridge re-adopts them.
     ///

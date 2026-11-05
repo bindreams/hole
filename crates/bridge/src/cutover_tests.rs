@@ -830,7 +830,7 @@ fn an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_
 
     // The premise, on the lane that always runs. A `Persistent` key goes
     // unproven under exactly one outcome — `Failed` — and `Failed` is what
-    // `first_delete_failure` turns into a `SweepOutcome::failed`, so a
+    // `first_delete_failure` turns into the failure of a `SweepOutcome::per_kind`, so a
     // clearance carrying one reaches its caller as `Err` and is dropped by the
     // `?` in `unlock_with`/`release_covers_with` before any render site. The
     // Windows half of that chain is
