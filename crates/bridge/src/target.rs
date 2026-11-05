@@ -174,24 +174,6 @@ fn persisted(target: &Target) -> PersistedTarget {
     }
 }
 
-/// A test fixture: persist `target` as [`apply`] would, without a decision in front of it. Creates `state_dir` at 0700
-/// and the file at 0600 (unix, see [`TargetPlacement`]): this file holds a shadowsocks password via `ProxyConfig`'s
-/// `ServerEntry`, the same secret the user's own config already keeps at 0600 in a 0700 directory
-/// (`CONTRIBUTING.md#server-address-redaction`).
-#[cfg(test)]
-pub(crate) fn save(state_dir: &Path, target: &Target, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
-    target_file(state_dir)
-        .update(&TargetPlacement { owner }, |_| {
-            (
-                Change::Store(TargetFile {
-                    target: persisted(target),
-                }),
-                (),
-            )
-        })
-        .map(|_| ())
-}
-
 /// Where the state files are written: the directory is handed to `owner` at 0700 (unix) or given the state DACL
 /// (Windows, opened with the right to rewrite it), and each file is sealed through its own handle before the rename,
 /// because the directory may belong to the interactive user.
@@ -541,20 +523,6 @@ pub(crate) fn apply_startup_preference(
             let mut pref = preference_of(&observed.loaded);
             f(&mut pref);
             (Change::Store(StartupPreferenceFile::from(&pref)), ())
-        })
-        .map(|_| ())
-}
-
-/// A test fixture: persist the startup preference through the same [`TargetPlacement`] as [`apply_startup_preference`].
-#[cfg(test)]
-pub(crate) fn save_startup_preference(
-    state_dir: &Path,
-    pref: &StartupPreference,
-    owner: Option<(u32, u32)>,
-) -> Result<(), StoreError> {
-    startup_file(state_dir)
-        .update(&TargetPlacement { owner }, |_| {
-            (Change::Store(StartupPreferenceFile::from(pref)), ())
         })
         .map(|_| ())
 }

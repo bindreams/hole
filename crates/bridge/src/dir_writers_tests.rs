@@ -28,6 +28,7 @@ use util::dir::testing::{plant_link, user_dir};
 use util::dir::{Dir, Refusal};
 
 use crate::target::{self, Target};
+use crate::test_support::target_records;
 use util::versioned_file::{CreateOutcome, StoreError};
 
 mod scan;
@@ -339,7 +340,7 @@ fn writers() -> Vec<Writer> {
             names: &[target::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, owner| target::save(dir, &Target::Off, owner).map_err(io::Error::other),
+            run: |dir, owner| target_records::save(dir, &Target::Off, owner).map_err(io::Error::other),
         },
         Writer {
             name: "the update marker, claimed",
@@ -706,7 +707,7 @@ fn readings() -> Vec<Reading> {
             name: "target::load",
             file: target::STATE_FILE_NAME,
             // `Off` is what an absent file reads as too, but a planted name is not absent: it reads `Unreadable`.
-            write_valid: |dir| target::save(dir, &Target::Off, None).unwrap(),
+            write_valid: |dir| target_records::save(dir, &Target::Off, None).unwrap(),
             reads_it: |dir| matches!(target::load(dir), Target::Off),
         },
         Reading {
@@ -717,7 +718,7 @@ fn readings() -> Vec<Reading> {
                     on_startup: StartupBehavior::AlwaysConnect,
                     candidate: None,
                 };
-                target::save_startup_preference(dir, &preference, None).unwrap();
+                target_records::save_startup_preference(dir, &preference, None).unwrap();
             },
             reads_it: |dir| target::load_startup_preference(dir).on_startup == StartupBehavior::AlwaysConnect,
         },

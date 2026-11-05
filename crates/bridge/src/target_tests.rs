@@ -6,6 +6,7 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 use util::dir::testing::{plant_link, user_dir, SystemScratch};
 
 use crate::test_support::log_capture::VecWriter;
+use crate::test_support::target_records::{save, save_startup_preference};
 
 /// Capture this crate's log records at `WARN` and above for the duration of
 /// `body`. Both state-file loaders classify their failure into a `warn!` and

@@ -379,6 +379,7 @@ impl RoutesInstalled for MockRoutes {
 // Helpers =============================================================================================================
 
 use crate::test_support::rt;
+use crate::test_support::target_records;
 
 /// Build a mock proxy manager backed by a throw-away state dir. Uses
 /// `tempfile::tempdir().keep()` so the directory is created but its
@@ -1550,7 +1551,7 @@ fn a_start_with_no_startup_preference_leaves_the_persisted_one_alone() {
     rt().block_on(async {
         let path = test_socket_path("on-startup-noop");
         let state_dir = tempfile::tempdir().unwrap().keep();
-        target::save_startup_preference(
+        target_records::save_startup_preference(
             &state_dir,
             &target::StartupPreference {
                 on_startup: StartupBehavior::AlwaysConnect,

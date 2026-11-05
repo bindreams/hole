@@ -5,9 +5,10 @@ use hole_common::protocol::{ProxyConfig, TunnelMode};
 use crate::plugin_state;
 use crate::proxy_manager::proxy_manager_tests::{MockProxy, MockRouting};
 use crate::proxy_manager::ProxyState;
-use crate::target::{self, Target};
+use crate::target::Target;
 use crate::test_support::reap_child::EchoChild;
 use crate::test_support::rt;
+use crate::test_support::target_records;
 use std::sync::atomic::Ordering;
 use tun_engine::routing::{CoverPresence, CoverRecovery, Recovery};
 
@@ -48,7 +49,7 @@ fn connectable() -> Target {
 fn the_boot_reap_spares_the_plugin_of_the_boot_auto_connect() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        target::save(dir.path(), &connectable(), None).unwrap();
+        target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let mut leftover = EchoChild::spawn();
         plugin_state::append_record(dir.path(), leftover.record(), None).unwrap();
@@ -100,7 +101,7 @@ fn the_boot_reap_spares_the_plugin_of_the_boot_auto_connect() {
 fn the_boot_reconcile_sees_the_cover_route_recovery_adopted() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        target::save(dir.path(), &connectable(), None).unwrap();
+        target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
         let routing_state = routing.state();
