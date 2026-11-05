@@ -29,11 +29,7 @@ fn a_change_begun_names_its_holder_and_a_change_ended_names_none() {
     assert_eq!(mark.read().holder(), Some(Changer::Running), "this process holds it");
 
     mark.end(&Stamp::current()).expect("end");
-    assert_eq!(
-        key.get_string(VALUE).expect("the value"),
-        format!("2/{}", Stamp::current().encode()),
-        "the count and the process that ended the change"
-    );
+    ScratchChangeKey::assert_at_rest(&key.get_string(VALUE).expect("the value"), 2, &Stamp::current());
     assert_eq!(mark.read().holder(), None);
 }
 
@@ -92,10 +88,7 @@ fn a_value_that_is_not_a_mark_names_no_holder() {
     key.set_u32(VALUE, 7).expect("write");
     assert_eq!(scratch.mark().read().holder(), None);
     scratch.mark().end(&Stamp::current()).expect("end");
-    assert_eq!(
-        key.get_string(VALUE).expect("replaced"),
-        format!("1/{}", Stamp::current().encode())
-    );
+    ScratchChangeKey::assert_at_rest(&key.get_string(VALUE).expect("replaced"), 1, &Stamp::current());
 }
 
 /// A value of the wrong type is read as an empty mark, and says so, as every
@@ -167,6 +160,23 @@ fn changes_that_end_on_a_fresh_key_each_leave_a_different_mark() {
     mark.begin(&second).expect("mark again");
     mark.end(&second).expect("end");
     assert_ne!(mark.read(), after_first);
+}
+
+/// One process that ends a change on each of two fresh keys, both at the same
+/// count, repeats its stamp; the mark must still differ.
+#[skuld::test]
+fn one_process_ending_two_changes_on_fresh_keys_at_the_same_count_leaves_two_marks() {
+    let holder = Stamp::current();
+    let mut at_rest = Vec::new();
+    for name in ["same-process-a", "same-process-b"] {
+        let (scratch, key) = ScratchChangeKey::created(name);
+        let mark = scratch.mark();
+        mark.begin(&holder).expect("begin");
+        mark.end(&holder).expect("end");
+        at_rest.push(key.get_string(VALUE).expect("the value"));
+    }
+    assert!(at_rest.iter().all(|value| value.starts_with("2/")), "{at_rest:?}");
+    assert_ne!(at_rest[0], at_rest[1]);
 }
 
 /// A status reader over the real mark in a scratch key, whose service is

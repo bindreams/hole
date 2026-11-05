@@ -6,22 +6,26 @@
 //! would be read half done. The reader reads the mark before and after and
 //! goes again if it moved ([`crate::service_scm::repair::display`]).
 //!
-//! The value is `<n>/<pid>:<created>` while no change runs and
+//! The value is `<n>/<pid>:<created>/<seq>` while no change runs and
 //! `<n>:<pid>:<created>` while a holder changes the service, `n` counting every
 //! transition and the rest being a [`Stamp`]: the holder's while it changes the
-//! service, the one that ended the last change at rest. The holder's stamp is
+//! service, the one that ended the last change at rest, and `seq` counting the
+//! changes this process has ended. The holder's stamp is
 //! what keeps one that crashed from reading as a change for ever: the reader
 //! asks whether its process runs, as it does for the record. The holder writes
 //! it under the lock, after taking it and before its first read, and writes the
 //! at-rest value after its last write and before letting go, so no change runs
 //! while the mark says none does. The ender's stamp is what keeps the at-rest
 //! value from repeating: a reinstall deletes the key and the count with it, so
-//! two installs can end at the same `n`, but never in the same process. A bare
-//! `<n>`, which an earlier build wrote at rest, equals no value written now.
+//! two installs can end at the same `n`, but never in the same process. `seq`
+//! covers the same process ending two changes at the same `n`. A bare `<n>` and
+//! an `<n>/<pid>:<created>`, which earlier builds wrote at rest, equal no value
+//! written now.
 //! The mark sits in the service's key, which an unprivileged user can read and
 //! no user can write.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::warn;
 use windows::Win32::System::Registry::{KEY_QUERY_VALUE, KEY_SET_VALUE};
@@ -34,6 +38,10 @@ use crate::platform::os::SERVICE_NAME;
 
 /// The value's name.
 const VALUE: &str = "HoleChangeMark";
+
+/// The changes this process has ended, so its at-rest values differ even on
+/// keys that start from the same count.
+static ENDED: AtomicU64 = AtomicU64::new(0);
 
 /// Where the mark lives: a key, which the mark's value is in.
 #[derive(Clone)]
@@ -90,7 +98,8 @@ impl ChangeKey {
     /// Marks the change `holder` made ended; the key not being there is success
     /// (the service was deleted).
     pub fn end(&self, holder: &Stamp) -> io::Result<()> {
-        self.write(|n| format!("{n}/{}", holder.encode()))
+        let seq = ENDED.fetch_add(1, Ordering::Relaxed);
+        self.write(|n| format!("{n}/{}/{seq}", holder.encode()))
     }
 
     /// Writes the value for transition number `previous + 1`.
@@ -147,6 +156,7 @@ pub(crate) mod scratch {
     use windows_registry::{Key, CURRENT_USER};
 
     use super::ChangeKey;
+    use crate::disable_record::stamp::Stamp;
 
     pub(crate) struct ScratchChangeKey {
         path: String,
@@ -176,6 +186,24 @@ pub(crate) mod scratch {
         pub(crate) fn recreated(&self) -> Key {
             CURRENT_USER.remove_tree(&self.path).expect("delete the scratch key");
             CURRENT_USER.create(&self.path).expect("create the scratch key again")
+        }
+
+        /// The mark's value as stored.
+        pub(crate) fn stored(&self) -> String {
+            let key = CURRENT_USER.open(&self.path).expect("open the scratch key");
+            key.get_string(super::VALUE).expect("the stored mark")
+        }
+
+        /// `value` is the at-rest value of change number `count` ended by `holder`:
+        /// `<count>/<stamp>/<seq>`, with a `seq` that depends on what else the
+        /// process has ended.
+        pub(crate) fn assert_at_rest(value: &str, count: u64, holder: &Stamp) {
+            let prefix = format!("{count}/{}/", holder.encode());
+            let seq = value.strip_prefix(&prefix);
+            assert!(
+                seq.is_some_and(|seq| seq.parse::<u64>().is_ok()),
+                "{value:?} is not {prefix}<seq>"
+            );
         }
 
         pub(crate) fn exists(&self) -> bool {
