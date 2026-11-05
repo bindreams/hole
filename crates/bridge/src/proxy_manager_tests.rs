@@ -698,6 +698,43 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
 }
 
 #[skuld::test]
+fn a_mock_cover_released_under_its_own_dirs_lock_disengages() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let lock = routing.lock_covers();
+    let cover = routing
+        .install_lockdown(
+            &lock,
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            &TunIdentity::synthetic(0xFEED, "hole-tun"),
+            &[],
+        )
+        .unwrap();
+
+    tun_engine::routing::CoverGuard::release(cover, &lock);
+
+    assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 1);
+}
+
+#[skuld::test(should_panic = "released under the lock of its own state dir")]
+fn a_mock_cover_released_under_another_dirs_lock_panics() {
+    let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let cover = routing
+        .install_lockdown(
+            &routing.lock_covers(),
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            &TunIdentity::synthetic(0xFEED, "hole-tun"),
+            &[],
+        )
+        .unwrap();
+    let wrong = CoverLock::acquire(other.path());
+
+    tun_engine::routing::CoverGuard::release(cover, &wrong);
+}
+
+#[skuld::test]
 fn a_stale_guard_release_after_a_completed_sweep_deletes_nothing() {
     // The stamp rule the real guards follow: a completed sweep took what the guard held, so its later drop (or
     // release) must not disengage a second time.
@@ -4545,7 +4582,7 @@ mod self_test {
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
-            pm.set_bootstrap_querier_for_test(Arc::new(DeadQuerier));
+            pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
             let mut cfg = test_config();
             // Resolvable on every CI host without network.
             cfg.server.server = "localhost".into();
@@ -5899,16 +5936,6 @@ mod self_test {
         });
     }
 
-    /// A querier that answers nothing, so every configured resolver fails.
-    struct DeadQuerier;
-
-    #[async_trait::async_trait]
-    impl DohQuerier for DeadQuerier {
-        async fn query(&self, _server: IpAddr, _wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            Err(UpstreamCause::Unreachable)
-        }
-    }
-
     // Every resolver failed and the OS resolver supplied the address, so no
     // resolver is known to serve the ECH lookup — the URL is still derived,
     // because omitting it refuses the start under `ech=always`.
@@ -5918,7 +5945,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
-            pm.set_bootstrap_querier_for_test(Arc::new(DeadQuerier));
+            pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
             let mut cfg = test_config();
             // Resolvable on every CI host without network.
             cfg.server.server = "localhost".into();
