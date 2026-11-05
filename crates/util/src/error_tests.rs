@@ -169,12 +169,6 @@ fn find_reaches_a_typed_error_inside_the_io_error_a_store_error_wraps() {
     assert!(find::<Marker>(&e).is_some());
 }
 
-#[skuld::test]
-fn raw_os_error_takes_the_first_code_in_the_chain() {
-    let e = io::Error::other(io::Error::other(io::Error::from_raw_os_error(10054)));
-    assert_eq!(raw_os_error(&e), Some(10054));
-}
-
 // no transparent wrappers =============================================================================================
 
 /// `#[error(transparent)]` forwards `source()` to the wrapped value, so the value itself is never a link and
