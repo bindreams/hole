@@ -40,6 +40,8 @@ pub(super) struct Meta {
     pub uid: u32,
     pub gid: u32,
     pub mode: u32,
+    /// The file's link count: how many names it has.
+    pub links: u64,
 }
 
 impl Meta {
@@ -114,6 +116,7 @@ fn meta_of(st: &libc::stat) -> Meta {
         uid: st.st_uid,
         gid: st.st_gid,
         mode: u32::from(st.st_mode),
+        links: st.st_nlink as u64,
     }
 }
 
@@ -387,6 +390,8 @@ pub(super) fn id_of(dir: &File, name: &OsStr) -> io::Result<Option<FileId>> {
 
 pub(super) fn ids_of(dir: &File, name: &OsStr) -> io::Result<Option<(u32, u32)>> {
     match fstatat_nofollow(dir.as_raw_fd(), &cstr(name)?) {
+        Ok(meta) if meta.kind() != EntryKind::File => Err(Refusal::NotRegular.into_io_error()),
+        Ok(meta) if meta.links != 1 => Err(Refusal::ForeignFile.into_io_error()),
         Ok(meta) => Ok(Some((meta.uid, meta.gid))),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
