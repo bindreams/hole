@@ -12,19 +12,16 @@
 //! restart-on-failure action. S is crashed, then C. C's restarted instance
 //! signals an event, and that event, not a delay, is what the test waits for:
 //! it bounds the read of S from above, because S's action was due well before
-//! C's: C is killed only after S's queued restart was read off the log, so C's
-//! is due `C_RESTART_DELAY` after that read and S's `S_RESTART_DELAY` after the
-//! SCM queued it. S's disable is written either while its restart is queued
-//! (variant `queued`) or before the crash (variant `running`).
+//! C's. S's disable is written either while its restart is queued (variant
+//! `queued`) or before the crash (variant `running`).
 //!
 //! The `queued` variant needs the disable to land before the SCM's restart
 //! timer fires, which the test cannot guarantee: only the SCM runs that timer.
 //! No read of S's state can place a restart against the disable (the disable
 //! writes no event, and a state read leaves the restart on the other side of it
 //! open), so the restart is placed by when it happened. The system time is read
-//! just before the disable is written (`t0`) and just after it returns (`t1`),
-//! and the creation time of S's restarted instance is read from the process
-//! list, by the process id the SCM reports for S:
+//! just before the disable is written (`t0`) and just after it returns (`t1`).
+//! The restarted instance's creation time is compared against them:
 //! - created before `t0`: the timer fired first, nothing was measured: rerun;
 //! - created after `t1`: the SCM started a disabled service: FALSIFIED;
 //! - created within `[t0, t1]`: the order is unknowable, so it is no
@@ -32,29 +29,22 @@
 //!
 //! Two residuals remain. The creation time is when the process was created, not
 //! when the SCM decided to restart: a restart decided before `t0` can be created
-//! after `t1` (the SCM's decision-to-creation delay, which a loaded runner
-//! stretches to hundreds of ms), and is then read as a false FALSIFIED, never as
-//! a silent pass. What keeps the timer away from `t0` is the margin, S's 30 s
-//! delay against the ~6 s the event-log read before the disable took on a loaded
-//! runner; nothing the SCM's API exposes places its decision, so no design of
-//! this probe removes the residual. And `t0`, `t1` and the creation stamp are
+//! after `t1` (the SCM's decision-to-creation delay), and is then read as a
+//! false FALSIFIED, never as a silent pass. What keeps the timer away from `t0`
+//! is the margin, S's 30 s delay against the ~6 s the event-log read before the
+//! disable took on a loaded runner. And `t0`, `t1` and the creation stamp are
 //! wall-clock readings, so a clock step between them reorders them, in either
 //! direction: a lost race can read as FALSIFIED, and a real FALSIFIED as a
 //! rerun (creation reads before `t0`). A FALSIFIED is therefore read against the
 //! `t0`, `t1` and creation time the probe prints.
 //!
-//! S is read once, after C's restarted instance is up, and there is no wait: one
-//! `QueryServiceStatusEx` (state and process id, in every state), the restarted
-//! instance's creation time at once (before its pid can be reused), then its pid
-//! log. State before log: a restart that comes and goes between the two reads
-//! still shows in the log. In the `running` variant a state other than STOPPED,
-//! or a second pid in the log, is FALSIFIED. In the `queued` variant:
-//! - S not STOPPED: its process is the restarted instance, placed as above; a
-//!   process missing from the process list, or no process id yet, fails the probe;
-//! - S STOPPED with a second pid in the log: an instance started after the status
-//!   read, or came and went, so it cannot be placed. That fails the probe, never a
-//!   rerun: an unplaceable restart must not pass for a lost race;
-//! - otherwise NOT FALSIFIED.
+//! S is read once, after C's restarted instance is up: its state, then the
+//! restarted instance's creation time at once, before its pid can be reused,
+//! then its pid log. State before log: a restart that comes and goes between
+//! the reads still shows in the log. A queued restart that cannot be placed
+//! (STOPPED with a second pid logged, no process id, process not listed) fails
+//! the probe, never a rerun, so an unplaceable restart cannot pass for a lost
+//! race.
 
 use std::ffi::OsString;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -75,11 +65,9 @@ use super::named_event::NamedEvent;
 use super::raw_scm;
 use super::{left_behind, scm_deletion, scm_probe, GLOBAL_NET_STATE, TUN};
 
-/// How long the SCM waits before it restarts S, and C. C's is the longer, and C
-/// is killed only after the read of S's queued restart, so S's action is due
-/// well before the control's restart is up. A longer one for S makes a lost
-/// race rarer (the event-log read before the disable measured ~6 s on a loaded
-/// runner); a loss is rerun, not failed.
+/// How long the SCM waits before it restarts S, and C. S's margin over the
+/// event-log read before the disable keeps the timer from winning; C's is longer
+/// so S's action is due first. A lost race is rerun.
 const S_RESTART_DELAY: Duration = Duration::from_secs(30);
 const C_RESTART_DELAY: Duration = Duration::from_secs(40);
 
@@ -127,13 +115,11 @@ impl DisableWindow {
         }
     }
 
-    /// `t0` and `t1` for a log line.
     fn describe_window(self) -> String {
         format!("t0 {}, t1 {} (FILETIME, 100 ns)", self.before, self.after)
     }
 
-    /// The window and `created` for a log line, with `created` in milliseconds
-    /// from `t0`.
+    /// With `created` in ms from `t0`.
     fn describe(self, created: u64) -> String {
         let from_t0_ms = (i128::from(created) - i128::from(self.before)) / 10_000;
         format!(
@@ -156,8 +142,7 @@ fn creation_time_of(pid: u32, read: &str) -> u64 {
 /// Fails if a probe service from an earlier run is still registered. A run the
 /// nextest terminate-after killed skips `ProbeService::drop`, leaving an
 /// AutoStart LocalSystem service that restarts on failure, and nothing else
-/// would notice: the names are new each attempt. Detection only; the test
-/// deletes only what it created.
+/// would notice: the names are new each attempt.
 fn assert_no_leftover_probe_services() {
     let services = windows_registry::LOCAL_MACHINE
         .open(r"SYSTEM\CurrentControlSet\Services")
@@ -419,9 +404,7 @@ const CORRECTIVE_ACTION_EVENT: u32 = 7031;
 /// Where S's disable is written relative to the crash.
 #[derive(Clone, Copy)]
 enum Variant {
-    /// After the crash, while the SCM's restart is queued.
     Queued,
-    /// Before the crash.
     Running,
 }
 
@@ -448,10 +431,7 @@ enum AttemptOutcome {
     /// S's restart was created before the disable was written, or too close to
     /// it to tell which came first (`DisableWindow`): the disable did not meet
     /// a queued restart, so nothing was measured.
-    RaceLost {
-        /// What was read, for the one line printed per lost attempt.
-        evidence: String,
-    },
+    RaceLost { evidence: String },
 }
 
 /// Runs the probe until an attempt measures its scenario. Unbounded on purpose:
@@ -484,11 +464,8 @@ fn scm_entries_dump(display_name: &str) -> String {
 }
 
 /// One attempt, on services and events named for it: the SCM log keeps every
-/// earlier attempt's and run's entries, which a name any of them used would
-/// read as this one's. The id (variant, test process id, attempt, and the
-/// system time at the attempt's start, the last three fixed-width) is unique to
-/// the attempt, and each display name closes in `]`, so no name is a prefix of
-/// another.
+/// earlier attempt's and run's entries, which a reused name would read as this
+/// one's. Display names close in `]` so none is a prefix of another.
 fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
     let name = variant.name();
     let id = format!(
@@ -546,7 +523,7 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
     eprintln!("P1 {name}: S disabled; killed C (process {c_pid}); waiting for C's restarted instance");
     c_running.wait();
 
-    // S is read once (see the module doc): state, then the creation time, then the pid log.
+    // Order matters: see the module doc.
     let s_status = raw_scm::query(&s.name);
     let s_stopped = s_status.dwCurrentState == SERVICE_STOPPED;
     let s_state = raw_scm::state_name(s_status.dwCurrentState.0);

@@ -223,8 +223,8 @@ success-output = 'immediate-final'
 filter = 'test(/cutover_global_net_state_uninstall_smoke_whichever_side_of_the_scm_restart_wins/)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 
-# The recovery-restart probes wait out the SCM's restart delays they configure (~50 s an attempt)
-# and rerun an attempt the SCM's timer won.
+# Each attempt waits out the SCM restart delays the probe sets (~50 s); attempts rerun until one
+# measures, so this is the failure bound.
 [[profile.default.overrides]]
 filter = 'test(/cutover_global_net_state_probe_disabled_refuses_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
