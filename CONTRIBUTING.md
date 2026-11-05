@@ -726,7 +726,10 @@ re-derive them.
    (a rename moves the inode), so it is read. What the user could learn from it is limited by the readers, below.
    This holds for the files read with
    `read_vouched`, which are published by rename (the update marker's claim by a rename that refuses to replace) and
-   so have one name; `ReadDir::read` does not have it, and is for a file that has a second name by design. A
+   so have one name; `ReadDir::read` does not have it, and is for a file that has a second name by design. One
+   exception: a write that fails to publish makes a backup link first, and when taking that backup back also
+   fails the original has two names, so it reads as `ForeignFile` until the backup is removed
+   (`crates/util/src/versioned_file/store.rs`, `take_back_backup`). A
    filesystem with no such rename fails the claim, and the move-aside of an unreadable record, with an `Unsupported`
    error naming the file; neither falls back to a hard link, which would leave the file under two names.
 
@@ -2631,8 +2634,12 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   `HoleChangeMark` value in the service's key (`ChangeKey`,
   [`change_mark.rs`](crates/bridge/src/disable_record/change_mark.rs)) when its
   outermost hold on a thread begins, `<n>:<pid>:<creation>`, and again when that
-  hold ends, `<n>` (`n` counts transitions; the nested holds of a change's own
-  steps are no transition). `display` reads the mark, the start type, the
+  hold ends, `<n>/<pid>:<creation>/<seq>` (`n` counts transitions; the nested
+  holds of a change's own steps are no transition). The ending value is unique
+  per completed change: a reinstall deletes the key and the count with it, so
+  `n` repeats across keys; the ending holder's stamp tells apart two processes,
+  and `seq`, which counts the changes that process has ended, tells apart two
+  it ends at the same `n`. `display` reads the mark, the start type, the
   record and the mark again, and goes again unless the two marks are equal; a
   mark that names a running holder is `InChange` too, so a holder that stamps
   nothing (an administrator-disabled service's hardening, a first install, the

@@ -15,11 +15,11 @@
 //! asks whether its process runs, as it does for the record. The holder writes
 //! it under the lock, after taking it and before its first read, and writes the
 //! at-rest value after its last write and before letting go, so no change runs
-//! while the mark says none does. The ender's stamp is what keeps the at-rest
-//! value from repeating: a reinstall deletes the key and the count with it, so
-//! two installs can end at the same `n`, but never in the same process. `seq`
-//! covers the same process ending two changes at the same `n`. A bare `<n>` and
-//! an `<n>/<pid>:<created>`, which earlier builds wrote at rest, equal no value
+//! while the mark says none does. A reinstall deletes the key and the count with
+//! it, so the count alone repeats; the at-rest value is unique per ended change
+//! because it adds the ending holder's stamp, which names one process, and the
+//! per-process `seq`, which tells apart two changes that process ends at the
+//! same count. A bare `<n>`, which earlier builds wrote at rest, equals no value
 //! written now.
 //! The mark sits in the service's key, which an unprivileged user can read and
 //! no user can write.

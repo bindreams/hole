@@ -124,14 +124,14 @@ fn a_mark_with_no_key_is_neither_written_nor_an_error() {
     assert_eq!(mark.read(), ChangeMark::new(None, None));
 }
 
-/// The count continues from an at-rest value of either format: the one a change
-/// ends with and the bare count an earlier build left.
+/// The count continues from an at-rest value of either format: the bare count
+/// an earlier build left and the one a change ends with now.
 #[skuld::test]
 fn the_count_goes_on_from_an_at_rest_value_of_either_format() {
     let (scratch, key) = ScratchChangeKey::created("counts-on");
     let mark = scratch.mark();
     let holder = Stamp::current();
-    for (at_rest, next) in [("7", 8), (&*format!("7/{}", holder.encode()), 8)] {
+    for (at_rest, next) in [("7", 8), (&*format!("7/{}/3", holder.encode()), 8)] {
         key.set_string(VALUE, at_rest).expect("write");
         mark.begin(&holder).expect("begin");
         assert_eq!(
