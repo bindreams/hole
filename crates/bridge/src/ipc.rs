@@ -100,30 +100,22 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// WITHOUT taking `proxy.lock()` — the escape must work even while a
     /// teardown wedges that lock.
     pub routing: Arc<R>,
-    /// The SAME `Arc<AtomicBool>` `proxy`'s `ProxyManager` holds internally,
-    /// cloned once at bind time via `ProxyManager::cover_invalidation_handle`
-    /// — the same derivation pattern as `routing` above. `handle_unblock`
-    /// sets this after releasing every OS-level cover, lock-free, so a
-    /// concurrent `start_cancellable` (which does hold `proxy.lock()`) can
-    /// tell its own `Posture::PendingStart` guard is a zombie the next time
-    /// it looks.
-    pub cover_invalidated: Arc<std::sync::atomic::AtomicBool>,
     /// Bumped by `handle_unblock` right after its `Off` save succeeds, under
     /// [`Self::intent_persist`], so a failed save never announces an unblock.
     /// `handle_start`/`handle_reload` snapshot it before touching the proxy;
     /// `persist_after_start` re-reads it under `intent_persist` and declines the
     /// start's records if it moved. Every read is a pre-persist snapshot or sits
-    /// under that mutex. A counter rather than `cover_invalidated`, which
-    /// `start_cancellable` consumes: `reload`'s hot-swap path never calls that,
-    /// so one stale unblock would wedge every later hot-swap write.
+    /// under that mutex. A counter, not a flag a start consumes: `reload`'s hot-swap
+    /// path would never consume it, so one stale unblock would wedge every later
+    /// hot-swap write.
     ///
     /// The compare-and-set the proxy lock cannot give, because `handle_unblock`
     /// deliberately takes no proxy lock.
     ///
-    /// This is the user's decision to be Off, not "a release began": it decides whether a start or reload may record
-    /// `Connected` and its candidate, and only the tray's Unblock moves it. A `ReleaseWatch`
-    /// cannot stand in for it: any release moves the release epoch (a sweep, `bridge unlock`), and a start must still
-    /// record its target after one of those.
+    /// This is the persisted `Off` the start reads, not "a release ended": it decides whether a start or reload may
+    /// record `Connected` and its candidate, and only the tray's Unblock moves it. The release epoch, which every
+    /// guard that ends moves unless it changed nothing, cannot stand in for it: a sweep or `bridge unlock` moves
+    /// the epoch too, and a start must still record its target after one of those.
     pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Orders `persist_after_start`'s target + candidate writes against
     /// `handle_unblock`'s `Off` + `set_enabled` + candidate clear, each a
@@ -196,15 +188,14 @@ impl IpcServer {
         // and test caller — uncontended by construction. Deriving the
         // routing handle this way (rather than threading a new parameter)
         // keeps every existing `bind`/`bind_with_dirs` call site unchanged.
-        let (routing, cover_invalidated) = {
-            let guard = proxy.try_lock().expect("proxy mutex must be uncontended at bind time");
-            (guard.routing_handle(), guard.cover_invalidation_handle())
-        };
+        let routing = proxy
+            .try_lock()
+            .expect("proxy mutex must be uncontended at bind time")
+            .routing_handle();
 
         let state = Arc::new(IpcState {
             proxy,
             routing,
-            cover_invalidated,
             unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             intent_persist: Arc::new(std::sync::Mutex::new(())),
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
@@ -813,24 +804,16 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Announced before the first firewall call and held through the persist
-    // below. A start that opened its release watch earlier is superseded when
-    // this guard ends, unless the Unblock changed nothing; while it is in
-    // flight, a start that commits to a cover is cancelled. Takes no lock a
-    // start holds. The persist's closure owns the guard: hyper drops this
+    // below. While it is in flight a start that commits to a cover (a covered
+    // start, or one with the standing cover expected) is cancelled; uncovered
+    // starts and reloads proceed, having nothing for the Unblock to undo. When
+    // the guard ends it supersedes every start whose watch opened earlier and
+    // every cover a start held, unless the Unblock changed nothing. Takes no
+    // lock a start holds. The persist's closure owns the guard: hyper drops this
     // future when the client goes away, and the persist runs on regardless.
     // The Unblock moves two counters: the release epoch (when a guard ends) and
     // `unblock_generation` at the `Off` commit below.
     let release = tun_engine::routing::failclosed::begin_release(&state.state_dir);
-
-    // Invalidate any transient cover guard a concurrent, lock-holding
-    // `start_cancellable` may still be tracking internally — set
-    // unconditionally, a no-op if nothing is tracked, reachable without
-    // `&mut self`, unlike `turn_lockdown_off`'s own equivalent first step.
-    // Must happen before the release below, not after: `start_cancellable`
-    // only reads this signal at its own entry, so setting it late (after a
-    // concurrent start has already passed that check) would miss the very
-    // race it exists to close.
-    state.cover_invalidated.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Unconditional, with no presence probe in front of it.
     // `release_all_covers` is documented idempotent, so a check here would be

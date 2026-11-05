@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
-use tun_engine::routing::failclosed::{watch_releases, ReleaseWatch};
+use tun_engine::routing::failclosed::{watch_releases, Overtaken, ReleaseWatch};
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
 
 use crate::reconciler::{teardown_cover_disposition, transient_cover_disposition, CoverDisposition};
@@ -272,14 +272,6 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// once a start honours this claim with a real `install_lockdown`. Holding
     /// both facts here is what let a plain disconnect disarm the switch.
     adopted_standing_cover: bool,
-    /// Set (lock-free) by `handle_unblock` via [`Self::cover_invalidation_handle`]
-    /// when it releases every OS-level cover from outside this manager's own
-    /// lock (R7: the escape must work even while a wedged teardown holds
-    /// `state.proxy.lock()`). `start_cancellable` consumes it — see the swap
-    /// at its top — the same way `turn_lockdown_off` drops a held transient
-    /// guard directly via `posture.take_pending()`, just reachable without
-    /// `&mut self`.
-    cover_invalidated: Arc<std::sync::atomic::AtomicBool>,
     /// Test-only DoH querier override. Set by `set_bootstrap_querier_for_test`;
     /// when present, `start_cancellable` resolves via `resolve_via_doh_with`
     /// instead of the production `resolve_via_doh`.
@@ -313,6 +305,46 @@ struct BlockedStart<C> {
     /// not — it describes the live OS cover, not the current config. See the
     /// struct doc for what it means.
     resolver_permit: Option<IpAddr>,
+    /// The watch of the start that installed `cover`, opened before the install. A release that ended with a
+    /// change since then took the cover; see [`Self::is_superseded`]. `None` without a state dir.
+    watch: Option<ReleaseWatch>,
+}
+
+impl<C> BlockedStart<C> {
+    /// Whether a release has taken the cover since the start that installed it opened its watch. The OS objects
+    /// it claims to hold are gone, so a start must not trust it. A release still in flight has not said what it
+    /// did, so it does not count here.
+    fn is_superseded(&self) -> bool {
+        let Some(watch) = &self.watch else {
+            return false;
+        };
+        match watch.check() {
+            Err(Overtaken::Superseded) => true,
+            Err(Overtaken::InDoubt) | Ok(()) => false,
+        }
+    }
+}
+
+/// Why a start ended in [`ProxyError::Cancelled`], which decides what becomes of the cover an earlier start held.
+#[derive(Debug, Clone, Copy)]
+enum StartCancel {
+    /// The user, or the start's own token, cancelled it.
+    Requested,
+    /// A release overtook it.
+    Overtaken(Overtaken),
+}
+
+impl StartCancel {
+    /// Whether the cancelled start also drops the cover an earlier start held (a user disconnect does; so does a
+    /// release that took it). A release still in flight has not said what it did: the held cover stays, and a
+    /// later start decides on what the release turned out to do.
+    fn drops_the_held_cover(self) -> bool {
+        match self {
+            StartCancel::Requested => true,
+            StartCancel::Overtaken(Overtaken::Superseded) => true,
+            StartCancel::Overtaken(Overtaken::InDoubt) => false,
+        }
+    }
 }
 
 // Posture =============================================================================================================
@@ -418,7 +450,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             state_dir: None,
             state_owner: None,
             adopted_standing_cover: false,
-            cover_invalidated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             bootstrap_querier: None,
             #[cfg(test)]
@@ -441,15 +472,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// taking `state.proxy.lock()`.
     pub fn routing_handle(&self) -> Arc<R> {
         Arc::clone(&self.routing)
-    }
-
-    /// Clone of the lock-free cover-invalidation signal. `bind_with_dirs`
-    /// derives `IpcState::cover_invalidated` from this, the same way it
-    /// derives `routing` from [`Self::routing_handle`] — taken once at bind
-    /// time, uncontended. `handle_unblock` sets it after releasing every
-    /// OS-level cover; [`Self::start_cancellable`] consumes it.
-    pub fn cover_invalidation_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        Arc::clone(&self.cover_invalidated)
     }
 
     /// Set the state directory for plugin PID crash recovery.
@@ -852,24 +874,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        // Opened first: before the invalidation flag below is read and before this start
-        // reads anything an Unblock writes (the intent, the target). An Unblock that
-        // begins after this point supersedes the start where it commits to a cover. A
-        // start that installs no cover (an uncovered one, a reload without a standing
-        // cover expected) is never refused by it.
+        // Opened first: before this start reads anything an Unblock writes (the intent, the
+        // target) and before it drops a superseded cover below. An Unblock that ends after this
+        // point supersedes the start where it commits to a cover; one in flight there cancels it.
+        // A start that installs no cover (an uncovered one, a reload without a standing cover
+        // expected) is never refused by it.
         let release_watch = self.state_dir.as_deref().map(watch_releases);
 
-        // A lock-free `handle_unblock` may have released every OS-level
-        // cover while this manager wasn't holding the lock. Any
-        // `PendingStart` we're still carrying is now a zombie: the OS
-        // objects it claims to hold are already gone. Drop it before the
-        // reuse checks below (`repair_fallback`, the `pending().is_none()`
-        // gate) can trust it — `take_pending()` is a no-op when nothing is
-        // pending, and the dropped guard's own Drop is idempotent against
-        // an already-cleared cover on both platforms, so this is safe
-        // whether or not anything was actually held. `swap` both reads and
-        // clears in one step, so this consumes the signal exactly once.
-        if self.cover_invalidated.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        // A lock-free `handle_unblock` may have released every OS-level cover while this manager
+        // wasn't holding the lock. A `PendingStart` the release took since its own start opened its
+        // watch is now a zombie: the OS objects it claims to hold are already gone. Drop it before
+        // the reuse checks below (`repair_fallback`, the `pending().is_none()` gate) can trust it;
+        // the dropped guard's own Drop is idempotent against an already-cleared cover on both
+        // platforms.
+        if self.posture.pending().is_some_and(BlockedStart::is_superseded) {
             self.posture.take_pending();
         }
 
@@ -906,7 +924,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
                 Ok(b) => (b.server_ip, b.via),
-                Err(ProxyError::Cancelled) => return Err(self.cancelled_start()),
+                Err(ProxyError::Cancelled) => return Err(self.cancelled_start(StartCancel::Requested)),
                 Err(e) => {
                     self.last_error = Some(e.to_string());
                     // A covered start that can't resolve has no IP to permit, so no
@@ -996,11 +1014,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // The point where this start commits to a cover: to install the standing one, to
         // engage a transient one, or to reuse the one a failed start held. A release in
-        // flight, or one that reached the firewall since the watch opened, refuses it. The
-        // held cover goes with the start: the release has taken it or is taking it, and
-        // keeping it would report a host as blocked that the release is opening.
-        if (covered || lockdown_on) && overtaken_by_release(release_watch.as_ref()).is_err() {
-            return Err(self.cancelled_start());
+        // flight, or one that ended with a change since the watch opened, refuses it. What
+        // becomes of a held cover is `StartCancel::drops_the_held_cover`'s one answer.
+        if covered || lockdown_on {
+            if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
+                return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
+            }
         }
 
         // A held cover's resolver_permit is fixed at engage time; re-engage
@@ -1077,8 +1096,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
                         // Dropped here, uncommitted, if a release overtook it.
-                        if overtaken_by_release(release_watch.as_ref()).is_err() {
-                            return Err(self.cancelled_start());
+                        if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
+                            return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
                         }
                         self.posture.hold_pending(BlockedStart {
                             cover,
@@ -1086,16 +1105,19 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             server_ip,
                             pin: engaged_pin,
                             resolver_permit: ech_resolver_permit,
+                            watch: release_watch.clone(),
                         });
                     }
-                    // Superseded by a release: cancel, neither run uncovered nor engage again.
-                    Err(e) if e.overtaken_by_release().is_some() => return Err(self.cancelled_start()),
                     Err(e) => {
+                        // Superseded by a release: cancel, neither run uncovered nor engage again.
+                        if let Some(verdict) = e.overtaken_by_release() {
+                            return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
+                        }
                         if let Some((old_permit, original_pin)) = repair_fallback {
                             match self.routing.install_failclosed_cover(server_ip, old_permit) {
                                 Ok(cover) => {
-                                    if overtaken_by_release(release_watch.as_ref()).is_err() {
-                                        return Err(self.cancelled_start());
+                                    if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
+                                        return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
                                     }
                                     self.posture.hold_pending(BlockedStart {
                                         cover,
@@ -1103,6 +1125,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                         server_ip,
                                         pin: original_pin,
                                         resolver_permit: old_permit,
+                                        watch: release_watch.clone(),
                                     });
                                     // The restored permit is stale either way, but which
                                     // direction it's stale in depends on whether the fetch
@@ -1131,8 +1154,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                     }
                                     self.last_error = Some(e.to_string());
                                 }
-                                Err(e2) if e2.overtaken_by_release().is_some() => return Err(self.cancelled_start()),
                                 Err(e2) => {
+                                    if let Some(verdict) = e2.overtaken_by_release() {
+                                        return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
+                                    }
                                     warn!(
                                         error = &e as &dyn std::error::Error,
                                         restore_error = &e2 as &dyn std::error::Error,
@@ -1267,7 +1292,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 info!(started = %dump!(&diag), "proxy started");
                 Ok(())
             }
-            Err(ProxyError::Cancelled) => Err(self.cancelled_start()),
+            Err(ProxyError::Cancelled) => Err(self.cancelled_start(StartCancel::Requested)),
+            Err(ProxyError::Overtaken(verdict)) => Err(self.cancelled_start(StartCancel::Overtaken(verdict))),
             Err(e) => {
                 // Covered start failed: RETAIN the held cover (the posture keeps
                 // it as `PendingStart`, so its Drop does NOT run) — the host stays
@@ -1280,11 +1306,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
-    /// The one exit of a cancelled start, whether the user or a release cancelled it, early or late: release the
-    /// cover (same trust as a user disconnect). A cancel records no `last_error`.
-    fn cancelled_start(&mut self) -> ProxyError {
-        drop(self.posture.take_pending());
-        info!("proxy start cancelled");
+    /// The one exit of a cancelled start, whether the user or a release cancelled it, early or late. The cover an
+    /// earlier start held is dropped or kept as [`StartCancel::drops_the_held_cover`] says. A cancel records no
+    /// `last_error`.
+    fn cancelled_start(&mut self, reason: StartCancel) -> ProxyError {
+        if reason.drops_the_held_cover() {
+            drop(self.posture.take_pending());
+        }
+        info!(?reason, "proxy start cancelled");
         ProxyError::Cancelled
     }
 
@@ -1850,12 +1879,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let lockdown = if standing_cover_expected {
             match routing.install_lockdown(server_ip, &tun_identity, &app_ids) {
                 Ok(cover) => {
-                    if let Err(e) = overtaken_by_release(release_watch) {
+                    if let Err(verdict) = overtaken_by_release(release_watch) {
                         drop(cover);
                         if let Some(mut d) = dispatcher.take() {
                             d.shutdown().await;
                         }
-                        return Err(e);
+                        return Err(ProxyError::Overtaken(verdict));
                     }
                     promote_adopted_claim(state_dir, owner);
                     Some(cover)
@@ -2316,13 +2345,10 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
     }
 }
 
-/// `Cancelled` if a release is in flight or reached the firewall since `watch` opened.
-/// The caller drops the cover it holds on `Err`.
-fn overtaken_by_release(watch: Option<&ReleaseWatch>) -> Result<(), ProxyError> {
+/// The verdict if a release is in flight, or ended with a change, since `watch` opened.
+fn overtaken_by_release(watch: Option<&ReleaseWatch>) -> Result<(), Overtaken> {
     match watch {
-        Some(watch) => watch
-            .check()
-            .map_err(|verdict| ProxyError::from(tun_engine::RoutingError::from(verdict))),
+        Some(watch) => watch.check(),
         None => Ok(()),
     }
 }

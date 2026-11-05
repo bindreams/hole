@@ -3876,15 +3876,18 @@ mod self_test {
         });
     }
 
+    /// A release in flight has not said what it did: the start is cancelled, and the cover an earlier start held
+    /// stays held. Once the release says it changed nothing, a retry reuses that cover.
     #[skuld::test]
-    fn a_start_cancelled_by_an_unblock_in_flight_drops_the_cover_an_earlier_start_held() {
+    fn a_covered_start_that_meets_a_failing_release_is_cancelled_and_the_held_cover_survives_it() {
         rt().block_on(async {
             let (mut pm, cfg, st, dir) = covered_gate_setup(false);
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(pm.blocked_until_connected(), "the failed covered start holds its cover");
-            let _release = tun_engine::routing::failclosed::begin_release(dir.path());
+            let engaged = st.cover_engage_attempts.load(Ordering::SeqCst);
+            let release = tun_engine::routing::failclosed::begin_release(dir.path());
 
             let err = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
@@ -3893,9 +3896,48 @@ mod self_test {
 
             assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
             assert!(
-                !pm.blocked_until_connected(),
-                "a cancelled start releases the cover, as every other cancelled exit does"
+                pm.blocked_until_connected(),
+                "nothing has moved yet: the release may yet change nothing, so the held cover stays"
             );
+            assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 0);
+
+            release.changed_nothing();
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(!matches!(err, ProxyError::Cancelled), "{err:?}");
+            assert!(pm.blocked_until_connected());
+            assert_eq!(
+                st.cover_engage_attempts.load(Ordering::SeqCst),
+                engaged,
+                "the retry reuses the held cover: a release that changed nothing is no reason to drop it"
+            );
+            assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// A release that ended with a change took the held cover: a start that then meets another release in flight
+    /// is cancelled, and the cover goes with it.
+    #[skuld::test]
+    fn a_covered_start_that_meets_a_release_after_one_superseded_the_held_cover_drops_it() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected());
+            drop(tun_engine::routing::failclosed::begin_release(dir.path()));
+            let _release = tun_engine::routing::failclosed::begin_release(dir.path());
+
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert!(!pm.blocked_until_connected());
             assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 1);
         });
     }
@@ -3932,16 +3974,16 @@ mod self_test {
     }
 
     #[skuld::test]
-    fn an_unblock_that_completes_as_the_start_consumes_the_invalidated_cover_cancels_the_start() {
+    fn an_unblock_that_completes_as_the_start_drops_the_superseded_cover_cancels_the_start() {
         rt().block_on(async {
             let (mut pm, cfg, st, dir) = covered_gate_setup(false);
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(pm.blocked_until_connected());
-            // The Unblock's own order: flag the held cover, then release it.
-            pm.cover_invalidation_handle()
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // An Unblock has ended since the cover was held, so the start drops the cover at its entry; a second
+            // one runs to its end inside that drop, after this start opened its own watch.
+            drop(tun_engine::routing::failclosed::begin_release(dir.path()));
             st.unblock_during_next_cover_drop(dir.path());
             let engaged = st.cover_engage_attempts.load(Ordering::SeqCst);
 
@@ -3952,7 +3994,7 @@ mod self_test {
 
             assert!(
                 matches!(err, ProxyError::Cancelled),
-                "the Unblock ran inside this start, after the start saw the flag: {err:?}"
+                "the Unblock ran inside this start, after the start opened its watch: {err:?}"
             );
             assert_eq!(
                 st.cover_engage_attempts.load(Ordering::SeqCst),
@@ -6160,6 +6202,7 @@ mod self_test {
                 server_ip,
                 pin: crate::dns::ech::PinSource::NoQueryNeeded,
                 resolver_permit: None,
+                watch: None,
             });
         });
     }
@@ -6187,6 +6230,7 @@ mod self_test {
                 server_ip,
                 pin: crate::dns::ech::PinSource::NoQueryNeeded,
                 resolver_permit: None,
+                watch: None,
             });
         });
     }
