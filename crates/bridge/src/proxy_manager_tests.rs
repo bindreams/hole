@@ -2251,9 +2251,10 @@ fn a_covered_start_that_fails_over_a_third_party_upstream_reports_blocked() {
         let err = pm
             .start_cancellable(
                 &test_config(),
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -2387,14 +2388,9 @@ fn start_cancellable_succeeds_when_not_cancelled() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         let token = CancellationToken::new();
-        pm.start_cancellable(
-            &test_config(),
-            false,
-            token,
-            pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-        )
-        .await
-        .unwrap();
+        pm.start_cancellable(&test_config(), Coverage::Uncovered, token)
+            .await
+            .unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
         pm.stop().await.unwrap();
     });
@@ -2423,12 +2419,7 @@ fn start_cancellable_cancelled_during_ss_start_rolls_back() {
         });
 
         let err = pm
-            .start_cancellable(
-                &test_config(),
-                false,
-                token,
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-            )
+            .start_cancellable(&test_config(), Coverage::Uncovered, token)
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
@@ -2460,12 +2451,7 @@ fn start_cancellable_cancel_before_start_returns_immediately() {
         token.cancel(); // already cancelled before start is even called
 
         let err = pm
-            .start_cancellable(
-                &test_config(),
-                false,
-                token,
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-            )
+            .start_cancellable(&test_config(), Coverage::Uncovered, token)
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled));
@@ -2482,14 +2468,9 @@ fn start_cancellable_late_cancel_on_finished_token_is_noop() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         let token = CancellationToken::new();
-        pm.start_cancellable(
-            &test_config(),
-            false,
-            token.clone(),
-            pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-        )
-        .await
-        .unwrap();
+        pm.start_cancellable(&test_config(), Coverage::Uncovered, token.clone())
+            .await
+            .unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
 
         // Late cancel — must not panic, must not mutate proxy state.
@@ -2524,12 +2505,7 @@ fn start_cancellable_dropped_future_runs_guards() {
         // surrounding scope drops `f`, running the drop-safety guards.
         {
             let cfg = test_config();
-            let f = pm.start_cancellable(
-                &cfg,
-                false,
-                token,
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-            );
+            let f = pm.start_cancellable(&cfg, Coverage::Uncovered, token);
             tokio::pin!(f);
             tokio::select! {
                 _ = &mut f => panic!("start should not complete while gate is unfired"),
@@ -2608,12 +2584,7 @@ fn pure_vpn_start_cancellable_during_proxy_start() {
         });
 
         let err = pm
-            .start_cancellable(
-                &config,
-                false,
-                token,
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-            )
+            .start_cancellable(&config, Coverage::Uncovered, token)
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
@@ -3355,12 +3326,7 @@ mod self_test {
 
             tokio::time::pause();
             let err = pm
-                .start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
 
@@ -3416,12 +3382,7 @@ mod self_test {
 
             tokio::time::pause();
             let err = pm
-                .start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(
@@ -3444,14 +3405,9 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, _dir) = new_manager(MockProxy::new());
             // test_config() already has dns.enabled = false.
-            pm.start_cancellable(
-                &test_config(),
-                false,
-                CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-            )
-            .await
-            .unwrap();
+            pm.start_cancellable(&test_config(), Coverage::Uncovered, CancellationToken::new())
+                .await
+                .unwrap();
             assert_eq!(pm.state(), ProxyState::Running);
             pm.stop().await.unwrap();
         });
@@ -3503,12 +3459,7 @@ mod self_test {
             let (mut pm, cfg, _dir) = gate_failure_setup(true);
             tokio::time::pause();
             let err = pm
-                .start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             // Either reading is admissible: a closed loopback port is REFUSED on
@@ -3554,14 +3505,9 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let (mut pm, cfg, _dir) = gate_failure_setup(false);
-                pm.start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
-                .await
-                .expect_err("both the probe and the gate must fail");
+                pm.start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
+                    .await
+                    .expect_err("both the probe and the gate must fail");
             });
         let output = writer.snapshot_string();
         assert!(
@@ -3580,12 +3526,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, cfg, _dir) = gate_failure_setup(false);
             let err = pm
-                .start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             match err {
@@ -3640,9 +3581,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -3673,9 +3615,10 @@ mod self_test {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -3696,9 +3639,10 @@ mod self_test {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -3717,12 +3661,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
-                .start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3743,9 +3682,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -3768,9 +3708,10 @@ mod self_test {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -3800,9 +3741,10 @@ mod self_test {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -3821,9 +3763,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -3852,9 +3795,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -3862,9 +3806,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -3894,9 +3839,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -3904,9 +3850,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -3940,9 +3887,10 @@ mod self_test {
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
             pm.start_cancellable(
                 &test_config(),
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap();
@@ -3979,9 +3927,10 @@ mod self_test {
             let err = pm
                 .start_cancellable(
                     &test_config(),
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     token,
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4016,9 +3965,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4055,9 +4005,10 @@ mod self_test {
                 runtime
                     .block_on(pm.start_cancellable(
                         &cfg,
-                        true,
+                        Coverage::Covered {
+                            unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                        },
                         CancellationToken::new(),
-                        pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                     ))
                     .unwrap_err()
             });
@@ -4103,9 +4054,10 @@ mod self_test {
                 runtime
                     .block_on(pm.start_cancellable(
                         &cfg,
-                        true,
+                        Coverage::Covered {
+                            unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                        },
                         CancellationToken::new(),
-                        pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                     ))
                     .unwrap_err()
             });
@@ -4144,7 +4096,7 @@ mod self_test {
             pm.unblock_generation_handle().fetch_add(1, Ordering::SeqCst);
 
             let err = pm
-                .start_cancellable(&cfg, true, CancellationToken::new(), pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+                .start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, CancellationToken::new())
                 .await
                 .unwrap_err();
 
@@ -4212,9 +4164,10 @@ mod self_test {
             let result = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await;
 
@@ -4252,7 +4205,13 @@ mod self_test {
             generation.fetch_add(1, Ordering::SeqCst);
 
             let result = pm
-                .start_cancellable(&cfg, true, CancellationToken::new(), snapshot)
+                .start_cancellable(
+                    &cfg,
+                    Coverage::Covered {
+                        unblock_snapshot: snapshot,
+                    },
+                    CancellationToken::new(),
+                )
                 .await;
 
             assert_eq!(
@@ -4292,12 +4251,7 @@ mod self_test {
             held_rx.recv().unwrap();
 
             let err = rt()
-                .block_on(pm.start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                ))
+                .block_on(pm.start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new()))
                 .unwrap_err();
 
             assert!(!matches!(err, ProxyError::Cancelled), "{err:?}");
@@ -4339,9 +4293,10 @@ mod self_test {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -4367,9 +4322,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &test_config(),
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await;
 
@@ -4402,9 +4358,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4516,9 +4473,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4563,9 +4521,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4610,9 +4569,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await;
             assert_eq!(
@@ -4651,9 +4611,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4689,9 +4650,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4728,9 +4690,10 @@ mod self_test {
 
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -4739,9 +4702,10 @@ mod self_test {
 
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -4785,9 +4749,10 @@ mod self_test {
 
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -4797,9 +4762,10 @@ mod self_test {
             cfg.server.plugin = None; // attempt 2: plugin removed, nothing to permit now
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -4864,9 +4830,10 @@ mod self_test {
 
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4879,9 +4846,10 @@ mod self_test {
                 cfg.server.plugin = None;
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4953,9 +4921,10 @@ mod self_test {
             let err1 = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -4979,9 +4948,10 @@ mod self_test {
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5037,9 +5007,10 @@ mod self_test {
 
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5057,9 +5028,10 @@ mod self_test {
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5125,9 +5097,10 @@ mod self_test {
         cfg.dns.servers = vec![answering_resolver];
         pm.start_cancellable(
             &cfg,
-            true,
+            Coverage::Covered {
+                unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+            },
             CancellationToken::new(),
-            pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
         )
         .await
         .unwrap_err();
@@ -5183,9 +5156,10 @@ mod self_test {
 
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -5197,9 +5171,10 @@ mod self_test {
                 cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -5260,9 +5235,10 @@ mod self_test {
 
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -5274,9 +5250,10 @@ mod self_test {
                 cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -5322,9 +5299,10 @@ mod self_test {
             // Attempt 1: engages with permit None.
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5340,9 +5318,10 @@ mod self_test {
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5358,9 +5337,10 @@ mod self_test {
             // uncounted) and restore again (counted) — not skip.
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5380,9 +5360,10 @@ mod self_test {
             st.fail_cover_for_resolvers.lock().unwrap().clear();
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5430,7 +5411,7 @@ mod self_test {
             cfg.dns.servers = vec![answering_resolver];
 
             // Attempt 1: engages with permit None.
-            pm.start_cancellable(&cfg, true, CancellationToken::new(), pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+            pm.start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -5443,7 +5424,7 @@ mod self_test {
             st.fail_cover_for_resolvers.lock().unwrap().insert(None);
             cfg.server.plugin = Some("ex-ray".into());
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-            pm.start_cancellable(&cfg, true, CancellationToken::new(), pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+            pm.start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, CancellationToken::new())
                 .await
                 .unwrap_err();
 
@@ -5474,7 +5455,7 @@ mod self_test {
             // Attempt 3: unchanged config. With the cover gone, this is an
             // ordinary fresh engage attempt (not a repair) — no wedge.
             st.fail_cover_for_resolvers.lock().unwrap().clear();
-            pm.start_cancellable(&cfg, true, CancellationToken::new(), pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+            pm.start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -5529,9 +5510,10 @@ mod self_test {
 
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -5544,9 +5526,10 @@ mod self_test {
                 cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -5597,9 +5580,10 @@ mod self_test {
             // Attempt 1: pin = Answered(A), engages Some(A).
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5613,9 +5597,10 @@ mod self_test {
             cfg.dns.servers = vec![resolver_b];
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5635,9 +5620,10 @@ mod self_test {
             cfg.dns.servers = vec![resolver_c];
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -5706,7 +5692,7 @@ mod self_test {
             cfg.dns.servers = vec![resolver_a];
 
             // Attempt 1: fresh resolve, A answers -> pin = Answered(A).
-            pm.start_cancellable(&cfg, true, CancellationToken::new(), pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+            pm.start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_a));
@@ -5718,7 +5704,7 @@ mod self_test {
             // bug's site: the new BlockedStart must still remember A was
             // ONCE verified-answering, not just that B currently isn't.
             cfg.dns.servers = vec![resolver_b];
-            pm.start_cancellable(&cfg, true, CancellationToken::new(), pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+            pm.start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_b));
@@ -5734,7 +5720,7 @@ mod self_test {
             // reappear, because `revalidate` is being applied to the
             // ORIGINAL Answered(A), not to attempt 2's ResolverDeselected.
             cfg.dns.servers = vec![resolver_a];
-            pm.start_cancellable(&cfg, true, CancellationToken::new(), pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+            pm.start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_a));
@@ -5786,9 +5772,10 @@ mod self_test {
                 let _ = pm
                     .start_cancellable(
                         &cfg,
-                        true,
+                        Coverage::Covered {
+                            unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                        },
                         CancellationToken::new(),
-                        pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                     )
                     .await
                     .unwrap_err();
@@ -5839,9 +5826,10 @@ mod self_test {
                 let _ = pm
                     .start_cancellable(
                         &cfg,
-                        true,
+                        Coverage::Covered {
+                            unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                        },
                         CancellationToken::new(),
-                        pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                     )
                     .await
                     .unwrap_err();
@@ -5893,7 +5881,7 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
                 let _ = pm
-                    .start_cancellable(&cfg, true, CancellationToken::new(), pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+                    .start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, CancellationToken::new())
                     .await
                     .unwrap_err();
 
@@ -5951,9 +5939,10 @@ mod self_test {
                 let _ = pm
                     .start_cancellable(
                         &cfg,
-                        true,
+                        Coverage::Covered {
+                            unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                        },
                         CancellationToken::new(),
-                        pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                     )
                     .await
                     .unwrap_err();
@@ -6012,9 +6001,10 @@ mod self_test {
 
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -6022,9 +6012,10 @@ mod self_test {
                 cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
                 pm.start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -6061,9 +6052,10 @@ mod self_test {
 
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -6073,9 +6065,10 @@ mod self_test {
 
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -6126,9 +6119,10 @@ mod self_test {
 
         pm.start_cancellable(
             &cfg,
-            true,
+            Coverage::Covered {
+                unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+            },
             CancellationToken::new(),
-            pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
         )
         .await
         .unwrap_err();
@@ -6153,9 +6147,10 @@ mod self_test {
             let (mut pm, cfg, _dir, _st) = covered_start_holding_the_cover(tempfile::tempdir().unwrap()).await;
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -6174,12 +6169,7 @@ mod self_test {
             let cfg = test_config();
             assert!(cfg.server.plugin.is_none(), "the default test config has no plugin");
             let _ = pm
-                .start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await;
             assert_eq!(pm.last_ech_doh(), None);
         });
@@ -6198,12 +6188,7 @@ mod self_test {
             cfg.server.plugin = Some("hole-694-absent-plugin".into());
             cfg.dns.servers = vec!["2606:4700:4700::1111".parse().unwrap(), "1.0.0.1".parse().unwrap()];
             let _ = pm
-                .start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await;
             assert_eq!(pm.last_ech_doh(), Some("https://1.0.0.1/dns-query"));
         });
@@ -6236,12 +6221,7 @@ mod self_test {
             cfg.dns.allow_insecure_bootstrap = true;
             cfg.dns.servers = vec!["2606:4700:4700::1111".parse().unwrap(), "1.0.0.1".parse().unwrap()];
             let _ = pm
-                .start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await;
             assert_eq!(pm.last_ech_doh(), Some("https://1.0.0.1/dns-query"));
         });
@@ -6269,9 +6249,10 @@ mod self_test {
             cfg.dns.servers = vec!["8.8.8.8".parse().unwrap()];
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -6353,9 +6334,10 @@ mod self_test {
             cfg.server.server = "proxy-a.example".into();
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -6366,9 +6348,10 @@ mod self_test {
             cfg.server.server = "proxy-b.example".into();
             pm.start_cancellable(
                 &cfg,
-                true,
+                Coverage::Covered {
+                    unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                },
                 CancellationToken::new(),
-                pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
             )
             .await
             .unwrap_err();
@@ -6411,9 +6394,10 @@ mod self_test {
             let err = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -6466,12 +6450,7 @@ mod self_test {
             cfg.dns.allow_insecure_bootstrap = false;
 
             let err = pm
-                .start_cancellable(
-                    &cfg,
-                    false,
-                    CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
-                )
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             match err {
@@ -6551,9 +6530,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -6708,9 +6688,10 @@ mod self_test {
             let _ = pm
                 .start_cancellable(
                     &cfg,
-                    true,
+                    Coverage::Covered {
+                        unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+                    },
                     CancellationToken::new(),
-                    pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
                 )
                 .await
                 .unwrap_err();
@@ -6776,9 +6757,10 @@ fn a_corrupt_intent_file_still_engages_the_transient_cover() {
 
         pm.start_cancellable(
             &cfg,
-            true,
+            Coverage::Covered {
+                unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+            },
             CancellationToken::new(),
-            pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
         )
         .await
         .unwrap_err();

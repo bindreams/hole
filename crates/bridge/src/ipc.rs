@@ -4,7 +4,7 @@ use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{CoverPresence, Routing};
 
 use crate::proxy::{Proxy, ProxyError};
-use crate::proxy_manager::{ProxyManager, ProxyState};
+use crate::proxy_manager::{Coverage, ProxyManager, ProxyState};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use crate::target::{self, Target};
@@ -497,7 +497,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // bridge's own boot-time reconciliation (#617, `reconcile_once`), which
     // calls `ProxyManager` directly and never goes through this handler at
     // all.
-    let covered = false;
+    let coverage = Coverage::Uncovered;
     #[allow(clippy::disallowed_methods)]
     // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
     let token = CancellationToken::new();
@@ -541,12 +541,12 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // until `in_flight` clears below, after this persist has completed.
     // Snapshot BEFORE the proxy lock: any unblock from here on is concurrent
     // with this start and must win the target write. It reads the user's decision
-    // to be Off (`unblock_generation`). The same value goes into `start_cancellable`, so
-    // the records and the transient cover decide against one start-begin.
+    // to be Off (`unblock_generation`). A covered start would carry the same value in
+    // `Coverage::Covered`, so the records and the transient cover decide against one start-begin.
     let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let result = {
         let mut pm = state.proxy.lock().await;
-        let result = pm.start_cancellable(&config, covered, token, unblock_snapshot).await;
+        let result = pm.start_cancellable(&config, coverage, token).await;
         persist_after_start(&state, &config, on_startup, result.is_ok(), unblock_snapshot).await;
         result
     };

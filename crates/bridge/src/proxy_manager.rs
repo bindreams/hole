@@ -273,9 +273,9 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// both facts here is what let a plain disconnect disarm the switch.
     adopted_standing_cover: bool,
     /// The count of Unblocks the tray has committed, shared with `IpcState::unblock_generation` (see
-    /// [`Self::unblock_generation_handle`]). A covered start is handed a snapshot taken when it began and the
-    /// transient cover section compares it under the cover lock: an Unblock since then means the user released the
-    /// cover the start is about to engage.
+    /// [`Self::unblock_generation_handle`]). The transient cover section compares it under the cover lock against
+    /// the snapshot in [`Coverage::Covered`]: an Unblock since then means the user released the cover the start is
+    /// about to engage.
     unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only DoH querier override. Set by `set_bootstrap_querier_for_test`;
     /// when present, `start_cancellable` resolves via `resolve_via_doh_with`
@@ -286,6 +286,19 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// derivation is otherwise observable only through the plugin it spawns.
     #[cfg(test)]
     last_ech_doh: Option<String>,
+}
+
+/// Whether a start runs under the transient block-until-connected cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    Uncovered,
+    /// `unblock_snapshot` is the Unblock count the caller read when the start began, before it waited for this
+    /// manager (the IPC handler reads it before locking `state.proxy`). An Unblock committed since is concurrent
+    /// with the start, and the transient cover section compares against this one value (see
+    /// `engage_transient_cover`); the start takes no snapshot of its own.
+    Covered {
+        unblock_snapshot: u64,
+    },
 }
 
 /// A held block-until-connected cover plus the server identity it permits —
@@ -818,9 +831,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[allow(clippy::disallowed_methods)]
         // Non-cancellable shim: callers explicitly opt out of cancel semantics. See clippy.toml CancellationToken::new rule.
         let token = CancellationToken::new();
-        // Uncovered, so the snapshot is never compared; read at entry, which is where this start begins.
-        let unblock_snapshot = self.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
-        self.start_cancellable(config, false, token, unblock_snapshot).await
+        self.start_cancellable(config, Coverage::Uncovered, token).await
     }
 
     /// Start the proxy with a caller-supplied `CancellationToken`.
@@ -850,16 +861,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    running, plugin chain included; the client sees `Ok(())`. A caller
     ///    that wanted to cancel that late can follow up with an explicit stop.
     ///
-    /// `unblock_snapshot` is the Unblock count the caller read when the start began, before it waited for this
-    /// manager (the IPC handler reads it before locking `state.proxy`). An Unblock committed since is concurrent
-    /// with the start, and the transient cover section compares against this one value (see
-    /// `engage_transient_cover`); the start takes no snapshot of its own.
     pub async fn start_cancellable(
         &mut self,
         config: &ProxyConfig,
-        covered: bool,
+        coverage: Coverage,
         cancel: CancellationToken,
-        unblock_snapshot: u64,
     ) -> Result<(), ProxyError> {
         debug!(
             local_port = config.local_port,
@@ -917,7 +923,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     // A covered start that can't resolve has no IP to permit, so no
                     // cover can engage: the block-until-connected intent falls open
                     // here — logged so the gap is visible, not silent.
-                    if covered {
+                    if let Coverage::Covered { .. } = coverage {
                         warn!(
                             error = &e as &dyn std::error::Error,
                             "covered start could not resolve the server; host NOT blocked (no IP to permit)"
@@ -999,31 +1005,37 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // blocking not leaking).
         let lockdown_on = self.standing_cover_expected();
 
-        if covered && !lockdown_on {
-            self.engage_transient_cover(
-                config.server.server.expose(),
-                server_ip,
-                pin,
-                ech_resolver_permit,
-                &effective_ech_doh,
-                unblock_snapshot,
-            );
-        } else if covered {
-            // Covered retry after the user enabled lockdown mid-blocked-state:
-            // release the held cover. This opens egress until the standing lockdown
-            // cover engages at routing.install — a brief, disclosed open window
-            // (bindreams/hole#758: not closed by the macOS pf work).
-            if self.posture.take_pending().is_some() {
-                warn!(
-                    "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
-                     uncovered until the standing lockdown cover engages at connect"
+        match coverage {
+            Coverage::Covered { unblock_snapshot } if !lockdown_on => {
+                self.engage_transient_cover(
+                    config.server.server.expose(),
+                    server_ip,
+                    pin,
+                    ech_resolver_permit,
+                    &effective_ech_doh,
+                    unblock_snapshot,
                 );
             }
-        } else if self.posture.take_pending().is_some() {
-            // Manual (uncovered) connect or reload-while-blocked: fail-open by
-            // design. Releasing the held cover opens egress — logged so the fail-open
-            // has a visible disposition, never a silent drop.
-            warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
+            Coverage::Covered { .. } => {
+                // Covered retry after the user enabled lockdown mid-blocked-state:
+                // release the held cover. This opens egress until the standing lockdown
+                // cover engages at routing.install — a brief, disclosed open window
+                // (bindreams/hole#758: not closed by the macOS pf work).
+                if self.posture.take_pending().is_some() {
+                    warn!(
+                        "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
+                         uncovered until the standing lockdown cover engages at connect"
+                    );
+                }
+            }
+            Coverage::Uncovered => {
+                // Manual (uncovered) connect or reload-while-blocked: fail-open by
+                // design. Releasing the held cover opens egress — logged so the fail-open
+                // has a visible disposition, never a silent drop.
+                if self.posture.take_pending().is_some() {
+                    warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
+                }
+            }
         }
         // Whether THIS attempt still holds a transient cover after the
         // release/reuse decisions above — read once here so `start_inner`
