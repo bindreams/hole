@@ -727,8 +727,8 @@ re-derive them.
    This holds for the files read with
    `read_vouched`, which are published by rename (the update marker's claim by a rename that refuses to replace) and
    so have one name; `ReadDir::read` does not have it, and is for a file that has a second name by design. A
-   filesystem with no such rename fails the claim, and the move-aside of an unreadable record, with an error naming
-   the directory; neither falls back to a hard link, which would leave the file under two names.
+   filesystem with no such rename fails the claim, and the move-aside of an unreadable record, with an `Unsupported`
+   error naming the file; neither falls back to a hard link, which would leave the file under two names.
 
 1. **Remove and move aside through the handle too.** A state file is removed by `VersionedFile::update` with `Change::Remove` and
    moved aside by `Change::MoveAside` or `Dir::rename_noreplace` (`dns_state::supersede`), never `std::fs::remove_file` or `rename` on a
@@ -3210,8 +3210,8 @@ while it is set, and it is the PR3 banner source. It is cleared unconditionally
 (remove-by-name, never parse-then-clear) on the next bridge's post-bind sweep.
 Every write, the clear and the read go through the log directory's no-follow `Dir`
 handle (a temp file staged and sealed through its own handle, then renamed; the
-single-occupancy claim renames without replacing, and hard-links only where the
-filesystem has no such rename). The read is the same for the GUI as the
+single-occupancy claim renames without replacing, and fails with `Unsupported`, naming
+the file, where the filesystem has no such rename). The read is the same for the GUI as the
 user and for the bridge as root: the bridge reads it in a log directory a user may
 own, where a FIFO planted at the name must not be waited for. A link or a FIFO at
 the name reads as `Marker::Indeterminate`, a claim of no cutover.

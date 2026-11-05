@@ -264,10 +264,19 @@ impl<S: VersionedState> VersionedFile<S> {
         };
         place.prepare_dir(&dir)?;
         let staged = dir.stage(self.file_name(), bytes, place.owner(), |tmp| place.prepare_tmp(tmp))?;
-        if back_up {
-            self.link_to_free_backup(&dir)?;
+        let backup = match back_up {
+            true => self.link_to_free_backup(&dir)?,
+            false => None,
+        };
+        if let Err(e) = self.fs.publish(staged) {
+            if let Some(backup) = &backup {
+                self.take_back_backup(&dir, backup);
+            }
+            return Err(e.into());
         }
-        self.fs.publish(staged)?;
+        if let Some(backup) = &backup {
+            self.log_backup("backed up a state file", backup);
+        }
         self.finalize(place, &dir);
         Ok(())
     }

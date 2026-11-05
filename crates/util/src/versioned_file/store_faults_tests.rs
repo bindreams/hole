@@ -7,6 +7,9 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use garter::test_utils::WaitableWriter;
+use garter::tracing_test::set_default_in_current_thread;
+
 use super::{DefaultPlacement, Fs, StoreError, VersionedFile};
 use crate::versioned_file::fixtures::{dir, names, put, unreadable_bytes, DecisionFile, NoteV3};
 use crate::versioned_file::CannotRead;
@@ -48,7 +51,7 @@ impl Fs for FailsLink {
 
 #[skuld::test]
 fn decision_store_never_exposes_an_absent_file() {
-    for cause in [CannotRead::Newer, CannotRead::Corrupt] {
+    for (cause, expected) in [(CannotRead::Newer, "Newer"), (CannotRead::Corrupt, "Corrupt")] {
         let dir = dir();
         let original = unreadable_bytes(cause);
         put(&dir, "decision.json", original);
@@ -57,20 +60,56 @@ fn decision_store_never_exposes_an_absent_file() {
         let err = file.store(&decision("new"), &plain()).unwrap_err();
 
         assert!(matches!(err, StoreError::Io(_)), "{cause:?}: {err:?}");
-        // The original is still at its name, with its bytes, and the temp is gone.
-        // The backup made before the failed publish is a second name for the same
-        // bytes: nothing is lost.
+        // The original is still at its name, with its bytes, and under that name alone: the backup link made
+        // before the failed publish is taken back, since a second name is what the vouched read refuses.
         assert_eq!(std::fs::read(dir.path().join("decision.json")).unwrap(), original);
-        assert_eq!(
-            names(&dir),
-            ["decision.json", "decision.json.unreadable.bak"],
-            "{cause:?}"
-        );
-        assert_eq!(
-            std::fs::read(dir.path().join("decision.json.unreadable.bak")).unwrap(),
-            original
-        );
+        assert_eq!(names(&dir), ["decision.json"], "{cause:?}");
+        let read_back = format!("{:?}", file.observe().loaded);
+        assert!(read_back.starts_with(expected), "{cause:?}: {read_back}");
     }
+}
+
+/// The publish and the unlink of the backup both fail: the publish error is the one returned, and the backup stays,
+/// which is a second name but loses nothing.
+#[skuld::test]
+fn a_failed_unlink_of_the_backup_returns_the_publish_error_and_keeps_the_backup() {
+    struct FailsPublishAndUnlink;
+
+    impl Fs for FailsPublishAndUnlink {
+        fn publish(&self, _staged: crate::dir::Staged<'_>) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+
+        fn remove_file(&self, _dir: &crate::dir::Dir, _name: &std::ffi::OsStr) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+    }
+
+    let writer = WaitableWriter::new();
+    let _guard = set_default_in_current_thread(
+        tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let dir = dir();
+    let original = unreadable_bytes(CannotRead::Newer);
+    put(&dir, "decision.json", original);
+    let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsPublishAndUnlink));
+
+    let err = file.store(&decision("new"), &plain()).unwrap_err();
+
+    match err {
+        StoreError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(std::fs::read(dir.path().join("decision.json")).unwrap(), original);
+    assert_eq!(names(&dir), ["decision.json", "decision.json.unreadable.bak"]);
+    let log = writer.snapshot();
+    assert!(
+        log.contains("WARN") && log.contains("the backup could not be removed"),
+        "{log}"
+    );
 }
 
 #[skuld::test]

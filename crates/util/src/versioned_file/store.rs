@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::{frame, CannotRead, Chain, ChainError, VersionedState};
 use crate::dir::{Dir, EntryKind, ReadDir, Staged};
+use crate::error_chain::error_chain;
 use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
@@ -254,19 +255,15 @@ impl<S: VersionedState> VersionedFile<S> {
         OsStr::new(S::FILE_NAME)
     }
 
-    /// Hard-links the file to the first free backup name and logs it.
-    /// `hard_link` fails atomically on an existing name, so two writers never
-    /// take the same name and no backup is ever replaced. `None` when the file
-    /// is not there.
+    /// Hard-links the file to the first free backup name; the caller logs it once the write it precedes has
+    /// published. `hard_link` fails atomically on an existing name, so two writers never take the same name and no
+    /// backup is ever replaced. `None` when the file is not there.
     pub(super) fn link_to_free_backup(&self, dir: &Dir) -> io::Result<Option<OsString>> {
         let mut attempt = 1u64;
         loop {
             let backup = self.backup_name(attempt);
             match self.fs.hard_link(dir, self.file_name(), &backup) {
-                Ok(()) => {
-                    self.log_backup("backed up a state file", &backup);
-                    return Ok(Some(backup));
-                }
+                Ok(()) => return Ok(Some(backup)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e),
@@ -274,7 +271,21 @@ impl<S: VersionedState> VersionedFile<S> {
         }
     }
 
-    fn log_backup(&self, what: &str, backup: &OsStr) {
+    /// Unlinks a backup made for a write that then failed to publish, so the original keeps one name: the vouched
+    /// read refuses a file with two. A failed unlink leaves the backup (a second name, nothing lost) and is logged;
+    /// the caller returns the publish error either way.
+    pub(super) fn take_back_backup(&self, dir: &Dir, backup: &OsStr) {
+        if let Err(e) = self.fs.remove_file(dir, backup) {
+            tracing::warn!(
+                file = S::FILE_NAME,
+                backup = %backup.to_string_lossy(),
+                error = %error_chain(&e),
+                "a write failed after its backup was made, and the backup could not be removed"
+            );
+        }
+    }
+
+    pub(super) fn log_backup(&self, what: &str, backup: &OsStr) {
         tracing::warn!(file = S::FILE_NAME, backup = %backup.to_string_lossy(), "{what}");
     }
 

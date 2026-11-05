@@ -71,7 +71,7 @@ impl Fs for NoRename {
 }
 
 #[skuld::test]
-fn a_backup_is_logged_even_when_the_publish_after_it_fails() {
+fn a_backup_is_logged_only_once_the_publish_after_it_has_succeeded() {
     let (subscriber, log) = capture();
     let _guard = set_default_in_current_thread(subscriber);
     let dir = dir();
@@ -81,13 +81,20 @@ fn a_backup_is_logged_even_when_the_publish_after_it_fails() {
         VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsPublish)).store(&decision("new"), &plain());
 
     assert!(result.is_err());
+    let after_failure = log.snapshot();
+    assert!(
+        !after_failure.contains("backed up a state file"),
+        "a backup taken back is not logged: {after_failure}"
+    );
+    assert_eq!(names(&dir), ["decision.json"]);
+
+    VersionedFile::<DecisionFile>::new(dir.path())
+        .store(&decision("new"), &plain())
+        .unwrap();
+
     let log = log.snapshot();
     assert_eq!(log.matches("backed up a state file").count(), 1, "{log}");
     assert!(log.contains("decision.json.unreadable.bak"), "{log}");
-    assert!(
-        names(&dir).contains(&"decision.json.unreadable.bak".to_string()),
-        "a logged backup is kept, not cleaned up"
-    );
 }
 
 #[skuld::test]
