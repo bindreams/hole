@@ -2,7 +2,7 @@
 //! and a real denial are both `ERROR_ACCESS_DENIED`.
 //!
 //! The error keeps its [`io::ErrorKind`]. The OS code moves to the error's `source()`, so read it with
-//! [`crate::error_chain::raw_os_error`].
+//! [`crate::error::raw_os_error`].
 
 use std::fmt;
 use std::fs::File;
