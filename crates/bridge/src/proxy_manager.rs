@@ -273,9 +273,9 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// both facts here is what let a plain disconnect disarm the switch.
     adopted_standing_cover: bool,
     /// The count of Unblocks the tray has committed, shared with `IpcState::unblock_generation` (see
-    /// [`Self::unblock_generation_handle`]). A covered start snapshots it at entry and the transient cover section
-    /// compares it under the cover lock: an Unblock since the start began means the user released the cover the
-    /// start is about to engage.
+    /// [`Self::unblock_generation_handle`]). A covered start is handed a snapshot taken when it began and the
+    /// transient cover section compares it under the cover lock: an Unblock since then means the user released the
+    /// cover the start is about to engage.
     unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only DoH querier override. Set by `set_bootstrap_querier_for_test`;
     /// when present, `start_cancellable` resolves via `resolve_via_doh_with`
@@ -818,7 +818,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[allow(clippy::disallowed_methods)]
         // Non-cancellable shim: callers explicitly opt out of cancel semantics. See clippy.toml CancellationToken::new rule.
         let token = CancellationToken::new();
-        self.start_cancellable(config, false, token).await
+        // Uncovered, so the snapshot is never compared; read at entry, which is where this start begins.
+        let unblock_snapshot = self.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
+        self.start_cancellable(config, false, token, unblock_snapshot).await
     }
 
     /// Start the proxy with a caller-supplied `CancellationToken`.
@@ -847,11 +849,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    late cancel cannot race the commit. The started session is left
     ///    running, plugin chain included; the client sees `Ok(())`. A caller
     ///    that wanted to cancel that late can follow up with an explicit stop.
+    ///
+    /// `unblock_snapshot` is the Unblock count the caller read when the start began, before it waited for this
+    /// manager (the IPC handler reads it before locking `state.proxy`). An Unblock committed since is concurrent
+    /// with the start, and the transient cover section compares against this one value (see
+    /// `engage_transient_cover`); the start takes no snapshot of its own.
     pub async fn start_cancellable(
         &mut self,
         config: &ProxyConfig,
         covered: bool,
         cancel: CancellationToken,
+        unblock_snapshot: u64,
     ) -> Result<(), ProxyError> {
         debug!(
             local_port = config.local_port,
@@ -865,11 +873,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if self.posture.session().is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
-        // Taken under `state.proxy`, before this start reads or resolves anything: an Unblock that commits after
-        // this is concurrent with the start (see `engage_transient_cover`); one that finished before it is not an
-        // input.
-        let unblock_snapshot = self.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
-
         // `handle_unblock` takes no `state.proxy` lock, so it may have released every OS-level cover while this
         // manager was not holding it. A `PendingStart` whose cover it took is a zombie: the OS objects it claims
         // to hold are gone. Drop it before the reuse checks below can trust it (`pending()` filters it out too).

@@ -422,7 +422,12 @@ pub async fn reconcile_once<P, R, D>(
                 // it prevents. Users who want the strict trade turn the kill
                 // switch on, which engages the STANDING cover instead; that
                 // path is untouched and still holds on failure.
-                if let Err(error) = pm.start_cancellable(config, false, cancel.child_token()).await {
+                // Uncovered, so the snapshot is never compared; read here, where this start begins.
+                let unblock_snapshot = pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst);
+                if let Err(error) = pm
+                    .start_cancellable(config, false, cancel.child_token(), unblock_snapshot)
+                    .await
+                {
                     tracing::warn!(
                         error = &error as &dyn std::error::Error,
                         "reconcile_once: failed to start the persisted target"
