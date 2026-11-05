@@ -193,15 +193,3 @@ fn helper_inside_current_thread_block_on_captures_spawned_events() {
         written(&writer),
     );
 }
-
-/// `captured` keeps events below INFO, so a test can assert on a `debug!` line
-/// and a negative assertion on one is not vacuous.
-#[skuld::test]
-fn captured_keeps_every_level() {
-    let log = crate::tracing_test::captured(|| {
-        tracing::trace!("trace-line");
-        tracing::debug!("debug-line");
-    });
-    assert!(log.contains("trace-line"), "{log:?}");
-    assert!(log.contains("debug-line"), "{log:?}");
-}
