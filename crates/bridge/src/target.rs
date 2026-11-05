@@ -464,26 +464,6 @@ pub fn apply(
     owner: Option<(u32, u32)>,
     f: impl FnOnce(Target) -> Target,
 ) -> Result<Target, TargetError> {
-    apply_committing(state_dir, owner, f, || {})
-}
-
-/// [`apply`] plus `on_commit`, run only after the new target is durably saved
-/// and while the exclusive lock is STILL held.
-///
-/// That placement is the point. A caller that needs to publish "this write
-/// happened" — `handle_unblock` bumping the generation counter
-/// `persist_after_start` compares against — cannot do it inside `f`, because
-/// `f` runs before `save` and a save failure would leave the announcement
-/// standing over a write that never landed, permanently declining every later
-/// start's target write. Doing it after `apply` returns is equally wrong: the
-/// lock is gone by then, so a concurrent reader can observe the commit without
-/// the announcement.
-pub fn apply_committing(
-    state_dir: &Path,
-    owner: Option<(u32, u32)>,
-    f: impl FnOnce(Target) -> Target,
-    on_commit: impl FnOnce(),
-) -> Result<Target, TargetError> {
     let _lock = TargetExclusive::acquire(state_dir, owner).map_err(TargetError::Lock)?;
     let current = load(state_dir);
     let next = f(current);
@@ -496,7 +476,6 @@ pub fn apply_committing(
         return Ok(next);
     }
     save(state_dir, &next, owner)?;
-    on_commit();
     Ok(next)
 }
 
