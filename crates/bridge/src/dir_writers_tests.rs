@@ -1833,8 +1833,14 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "crates/bridge/src/bin/test_service.rs",
         "std::fs::OpenOptions::new",
+        5,
+        "a test binary: appends to the logs, and claims the crash marker, that the test names",
+    ),
+    (
+        "crates/bridge/src/bin/test_service/scan.rs",
+        "std::fs::write",
         1,
-        "a test binary: appends to a control log the test names",
+        "a test binary: writes the report to the file the test names",
     ),
     (
         "crates/bridge/src/cutover/extract.rs",

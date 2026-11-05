@@ -535,7 +535,7 @@ def test_bridge_release_blocks_uninstall_on_failure(package: ET.Element) -> None
         "BridgeRelease must be Return='check': proceeding into RemoveFiles after a "
         "failed release leaves persistent WFP filters with no binary left to remove them"
     )
-    assert ca.get("ExeCommand") == "bridge release-covers"
+    assert ca.get("ExeCommand", "").startswith("bridge release-covers"), ca.get("ExeCommand")
     assert ca.get("Execute") == "deferred"
     assert ca.get("Impersonate") == "no", "the release needs elevation to reach WFP"
 
@@ -570,7 +570,7 @@ def test_bridge_uninstall_runs_on_upgrade_and_keeps_covers(package: ET.Element) 
     )
     ca = _ca_map(package).get("BridgeUninstall")
     assert ca is not None
-    assert ca.get("ExeCommand") == "bridge uninstall --keep-covers", (
+    assert ca.get("ExeCommand", "").startswith("bridge uninstall --keep-covers"), (
         "without --keep-covers the upgrade path silently disarms the kill switch"
     )
 
@@ -621,6 +621,30 @@ def test_bridge_uninstall_has_a_rollback_partner(package: ET.Element) -> None:
         "the rollback must re-run exactly what the install CA runs, or the restored state "
         "is not the state the uninstall found"
     )
+
+
+def test_bridge_cas_pass_the_shared_log_dir(package: ET.Element) -> None:
+    """Every `bridge install|release-covers|uninstall` action logs to one place.
+
+    Without --log-dir the CLI's gui-cli.log lands in the profile of whichever
+    account the action runs as, which nobody looking at a failed install knows
+    to open. The path is quoted (ExeCommand is appended to the quoted hole.exe
+    path as one command line) and has no trailing backslash, which would escape
+    the closing quote.
+    """
+    wanted = r' --log-dir "[CommonAppDataFolder]hole\logs"'
+    bridge_cas = {
+        ca_id: ca
+        for ca_id, ca in _ca_map(package).items()
+        if ca.get("ExeCommand", "").split()[:2]
+        in (["bridge", "install"], ["bridge", "release-covers"], ["bridge", "uninstall"])
+    }
+    assert set(bridge_cas) == {"BridgeInstall", "BridgeRelease", "BridgeUninstall", "BridgeUninstallRollback"}, (
+        f"unexpected set of bridge CAs: {sorted(bridge_cas)}"
+    )
+    for ca_id, ca in bridge_cas.items():
+        command = ca.get("ExeCommand", "")
+        assert command.endswith(wanted), f"{ca_id} must end with{wanted!r}, got {command!r}"
 
 
 def test_bridge_release_has_an_override(package: ET.Element) -> None:

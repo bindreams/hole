@@ -343,7 +343,7 @@ fn transport_after_elevation_toast_points_to_log() {
     assert!(toast.contains("connection refused"), "{toast}");
 }
 
-// should_prompt_install ===============================================================================================
+// install_gate_for ====================================================================================================
 
 #[skuld::test]
 fn install_gate_skips_externally_supervised_bridge() {
@@ -351,20 +351,42 @@ fn install_gate_skips_externally_supervised_bridge() {
     // Externally supervised (HOLE_BRIDGE_SOCKET / dev): never prompt, and the
     // production status probe is never even consulted (it may spawn launchctl).
     let mut probed = false;
-    assert!(!should_prompt_install(true, || {
-        probed = true;
-        NotInstalled
-    }));
+    assert_eq!(
+        install_gate_for(true, || {
+            probed = true;
+            NotInstalled
+        }),
+        InstallGate::Proceed
+    );
     assert!(!probed, "external bridge must short-circuit before the status probe");
 }
 
 #[skuld::test]
-fn install_gate_prompts_only_when_production_service_absent() {
+fn install_gate_offers_what_the_production_service_needs() {
     use crate::setup::BridgeInstallStatus::*;
-    // GUI owns the bridge: prompt iff the production service is absent.
-    assert!(should_prompt_install(false, || NotInstalled));
-    assert!(!should_prompt_install(false, || Installed));
-    assert!(!should_prompt_install(false, || Running));
+    use crate::setup::InstallPrompt;
+    use hole_bridge::disable_record::DisabledBy;
+    // GUI owns the bridge: an install for a missing service, a repair or an
+    // enable for a disabled one, nothing for one that is there, and a wait for
+    // one whose start type is being changed.
+    assert_eq!(
+        install_gate_for(false, || NotInstalled),
+        InstallGate::Prompt(InstallPrompt::Install)
+    );
+    assert_eq!(
+        install_gate_for(false, || Disabled(DisabledBy::InterruptedChange)),
+        InstallGate::Prompt(InstallPrompt::Repair)
+    );
+    assert_eq!(
+        install_gate_for(false, || Disabled(DisabledBy::Elsewhere)),
+        InstallGate::Prompt(InstallPrompt::Enable)
+    );
+    assert_eq!(install_gate_for(false, || Installed), InstallGate::Proceed);
+    assert_eq!(install_gate_for(false, || Running), InstallGate::Proceed);
+    assert_eq!(
+        install_gate_for(false, || ChangeInProgress),
+        InstallGate::ChangeInProgress
+    );
 }
 
 // decide_elevation ====================================================================================================
