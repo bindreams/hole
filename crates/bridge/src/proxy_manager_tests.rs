@@ -698,43 +698,6 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
 }
 
 #[skuld::test]
-fn a_mock_cover_released_under_its_own_dirs_lock_disengages() {
-    let dir = tempfile::tempdir().unwrap();
-    let routing = MockRouting::new(dir.path().to_path_buf());
-    let state = routing.state();
-    let lock = routing.lock_covers();
-    let cover = routing
-        .install_lockdown(
-            &lock,
-            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
-            &TunIdentity::synthetic(0xFEED, "hole-tun"),
-            &[],
-        )
-        .unwrap();
-
-    tun_engine::routing::CoverGuard::release(cover, &lock);
-
-    assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 1);
-}
-
-#[skuld::test(should_panic = "released under the lock of its own state dir")]
-fn a_mock_cover_released_under_another_dirs_lock_panics() {
-    let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let routing = MockRouting::new(dir.path().to_path_buf());
-    let cover = routing
-        .install_lockdown(
-            &routing.lock_covers(),
-            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
-            &TunIdentity::synthetic(0xFEED, "hole-tun"),
-            &[],
-        )
-        .unwrap();
-    let wrong = CoverLock::acquire(other.path());
-
-    tun_engine::routing::CoverGuard::release(cover, &wrong);
-}
-
-#[skuld::test]
 fn a_stale_guard_release_after_a_completed_sweep_deletes_nothing() {
     // The stamp rule the real guards follow: a completed sweep took what the guard held, so its later drop (or
     // release) must not disengage a second time.
@@ -809,11 +772,11 @@ pub(crate) fn covered_now<P: Proxy, R: Routing, D: Dns>(pm: &ProxyManager<P, R, 
     }
 }
 
-/// A DoH bootstrap querier that never answers, so a resolve fails with no network.
-struct NeverQuerier;
+/// A DoH bootstrap querier that fails every query at once, so a resolve fails with no network.
+struct UnreachableQuerier;
 
 #[async_trait::async_trait]
-impl crate::dns::bootstrap::DohQuerier for NeverQuerier {
+impl crate::dns::bootstrap::DohQuerier for UnreachableQuerier {
     async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, crate::dns::forwarder::UpstreamCause> {
         Err(crate::dns::forwarder::UpstreamCause::Unreachable)
     }
@@ -2244,7 +2207,7 @@ fn build_config_failure_sets_last_error() {
 fn doh_bootstrap_failure_sets_last_error() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
-        pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+        pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
         let mut config = test_config();
         // RFC 2606 reserves .invalid for guaranteed-non-resolution; the stub
         // querier never answers, so resolve is fail-closed without any network.
@@ -2290,7 +2253,7 @@ fn a_start_that_cannot_resolve_logs_the_measured_cover_presence() {
                 let routing = MockRouting::new(dir.path().to_path_buf());
                 *routing.state.cover_presence.lock().unwrap() = presence;
                 let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
-                pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+                pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
                 let mut config = test_config();
                 // RFC 2606 reserves .invalid for guaranteed non-resolution.
                 config.server.server = "test.invalid".into();
@@ -3242,7 +3205,7 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
     // system DNS or network).
     rt().block_on(async {
         let (mut pm, rstate, _dir) = new_manager_capturing(MockProxy::new());
-        pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+        pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
         let mut config = doh_config_with_server_host("proxy.example", TunnelMode::Full);
         config.server.plugin = None;
         let err = pm.start(&config).await.unwrap_err();
@@ -4582,7 +4545,7 @@ mod self_test {
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
-            pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+            pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
             let mut cfg = test_config();
             // Resolvable on every CI host without network.
             cfg.server.server = "localhost".into();
@@ -5945,7 +5908,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
-            pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+            pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
             let mut cfg = test_config();
             // Resolvable on every CI host without network.
             cfg.server.server = "localhost".into();

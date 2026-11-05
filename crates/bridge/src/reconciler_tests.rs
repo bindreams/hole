@@ -873,11 +873,10 @@ fn coverage_policy_lives_on_the_type_not_at_call_sites() {
     let offenders = decisions_outside(&["coverage.rs", "proxy_manager.rs"], "CoverPlan::");
     assert!(
         offenders.is_empty(),
-        "per-variant CoverPlan policy decided outside `coverage.rs` and the one dispatch match in          `start_cancellable`:
-  {}
+        "per-variant CoverPlan policy decided outside `coverage.rs` and the one dispatch match in \
+         `start_cancellable`:\n  {}\n\
          Add a method to `CoverPlan` (one exhaustive match) and ask it instead.",
-        offenders.join("
-  ")
+        offenders.join("\n  ")
     );
 
     let text = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/proxy_manager.rs"))
