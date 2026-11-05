@@ -66,5 +66,4 @@ tokio = { version = "1", features = ["test-util"] }
 # `versioned_file`'s compile-fail fixtures pin that a gap in a migration chain
 # does not build.
 trybuild = { workspace = true }
-# `error_tests` walks the workspace's sources for `#[error(transparent)]`.
-walkdir = "2"
+

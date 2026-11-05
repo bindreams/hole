@@ -9287,7 +9287,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trybuild",
- "walkdir",
  "windows 0.62.2",
 ]
 
