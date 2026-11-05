@@ -1570,10 +1570,12 @@ pub trait CoverGuard {
     /// resource, and the enable refcount is the thing being persisted.
     fn disarm(self);
 
-    /// Disengage the cover under `lock`, the proof that no other cover mutation runs. The explicit form of
-    /// dropping the guard, for a caller that holds the lock and wants the release to say so. Deletes only while
+    /// Disengage the cover under `lock`, the proof that no other cover mutation runs. Asserts `lock` is this
+    /// guard's directory's, then drops the guard: its `Drop` is the only code that deletes. Deletes only while
     /// this guard's install is current ([`CoverGuard::is_current`]); a stale guard releases nothing, so it can
-    /// never delete a newer cover's filters or drop a pf token a sweep already dropped.
+    /// never delete a newer cover's filters or drop a pf token a sweep already dropped. A panic in the assert
+    /// unwinds with the guard intact and its `Drop` releases; a panic in the delete propagates once from that
+    /// `Drop` and is not retried.
     fn release(self, lock: &failclosed::CoverLock);
 
     /// Whether this guard still owns the cover: no later install of its kind, and no sweep that released it, has

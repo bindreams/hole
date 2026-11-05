@@ -399,7 +399,7 @@ fn enable_pf_capture_token() -> Result<String, RoutingError> {
 /// pf-backed cover guard. Drop disengages per its stamp's [`CoverKind`], while its install is the latest
 /// ([`InstallStamp`]): the transient cover restores `/etc/pf.conf`; the lockdown cover restores the snapshot.
 pub struct Cover {
-    /// `None` once `release` or `detach` has consumed the claim, which makes `Drop` a no-op.
+    /// `None` once `detach` has consumed the claim, which makes `Drop` a no-op.
     held: Option<Held>,
     stamp: InstallStamp,
 }
@@ -423,12 +423,11 @@ impl Cover {
         self.held = None;
     }
 
-    /// Disengage this cover under `lock`; a stale install disengages nothing (its token is already dropped).
-    pub(crate) fn release(mut self, lock: &CoverLock) {
-        let held = self.held.as_ref().expect("a live cover holds its claim");
-        self.stamp.release(lock, || held.disengage(self.stamp.kind()));
-        // Emptied only once the disengage returned: a panic in it unwinds with the claim in place, so `Drop` retries.
-        self.held = None;
+    /// Release this cover under `lock`, which must be its own state dir's: its `Drop`, the only code that disengages,
+    /// runs inside the caller's section.
+    pub(crate) fn release(self, lock: &CoverLock) {
+        self.stamp.assert_held_under(lock);
+        drop(self);
     }
 
     pub(crate) fn is_current(&self) -> bool {
