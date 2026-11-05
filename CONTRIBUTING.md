@@ -647,8 +647,8 @@ delegates to it, so logging that error as `error = &e as &dyn std::error::Error`
 The reason is a fixed sentence or a uid, never a name or a path: the directory's
 refusal is folded into that `Display`, not a link of its own. That cannot put a username in
 `bridge.log` (which the support bundle collects), also when a caller's error holds it as
-a `#[source]`. `Refused::path()` is the one way out; a caller that wants it chooses a sink that may hold a path (`gui.log`), never
-the bridge log or the bundle.
+a `#[source]`. `Refused::path()` is the one way out; a caller that wants it chooses a sink
+that may hold a path (`gui.log`), never the bridge log or the bundle.
 
 ### Privileged code in folders a user may own
 
