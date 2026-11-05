@@ -42,9 +42,10 @@ async fn covered_start_holding_the_cover(
 
     pm.start_cancellable(
         &cfg,
-        true,
+        Coverage::Covered {
+            unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
+        },
         tokio_util::sync::CancellationToken::new(),
-        pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst),
     )
     .await
     .unwrap_err();
@@ -324,7 +325,7 @@ fn an_externally_released_cover_is_not_silently_reused() {
         // attempt succeeds all the way through instead of failing again.
         let cfg = test_config();
 
-        pm.start_cancellable(&cfg, true, tokio_util::sync::CancellationToken::new(), pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+        pm.start_cancellable(&cfg, Coverage::Covered { unblock_snapshot: pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst) }, tokio_util::sync::CancellationToken::new())
             .await
             .expect("the superseded zombie must not block a fresh, successful retry");
 

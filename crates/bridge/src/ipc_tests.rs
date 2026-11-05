@@ -1892,7 +1892,7 @@ async fn a_second_start_cannot_begin_while_the_first_is_still_persisting() {
 
 #[skuld::test]
 fn ipc_start_never_engages_the_cover_even_on_failure() {
-    // #979: `handle_start` hardcodes `covered = false` unconditionally now —
+    // #979: `handle_start` hardcodes `Coverage::Uncovered` unconditionally now —
     // there is no wire signal left that can make an IPC-driven start covered
     // (`X-Hole-Covered` was deleted; the only remaining source of a covered
     // start is the bridge's own boot-time reconcile, which bypasses IPC

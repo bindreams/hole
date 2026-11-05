@@ -16,7 +16,7 @@ use tun_engine::routing::{CoverPresence, Routing};
 
 use crate::dns::system::Dns;
 use crate::proxy::Proxy;
-use crate::proxy_manager::{ProxyManager, ProxyState};
+use crate::proxy_manager::{Coverage, ProxyManager, ProxyState};
 use crate::target::{self, SessionEvent, Target};
 #[cfg(test)]
 use hole_common::protocol::ProxyConfig;
@@ -278,7 +278,7 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// that macOS pf rules do not survive a reboot, so an armed user egresses in
 /// the clear until a connect re-engages the cover; reconciling at boot makes
 /// that connect happen sooner, but a boot connect that FAILS engages nothing
-/// at all (it is deliberately uncovered — see `start_cancellable`'s `covered`
+/// at all (it is deliberately uncovered — see `start_cancellable`'s `Coverage`
 /// argument below). Closing #617 needs a cover that survives reboot on its
 /// own; see #1000.
 ///
@@ -300,7 +300,7 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// So `Phase::Cover(Engage)` is a no-op in this driver — the standing cover's
 /// actual engage happens inside `start_cancellable`'s own
 /// `standing_cover_expected()` gate, once the TUN device and routes it needs
-/// exist. `start_cancellable` is called with `covered = false`, so no
+/// exist. `start_cancellable` is called with `Coverage::Uncovered`, so no
 /// transient cover holds the connect window when the lockdown intent is off —
 /// a boot auto-connect that fails leaves the host reachable rather than
 /// blocked.
@@ -414,7 +414,7 @@ pub async fn reconcile_once<P, R, D>(
                 // SCM Stop arriving mid-boot abandons the auto-connect instead
                 // of racing it. A token minted here would be one
                 // nothing else holds: uncancellable by construction.
-                // `covered = false`: a boot auto-connect that fails leaves the
+                // `Coverage::Uncovered`: a boot auto-connect that fails leaves the
                 // host REACHABLE. The transient block-until-connected cover
                 // would block all egress on a path the user never opted into,
                 // so any bug in the connect sequence strands them with no
@@ -422,10 +422,8 @@ pub async fn reconcile_once<P, R, D>(
                 // it prevents. Users who want the strict trade turn the kill
                 // switch on, which engages the STANDING cover instead; that
                 // path is untouched and still holds on failure.
-                // Uncovered, so the snapshot is never compared; read here, where this start begins.
-                let unblock_snapshot = pm.unblock_generation_handle().load(std::sync::atomic::Ordering::SeqCst);
                 if let Err(error) = pm
-                    .start_cancellable(config, false, cancel.child_token(), unblock_snapshot)
+                    .start_cancellable(config, Coverage::Uncovered, cancel.child_token())
                     .await
                 {
                     tracing::warn!(
