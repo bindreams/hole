@@ -22,6 +22,8 @@
 //!
 //! A guard dropped on a thread that already holds the lock (an early return or an unwind inside a section) deletes
 //! under that held lock ([`InstallStamp::release_on_drop`]); it can neither deadlock nor panic while unwinding.
+//! A guard's explicit release is that same drop, after a check that the lock is its directory's: no second delete
+//! path exists to disagree with it.
 //! [`CoverLock::acquire`] on a lock this thread already holds is a bug a std mutex would turn into a hang, so it
 //! panics and names the two release paths instead.
 
@@ -180,14 +182,19 @@ impl InstallStamp {
         self.slot.stamps[self.kind.index()].load(Ordering::Acquire) == self.value
     }
 
-    /// Run `delete` iff this stamp is current. Takes the lock as proof it is held; panics if it is another
-    /// directory's. A stamp is a fact about one install, so asking twice is harmless: the guard that owns it
-    /// decides when to ask.
-    pub fn release(&self, lock: &CoverLock, delete: impl FnOnce()) {
+    /// Panics unless `lock` is the lock of this stamp's own state dir.
+    pub fn assert_held_under(&self, lock: &CoverLock) {
         assert!(
             std::ptr::eq(self.slot, lock.slot),
             "a cover is released under the lock of its own state dir"
         );
+    }
+
+    /// Run `delete` iff this stamp is current. Takes the lock as proof it is held; panics if it is another
+    /// directory's. A stamp is a fact about one install, so asking twice is harmless: the guard that owns it
+    /// decides when to ask.
+    pub fn release(&self, lock: &CoverLock, delete: impl FnOnce()) {
+        self.assert_held_under(lock);
         if self.is_current() {
             delete();
         }

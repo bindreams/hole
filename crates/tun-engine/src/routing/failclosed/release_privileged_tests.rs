@@ -373,8 +373,9 @@ fn release_all_leaves_nothing_the_oracle_can_see() {
     );
 }
 
-/// A release that panics before it deletes (here: the lock is another directory's) leaves the guard owning its
-/// cover, so the unwind's `Drop` still removes it.
+/// A release under another directory's lock panics in its assert, before the guard is dropped, so the guard
+/// unwinds intact and its `Drop` removes the cover. A panic in the delete itself is not retried: `Drop` is the
+/// only code that deletes.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn release_all_finds_nothing_after_a_release_that_panicked() {
@@ -395,8 +396,17 @@ fn release_all_finds_nothing_after_a_release_that_panicked() {
     );
 
     let wrong_lock = CoverLock::acquire(other.path());
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cover.release(&wrong_lock)));
-    assert!(panicked.is_err(), "releasing under another directory's lock must panic");
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cover.release(&wrong_lock)))
+        .expect_err("releasing under another directory's lock must panic");
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|m| m.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .expect("the panic carries a message");
+    assert!(
+        message.contains("released under the lock of its own state dir"),
+        "the panic must be the lock-mismatch assert, got: {message}"
+    );
     drop(wrong_lock);
 
     assert_eq!(

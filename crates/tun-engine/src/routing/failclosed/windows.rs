@@ -1307,13 +1307,13 @@ fn first_delete_failure(codes: &[(&'static str, u32)]) -> Option<RoutingError> {
 /// WFP-backed cover guard. Drop deletes the filters it installed by GUID, while its install is the latest
 /// ([`InstallStamp`]); the stamp's [`CoverKind`] selects the GUID set.
 pub struct Cover {
-    /// `None` once `release` or `detach` has taken and closed the engine, which makes `Drop` a no-op.
+    /// `None` once `detach` has taken and closed the engine, which makes `Drop` a no-op.
     engine: Option<HANDLE>,
     stamp: InstallStamp,
 }
 
 // SAFETY: the FWPM engine handle is owned exclusively by this guard and only
-// touched in `engage`, `release`, `detach` and `Drop`. Sending it between threads is sound; FWPM
+// touched in `engage`, `detach` and `Drop`. Sending it between threads is sound; FWPM
 // engine handles are not thread-affine.
 unsafe impl Send for Cover {}
 
@@ -2022,15 +2022,11 @@ impl Cover {
         }
     }
 
-    /// Delete this cover under `lock`, then close the engine. A stale install deletes nothing but still closes it.
-    pub(crate) fn release(mut self, lock: &CoverLock) {
-        let engine = self.engine.expect("a live cover holds its engine");
-        let kind = self.stamp.kind();
-        self.stamp.release(lock, || Self::delete_filters(engine, kind));
-        // Emptied only once the deletes returned: a panic in them unwinds with the engine in place, so `Drop`
-        // retries and closes it.
-        self.engine = None;
-        Self::close_engine(engine);
+    /// Release this cover under `lock`, which must be its own state dir's: its `Drop`, the only code that deletes,
+    /// runs inside the caller's section.
+    pub(crate) fn release(self, lock: &CoverLock) {
+        self.stamp.assert_held_under(lock);
+        drop(self);
     }
 
     pub(crate) fn is_current(&self) -> bool {
