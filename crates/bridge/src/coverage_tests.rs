@@ -17,15 +17,3 @@ fn plan_engages_only_a_covered_start_with_no_standing_cover() {
         );
     }
 }
-
-#[skuld::test]
-fn only_a_fail_open_plan_expects_no_cover() {
-    let table = [
-        (CoverPlan::Engage { unblock_snapshot: 0 }, true),
-        (CoverPlan::HandToLockdown, true),
-        (CoverPlan::FailOpen, false),
-    ];
-    for (plan, expected) in table {
-        assert_eq!(plan.expects_cover(), expected, "{plan:?}");
-    }
-}

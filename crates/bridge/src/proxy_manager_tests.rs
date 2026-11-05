@@ -2222,55 +2222,58 @@ fn doh_bootstrap_failure_sets_last_error() {
     });
 }
 
-/// A covered start that cannot resolve the server warns the host is not blocked exactly when no cover holds it.
-/// Who holds the host is the OS probe's answer, not the kill-switch intent: intent On with nothing engaged (the
-/// standing cover arrives only at `routing.install`, which a failed resolve never reaches) leaves the host open.
+/// A start that cannot resolve the server logs the failure with the measured cover presence, whatever the start's
+/// coverage and whatever the probe answered. The line states what the start did, not whether the host is blocked.
 #[skuld::test]
-fn a_covered_start_that_cannot_resolve_warns_unblocked_exactly_when_nothing_holds_the_host() {
+fn a_start_that_cannot_resolve_logs_the_measured_cover_presence() {
     use crate::test_support::log_capture::VecWriter;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
     use tun_engine::routing::CoverPresence;
 
-    for (intent_on, presence, expect_warning) in [
-        (false, CoverPresence::Absent, true),
-        (true, CoverPresence::Absent, true),
-        (true, CoverPresence::Live, false),
-        (false, CoverPresence::Live, false),
+    for presence in [
+        CoverPresence::Live,
+        CoverPresence::Recorded,
+        CoverPresence::Absent,
+        CoverPresence::Indeterminate,
+        CoverPresence::Unreachable,
     ] {
-        current_thread_rt().block_on(async {
-            let writer = VecWriter::new();
-            let subscriber = tracing_subscriber::registry().with(
-                fmt::layer()
-                    .with_writer(writer.clone())
-                    .with_ansi(false)
-                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
-            );
-            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        for covered in [true, false] {
+            current_thread_rt().block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-            let dir = tempfile::tempdir().unwrap();
-            let routing = MockRouting::new(dir.path().to_path_buf());
-            *routing.state.cover_presence.lock().unwrap() = presence;
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, intent_on);
-            pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
-            let mut config = test_config();
-            // RFC 2606 reserves .invalid for guaranteed non-resolution.
-            config.server.server = "test.invalid".into();
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                *routing.state.cover_presence.lock().unwrap() = presence;
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+                let mut config = test_config();
+                // RFC 2606 reserves .invalid for guaranteed non-resolution.
+                config.server.server = "test.invalid".into();
+                let coverage = if covered { covered_now(&pm) } else { Coverage::Uncovered };
 
-            let err = pm
-                .start_cancellable(&config, covered_now(&pm), CancellationToken::new())
-                .await
-                .unwrap_err();
-            assert!(matches!(err, ProxyError::DohBootstrap(_)), "{err:?}");
+                let err = pm
+                    .start_cancellable(&config, coverage, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, ProxyError::DohBootstrap(_)), "{err:?}");
 
-            let output = writer.snapshot_string();
-            assert_eq!(
-                output.contains("host NOT blocked"),
-                expect_warning,
-                "intent_on={intent_on} presence={presence:?}: the unblocked warning must appear exactly when no cover holds the host; got:
+                let output = writer.snapshot_string();
+                let want = format!("cover_presence={presence:?}");
+                assert!(
+                    output.contains("could not resolve the server") && output.contains(&want),
+                    "covered={covered}: the resolve failure must log `{want}`; got:
 {output}"
-            );
-        });
+                );
+            });
+        }
     }
 }
 
