@@ -57,8 +57,8 @@ where
 }
 
 /// Runs `body` with a plain-text `fmt` subscriber installed on this thread
-/// only, and returns what it logged. The subscriber is gone before the
-/// snapshot is taken.
+/// only, and returns everything it logged, at every level. The subscriber is
+/// gone before the snapshot is taken.
 ///
 /// # Panics
 ///
@@ -70,6 +70,7 @@ pub fn captured(body: impl FnOnce()) -> String {
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer.clone())
         .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
         .finish();
     {
         let _guard = set_default_in_current_thread(subscriber);
