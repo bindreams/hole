@@ -107,8 +107,8 @@ fn a_stale_stamp_releases_nothing() {
     let b = lock.stamp_install(CoverKind::Lockdown);
 
     let mut ran = Vec::new();
-    a.release(&lock, || ran.push("a"));
-    b.release(&lock, || ran.push("b"));
+    a.release_on_drop(|| ran.push("a"));
+    b.release_on_drop(|| ran.push("b"));
 
     assert_eq!(ran, ["b"]);
 }
@@ -197,7 +197,7 @@ fn a_cover_released_with_the_lock_deletes_once() {
     let stamp = lock.stamp_install(CoverKind::Transient);
     let mut deleted = 0;
 
-    stamp.release(&lock, || deleted += 1);
+    stamp.release_on_drop(|| deleted += 1);
 
     assert_eq!(deleted, 1);
 }

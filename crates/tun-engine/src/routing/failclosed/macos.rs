@@ -423,15 +423,8 @@ impl Cover {
         self.held = None;
     }
 
-    /// Release this cover under `lock`, which must be its own state dir's: its `Drop`, the only code that disengages,
-    /// runs inside the caller's section.
-    pub(crate) fn release(self, lock: &CoverLock) {
-        self.stamp.assert_held_under(lock);
-        drop(self);
-    }
-
-    pub(crate) fn is_current(&self) -> bool {
-        self.stamp.is_current()
+    pub(crate) fn stamp(&self) -> &InstallStamp {
+        &self.stamp
     }
 }
 

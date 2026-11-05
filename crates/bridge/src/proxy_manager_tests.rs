@@ -655,8 +655,10 @@ impl tun_engine::routing::CoverGuard for MockCover {
         std::mem::forget(self);
     }
 
-    /// Under the held lock a drop IS the explicit release, so this is one.
-    fn release(self, _lock: &CoverLock) {
+    /// Under the held lock a drop IS the explicit release, so this is one, after the lock-dir check the real guards
+    /// make.
+    fn release(self, lock: &CoverLock) {
+        self.stamp.assert_held_under(lock);
         drop(self);
     }
 
