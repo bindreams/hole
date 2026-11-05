@@ -193,8 +193,7 @@ pub struct UpstreamErr {
     /// and report `tcp_*` instead.
     pub udp_sent: Option<u64>,
     pub udp_received: Option<u64>,
-    /// First `io::Error::raw_os_error()` found walking
-    /// `std::error::Error::source()` from `source`. Distinguishes FIN
+    /// First OS error code in `source`'s chain ([`util::error::raw_os_error`]). Distinguishes FIN
     /// (graceful close, `None` on Windows since FIN surfaces as `Ok(0)`
     /// with no errno) from RST (`WSAECONNRESET=10054`) and friends.
     pub os_errno: Option<i32>,
@@ -206,7 +205,7 @@ pub struct UpstreamErr {
 
 impl UpstreamErr {
     pub fn new(layer: UpstreamLayer, source: io::Error) -> Self {
-        let os_errno = first_os_errno(&source);
+        let os_errno = util::error::raw_os_error(&source);
         Self {
             decorated: false,
             layer,
@@ -233,7 +232,7 @@ impl UpstreamErr {
 
     /// Classify this failure for reporting. Two layers need more than the tag:
     ///
-    /// - `Tls` splits on whether `first_rustls_error` found a TRUST-CHAIN
+    /// - `Tls` splits on whether the source holds a TRUST-CHAIN
     ///   rejection (see [`is_trust_chain_rejection`]).
     /// - `Timeout` splits on whether a transport had been PUBLISHED when the
     ///   budget fired. `socks5_ms` is set by `AttemptProbe::connected` and
@@ -260,7 +259,7 @@ impl UpstreamErr {
             }
             UpstreamLayer::Http => UpstreamCause::BadResponse,
             UpstreamLayer::Io => UpstreamCause::Io,
-            UpstreamLayer::Tls => match first_rustls_error(&self.source) {
+            UpstreamLayer::Tls => match util::error::find::<rustls::Error>(&self.source) {
                 Some(e) if is_trust_chain_rejection(e) => UpstreamCause::CertificateRejected,
                 _ => UpstreamCause::TlsFailed,
             },
@@ -464,33 +463,6 @@ impl AttemptProbe {
     }
 }
 
-/// Walk `std::error::Error::source()` looking for the first
-/// `io::Error::raw_os_error()` value. Needed because tokio-rustls wraps
-/// its own `tls handshake eof` around a synthesized inner `io::Error`
-/// that has no errno — but if the root is a real socket error
-/// (`WSAECONNRESET` on Windows) it's further down the chain.
-///
-/// Special-cases `io::Error`: its `Error::source()` impl skips the
-/// Custom-wrapper and delegates to the *inner* error's `source()`,
-/// which would hide the inner `io::Error` entirely. Use `get_ref()` to
-/// descend through nested `io::Error` directly.
-fn first_os_errno(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(err) = current {
-        if let Some(io_err) = err.downcast_ref::<io::Error>() {
-            if let Some(errno) = io_err.raw_os_error() {
-                return Some(errno);
-            }
-            if let Some(inner) = io_err.get_ref() {
-                current = Some(inner);
-                continue;
-            }
-        }
-        current = err.source();
-    }
-    None
-}
-
 /// Does this rustls error mean the peer's chain did not verify against our
 /// trust roots — as opposed to any other certificate complaint?
 ///
@@ -526,27 +498,6 @@ fn is_trust_chain_rejection(e: &rustls::Error) -> bool {
         }
         _ => false,
     }
-}
-
-/// Walk the chain for a `rustls::Error`. tokio-rustls reports a verification
-/// failure as `io::Error::new(InvalidData, rustls::Error)`, so the rustls error
-/// hangs off `io::Error::get_ref()` — `io::Error::source()` skips the wrapper
-/// and would hide it. Same descent as [`first_os_errno`].
-fn first_rustls_error<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(err) = current {
-        if let Some(r) = err.downcast_ref::<rustls::Error>() {
-            return Some(r);
-        }
-        if let Some(io_err) = err.downcast_ref::<io::Error>() {
-            if let Some(inner) = io_err.get_ref() {
-                current = Some(inner);
-                continue;
-            }
-        }
-        current = err.source();
-    }
-    None
 }
 
 /// Upstream port for plain DNS (RFC 1035) and DoT (RFC 7858).
