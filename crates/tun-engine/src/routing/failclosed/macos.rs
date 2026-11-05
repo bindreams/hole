@@ -416,9 +416,9 @@ impl Cover {
     /// macOS holds NO process-local OS resource here: `token` is the
     /// `pfctl -E` enable ticket, and `Drop`'s `pfctl -X <token>` releases pf's
     /// enable refcount rather than freeing anything owned by this process.
-    /// Leaving pf enabled is precisely what detaching means, so skipping
-    /// `Drop` is the whole operation — unlike Windows, which must close its
-    /// FWPM engine handle here.
+    /// Leaving pf enabled is precisely what detaching means, so emptying the
+    /// guard (`Drop` then disengages nothing) is the whole operation — unlike
+    /// Windows, which must close its FWPM engine handle here.
     pub(crate) fn detach(mut self) {
         self.held = None;
     }

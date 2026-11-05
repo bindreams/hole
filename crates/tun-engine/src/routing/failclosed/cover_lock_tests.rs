@@ -386,6 +386,25 @@ fn a_sweep_that_released_neither_kind_outdates_neither_stamp() {
 }
 
 #[skuld::test]
+fn a_sweep_that_failed_to_open_the_firewall_outdates_no_stamp() {
+    // `SweepOutcome::failed` attributes no kind: the firewall was never reached, so every held guard still owns
+    // its cover and retries.
+    let d = dir();
+    let lock = CoverLock::acquire(d.path());
+    let transient = lock.stamp_install(CoverKind::Transient);
+    let lockdown = lock.stamp_install(CoverKind::Lockdown);
+    let result = sweep_with_witness(&lock, None, |_| {
+        SweepOutcome::failed(
+            Clearance::proven(),
+            RoutingError::RouteSetup("the engine did not open".into()),
+        )
+    });
+    assert!(result.is_err());
+    assert!(transient.is_current());
+    assert!(lockdown.is_current());
+}
+
+#[skuld::test]
 fn a_failing_sweep_releases_the_lock() {
     let d = dir();
     {

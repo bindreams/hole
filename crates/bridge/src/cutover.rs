@@ -368,7 +368,7 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// filter of it, and every key that reaches THIS message is nonetheless a
 /// boot-time twin. A `Persistent` key goes unproven under exactly one outcome,
 /// `failclosed::KeyOutcome::Failed`; that outcome is what `first_delete_failure`
-/// turns into a `SweepOutcome::failed`, so the clearance holding it reaches
+/// turns into the failure of a `SweepOutcome::per_kind`, so the clearance holding it reaches
 /// `unlock_with`/`release_covers_with` as `Err` and is dropped by their `?`
 /// before any of the three render sites runs. The message therefore states
 /// what its keys are instead of hedging

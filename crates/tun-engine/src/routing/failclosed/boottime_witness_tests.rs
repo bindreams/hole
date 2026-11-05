@@ -13,7 +13,8 @@
 use std::path::Path;
 
 use super::super::{
-    ArmingWitness, Clearance, CoverLock, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, RoutingError, SweepOutcome,
+    ArmingWitness, Clearance, CoverKind, CoverLock, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, RoutingError,
+    SweepOutcome,
 };
 use super::{next_record, WitnessUpdate};
 
@@ -87,9 +88,14 @@ fn arm(state_dir: &Path) {
 /// code is inspected until all of them are in.
 fn failing_sweep(state_dir: &Path, observations: &[KeyObservation]) -> RoutingError {
     sweep_with_lock(state_dir, |_, witness| {
-        SweepOutcome::failed(
+        SweepOutcome::per_kind(
             Clearance::from_observations(observations, witness),
-            RoutingError::RouteSetup("the firewall refused one of the deletes".into()),
+            [(
+                CoverKind::Lockdown,
+                Some(RoutingError::RouteSetup(
+                    "the firewall refused one of the deletes".into(),
+                )),
+            )],
         )
     })
     .expect_err("the sweep body failed")

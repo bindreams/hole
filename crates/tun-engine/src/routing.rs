@@ -1558,8 +1558,8 @@ where
 /// `Routing::Cover` associated type, and an inherent method is not callable
 /// through that type parameter.
 pub trait CoverGuard {
-    /// Persist the underlying filters without disengaging: consume the guard so
-    /// its `Drop` (the disengage) never runs.
+    /// Persist the underlying filters without disengaging: consume the guard and
+    /// empty what it holds, so its `Drop` disengages nothing.
     ///
     /// Persists the filters and releases this process's claim on them. Safe
     /// for a LONG-LIVED caller: the implementation closes whatever the guard

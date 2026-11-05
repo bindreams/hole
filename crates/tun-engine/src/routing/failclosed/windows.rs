@@ -1313,7 +1313,7 @@ pub struct Cover {
 }
 
 // SAFETY: the FWPM engine handle is owned exclusively by this guard and only
-// touched in `engage` and `Drop`. Sending it between threads is sound; FWPM
+// touched in `engage`, `release`, `detach` and `Drop`. Sending it between threads is sound; FWPM
 // engine handles are not thread-affine.
 unsafe impl Send for Cover {}
 
@@ -1941,8 +1941,8 @@ unsafe fn add_filter(
 
 impl Cover {
     /// Release this process's claim on the cover without disengaging it:
-    /// close the FWPM engine handle, then skip `Drop` so its filter deletes
-    /// never run.
+    /// close the FWPM engine handle and empty the guard, so `Drop` deletes no
+    /// filter.
     ///
     /// Safe because no object this cover installs is owned by the engine
     /// session, and that turns on the SESSION, not on any filter's flags:
