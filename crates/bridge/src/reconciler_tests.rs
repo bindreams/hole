@@ -839,13 +839,39 @@ fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// working. What this forbids is DECIDING from one (`=>`, `==`, `!=`).
 #[skuld::test]
 fn session_event_policy_lives_on_the_type_not_at_call_sites() {
-    let scan_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let src_root = scan_root.clone();
     // The two exhaustive deciders, by path relative to `src/`.
-    let sanctioned = ["target.rs", "reconciler.rs"];
+    let offenders = decisions_outside(&["target.rs", "reconciler.rs"], "SessionEvent::");
+    assert!(
+        offenders.is_empty(),
+        "per-variant SessionEvent policy decided outside `target.rs`/`reconciler.rs`:\n  {}\n\
+         Add a classifier method to `SessionEvent` (one exhaustive match, in one place) and ask \
+         it here instead. A sixth variant must be a compile error once, not silently inherit a \
+         group at every site that forgot it.",
+        offenders.join("\n  ")
+    );
+}
+
+/// The same rule for [`crate::coverage::Coverage`]: whether a start engages, hands over or releases the transient
+/// cover is decided once, by `Coverage::plan`, and a call site that matched a `Coverage` variant would make its
+/// own decision (the resolve-failure warning did, and was false under a standing cover).
+#[skuld::test]
+fn coverage_policy_lives_on_the_type_not_at_call_sites() {
+    let offenders = decisions_outside(&["coverage.rs"], "Coverage::");
+    assert!(
+        offenders.is_empty(),
+        "per-variant Coverage policy decided outside `coverage.rs`:\n  {}\n\
+         Ask `Coverage::plan` instead.",
+        offenders.join("\n  ")
+    );
+}
+
+/// Every non-test line of `crates/bridge/src` that names `token` and decides from it ([`line_decides`]), outside
+/// the `sanctioned` files (paths relative to `src/`).
+fn decisions_outside(sanctioned: &[&str], token: &str) -> Vec<String> {
+    let scan_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders: Vec<String> = Vec::new();
 
-    for entry in walkdir::WalkDir::new(&src_root) {
+    for entry in walkdir::WalkDir::new(&scan_root) {
         let entry = entry.expect("failed to walk crates/bridge/src");
         let path = entry.path();
         if !entry.file_type().is_file() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
@@ -867,20 +893,12 @@ fn session_event_policy_lives_on_the_type_not_at_call_sites() {
         }
         let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
         for (idx, line) in code_lines(&text) {
-            if line.contains("SessionEvent::") && line_decides(line) {
+            if line.contains(token) && line_decides(line) {
                 offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
             }
         }
     }
-
-    assert!(
-        offenders.is_empty(),
-        "per-variant SessionEvent policy decided outside `target.rs`/`reconciler.rs`:\n  {}\n\
-         Add a classifier method to `SessionEvent` (one exhaustive match, in one place) and ask \
-         it here instead. A sixth variant must be a compile error once, not silently inherit a \
-         group at every site that forgot it.",
-        offenders.join("\n  ")
-    );
+    offenders
 }
 
 /// The same defect shape as [`session_event_policy_lives_on_the_type_not_at_call_sites`],

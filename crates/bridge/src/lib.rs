@@ -1,4 +1,5 @@
 pub mod boot;
+pub mod coverage;
 pub mod cutover;
 pub mod diagnostics;
 pub mod disable_record;

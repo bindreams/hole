@@ -271,7 +271,7 @@ before editing; the sections linked below are the authoritative source.
 - **Per-variant policy lives on the type, never at a call site** — a decision
   keyed to an enum variant belongs in ONE exhaustive match on that type
   (`SessionEvent::preserves_death_reason`, `CoverPresence::is_present`,
-  `StaleKeyPolicy::refuses_a_stale_key`), and
+  `StaleKeyPolicy::refuses_a_stale_key`, `Coverage::plan`), and
   two variants are never grouped because they happen to share a consequence.
   Grouping by consequence is what let `ProcessExiting` inherit an answer chosen
   for a cutover; re-deriving the rule at each site is what let `== Live` drop
@@ -280,7 +280,8 @@ before editing; the sections linked below are the authoritative source.
   violated at a call site far away — so it is test-enforced
   (`session_event_policy_lives_on_the_type_not_at_call_sites`,
   `cover_presence_is_never_compared_against_a_variant`,
-  `stale_key_policy_lives_on_the_type_not_at_call_sites`). Prefer removing the
+  `stale_key_policy_lives_on_the_type_not_at_call_sites`,
+  `coverage_policy_lives_on_the_type_not_at_call_sites`). Prefer removing the
   hazard outright over guarding it: `CoverGuard::disarm` had a "call only
   before process exit" precondition that no test could enforce, and closing the
   handle it leaked deleted the rule instead of policing it.
