@@ -19,13 +19,13 @@ fn plan_engages_only_a_covered_start_with_no_standing_cover() {
 }
 
 #[skuld::test]
-fn only_an_engage_plan_needs_the_transient_cover() {
+fn only_a_fail_open_plan_expects_no_cover() {
     let table = [
         (CoverPlan::Engage { unblock_snapshot: 0 }, true),
-        (CoverPlan::HandToLockdown, false),
+        (CoverPlan::HandToLockdown, true),
         (CoverPlan::FailOpen, false),
     ];
     for (plan, expected) in table {
-        assert_eq!(plan.needs_transient_cover(), expected, "{plan:?}");
+        assert_eq!(plan.expects_cover(), expected, "{plan:?}");
     }
 }

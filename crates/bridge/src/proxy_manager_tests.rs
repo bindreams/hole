@@ -770,6 +770,16 @@ pub(crate) fn covered_now<P: Proxy, R: Routing, D: Dns>(pm: &ProxyManager<P, R, 
     }
 }
 
+/// A DoH bootstrap querier that never answers, so a resolve fails with no network.
+struct NeverQuerier;
+
+#[async_trait::async_trait]
+impl crate::dns::bootstrap::DohQuerier for NeverQuerier {
+    async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, crate::dns::forwarder::UpstreamCause> {
+        Err(crate::dns::forwarder::UpstreamCause::Unreachable)
+    }
+}
+
 /// Current-thread, unlike `rt()`: `tokio::time::pause()` panics on a
 /// multi-thread runtime. For tests that drive the DNS self-test gate against
 /// a closed/black-holed real socket, where the gate's own bound is seconds,
@@ -2193,15 +2203,6 @@ fn build_config_failure_sets_last_error() {
 
 #[skuld::test]
 fn doh_bootstrap_failure_sets_last_error() {
-    use crate::dns::bootstrap::DohQuerier;
-    use crate::dns::forwarder::UpstreamCause;
-    struct NeverQuerier;
-    #[async_trait::async_trait]
-    impl DohQuerier for NeverQuerier {
-        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            Err(UpstreamCause::Unreachable)
-        }
-    }
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
@@ -2219,61 +2220,55 @@ fn doh_bootstrap_failure_sets_last_error() {
     });
 }
 
-/// A covered start that cannot resolve the server warns the host is not blocked only when no standing cover
-/// holds it: with the kill switch on, the standing cover already blocks the host, so that warning would be false.
+/// A covered start that cannot resolve the server warns the host is not blocked exactly when no cover holds it.
+/// Who holds the host is the OS probe's answer, not the kill-switch intent: intent On with nothing engaged (the
+/// standing cover arrives only at `routing.install`, which a failed resolve never reaches) leaves the host open.
 #[skuld::test]
-fn a_covered_start_that_cannot_resolve_warns_unblocked_only_without_a_standing_cover() {
-    use crate::dns::bootstrap::DohQuerier;
-    use crate::dns::forwarder::UpstreamCause;
+fn a_covered_start_that_cannot_resolve_warns_unblocked_exactly_when_nothing_holds_the_host() {
     use crate::test_support::log_capture::VecWriter;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
+    use tun_engine::routing::CoverPresence;
 
-    struct NeverQuerier;
-    #[async_trait::async_trait]
-    impl DohQuerier for NeverQuerier {
-        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            Err(UpstreamCause::Unreachable)
-        }
-    }
+    for (intent_on, presence, expect_warning) in [
+        (false, CoverPresence::Absent, true),
+        (true, CoverPresence::Absent, true),
+        (true, CoverPresence::Live, false),
+        (false, CoverPresence::Live, false),
+    ] {
+        current_thread_rt().block_on(async {
+            let writer = VecWriter::new();
+            let subscriber = tracing_subscriber::registry().with(
+                fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            );
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-    for (lockdown, expect_warning) in [(false, true), (true, false)] {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let writer = VecWriter::new();
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            *routing.state.cover_presence.lock().unwrap() = presence;
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, intent_on);
+            pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+            let mut config = test_config();
+            // RFC 2606 reserves .invalid for guaranteed non-resolution.
+            config.server.server = "test.invalid".into();
 
-                let dir = tempfile::tempdir().unwrap();
-                let routing = MockRouting::new(dir.path().to_path_buf());
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
-                pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
-                let mut config = test_config();
-                // RFC 2606 reserves .invalid for guaranteed non-resolution.
-                config.server.server = "test.invalid".into();
+            let err = pm
+                .start_cancellable(&config, covered_now(&pm), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::DohBootstrap(_)), "{err:?}");
 
-                let err = pm
-                    .start_cancellable(&config, covered_now(&pm), CancellationToken::new())
-                    .await
-                    .unwrap_err();
-                assert!(matches!(err, ProxyError::DohBootstrap(_)), "{err:?}");
-
-                let output = writer.snapshot_string();
-                assert_eq!(
-                    output.contains("host NOT blocked"),
-                    expect_warning,
-                    "lockdown={lockdown}: the unblocked warning must appear exactly when no standing cover holds the host; got:
+            let output = writer.snapshot_string();
+            assert_eq!(
+                output.contains("host NOT blocked"),
+                expect_warning,
+                "intent_on={intent_on} presence={presence:?}: the unblocked warning must appear exactly when no cover holds the host; got:
 {output}"
-                );
-            });
+            );
+        });
     }
 }
 
@@ -3203,14 +3198,6 @@ fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
 fn full_start_fails_closed_when_doh_cannot_resolve() {
     // A stub that never answers → Unreachable → DohBootstrap, hermetic (no
     // system DNS or network).
-    use crate::dns::forwarder::UpstreamCause;
-    struct NeverQuerier;
-    #[async_trait::async_trait]
-    impl DohQuerier for NeverQuerier {
-        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            Err(UpstreamCause::Unreachable)
-        }
-    }
     rt().block_on(async {
         let (mut pm, rstate, _dir) = new_manager_capturing(MockProxy::new());
         pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
