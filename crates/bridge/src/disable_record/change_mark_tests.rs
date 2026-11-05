@@ -91,26 +91,52 @@ fn a_value_that_is_not_a_mark_names_no_holder() {
     ScratchChangeKey::assert_at_rest(&key.get_string(VALUE).expect("replaced"), 1, &Stamp::current());
 }
 
-/// A value of the wrong type is read as an empty mark, and says so, as every
-/// other failed read of the mark does.
-#[skuld::test]
-fn a_value_of_the_wrong_type_is_read_as_empty_and_warned_about() {
+/// What `body` logs, with the subscriber installed on this thread only.
+fn logged(body: impl FnOnce()) -> String {
     use garter::test_utils::WaitableWriter;
     use garter::tracing_test::set_default_in_current_thread;
 
-    let (scratch, key) = ScratchChangeKey::created("wrong-type");
-    key.set_u32(VALUE, 7).expect("write");
     let writer = WaitableWriter::new();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer.clone())
         .with_ansi(false)
         .finish();
-    let mark = {
+    {
         let _guard = set_default_in_current_thread(subscriber);
-        scratch.mark().read()
-    };
-    assert_eq!(mark, ChangeMark::new(Some(String::new()), None));
-    assert!(writer.snapshot().contains("WARN"), "{:?}", writer.snapshot());
+        body();
+    }
+    writer.snapshot()
+}
+
+/// A stored value whose count does not parse restarts the count, and says so
+/// without quoting the value; a missing value is the first change, not an error.
+#[skuld::test]
+fn an_unreadable_stored_mark_warns_and_a_missing_one_is_silent() {
+    let (scratch, key) = ScratchChangeKey::created("unreadable-warns");
+    key.set_string(VALUE, "secret-text").expect("write");
+    let log = logged(|| scratch.mark().begin(&Stamp::current()).expect("begin"));
+    assert!(log.contains("WARN"), "{log:?}");
+    assert!(!log.contains("secret-text"), "{log:?}");
+    assert!(
+        key.get_string(VALUE).expect("the value").starts_with("1:"),
+        "the count restarted"
+    );
+
+    let (scratch, _key) = ScratchChangeKey::created("missing-silent");
+    let log = logged(|| scratch.mark().begin(&Stamp::current()).expect("begin"));
+    assert!(!log.contains("WARN"), "{log:?}");
+}
+
+/// A value of the wrong type is read as an empty mark, and says so, as every
+/// other failed read of the mark does.
+#[skuld::test]
+fn a_value_of_the_wrong_type_is_read_as_empty_and_warned_about() {
+    let (scratch, key) = ScratchChangeKey::created("wrong-type");
+    key.set_u32(VALUE, 7).expect("write");
+    let mut mark = None;
+    let log = logged(|| mark = Some(scratch.mark().read()));
+    assert_eq!(mark, Some(ChangeMark::new(Some(String::new()), None)));
+    assert!(log.contains("WARN"), "{log:?}");
 }
 
 /// No key is no service: nothing to mark, and a key made here would outlive it.
@@ -124,8 +150,7 @@ fn a_mark_with_no_key_is_neither_written_nor_an_error() {
     assert_eq!(mark.read(), ChangeMark::new(None, None));
 }
 
-/// The count continues from an at-rest value of either format: the bare count
-/// an earlier build left and the one a change ends with now.
+/// Old bare `<n>` and new `<n>/<stamp>/<seq>` at rest both seed the next count.
 #[skuld::test]
 fn the_count_goes_on_from_an_at_rest_value_of_either_format() {
     let (scratch, key) = ScratchChangeKey::created("counts-on");
@@ -140,6 +165,36 @@ fn the_count_goes_on_from_an_at_rest_value_of_either_format() {
             "{at_rest:?}"
         );
     }
+}
+
+/// A bare `<n>` at rest, as earlier builds wrote it, names no holder and never
+/// equals what a change that ends at the same count writes now.
+#[skuld::test]
+fn a_bare_count_at_rest_never_equals_the_mark_a_change_ends_with_now() {
+    let (old, old_key) = ScratchChangeKey::created("bare-at-rest");
+    old_key.set_string(VALUE, "2").expect("write");
+    let bare = old.mark().read();
+    assert_eq!(bare.holder(), None);
+
+    let (new, _key) = ScratchChangeKey::created("ended-at-two");
+    let mark = new.mark();
+    mark.begin(&Stamp::current()).expect("begin");
+    mark.end(&Stamp::current()).expect("end");
+    let ended = mark.read();
+    ScratchChangeKey::assert_at_rest(&new.stored(), 2, &Stamp::current());
+    assert_ne!(bare, ended);
+}
+
+/// At the same count and `seq`, two holders that differ in only one field of
+/// their stamp leave different values: two processes each start `seq` at 0.
+#[skuld::test]
+fn at_rest_values_of_the_same_count_and_seq_differ_by_stamp() {
+    let base = Stamp { pid: 4, created: 40 };
+    let other_pid = Stamp { pid: 5, created: 40 };
+    let other_created = Stamp { pid: 4, created: 41 };
+    let value = at_rest(2, &base, 0);
+    assert_ne!(value, at_rest(2, &other_pid, 0));
+    assert_ne!(value, at_rest(2, &other_created, 0));
 }
 
 /// Two installs that each end on a key of their own end at the same count; the
@@ -179,10 +234,8 @@ fn one_process_ending_two_changes_on_fresh_keys_at_the_same_count_leaves_two_mar
     assert_ne!(at_rest[0], at_rest[1]);
 }
 
-/// A status reader over the real mark in a scratch key, whose service is
-/// reinstalled by another process right after its first read of the start type:
-/// the old key is deleted and a new one made, and the new service has a start
-/// type and no record yet.
+/// A status reader whose service is reinstalled (key deleted and recreated)
+/// right after its first start-type read.
 struct Reinstalled<'a> {
     scratch: &'a ScratchChangeKey,
     mark: ChangeKey,
@@ -220,9 +273,8 @@ impl StartRead for Reinstalled<'_> {
     }
 }
 
-/// The service's key is deleted and made again by a reinstall, and both
-/// installs end at the same count: a read that took the equal marks for no
-/// change would call the service disabled by an administrator.
+/// Equal counts across a reinstall must not read as no change: that would
+/// report the service as disabled by an administrator.
 #[skuld::test]
 fn a_status_read_that_a_reinstall_straddles_reads_again() {
     let (scratch, key) = ScratchChangeKey::created("reinstall-straddle");

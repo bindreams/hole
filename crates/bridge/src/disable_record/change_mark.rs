@@ -8,19 +8,16 @@
 //!
 //! The value is `<n>/<pid>:<created>/<seq>` while no change runs and
 //! `<n>:<pid>:<created>` while a holder changes the service, `n` counting every
-//! transition and the rest being a [`Stamp`]: the holder's while it changes the
-//! service, the one that ended the last change at rest, and `seq` counting the
-//! changes this process has ended. The holder's stamp is
+//! transition and `<pid>:<created>` being a [`Stamp`]: the holder's while it
+//! changes the service, the ending holder's at rest. The holder's stamp is
 //! what keeps one that crashed from reading as a change for ever: the reader
 //! asks whether its process runs, as it does for the record. The holder writes
 //! it under the lock, after taking it and before its first read, and writes the
 //! at-rest value after its last write and before letting go, so no change runs
 //! while the mark says none does. A reinstall deletes the key and the count with
-//! it, so the count alone repeats; the at-rest value is unique per ended change
-//! because it adds the ending holder's stamp, which names one process, and the
-//! per-process `seq`, which tells apart two changes that process ends at the
-//! same count. A bare `<n>`, which earlier builds wrote at rest, equals no value
-//! written now.
+//! it, so the count alone repeats; the at-rest value adds the ending holder's
+//! stamp (one process) and a per-process `seq` (two changes that process ends
+//! at the same count).
 //! The mark sits in the service's key, which an unprivileged user can read and
 //! no user can write.
 
@@ -99,7 +96,7 @@ impl ChangeKey {
     /// (the service was deleted).
     pub fn end(&self, holder: &Stamp) -> io::Result<()> {
         let seq = ENDED.fetch_add(1, Ordering::Relaxed);
-        self.write(|n| format!("{n}/{}/{seq}", holder.encode()))
+        self.write(|n| at_rest(n, holder, seq))
     }
 
     /// Writes the value for transition number `previous + 1`.
@@ -134,10 +131,21 @@ impl ChangeKey {
     }
 }
 
-/// The count `value` starts with; 0 for a value that is not one.
+/// The value of change number `count` ended by `holder` as its `seq`th.
+fn at_rest(count: u64, holder: &Stamp, seq: u64) -> String {
+    format!("{count}/{}/{seq}", holder.encode())
+}
+
+/// The count `value` starts with; 0 for a value that is not one, which warns
+/// unless the value is empty (no mark yet).
 fn counted(value: &str) -> u64 {
     let count = value.split([':', '/']).next().unwrap_or_default();
-    count.parse().unwrap_or(0)
+    count.parse().unwrap_or_else(|_| {
+        if !value.is_empty() {
+            warn!("the service's change mark is unreadable; its count restarts");
+        }
+        0
+    })
 }
 
 /// The holder a value names, if it names one.
@@ -188,15 +196,13 @@ pub(crate) mod scratch {
             CURRENT_USER.create(&self.path).expect("create the scratch key again")
         }
 
-        /// The mark's value as stored.
         pub(crate) fn stored(&self) -> String {
             let key = CURRENT_USER.open(&self.path).expect("open the scratch key");
             key.get_string(super::VALUE).expect("the stored mark")
         }
 
-        /// `value` is the at-rest value of change number `count` ended by `holder`:
-        /// `<count>/<stamp>/<seq>`, with a `seq` that depends on what else the
-        /// process has ended.
+        /// `seq` depends on what else this process has ended, so it is only
+        /// checked to be a number.
         pub(crate) fn assert_at_rest(value: &str, count: u64, holder: &Stamp) {
             let prefix = format!("{count}/{}/", holder.encode());
             let seq = value.strip_prefix(&prefix);
