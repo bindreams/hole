@@ -96,6 +96,21 @@ impl std::fmt::Display for LeftAsItIs {
 
 impl std::error::Error for LeftAsItIs {}
 
+/// A writer that removes or keeps what it finds reports a file it left in place as [`LeftAsItIs`]; no file there is
+/// nothing left.
+fn left_as_it_is_unless_nothing_was_there(outcome: util::versioned_file::UpdateOutcome, dir: &Path) -> io::Result<()> {
+    use util::versioned_file::UpdateOutcome;
+    match outcome {
+        UpdateOutcome::Removed | UpdateOutcome::Stored | UpdateOutcome::Absent | UpdateOutcome::MovedAside(_) => Ok(()),
+        UpdateOutcome::Kept | UpdateOutcome::Unchanged => {
+            match dir.join(crate::plugin_state::STATE_FILE_NAME).symlink_metadata() {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                _ => Err(io::Error::other(LeftAsItIs)),
+            }
+        }
+    }
+}
+
 /// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's, a
 /// versioned file's decision to leave a file it cannot read as it is, or the update marker's refusal to stamp one.
 fn is_a_refusal(err: &io::Error) -> bool {
@@ -368,14 +383,26 @@ fn writers() -> Vec<Writer> {
             run: |dir, owner| crate::plugin_state::append_record(dir, plugin_record(), owner).map_err(io::Error::other),
         },
         Writer {
-            name: "the plugin state, cleared",
+            name: "the plugin state, reaped",
             sources: &[],
             names: &[crate::plugin_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match crate::plugin_state::clear(dir).map_err(io::Error::other)? {
-                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
-                _ => Ok(()),
+            run: |dir, _| {
+                let outcome =
+                    crate::plugin_state::remove_accounted(dir, &[plugin_record()]).map_err(io::Error::other)?;
+                left_as_it_is_unless_nothing_was_there(outcome, dir)
+            },
+        },
+        Writer {
+            name: "the plugin state, cleared when obsolete",
+            sources: &[],
+            names: &[crate::plugin_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, _| {
+                let outcome = crate::plugin_state::clear_obsolete(dir).map_err(io::Error::other)?;
+                left_as_it_is_unless_nothing_was_there(outcome, dir)
             },
         },
         Writer {
