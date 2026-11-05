@@ -282,6 +282,10 @@ pub(crate) fn snapshot(state_dir: &Path) -> Snapshot {
 /// Apply a sweep's [`WitnessUpdate`], decided against the record as it is NOW and the generation as it was at
 /// `since`; the read and the write are one `update`, so nothing in this process writes between them.
 pub(crate) fn apply(state_dir: &Path, since: Snapshot, update: WitnessUpdate, owner: Option<(u32, u32)>) {
+    // `Leave` writes nothing for any record, so it must not even open the directory (a failed open moves the generation).
+    if update == WitnessUpdate::Leave {
+        return;
+    }
     let mut decided = None;
     let written = file(state_dir).update(&DefaultPlacement { owner }, |now| {
         match next_record(arming_of(&now.loaded), update, now.generation != since.generation) {

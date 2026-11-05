@@ -513,7 +513,7 @@ fn an_engage_during_an_arming_sweep_changes_nothing() {
 
 #[skuld::test]
 fn a_concurrent_sweeps_arm_also_drops_a_disarm_taken_from_an_older_snapshot() {
-    // Spec rule 3: the veto is any write of this process, not only an engage's. Sweep B arms over a record A read
+    // The veto is any write of this process, not only an engage's. Sweep B arms over a record A read
     // as unreadable; A's later `Disarm` speaks for the twins A deleted, not for the one B just found.
     let state = dir();
     std::fs::write(state.path().join(super::STATE_FILE_NAME), b"{ not json").expect("write");
@@ -562,6 +562,49 @@ fn an_engage_whose_directory_open_fails_still_drops_the_disarm() {
         ArmingWitness::Armed,
         "the engage's failed open moved the generation, so the stale Disarm is dropped"
     );
+}
+
+#[skuld::test]
+fn a_sweep_that_leaves_the_record_does_no_i_o() {
+    // `Leave` says nothing about the record, so applying it must not open the directory: an open that fails would move
+    // the generation (vetoing a concurrent sweep's `Disarm`) and warn about a write nobody asked for.
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+
+    let root = dir();
+    let state = root.path().join("state");
+    std::fs::create_dir(&state).expect("state dir");
+    super::record_armed(&state, None);
+    let since = super::snapshot(&state);
+    let generation = since.generation;
+
+    let aside = root.path().join("aside");
+    std::fs::rename(&state, &aside).expect("move the state dir aside");
+    let link = util::dir::testing::state_dir_linked_to_a_system_folder(root.path());
+    assert_eq!(link, state, "guard: the link sits at the state dir's path");
+
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::apply(&state, since, WitnessUpdate::Leave, None);
+    }
+    let logs = writer.snapshot();
+
+    std::fs::remove_dir_all(&link).expect("remove the link");
+    std::fs::rename(&aside, &state).expect("put the state dir back");
+
+    assert_eq!(
+        super::snapshot(&state).generation,
+        generation,
+        "Leave is not a write attempt"
+    );
+    assert!(logs.is_empty(), "Leave warned about a write nobody asked for: {logs}");
 }
 
 #[skuld::test]
