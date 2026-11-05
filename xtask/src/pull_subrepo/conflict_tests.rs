@@ -16,22 +16,22 @@ fn allowlisted_conflict_auto_resolves_to_upstream() {
     let fx = Fixture::build(ConflictKind::Allowlisted);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
         go_mod.contains("newdep"),
-        "upstream's go.mod content should win: {go_mod}"
+        "upstream's go.mod content should win: {go_mod}\n{clean:?}"
     );
     assert!(
         !go_mod.contains("patchdep"),
-        "our spurious downstream-only require should not survive: {go_mod}"
+        "our spurious downstream-only require should not survive: {go_mod}\n{clean:?}"
     );
 
     let go_sum = std::fs::read_to_string(fx.downstream.join("vendor/go.sum")).unwrap();
     assert!(
         go_sum.contains("v2.0.0"),
-        "upstream's go.sum content should win: {go_sum}"
+        "upstream's go.sum content should win: {go_sum}\n{clean:?}"
     );
 
     // `git subrepo commit` (the finishing command on the conflict-resolve
@@ -42,7 +42,7 @@ fn allowlisted_conflict_auto_resolves_to_upstream() {
     let gitrepo = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
     assert!(
         gitrepo.contains("branch = v2"),
-        "the branch pin must be updated even on the conflict-resolve path: {gitrepo}"
+        "the branch pin must be updated even on the conflict-resolve path: {gitrepo}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -121,12 +121,12 @@ fn allowlisted_go_mod_conflict_auto_resolves_when_upstream_already_carries_the_s
     let fx = Fixture::build(ConflictKind::AllowlistedWithMatchingReplace);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
         go_mod.contains("newdep") && go_mod.contains("loadbearing"),
-        "upstream's go.mod (which already carries our replace directive) should win: {go_mod}"
+        "upstream's go.mod (which already carries our replace directive) should win: {go_mod}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -138,10 +138,10 @@ fn allowlisted_delete_conflict_removes_the_file_instead_of_erroring() {
     let fx = Fixture::build(ConflictKind::AllowlistedDelete);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
     assert!(
         !fx.downstream.join("vendor/go.sum").exists(),
-        "go.sum should be removed, matching upstream's deletion"
+        "go.sum should be removed, matching upstream's deletion\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -211,12 +211,12 @@ fn go_mod_conflict_resolves_to_upstream_when_downstream_deleted_it() {
     let fx = Fixture::build(ConflictKind::DownstreamDeletesGoMod);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
         go_mod.contains("newdep"),
-        "upstream's go.mod should be resurrected: {go_mod}"
+        "upstream's go.mod should be resurrected: {go_mod}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -229,12 +229,12 @@ fn allowlisted_workflow_conflict_auto_resolves_to_upstream() {
     let fx = Fixture::build(ConflictKind::AllowlistedWorkflow);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let workflow = std::fs::read_to_string(fx.downstream.join("vendor/.github/workflows/ci.yml")).unwrap();
     assert!(
         workflow.contains("upstream-changed"),
-        "upstream's workflow content should win: {workflow}"
+        "upstream's workflow content should win: {workflow}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -248,16 +248,16 @@ fn glob_metacharacter_filename_conflict_resolves_without_touching_the_sibling() 
     let fx = Fixture::build(ConflictKind::AllowlistedGlobMetacharacterFilename);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     assert!(
         !fx.downstream.join("vendor/.github/workflows/x[1].yml").exists(),
-        "x[1].yml should be removed, matching upstream's deletion"
+        "x[1].yml should be removed, matching upstream's deletion\n{clean:?}"
     );
     let sibling = std::fs::read_to_string(fx.downstream.join("vendor/.github/workflows/x1.yml")).unwrap();
     assert_eq!(
         sibling, "sibling, do not touch\n",
-        "the unrelated sibling x1.yml must survive untouched: {sibling}"
+        "the unrelated sibling x1.yml must survive untouched: {sibling}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -268,12 +268,12 @@ fn non_ascii_workflow_filename_conflict_auto_resolves_to_upstream() {
     let fx = Fixture::build(ConflictKind::AllowlistedWorkflowNonAscii);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let workflow = std::fs::read_to_string(fx.downstream.join("vendor/.github/workflows/café.yml")).unwrap();
     assert_eq!(
         workflow, "upstream-changed\n",
-        "upstream's non-ASCII-named workflow content should win: {workflow}"
+        "upstream's non-ASCII-named workflow content should win: {workflow}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -287,12 +287,12 @@ fn go_sum_conflict_auto_resolves_when_go_mod_never_conflicted_and_already_matche
     let fx = Fixture::build(ConflictKind::GoSumConflictsAloneWithMatchingGoMod);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_sum = std::fs::read_to_string(fx.downstream.join("vendor/go.sum")).unwrap();
     assert!(
         go_sum.contains("v2.0.0"),
-        "upstream's go.sum content should win: {go_sum}"
+        "upstream's go.sum content should win: {go_sum}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -308,17 +308,17 @@ fn go_mod_matching_upstream_via_a_clean_merge_does_not_falsely_flag_an_untouched
     let fx = Fixture::build(ConflictKind::UpstreamOnlyGoModChangeWithConflictingWorkflow);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
         go_mod.contains("newdep"),
-        "go.mod should merge cleanly to upstream's content: {go_mod}"
+        "go.mod should merge cleanly to upstream's content: {go_mod}\n{clean:?}"
     );
     let workflow = std::fs::read_to_string(fx.downstream.join("vendor/.github/workflows/ci.yml")).unwrap();
     assert!(
         workflow.contains("upstream-changed"),
-        "the real workflow conflict should auto-resolve to upstream: {workflow}"
+        "the real workflow conflict should auto-resolve to upstream: {workflow}\n{clean:?}"
     );
     // The one observable that distinguishes "the safety net correctly
     // stayed silent" from "it wrongly fired": go.sum here is untouched by
@@ -327,7 +327,7 @@ fn go_mod_matching_upstream_via_a_clean_merge_does_not_falsely_flag_an_untouched
     let go_sum = std::fs::read_to_string(fx.downstream.join("vendor/go.sum")).unwrap();
     assert_eq!(
         go_sum, "fixture v1.0.0-patched h1:def=\n",
-        "go.sum must be untouched — the safety net must not have fired: {go_sum}"
+        "go.sum must be untouched — the safety net must not have fired: {go_sum}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -338,12 +338,12 @@ fn go_mod_conflict_auto_resolves_and_silently_realigns_a_now_stale_go_sum() {
     let fx = Fixture::build(ConflictKind::GoModConflictsAloneLeavingGoSumStale);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
         go_mod.contains("newdep"),
-        "go.mod should auto-resolve to upstream: {go_mod}"
+        "go.mod should auto-resolve to upstream: {go_mod}\n{clean:?}"
     );
     // This fixture's upstream only bumps go.mod (v2 leaves go.sum
     // unchanged from v1), so upstream's own go.sum is v1's content —
@@ -351,7 +351,7 @@ fn go_mod_conflict_auto_resolves_and_silently_realigns_a_now_stale_go_sum() {
     let go_sum = std::fs::read_to_string(fx.downstream.join("vendor/go.sum")).unwrap();
     assert_eq!(
         go_sum, "fixture v1.0.0 h1:abc=\n",
-        "the now-stale go.sum should be silently realigned to upstream's (unchanged) content: {go_sum}"
+        "the now-stale go.sum should be silently realigned to upstream's (unchanged) content: {go_sum}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -365,16 +365,16 @@ fn go_mod_conflict_auto_resolves_and_removes_a_go_sum_upstream_never_shipped() {
     let fx = Fixture::build(ConflictKind::GoModConflictsAloneWithGoSumNeverUpstream);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
         go_mod.contains("newdep"),
-        "go.mod should auto-resolve to upstream: {go_mod}"
+        "go.mod should auto-resolve to upstream: {go_mod}\n{clean:?}"
     );
     assert!(
         !fx.downstream.join("vendor/go.sum").exists(),
-        "go.sum should be removed, matching upstream never having shipped one"
+        "go.sum should be removed, matching upstream never having shipped one\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -388,17 +388,17 @@ fn go_mod_conflict_auto_resolves_and_resurrects_a_go_sum_downstream_deleted() {
     let fx = Fixture::build(ConflictKind::DownstreamDeletesGoSumWhileUpstreamKeepsIt);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
         go_mod.contains("newdep"),
-        "go.mod should auto-resolve to upstream: {go_mod}"
+        "go.mod should auto-resolve to upstream: {go_mod}\n{clean:?}"
     );
     let go_sum = std::fs::read_to_string(fx.downstream.join("vendor/go.sum")).unwrap();
     assert_eq!(
         go_sum, "fixture v1.0.0 h1:abc=\n",
-        "go.sum should be resurrected from upstream's (unchanged) content: {go_sum}"
+        "go.sum should be resurrected from upstream's (unchanged) content: {go_sum}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -411,16 +411,16 @@ fn go_mod_conflict_auto_resolves_when_go_sum_is_absent_on_both_sides() {
     let fx = Fixture::build(ConflictKind::GoModConflictsAloneWithGoSumAbsentEverywhere);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
     assert!(
         go_mod.contains("newdep"),
-        "go.mod should auto-resolve to upstream: {go_mod}"
+        "go.mod should auto-resolve to upstream: {go_mod}\n{clean:?}"
     );
     assert!(
         !fx.downstream.join("vendor/go.sum").exists(),
-        "go.sum should remain absent — it was never present on either side"
+        "go.sum should remain absent — it was never present on either side\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -532,10 +532,10 @@ fn allowlisted_conflict_resolves_from_a_linked_worktree() {
 
     let outcome = pull_subrepo::run(&worktree_path, "vendor", "v2")
         .expect("conflict resolution should succeed from a linked worktree");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let go_mod = std::fs::read_to_string(worktree_path.join("vendor/go.mod")).unwrap();
-    assert!(go_mod.contains("newdep"));
+    assert!(go_mod.contains("newdep"), "{go_mod}\n{clean:?}");
 }
 #[skuld::test]
 fn force_commit_conflicted_commits_the_conflicted_tree_and_fixes_the_branch_field() {
