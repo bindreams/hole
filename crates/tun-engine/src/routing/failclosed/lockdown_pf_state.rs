@@ -34,11 +34,11 @@ pub struct LockdownPfState {
     ///
     /// Defaults `true` (NO schema bump) so a file written before this field
     /// existed reads as the captured baseline it was. Bumping the schema
-    /// version instead would make every existing file `Unusable`, which
-    /// [`load`] collapses to `None`, which makes `disengage_lockdown`
-    /// early-return `Ok(())` over a still-blocked host — silently breaking
-    /// `hole bridge unlock` and the tray's Unblock item on the ordinary macOS
-    /// upgrade path.
+    /// version instead would make every existing file `Unusable`, which a
+    /// reader that took it for an absent record would answer with an early
+    /// `Ok(())` from `disengage_lockdown` over a still-blocked host — silently
+    /// breaking `hole bridge unlock` and the tray's Unblock item on the
+    /// ordinary macOS upgrade path.
     #[serde(default = "default_true")]
     pub main_snapshot_captured: bool,
 }

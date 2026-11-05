@@ -255,7 +255,7 @@ pub(crate) enum FatalPhase {
     /// macOS pf cover engage. Runs through [`run_capturing`], not a route-command
     /// runner (Windows engages via FWPM FFI — no subprocess phase); gated so it is
     /// not dead code on a non-test Windows lib build under `-D warnings`.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     CoverEngage,
 }
 
@@ -274,7 +274,7 @@ pub(crate) enum BestEffortPhase {
     RecoverSplit,
     RecoverBypass,
     /// macOS-only, for the same reason as [`FatalPhase::CoverEngage`].
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     RecoverCover,
 }
 
@@ -285,7 +285,7 @@ impl Phase for FatalPhase {
     fn name(self) -> &'static str {
         match self {
             Self::Setup => "setup",
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", test))]
             Self::CoverEngage => "cover-engage",
         }
     }
@@ -300,7 +300,7 @@ impl Phase for BestEffortPhase {
             Self::Teardown => "teardown",
             Self::RecoverSplit => "recover-split",
             Self::RecoverBypass => "recover-bypass",
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", test))]
             Self::RecoverCover => "recover-cover",
         }
     }
