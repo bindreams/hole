@@ -208,10 +208,11 @@ pub(crate) fn record_armed(state_dir: &Path, owner: Option<(u32, u32)>) {
 /// bridge armed a twin under a different `state_dir`. Reproducing it needs a
 /// peer dir with an armed record and no other evidence at all — which is
 /// exactly the state a Windows `engage_lockdown` leaves and nothing else does.
+/// `owner` is passed through to the write, so a writer-table row can supply one.
 /// Behind `test-utils`, so no production build can reach it.
 #[cfg(feature = "test-utils")]
-pub fn record_armed_for_test(state_dir: &Path) {
-    record_armed(state_dir, None);
+pub fn record_armed_for_test(state_dir: &Path, owner: Option<(u32, u32)>) {
+    record_armed(state_dir, owner);
 }
 
 /// What a sweep's own observations say the record should now hold.
