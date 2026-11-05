@@ -8,10 +8,17 @@ use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 /// How many writes this process has made to one path through `update`: equal values mean no write in between. A
 /// `create_new` does not move it (a claim is made across processes and nothing compares its generation).
 ///
-/// Per path, process-wide, and moved by every write attempt (a write, a remove, a move aside), under the path's
-/// lock and before the attempt, so one that fails still moves it.
+/// Per path, process-wide, and moved once by every `update` that is not a `Keep` or that fails to open the
+/// directory, under the path's lock and before any I/O, so an attempt that is refused or fails still moves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Generation(u64);
+
+impl Generation {
+    /// The generation right after one write of this process.
+    pub fn next(self) -> Generation {
+        Generation(self.0 + 1)
+    }
+}
 
 struct Slot {
     generation: Mutex<u64>,
@@ -46,7 +53,7 @@ impl Held {
         Generation(*self.guard)
     }
 
-    /// Called before every write attempt.
+    /// Called by `update` only, once per attempt.
     pub(super) fn bump(&mut self) {
         *self.guard += 1;
     }

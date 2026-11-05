@@ -50,6 +50,7 @@ fn root_is_the_system_and_every_other_uid_a_user() {
         dev: 1,
         ino: 1,
         uid,
+        gid: 0,
         mode: 0,
     };
 
@@ -488,6 +489,28 @@ fn a_symlink_below_a_directory_the_caller_can_only_search_is_followed_by_the_sam
     as_unprivileged(tmp.path(), || {
         assert!(Dir::open(&guarded.join("link"), false, None).is_ok());
         assert_eq!(refusal(Dir::open(&guarded.join("etc"), false, None)), Refusal::Symlink);
+    });
+}
+
+// owner_of ------------------------------------------------------------------------------------------------------------
+
+/// A name inside a directory the caller cannot search cannot be examined: the error is the answer, not `None`.
+#[skuld::test]
+fn owner_of_fails_for_a_name_it_cannot_examine() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("f"), b"x").unwrap();
+    let _restore = Restore(tmp.path().to_path_buf(), 0o755);
+
+    as_unprivileged(tmp.path(), || {
+        let dir = Dir::open(tmp.path(), false, None).unwrap();
+        // Through the held handle: the directory is no longer searchable, and the handle is still open.
+        dir.file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+
+        let err = dir.owner_of("f".as_ref()).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err:?}");
     });
 }
 
