@@ -3860,6 +3860,30 @@ mod self_test {
     }
 
     #[skuld::test]
+    fn a_start_cancelled_by_an_unblock_in_flight_drops_the_cover_an_earlier_start_held() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected(), "the failed covered start holds its cover");
+            let _release = tun_engine::routing::failclosed::begin_release(dir.path());
+
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert!(
+                !pm.blocked_until_connected(),
+                "a cancelled start releases the cover, as every other cancelled exit does"
+            );
+            assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[skuld::test]
     fn an_unblock_that_ended_before_the_start_began_does_not_cancel_it() {
         rt().block_on(async {
             let (mut pm, cfg, st, dir) = covered_gate_setup(false);

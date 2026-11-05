@@ -185,7 +185,7 @@ fn remove_accounted_over_an_absent_file_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(
         remove_accounted(dir.path(), &[synthetic(1, 1)]).unwrap(),
-        UpdateOutcome::Absent
+        UpdateOutcome::Unchanged
     );
     assert!(!state_path(dir.path()).exists());
 }
@@ -423,7 +423,7 @@ fn a_reap_keeps_a_record_it_cannot_read() {
 
         assert_eq!(
             remove_accounted(dir.path(), &[synthetic(1, 1)]).unwrap(),
-            UpdateOutcome::Kept,
+            UpdateOutcome::Unchanged,
             "{what}"
         );
         match bytes {
@@ -442,9 +442,29 @@ fn remove_accounted_leaves_a_file_it_cannot_read_alone() {
     plant_unreadable(dir.path());
     assert_eq!(
         remove_accounted(dir.path(), &[synthetic(1, 1)]).unwrap(),
-        UpdateOutcome::Kept
+        UpdateOutcome::Unchanged
     );
     assert!(state_path(dir.path()).exists());
+}
+
+#[skuld::test]
+fn a_reap_that_has_nothing_to_edit_does_not_move_the_generation() {
+    // An absent file and each unreadable one: the reap has no record to remove, so it writes nothing and a reader
+    // that compares generations sees no write.
+    let mut cases = vec![("absent", tempfile::tempdir().unwrap())];
+    for u in &UNREADABLE {
+        let dir = tempfile::tempdir().unwrap();
+        (u.plant)(dir.path());
+        cases.push((u.what, dir));
+    }
+    for (what, dir) in cases {
+        let dir = dir.path();
+        let before = file(dir).observe().generation;
+
+        remove_accounted(dir, &[synthetic(1, 1)]).unwrap();
+
+        assert_eq!(file(dir).observe().generation, before, "{what}");
+    }
 }
 
 #[skuld::test]
@@ -531,10 +551,22 @@ fn remove_accounted_says_why_it_removed_nothing_from_a_file_that_is_gone_or_unus
     });
     assert!(log.contains("DEBUG") && log.contains("no plugin state file"), "{log}");
 
-    let unusable = tempfile::tempdir().unwrap();
-    std::fs::write(state_path(unusable.path()), b"{not json").unwrap();
-    let log = captured(|| {
-        remove_accounted(unusable.path(), &[synthetic(1, 1)]).unwrap();
-    });
-    assert!(log.contains("DEBUG") && log.contains("unusable"), "{log}");
+    // Each unusable file gets its own warning, worded by what is wrong with it.
+    for (what, expected) in [
+        ("newer", "newer"),
+        ("corrupt", "corrupt"),
+        ("a failed read", "unreadable"),
+    ] {
+        let unusable = tempfile::tempdir().unwrap();
+        let case = UNREADABLE.iter().find(|u| u.what == what).unwrap();
+        (case.plant)(unusable.path());
+        let log = captured(|| {
+            remove_accounted(unusable.path(), &[synthetic(1, 1)]).unwrap();
+        });
+        assert!(
+            log.lines()
+                .any(|l| l.contains("WARN") && l.contains("nothing to remove") && l.contains(expected)),
+            "{what}: {log}"
+        );
+    }
 }

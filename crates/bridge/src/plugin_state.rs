@@ -92,13 +92,13 @@ pub fn load(state_dir: &Path) -> Loaded<PluginState> {
 ///
 /// The caller loaded the file earlier and settled those records (killed, gone, or unrestorable here); the file may
 /// have grown since, and what grew is not the caller's to touch. The rewrite keeps the file's owner and never
-/// chowns the directory. A record this release cannot read is kept ([`UpdateOutcome::Kept`]) and a missing one has
-/// nothing to remove ([`UpdateOutcome::Absent`]).
+/// chowns the directory. A file this release cannot read, or that is missing, has no record of the caller's to edit:
+/// nothing is written and the outcome is [`UpdateOutcome::Unchanged`]. A file that cannot be read is named in a warning.
 pub(crate) fn remove_accounted(
     state_dir: &Path,
     accounted: &[cosca::identity::ProcessIdRecord],
 ) -> Result<UpdateOutcome, StoreError> {
-    let outcome = file(state_dir)
+    file(state_dir)
         .update(&KeepOwner, |observed| match &observed.loaded {
             Loaded::Current { value, .. } => {
                 let mut state = value.clone();
@@ -111,20 +111,26 @@ pub(crate) fn remove_accounted(
                     (Change::Store(state), ())
                 }
             }
-            // Nothing of the caller's to edit: the role keeps what it cannot read, and a missing file is `Absent`.
-            Loaded::Absent | Loaded::Newer { .. } | Loaded::Corrupt { .. } | Loaded::Unreadable { .. } => {
-                (Change::Remove, ())
+            Loaded::Absent => {
+                tracing::debug!("no plugin state file: nothing to remove");
+                (Change::Keep, ())
+            }
+            Loaded::Newer { .. } => {
+                tracing::warn!("the plugin state file is newer than this release reads: kept, nothing to remove");
+                (Change::Keep, ())
+            }
+            Loaded::Corrupt { .. } => {
+                tracing::warn!("the plugin state file is corrupt: kept, nothing to remove");
+                (Change::Keep, ())
+            }
+            Loaded::Unreadable { .. } => {
+                tracing::warn!("the plugin state file is unreadable: kept, nothing to remove");
+                (Change::Keep, ())
             }
             // Names no process at all, so no record of the caller's is in it.
             Loaded::Obsolete { .. } => (Change::Keep, ()),
         })
-        .map(|((), outcome)| outcome)?;
-    match outcome {
-        UpdateOutcome::Absent => tracing::debug!("no plugin state file: nothing to remove"),
-        UpdateOutcome::Kept => tracing::debug!("the plugin state file is unusable: nothing to remove"),
-        _ => {}
-    }
-    Ok(outcome)
+        .map(|((), outcome)| outcome)
 }
 
 /// Deletes the record iff it is still obsolete. The caller classified it earlier; an append may have rewritten it
