@@ -77,8 +77,10 @@ fn engage_publishing(
     };
     let token = engage_with(server_ip, None, &mut ops)?;
     Ok(Cover {
-        token,
-        state_dir: lock.state_dir().to_owned(),
+        held: Some(Held {
+            token,
+            state_dir: lock.state_dir().to_owned(),
+        }),
         stamp: lock.stamp_install(CoverKind::Transient),
     })
 }
@@ -595,7 +597,11 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                         // loaded. The refcount stays balanced: this engage's own `-E`
                         // already ran, so this `-X` brings it back down by exactly one.
                         if let Err(e) = pfctl_status(
-                            pfctl(&["-X", &old.token], None, BestEffortPhase::RecoverCover),
+                            pfctl(
+                                &["-X", &old.held.as_ref().unwrap().token],
+                                None,
+                                BestEffortPhase::RecoverCover,
+                            ),
                             "pfctl -X",
                         ) {
                             tracing::warn!(
