@@ -923,11 +923,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     // A covered start that can't resolve has no IP to permit, so no
                     // cover can engage: the block-until-connected intent falls open
                     // here — logged so the gap is visible, not silent.
-                    if let Coverage::Covered { .. } = coverage {
-                        warn!(
+                    match coverage {
+                        Coverage::Covered { .. } => warn!(
                             error = &e as &dyn std::error::Error,
                             "covered start could not resolve the server; host NOT blocked (no IP to permit)"
-                        );
+                        ),
+                        Coverage::Uncovered => {}
                     }
                     return Err(e);
                 }
@@ -1006,25 +1007,26 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let lockdown_on = self.standing_cover_expected();
 
         match coverage {
-            Coverage::Covered { unblock_snapshot } if !lockdown_on => {
-                self.engage_transient_cover(
-                    config.server.server.expose(),
-                    server_ip,
-                    pin,
-                    ech_resolver_permit,
-                    &effective_ech_doh,
-                    unblock_snapshot,
-                );
-            }
-            Coverage::Covered { .. } => {
-                // Covered retry after the user enabled lockdown mid-blocked-state:
-                // release the held cover. This opens egress until the standing lockdown
-                // cover engages at routing.install — a brief, disclosed open window
-                // (bindreams/hole#758: not closed by the macOS pf work).
-                if self.posture.take_pending().is_some() {
-                    warn!(
-                        "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
-                         uncovered until the standing lockdown cover engages at connect"
+            Coverage::Covered { unblock_snapshot } => {
+                if lockdown_on {
+                    // Covered retry after the user enabled lockdown mid-blocked-state:
+                    // release the held cover. This opens egress until the standing lockdown
+                    // cover engages at routing.install — a brief, disclosed open window
+                    // (bindreams/hole#758: not closed by the macOS pf work).
+                    if self.posture.take_pending().is_some() {
+                        warn!(
+                            "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
+                             uncovered until the standing lockdown cover engages at connect"
+                        );
+                    }
+                } else {
+                    self.engage_transient_cover(
+                        config.server.server.expose(),
+                        server_ip,
+                        pin,
+                        ech_resolver_permit,
+                        &effective_ech_doh,
+                        unblock_snapshot,
                     );
                 }
             }
