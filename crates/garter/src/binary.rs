@@ -1311,10 +1311,10 @@ async fn watch_root_exit_within(plugin: &str, tree: &impl PluginTree, grace: std
 /// Shuts a running plugin down: asks the root to exit, gives it `grace`, hard-kills it if it has not
 /// exited (or could not be asked or watched: the escalation), then [`end_plugin`]s it.
 ///
-/// A refused root kill (an elevated or setuid wrapper) is logged at once and returned. The tree is
-/// still killed and its output drained, but the root is reaped only if a probe then finds it exited:
-/// a root that survives the tree kill too cannot be waited for, and the handle is left armed so that
-/// dropping it still kills what it can.
+/// A refused root kill (an elevated or setuid wrapper, or on macOS a root launchd holds as a zombie)
+/// is logged at once and returned. The tree is still killed and its output drained, but the root is
+/// reaped only if a probe then finds it exited: a root that survives the tree kill too cannot be
+/// waited for, and the handle is left armed so that dropping it still kills what it can.
 pub(crate) async fn shut_plugin_down(
     plugin: &str,
     tree: &mut impl PluginTree,
@@ -1333,7 +1333,8 @@ pub(crate) async fn shut_plugin_down(
 }
 
 /// The end of a take-down, once the root has had its grace: kills a root that has not exited, then
-/// [`end_plugin`]s it. A refused root kill is handled as [`shut_plugin_down`] documents.
+/// [`end_plugin`]s it. A refused root kill (an elevated or setuid wrapper, or on macOS a root launchd
+/// holds as a zombie) is handled as [`shut_plugin_down`] documents.
 async fn finish_plugin(
     plugin: &str,
     tree: &mut impl PluginTree,
