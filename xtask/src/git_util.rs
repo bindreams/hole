@@ -20,7 +20,8 @@ pub fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
         // commit") report the actual failure reason on stdout, not stderr —
         // include both so the real cause isn't dropped.
         bail!(
-            "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+            "git {args:?} failed ({}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
             String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -46,7 +47,8 @@ pub fn run_git_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Resu
         .with_context(|| format!("failed to run git {args:?}"))?;
     if !output.status.success() {
         bail!(
-            "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+            "git {args:?} failed ({}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
             String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -139,7 +141,8 @@ pub fn run_git_raw(cwd: &Path, args: &[&str]) -> Result<String> {
         .with_context(|| format!("failed to run git {args:?}"))?;
     if !output.status.success() {
         bail!(
-            "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+            "git {args:?} failed ({}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
             String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
