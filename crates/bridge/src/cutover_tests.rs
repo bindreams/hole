@@ -685,7 +685,7 @@ fn the_uninstall_gate_reads_a_twin_recorded_in_a_peer_state_dir() {
         "no evidence anywhere: this is what almost every uninstall looks like"
     );
 
-    tun_engine::routing::failclosed::boottime_witness::record_armed_for_test(peer.path());
+    tun_engine::routing::failclosed::boottime_witness::record_armed_for_test(peer.path(), None);
     let loud = release_covers_with(dir.path(), &[peer.path().to_path_buf()], || {
         Ok(clearance_with_sibling(KeyOutcome::NotFound, &twins))
     })

@@ -412,8 +412,8 @@ fn writers() -> Vec<Writer> {
             names: &[boottime_witness::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| {
-                boottime_witness::record_armed_for_test(dir);
+            run: |dir, owner| {
+                boottime_witness::record_armed_for_test(dir, owner);
                 Ok(())
             },
         },
