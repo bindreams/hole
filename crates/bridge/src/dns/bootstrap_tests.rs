@@ -502,9 +502,9 @@ async fn insecure_fallback_logs_the_certificate_rejection_even_when_it_succeeds(
         "the WARN must state the consequence, not just flag it; got:\n{output}"
     );
     // The fallback line itself carries both halves: the message names the finding in the words the error's
-    // Display uses, and the error field is that Display.
+    // Display uses, and the error field is that Display, followed by the line's one other field.
     const FINDING: &str = "a certificate that could not be verified";
-    const DISPLAY: &str = "a secure DNS resolver presented a certificate that could not be verified";
+    let display = BootstrapError::CertificateRejected.to_string();
     let fallback = output
         .lines()
         .find(|line| line.contains("PLAINTEXT system DNS"))
@@ -517,8 +517,13 @@ async fn insecure_fallback_logs_the_certificate_rejection_even_when_it_succeeds(
         "the message must share the words {FINDING:?} with the rendered error; got:\n{output}"
     );
     assert!(
-        field.starts_with(DISPLAY),
-        "the fallback line's error field must name the finding the fallback is proceeding past; got:\n{output}"
+        display.contains(FINDING),
+        "the error's Display must name the finding {FINDING:?}; got: {display}"
+    );
+    assert_eq!(
+        field,
+        format!("{display} resolvers=1"),
+        "the fallback line's error field must be the error's Display; got:\n{output}"
     );
 }
 
