@@ -1815,11 +1815,42 @@ fn recover_records_the_intent_before_acting_on_it() {
 }
 
 /// The intent read said `Unset`, but an `Off` landed before the repair wrote: the repair's own read-and-write is one
-/// update over the CURRENT intent, so the user's `Off` survives it.
+/// update over the CURRENT intent, so the user's `Off` survives it, and recovery acts on the `Off` it saw (a sweep),
+/// not on the stale `Unset` (an adoption).
 #[skuld::test]
-fn recover_does_not_overwrite_an_off_that_lands_between_its_read_and_its_write() {
+fn recover_acts_on_the_off_that_lands_between_its_read_and_its_write() {
     let dir = tempfile::tempdir().unwrap();
     failclosed::lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+    let acted: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
+    let decision = recover_routes_with(
+        dir.path(),
+        None,
+        Some("hole-tun"),
+        |_, _c, _p| Ok(()),
+        |_d, _a| {},
+        Intent::Unset,
+        || Live,
+        |action, _tun_name| acted.set(Some(action)),
+    );
+
+    assert_eq!(
+        failclosed::lockdown_state::load_intent(dir.path()),
+        Intent::Off,
+        "the user's Off is never turned into On"
+    );
+    assert_eq!(acted.get(), Some(Sweep), "the Off the update saw decides the action");
+    assert_eq!(
+        decision.action, Sweep,
+        "and the returned decision, which seeds the adopted claim"
+    );
+    assert!(!decision.record_intent_on, "nothing was repaired");
+}
+
+/// The same race, but an `On` landed: the cover is adopted as the `On` says, and the repair is not reported as done.
+#[skuld::test]
+fn recover_adopts_over_an_on_that_lands_between_its_read_and_its_write() {
+    let dir = tempfile::tempdir().unwrap();
+    failclosed::lockdown_state::set_enabled(dir.path(), true, None).unwrap();
     let decision = recover_routes_with(
         dir.path(),
         None,
@@ -1831,12 +1862,9 @@ fn recover_does_not_overwrite_an_off_that_lands_between_its_read_and_its_write()
         |_action, _tun_name| {},
     );
 
-    assert!(decision.record_intent_on, "the stale read still asked for the repair");
-    assert_eq!(
-        failclosed::lockdown_state::load_intent(dir.path()),
-        Intent::Off,
-        "the user's Off is never turned into On"
-    );
+    assert_eq!(decision.action, Adopt);
+    assert!(!decision.record_intent_on, "the update wrote nothing");
+    assert_eq!(failclosed::lockdown_state::load_intent(dir.path()), Intent::On);
 }
 
 /// An unreadable record may hold the user's `Off` (a newer or garbled schema): the cover is adopted and the
