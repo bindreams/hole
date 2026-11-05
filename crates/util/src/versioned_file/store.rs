@@ -163,7 +163,7 @@ pub enum StoreError {
     /// is a fixed label, never content; the error's category is logged.
     #[error("cannot encode the state file: {0}")]
     Encode(&'static str),
-    #[error(transparent)]
+    #[error("{0}")]
     Io(#[from] io::Error),
 }
 

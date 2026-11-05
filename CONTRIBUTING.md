@@ -4285,7 +4285,10 @@ tracing::warn!(error = &e as &dyn std::error::Error, "what failed");
   link's `Display` as one item (a multi-line `Display` stays one item). The stock formatter that `galoshes` and
   `garter-bin` install prints the same field as `error=<Display> error.sources=[..]`, so the call site is the same there.
 - **The type rule.** A variant's `Display` names what this layer failed to do and never formats its `source()`; a cause
-  is `#[source]` or `#[from]`. A `Display` that includes its cause prints it twice.
+  is `#[source]` or `#[from]`. A `Display` that includes its cause prints it twice. A wrapper variant exposes its
+  inner error as `#[source]` and writes `#[error("{0}")]`, never `transparent`: that forwards `source()` past the inner
+  value, so `find` and `raw_os_error` cannot reach it (test-enforced). Until such a variant gets text of its own, a
+  logged chain shows the inner text twice.
 - **Reading a chain in code.** [`util::error`](crates/util/src/error.rs) has two walks. `chain` follows `source()`
   only; it is what the renderer prints. `links` also descends an `io::Error` through `get_ref`, because
   `io::Error::other(e)` keeps `e` out of `source()` while its `Display` shows it. `find::<T>` and `raw_os_error` are

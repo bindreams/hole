@@ -1,4 +1,5 @@
 use super::{chain, find, links, raw_os_error};
+use crate::versioned_file::StoreError;
 use std::error::Error;
 use std::io;
 
@@ -157,7 +158,67 @@ fn raw_os_error_reads_a_code_behind_a_non_io_error() {
 }
 
 #[skuld::test]
+fn raw_os_error_reads_the_code_of_the_io_error_a_store_error_wraps() {
+    let e = StoreError::Io(io::Error::from_raw_os_error(5));
+    assert_eq!(raw_os_error(&e), Some(5));
+}
+
+#[skuld::test]
+fn find_reaches_a_typed_error_inside_the_io_error_a_store_error_wraps() {
+    let e = io::Error::other(StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, Marker)));
+    assert!(find::<Marker>(&e).is_some());
+}
+
+#[skuld::test]
 fn raw_os_error_takes_the_first_code_in_the_chain() {
     let e = io::Error::other(io::Error::other(io::Error::from_raw_os_error(10054)));
     assert_eq!(raw_os_error(&e), Some(10054));
+}
+
+// no transparent wrappers =============================================================================================
+
+/// `#[error(transparent)]` forwards `source()` to the wrapped value, so the value itself is never a link and
+/// [`find`] and [`raw_os_error`] cannot reach it. A wrapper writes `#[error("{0}")]` and marks the inner error
+/// `#[source]`.
+#[skuld::test]
+fn no_error_type_in_the_workspace_is_transparent() {
+    // Built in pieces: this file is scanned too.
+    let needle = concat!("error(", "transparent", ")");
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let mut scanned = 0usize;
+    let mut offenders: Vec<String> = Vec::new();
+    for root in ["crates", "xtask", "xtask-lib"] {
+        let walk = walkdir::WalkDir::new(workspace.join(root))
+            .into_iter()
+            .filter_entry(|entry| entry.file_name() != "target" && entry.file_name() != "node_modules");
+        for entry in walk {
+            let entry = entry.expect("walk the workspace sources");
+            let path = entry.path();
+            if !entry.file_type().is_file() || path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            scanned += 1;
+            let text = std::fs::read_to_string(path).expect("read a walked source file");
+            // Whitespace-free, so `#[error( transparent )]` and a spelling split across lines are found too.
+            let code: String = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(str::chars)
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if code.contains(needle) {
+                offenders.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "the scan read {scanned} sources; a tripwire that reads nothing passes forever"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a transparent error hides its inner error from `util::error`'s walks; write `#[error(\"{{0}}\")]` with \
+         `#[source]` on the inner error instead:\n  {}",
+        offenders.join("\n  ")
+    );
 }

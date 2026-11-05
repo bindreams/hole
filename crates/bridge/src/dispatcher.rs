@@ -45,9 +45,9 @@ pub enum DriverExit {
 /// of a flattened `io::Error` whose type information is already gone.
 #[derive(Debug, thiserror::Error)]
 pub enum DispatcherStartError {
-    #[error(transparent)]
+    #[error("{0}")]
     Device(#[from] tun_engine::DeviceError),
-    #[error(transparent)]
+    #[error("{0}")]
     Io(#[from] std::io::Error),
 }
 

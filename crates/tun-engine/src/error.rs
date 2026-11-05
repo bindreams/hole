@@ -79,11 +79,11 @@ pub(crate) enum CheckpointFailure {
 /// Why `setup_routes` stopped.
 #[derive(Debug, Error)]
 pub(crate) enum SetupFailure {
-    #[error(transparent)]
-    Command(RouteCommandError),
+    #[error("{0}")]
+    Command(#[source] RouteCommandError),
     /// The record of the next command could not be written, so it did not run.
-    #[error(transparent)]
-    Checkpoint(CheckpointFailure),
+    #[error("{0}")]
+    Checkpoint(#[source] CheckpointFailure),
 }
 
 impl From<SetupFailure> for RoutingError {
