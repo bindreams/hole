@@ -1788,8 +1788,9 @@ warning into a failed engage.
 that is a behaviour change.** The transaction has already committed when
 `verify_boottime_twins` runs, so `engage_lockdown` returns `Err` with the
 filters installed and no guard over them. They are not orphaned — the next start
-reads `Live` off the fixed GUIDs, `decide_cover_recovery` yields `Adopt`, and
-`record_intent_on` repairs `bridge-lockdown.json`. But over a **clean host on a
+reads `Live` off the fixed GUIDs, and `decide_cover_recovery` yields `Adopt`
+(over an intent nobody recorded it also repairs `bridge-lockdown.json`, through
+`record_intent_on`). But over a **clean host on a
 first engage** a pre-commit abort used to leave the host untouched, and this
 path instead leaves a full block-all in force while the start fails: the permits
 alongside it are loopback, the server IP, the TUN and Hole's own App-IDs, so
@@ -2943,8 +2944,10 @@ Disclosed residuals:
    `Intent::Off` **and** an actionable presence; `Adopt` requires an
    actionable presence with an intent of `On`/`Unreadable`/`Unset`, and
    `Unset` additionally requires positive evidence; the intent file is
-   repaired to `enabled: true` only on `Presence::Live` with an `Unset` or
-   `Unreadable` intent, never inferred.
+   repaired to `enabled: true` only on `Presence::Live` with an `Unset`
+   intent, never inferred. An `Unreadable` record is adopted over and left as it
+   is: it already reads armed and may hold the user's `Off`, which a write would
+   turn into `On`.
 
    `Live` means **any residue**, not the whole cover: the Windows sweeps loop
    delete-by-key with every return code discarded, over the persistent filters
