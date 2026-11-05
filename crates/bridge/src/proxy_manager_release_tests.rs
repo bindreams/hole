@@ -292,11 +292,12 @@ fn an_externally_released_cover_is_not_silently_reused() {
     // 18c09cd9 (transient half): a lock-free `handle_unblock` releasing every
     // OS-level cover while this manager isn't holding the lock leaves any
     // `PendingStart` a zombie — the OS objects it claims to hold are already
-    // gone. Without consuming `cover_invalidated`, a same-host retry would
-    // trust the zombie (`pending().is_none()` reads false) and skip
-    // re-engaging, believing an already-gone cover still protects it. The
-    // signal must force the zombie's own `Drop` (idempotent against an
-    // already-cleared cover either way) and a fresh, real re-engage.
+    // gone. Without noticing that a release ended since the cover was held, a
+    // same-host retry would trust the zombie (`pending().is_none()` reads
+    // false) and skip re-engaging, believing an already-gone cover still
+    // protects it. The release must force the zombie's own `Drop`
+    // (idempotent against an already-cleared cover either way) and a fresh,
+    // real re-engage.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let (mut pm, st) = covered_start_holding_the_cover(&dir).await;
@@ -309,7 +310,7 @@ fn an_externally_released_cover_is_not_silently_reused() {
 
         // Simulate `handle_unblock` releasing out-of-band, lock-free, while
         // this manager wasn't holding its lock.
-        pm.cover_invalidation_handle().store(true, Ordering::SeqCst);
+        drop(tun_engine::routing::failclosed::begin_release(dir.path()));
 
         // `test_config()`'s default server host is the same `127.0.0.1` as
         // `covered_start_holding_the_cover`'s closed probe, so this retry
@@ -320,7 +321,7 @@ fn an_externally_released_cover_is_not_silently_reused() {
 
         pm.start_cancellable(&cfg, true, tokio_util::sync::CancellationToken::new())
             .await
-            .expect("the invalidated zombie must not block a fresh, successful retry");
+            .expect("the superseded zombie must not block a fresh, successful retry");
 
         assert_eq!(
             st.cover_disengage_calls.load(Ordering::SeqCst),

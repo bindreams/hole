@@ -96,6 +96,11 @@ pub enum ProxyError {
     /// a diagnostic failure.
     #[error("cancelled")]
     Cancelled,
+    /// A release overtook the start. `start_cancellable` turns it into
+    /// [`ProxyError::Cancelled`] after deciding, on the verdict, what to do with a cover it holds; it never
+    /// reaches a caller.
+    #[error("cancelled: {0}")]
+    Overtaken(tun_engine::routing::failclosed::Overtaken),
     #[error("wintun.dll not found (tried: {})", .tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))]
     WintunMissing { tried: Vec<PathBuf> },
     #[error("wintun.dll load failed at {}: {message}", .path.display())]
@@ -244,6 +249,7 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
         use hole_common::protocol::StartError;
         match e {
             ProxyError::Cancelled => StartError::Cancelled,
+            ProxyError::Overtaken(_) => StartError::Cancelled,
             ProxyError::AlreadyRunning => StartError::AlreadyRunning,
             ProxyError::NetworkBlocked => StartError::NetworkBlocked,
             // Every other start failure is generic; its `Display` is the reason.
@@ -291,7 +297,7 @@ impl From<tun_engine::RoutingError> for ProxyError {
             tun_engine::RoutingError::RouteSetup(s) => ProxyError::RouteSetup(s),
             // The path is in the bridge log (tun-engine logged it); the toast names the file only.
             tun_engine::RoutingError::StateUnreadable { .. } => ProxyError::RouteSetup(e.redacted()),
-            tun_engine::RoutingError::SupersededByRelease(_) => ProxyError::Cancelled,
+            tun_engine::RoutingError::SupersededByRelease(verdict) => ProxyError::Overtaken(verdict),
         }
     }
 }

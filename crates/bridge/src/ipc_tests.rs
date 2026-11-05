@@ -1118,14 +1118,10 @@ fn lockdown_off_releases_covers_through_the_same_path() {
 fn ipc_state_over(routing: MockRouting, dir: PathBuf) -> Arc<IpcState<MockProxy, MockRouting>> {
     let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.clone());
     let proxy = Arc::new(Mutex::new(pm));
-    let (routing_handle, cover_invalidated) = {
-        let guard = proxy.try_lock().unwrap();
-        (guard.routing_handle(), guard.cover_invalidation_handle())
-    };
+    let routing_handle = proxy.try_lock().unwrap().routing_handle();
     Arc::new(IpcState {
         proxy,
         routing: routing_handle,
-        cover_invalidated,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
@@ -1788,13 +1784,11 @@ fn ipc_state_with_persist_gate(
     let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.clone());
     let proxy = Arc::new(Mutex::new(pm));
     let routing_handle = proxy.try_lock().unwrap().routing_handle();
-    let cover_invalidated = proxy.try_lock().unwrap().cover_invalidation_handle();
     let gate = Arc::new(tokio::sync::Notify::new());
     let (entered_tx, entered_rx) = oneshot::channel();
     let state = Arc::new(IpcState {
         proxy,
         routing: routing_handle,
-        cover_invalidated,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
@@ -1967,14 +1961,10 @@ fn ipc_state_with_dir_and_proxy(dir: PathBuf, proxy: MockProxy) -> Arc<IpcState<
     let routing = MockRouting::new(dir.clone());
     let pm = ProxyManager::new(proxy, routing).with_state_dir(dir.clone());
     let proxy = Arc::new(Mutex::new(pm));
-    let (routing_handle, cover_invalidated) = {
-        let guard = proxy.try_lock().unwrap();
-        (guard.routing_handle(), guard.cover_invalidation_handle())
-    };
+    let routing_handle = proxy.try_lock().unwrap().routing_handle();
     Arc::new(IpcState {
         proxy,
         routing: routing_handle,
-        cover_invalidated,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
@@ -3478,16 +3468,13 @@ fn redacting_capture() -> (
 
 fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<IpcState<MockProxy, MockRouting>> {
     let dir = tempfile::tempdir().unwrap().keep();
-    let (routing, cover_invalidated) = {
-        let guard = proxy
-            .try_lock()
-            .expect("proxy mutex must be uncontended at construction time");
-        (guard.routing_handle(), guard.cover_invalidation_handle())
-    };
+    let routing = proxy
+        .try_lock()
+        .expect("proxy mutex must be uncontended at construction time")
+        .routing_handle();
     Arc::new(IpcState {
         proxy,
         routing,
-        cover_invalidated,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
