@@ -44,6 +44,7 @@ hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
 util = { path = "../util" }
 tun-engine = { path = "../tun-engine" }
+file-lock = { path = "../file-lock" }
 dump = { path = "../dump" }
 garter = { path = "../garter" }
 # Single source of truth for the BINDIR name set; the Windows update-cutover
@@ -157,6 +158,10 @@ ferrisetw = "1.2.0"
 
 [dev-dependencies]
 skuld = { workspace = true }
+# `util::dir::testing`: the links and folders a test of the walk needs.
+util = { path = "../util", features = ["test-support"] }
+# `tombstone::crash::write_marker_for`: the crash marker's write, as a row of the writer table.
+tombstone = { path = "../tombstone", features = ["test-support"] }
 hole-test-observability = { path = "../test-observability" }
 # Test-harness-only (`test_support::dist_harness`). A dev-dependency so the
 # privileged bridge binary cannot link it: `handle_holders::find_holders` spawns

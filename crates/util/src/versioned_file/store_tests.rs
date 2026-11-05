@@ -1,8 +1,11 @@
 use std::cell::RefCell;
+use std::ffi::OsStr;
+use std::fs::File;
 use std::io;
 use std::path::Path;
 
 use super::{DefaultPlacement, Placement, Removal, StoreError, VersionedFile};
+use crate::dir::Dir;
 use crate::versioned_file::fixtures::{
     dir, names, put, unreadable_bytes, ConfigFile, DecisionFile, DroppedFile, LegacyRecordFile, NotAnObject, NoteV3,
     OsRecordFile, OwnsVersionKey, TopEnum, Wide, WithFloat,
@@ -431,17 +434,16 @@ impl Recorder<'_> {
 }
 
 impl Placement for Recorder<'_> {
-    fn prepare_dir(&self, dir: &Path) -> io::Result<()> {
+    fn prepare_dir(&self, _dir: &Dir) -> io::Result<()> {
         self.events
             .borrow_mut()
             .push(format!("prepare_dir[{}]", self.on_disk()));
-        std::fs::create_dir_all(dir)
+        Ok(())
     }
 
-    fn prepare_tmp(&self, tmp: &Path) -> io::Result<()> {
-        let tmp_bytes = std::fs::read(tmp)?;
+    fn prepare_tmp(&self, tmp: &File) -> io::Result<()> {
         assert!(
-            !tmp_bytes.is_empty(),
+            tmp.metadata()?.len() > 0,
             "the temp file must be complete before prepare_tmp"
         );
         self.events
@@ -450,14 +452,14 @@ impl Placement for Recorder<'_> {
         Ok(())
     }
 
-    fn after_publish(&self, _path: &Path) -> io::Result<()> {
+    fn after_publish(&self, _dir: &Dir, _name: &OsStr) -> io::Result<()> {
         self.events
             .borrow_mut()
             .push(format!("after_publish[{}]", self.on_disk()));
         Ok(())
     }
 
-    fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+    fn sync_dir(&self, _dir: &Dir) -> io::Result<()> {
         self.events.borrow_mut().push(format!("sync_dir[{}]", self.on_disk()));
         Ok(())
     }
@@ -500,13 +502,13 @@ fn a_failure_after_the_rename_says_the_file_was_replaced() {
         in_after_publish: bool,
     }
     impl Placement for FailsAfter {
-        fn after_publish(&self, _path: &Path) -> io::Result<()> {
+        fn after_publish(&self, _dir: &Dir, _name: &OsStr) -> io::Result<()> {
             match self.in_after_publish {
                 true => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
                 false => Ok(()),
             }
         }
-        fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+        fn sync_dir(&self, _dir: &Dir) -> io::Result<()> {
             match self.in_after_publish {
                 true => Ok(()),
                 false => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
@@ -543,17 +545,8 @@ fn a_failure_after_the_rename_says_the_file_was_replaced() {
 fn a_failed_prepare_tmp_leaves_no_temp_and_the_original() {
     struct Fails;
     impl Placement for Fails {
-        fn prepare_dir(&self, dir: &Path) -> io::Result<()> {
-            std::fs::create_dir_all(dir)
-        }
-        fn prepare_tmp(&self, _tmp: &Path) -> io::Result<()> {
+        fn prepare_tmp(&self, _tmp: &File) -> io::Result<()> {
             Err(io::Error::from(io::ErrorKind::PermissionDenied))
-        }
-        fn after_publish(&self, _path: &Path) -> io::Result<()> {
-            Ok(())
-        }
-        fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
-            Ok(())
         }
     }
 
@@ -575,18 +568,11 @@ fn a_failed_prepare_tmp_leaves_no_temp_and_the_original() {
     assert_eq!(names(&dir), ["decision.json"]);
 }
 
-/// The directory sync reaches the directory: a directory that is not there
-/// fails it, on every platform.
-#[skuld::test]
-fn sync_dir_of_a_missing_directory_fails() {
-    let dir = dir();
-    let err = plain().sync_dir(&dir.path().join("missing")).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
-}
-
 #[skuld::test]
 fn sync_dir_of_a_directory_succeeds() {
-    plain().sync_dir(dir().path()).unwrap();
+    plain()
+        .sync_dir(&Dir::open(dir().path(), false, None).unwrap())
+        .unwrap();
 }
 
 // Redaction ===========================================================================================================
@@ -667,10 +653,11 @@ mod unix_directory_flush {
 #[skuld::test]
 fn the_directory_flush_tolerates_a_filesystem_without_one_where_it_is_wired() {
     let dir = crate::versioned_file::fixtures::dir();
+    let handle = Dir::open(dir.path(), false, None).unwrap();
     let os = |code: i32| std::io::Error::from_raw_os_error(code);
 
-    super::sync_dir_with(dir.path(), |_| Err(os(libc::EINVAL))).unwrap();
-    let err = super::sync_dir_with(dir.path(), |_| Err(os(libc::EIO))).unwrap_err();
+    super::sync_dir_with(&handle, |_| Err(os(libc::EINVAL))).unwrap();
+    let err = super::sync_dir_with(&handle, |_| Err(os(libc::EIO))).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EIO));
 }
 
@@ -678,7 +665,7 @@ fn the_directory_flush_tolerates_a_filesystem_without_one_where_it_is_wired() {
 #[skuld::test]
 fn a_real_directory_without_fsync_is_not_a_failed_flush() {
     // procfs answers a directory fsync with EINVAL.
-    super::sync_dir(std::path::Path::new("/proc")).unwrap();
+    super::sync_dir(&Dir::open(std::path::Path::new("/proc"), false, None).unwrap()).unwrap();
 }
 
 #[skuld::test]
@@ -687,10 +674,10 @@ fn a_failed_after_publish_still_flushes_the_directory() {
         flushed: std::cell::Cell<bool>,
     }
     impl Placement for FailsAfterPublish {
-        fn after_publish(&self, _path: &Path) -> io::Result<()> {
+        fn after_publish(&self, _dir: &Dir, _name: &OsStr) -> io::Result<()> {
             Err(io::Error::from(io::ErrorKind::PermissionDenied))
         }
-        fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+        fn sync_dir(&self, _dir: &Dir) -> io::Result<()> {
             self.flushed.set(true);
             Err(io::Error::from(io::ErrorKind::Other))
         }

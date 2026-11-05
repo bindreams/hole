@@ -133,7 +133,8 @@ impl From<CliTunnelMode> for hole_common::protocol::TunnelMode {
 pub(crate) enum BridgeAction {
     /// Run the bridge (foreground by default)
     Run {
-        /// Override the IPC socket path
+        /// Override the IPC socket path. Its folder gets the default path's link walk and no further: whoever passes
+        /// this vouches for the folder's owner
         #[arg(long)]
         socket_path: Option<std::path::PathBuf>,
         /// Run as a system service (invoked by SCM/launchd)
@@ -411,6 +412,14 @@ fn to_ids(u: &hole_bridge::group::RealUser) -> (u32, u32) {
     (u.uid, u.gid)
 }
 
+/// `state_dir` as an absolute path, so a service whose cwd is `C:\Windows\System32` or `/` does not read it relative
+/// to that. Links are not resolved: the walk of `util::dir` judges every one in the path, and a path resolved here
+/// would have none left for it to refuse. An error when there is no absolute form (an empty path, or a working
+/// directory that cannot be read): the relative path is not a fallback, it is the thing this prevents.
+fn absolute_state_dir(state_dir: std::path::PathBuf) -> std::io::Result<std::path::PathBuf> {
+    std::path::absolute(&state_dir)
+}
+
 /// Per-user log directory under the resolved user's home, derived from `home`
 /// (never `$HOME`/`dirs`, which under osascript-admin still point at the
 /// invoking user but are easy to get wrong for an elevated process).
@@ -680,19 +689,15 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 return 2;
             }
 
-            // Canonicalize state_dir to an absolute path. If canonicalize
-            // fails (e.g. directory doesn't exist yet), fall back to
-            // joining against cwd so the service mode doesn't surprise the
-            // user with a cwd-relative path (service cwd is `C:\Windows\System32`
-            // on Windows or `/` on macOS).
             #[cfg(target_os = "macos")]
             let state_dir = state_dir.or_else(|| owner.as_ref().map(|u| user_state_dir(&u.home)));
-            let state_dir = state_dir.unwrap_or_else(hole_common::paths::default_state_dir);
-            let state_dir = state_dir.canonicalize().unwrap_or_else(|_| {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(&state_dir))
-                    .unwrap_or(state_dir)
-            });
+            let state_dir = match absolute_state_dir(state_dir.unwrap_or_else(hole_common::paths::default_state_dir)) {
+                Ok(state_dir) => state_dir,
+                Err(e) => {
+                    cli_log!(error, "bridge error: cannot resolve the state directory: {e}");
+                    return 1;
+                }
+            };
 
             let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
 
@@ -900,7 +905,7 @@ fn file_was_rotated(path: &std::path::Path, current: &same_file::Handle) -> std:
 }
 
 /// Tail and follow a log file (like `tail -f`). Detects rename-rotation by
-/// `file-rotate` and reopens `path` so the stream keeps flowing after
+/// `DirRotate` and reopens `path` so the stream keeps flowing after
 /// rollover.
 fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
     use std::io::{BufRead, Seek, SeekFrom};
@@ -944,7 +949,7 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
                 match file_was_rotated(path, &handle) {
                     Ok(true) => {
                         // Drain any final bytes from the old (renamed) file
-                        // before swapping. file-rotate may have flushed a
+                        // before swapping. `DirRotate` may have flushed a
                         // line between our last Ok(0) and the rename.
                         loop {
                             line.clear();
