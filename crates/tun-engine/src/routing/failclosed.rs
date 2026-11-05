@@ -106,6 +106,9 @@ pub mod lockdown_state;
 
 pub mod boottime_witness;
 
+pub mod cover_lock;
+pub use cover_lock::{CoverKind, CoverLock, InstallStamp};
+
 pub mod release_epoch;
 pub use release_epoch::{begin_release, watch_releases, Overtaken, ReleaseInFlight, ReleaseWatch};
 
