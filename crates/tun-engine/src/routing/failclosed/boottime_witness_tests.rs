@@ -371,223 +371,39 @@ fn every_update_and_record_pair_has_one_write_answer() {
         (ArmingWitness::Unreadable, WitnessUpdate::Disarm, Some(false)),
     ];
     for (current, update, want) in table {
-        // Third column: no write by this process since the sweep's snapshot.
-        assert_eq!(next_record(current, update, false), want, "{current:?} + {update:?}");
+        assert_eq!(next_record(current, update), want, "{current:?} + {update:?}");
     }
 }
 
 #[skuld::test]
-fn an_engage_during_the_sweep_vetoes_only_the_disarm() {
-    // `generation_moved` is "this process wrote the record since this sweep's snapshot".
-    // The sweep's `Disarm` speaks for the twins it deleted, not for the one
-    // that engage just armed, so it is dropped whatever the record holds. `Arm`
-    // and `Leave` are unaffected: neither retracts anything.
-    for current in [
-        ArmingWitness::Armed,
-        ArmingWitness::Disarmed,
-        ArmingWitness::Unset,
-        ArmingWitness::Unreadable,
-    ] {
-        assert_eq!(next_record(current, WitnessUpdate::Disarm, true), None, "{current:?}");
-        for update in [WitnessUpdate::Arm, WitnessUpdate::Leave] {
-            assert_eq!(
-                next_record(current, update, true),
-                next_record(current, update, false),
-                "{current:?} + {update:?}"
-            );
-        }
-    }
-}
-
-#[skuld::test]
-fn every_recorded_engage_moves_the_generation() {
-    let state = dir();
-    let before = super::snapshot(state.path());
-    arm(state.path());
-    let after = super::snapshot(state.path());
-    assert_ne!(before.generation, after.generation);
-    assert_eq!(after.witness, ArmingWitness::Armed);
-}
-
-#[skuld::test]
-fn an_engage_that_commits_during_a_disarming_sweep_stays_recorded() {
-    // `Armed` -> `Armed` is invisible to a value comparison; only the generation vetoes the stale `Disarm`.
+fn an_engage_after_a_disarming_sweep_arms_the_record() {
+    // The engage and the sweep cannot overlap (both hold the cover lock), so the order is one or the other: a sweep
+    // that watched its twins go disarms the record, and the next engage arms it again.
     let state = dir();
     arm(state.path());
 
-    let c = sweep_with_lock(state.path(), |lock, witness| {
-        super::record_armed(lock, None);
-        SweepOutcome::completed(Clearance::from_observations(
-            &[sibling(KeyOutcome::Removed), twin_removed()],
-            witness,
-        ))
-    })
-    .expect("the sweep body cannot fail");
-
+    let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
     assert!(
         c.leftover_keys().is_empty(),
         "the sweep itself proved its own twins gone"
     );
-    assert_eq!(
-        super::load(state.path()),
-        ArmingWitness::Armed,
-        "the twin the engage armed during the sweep was not deleted by it"
-    );
-}
-
-#[skuld::test]
-fn an_engage_in_another_state_dir_does_not_veto_a_sweeps_disarm() {
-    // The generation is per `state_dir`: an engage recorded under B during A's sweep
-    // says nothing about the twins A's sweep deleted.
-    let (a, b) = (dir(), dir());
-    arm(a.path());
-
-    let c = sweep_with_lock(a.path(), |_, witness| {
-        arm(b.path());
-        SweepOutcome::completed(Clearance::from_observations(
-            &[sibling(KeyOutcome::Removed), twin_removed()],
-            witness,
-        ))
-    })
-    .expect("the sweep body cannot fail");
-
-    assert!(c.is_proven());
-    assert_eq!(super::load(a.path()), ArmingWitness::Disarmed);
-    assert_eq!(super::load(b.path()), ArmingWitness::Armed, "and B's record is B's");
-}
-
-#[skuld::test]
-fn an_engage_in_another_state_dir_before_the_sweep_does_not_veto_its_disarm() {
-    // The snapshot's generation is this `state_dir`'s own, not a count over all of them.
-    let (a, b) = (dir(), dir());
-    arm(b.path());
-    arm(a.path());
-
-    let c = sweep(a.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
-
-    assert!(c.is_proven());
-    assert_eq!(super::load(a.path()), ArmingWitness::Disarmed);
-}
-
-#[skuld::test]
-fn a_disarm_dropped_for_a_concurrent_engage_is_made_by_the_next_sweep() {
-    // The cost of the veto is one over-report, not a record that can never
-    // clear: the next sweep snapshots the moved generation and disarms normally.
-    let state = dir();
-    arm(state.path());
-    let _ = sweep_with_lock(state.path(), |lock, witness| {
-        super::record_armed(lock, None);
-        SweepOutcome::completed(Clearance::from_observations(
-            &[sibling(KeyOutcome::Removed), twin_removed()],
-            witness,
-        ))
-    })
-    .expect("the sweep body cannot fail");
-    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
-
-    let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
-    assert!(c.is_proven());
     assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
-}
 
+    arm(state.path());
+    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
+}
 #[skuld::test]
-fn a_disarming_sweep_with_no_concurrent_engage_still_disarms() {
+fn a_disarming_sweep_over_an_armed_record_disarms_it() {
     let state = dir();
     arm(state.path());
     let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
     assert!(c.is_proven());
     assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
 }
-
-#[skuld::test]
-fn a_failing_sweep_with_a_concurrent_engage_stays_armed() {
-    // A sweep that ends in `Err` has still deleted what it deleted, and its
-    // witness update is generation-checked like any other.
-    let state = dir();
-    arm(state.path());
-    sweep_with_lock(state.path(), |lock, witness| {
-        super::record_armed(lock, None);
-        SweepOutcome::failed(
-            Clearance::from_observations(&[sibling(KeyOutcome::Removed), twin_removed()], witness),
-            RoutingError::RouteSetup("the firewall refused one of the deletes".into()),
-        )
-    })
-    .expect_err("the sweep body failed");
-    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
-}
-
-#[skuld::test]
-fn an_engage_during_an_arming_sweep_changes_nothing() {
-    let state = dir();
-    let c = sweep_with_lock(state.path(), |lock, witness| {
-        super::record_armed(lock, None);
-        SweepOutcome::completed(Clearance::from_observations(
-            &[sibling(KeyOutcome::Removed), twin_not_found()],
-            witness,
-        ))
-    })
-    .expect("the sweep body cannot fail");
-    assert_eq!(c.leftover_keys(), [TWIN]);
-    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
-}
-
-#[skuld::test]
-fn a_concurrent_sweeps_arm_also_drops_a_disarm_taken_from_an_older_snapshot() {
-    // The veto is any write of this process, not only an engage's. Sweep B arms over a record A read
-    // as unreadable; A's later `Disarm` speaks for the twins A deleted, not for the one B just found.
-    let state = dir();
-    std::fs::write(state.path().join(super::STATE_FILE_NAME), b"{ not json").expect("write");
-
-    let _clearance = sweep_with_lock(state.path(), |lock, witness| {
-        assert_eq!(witness, ArmingWitness::Unreadable, "guard: A read the corrupt record");
-        let b = sweep_under(lock, &[sibling(KeyOutcome::Removed), twin_not_found()]);
-        assert_eq!(b.leftover_keys(), [TWIN], "guard: B armed the record");
-        SweepOutcome::completed(Clearance::from_observations(
-            &[sibling(KeyOutcome::Removed), twin_removed()],
-            witness,
-        ))
-    })
-    .expect("the sweep body cannot fail");
-
-    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
-}
-
-#[skuld::test]
-fn an_engage_whose_directory_open_fails_still_drops_the_disarm() {
-    // The engage's write never reaches the file, but it is a write attempt: a reader that compared only the bytes
-    // could not tell it from none. The directory is swapped for a link into a system folder around the engage and
-    // swapped back, so the sweep's own write opens it again.
-    let root = dir();
-    let state = root.path().join("state");
-    std::fs::create_dir(&state).expect("state dir");
-    arm(&state);
-
-    let _clearance = sweep_with_lock(&state, |lock, witness| {
-        let aside = root.path().join("aside");
-        std::fs::rename(&state, &aside).expect("move the state dir aside");
-        let link = util::dir::testing::state_dir_linked_to_a_system_folder(root.path());
-        assert_eq!(link, state, "guard: the link sits at the state dir's path");
-        super::record_armed(lock, None);
-        std::fs::remove_dir_all(&link).expect("remove the link");
-        std::fs::rename(&aside, &state).expect("put the state dir back");
-        SweepOutcome::completed(Clearance::from_observations(
-            &[sibling(KeyOutcome::Removed), twin_removed()],
-            witness,
-        ))
-    })
-    .expect("the sweep body cannot fail");
-
-    assert_eq!(
-        super::load(&state),
-        ArmingWitness::Armed,
-        "the engage's failed open moved the generation, so the stale Disarm is dropped"
-    );
-}
-
 #[skuld::test]
 fn a_sweep_that_leaves_the_record_does_no_i_o() {
-    // `Leave` says nothing about the record, so applying it must not open the directory: an open that fails would move
-    // the generation (vetoing a concurrent sweep's `Disarm`) and warn about a write nobody asked for.
+    // `Leave` says nothing about the record, so applying it must not open the directory: an open that fails would warn
+    // about a write nobody asked for.
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Layer;
 
@@ -595,8 +411,6 @@ fn a_sweep_that_leaves_the_record_does_no_i_o() {
     let state = root.path().join("state");
     std::fs::create_dir(&state).expect("state dir");
     arm(&state);
-    let since = super::snapshot(&state);
-    let generation = since.generation;
 
     let aside = root.path().join("aside");
     std::fs::rename(&state, &aside).expect("move the state dir aside");
@@ -612,18 +426,13 @@ fn a_sweep_that_leaves_the_record_does_no_i_o() {
     );
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-        super::apply(&state, since, WitnessUpdate::Leave, None);
+        super::apply(&state, WitnessUpdate::Leave, None);
     }
     let logs = writer.snapshot();
 
     std::fs::remove_dir_all(&link).expect("remove the link");
     std::fs::rename(&aside, &state).expect("put the state dir back");
 
-    assert_eq!(
-        super::snapshot(&state).generation,
-        generation,
-        "Leave is not a write attempt"
-    );
     assert!(logs.is_empty(), "Leave warned about a write nobody asked for: {logs}");
 }
 
