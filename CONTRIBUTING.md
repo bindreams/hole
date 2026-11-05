@@ -4277,8 +4277,9 @@ An error reaches a log as a value, in one form:
 tracing::warn!(error = &e as &dyn std::error::Error, "what failed");
 ```
 
-- **Boxed and borrowed.** `Box<dyn Error + Send + Sync>` and `anyhow::Error` pass as `error = &*b`. When `e` is already
-  a reference, cast it without the extra `&` (`error = e as &dyn std::error::Error`): `&&T` is not `'static`.
+- **Boxed and borrowed.** A boxed error (`Box<dyn Error>`, with or without `+ Send + Sync`) and an `anyhow::Error` pass
+  as `error = &*b`, and a reference to one as `error = &**b`. When `e` is a reference to a concrete error, cast it
+  without the extra `&` (`error = e as &dyn std::error::Error`): `&&T` is not `'static`.
 - **The message never interpolates the error** (`{e}`, `%e`, `?e`): the field carries it, and the message would print
   its first link a second time. The message names what failed.
 - **The renderer.** `YamlFormat` renders an error field as a YAML list of its `source()` chain, outermost first, each

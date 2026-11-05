@@ -6,7 +6,8 @@
 //!
 //! The walks reach only what each error exposes through `source()` (and, for
 //! [`links`], an `io::Error`'s payload). An inner error a type does not expose
-//! is invisible to every walk here, as to [`find`] and [`raw_os_error`].
+//! is invisible to both walks, and so to [`find`] and [`raw_os_error`], which
+//! are predicates over [`links`].
 
 use std::io;
 
