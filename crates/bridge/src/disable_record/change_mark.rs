@@ -6,15 +6,20 @@
 //! would be read half done. The reader reads the mark before and after and
 //! goes again if it moved ([`crate::service_scm::repair::display`]).
 //!
-//! The value is `<n>` while no change runs and `<n>:<pid>:<created>` while a
-//! holder changes the service, `n` counting every transition and the rest
-//! being the holder's [`Stamp`]. The stamp is what keeps a holder that
-//! crashed from reading as a change for ever: the reader asks whether its
-//! process runs, as it does for the record. The holder writes it under the
-//! lock, after taking it and before its first read, and writes `<n>` again
-//! after its last write and before letting go, so no change runs while the
-//! mark says none does. It sits in the service's key, which an unprivileged
-//! user can read and no user can write.
+//! The value is `<n>/<pid>:<created>` while no change runs and
+//! `<n>:<pid>:<created>` while a holder changes the service, `n` counting every
+//! transition and the rest being a [`Stamp`]: the holder's while it changes the
+//! service, the one that ended the last change at rest. The holder's stamp is
+//! what keeps one that crashed from reading as a change for ever: the reader
+//! asks whether its process runs, as it does for the record. The holder writes
+//! it under the lock, after taking it and before its first read, and writes the
+//! at-rest value after its last write and before letting go, so no change runs
+//! while the mark says none does. The ender's stamp is what keeps the at-rest
+//! value from repeating: a reinstall deletes the key and the count with it, so
+//! two installs can end at the same `n`, but never in the same process. A bare
+//! `<n>`, which an earlier build wrote at rest, equals no value written now.
+//! The mark sits in the service's key, which an unprivileged user can read and
+//! no user can write.
 
 use std::io;
 
@@ -82,10 +87,10 @@ impl ChangeKey {
         self.write(|n| format!("{n}:{}", holder.encode()))
     }
 
-    /// Marks the change ended; the key not being there is success (the
-    /// service was deleted).
-    pub fn end(&self) -> io::Result<()> {
-        self.write(|n| n.to_string())
+    /// Marks the change `holder` made ended; the key not being there is success
+    /// (the service was deleted).
+    pub fn end(&self, holder: &Stamp) -> io::Result<()> {
+        self.write(|n| format!("{n}/{}", holder.encode()))
     }
 
     /// Writes the value for transition number `previous + 1`.
@@ -122,7 +127,7 @@ impl ChangeKey {
 
 /// The count `value` starts with; 0 for a value that is not one.
 fn counted(value: &str) -> u64 {
-    let count = value.split_once(':').map_or(value, |(count, _)| count);
+    let count = value.split([':', '/']).next().unwrap_or_default();
     count.parse().unwrap_or(0)
 }
 
@@ -165,6 +170,12 @@ pub(crate) mod scratch {
 
         pub(crate) fn mark(&self) -> ChangeKey {
             ChangeKey::new(|| CURRENT_USER, self.path.clone())
+        }
+
+        /// What a reinstall does to the key: it is deleted and made again, empty.
+        pub(crate) fn recreated(&self) -> Key {
+            CURRENT_USER.remove_tree(&self.path).expect("delete the scratch key");
+            CURRENT_USER.create(&self.path).expect("create the scratch key again")
         }
 
         pub(crate) fn exists(&self) -> bool {

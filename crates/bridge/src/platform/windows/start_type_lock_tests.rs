@@ -293,7 +293,10 @@ fn every_hold_by_every_thread_changes_the_mark_twice() {
         });
     }
     let raw = scratch.mark().read();
-    assert_eq!(raw, ChangeMark::new(Some("8".to_string()), None));
+    assert_eq!(
+        raw,
+        ChangeMark::new(Some(format!("8/{}", Stamp::current().encode())), None)
+    );
 }
 
 /// No service yet (the first install): there is no key to mark, and the hold
