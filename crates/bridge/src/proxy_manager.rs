@@ -2327,7 +2327,8 @@ fn overtaken_by_release(watch: Option<&ReleaseWatch>) -> Result<(), ProxyError> 
 /// installed is first-hand evidence, stronger than the startup measurement
 /// `decide_cover_recovery` grounds its own repair write in.
 ///
-/// Promotes only over `Unset`/`Unreadable` ([`lockdown_state::Intent::admits_adoption_promotion`]).
+/// Promotes only over `Unset` ([`lockdown_state::Intent::admits_adoption_promotion`]); an unreadable record already
+/// reads armed and may hold the user's `Off`.
 /// An explicit recorded `Off` must never be clobbered: an out-of-process
 /// `hole bridge unlock` or the tray's Unblock can write it at any moment, and a
 /// claim is never proof the intent is still unset. The check and the write are

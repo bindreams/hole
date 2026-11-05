@@ -2926,7 +2926,10 @@ Disclosed residuals:
    that only arrives after `routing.install`, and `consent_gate` still asks
    for informed consent because no standing cover holds the update gap. The
    tray can therefore read `Lockdown: On (warning: not engaged)` there, which
-   is the honest rendering.
+   is the honest rendering. The start's adoption promotion
+   (`promote_unrecorded`, `Intent::admits_adoption_promotion`) writes only over
+   `Unset`: an unreadable record already reads armed, and a write over it could
+   turn a user's `Off` (a newer or obsolete schema, a garbled write) into `On`.
 
 1. Startup reconciliation is a **20-cell table** over two measured axes, not
    two bools — `decide_cover_recovery(Intent, CoverPresence)` in

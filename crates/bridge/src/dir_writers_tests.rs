@@ -440,9 +440,14 @@ fn writers() -> Vec<Writer> {
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
             run: |dir, owner| {
-                lockdown_state::promote_unrecorded(dir, owner)
-                    .map(drop)
-                    .map_err(io::Error::other)
+                // It writes only where nothing is recorded, and leaves what it cannot read as it found it.
+                match lockdown_state::promote_unrecorded(dir, owner).map_err(io::Error::other)? {
+                    true => Ok(()),
+                    false => match lockdown_state::load_intent(dir) {
+                        lockdown_state::Intent::Unreadable => Err(io::Error::other(LeftAsItIs)),
+                        _ => Ok(()),
+                    },
+                }
             },
         },
         Writer {
