@@ -4360,9 +4360,8 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   `gh release create` (`hole=true`, others `false`); without it GitHub's legacy
   semver+date heuristic can promote the wrong track (#308).
 - **garter publish is idempotent** — it queries crates.io and skips `cargo publish` if the version exists; a `dry_run` input runs `--dry-run` only.
-- **garter publish is blocked** — garter takes `cosca` as a git rev with no
-  version key, which `cargo package` refuses. It unblocks when the workspace pin
-  names a registry version, the final gate of #816.
+- **garter publishes against crates.io's `cosca`** — the workspace pins a registry
+  version, so `cargo package` accepts the dependency.
 - **Versions** live in each crate's `[package.metadata.hole-release].group`
   (ex-ray in `crates/ex-ray/version.toml`); validate with `cargo xtask version [--check --group <name> [--exact]]` (release CI uses `--exact`). The legacy
   `v0.1.0` tag predates the scheme and is ignored.
