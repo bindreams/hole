@@ -425,8 +425,10 @@ impl Cover {
 
     /// Disengage this cover under `lock`; a stale install disengages nothing (its token is already dropped).
     pub(crate) fn release(mut self, lock: &CoverLock) {
-        let held = self.held.take().expect("a live cover holds its claim");
+        let held = self.held.as_ref().expect("a live cover holds its claim");
         self.stamp.release(lock, || held.disengage(self.stamp.kind()));
+        // Emptied only once the disengage returned: a panic in it unwinds with the claim in place, so `Drop` retries.
+        self.held = None;
     }
 
     pub(crate) fn is_current(&self) -> bool {

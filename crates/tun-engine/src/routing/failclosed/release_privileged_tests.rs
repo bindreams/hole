@@ -373,6 +373,39 @@ fn release_all_leaves_nothing_the_oracle_can_see() {
     );
 }
 
+/// A release that panics before it deletes (here: the lock is another directory's) leaves the guard owning its
+/// cover, so the unwind's `Drop` still removes it.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn release_all_finds_nothing_after_a_release_that_panicked() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
+    let routing = SystemRouting::new(dir.path().to_path_buf(), None);
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    assert_baseline_reachable(dir.path());
+
+    let cover = routing
+        .install_failclosed_cover(&routing.lock_covers(), server_ip, None)
+        .expect("engage the real transient cover");
+    assert!(
+        held_covers(dir.path()).is_some(),
+        "the cover must be in force before the release"
+    );
+
+    let wrong_lock = CoverLock::acquire(other.path());
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cover.release(&wrong_lock)));
+    assert!(panicked.is_err(), "releasing under another directory's lock must panic");
+    drop(wrong_lock);
+
+    assert_eq!(
+        held_covers(dir.path()),
+        None,
+        "the unwound guard's Drop must have removed the cover the panicking release left in place"
+    );
+}
+
 /// A release that cleared the record but left pf blocking: the record is the only thing the engaging
 /// directory can show, so the oracle must read the live ruleset.
 #[cfg(target_os = "macos")]

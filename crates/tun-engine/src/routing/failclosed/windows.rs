@@ -2024,9 +2024,12 @@ impl Cover {
 
     /// Delete this cover under `lock`, then close the engine. A stale install deletes nothing but still closes it.
     pub(crate) fn release(mut self, lock: &CoverLock) {
-        let engine = self.engine.take().expect("a live cover holds its engine");
+        let engine = self.engine.expect("a live cover holds its engine");
         let kind = self.stamp.kind();
         self.stamp.release(lock, || Self::delete_filters(engine, kind));
+        // Emptied only once the deletes returned: a panic in them unwinds with the engine in place, so `Drop`
+        // retries and closes it.
+        self.engine = None;
         Self::close_engine(engine);
     }
 
