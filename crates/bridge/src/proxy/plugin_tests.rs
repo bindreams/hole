@@ -133,9 +133,10 @@ async fn dropping_a_chain_task_cancels_its_token_and_aborts_its_task() {
 
 mod identity {
     use super::super::{record_plugin_pid, PluginChain};
-    use crate::plugin_state::{self, Loaded, STATE_FILE_NAME};
+    use crate::plugin_state::{self, STATE_FILE_NAME};
     use crate::test_support::reap_child::EchoChild;
     use tokio_util::sync::CancellationToken;
+    use util::versioned_file::Loaded;
 
     fn synthetic_record() -> cosca::identity::ProcessIdRecord {
         cosca::identity::ProcessIdRecord {
@@ -163,7 +164,7 @@ mod identity {
 
         record_plugin_pid(dir.path(), child.pid(), None);
 
-        let Loaded::State(state) = plugin_state::load(dir.path()) else {
+        let Loaded::Current { value: state, .. } = plugin_state::load(dir.path()) else {
             panic!("the sink must have written a loadable state file");
         };
         assert_eq!(state.plugins.len(), 1, "one spawn, one record");
@@ -173,6 +174,18 @@ mod identity {
             child.identity(),
             "the record must be built from the child's resolved identity"
         );
+    }
+
+    #[skuld::test]
+    fn a_plugin_start_with_an_unreadable_record_still_succeeds() {
+        // `record_plugin_pid` warns and returns; the record it could not extend is left as it was.
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = b"not json";
+        std::fs::write(dir.path().join(STATE_FILE_NAME), corrupt).unwrap();
+
+        record_plugin_pid(dir.path(), std::process::id(), None);
+
+        assert_eq!(std::fs::read(dir.path().join(STATE_FILE_NAME)).unwrap(), corrupt);
     }
 
     #[skuld::test]

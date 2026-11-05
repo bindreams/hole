@@ -11,119 +11,87 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use util::versioned_file::{
+    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
+};
 
 // Types ===============================================================================================================
-
-pub const SCHEMA_VERSION: u32 = 2;
 
 /// Filename of the persisted state file under `state_dir`. Exported so
 /// external tooling can reference the single source of truth.
 pub const STATE_FILE_NAME: &str = "bridge-plugins.json";
 
+/// The plugin children a run started and has not yet reaped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PluginState {
-    pub version: u32,
     pub plugins: Vec<cosca::identity::ProcessIdRecord>,
 }
 
-/// What [`load`] found. Deliberately no `PartialEq`: a variant carrying an
-/// `io::Error` joins this set, so callers and tests match with `matches!`.
-#[derive(Debug)]
-pub enum Loaded {
-    /// No state file — nothing was ever recorded, or a reap already cleared it.
-    Absent,
-    /// Present, but the read itself failed: a sharing violation, an EACCES, a
-    /// short read. The records may be perfectly valid and name live processes,
-    /// so this is not "worthless". The io error travels with the variant
-    /// because this is the one arm that deliberately leaves the file behind
-    /// for a human, and the remedy depends on why.
-    Unreadable(std::io::Error),
-    /// Present and read, but provably worthless: an old schema, malformed
-    /// JSON, or an unknown field. Nothing in it can name a process.
-    Unusable,
-    /// Parsed at the current schema version.
-    State(PluginState),
+/// Schema 2. Version 1 held `{pid, start_time_unix_ms}` records, which cannot name a process.
+impl Schema for PluginState {
+    const VERSION: u32 = 2;
+    type Prev = Obsolete<1>;
+
+    fn upgrade(prev: Obsolete<1>) -> Self {
+        match prev {}
+    }
 }
+
+/// An OS record: it may name plugins that are still running, so one this release cannot read is never replaced or
+/// removed.
+impl VersionedState for PluginState {
+    const FILE_NAME: &'static str = STATE_FILE_NAME;
+    const ROLE: Role = Role::OsRecord;
+}
+
+util::assert_contiguous!(PluginState);
 
 // I/O =================================================================================================================
 
-/// Write `state` to `<state_dir>/bridge-plugins.json` atomically.
-/// Same atomic-write pattern as `routing::state::write`.
-pub fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
+/// The plugin record's file. Every read and write of it goes through this type.
+pub type PluginFile = VersionedFile<PluginState>;
+
+pub fn file(state_dir: &Path) -> PluginFile {
+    VersionedFile::new(state_dir)
 }
 
-/// Append a single record to the state file. Creates the file if missing.
-/// Reads existing records, merges, atomically writes the result.
+/// Appends a single record, creating the file if missing. A newer, corrupt or unreadable record is refused
+/// ([`StoreError`]) and left as it is: rewriting it with one record would drop the plugins it tracks. An obsolete
+/// one is replaced without a backup.
 pub fn append_record(
     state_dir: &Path,
     record: cosca::identity::ProcessIdRecord,
     owner: Option<(u32, u32)>,
-) -> std::io::Result<()> {
-    append_loaded(load(state_dir), state_dir, record, owner)
+) -> Result<(), StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement { owner }, |observed| {
+            let mut state = match &observed.loaded {
+                Loaded::Current { value, .. } => value.clone(),
+                // Nothing to extend. The role refuses a store over a newer, corrupt or unreadable record; an obsolete
+                // one is replaced without a backup, by design.
+                Loaded::Absent
+                | Loaded::Obsolete { .. }
+                | Loaded::Newer { .. }
+                | Loaded::Corrupt { .. }
+                | Loaded::Unreadable { .. } => PluginState { plugins: Vec::new() },
+            };
+            state.plugins.push(record);
+            (Change::Store(state), ())
+        })
+        .map(|_| ())
 }
 
-/// The append's dispositions, over an already-loaded state. Taking `Loaded` by
-/// value makes every arm drivable from a test without a fixture that has to
-/// defeat a real `fs::read`.
-///
-/// Called at plugin spawn, where a file that will not parse is already dead
-/// weight, so `Absent` and `Unusable` both start a fresh state. A file that
-/// could not be *read* is not dead weight: rewriting it with a single record
-/// would drop the previously-tracked plugins permanently, so the read error is
-/// returned and nothing is written.
-pub(crate) fn append_loaded(
-    loaded: Loaded,
-    state_dir: &Path,
-    record: cosca::identity::ProcessIdRecord,
-    owner: Option<(u32, u32)>,
-) -> std::io::Result<()> {
-    let mut state = match loaded {
-        Loaded::State(state) => state,
-        Loaded::Unreadable(e) => return Err(e),
-        Loaded::Absent | Loaded::Unusable => PluginState {
-            version: SCHEMA_VERSION,
-            plugins: Vec::new(),
-        },
-    };
-    state.plugins.push(record);
-    save(state_dir, &state, owner)
+/// Reads the record. A failed read, a newer or a corrupt record is for the caller to act on; the schema/JSON detail
+/// is logged where it is detected.
+pub fn load(state_dir: &Path) -> Loaded<PluginState> {
+    file(state_dir).observe().loaded
 }
 
-/// Load the state file, distinguishing "nothing recorded" from "could not be
-/// read" from "recorded but worthless". Logs the schema/JSON detail where it
-/// is detected; a failed read is reported to the caller instead, because the
-/// caller is the one that knows the consequence.
-pub fn load(state_dir: &Path) -> Loaded {
-    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Absent,
-        Err(e) => return Loaded::Unreadable(e),
-    };
-    match serde_json::from_slice::<PluginState>(&bytes) {
-        Ok(state) if state.version == SCHEMA_VERSION => Loaded::State(state),
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = SCHEMA_VERSION,
-                "plugin-state schema mismatch, discarding"
-            );
-            Loaded::Unusable
-        }
-        Err(e) => {
-            // The error quotes the file, which the user may have put there: keep its position, not its text.
-            let e = util::parse_error::ParseFailure::from(&e);
-            tracing::warn!(error = %e, file = STATE_FILE_NAME, "plugin-state parse failed");
-            Loaded::Unusable
-        }
-    }
-}
-
-/// Delete the state file. Tolerates a missing file.
-pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
+/// Deletes the record. One this release cannot read is kept ([`UpdateOutcome::Kept`]).
+pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
+        .map(|((), outcome)| outcome)
 }
 
 #[cfg(test)]

@@ -59,7 +59,7 @@
 //! follows a symlink at the name: a link is renamed, linked or removed as
 //! itself, and reading or appending through one is an error. [`Dir::stage`]
 //! writes a complete temp file that [`Staged::publish`] renames over a name or
-//! [`Staged::claim`] links to a free one; [`Dir::write_atomic`] is the two in one.
+//! [`Staged::claim`] renames to a free one; [`Dir::write_atomic`] is the two in one.
 //! On Windows a file that is read or appended shares everything with other
 //! handles, delete included, and a replace or an unlink has POSIX semantics where
 //! the volume has them (Windows 10 1607, NTFS), so an open reader neither blocks
@@ -443,10 +443,22 @@ impl Staged<'_> {
         Ok(())
     }
 
-    /// Gives the temp file the final name if that is free (`AlreadyExists` otherwise), by a hard link, then removes
-    /// the temp name. Two claims of one name cannot both win, and a reader never sees a partial file.
+    /// Gives the temp file the final name if that is free (`AlreadyExists` otherwise), by one rename that refuses to
+    /// replace: two claims of one name cannot both win, a reader never sees a partial file, and the file never has
+    /// a second name. Where the platform or filesystem has no such rename the error is `Unsupported`; nothing is
+    /// claimed, and the temp name is removed on drop.
     pub fn claim(self) -> io::Result<()> {
-        self.dir.link(&self.temp_name, &self.name)
+        self.claim_with(|| {})
+    }
+
+    /// [`Self::claim`] with `after_claim` run right after the name is taken, before the staged value is dropped.
+    pub(crate) fn claim_with(mut self, after_claim: impl FnOnce()) -> io::Result<()> {
+        // Closed first: Windows renames a name only once no handle without delete sharing is open on it.
+        drop(self.temp.take());
+        self.dir.rename_noreplace(&self.temp_name, &self.name)?;
+        self.pending = false;
+        after_claim();
+        Ok(())
     }
 }
 
@@ -456,7 +468,7 @@ impl Drop for Staged<'_> {
         drop(self.temp.take());
         if self.pending {
             // The caller already has its answer, so a failure is logged, not returned: the name stays in a folder
-            // a user may own, and after a `claim` it is a second link to the published file. Gone already is fine.
+            // a user may own. Gone already is fine.
             match platform::unlink(&self.dir.file, &self.temp_name) {
                 Err(err) if err.kind() != io::ErrorKind::NotFound => {
                     tracing::warn!(error = %err, temp = %self.temp_name.to_string_lossy(), "a temporary file was left behind");
@@ -473,53 +485,16 @@ pub fn give_file(file: &File, owner: Option<(u32, u32)>) {
     platform::give_file(file, owner);
 }
 
-/// Writes `bytes` to the state file `name` in `state_dir` as a whole or not at all, for a privileged
-/// writer whose state directory the interactive user may own: the directory is opened without
-/// following a symlink and created if missing, handed to `owner`, and the file is written through
-/// [`Dir::write_atomic`] (owned by `owner`, mode `0600`, unix). Nothing goes by path after the open.
-pub fn write_state_file(state_dir: &Path, name: &OsStr, bytes: &[u8], owner: Option<(u32, u32)>) -> io::Result<()> {
-    let dir = Dir::open(state_dir, true, owner)?;
-    dir.secure(owner, None)?;
-    dir.write_atomic(name, bytes, owner, |_| Ok(()))
-}
-
-/// Removes the state file `name` in `state_dir`, the counterpart of [`write_state_file`] for a privileged step that
-/// runs in a folder the interactive user may own: the directory is opened without following a symlink and the name
-/// is unlinked through the handle, so a link planted in the path is refused ([`Refusal`]) and a link at the name is
-/// removed as itself. Missing is `Ok`, whether the file or the directory. Nothing is created.
-pub fn remove_state_file(state_dir: &Path, name: &OsStr) -> io::Result<()> {
-    let dir = match Dir::open(state_dir, false, None) {
-        Ok(dir) => dir,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    match dir.unlink(name) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
-}
-
 /// Makes `dir` (and the folders above it) if missing and frees `name` in it, for a privileged step about to create
 /// `name` itself by path, as a socket bind does, in a folder the interactive user may own. Both go through a handle
 /// opened without following a symlink: a link planted on the way is refused ([`Refusal`]), and what is at `name`
 /// (a stale file, or a link) is unlinked as itself. A name that is not there is `Ok`; one that cannot be unlinked is
-/// an error, as it is for [`remove_state_file`].
+/// an error.
 pub fn make_dir_and_free_name(dir: &Path, name: &OsStr) -> io::Result<()> {
     match Dir::open(dir, true, None)?.unlink(name) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
     }
-}
-
-/// The whole file `name` in the state directory `state_dir`, the counterpart of [`write_state_file`] for a reader
-/// that runs privileged. `NotFound` for a missing file or directory. The directory is walked by [`ReadDir::open`]: a
-/// link at the name, or a FIFO a user planted there, is an error, never the file it leads to and never a wait. So is a
-/// file the folder's owner cannot vouch for ([`Refusal::ForeignFile`]): one owned by the folder's own user is read, and
-/// so is one the system owns that has no second name, but a second name a user added to any other file is not. The
-/// files this reads are published by rename, so none has a second name of its own making. A file the system owns that
-/// the user moved to the name is read: the caller parses it as its schema and logs a `ParseFailure`, never the text.
-pub fn read_state_file(state_dir: &Path, name: &OsStr) -> io::Result<Vec<u8>> {
-    ReadDir::open(state_dir)?.read_vouched(name)
 }
 
 /// The whole file `name` in the directory `dir`, through a handle that shares delete, so a replace of the file does

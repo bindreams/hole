@@ -54,7 +54,7 @@ fn save(dir: &Path, state: &RouteState, owner: Option<(u32, u32)>) -> Result<(),
     write(&file(dir), state, owner)
 }
 
-fn clear(dir: &Path) -> std::io::Result<Cleared> {
+fn clear(dir: &Path) -> Result<Cleared, StoreError> {
     remove(&file(dir))
 }
 
@@ -228,12 +228,27 @@ fn save_over_a_record_whose_read_fails_is_refused_and_leaves_it() {
     let err = write(&file_whose_reads_fail(dir.path()), &sample_ipv4(), None).expect_err("must refuse");
 
     assert!(
-        matches!(&err, StoreError::ReadFailed { path: p, kind } if *p == path && *kind == std::io::ErrorKind::PermissionDenied),
+        matches!(&err, StoreError::ReadFailed { file, kind } if *file == STATE_FILE_NAME && *kind == std::io::ErrorKind::PermissionDenied),
         "{err:?}"
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
     let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
     assert_eq!(leftovers.len(), 1, "no temp file or backup may appear");
+}
+
+/// A second name for a record is read only when the folder's owner can vouch for the file; a test cannot make a file the
+/// system owns, so the expectation follows the runner.
+#[skuld::test]
+fn a_route_record_with_a_second_name_reads_as_unreadable_when_the_runner_is_the_system() {
+    use util::dir::testing::{planted_name_is_not_read, PlantedName, Reader};
+    let scratch = tempfile::tempdir().unwrap();
+    let reader = Reader {
+        file: STATE_FILE_NAME,
+        write_valid: &|dir| save(dir, &sample_ipv4(), None).unwrap(),
+        reads_it: &|dir| load_record(dir).is_some(),
+    };
+
+    planted_name_is_not_read(scratch.path(), PlantedName::HardLink, &reader).unwrap();
 }
 
 #[skuld::test]

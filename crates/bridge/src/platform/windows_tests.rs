@@ -45,7 +45,7 @@ fn stopped_status_is_terminal_and_carries_the_exit_code() {
 #[skuld::test]
 fn post_bind_sweep_clears_marker() {
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &super::test_marker(), None).unwrap();
     sweep_marker(dir.path());
     assert!(!hole_common::update_marker::is_present(dir.path()));
     sweep_marker(dir.path()); // idempotent: absent marker is a no-op
@@ -54,7 +54,7 @@ fn post_bind_sweep_clears_marker() {
 #[skuld::test]
 fn sweep_marker_then_ready_sweeps_before_reporting() {
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &super::test_marker(), None).unwrap();
     let marker_gone_when_reported = std::cell::Cell::new(false);
     super::sweep_marker_then_ready(dir.path(), || {
         marker_gone_when_reported.set(!hole_common::update_marker::is_present(dir.path()));
@@ -73,7 +73,7 @@ fn sweep_marker_then_ready_errs_when_marker_survives_sweep() {
     // Inject a no-op sweep so the marker survives: the helper must return Err and
     // NEVER report Running (which would false-fail a healthy update).
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &super::test_marker(), None).unwrap();
     let reported = std::cell::Cell::new(false);
     let out = super::sweep_marker_then_ready_with(
         || {}, // no-op sweep: the marker is NOT removed

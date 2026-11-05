@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
+use crate::test_support::target_records;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 use std::io;
@@ -1026,7 +1027,7 @@ fn an_unexpected_death_moves_the_target_off() {
         let routing = MockRouting::new(dir.path().to_path_buf());
         let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
         pm.start(&test_config()).await.unwrap();
-        target::save(
+        target_records::save(
             dir.path(),
             &Target::Connected {
                 config: Box::new(test_config()),
@@ -1324,7 +1325,7 @@ fn a_plugin_chain_death_moves_the_target_off() {
         let routing = MockRouting::new(dir.path().to_path_buf());
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         pm.start(&test_config()).await.unwrap();
-        target::save(
+        target_records::save(
             dir.path(),
             &Target::Connected {
                 config: Box::new(test_config()),
@@ -1863,7 +1864,7 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
             // reaching the `Connected` arm's `Hold` (what a cutover needs)
             // requires the target to already read `Connected` before the
             // stop.
-            target::save(
+            target_records::save(
                 dir.path(),
                 &Target::Connected {
                     config: Box::new(test_config()),
@@ -5832,7 +5833,7 @@ fn a_cutover_stop_keeps_the_claim() {
         // `Connected` arm's `Hold` (what a cutover needs) requires the
         // target to already read `Connected` — `start()` itself never
         // persists it (that is `ipc::persist_after_start`'s job).
-        target::save(
+        target_records::save(
             dir.path(),
             &Target::Connected {
                 config: Box::new(test_config()),
@@ -5870,7 +5871,7 @@ fn a_cutover_leaves_the_persisted_target_connected() {
         let connected = Target::Connected {
             config: Box::new(test_config()),
         };
-        target::save(dir.path(), &connected, None).unwrap();
+        target_records::save(dir.path(), &connected, None).unwrap();
 
         pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
 
@@ -5956,7 +5957,7 @@ fn an_unexpected_session_death_retires_the_claim_too() {
         let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
-        target::save(
+        target_records::save(
             dir.path(),
             &Target::Connected {
                 config: Box::new(test_config()),

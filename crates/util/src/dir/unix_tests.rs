@@ -493,12 +493,11 @@ fn a_symlink_below_a_directory_the_caller_can_only_search_is_followed_by_the_sam
 
 // rename_noreplace ----------------------------------------------------------------------------------------------------
 
-/// Only an answer that says the flag is unavailable falls back to the hard link. `EPERM` is a real refusal (a sticky
-/// directory, a security module): the link is allowed where the rename was not, and the delete that follows it is
-/// refused again, so the fallback would leave a backup and fail.
+/// Only an answer that says the flag is unavailable is `Unsupported`. `EPERM` is a real refusal (a sticky directory,
+/// a security module), not a filesystem without the flag.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn only_renameat2_answers_that_mean_it_is_unavailable_fall_back_to_the_link() {
+fn only_renameat2_answers_that_mean_it_is_unavailable_are_unsupported() {
     for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP] {
         assert!(renameat2_unavailable(errno), "errno {errno}");
     }

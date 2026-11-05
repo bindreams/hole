@@ -551,8 +551,9 @@ start and is not restarted ([garter README](crates/garter/README.md)).
 
 A cross-process lock on a file goes through
 [`file_lock::Exclusive`](crates/file-lock/src/exclusive.rs) (`flock` /
-`LockFileEx`), not a second implementation. The bridge's liveness lock and
-`TargetExclusive` use it.
+`LockFileEx`), not a second implementation. The bridge's liveness lock uses it. A
+state file takes no lock file: `VersionedFile` serializes in-process callers on a
+per-path lock and `BridgeLiveness` excludes other processes.
 
 The lock file sits in a state directory the interactive user may own, so
 whatever is at its name is attacker-chosen and the name can change between any
@@ -614,23 +615,29 @@ file at the name, a file owned by a third party, or a directory in the path that
 `file_lock::Refused`. A second name for the lock file is not: the count can change
 after it is read.
 
-State-file writers use the same handle. `bridge-target.json`,
-`bridge-startup.json`, `bridge-plugins.json` and the four fail-closed files
-(`bridge-failclosed.json`, `bridge-lockdown.json`, `bridge-lockdown-pf.json`,
-`bridge-boottime.json`) are written by `Dir::write_atomic` (most through
-`util::dir::write_state_file`): the temp file's owner, mode and ACL are set
-on its own handle before the rename and nothing touches the final name after it,
-so a name swapped for a hard link or symlink after the rename changes nothing.
-`the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps them on it.
-
-`bridge-routes.json` is a `util::versioned_file::VersionedFile`, which opens its
-directory as a `Dir` for each call (load, store, remove, move-aside) and does
-every step inside that handle: the read, the staged temp file (sealed through its
-own handle), the backup hard link, the no-clobber rename, the replace and the
-directory flush. A symlink at the file's own name is never read through: it is a
+State-file writers use the same handle. Every state file is a
+`util::versioned_file::VersionedFile` (`bridge-routes.json`, `bridge-target.json`,
+`bridge-startup.json`, `bridge-plugins.json`, `bridge-dns.json`, the update marker
+and the fail-closed files `bridge-failclosed.json`, `bridge-lockdown.json`,
+`bridge-lockdown-pf.json`, `bridge-boottime.json`), and its three calls
+(`observe`, `update`, `create_new`) open the directory as a `Dir` and do every
+step inside that handle: the read, the staged temp file (sealed through its own
+handle: owner, mode and ACL are set before the rename), the backup hard link, the
+no-clobber rename, the replace and the directory flush. Nothing touches the final
+name after the rename, so a name swapped for a hard link or symlink after it
+changes nothing. A symlink at the file's own name is never read through: it is a
 file this release cannot read, and the file's role decides what happens to it.
-The update marker (`hole_common::update_marker`) and the log directory
-(`hole_common::logging::init_dual`, with `DirRotate`) are written the same way.
+`the_state_file_writers_never_chown_chmod_or_rename_by_path` keeps the writers on
+it. The log directory (`hole_common::logging::init_dual`, with `DirRotate`) is
+written through the same `Dir`.
+
+A write that reached the rename is complete: a failure of the directory flush after it is logged at warn and the call
+is `Ok`, because the caller acts on what is on disk. A refusal (`StoreError::Unreadable`, `ReadFailed`) names the file,
+never its directory. Every state file reader ignores a field it does not know (the owner's rule, "readers ignore unknown
+fields"): the version is the only compatibility signal. For the lockdown intent, the boot-time witness,
+`bridge-failclosed.json` and `bridge-lockdown-pf.json` that changed with `VersionedFile`, which replaced
+`deny_unknown_fields`: `{"version":1,"enabled":false,"stray":1}` now reads as the intent Off, where it was
+`Unreadable` (which keeps a standing cover at boot).
 
 `Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
 lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
@@ -701,7 +708,7 @@ re-derive them.
    file's owner and mode are left alone.
 
 1. **Read through the handle too.** A privileged read of a fixed name in such a folder is `ReadDir::read` after the
-   same walk (`util::dir::read_state_file` for a state file). `std::fs::read` opens by path without `O_NONBLOCK`: a
+   same walk (`VersionedFile::observe` for a state file, `ReadDir::read_vouched` for any other). `std::fs::read` opens by path without `O_NONBLOCK`: a
    FIFO the user plants at the name hangs the bridge (at start, before it serves; at shutdown, before it tears
    down), a link to `/dev/zero` is read without end, and a link is read as any path the user names. A read by
    path stays only where the reader is the unprivileged GUI. Code that only reads holds a `ReadDir`, not a `Dir`:
@@ -709,24 +716,25 @@ re-derive them.
    written, on any platform. Windows is not asked for the right to add to a `ReadDir`'s directory, so a folder
    whose ACL a machine tightened to read-only for the reader (the GUI reads the update marker as the user) is
    still read. Code that also writes opens a `Dir` and takes a `ReadDir` view of it with `Dir::reader`
-   (`VersionedFile::store` and `remove` read the current file that way; `load` opens a `ReadDir`).
+   (`VersionedFile::update` reads the current file that way; `observe` opens a `ReadDir`).
 
-   `read_state_file` also refuses a file the folder's owner cannot vouch for (`Refusal::ForeignFile`, decided by
+   `ReadDir::read_vouched`, which `VersionedFile::observe` reads with, also refuses a file the folder's owner cannot vouch for (`Refusal::ForeignFile`, decided by
    `trail::may_read` on both platforms): the file must be owned by the folder's own user, or by the system (root,
    SYSTEM, Administrators) with exactly one link. A user can hard-link any file the system can read at a state name
    (macOS has no `protected_hardlinks`), and the planted name has two links. The rule stops that and nothing else
    about ownership: a file the system owns that the user moved into the folder keeps its owner and its one link
    (a rename moves the inode), so it is read. What the user could learn from it is limited by the readers, below.
-   This holds only for the state files,
-   which are published by rename and so have one name; `ReadDir::read`, which `VersionedFile::load` and the update
-   marker use, does not have it yet, because `VersionedFile::store` and the marker's claim make a second name for a
-   live file themselves. The rule reaches them in the follow-up branch `azhukova/1118-2`.
+   This holds for the files read with
+   `read_vouched`, which are published by rename (the update marker's claim by a rename that refuses to replace) and
+   so have one name; `ReadDir::read` does not have it, and is for a file that has a second name by design. A
+   filesystem with no such rename fails the claim, and the move-aside of an unreadable record, with an `Unsupported`
+   error naming the file; neither falls back to a hard link, which would leave the file under two names.
 
-1. **Remove and move aside through the handle too.** A state file is removed with `util::dir::remove_state_file` and
-   moved aside with `Dir::rename_noreplace` (`dns_state::supersede`), never `std::fs::remove_file` or `rename` on a
+1. **Remove and move aside through the handle too.** A state file is removed by `VersionedFile::update` with `Change::Remove` and
+   moved aside by `Change::MoveAside` or `Dir::rename_noreplace` (`dns_state::supersede`), never `std::fs::remove_file` or `rename` on a
    path: a component the user swapped for a link redirects the call, and a probe followed by a rename replaces a name
    that appeared in between. The same holds for the stale socket (`socket::remove`, `util::dir::make_dir_and_free_name`)
-   and the installer's SID file in the `hole` folder of `%ProgramData%`, to which a standard user can add names (it
+   and the installer's SID file (`Dir::write_atomic`, `ReadDir::read_vouched`, `socket::remove_name`) in the `hole` folder of `%ProgramData%`, to which a standard user can add names (it
    inherits `BUILTIN\Users:(CI)(WD,AD,WEA,WA)`; the installer does not narrow it). The socket's bind and the mode or
    DACL set on it afterwards still name it by path: no platform binds relative to a directory handle. A folder named by
    `--socket-path` is walked like the default one, so a link is followed only under the ownership-transition rule (one
@@ -743,12 +751,12 @@ re-derive them.
 `crates/bridge/src/dir_writers_tests.rs` holds every writer into a state directory to two properties: a hard link, a
 symlink or a FIFO planted at a name it acts on changes nothing it leads to, and the writer either takes the name over
 (or removes it) or refuses it with a typed refusal, and a second run in the same layout, with or without a user's link
-on the path, succeeds. A source file that opens a `Dir`, calls `write_state_file`, `remove_state_file`,
-`make_dir_and_free_name` or `append_own_file`, or writes a `VersionedFile`, and has no row in its table fails
+on the path, succeeds. A source file that opens a `Dir`, calls `make_dir_and_free_name` or `append_own_file`, or
+writes a `VersionedFile`, and has no row in its table fails
 `every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. The readers have the same kind
 of table (`no_reader_reads_through_a_symlink_planted_at_its_name`, `no_reader_waits_on_a_fifo_planted_at_its_name`,
 and `state_symlink_tests.rs` in `tun-engine`): each writes a valid file, plants the name, and the reader must not
-report the file the name leads to. A hard link is the file's own inode, so only `read_state_file`'s ownership and link-count rule tells it from the
+report the file the name leads to. A hard link is the file's own inode, so only `read_vouched`'s ownership and link-count rule tells it from the
 file (`no_reader_reads_a_hard_link_the_system_would_not_have_made` and its `tun-engine` twin: a test cannot make a
 file the system owns without being the system, so the planted name is refused when the runner is root or an elevated
 token and read when it is a user). What a reader takes from a folder the user owns is parsed as that state's schema
@@ -3201,8 +3209,9 @@ of flashing Disconnected while it is set, the bridge shutdown disarms the cover
 while it is set, and it is the PR3 banner source. It is cleared unconditionally
 (remove-by-name, never parse-then-clear) on the next bridge's post-bind sweep.
 Every write, the clear and the read go through the log directory's no-follow `Dir`
-handle (a temp file staged and sealed through its own handle, then renamed or, for
-the single-occupancy claim, hard-linked). The read is the same for the GUI as the
+handle (a temp file staged and sealed through its own handle, then renamed; the
+single-occupancy claim renames without replacing, and fails with `Unsupported`, naming
+the file, where the filesystem has no such rename). The read is the same for the GUI as the
 user and for the bridge as root: the bridge reads it in a log directory a user may
 own, where a FIFO planted at the name must not be waited for. A link or a FIFO at
 the name reads as `Marker::Indeterminate`, a claim of no cutover.
@@ -3269,8 +3278,8 @@ callback does.
 unprivileged GUI. The sweep opens `log_dir` through `Dir` and reads each marker
 through a `ReadDir` by its name inside that handle: a symlink at a marker name
 is reported unreadable and unlinked as itself, a FIFO is never waited for, and a
-marker the directory's owner cannot vouch for (`ReadDir::read_vouched`, the rule
-of `read_state_file`) is reported unreadable too.
+marker the directory's owner cannot vouch for (`ReadDir::read_vouched`) is reported
+unreadable too.
 The listing of names is by path (names only; each read and removal is by name
 in the handle, as `cleanup_legacy_daily_logs` does).
 

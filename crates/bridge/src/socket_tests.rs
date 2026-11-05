@@ -130,6 +130,22 @@ fn remove_removes_a_file_and_answers_ok_for_a_missing_one() {
     assert!(!path.exists());
 }
 
+#[skuld::test]
+fn remove_removes_a_symlink_at_the_name_and_not_what_it_points_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("kept"), b"keep").unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    util::dir::testing::plant_link(&target, &state.join("hole-bridge.sock"));
+
+    remove(&state.join("hole-bridge.sock")).unwrap();
+
+    assert!(std::fs::symlink_metadata(state.join("hole-bridge.sock")).is_err());
+    assert_eq!(std::fs::read(target.join("kept")).unwrap(), b"keep");
+}
+
 // Security ------------------------------------------------------------------------------------------------------------
 
 /// Verify that `bind_restricted` applies mode 0600 to the socket file.

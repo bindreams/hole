@@ -27,12 +27,8 @@ fn lockdown_state_is_not_written_through_a_symlinked_state_directory() {
     let (_tmp, scratch, state_dir) = state_dir_linked_to_the_system();
     let names = [lockdown_state::STATE_FILE_NAME];
     let before = present(&scratch, &names);
-    let state = lockdown_state::LockdownState {
-        version: lockdown_state::SCHEMA_VERSION,
-        enabled: true,
-    };
 
-    assert!(lockdown_state::save(&state_dir, &state, None).is_err());
+    assert!(lockdown_state::set_enabled(&state_dir, true, None).is_err());
 
     assert_eq!(
         present(&scratch, &names),
@@ -60,11 +56,10 @@ fn the_boottime_witness_is_not_written_through_a_symlinked_state_directory() {
 #[skuld::test]
 #[cfg(target_os = "macos")]
 fn failclosed_state_is_not_written_through_a_symlinked_state_directory() {
-    use super::failclosed_state::{save, FailClosedState, SCHEMA_VERSION, STATE_FILE_NAME};
+    use super::failclosed_state::{save, FailClosedState, STATE_FILE_NAME};
     let (_tmp, scratch, state_dir) = state_dir_linked_to_the_system();
     let before = present(&scratch, &[STATE_FILE_NAME]);
     let state = FailClosedState {
-        version: SCHEMA_VERSION,
         pf_token: "1".into(),
         pf_was_enabled: true,
     };
@@ -81,11 +76,10 @@ fn failclosed_state_is_not_written_through_a_symlinked_state_directory() {
 #[skuld::test]
 #[cfg(target_os = "macos")]
 fn lockdown_pf_state_is_not_written_through_a_symlinked_state_directory() {
-    use super::lockdown_pf_state::{save, LockdownPfState, SCHEMA_VERSION, STATE_FILE_NAME};
+    use super::lockdown_pf_state::{save, LockdownPfState, STATE_FILE_NAME};
     let (_tmp, scratch, state_dir) = state_dir_linked_to_the_system();
     let before = present(&scratch, &[STATE_FILE_NAME]);
     let state = LockdownPfState {
-        version: SCHEMA_VERSION,
         pf_token: "1".into(),
         main_snapshot: String::new(),
         nat_snapshot: String::new(),
@@ -108,12 +102,8 @@ fn lockdown_state_is_written_through_a_users_link_to_the_users_folder() {
     user_dir(&real);
     let state_dir = tmp.path().join("state");
     plant_link(&real, &state_dir);
-    let state = lockdown_state::LockdownState {
-        version: lockdown_state::SCHEMA_VERSION,
-        enabled: true,
-    };
 
-    lockdown_state::save(&state_dir, &state, None).unwrap();
+    lockdown_state::set_enabled(&state_dir, true, None).unwrap();
 
     assert!(real.join(lockdown_state::STATE_FILE_NAME).is_file());
 }
@@ -128,7 +118,10 @@ use util::dir::testing::{planted_name_is_not_read, PlantedName, Reader};
 
 #[cfg(target_os = "macos")]
 fn write_state(dir: &std::path::Path, name: &str, json: &[u8]) {
-    util::dir::write_state_file(dir, std::ffi::OsStr::new(name), json, None).unwrap();
+    util::dir::Dir::open(dir, true, None)
+        .unwrap()
+        .write_atomic(std::ffi::OsStr::new(name), json, None, |_| Ok(()))
+        .unwrap();
 }
 
 /// The readers by name, and what each reports of a valid file.
@@ -139,13 +132,7 @@ fn readers() -> Vec<(&'static str, Reader<'static>)> {
             "lockdown_state::load_intent",
             Reader {
                 file: lockdown_state::STATE_FILE_NAME,
-                write_valid: &|dir| {
-                    let state = lockdown_state::LockdownState {
-                        version: lockdown_state::SCHEMA_VERSION,
-                        enabled: true,
-                    };
-                    lockdown_state::save(dir, &state, None).unwrap();
-                },
+                write_valid: &|dir| lockdown_state::set_enabled(dir, true, None).unwrap(),
                 reads_it: &|dir| lockdown_state::load_intent(dir) == lockdown_state::Intent::On,
             },
         ),
@@ -173,15 +160,10 @@ fn pf_readers() -> Vec<(&'static str, Reader<'static>)> {
             Reader {
                 file: failclosed_state::STATE_FILE_NAME,
                 write_valid: &|dir| {
-                    let state = failclosed_state::FailClosedState {
-                        version: failclosed_state::SCHEMA_VERSION,
-                        pf_token: "1".into(),
-                        pf_was_enabled: true,
-                    };
                     write_state(
                         dir,
                         failclosed_state::STATE_FILE_NAME,
-                        &serde_json::to_vec(&state).unwrap(),
+                        br#"{"version":1,"pf_token":"1","pf_was_enabled":true}"#,
                     );
                 },
                 reads_it: &|dir| matches!(failclosed_state::load_presence(dir), StateFile::Present(_)),
@@ -192,17 +174,10 @@ fn pf_readers() -> Vec<(&'static str, Reader<'static>)> {
             Reader {
                 file: lockdown_pf_state::STATE_FILE_NAME,
                 write_valid: &|dir| {
-                    let state = lockdown_pf_state::LockdownPfState {
-                        version: lockdown_pf_state::SCHEMA_VERSION,
-                        pf_token: "1".into(),
-                        main_snapshot: String::new(),
-                        nat_snapshot: String::new(),
-                        main_snapshot_captured: false,
-                    };
                     write_state(
                         dir,
                         lockdown_pf_state::STATE_FILE_NAME,
-                        &serde_json::to_vec(&state).unwrap(),
+                        br#"{"version":1,"pf_token":"1","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":false}"#,
                     );
                 },
                 reads_it: &|dir| matches!(lockdown_pf_state::load_presence(dir), StateFile::Present(_)),
@@ -253,13 +228,13 @@ fn no_state_reader_waits_on_a_fifo_planted_at_its_name() {
 
 const ECHOED_SECRET: &str = "hunter2-SECRET";
 
-/// The warnings `read` logs when `file` in a fresh folder holds a `version` that is a string where a number belongs:
-/// `serde_json`'s own message for that quotes the string.
-fn warnings_for_a_file_that_quotes_a_secret(file: &str, read: fn(&std::path::Path)) -> String {
+/// The warnings `read` logs when `file` in a fresh folder is the object `{ <head> "<secret>" }`: `head` ends at a key
+/// whose value is a string where something else belongs, and `serde_json`'s own message for that quotes the string.
+fn warnings_for_a_file_that_quotes_a_secret(file: &str, head: &str, read: fn(&std::path::Path)) -> String {
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join(file), format!(r#"{{"version":"{ECHOED_SECRET}"}}"#)).unwrap();
+    std::fs::write(tmp.path().join(file), format!(r#"{{{head}"{ECHOED_SECRET}"}}"#)).unwrap();
     let writer = garter::test_utils::WaitableWriter::new();
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
@@ -274,18 +249,30 @@ fn warnings_for_a_file_that_quotes_a_secret(file: &str, read: fn(&std::path::Pat
     writer.snapshot()
 }
 
-/// A reader that logs a parse failure: its name, the file it reads, and a call of it.
-type ParseFailureReader = (&'static str, &'static str, fn(&std::path::Path));
+/// A reader that logs a parse failure: its name, the file it reads, the start of a document of that file that puts a
+/// string where it does not belong (a framed file's payload failure keeps a position; its framing has none), and a
+/// call of it.
+type ParseFailureReader = (&'static str, &'static str, &'static str, fn(&std::path::Path));
 
 fn parse_failure_readers() -> Vec<ParseFailureReader> {
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut readers: Vec<ParseFailureReader> = vec![
-        ("lockdown_state::load_intent", lockdown_state::STATE_FILE_NAME, |dir| {
-            let _ = lockdown_state::load_intent(dir);
-        }),
-        ("boottime_witness::load", boottime_witness::STATE_FILE_NAME, |dir| {
-            let _ = boottime_witness::load(dir);
-        }),
+        (
+            "lockdown_state::load_intent",
+            lockdown_state::STATE_FILE_NAME,
+            r#""version":1,"enabled":"#,
+            |dir| {
+                let _ = lockdown_state::load_intent(dir);
+            },
+        ),
+        (
+            "boottime_witness::load",
+            boottime_witness::STATE_FILE_NAME,
+            r#""version":1,"armed":"#,
+            |dir| {
+                let _ = boottime_witness::load(dir);
+            },
+        ),
     ];
     #[cfg(target_os = "macos")]
     {
@@ -293,6 +280,7 @@ fn parse_failure_readers() -> Vec<ParseFailureReader> {
         readers.push((
             "failclosed_state::load_presence",
             failclosed_state::STATE_FILE_NAME,
+            r#""version":1,"pf_token":"1","pf_was_enabled":"#,
             |dir| {
                 let _ = failclosed_state::load_presence(dir);
             },
@@ -300,6 +288,7 @@ fn parse_failure_readers() -> Vec<ParseFailureReader> {
         readers.push((
             "lockdown_pf_state::load_presence",
             lockdown_pf_state::STATE_FILE_NAME,
+            r#""version":1,"pf_token":"1","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":"#,
             |dir| {
                 let _ = lockdown_pf_state::load_presence(dir);
             },
@@ -311,8 +300,8 @@ fn parse_failure_readers() -> Vec<ParseFailureReader> {
 #[skuld::test]
 fn no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse() {
     let mut failures = Vec::new();
-    for (name, file, read) in parse_failure_readers() {
-        let logs = warnings_for_a_file_that_quotes_a_secret(file, read);
+    for (name, file, head, read) in parse_failure_readers() {
+        let logs = warnings_for_a_file_that_quotes_a_secret(file, head, read);
         if logs.contains(ECHOED_SECRET) {
             failures.push(format!("{name} logged the file's content: {logs}"));
         } else if !logs.contains("line 1") {

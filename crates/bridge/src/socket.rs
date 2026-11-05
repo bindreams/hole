@@ -245,7 +245,21 @@ fn split(path: &Path) -> io::Result<(&Path, &std::ffi::OsStr)> {
 /// is `Ok`.
 pub fn remove(path: &Path) -> io::Result<()> {
     let (parent, name) = split(path)?;
-    util::dir::remove_state_file(parent, name)
+    remove_name(parent, name)
+}
+
+/// Removes `name` in the folder `dir`, whatever it is, but not what it points at. A link planted on the way to the
+/// folder is refused ([`util::dir::Refusal`]); a missing name or folder is `Ok`, and nothing is created.
+pub(crate) fn remove_name(dir: &Path, name: &std::ffi::OsStr) -> io::Result<()> {
+    let dir = match util::dir::Dir::open(dir, false, None) {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    match dir.unlink(name) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 /// Makes the folder of `path` if it is missing and frees the name: a stale socket is removed. A name that cannot be
