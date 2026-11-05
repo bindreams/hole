@@ -541,11 +541,12 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // until `in_flight` clears below, after this persist has completed.
     // Snapshot BEFORE the proxy lock: any unblock from here on is concurrent
     // with this start and must win the target write. It reads the user's decision
-    // to be Off (`unblock_generation`).
+    // to be Off (`unblock_generation`). The same value goes into `start_cancellable`, so
+    // the records and the transient cover decide against one start-begin.
     let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let result = {
         let mut pm = state.proxy.lock().await;
-        let result = pm.start_cancellable(&config, covered, token).await;
+        let result = pm.start_cancellable(&config, covered, token, unblock_snapshot).await;
         persist_after_start(&state, &config, on_startup, result.is_ok(), unblock_snapshot).await;
         result
     };
