@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
-use tun_engine::routing::failclosed::{watch_releases, CoverLock, Overtaken, ReleaseWatch};
+use tun_engine::routing::failclosed::CoverLock;
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
 
 use crate::reconciler::{teardown_cover_disposition, transient_cover_disposition, CoverDisposition};
@@ -305,36 +305,6 @@ struct BlockedStart<C> {
     /// not — it describes the live OS cover, not the current config. See the
     /// struct doc for what it means.
     resolver_permit: Option<IpAddr>,
-    /// The watch of the start that installed `cover`, opened before the install; see [`Self::stands`].
-    watch: ReleaseWatch,
-}
-
-impl<C> BlockedStart<C> {
-    /// Whether a HELD cover is still the OS's: the ONE place a cover held from an earlier attempt meets the
-    /// release verdict, so every read, keep and drop of one asks this and nothing else matches on the verdict.
-    ///
-    /// A release that ended with a change since the installing start opened its watch took the cover: the OS
-    /// objects it claims to hold are gone, so nothing may trust or report it. A release still in flight has not
-    /// said what it did, so the cover stays held until it does: it passed its own post-install check, so any
-    /// release in flight began after the install and its deletes are still to come. A cover installed by the
-    /// current start is not asked this; it is dropped on any verdict (see `start_cancellable`).
-    fn stands(&self) -> bool {
-        match self.watch.check() {
-            Ok(()) => true,
-            Err(Overtaken::InDoubt) => true,
-            Err(Overtaken::Superseded) => false,
-        }
-    }
-}
-
-/// Why a start ended in [`ProxyError::Cancelled`]. A user cancel drops the held cover; a release that overtook the
-/// start drops a held cover that no longer stands ([`BlockedStart::stands`]).
-#[derive(Debug, Clone, Copy)]
-enum StartCancel {
-    /// The user, or the start's own token, cancelled it.
-    Requested,
-    /// A release overtook it. The verdict is logged; the cover's fate is not read from it.
-    Overtaken(Overtaken),
 }
 
 // Posture =============================================================================================================
@@ -367,18 +337,20 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
         }
     }
 
-    /// The held cover, if it still stands ([`BlockedStart::stands`]). Every read of a held cover goes through
-    /// this, so a cover a release took is never reused, reported or trusted.
+    /// The held cover, if it is still the OS's: its install is current ([`CoverGuard::is_current`]), so no release
+    /// has taken it since. Every read of a held cover goes through this, so a cover a release took is never
+    /// reused, reported or trusted. A lock-free read: a section that decides over it reads it under the cover
+    /// lock, where the answer cannot change.
     fn pending(&self) -> Option<&BlockedStart<R::Cover>> {
         match self {
-            Posture::PendingStart(b) if b.stands() => Some(b),
+            Posture::PendingStart(b) if b.cover.is_current() => Some(b),
             Posture::PendingStart(_) | Posture::Idle | Posture::Session(_) => None,
         }
     }
 
-    /// Drop a held cover that no longer stands, and keep one that does.
+    /// Drop a held cover a release took, and keep one that is current.
     fn reap_taken(&mut self) {
-        let taken = matches!(self, Posture::PendingStart(b) if !b.stands());
+        let taken = matches!(self, Posture::PendingStart(b) if !b.cover.is_current());
         if taken {
             self.take_pending();
         }
@@ -397,10 +369,10 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
         }
     }
 
-    /// Contract: no session, and no held cover that stands. Provers: `start_cancellable`'s
+    /// Contract: no session, and no current held cover. Provers: `start_cancellable`'s
     /// `AlreadyRunning` guard rules out `Session`; the caller's own
     /// `self.posture.pending().is_none()` check, immediately before this
-    /// call, rules out a standing `PendingStart`. A held cover a release took is replaced, and its guard dropped.
+    /// call, rules out a current `PendingStart`. A held cover a release took is replaced, and its guard dropped.
     fn hold_pending(&mut self, held: BlockedStart<R::Cover>) {
         debug_assert!(
             !matches!(self, Posture::Session(_)) && self.pending().is_none(),
@@ -800,7 +772,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // condition — a no-op when nothing is pending — it exists so no live
         // guard outlives the OS objects `release_all_covers` is about to
         // delete out from under it.
-        self.posture.take_pending();
+        if let Some(held) = self.posture.take_pending() {
+            held.cover.release(&lock);
+        }
 
         // Unconditional: `release_all_covers` is documented idempotent, so
         // gating it on a presence probe is a check-then-act guard on an
@@ -880,26 +854,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        // Opened first: before this start reads anything an Unblock writes (the intent, the
-        // target) and before it drops a superseded cover below. An Unblock that ends after this
-        // point supersedes the start where it commits to a cover; one in flight there cancels it.
-        // A start that installs no cover (an uncovered one, a reload without a standing cover
-        // expected) is never refused by it.
-        let release_watch = self.state_dir.as_deref().map(watch_releases);
-        // A covered start holds a cover under that watch, so one with no state dir cannot be ordered against a
-        // release: refused before it reads or installs anything.
-        if covered && release_watch.is_none() {
-            return Err(ProxyError::Runtime(std::io::Error::other(
-                "cannot start covered: bridge has no state_dir to order the cover against a release",
-            )));
-        }
-
-        // A lock-free `handle_unblock` may have released every OS-level cover while this manager
-        // wasn't holding the lock. A `PendingStart` the release took since its own start opened its
-        // watch is now a zombie: the OS objects it claims to hold are already gone. Drop it before
-        // the reuse checks below (`repair_fallback`, the `pending().is_none()` gate) can trust it;
-        // the dropped guard's own Drop is idempotent against an already-cleared cover on both
-        // platforms.
+        // `handle_unblock` takes no `state.proxy` lock, so it may have released every OS-level cover while this
+        // manager was not holding it. A `PendingStart` whose cover it took is a zombie: the OS objects it claims
+        // to hold are gone. Drop it before the reuse checks below can trust it (`pending()` filters it out too).
         self.posture.reap_taken();
 
         // A (re)start supersedes any prior out-of-band death — clear the death
@@ -935,7 +892,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
                 Ok(b) => (b.server_ip, b.via),
-                Err(ProxyError::Cancelled) => return Err(self.cancelled_start(StartCancel::Requested)),
+                Err(ProxyError::Cancelled) => return Err(self.cancelled_start()),
                 Err(e) => {
                     self.last_error = Some(e.to_string());
                     // A covered start that can't resolve has no IP to permit, so no
@@ -1023,174 +980,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // blocking not leaking).
         let lockdown_on = self.standing_cover_expected();
 
-        // The point where this start commits to a cover: to install the standing one, to
-        // engage a transient one, or to reuse the one a failed start held. A release in
-        // flight, or one that ended with a change since the watch opened, refuses it. What
-        // becomes of a held cover is `BlockedStart::stands`'s one answer.
-        if covered || lockdown_on {
-            if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
-                return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
-            }
-        }
-        // The resolve above awaited: a release may have taken the held cover since the entry reap.
-        self.posture.reap_taken();
-
-        // A held cover's resolver_permit is fixed at engage time; re-engage
-        // whenever this attempt's fresh derivation DIFFERS from what the
-        // held cover already has — a narrowing to `None` (e.g. the plugin
-        // was removed, or `effective_ech_doh` no longer resolves to
-        // `Holes`) drifts too: leaving a wider-than-needed permit live is a
-        // real widening of the kill switch (the resolver permit carries no
-        // App-ID/process scoping on either platform, so it is available to
-        // every process on the host, not just the plugin chain), not a
-        // correction with no benefit. `repair_fallback` captures what's
-        // being given up: `Some((old_permit, original_pin))` means a good
-        // cover existed a moment ago, so a failed fresh engage below
-        // restores it instead of leaving the host uncovered. `original_pin`
-        // is `pin` BEFORE this attempt's own `revalidate` — see the repair
-        // arms below for why it, not the local `pin` variable, is what gets
-        // stored back.
-        //
-        // A retry whose desired permit still matches a value a PRIOR repair
-        // already proved unreachable is not treated specially — it repairs
-        // again like any other drift. The corrected engage's own failure
-        // could be transient (a momentary OS-level condition), not a
-        // lasting property of the value, so there is no principled way to
-        // tell "will fail again" from "would now succeed" without trying;
-        // skipping on a heuristic (e.g. a fixed number of retries) would
-        // just delay a correction that could have landed this attempt. Each
-        // attempt's release-to-reengage window is bounded to this one
-        // (user-paced) retry either way — see the restore fallback below.
-        let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
-            self.posture
-                .pending()
-                .filter(|b| b.host == config.server.server.expose() && b.resolver_permit != ech_resolver_permit)
-                .map(|b| (b.resolver_permit, b.pin))
-        } else {
-            None
-        };
-        if repair_fallback.is_some() {
-            // On macOS the drop reloads `/etc/pf.conf`, so the host is open until the
-            // re-engage below; re-engaging over the live cover instead is bindreams/hole#758.
-            self.posture.take_pending();
-            warn!(
-                "covered retry: this attempt's resolver permit differs from the held cover's; \
-                 releasing it so a fresh engage can correct it — egress is briefly OPEN until \
-                 the corrected (or, on failure, the restored) cover re-engages below"
-            );
-        }
-
         if covered && !lockdown_on {
-            // The transient cover is a global singleton — never construct a second
-            // over the same objects. An engage failure proceeds UNCOVERED (aborting
-            // would leave the user unconnected AND unprotected), surfaced via last_error
-            // — UNLESS this was a repair (`repair_fallback` is `Some`), in which case
-            // the host was ALREADY covered a moment ago and a compensating re-engage
-            // of the OLD permit is attempted first: correcting a permit now takes
-            // BOTH the corrected AND the restore engage failing to lose the cover
-            // (the `Err(e2)` arm below), not one — never impossible, just
-            // narrowed from the ordinary single-engage failure case. On that
-            // double failure this attempt proceeds open, same as the
-            // non-repair case; the NEXT retry finds the posture holds no
-            // pending start and re-engages fresh from scratch.
-            if self.posture.pending().is_none() {
-                // A repair's corrected engage still carries forward the
-                // ORIGINAL cover's `pin`, not this attempt's locally
-                // revalidated `pin`: `pin` (the struct field) records when
-                // the SERVER IP was resolved, a fact independent of which
-                // ECH resolver this attempt's permit needs — `revalidate`
-                // only ever downgrades (`Answered` -> `ResolverDeselected`),
-                // so persisting an already-downgraded value here would make
-                // that loss permanent, unrecoverable even once the original
-                // resolver returns to `dns.servers`. A fresh (non-repair)
-                // engage has no prior cover to preserve, so `pin` (fresh
-                // from resolve, or a first same-host reuse) is correct as-is.
-                let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
-                match self.engage_transient_cover(server_ip, ech_resolver_permit) {
-                    Ok(cover) => {
-                        // Any verdict drops the fresh cover: a release in flight may already have run its
-                        // deletes before this install, so keeping the cover could strand a live block no
-                        // status reports.
-                        if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
-                            drop(cover);
-                            return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
-                        }
-                        self.posture.hold_pending(BlockedStart {
-                            cover,
-                            host: config.server.server.expose().to_string(),
-                            server_ip,
-                            pin: engaged_pin,
-                            resolver_permit: ech_resolver_permit,
-                            watch: covered_watch(release_watch.as_ref()),
-                        });
-                    }
-                    Err(e) => {
-                        // Superseded by a release: cancel, neither run uncovered nor engage again.
-                        if let Some(verdict) = e.overtaken_by_release() {
-                            return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
-                        }
-                        if let Some((old_permit, original_pin)) = repair_fallback {
-                            match self.engage_transient_cover(server_ip, old_permit) {
-                                Ok(cover) => {
-                                    if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
-                                        drop(cover);
-                                        return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
-                                    }
-                                    self.posture.hold_pending(BlockedStart {
-                                        cover,
-                                        host: config.server.server.expose().to_string(),
-                                        server_ip,
-                                        pin: original_pin,
-                                        resolver_permit: old_permit,
-                                        watch: covered_watch(release_watch.as_ref()),
-                                    });
-                                    // The restored permit is stale either way, but which
-                                    // direction it's stale in depends on whether the fetch
-                                    // this attempt needs an ECH resolver at all: widening
-                                    // repairs (`Holes`) restore something narrower than
-                                    // needed, so the fetch may stall; narrowing repairs
-                                    // (`None`/`Operators`, no fetch this cover permits
-                                    // anyway) instead restore something WIDER than needed —
-                                    // a live kill-switch permit for an address nothing
-                                    // dials, not a stall risk.
-                                    if matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes) {
-                                        warn!(
-                                            error = &e as &dyn std::error::Error,
-                                            "failed to engage the corrected fail-closed cover; restored the \
-                                             PREVIOUS permit instead of leaving the host open — ex-ray's ECH \
-                                             fetch may still stall against the now-stale permit"
-                                        );
-                                    } else {
-                                        warn!(
-                                            error = &e as &dyn std::error::Error,
-                                            ?old_permit,
-                                            "failed to engage the corrected fail-closed cover; restored the \
-                                             PREVIOUS permit instead of leaving the host open — the fail-closed \
-                                             cover still permits a resolver address this attempt no longer needs"
-                                        );
-                                    }
-                                    self.last_error = Some(e.to_string());
-                                }
-                                Err(e2) => {
-                                    if let Some(verdict) = e2.overtaken_by_release() {
-                                        return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
-                                    }
-                                    warn!(
-                                        error = &e as &dyn std::error::Error,
-                                        restore_error = &e2 as &dyn std::error::Error,
-                                        "failed to engage BOTH the corrected and the previous fail-closed \
-                                         cover; host NOT blocked, proceeding open"
-                                    );
-                                    self.last_error = Some(e.to_string());
-                                }
-                            }
-                        } else {
-                            warn!(error = &e as &dyn std::error::Error, "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open");
-                            self.last_error = Some(e.to_string());
-                        }
-                    }
-                }
-            }
+            self.engage_transient_cover(
+                config.server.server.expose(),
+                server_ip,
+                pin,
+                ech_resolver_permit,
+                &effective_ech_doh,
+            );
         } else if covered {
             // Covered retry after the user enabled lockdown mid-blocked-state:
             // release the held cover. This opens egress until the standing lockdown
@@ -1273,7 +1070,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             lockdown_on,
             self.state_dir.as_deref(),
             self.state_owner,
-            release_watch.as_ref(),
             cancel,
         )
         .await;
@@ -1309,8 +1105,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 info!(started = %dump!(&diag), "proxy started");
                 Ok(())
             }
-            Err(ProxyError::Cancelled) => Err(self.cancelled_start(StartCancel::Requested)),
-            Err(ProxyError::Overtaken(verdict)) => Err(self.cancelled_start(StartCancel::Overtaken(verdict))),
+            Err(ProxyError::Cancelled) => Err(self.cancelled_start()),
             Err(e) => {
                 // Covered start failed: RETAIN the held cover (the posture keeps
                 // it as `PendingStart`, so its Drop does NOT run) — the host stays
@@ -1323,29 +1118,136 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
-    /// Engage the transient cover under the cover lock. No `.await` while it is held.
+    /// Engage the transient block-until-connected cover for a covered start whose lockdown intent is off: one
+    /// section under the cover lock, so the held cover this decides over cannot be taken, and no Unblock can run,
+    /// between the read and the install. Never `.await`s.
+    ///
+    /// A held cover's `resolver_permit` is fixed at engage time; this re-engages whenever this attempt's fresh
+    /// derivation DIFFERS from what the held cover already has. A narrowing to `None` (the plugin was removed, or
+    /// `effective_ech_doh` no longer resolves to `Holes`) drifts too: a wider-than-needed permit is a real
+    /// widening of the kill switch (the resolver permit carries no App-ID/process scoping on either platform, so
+    /// every process on the host has it), not a correction with no benefit. `repair_fallback` captures what is
+    /// given up: `Some((old_permit, original_pin))` means a good cover existed a moment ago, so a failed fresh
+    /// engage restores it instead of leaving the host uncovered. `original_pin` is the held cover's `pin`, not
+    /// this attempt's locally revalidated one: `revalidate` only ever downgrades (`Answered` ->
+    /// `ResolverDeselected`), so persisting a downgraded value would make that loss permanent even once the
+    /// original resolver returns to `dns.servers`.
+    ///
+    /// A retry whose desired permit still matches a value a PRIOR repair proved unreachable repairs again like any
+    /// other drift: the corrected engage's failure could be transient, and there is no principled way to tell
+    /// "will fail again" from "would now succeed" without trying.
+    ///
+    /// The transient cover is a global singleton, so a second is never constructed over the same objects. An
+    /// engage failure proceeds UNCOVERED (aborting would leave the user unconnected AND unprotected), surfaced via
+    /// `last_error`, unless this was a repair: then the compensating engage of the OLD permit is attempted first,
+    /// and it takes BOTH engages failing to lose the cover. A held cover a release took (`is_current` false) is not
+    /// reused: the start engages fresh.
     fn engage_transient_cover(
-        &self,
+        &mut self,
+        host: &str,
         server_ip: IpAddr,
-        resolver_ip: Option<IpAddr>,
-    ) -> Result<R::Cover, tun_engine::RoutingError> {
-        let lock = self.routing.lock_covers();
-        self.routing.install_failclosed_cover(&lock, server_ip, resolver_ip)
-    }
+        pin: crate::dns::ech::PinSource,
+        ech_resolver_permit: Option<IpAddr>,
+        effective_ech_doh: &crate::proxy::plugin::EffectiveEchDoh,
+    ) {
+        let routing = Arc::clone(&self.routing);
+        let lock = routing.lock_covers();
 
-    /// The one exit of a cancelled start, whether the user or a release cancelled it, early or late. A user cancel
-    /// drops the held cover; after a release a HELD cover is dropped only if it no longer stands
-    /// ([`BlockedStart::stands`]), so one a release in flight has not yet taken stays held. A cover this start just
-    /// installed never reaches here held: the install sites drop it on any verdict. A cancel records no `last_error`.
-    fn cancelled_start(&mut self, reason: StartCancel) -> ProxyError {
-        match reason {
-            StartCancel::Requested => drop(self.posture.take_pending()),
-            StartCancel::Overtaken(verdict) => {
-                info!(%verdict, "a release overtook the start");
-                self.posture.reap_taken();
+        let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = self
+            .posture
+            .pending()
+            .filter(|b| b.host == host && b.resolver_permit != ech_resolver_permit)
+            .map(|b| (b.resolver_permit, b.pin));
+        if repair_fallback.is_some() {
+            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below;
+            // re-engaging over the live cover instead is bindreams/hole#758.
+            if let Some(held) = self.posture.take_pending() {
+                held.cover.release(&lock);
+            }
+            warn!(
+                "covered retry: this attempt's resolver permit differs from the held cover's; \
+                 releasing it so a fresh engage can correct it — egress is briefly OPEN until \
+                 the corrected (or, on failure, the restored) cover re-engages below"
+            );
+        }
+        if self.posture.pending().is_some() {
+            return;
+        }
+
+        // A repair's corrected engage carries forward the ORIGINAL cover's `pin`; a fresh engage has no prior
+        // cover to preserve, so `pin` (fresh from resolve, or a first same-host reuse) is correct as-is.
+        let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
+        match routing.install_failclosed_cover(&lock, server_ip, ech_resolver_permit) {
+            Ok(cover) => {
+                self.posture.hold_pending(BlockedStart {
+                    cover,
+                    host: host.to_string(),
+                    server_ip,
+                    pin: engaged_pin,
+                    resolver_permit: ech_resolver_permit,
+                });
+            }
+            Err(e) => {
+                let Some((old_permit, original_pin)) = repair_fallback else {
+                    warn!(
+                        error = &e as &dyn std::error::Error,
+                        "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open"
+                    );
+                    self.last_error = Some(e.to_string());
+                    return;
+                };
+                match routing.install_failclosed_cover(&lock, server_ip, old_permit) {
+                    Ok(cover) => {
+                        self.posture.hold_pending(BlockedStart {
+                            cover,
+                            host: host.to_string(),
+                            server_ip,
+                            pin: original_pin,
+                            resolver_permit: old_permit,
+                        });
+                        // The restored permit is stale either way, but which direction it's stale in depends on
+                        // whether the fetch this attempt needs an ECH resolver at all: widening repairs
+                        // (`Holes`) restore something narrower than needed, so the fetch may stall; narrowing
+                        // repairs (`None`/`Operators`, no fetch this cover permits anyway) instead restore
+                        // something WIDER than needed — a live kill-switch permit for an address nothing dials,
+                        // not a stall risk.
+                        if matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes) {
+                            warn!(
+                                error = &e as &dyn std::error::Error,
+                                "failed to engage the corrected fail-closed cover; restored the \
+                                 PREVIOUS permit instead of leaving the host open — ex-ray's ECH \
+                                 fetch may still stall against the now-stale permit"
+                            );
+                        } else {
+                            warn!(
+                                error = &e as &dyn std::error::Error,
+                                ?old_permit,
+                                "failed to engage the corrected fail-closed cover; restored the \
+                                 PREVIOUS permit instead of leaving the host open — the fail-closed \
+                                 cover still permits a resolver address this attempt no longer needs"
+                            );
+                        }
+                        self.last_error = Some(e.to_string());
+                    }
+                    Err(e2) => {
+                        warn!(
+                            error = &e as &dyn std::error::Error,
+                            restore_error = &e2 as &dyn std::error::Error,
+                            "failed to engage BOTH the corrected and the previous fail-closed \
+                             cover; host NOT blocked, proceeding open"
+                        );
+                        self.last_error = Some(e.to_string());
+                    }
+                }
             }
         }
-        info!(?reason, "proxy start cancelled");
+    }
+
+    /// The one exit of a cancelled start, early or late: the user, or the start's own token, cancelled it, so the
+    /// held cover is dropped. A cancel records no `last_error`.
+    fn cancelled_start(&mut self) -> ProxyError {
+        drop(self.posture.take_pending());
+        info!("proxy start cancelled");
         ProxyError::Cancelled
     }
 
@@ -1396,8 +1298,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    before `R::Installed`; disengages the standing cover (only `Some`
     ///    when intent is on and engage already succeeded). On the fail-FATAL
     ///    engage `?` it is never constructed, so only `R::Installed` tears down.
-    ///    A release that overtakes the start right after the install, in flight
-    ///    or ended, drops it too: a failed start drops its standing cover, no exception.
+    ///    A failed start drops its standing cover, no exception.
     ///
     /// Per-phase cancellation strategy:
     /// - **Phase 1 (plugin chain)**: the bridge cancel is threaded into
@@ -1463,8 +1364,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         standing_cover_expected: bool,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
-        // The watch `start_cancellable` opened; checked after the standing cover installs.
-        release_watch: Option<&ReleaseWatch>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
@@ -1888,20 +1787,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // `lockdown_app_ids`'s doc.
         let app_ids = lockdown_app_ids(config);
 
-        // Re-read the intent fresh, right before the install it gates:
-        // `standing_cover_expected` was snapshotted by the caller before
-        // plugin-chain/DNS-bootstrap/TUN-device work that can take long
-        // enough for an explicit `hole bridge unlock`-equivalent (the tray's
-        // Unblock, `handle_unblock`) to land on a second, lock-free path in
-        // between. A fresh `Off` overrides the stale `true` so a start that
-        // began before an unblock cannot install a cover after it; any other
-        // fresh read (`On`, `Unreadable`, `Unset`) leaves the snapshot's own
-        // verdict (which already folded in `adopted_standing_cover`) alone.
-        let standing_cover_expected = match state_dir.map(lockdown_state::load_intent) {
-            Some(Intent::Off) => false,
-            _ => standing_cover_expected,
-        };
-
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to
         // today. Engaged AFTER routing.install (TUN exists => LUID resolvable)
@@ -1911,16 +1796,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // unwind, tearing down — the opposite of the transient cover's
         // fail-open. Committed only on the Ok path (the field below).
         let lockdown = if standing_cover_expected {
-            match install_standing_cover(
-                routing,
-                server_ip,
-                &tun_identity,
-                &app_ids,
-                release_watch,
-                state_dir,
-                owner,
-            ) {
-                Ok(cover) => Some(cover),
+            match install_standing_cover(routing, server_ip, &tun_identity, &app_ids, state_dir, owner) {
+                Ok(cover) => cover,
                 Err(e) => {
                     if let Some(mut d) = dispatcher.take() {
                         d.shutdown().await;
@@ -2121,10 +1998,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // 5. Standing lockdown cover: decided by `cover_step` against
                 // the target `event` just moved us to, not by `event` itself.
                 on_phase(StopPhase::SettleCover);
-                let presence = self.routing.lockdown_cover_presence();
-                let intent = self.effective_lockdown_intent();
-                let disposition = teardown_cover_disposition(event, intent, presence, &target);
-                self.apply_cover_disposition(disposition, lockdown);
+                self.settle_standing_cover(event, target, lockdown);
 
                 // Snapshot WFP + NDIS post-teardown. Emits warn when wintun-
                 // related references remain in either layer. Cheap and
@@ -2175,8 +2049,24 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
-    /// Act on a `cover_step` decision against the standing cover guard
-    /// extracted from a torn-down `RunningState`.
+    /// Settle the standing cover guard extracted from a torn-down `RunningState`: one section under the cover lock
+    /// that reads the presence, the intent and the target, decides with `cover_step` and acts, so an Unblock cannot
+    /// land between the decision and the act. The target is re-read from the record when there is one: the
+    /// teardown's phases awaited since `persist_session_event` wrote it.
+    fn settle_standing_cover(&mut self, event: SessionEvent, target: Target, cover: Option<R::Cover>) {
+        let routing = Arc::clone(&self.routing);
+        let lock = routing.lock_covers();
+        let presence = routing.lockdown_cover_presence();
+        let intent = self.effective_lockdown_intent();
+        let target = match self.state_dir.as_deref() {
+            Some(dir) => target::load(dir),
+            None => target,
+        };
+        let disposition = teardown_cover_disposition(event, intent, presence, &target);
+        self.apply_cover_disposition(&lock, disposition, cover);
+    }
+
+    /// Act on a `cover_step` decision against the standing cover guard, under the cover lock.
     ///
     /// `Engage` is unreachable here: by the time a session's teardown runs,
     /// the TUN/routes it would need (`server_ip`, `TunIdentity`, `app_ids`)
@@ -2185,7 +2075,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// turning lockdown on mid-session only persists the intent; there is no
     /// `turn_lockdown_on`). Treating it like `Hold` is the safe direction:
     /// it never opens the host.
-    fn apply_cover_disposition(&mut self, disposition: CoverDisposition, cover: Option<R::Cover>) {
+    fn apply_cover_disposition(&mut self, lock: &CoverLock, disposition: CoverDisposition, cover: Option<R::Cover>) {
         match disposition {
             CoverDisposition::ReleaseNow => {
                 // The guard's own Drop can only WARN on a genuine OS failure
@@ -2197,16 +2087,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // the claim only on a CONFIRMED open host: a false clear here
                 // is Rule #0 territory, the Unblock item disappearing exactly
                 // when it is still needed.
-                let lock = self.routing.lock_covers();
-                match self.routing.release_all_covers(&lock) {
+                match self.routing.release_all_covers(lock) {
                     Ok(()) => self.set_standing_cover_adopted(false),
                     Err(e) => tracing::warn!(
                         error = &e as &dyn std::error::Error,
                         "lockdown cover release could not be confirmed; keeping the escape visible"
                     ),
                 }
-                drop(cover);
-                drop(lock);
+                // After a confirmed release this guard is stale and deletes nothing; after a failed one it is
+                // current and retries its own deletes.
+                if let Some(c) = cover {
+                    c.release(lock);
+                }
             }
             CoverDisposition::KeepEngaged => {
                 if let Some(c) = cover {
@@ -2379,43 +2271,29 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
     }
 }
 
-/// The watch a covered start holds its cover under. A covered start without a state dir is refused at entry, so a
-/// covered start always has one.
-fn covered_watch(watch: Option<&ReleaseWatch>) -> ReleaseWatch {
-    watch
-        .expect("a covered start has a state dir: start_cancellable refuses one without")
-        .clone()
-}
-
-/// The verdict if a release is in flight, or ended with a change, since `watch` opened.
-fn overtaken_by_release(watch: Option<&ReleaseWatch>) -> Result<(), Overtaken> {
-    match watch {
-        Some(watch) => watch.check(),
-        None => Ok(()),
-    }
-}
-
-/// Install the standing cover under the cover lock, a sync section so the lock is never held across an `.await`.
-/// One read; any verdict drops the fresh cover (never `disarm`): a release in flight may have run its deletes
-/// before this install, and the intent is still on, so the next start installs again. A held cover is never
-/// decided this way (`BlockedStart::stands`).
+/// Install the standing cover, one section under the cover lock so the lock is never held across an `.await`.
+///
+/// The intent is re-read here, right before the install it gates: `standing_cover_expected` was snapshotted by the
+/// caller before plugin-chain, DNS-bootstrap and TUN-device work that can take long enough for the tray's Unblock
+/// (`handle_unblock`, which takes no `state.proxy` lock) to land in between. An `Off` recorded first overrides the
+/// stale `true`, so a start that began before an Unblock installs nothing after it; any other fresh read (`On`,
+/// `Unreadable`, `Unset`) leaves the snapshot's verdict (which already folded in `adopted_standing_cover`) alone.
+/// The Unblock holds the lock through its release and its `Off`, so the read and the install cannot straddle it.
 fn install_standing_cover<R: Routing>(
     routing: &R,
     server_ip: IpAddr,
     tun: &tun_engine::TunIdentity,
     app_ids: &[std::path::PathBuf],
-    release_watch: Option<&ReleaseWatch>,
     state_dir: Option<&std::path::Path>,
     owner: Option<(u32, u32)>,
-) -> Result<R::Cover, ProxyError> {
+) -> Result<Option<R::Cover>, ProxyError> {
     let lock = routing.lock_covers();
-    let cover = routing.install_lockdown(&lock, server_ip, tun, app_ids)?;
-    if let Err(verdict) = overtaken_by_release(release_watch) {
-        drop(cover);
-        return Err(ProxyError::Overtaken(verdict));
+    if matches!(state_dir.map(lockdown_state::load_intent), Some(Intent::Off)) {
+        return Ok(None);
     }
+    let cover = routing.install_lockdown(&lock, server_ip, tun, app_ids)?;
     promote_adopted_claim(&lock, state_dir, owner);
-    Ok(cover)
+    Ok(Some(cover))
 }
 
 /// Write the armed state to `bridge-lockdown.json` the moment an adopted claim

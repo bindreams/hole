@@ -957,79 +957,34 @@ fn cover_presence_is_never_compared_against_a_variant() {
     );
 }
 
-/// A held or just-installed cover meets the release verdict in one place: `BlockedStart::stands`. A start that
-/// matched on `Overtaken` at its own site (drop it on `Superseded`, keep it on `InDoubt`) re-derived that answer
-/// per site, and each site that forgot one variant was a finding: the post-install checks, the status read, the
-/// zombie check and the cancel exit each had their own copy. Constructing or forwarding a verdict is fine; deciding
-/// from one is forbidden outside the enum's own file and `stands`.
+/// The boot reconcile reads the startup preference and applies it in one section under the cover lock: an Unblock
+/// that landed between a read and the apply would have its `Off` overwritten from the candidate it cleared (the
+/// boot would reconnect to the server the user just escaped). Asserted by source, not by interleaving: neither
+/// step has a point a test can park at.
 #[skuld::test]
-fn a_covers_release_verdict_is_decided_in_one_method() {
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    let definition = "crates/tun-engine/src/routing/failclosed/release_epoch.rs";
-    let decider = "crates/bridge/src/proxy_manager.rs";
-    let mut offenders: Vec<String> = Vec::new();
-
-    for entry in walkdir::WalkDir::new(workspace.join("crates")) {
-        let entry = entry.expect("failed to walk crates/");
-        let path = entry.path();
-        if !entry.file_type().is_file() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let rel = path
-            .strip_prefix(&workspace)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.ends_with("_tests.rs") || rel == definition {
-            continue;
-        }
-        if path
-            .components()
-            .any(|c| c.as_os_str() == "test_support" || c.as_os_str() == "target")
-        {
-            continue;
-        }
-        let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
-        let sanctioned = if rel == decider {
-            method_lines(&text, "fn stands(")
-        } else {
-            0..0
-        };
-        for (idx, line) in code_lines(&text) {
-            if sanctioned.contains(&idx) {
-                continue;
-            }
-            if line.contains("Overtaken::") && line_decides(line) {
-                offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
-            }
-        }
-    }
+fn reconcile_once_reads_the_startup_preference_under_the_cover_lock() {
+    let src = include_str!("reconciler.rs");
+    let sites = regex::Regex::new(r"\block_covers\(|\bload_startup_preference\(|\btarget::apply\(").unwrap();
+    let in_function: Vec<String> = call_sites_by_function(src, &sites)
+        .into_iter()
+        .filter(|(name, line)| name == "reconcile_once" && !line.starts_with("//"))
+        .map(|(_, line)| line)
+        .collect();
+    let position = |needle: &str| {
+        in_function
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no site contains `{needle}`: {in_function:?}"))
+    };
 
     assert!(
-        offenders.is_empty(),
-        "the release verdict decided outside `BlockedStart::stands`:\n  {}\n\
-         Ask `stands()` (or `Posture::pending`/`reap_taken`, which ask it). A site that matches on \
-         `Overtaken` re-derives which verdict keeps a cover, and forgets one.",
-        offenders.join("\n  ")
+        position("lock_covers(") < position("load_startup_preference("),
+        "the preference is read after the cover lock is taken: {in_function:?}"
     );
-}
-
-/// The line indices of the item whose header contains `header`, from that line to the brace that closes it.
-fn method_lines(text: &str, header: &str) -> std::ops::Range<usize> {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| l.contains(header))
-        .unwrap_or_else(|| panic!("no `{header}` in the decider's source"));
-    let mut depth = 0i32;
-    for (idx, line) in lines.iter().enumerate().skip(start) {
-        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
-        if depth == 0 && line.contains('}') {
-            return start..idx + 1;
-        }
-    }
-    panic!("`{header}` is never closed");
+    assert!(
+        position("load_startup_preference(") < position("target::apply("),
+        "and applied after it is read, in the same section: {in_function:?}"
+    );
 }
 
 /// The guards are only worth having if they FAIL on the shapes that slipped

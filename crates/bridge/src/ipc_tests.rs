@@ -213,9 +213,9 @@ struct MockRouting {
     /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
     /// probe. Defaults to `Absent`.
     cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
-    /// Whether a release was in flight on `state_dir` when `release_all_covers`
-    /// ran: the Unblock must announce itself before its first firewall call.
-    saw_release_in_flight: Arc<AtomicBool>,
+    /// The state dir of the cover lock `release_all_covers` was handed: the Unblock releases under the lock of its
+    /// own state dir.
+    released_under: Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
 impl MockRouting {
@@ -227,7 +227,7 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
-            saw_release_in_flight: Arc::new(AtomicBool::new(false)),
+            released_under: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -246,7 +246,7 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
-            saw_release_in_flight: Arc::new(AtomicBool::new(false)),
+            released_under: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -258,7 +258,7 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
-            saw_release_in_flight: Arc::new(AtomicBool::new(false)),
+            released_under: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -346,21 +346,12 @@ impl Routing for MockRouting {
         tun_engine::routing::failclosed::CoverLock::acquire(&self.state_dir)
     }
 
-    fn release_all_covers(&self, _lock: &tun_engine::routing::failclosed::CoverLock) -> Result<(), RoutingError> {
+    fn release_all_covers(&self, lock: &tun_engine::routing::failclosed::CoverLock) -> Result<(), RoutingError> {
         self.release_all_calls.fetch_add(1, Ordering::SeqCst);
-        if tun_engine::routing::failclosed::watch_releases(&self.state_dir)
-            .check()
-            .is_err()
-        {
-            self.saw_release_in_flight.store(true, Ordering::SeqCst);
-        }
-        // As `failclosed::release_all`: a sweep that fails before the firewall supersedes nothing.
-        let release = tun_engine::routing::failclosed::begin_release(&self.state_dir);
+        *self.released_under.lock().unwrap() = Some(lock.state_dir().to_path_buf());
         if self.fail_release.load(Ordering::SeqCst) {
-            release.changed_nothing();
             return Err(crate::test_support::mock_gateway_failure());
         }
-        drop(release);
         Ok(())
     }
 
@@ -1135,7 +1126,6 @@ fn ipc_state_over(routing: MockRouting, dir: PathBuf) -> Arc<IpcState<MockProxy,
         proxy,
         routing: routing_handle,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -1147,77 +1137,57 @@ fn ipc_state_over(routing: MockRouting, dir: PathBuf) -> Arc<IpcState<MockProxy,
 }
 
 #[skuld::test]
-async fn an_unblock_is_a_release_in_flight_before_its_first_firewall_call() {
+async fn an_unblock_holds_the_cover_lock_before_its_first_firewall_call() {
     let dir = tempfile::tempdir().unwrap().keep();
     let routing = MockRouting::new(dir.clone());
-    let saw = Arc::clone(&routing.saw_release_in_flight);
+    let released_under = Arc::clone(&routing.released_under);
     let state = ipc_state_over(routing, dir.clone());
-    let watch = tun_engine::routing::failclosed::watch_releases(&dir);
 
-    let _ = super::handle_unblock(axum::extract::State(state)).await.unwrap();
+    let _ = super::handle_unblock(axum::extract::State(Arc::clone(&state)))
+        .await
+        .unwrap();
 
-    assert!(
-        saw.load(Ordering::SeqCst),
-        "a start's watch must refuse to open from the moment the release begins"
+    assert_eq!(
+        released_under.lock().unwrap().as_deref(),
+        Some(dir.as_path()),
+        "the release ran under the cover lock of the Unblock's own state dir"
     );
-    assert!(watch.check().is_err(), "a start that was already underway is overtaken");
-    assert!(
-        tun_engine::routing::failclosed::watch_releases(&dir).check().is_ok(),
-        "and the release ends with the Unblock"
-    );
+    // And the lock ends with the Unblock: a later acquire returns instead of waiting for ever.
+    drop(state.routing.lock_covers());
 }
-
 #[skuld::test]
-async fn an_unblock_whose_release_fails_still_ends_its_release() {
+async fn an_unblock_whose_release_fails_records_no_off_and_drops_the_lock() {
     let dir = tempfile::tempdir().unwrap().keep();
+    lockdown_state::set_enabled(&CoverLock::acquire(&dir), true, None).unwrap();
     let routing = MockRouting::new(dir.clone());
     routing.fail_release.store(true, Ordering::SeqCst);
     let state = ipc_state_over(routing, dir.clone());
-    let watch = tun_engine::routing::failclosed::watch_releases(&dir);
 
-    let result = super::handle_unblock(axum::extract::State(state)).await;
+    let result = super::handle_unblock(axum::extract::State(Arc::clone(&state))).await;
 
     assert!(result.is_err());
-    assert!(
-        tun_engine::routing::failclosed::watch_releases(&dir).check().is_ok(),
-        "a failed Unblock must not leave every later start refused"
-    );
-    assert!(
-        watch.check().is_ok(),
-        "and one that never reached the firewall supersedes no start"
-    );
-}
-
-/// The firewall was released before the persist failed, so the Unblock changed something: it supersedes by default.
-#[skuld::test]
-async fn an_unblock_whose_persist_fails_still_supersedes_a_start_that_began_before_it() {
-    let dir = tempfile::tempdir().unwrap().keep();
-    // A directory at the target record's name: the `Off` save cannot land.
-    std::fs::create_dir(dir.join(target::STATE_FILE_NAME)).unwrap();
-    let state = ipc_state_over(MockRouting::new(dir.clone()), dir.clone());
-    let watch = tun_engine::routing::failclosed::watch_releases(&dir);
-
-    let result = super::handle_unblock(axum::extract::State(state)).await;
-
-    assert!(result.is_err(), "the persist must fail for this test to mean anything");
     assert_eq!(
-        watch.check(),
-        Err(tun_engine::routing::failclosed::Overtaken::Superseded)
+        lockdown_state::load_intent(&dir),
+        lockdown_state::Intent::On,
+        "a release that failed records no `Off`: the user's retry, and the next start, still see the armed intent"
     );
+    assert_eq!(
+        state.unblock_generation.load(Ordering::SeqCst),
+        0,
+        "and no unblock is announced"
+    );
+    drop(state.routing.lock_covers());
 }
-
-/// The release spans the persisted `Off` as well as the firewall call, even when the
-/// client goes away and hyper drops the handler future at the persist's `.await`.
-/// The persist is held at the target file's lock, so it cannot end before the
-/// assertions run; dropping the runtime is what joins it.
 #[skuld::test]
-fn a_dropped_unblock_handler_future_does_not_end_the_release_before_the_persist() {
+fn a_dropped_unblock_handler_future_still_runs_its_release_and_persist_to_the_end() {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
-    use tun_engine::routing::failclosed::watch_releases;
 
     let dir = tempfile::tempdir().unwrap();
-    let state = ipc_state_over(MockRouting::new(dir.path().to_owned()), dir.path().to_owned());
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+    let routing = MockRouting::new(dir.path().to_owned());
+    let release_all_calls = Arc::clone(&routing.release_all_calls);
+    let state = ipc_state_over(routing, dir.path().to_owned());
 
     // Declared first, dropped last: dropping it joins the persist, which waits on `holder`, which
     // waits on `let_go_tx`. A failed assertion drops `let_go_tx` first and unblocks the chain.
@@ -1242,24 +1212,22 @@ fn a_dropped_unblock_handler_future_does_not_end_the_release_before_the_persist(
         assert!(matches!(polled, Poll::Pending), "the persist is waiting on the lock");
     });
 
-    assert!(
-        watch_releases(dir.path()).check().is_err(),
-        "the handler future is gone, but the persist it spawned is not done: the release is still in flight"
-    );
-
+    // The handler future is gone; the section it spawned is not: it finishes once its record lock is free.
     let_go_tx.send(()).unwrap();
     holder.join().unwrap().unwrap();
     drop(runtime);
-    assert!(
-        watch_releases(dir.path()).check().is_ok(),
-        "and it ends with the persist, not before and not never"
+    assert_eq!(release_all_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        lockdown_state::load_intent(dir.path()),
+        lockdown_state::Intent::Off,
+        "the persist ran to its end after the future was dropped"
     );
 }
 
-/// The release is announced before the first firewall call, and the guard moves into
-/// the persist's closure so nothing the handler future does can end it early.
+/// The cover lock is taken inside the Unblock's one blocking section, which owns it through the release and the
+/// persist: hyper drops the handler future when the client goes away, and the section runs on regardless.
 #[skuld::test]
-fn the_unblock_handler_hands_its_release_to_the_persist() {
+fn the_unblock_handler_holds_the_cover_lock_through_its_persist() {
     let src = include_str!("ipc.rs");
     let start = src.find("async fn handle_unblock").expect("handle_unblock must exist");
     let body = &src[start
@@ -1271,28 +1239,26 @@ fn the_unblock_handler_hands_its_release_to_the_persist() {
             .map(|i| start + i)
             .expect("the handler ends")];
 
-    let begin = body
-        .find("let release = ")
-        .expect("the guard must be a named binding, not `_`");
+    let spawn = body
+        .find("spawn_blocking")
+        .expect("the section runs off the async task");
+    let locked = body.find("lock_covers()").expect("the handler takes the cover lock");
     let released = body.find("release_all_covers(").expect("the handler releases covers");
-    let spawn = body.find("spawn_blocking").expect("the persist runs off-thread");
-    let moved = body
-        .find("let _release = release;")
-        .expect("the persist's closure must take the guard");
     let persist = body
         .find("lockdown_state::set_enabled")
         .expect("the handler persists the intent");
     assert!(
-        begin < released,
-        "the release is announced before the first firewall call"
+        spawn < locked,
+        "the lock is taken inside the closure, which owns it: not on the handler's future"
     );
     assert!(
-        spawn < moved && moved < persist,
-        "the closure owns the guard through the persist"
+        locked < released && released < persist,
+        "the lock is held before the first firewall call and through the persist"
     );
-    assert!(
-        !body.contains("drop(release"),
-        "the guard ends with the closure, not at a call in the handler"
+    assert_eq!(
+        body.matches("lock_covers()").count(),
+        1,
+        "one section: the release and the records share one lock, never two"
     );
 }
 
@@ -1706,8 +1672,14 @@ fn setting_the_target_persists_the_startup_preference() {
     rt().block_on(async {
         let path = test_socket_path("on-startup-persist");
         let state_dir = tempfile::tempdir().unwrap().keep();
+        // The routing's state dir is the IPC state dir, as in production wiring: the start's records are written
+        // under the routing's cover lock.
+        let proxy = Arc::new(Mutex::new(ProxyManager::new(
+            MockProxy::new(),
+            MockRouting::new(state_dir.clone()),
+        )));
         let server =
-            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", state_dir.clone(), state_dir.clone(), None).unwrap();
+            IpcServer::bind_with_dirs(&path, proxy, "test", state_dir.clone(), state_dir.clone(), None).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1820,7 +1792,6 @@ fn ipc_state_with_persist_gate(
         proxy,
         routing: routing_handle,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -1996,7 +1967,6 @@ fn ipc_state_with_dir_and_proxy(dir: PathBuf, proxy: MockProxy) -> Arc<IpcState<
         proxy,
         routing: routing_handle,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -2716,12 +2686,14 @@ async fn a_failed_kill_switch_on_logs_the_chain() {
 
 #[skuld::test]
 async fn a_failed_unblock_release_logs_the_cause() {
-    let (proxy, _calls, fail_release, _dir) = mock_proxy_with_release_state();
-    fail_release.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(dir.clone());
+    routing.fail_release.store(true, Ordering::SeqCst);
+    let state = ipc_state_over(routing, dir);
     let (subscriber, writer) = redacting_capture();
     let result = {
         let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
-        super::handle_unblock(axum::extract::State(ipc_state(proxy))).await
+        super::handle_unblock(axum::extract::State(state)).await
     };
 
     let Err((_, Json(body))) = result else {
@@ -3506,7 +3478,6 @@ fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<Ipc
         proxy,
         routing,
         unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        intent_persist: Arc::new(std::sync::Mutex::new(())),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -3746,23 +3717,15 @@ async fn an_unblock_whose_target_save_fails_leaves_the_generation_alone() {
     );
 }
 
-/// The start's target and candidate writes, and the unblock's Off, `set_enabled`
-/// and candidate clear, are each several critical sections, so an unblock
-/// committing between a start's two writes (or a start's pair landing between the
-/// unblock's) leaves `Off` beside a candidate, or `Connected` with its candidate
-/// erased. Both sequences run under `intent_persist`, and so does every access of
-/// `unblock_generation` inside them: the start reads it once before its writes, the
-/// unblock bumps it after the `Off` write succeeded.
-///
-/// Asserted by source, not by interleaving: neither sequence has a point a test
-/// can park at, and an unbounded wait for "the other side has blocked on the
-/// mutex" has no condition to re-check. In each function the guard must be bound
-/// (`let _ =` drops it at once) and taken before the first write.
 #[skuld::test]
-fn the_unblock_and_the_start_persist_run_under_the_intent_persist_mutex() {
+fn the_unblock_and_the_start_persist_run_under_the_cover_lock() {
     let src = include_str!("ipc.rs");
+    assert!(
+        !src.contains("intent_persist"),
+        "the cover lock is the one ordering of these writers: no second mutex beside it"
+    );
     let ordering_sites = regex::Regex::new(
-        r"\bintent_persist\.lock\(|\btarget::apply\(|\bwrite_start_records\(|\bapply_startup_preference\(|\bset_enabled\(|\bgeneration\.load\(|\bgeneration\.fetch_add\(",
+        r"\block_covers\(|\btarget::apply\(|\bwrite_start_records\(|\bapply_startup_preference\(|\bset_enabled\(|\bgeneration\.load\(|\bgeneration\.fetch_add\(",
     )
     .unwrap();
     let sites = crate::reconciler::reconciler_tests::call_sites_by_function(src, &ordering_sites);
@@ -3786,25 +3749,24 @@ fn the_unblock_and_the_start_persist_run_under_the_intent_persist_mutex() {
             "{function} must hold the lock and write under it: {in_function:?}"
         );
         assert!(
-            in_function[0].starts_with("let _ordered = intent_persist.lock("),
-            "{function} must bind the `intent_persist` guard before its first write: {in_function:?}"
+            in_function[0].contains("lock_covers("),
+            "{function} must take the cover lock before its first write or read of `unblock_generation`: {in_function:?}"
         );
     }
 
-    // The start reads the counter under the guard, before its first write.
+    // The start reads the counter under the lock, before its first write.
     let start = sites_of("persist_after_start");
     assert!(
         position(&start, "generation.load(") < position(&start, "write_start_records("),
         "the start must read `unblock_generation` before its writes: {start:?}"
     );
-    // The unblock bumps under the guard, and only after the `Off` write that `?` has confirmed.
+    // The unblock bumps under the lock, and only after the `Off` write that `?` has confirmed.
     let unblock = sites_of("handle_unblock");
     assert!(
         position(&unblock, "target::apply(") < position(&unblock, "generation.fetch_add("),
         "the unblock must bump `unblock_generation` after its target write: {unblock:?}"
     );
 }
-
 // Status probe placement ==============================================================================================
 
 /// `handle_status` used to reach cover presence through `pm.cover_presence()`

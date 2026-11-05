@@ -2288,7 +2288,7 @@ pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness) -> SweepOut
 /// refused the delete".
 fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witness: ArmingWitness) -> SweepOutcome {
     if let Some(rc) = open_failure {
-        return SweepOutcome::unreached(
+        return SweepOutcome::failed(
             // The empty fold, not a discarded one: no delete was issued, so
             // there is no observation to carry.
             Clearance::from_observations(&[], witness),
@@ -2384,7 +2384,7 @@ pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return SweepOutcome::unreached(
+            return SweepOutcome::failed(
                 // The empty fold: nothing was issued, so nothing was observed.
                 Clearance::from_observations(&[], witness),
                 RoutingError::RouteSetup(format!(

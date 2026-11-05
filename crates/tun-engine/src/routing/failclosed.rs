@@ -109,9 +109,6 @@ pub mod boottime_witness;
 pub mod cover_lock;
 pub use cover_lock::{CoverKind, CoverLock, InstallStamp};
 
-pub mod release_epoch;
-pub use release_epoch::{begin_release, watch_releases, Overtaken, ReleaseInFlight, ReleaseWatch};
-
 // Compiled out of a macOS PRODUCTION build — Windows' boot-time twin read-back
 // is its only caller — but kept for every lane's TESTS, because the rule it
 // encodes is platform-free and a rule proved only where the hazard lives is
@@ -1028,26 +1025,14 @@ fn sweep_with_witness(
     sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
     let state_dir = lock.state_dir();
-    // Announced before the sweep's first firewall call, held through the
-    // witness write: an engage that overlaps any of it backs out. It supersedes
-    // by default; only a sweep that reports it never reached the firewall
-    // changed nothing.
-    let release = release_epoch::begin_release(state_dir);
     let snapshot = boottime_witness::snapshot(state_dir);
-    let SweepOutcome {
-        clearance,
-        failure,
-        unreached,
-    } = sweep(snapshot.witness);
+    let SweepOutcome { clearance, failure } = sweep(snapshot.witness);
     // The record is written from what the sweep OBSERVED, before its failure
     // reaches the caller. A failing sweep is not an unobservant one: this
     // codebase's own sweeps issue every delete before inspecting any code, so
     // `Err` arrives after the sibling's delete already succeeded — see
     // [`SweepOutcome`].
     boottime_witness::apply(state_dir, snapshot, clearance.witness_update(), owner);
-    if unreached {
-        release.changed_nothing();
-    }
     match failure {
         Some(e) => Err(e),
         None => {
@@ -1079,8 +1064,6 @@ fn sweep_with_witness(
 pub(crate) struct SweepOutcome {
     clearance: Clearance,
     failure: Option<RoutingError>,
-    /// The sweep failed before its first firewall call, so the host is as it was.
-    unreached: bool,
 }
 
 impl SweepOutcome {
@@ -1089,7 +1072,6 @@ impl SweepOutcome {
         Self {
             clearance,
             failure: None,
-            unreached: false,
         }
     }
 
@@ -1101,18 +1083,6 @@ impl SweepOutcome {
         Self {
             clearance,
             failure: Some(error),
-            unreached: false,
-        }
-    }
-
-    /// The sweep failed before its first firewall call (the engine would not open), so it changed nothing:
-    /// its release supersedes no install. `clearance` is the empty fold.
-    #[cfg(any(test, target_os = "windows"))]
-    pub(crate) fn unreached(clearance: Clearance, error: RoutingError) -> Self {
-        Self {
-            clearance,
-            failure: Some(error),
-            unreached: true,
         }
     }
 

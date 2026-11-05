@@ -357,21 +357,6 @@ fn a_sweep_that_failed_after_reaching_the_firewall_leaves_a_stamp_current() {
 }
 
 #[skuld::test]
-fn a_sweep_that_never_reached_the_firewall_leaves_a_stamp_current() {
-    let d = dir();
-    let lock = CoverLock::acquire(d.path());
-    let stamp = lock.stamp_install(CoverKind::Lockdown);
-    let result = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
-        SweepOutcome::unreached(
-            Clearance::proven(),
-            RoutingError::RouteSetup("the engine would not open".into()),
-        )
-    });
-    assert!(result.is_err());
-    assert!(stamp.is_current());
-}
-
-#[skuld::test]
 fn a_failing_sweep_releases_the_lock() {
     let d = dir();
     {

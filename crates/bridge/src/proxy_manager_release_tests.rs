@@ -292,12 +292,11 @@ fn an_externally_released_cover_is_not_silently_reused() {
     // 18c09cd9 (transient half): a lock-free `handle_unblock` releasing every
     // OS-level cover while this manager isn't holding the lock leaves any
     // `PendingStart` a zombie — the OS objects it claims to hold are already
-    // gone. Without noticing that a release ended since the cover was held, a
+    // gone. Without noticing that a release took the cover since it was held, a
     // same-host retry would trust the zombie (`pending().is_none()` reads
     // false) and skip re-engaging, believing an already-gone cover still
-    // protects it. The release must force the zombie's own `Drop`
-    // (idempotent against an already-cleared cover either way) and a fresh,
-    // real re-engage.
+    // protects it. The stale stamp makes the retry drop the zombie (which
+    // deletes nothing) and engage a fresh, real cover.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let (mut pm, st) = covered_start_holding_the_cover(&dir).await;
@@ -310,7 +309,8 @@ fn an_externally_released_cover_is_not_silently_reused() {
 
         // Simulate `handle_unblock` releasing out-of-band, lock-free, while
         // this manager wasn't holding its lock.
-        drop(tun_engine::routing::failclosed::begin_release(dir.path()));
+        let routing = pm.routing_handle();
+        routing.release_all_covers(&routing.lock_covers()).unwrap();
 
         // `test_config()`'s default server host is the same `127.0.0.1` as
         // `covered_start_holding_the_cover`'s closed probe, so this retry
@@ -325,8 +325,8 @@ fn an_externally_released_cover_is_not_silently_reused() {
 
         assert_eq!(
             st.cover_disengage_calls.load(Ordering::SeqCst),
-            2,
-            "one disengage for the dropped zombie, one for the retry's own successful-connect release"
+            1,
+            "the dropped zombie's stamp is stale, so its drop deletes nothing; only the retry's own              successful-connect release disengages"
         );
         assert_eq!(
             st.cover_engage_calls.load(Ordering::SeqCst),

@@ -20,7 +20,7 @@ pub async fn recover_then_reconcile<P, R, D>(
     cancel: &CancellationToken,
 ) where
     P: Proxy,
-    R: Routing,
+    R: Routing + 'static,
     D: Dns,
 {
     recover_then_reconcile_with(
@@ -43,7 +43,7 @@ pub(crate) async fn recover_then_reconcile_with<P, R, D, F>(
     recover: F,
 ) where
     P: Proxy,
-    R: Routing,
+    R: Routing + 'static,
     D: Dns,
     F: FnOnce(&Path, Option<(u32, u32)>) -> Recovery + Send + 'static,
 {

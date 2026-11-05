@@ -1755,16 +1755,11 @@ pub trait Routing: Send + Sync {
     /// returning, which is what makes the discard here cost a message and not
     /// the finding.
     ///
-    /// Release-epoch contract: an implementation that changes the firewall
-    /// does so inside its own release guard (`failclosed::begin_release`),
-    /// opened before its first delete. The guard supersedes every start that
-    /// began earlier when it ends; an implementation that fails before it
-    /// changes anything consumes it with `ReleaseInFlight::changed_nothing`.
-    /// The caller leans on this: `handle_unblock` calls `changed_nothing` on
-    /// its own guard when this returns `Err`, because the implementation's
-    /// guard already carries what happened to the firewall. `SystemRouting`
-    /// meets it through `failclosed::sweep_with_witness`; a test double that
-    /// releases a cover opens a guard too.
+    /// Takes the cover lock as proof that no other cover mutation runs: a release decides and acts as one section
+    /// (see [`failclosed::CoverLock`]), and a guard held from before it releases nothing afterwards, because a
+    /// completed sweep outdates every guard's stamp. An implementation that completes calls
+    /// `outdate_stamps` for both cover kinds, as [`failclosed::release_all`] does; one that fails leaves them, so
+    /// a held guard's drop retries.
     fn release_all_covers(&self, lock: &failclosed::CoverLock) -> Result<(), RoutingError>;
 
     /// Take the cover lock for this provider's own state directory: the one every cover method above takes as its
