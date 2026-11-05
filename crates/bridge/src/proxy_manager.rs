@@ -2331,11 +2331,13 @@ fn install_standing_cover<R: Routing>(
 ///
 /// Promotes only over `Unset` ([`lockdown_state::Intent::admits_adoption_promotion`]); an unreadable record already
 /// reads armed and may hold the user's `Off`.
-/// An explicit recorded `Off` must never be clobbered: an out-of-process
-/// `hole bridge unlock` or the tray's Unblock can write it at any moment, and a
-/// claim is never proof the intent is still unset. The check and the write are
-/// one critical section ([`lockdown_state::promote_unrecorded`]), so no `Off`
-/// can land between them.
+/// An explicit recorded `Off` is never overwritten: a claim is never proof the intent is still unset, so
+/// [`lockdown_state::promote_unrecorded`] decides from the record it reads inside its own update.
+///
+/// `lock` is the caller's cover lock. It excludes every writer of that record in this process (the tray's Unblock, the
+/// lockdown handler, session teardown and the boot reconcile all take it), so none lands between the install and this
+/// write. It does not exclude another process: nothing writes the record while a bridge runs (`hole bridge unlock` and
+/// the cutover need `BridgeLiveness`), which is a premise of this function, not something it checks.
 ///
 /// Best-effort: the write only makes the preference durable, and failing the
 /// connect over a bookkeeping error would be the worse trade.
