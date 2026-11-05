@@ -729,7 +729,7 @@ fn bare_ss_tunnel_uses_doh_resolved_ip() {
 }
 
 /// Production-default fail-closed path: `allow_insecure_bootstrap = false` with
-/// a configured resolver that never answers must yield `DnsFailed` with no OS
+/// a configured resolver that fails every query must yield `DnsFailed` with no OS
 /// resolver and no network. Mirrors
 /// `proxy_manager_tests::full_start_fails_closed_when_doh_cannot_resolve`.
 /// Distinct from `run_test_returns_dns_failed_for_unresolvable_host`, which
@@ -740,9 +740,9 @@ fn run_test_fails_closed_when_doh_cannot_resolve() {
     use hole_common::config::{DnsConfig, DnsProtocol};
 
     use crate::dns::forwarder::UpstreamCause;
-    struct NeverQuerier;
+    struct UnreachableQuerier;
     #[async_trait::async_trait]
-    impl DohQuerier for NeverQuerier {
+    impl DohQuerier for UnreachableQuerier {
         async fn query(&self, _s: std::net::IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
             Err(UpstreamCause::Unreachable)
         }
@@ -758,7 +758,7 @@ fn run_test_fails_closed_when_doh_cannot_resolve() {
                 protocol: DnsProtocol::Https,
                 allow_insecure_bootstrap: false,
             },
-            bootstrap_querier: Some(std::sync::Arc::new(NeverQuerier)),
+            bootstrap_querier: Some(std::sync::Arc::new(UnreachableQuerier)),
             ..fast_test_config(bogus, bogus)
         };
 

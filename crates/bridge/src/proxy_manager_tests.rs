@@ -2210,7 +2210,7 @@ fn doh_bootstrap_failure_sets_last_error() {
         pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
         let mut config = test_config();
         // RFC 2606 reserves .invalid for guaranteed-non-resolution; the stub
-        // querier never answers, so resolve is fail-closed without any network.
+        // querier fails every query at once, so resolve fails without any network.
         config.server.server = "test.invalid".into();
 
         let err = pm.start(&config).await.unwrap_err();
@@ -2269,8 +2269,7 @@ fn a_start_that_cannot_resolve_logs_the_measured_cover_presence() {
                 let want = format!("cover_presence={presence:?}");
                 assert!(
                     output.contains("could not resolve the server") && output.contains(&want),
-                    "covered={covered}: the resolve failure must log `{want}`; got:
-{output}"
+                    "covered={covered}: the resolve failure must log `{want}`; got:\n{output}"
                 );
             });
         }
@@ -3201,7 +3200,7 @@ fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
 
 #[skuld::test]
 fn full_start_fails_closed_when_doh_cannot_resolve() {
-    // A stub that never answers → Unreachable → DohBootstrap, hermetic (no
+    // A stub that fails at once → Unreachable → DohBootstrap, hermetic (no
     // system DNS or network).
     rt().block_on(async {
         let (mut pm, rstate, _dir) = new_manager_capturing(MockProxy::new());
