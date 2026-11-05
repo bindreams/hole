@@ -200,11 +200,14 @@ fn route_record() -> route_state::RouteState {
 /// The macOS rows. Another platform lists their sources and runs none of them.
 #[cfg(target_os = "macos")]
 fn macos_writers() -> Vec<Writer> {
-    use tun_engine::routing::failclosed::{failclosed_state, lockdown_pf_state};
+    use tun_engine::routing::failclosed::{
+        failclosed_state, lockdown_pf_state,
+        pf_record::{self, Cleared},
+    };
     vec![
         Writer {
-            name: "the pf cover state, saved",
-            sources: &["crates/tun-engine/src/routing/failclosed/failclosed_state.rs"],
+            name: "the pf cover state, swapped",
+            sources: &["crates/tun-engine/src/routing/failclosed/pf_record.rs"],
             names: &[failclosed_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
@@ -213,7 +216,9 @@ fn macos_writers() -> Vec<Writer> {
                     pf_token: "0".to_owned(),
                     pf_was_enabled: false,
                 };
-                failclosed_state::save(dir, &state, owner).map_err(io::Error::other)
+                pf_record::swap(dir, &state, owner)
+                    .map(|_| ())
+                    .map_err(io::Error::other)
             },
         },
         Writer {
@@ -222,14 +227,16 @@ fn macos_writers() -> Vec<Writer> {
             names: &[failclosed_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match failclosed_state::clear(dir).map_err(io::Error::other)? {
-                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+            run: |dir, _| match pf_record::clear_if_token::<failclosed_state::FailClosedState>(dir, None)
+                .map_err(io::Error::other)?
+            {
+                Cleared::Kept => Err(io::Error::other(LeftAsItIs)),
                 _ => Ok(()),
             },
         },
         Writer {
-            name: "the pf lockdown state, saved",
-            sources: &["crates/tun-engine/src/routing/failclosed/lockdown_pf_state.rs"],
+            name: "the pf lockdown state, swapped",
+            sources: &[],
             names: &[lockdown_pf_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
@@ -240,7 +247,9 @@ fn macos_writers() -> Vec<Writer> {
                     nat_snapshot: String::new(),
                     main_snapshot_captured: true,
                 };
-                lockdown_pf_state::save(dir, &state, owner).map_err(io::Error::other)
+                pf_record::swap(dir, &state, owner)
+                    .map(|_| ())
+                    .map_err(io::Error::other)
             },
         },
         Writer {
@@ -249,8 +258,10 @@ fn macos_writers() -> Vec<Writer> {
             names: &[lockdown_pf_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match lockdown_pf_state::clear(dir).map_err(io::Error::other)? {
-                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+            run: |dir, _| match pf_record::clear_if_token::<lockdown_pf_state::LockdownPfState>(dir, None)
+                .map_err(io::Error::other)?
+            {
+                Cleared::Kept => Err(io::Error::other(LeftAsItIs)),
                 _ => Ok(()),
             },
         },
@@ -261,10 +272,7 @@ fn macos_writers() -> Vec<Writer> {
 fn macos_writers() -> Vec<Writer> {
     vec![Writer {
         name: "the pf states (macOS)",
-        sources: &[
-            "crates/tun-engine/src/routing/failclosed/failclosed_state.rs",
-            "crates/tun-engine/src/routing/failclosed/lockdown_pf_state.rs",
-        ],
+        sources: &["crates/tun-engine/src/routing/failclosed/pf_record.rs"],
         names: &[],
         at_a_planted_name: AtAPlantedName::Replaces,
         runs_here: false,
@@ -1535,6 +1543,7 @@ const STATE_MODULES: &[&str] = &[
     "crates/tun-engine/src/routing/failclosed/failclosed_state.rs",
     "crates/tun-engine/src/routing/failclosed/lockdown_pf_state.rs",
     "crates/tun-engine/src/routing/failclosed/lockdown_state.rs",
+    "crates/tun-engine/src/routing/failclosed/pf_record.rs",
 ];
 
 #[skuld::test]

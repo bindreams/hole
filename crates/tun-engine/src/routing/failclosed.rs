@@ -32,13 +32,18 @@ pub const RESOLVER_PERMIT_PORT: u16 = 443;
 /// `release_all`'s doc for why that distinction is load-bearing. Generic and
 /// declared here (not per-platform) so both macOS state modules share one
 /// reader shape.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum StateFile<T> {
     /// No file — no cover of this kind was ever engaged (or a prior release
     /// already cleared it).
     Absent,
-    /// A file exists but could not be read, parsed, or matched the expected
-    /// schema version. Treated as a cover to clear, never as absence.
+    /// The read failed with an I/O error other than "not found": the bytes were
+    /// never seen, so there is no token to salvage, and nothing may treat the
+    /// record as absent or remove it.
+    Unreadable,
+    /// A file exists and its bytes were read, but they are not a record this
+    /// release can use: corrupt, or at a version this release does not read.
+    /// Treated as a cover to clear, never as absence.
     ///
     /// `pf_token` is whatever [`StateFile::unusable`] could still salvage from
     /// the bytes, and carrying it is not a nicety: the reachable cause of this
@@ -47,8 +52,8 @@ pub enum StateFile<T> {
     /// record discards the only copy of the `pfctl -E` ticket in existence, and
     /// the sweep that then runs with no token to hand `pfctl -X` clears the
     /// file as well, leaking pf's enable refcount until reboot. `None` is the
-    /// honest answer for bytes that yielded nothing — an unreadable file, or
-    /// JSON with no usable `pf_token`.
+    /// honest answer for bytes that yielded nothing: JSON with no usable
+    /// `pf_token`.
     Unusable { pf_token: Option<String> },
     /// A file exists and parsed at the current schema version.
     Present(T),
@@ -76,28 +81,33 @@ impl<T> StateFile<T> {
     }
 }
 
-/// The fold of a read into the sweep's trichotomy: a record that is not `Current` keeps whatever token its bytes
-/// still hold, and a read that failed has no bytes.
-impl<T> From<Loaded<T>> for StateFile<T> {
-    fn from(loaded: Loaded<T>) -> Self {
+impl<T: Clone> StateFile<T> {
+    /// The fold of a read into the sweep's view: a record that is not `Current` keeps whatever token its bytes still
+    /// hold, and a read that failed has no bytes.
+    pub fn view(loaded: &Loaded<T>) -> StateFile<T> {
         match loaded {
-            Loaded::Current { value, .. } => StateFile::Present(value),
+            Loaded::Current { value, .. } => StateFile::Present(value.clone()),
             Loaded::Absent => StateFile::Absent,
             Loaded::Obsolete { raw, .. } => StateFile::unusable(raw.as_bytes()),
             Loaded::Newer { raw, .. } => StateFile::unusable(raw.as_bytes()),
             Loaded::Corrupt { raw, .. } => StateFile::unusable(raw.as_bytes()),
-            Loaded::Unreadable { .. } => StateFile::Unusable { pf_token: None },
+            Loaded::Unreadable { .. } => StateFile::Unreadable,
         }
     }
 }
 
 // macOS persists its pf enable token; Windows recovers WFP filters by fixed
-// GUID and needs no state.
-#[cfg(target_os = "macos")]
+// GUID and needs no state. Compiled for every platform's TESTS, because the
+// rules the two records and their clears implement are platform-free and a rule
+// proved only where the hazard lives is proved nowhere else.
+#[cfg(any(target_os = "macos", test))]
 pub mod failclosed_state;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod lockdown_pf_state;
+
+#[cfg(any(target_os = "macos", test))]
+pub mod pf_record;
 
 pub mod luid;
 pub use luid::{LuidResolver, SystemLuidResolver};
