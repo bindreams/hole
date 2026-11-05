@@ -390,9 +390,18 @@ pub(super) fn id_of(dir: &File, name: &OsStr) -> io::Result<Option<FileId>> {
 
 pub(super) fn ids_of(dir: &File, name: &OsStr) -> io::Result<Option<(u32, u32)>> {
     match fstatat_nofollow(dir.as_raw_fd(), &cstr(name)?) {
-        Ok(meta) if meta.kind() != EntryKind::File => Err(Refusal::NotRegular.into_io_error()),
-        Ok(meta) if meta.links != 1 => Err(Refusal::ForeignFile.into_io_error()),
-        Ok(meta) => Ok(Some((meta.uid, meta.gid))),
+        Ok(meta) => {
+            let facts = Facts {
+                regular: meta.kind() == EntryKind::File,
+                uid: meta.uid,
+                links: meta.links,
+            };
+            match (trusted_appender(facts, None), facts.regular) {
+                (true, _) => Ok(Some((meta.uid, meta.gid))),
+                (false, false) => Err(Refusal::NotRegular.into_io_error()),
+                (false, true) => Err(Refusal::ForeignFile.into_io_error()),
+            }
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }

@@ -22,7 +22,7 @@
 use crate::plugin_state::{self, PluginState};
 use cosca::identity::{ProcessId, Resolved};
 use std::path::Path;
-use util::versioned_file::{Loaded, UpdateOutcome};
+use util::versioned_file::Loaded;
 
 /// Kill every plugin process recorded under `state_dir`, then remove the records
 /// that were accounted for.
@@ -153,10 +153,8 @@ pub(crate) fn reap_loaded_with(
         }
     }
 
+    // A file it cannot read is named by `remove_accounted` itself.
     match plugin_state::remove_accounted(state_dir, &accounted) {
-        Ok(UpdateOutcome::Kept) => {
-            tracing::warn!("plugin state file could not be read at the removal, so it was kept")
-        }
         Ok(_) => {}
         Err(e) => tracing::warn!(
             error = &e as &dyn std::error::Error,

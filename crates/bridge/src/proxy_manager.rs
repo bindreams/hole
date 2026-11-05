@@ -871,7 +871,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Unblock that begins in between is not undone by a cover installed after
         // its release, and the start reports `Cancelled`. Refused outright while
         // an Unblock is in flight.
-        let release_watch = self.state_dir.as_deref().map(watch_releases).transpose()?;
+        let release_watch = match self.state_dir.as_deref().map(watch_releases).transpose() {
+            Ok(watch) => watch,
+            Err(e) => {
+                debug_assert!(e.cancels_the_start());
+                return Err(self.cancelled_start());
+            }
+        };
 
         // A (re)start supersedes any prior out-of-band death — clear the death
         // reason regardless of this attempt's outcome.
@@ -906,18 +912,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
                 Ok(b) => (b.server_ip, b.via),
+                Err(ProxyError::Cancelled) => return Err(self.cancelled_start()),
                 Err(e) => {
-                    if !matches!(e, ProxyError::Cancelled) {
-                        self.last_error = Some(e.to_string());
-                        // A covered start that can't resolve has no IP to permit, so no
-                        // cover can engage: the block-until-connected intent falls open
-                        // here — logged so the gap is visible, not silent.
-                        if covered {
-                            warn!(
-                                error = &e as &dyn std::error::Error,
-                                "covered start could not resolve the server; host NOT blocked (no IP to permit)"
-                            );
-                        }
+                    self.last_error = Some(e.to_string());
+                    // A covered start that can't resolve has no IP to permit, so no
+                    // cover can engage: the block-until-connected intent falls open
+                    // here — logged so the gap is visible, not silent.
+                    if covered {
+                        warn!(
+                            error = &e as &dyn std::error::Error,
+                            "covered start could not resolve the server; host NOT blocked (no IP to permit)"
+                        );
                     }
                     return Err(e);
                 }
@@ -1069,7 +1074,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
                         // Dropped here, uncommitted, if a release overtook it.
-                        overtaken_by_release(release_watch.as_ref())?;
+                        if overtaken_by_release(release_watch.as_ref()).is_err() {
+                            return Err(self.cancelled_start());
+                        }
                         self.posture.hold_pending(BlockedStart {
                             cover,
                             host: config.server.server.expose().to_string(),
@@ -1079,12 +1086,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         });
                     }
                     // Superseded by a release: cancel, neither run uncovered nor engage again.
-                    Err(e) if e.cancels_the_start() => return Err(e.into()),
+                    Err(e) if e.cancels_the_start() => return Err(self.cancelled_start()),
                     Err(e) => {
                         if let Some((old_permit, original_pin)) = repair_fallback {
                             match self.routing.install_failclosed_cover(server_ip, old_permit) {
                                 Ok(cover) => {
-                                    overtaken_by_release(release_watch.as_ref())?;
+                                    if overtaken_by_release(release_watch.as_ref()).is_err() {
+                                        return Err(self.cancelled_start());
+                                    }
                                     self.posture.hold_pending(BlockedStart {
                                         cover,
                                         host: config.server.server.expose().to_string(),
@@ -1119,7 +1128,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                     }
                                     self.last_error = Some(e.to_string());
                                 }
-                                Err(e2) if e2.cancels_the_start() => return Err(e2.into()),
+                                Err(e2) if e2.cancels_the_start() => return Err(self.cancelled_start()),
                                 Err(e2) => {
                                     warn!(
                                         error = &e as &dyn std::error::Error,
@@ -1255,13 +1264,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 info!(started = %dump!(&diag), "proxy started");
                 Ok(())
             }
-            Err(ProxyError::Cancelled) => {
-                // User asked to cancel: release the cover (same trust as a user
-                // disconnect). Do NOT set last_error on cancel.
-                drop(self.posture.take_pending());
-                info!("proxy start cancelled");
-                Err(ProxyError::Cancelled)
-            }
+            Err(ProxyError::Cancelled) => Err(self.cancelled_start()),
             Err(e) => {
                 // Covered start failed: RETAIN the held cover (the posture keeps
                 // it as `PendingStart`, so its Drop does NOT run) — the host stays
@@ -1272,6 +1275,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Err(e)
             }
         }
+    }
+
+    /// The one exit of a cancelled start, whether the user or a release cancelled it, early or late: release the
+    /// cover (same trust as a user disconnect). A cancel records no `last_error`.
+    fn cancelled_start(&mut self) -> ProxyError {
+        drop(self.posture.take_pending());
+        info!("proxy start cancelled");
+        ProxyError::Cancelled
     }
 
     /// Resolve the proxy server's hostname to an IP over PRIVATE DoH using the
