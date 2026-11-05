@@ -12,14 +12,19 @@
 //! restart-on-failure action. S is crashed, then C. C's restarted instance
 //! signals an event, and that event, not a delay, is what the test waits for:
 //! it bounds the read of S from above, because S's action was due well before
-//! C's. S's disable is written either while its restart is queued (variant
-//! `queued`) or before the crash (variant `running`).
+//! C's: C is killed only after S's queued restart was read off the log, so C's
+//! is due `C_RESTART_DELAY` after that read and S's `S_RESTART_DELAY` after the
+//! SCM queued it. S's disable is written either while its restart is queued
+//! (variant `queued`) or before the crash (variant `running`).
 //!
 //! The `queued` variant needs the disable to land before the SCM's restart
 //! timer fires, which the test cannot guarantee: only the SCM runs that timer.
-//! The disable's own read-back says which side won (S still STOPPED), so an
-//! attempt that lost the race is abandoned and rerun on fresh services, never
-//! reported as a verdict.
+//! S's state is read just BEFORE the disable is written: S not STOPPED then
+//! means the restart had already fired, so the attempt is abandoned and rerun
+//! on fresh services, never reported as a verdict. A restart after that read
+//! counts as a restart of a disabled service and fails loudly, even if it fell
+//! in the instant before the disable; the RESULT line carries the state before
+//! and after the disable and the SCM's entries for S, which tell the two apart.
 
 use std::ffi::OsString;
 use std::time::Duration;
@@ -38,10 +43,11 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use super::named_event::NamedEvent;
 use super::{scm_deletion, scm_probe, GLOBAL_NET_STATE, TUN};
 
-/// How long the SCM waits before it restarts S, and C. C's is the longer, so
-/// that S's action is due well before the control's restart is up. S's must
-/// outlast the event-log read before the disable (measured ~6 s on a loaded
-/// runner); a loss is rerun, not failed.
+/// How long the SCM waits before it restarts S, and C. C's is the longer, and C
+/// is killed only after the read of S's queued restart, so S's action is due
+/// well before the control's restart is up. S's must outlast the event-log read
+/// before the disable (measured ~6 s on a loaded runner); a loss is rerun, not
+/// failed.
 const S_RESTART_DELAY: Duration = Duration::from_secs(30);
 const C_RESTART_DELAY: Duration = Duration::from_secs(40);
 
@@ -312,14 +318,15 @@ impl Variant {
         }
     }
 
-    /// Whether the disable did what the variant says, given S's state read
-    /// right after it was written. A `queued` disable met a queued restart only
-    /// if S was still STOPPED, so one that reads otherwise lost the race with
-    /// the timer. A `running` disable precedes the crash by construction: a
-    /// restarted S there is a restart of a disabled service, not a lost race.
-    fn disable_met_its_scenario(self, state_after_disable: ServiceState) -> bool {
+    /// Whether the disable is still to meet the variant's scenario, given S's
+    /// state read just before it is written. A `queued` disable meets a queued
+    /// restart only if S is still STOPPED, so one that reads otherwise lost the
+    /// race with the timer. A `running` disable precedes the crash by
+    /// construction: a restarted S there is a restart of a disabled service,
+    /// not a lost race.
+    fn disable_meets_its_scenario(self, state_before_disable: ServiceState) -> bool {
         match self {
-            Variant::Queued => state_after_disable == ServiceState::Stopped,
+            Variant::Queued => state_before_disable == ServiceState::Stopped,
             Variant::Running => true,
         }
     }
@@ -330,7 +337,12 @@ enum AttemptOutcome {
     /// The scenario held and the verdict was asserted.
     Measured,
     /// The SCM restarted S before the disable was written; nothing was measured.
-    RaceLost,
+    RaceLost {
+        /// S's state, read just before the disable was due.
+        state_before_disable: ServiceState,
+        /// The SCM's log entries naming S, as `scm_entries_dump` writes them.
+        scm_entries: String,
+    },
 }
 
 /// Runs the probe until an attempt measures its scenario. Unbounded on purpose:
@@ -338,25 +350,45 @@ enum AttemptOutcome {
 /// bounded by the nextest terminate-after on these tests.
 fn run_probe(variant: Variant) {
     for attempt in 1.. {
-        match restart_probe(variant, attempt) {
+        match restart_probe(variant) {
             AttemptOutcome::Measured => return,
-            AttemptOutcome::RaceLost => eprintln!(
-                "P1 {}: attempt {attempt} lost the race with the SCM's restart timer; rerunning",
+            AttemptOutcome::RaceLost {
+                state_before_disable,
+                scm_entries,
+            } => eprintln!(
+                "P1 {}: attempt {attempt} lost the race with the SCM's restart timer: \
+                 S was {state_before_disable:?} when its disable was due, so its restart had already fired; \
+                 rerunning. \
+                 SCM log entries naming S, newest first: {scm_entries}",
                 variant.name()
             ),
         }
     }
 }
 
-/// One attempt, on services and events named for it: the SCM log keeps an
-/// earlier attempt's entries, which a reused name would read as this one's.
-fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
-    let tag = std::process::id();
+/// The SCM's log entries naming the service `display_name`, newest first, on one line.
+fn scm_entries_dump(display_name: &str) -> String {
+    system_log::scm_entries_naming(display_name)
+        .iter()
+        .map(|entry| format!("[{}: {}]", entry.event_id, entry.text))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One attempt, on services and events named for it: the SCM log keeps every
+/// earlier attempt's and run's entries, which a name any of them used would
+/// read as this one's. The id (variant, a random nonce, fixed-width) is unique
+/// to the attempt, and each display name closes in `]`, so no name is a prefix
+/// of another.
+fn restart_probe(variant: Variant) -> AttemptOutcome {
+    use rand::RngExt;
     let name = variant.name();
+    let id = format!("{name}-{:016x}", rand::rng().random::<u64>());
     let dir = tempfile::tempdir().unwrap();
     let (s_log, c_log) = (dir.path().join("s.log"), dir.path().join("c.log"));
-    let s_running = NamedEvent::create(&format!("RestartProbeSRunning{attempt}"));
-    let c_running = NamedEvent::create(&format!("RestartProbeCRunning{attempt}"));
+    // `NamedEvent` appends the process id to the tag, so the tag ends in a separator.
+    let s_running = NamedEvent::create(&format!("RestartProbeSRunning-{id}-"));
+    let c_running = NamedEvent::create(&format!("RestartProbeCRunning-{id}-"));
     let arguments = |log: &std::path::Path, running: &NamedEvent| -> Vec<OsString> {
         vec![
             "--pid-log".into(),
@@ -366,14 +398,14 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
         ]
     };
     let s = ProbeService::create(
-        format!("HoleProbeS{tag}a{attempt}"),
-        format!("Hole probe S {attempt}/{tag}"),
+        format!("HoleProbeS-{id}"),
+        format!("Hole probe S [{id}]"),
         arguments(&s_log, &s_running),
         S_RESTART_DELAY,
     );
     let c = ProbeService::create(
-        format!("HoleProbeC{tag}a{attempt}"),
-        format!("Hole probe C {attempt}/{tag}"),
+        format!("HoleProbeC-{id}"),
+        format!("Hole probe C [{id}]"),
         arguments(&c_log, &c_running),
         C_RESTART_DELAY,
     );
@@ -387,9 +419,18 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
     c_running.reset();
 
     let log = system_log::Watch::open();
-    if variant.disables_before_the_crash() {
+    // Reads S's state, then disables it unless that read shows the variant's
+    // scenario already lost: a disable written after the restart fired measures
+    // nothing.
+    let disable_s = || -> Result<ServiceState, ServiceState> {
+        let state_before_disable = s.state();
+        if !variant.disable_meets_its_scenario(state_before_disable) {
+            return Err(state_before_disable);
+        }
         s.disable();
-    }
+        Ok(state_before_disable)
+    };
+    let disabled_before_the_crash = variant.disables_before_the_crash().then(&disable_s);
     scm_probe::terminate_process(s_pid);
     eprintln!("P1 {name}: killed S (process {s_pid}); waiting for the SCM to log that it queued S's restart");
     log.wait_until(|| {
@@ -397,38 +438,36 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
             .iter()
             .any(|entry| entry.event_id == CORRECTIVE_ACTION_EVENT)
     });
-    if !variant.disables_before_the_crash() {
-        s.disable();
-    }
-    // A STOPPED service after the disable was written is one that had not been
-    // restarted when the disable landed.
+    let state_before_disable = match disabled_before_the_crash.unwrap_or_else(disable_s) {
+        Ok(state) => state,
+        Err(state_before_disable) => {
+            return AttemptOutcome::RaceLost {
+                state_before_disable,
+                scm_entries: scm_entries_dump(&s.display_name),
+            }
+        }
+    };
     let state_after_disable = s.state();
-    if !variant.disable_met_its_scenario(state_after_disable) {
-        eprintln!(
-            "P1 {name}: S was {state_after_disable:?} when the disable was written: its restart had already fired"
-        );
-        return AttemptOutcome::RaceLost;
-    }
     scm_probe::terminate_process(c_pid);
     eprintln!("P1 {name}: S disabled; killed C (process {c_pid}); waiting for C's restarted instance");
     c_running.wait();
 
     let (s_state, s_starts, c_starts) = (s.state(), starts_in(&s_log), starts_in(&c_log));
-    let entries = system_log::scm_entries_naming(&s.display_name);
     let restarted = s_starts > 1 || s_state != ServiceState::Stopped;
     eprintln!(
-        "P1 {name} RESULT: S's start type read back {:?}; S state when the disable was written {state_after_disable:?};          S state when C's restarted instance was up {s_state:?}; S starts {s_starts} (1 is the original); C starts {c_starts}          (2 is the original and its restart). SCM log entries naming S, newest first: {}",
+        "P1 {name} RESULT: S's start type read back {:?}; S state before the disable was \
+         written {state_before_disable:?}, after {state_after_disable:?}; \
+         S state when C's restarted instance was up {s_state:?}; S starts {s_starts} (1 is the original); \
+         C starts {c_starts} (2 is the original and its restart). \
+         SCM log entries naming S, newest first: {}",
         s.start_type(),
-        entries
-            .iter()
-            .map(|entry| format!("[{}: {}]", entry.event_id, entry.text))
-            .collect::<Vec<_>>()
-            .join(" ")
+        scm_entries_dump(&s.display_name)
     );
     let verdict = if restarted {
         "FALSIFIED: the disabled service was restarted"
     } else {
-        "NOT FALSIFIED: S was not restarted by the time C's restart was up. This probe cannot show that S will never          restart; the documented basis (ChangeServiceConfig2W Remarks) stands unless a run falsifies it"
+        "NOT FALSIFIED: S was not restarted by the time C's restart was up. This probe cannot show that S will never \
+         restart; the documented basis (ChangeServiceConfig2W Remarks) stands unless a run falsifies it"
     };
     eprintln!("P1 {name} VERDICT: {verdict}.");
     assert!(!restarted, "P1 {name}: the disabled service was restarted");
