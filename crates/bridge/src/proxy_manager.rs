@@ -272,6 +272,11 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// once a start honours this claim with a real `install_lockdown`. Holding
     /// both facts here is what let a plain disconnect disarm the switch.
     adopted_standing_cover: bool,
+    /// The count of Unblocks the tray has committed, shared with `IpcState::unblock_generation` (see
+    /// [`Self::unblock_generation_handle`]). A covered start snapshots it at entry and the transient cover section
+    /// compares it under the cover lock: an Unblock since the start began means the user released the cover the
+    /// start is about to engage.
+    unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only DoH querier override. Set by `set_bootstrap_querier_for_test`;
     /// when present, `start_cancellable` resolves via `resolve_via_doh_with`
     /// instead of the production `resolve_via_doh`.
@@ -422,6 +427,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             state_dir: None,
             state_owner: None,
             adopted_standing_cover: false,
+            unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             bootstrap_querier: None,
             #[cfg(test)]
@@ -444,6 +450,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// taking `state.proxy.lock()`.
     pub fn routing_handle(&self) -> Arc<R> {
         Arc::clone(&self.routing)
+    }
+
+    /// Clone of the Unblock counter. `bind_with_dirs` derives `IpcState::unblock_generation` from this, so the
+    /// handler that bumps it and the starts that read it share one counter.
+    pub fn unblock_generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.unblock_generation)
     }
 
     /// Set the state directory for plugin PID crash recovery.
@@ -853,6 +865,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if self.posture.session().is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
+        // Taken under `state.proxy`, before this start reads or resolves anything: an Unblock that commits after
+        // this is concurrent with the start (see `engage_transient_cover`); one that finished before it is not an
+        // input.
+        let unblock_snapshot = self.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
 
         // `handle_unblock` takes no `state.proxy` lock, so it may have released every OS-level cover while this
         // manager was not holding it. A `PendingStart` whose cover it took is a zombie: the OS objects it claims
@@ -987,6 +1003,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 pin,
                 ech_resolver_permit,
                 &effective_ech_doh,
+                unblock_snapshot,
             );
         } else if covered {
             // Covered retry after the user enabled lockdown mid-blocked-state:
@@ -1149,9 +1166,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         pin: crate::dns::ech::PinSource,
         ech_resolver_permit: Option<IpAddr>,
         effective_ech_doh: &crate::proxy::plugin::EffectiveEchDoh,
+        unblock_snapshot: u64,
     ) {
         let routing = Arc::clone(&self.routing);
         let lock = routing.lock_covers();
+
+        // The tray's Unblock holds this lock through its release and bumps the counter before it lets go, so a
+        // count that moved since the snapshot is an Unblock that ran during this start. The lockdown intent reads
+        // the same before and after it (`Off` is "no standing cover", as is never armed), so only the counter can
+        // tell. The user released the cover this start was about to engage: it installs none and proceeds
+        // uncovered, as an uncovered start does. A repair's restore engage is in this same section.
+        if self.unblock_generation.load(std::sync::atomic::Ordering::SeqCst) != unblock_snapshot {
+            info!("an Unblock ran since this covered start began: no transient cover is engaged");
+            return;
+        }
 
         let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = self
             .posture

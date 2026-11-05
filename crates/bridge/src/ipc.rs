@@ -174,15 +174,15 @@ impl IpcServer {
         // and test caller — uncontended by construction. Deriving the
         // routing handle this way (rather than threading a new parameter)
         // keeps every existing `bind`/`bind_with_dirs` call site unchanged.
-        let routing = proxy
-            .try_lock()
-            .expect("proxy mutex must be uncontended at bind time")
-            .routing_handle();
+        let (routing, unblock_generation) = {
+            let pm = proxy.try_lock().expect("proxy mutex must be uncontended at bind time");
+            (pm.routing_handle(), pm.unblock_generation_handle())
+        };
 
         let state = Arc::new(IpcState {
             proxy,
             routing,
-            unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            unblock_generation,
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
             log_dir,
