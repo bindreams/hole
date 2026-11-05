@@ -104,6 +104,7 @@ use super::platform::{
     boottime_probe, Action, Condition, FilterLifetime, FilterSpec, Layer, BLOCK_WEIGHT, FWP_E_FILTER_NOT_FOUND_DWORD,
     LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS, LOCKDOWN_FILTER_GUIDS, PROVIDER_GUID, SUBLAYER_GUID,
 };
+use super::CoverLock;
 use super::{engage_lockdown, SystemLuidResolver};
 use crate::{GLOBAL_NET_STATE, TUN};
 
@@ -618,11 +619,11 @@ fn boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_
     };
 
     let first_cover = engage_lockdown(
+        &CoverLock::acquire(dir.path()),
         server_ip,
         "Loopback Pseudo-Interface 1",
         &SystemLuidResolver,
         &[],
-        dir.path(),
         None,
     )
     .expect("first engage of the real WFP lockdown cover");
@@ -640,11 +641,11 @@ fn boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_
     // it (`decide_cover_recovery == Adopt`), and so does every reconnect that
     // refreshes the volatile permits.
     let second_cover = engage_lockdown(
+        &CoverLock::acquire(dir.path()),
         server_ip,
         "Loopback Pseudo-Interface 1",
         &SystemLuidResolver,
         &[],
-        dir.path(),
         None,
     )
     .expect("second engage over the held cover");
@@ -652,7 +653,9 @@ fn boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_
     let second_floor = floor("after the second engage");
 
     // Sweep before asserting: an assertion failure must not strand a real
-    // block-all block on the host, and `Cover::drop` runs on unwind anyway.
+    // block-all block on the host, and `Cover::drop` runs on unwind anyway. The
+    // second engage owns the cover, so its drop deletes; the first guard's stamp
+    // is stale, so its drop deletes nothing.
     drop(second_cover);
     drop(first_cover);
 

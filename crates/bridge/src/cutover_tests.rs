@@ -15,14 +15,14 @@ fn service_state_dir_matches_install_convention() {
 // `bridge unlock` ordering: the escape hatch must actually disengage the cover
 // before flipping intent off, or fail loud. A swallowed disengage failure would
 // leave the cover engaged (egress blocked) while intent reads off — misleading.
-use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::failclosed::{lockdown_state, CoverLock};
 
 #[skuld::test]
 fn unlock_failing_disengage_does_not_flip_intent() {
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || {
+    let result = unlock_with(dir.path(), |_lock| {
         Err(std::io::Error::other("cannot disengage / not elevated"))
     });
 
@@ -36,9 +36,9 @@ fn unlock_failing_disengage_does_not_flip_intent() {
 #[skuld::test]
 fn unlock_successful_disengage_flips_intent_off() {
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || Ok(Clearance::proven()));
+    let result = unlock_with(dir.path(), |_lock| Ok(Clearance::proven()));
 
     assert!(result.is_ok());
     assert!(
@@ -56,9 +56,9 @@ fn unlock_hands_back_what_the_disengage_could_not_prove() {
     // an off intent prevents. This is the last moment the qualification can
     // reach anybody, which is why `hole bridge unlock` prints it.
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
 
-    let clearance = unlock_with(dir.path(), || {
+    let clearance = unlock_with(dir.path(), |_lock| {
         Ok(unproven_clearance(&["lockdown boot-time block-all V4"]))
     })
     .expect("an unproven disengage is not a failure");
@@ -83,13 +83,13 @@ fn unlock_hands_back_what_the_disengage_could_not_prove() {
 #[skuld::test]
 fn unlock_refuses_against_a_live_bridge() {
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
 
     // Simulate a live bridge with the same lock a running bridge holds for
     // its whole lifetime — real contention, not a mocked probe.
     let _bridge = crate::liveness::BridgeLiveness::acquire(dir.path(), None).unwrap();
 
-    let result = unlock_with(dir.path(), || {
+    let result = unlock_with(dir.path(), |_lock| {
         panic!("disengage must never run while a bridge instance is live")
     });
 
@@ -107,9 +107,9 @@ fn unlock_refuses_against_a_live_bridge() {
 #[skuld::test]
 fn unlock_records_the_target_off_before_releasing() {
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || {
+    let result = unlock_with(dir.path(), |_lock| {
         assert_eq!(
             crate::target::load(dir.path()),
             crate::target::Target::Off,
@@ -129,7 +129,7 @@ fn unlock_over_a_target_it_cannot_read_leaves_off_and_keeps_a_backup() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(crate::target::STATE_FILE_NAME), unreadable).unwrap();
 
-        let _clearance = unlock_with(dir.path(), || Ok(Clearance::proven()))
+        let _clearance = unlock_with(dir.path(), |_lock| Ok(Clearance::proven()))
             .expect("the escape must not be blocked by a bad record");
 
         assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
@@ -147,9 +147,9 @@ fn unlock_over_a_target_it_cannot_read_leaves_off_and_keeps_a_backup() {
 #[skuld::test]
 fn unlock_holds_the_liveness_lock_across_the_whole_sequence() {
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || {
+    let result = unlock_with(dir.path(), |_lock| {
         // A bridge "starting" here — anywhere between the initial check and
         // the intent flip — must see the lock held, never a window where it
         // could acquire it and race the disengage/intent-flip below.
@@ -316,7 +316,7 @@ fn release_covers_probe(dir: &std::path::Path, release: impl FnOnce() -> std::io
     // target write), not about what the sweep proved — so they hand it
     // the fully-proven clearance and drop it again. The propagation itself is
     // pinned by `release_covers_reports_what_the_sweep_could_not_prove`.
-    release_covers_with(dir, &[], || release().map(|()| Clearance::proven())).map(|_| ())
+    release_covers_with(dir, &[], |_lock| release().map(|()| Clearance::proven())).map(|_| ())
 }
 
 #[skuld::test]
@@ -345,7 +345,7 @@ fn release_covers_refuses_against_a_bridge_live_in_a_peer_state_dir() {
 
     let _bridge = crate::liveness::BridgeLiveness::acquire(peer.path(), None).unwrap();
 
-    let result = release_covers_with(service.path(), &[peer.path().to_path_buf()], || {
+    let result = release_covers_with(service.path(), &[peer.path().to_path_buf()], |_lock| {
         panic!("the release must never run while a bridge instance is live")
     });
 
@@ -363,7 +363,7 @@ fn release_covers_locks_a_peer_state_dir_that_is_not_there_yet() {
     let service = tempfile::tempdir().unwrap();
     let absent = service.path().join("no-such-user").join("state");
 
-    let result = release_covers_with(service.path(), std::slice::from_ref(&absent), || {
+    let result = release_covers_with(service.path(), std::slice::from_ref(&absent), |_lock| {
         assert!(
             crate::liveness::BridgeLiveness::try_acquire(&absent, None)
                 .unwrap()
@@ -391,7 +391,9 @@ fn release_covers_leaves_every_peer_tree_it_provisioned() {
     let profile = service.path().join("no-such-user");
     let peer = profile.join("state");
 
-    let result = release_covers_with(service.path(), std::slice::from_ref(&peer), || Ok(Clearance::proven()));
+    let result = release_covers_with(service.path(), std::slice::from_ref(&peer), |_lock| {
+        Ok(Clearance::proven())
+    });
 
     assert!(result.is_ok(), "{result:?}");
     assert!(
@@ -419,7 +421,7 @@ fn release_covers_never_removes_a_symlink_on_a_peer_path() {
     let link = base.path().join("profile");
     std::os::unix::fs::symlink(base.path().join("volume-not-mounted"), &link).unwrap();
 
-    let result = release_covers_with(service.path(), &[link.join("hole").join("state")], || {
+    let result = release_covers_with(service.path(), &[link.join("hole").join("state")], |_lock| {
         Ok(Clearance::proven())
     });
 
@@ -441,7 +443,9 @@ fn release_covers_leaves_a_peer_state_dir_that_was_already_there() {
     let record = peer.path().join("bridge-routes.json");
     std::fs::write(&record, b"{}").unwrap();
 
-    let result = release_covers_with(service.path(), &[peer.path().to_path_buf()], || Ok(Clearance::proven()));
+    let result = release_covers_with(service.path(), &[peer.path().to_path_buf()], |_lock| {
+        Ok(Clearance::proven())
+    });
 
     assert!(result.is_ok(), "{result:?}");
     assert!(
@@ -465,7 +469,7 @@ fn release_covers_does_not_refuse_against_its_own_guard() {
         peer.path().to_path_buf(),
     ];
 
-    let result = release_covers_with(service.path(), &peers, || Ok(Clearance::proven()));
+    let result = release_covers_with(service.path(), &peers, |_lock| Ok(Clearance::proven()));
 
     assert!(
         result.is_ok(),
@@ -493,7 +497,7 @@ fn release_covers_records_the_target_off_before_releasing() {
 #[skuld::test]
 fn release_covers_fails_loud_when_it_cannot_release() {
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
 
     let result = release_covers_probe(dir.path(), || Err(std::io::Error::other("not elevated")));
 
@@ -510,7 +514,7 @@ fn release_covers_fails_loud_when_it_cannot_release() {
 #[skuld::test]
 fn release_covers_disarms_the_kill_switch_on_a_confirmed_release() {
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
 
     let result = release_covers_probe(dir.path(), || Ok(()));
 
@@ -543,7 +547,7 @@ fn release_covers_deletes_no_crash_recovery_record() {
         std::fs::write(dir.path().join(name), b"{}").unwrap();
     }
 
-    let result = release_covers_with(dir.path(), &[], || Ok(Clearance::proven()));
+    let result = release_covers_with(dir.path(), &[], |_lock| Ok(Clearance::proven()));
 
     assert!(result.is_ok(), "{result:?}");
     for name in ESCAPE_RECORDS {
@@ -654,7 +658,7 @@ fn release_covers_reports_what_the_sweep_could_not_prove() {
     // sweep's verdict, not a bare `Ok`. Collapsing it here would put the
     // silent `Ok` of #1003 back one layer up from where it was removed.
     let dir = tempfile::tempdir().unwrap();
-    let clearance = release_covers_with(dir.path(), &[], || {
+    let clearance = release_covers_with(dir.path(), &[], |_lock| {
         Ok(unproven_clearance(&["lockdown boot-time block-all V4"]))
     })
     .expect("an unproven clearance is not a failure");
@@ -675,7 +679,7 @@ fn the_uninstall_gate_reads_a_twin_recorded_in_a_peer_state_dir() {
     let peer = tempfile::tempdir().unwrap();
     let twins = ["lockdown boot-time block-all V4"];
 
-    let quiet = release_covers_with(dir.path(), &[peer.path().to_path_buf()], || {
+    let quiet = release_covers_with(dir.path(), &[peer.path().to_path_buf()], |_lock| {
         Ok(clearance_with_sibling(KeyOutcome::NotFound, &twins))
     })
     .expect("an unproven clearance is not a failure");
@@ -685,8 +689,8 @@ fn the_uninstall_gate_reads_a_twin_recorded_in_a_peer_state_dir() {
         "no evidence anywhere: this is what almost every uninstall looks like"
     );
 
-    tun_engine::routing::failclosed::boottime_witness::record_armed_for_test(peer.path(), None);
-    let loud = release_covers_with(dir.path(), &[peer.path().to_path_buf()], || {
+    tun_engine::routing::failclosed::boottime_witness::record_armed_for_test(&CoverLock::acquire(peer.path()), None);
+    let loud = release_covers_with(dir.path(), &[peer.path().to_path_buf()], |_lock| {
         Ok(clearance_with_sibling(KeyOutcome::NotFound, &twins))
     })
     .expect("an unproven clearance is not a failure");

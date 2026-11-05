@@ -29,8 +29,9 @@
 //! matches on both. Renaming a test WITHOUT updating that filter silently
 //! drops it from the group.
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::cover_oracle::{held_covers, permit_scenario};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use super::CoverLock;
 use crate::device::TunIdentity;
 use crate::routing::{CoverGuard, Routing, SystemRouting};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -73,7 +74,7 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 struct ReleaseOnDrop(std::path::PathBuf);
 impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {
-        let Err(e) = crate::routing::failclosed::release_all(&self.0) else {
+        let Err(e) = crate::routing::failclosed::release_all(&CoverLock::acquire(&self.0)) else {
             return;
         };
         let msg = format!(
@@ -131,7 +132,7 @@ fn release_stranded(what: &str, routing: &SystemRouting, state_dir: &std::path::
                 .blocked(NON_PERMITTED, &claim)
                 .run();
             routing
-                .release_all_covers()
+                .release_all_covers(&routing.lock_covers())
                 .unwrap_or_else(|e| panic!("release_all_covers must clear {what}: {e}"));
             verdict
         },
@@ -153,6 +154,7 @@ fn windows_release_all_clears_a_stranded_lockdown_cover() {
     release_stranded("the stranded lockdown cover", &routing, dir.path(), || {
         let cover = routing
             .install_lockdown(
+                &routing.lock_covers(),
                 server_ip,
                 &TunIdentity::synthetic(0, "Loopback Pseudo-Interface 1"),
                 &[],
@@ -176,7 +178,12 @@ fn macos_release_all_clears_a_stranded_lockdown_cover() {
 
     release_stranded("the stranded lockdown cover", &routing, dir.path(), || {
         let cover = routing
-            .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
+            .install_lockdown(
+                &routing.lock_covers(),
+                server_ip,
+                &TunIdentity::synthetic(0, "utun-absent"),
+                &[],
+            )
             .expect("engage real pf lockdown cover");
         cover.disarm();
     });
@@ -207,7 +214,7 @@ fn windows_release_all_clears_a_stranded_transient_cover() {
 
     release_stranded("the stranded transient cover", &routing, dir.path(), || {
         let cover = routing
-            .install_failclosed_cover(server_ip, None)
+            .install_failclosed_cover(&routing.lock_covers(), server_ip, None)
             .expect("engage real WFP transient cover");
         cover.disarm();
     });
@@ -227,7 +234,7 @@ fn macos_release_all_clears_a_stranded_transient_cover() {
 
     release_stranded("the stranded transient cover", &routing, dir.path(), || {
         let cover = routing
-            .install_failclosed_cover(server_ip, None)
+            .install_failclosed_cover(&routing.lock_covers(), server_ip, None)
             .expect("engage real pf transient cover");
         cover.disarm();
     });
@@ -254,6 +261,7 @@ fn windows_release_all_clears_both_stranded_covers() {
     release_stranded("both stranded covers", &routing, dir.path(), || {
         let lockdown = routing
             .install_lockdown(
+                &routing.lock_covers(),
                 server_ip,
                 &TunIdentity::synthetic(0, "Loopback Pseudo-Interface 1"),
                 &[],
@@ -261,7 +269,7 @@ fn windows_release_all_clears_both_stranded_covers() {
             .expect("engage real WFP lockdown cover");
         lockdown.disarm();
         let transient = routing
-            .install_failclosed_cover(server_ip, None)
+            .install_failclosed_cover(&routing.lock_covers(), server_ip, None)
             .expect("engage real WFP transient cover");
         transient.disarm();
     });
@@ -281,11 +289,16 @@ fn macos_release_all_clears_both_stranded_covers() {
 
     release_stranded("both stranded covers", &routing, dir.path(), || {
         let lockdown = routing
-            .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
+            .install_lockdown(
+                &routing.lock_covers(),
+                server_ip,
+                &TunIdentity::synthetic(0, "utun-absent"),
+                &[],
+            )
             .expect("engage real pf lockdown cover");
         lockdown.disarm();
         let transient = routing
-            .install_failclosed_cover(server_ip, None)
+            .install_failclosed_cover(&routing.lock_covers(), server_ip, None)
             .expect("engage real pf transient cover");
         transient.disarm();
     });
@@ -321,7 +334,12 @@ fn release_all_leaves_nothing_the_oracle_can_see() {
     assert_baseline_reachable(stranger.path());
 
     let lockdown = routing
-        .install_lockdown(server_ip, &TunIdentity::synthetic(0, COVER_TUN), &[])
+        .install_lockdown(
+            &routing.lock_covers(),
+            server_ip,
+            &TunIdentity::synthetic(0, COVER_TUN),
+            &[],
+        )
         .expect("engage the real lockdown cover");
     lockdown.disarm();
     assert!(
@@ -329,7 +347,7 @@ fn release_all_leaves_nothing_the_oracle_can_see() {
         "a stranded lockdown cover must be visible from a state directory that never engaged it"
     );
     routing
-        .release_all_covers()
+        .release_all_covers(&routing.lock_covers())
         .expect("release_all_covers must clear the stranded lockdown cover");
     assert_eq!(
         held_covers(stranger.path()),
@@ -338,7 +356,7 @@ fn release_all_leaves_nothing_the_oracle_can_see() {
     );
 
     let transient = routing
-        .install_failclosed_cover(server_ip, None)
+        .install_failclosed_cover(&routing.lock_covers(), server_ip, None)
         .expect("engage the real transient cover");
     transient.disarm();
     assert!(
@@ -346,7 +364,7 @@ fn release_all_leaves_nothing_the_oracle_can_see() {
         "a stranded transient cover must be visible from a state directory that never engaged it"
     );
     routing
-        .release_all_covers()
+        .release_all_covers(&routing.lock_covers())
         .expect("release_all_covers must clear the stranded transient cover");
     assert_eq!(
         held_covers(stranger.path()),
@@ -368,7 +386,7 @@ fn macos_release_all_sees_a_transient_cover_whose_record_is_gone() {
     assert_baseline_reachable(dir.path());
 
     let cover = routing
-        .install_failclosed_cover(server_ip, None)
+        .install_failclosed_cover(&routing.lock_covers(), server_ip, None)
         .expect("engage the real pf transient cover");
     cover.disarm();
     let record_path = dir.path().join(super::failclosed_state::STATE_FILE_NAME);
@@ -380,7 +398,7 @@ fn macos_release_all_sees_a_transient_cover_whose_record_is_gone() {
     // Put the record back first: the release reads it for the pf enable token it must drop.
     std::fs::write(&record_path, record).unwrap();
     routing
-        .release_all_covers()
+        .release_all_covers(&routing.lock_covers())
         .expect("release_all_covers must clear the stranded transient cover");
 
     let held = held.expect("pf still blocks with the record gone, so the oracle must still report the cover");
@@ -403,7 +421,9 @@ fn windows_release_all_on_a_clean_host_is_ok() {
 
     // Windows has no host-wide ruleset to compare (fixed compiled-in GUIDs, no
     // ambient policy): reachability is the only local signal available.
-    routing.release_all_covers().expect("a clean host must return Ok");
+    routing
+        .release_all_covers(&routing.lock_covers())
+        .expect("a clean host must return Ok");
 
     assert_restored(
         "a clean host's reachability must be unaffected",
@@ -451,7 +471,9 @@ fn macos_release_all_on_a_clean_host_is_ok() {
         .stdout;
     let enabled_before = super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info_before));
 
-    routing.release_all_covers().expect("a clean host must return Ok");
+    routing
+        .release_all_covers(&routing.lock_covers())
+        .expect("a clean host must return Ok");
 
     let sr_after = SystemTool::Pfctl
         .command()
@@ -513,7 +535,12 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
     assert_baseline_reachable(dir.path());
 
     let cover = routing
-        .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
+        .install_lockdown(
+            &routing.lock_covers(),
+            server_ip,
+            &TunIdentity::synthetic(0, "utun-absent"),
+            &[],
+        )
         .expect("engage real pf lockdown cover");
     cover.disarm();
 
@@ -522,7 +549,7 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
     std::fs::write(dir.path().join(super::lockdown_pf_state::STATE_FILE_NAME), b"not json").unwrap();
 
     routing
-        .release_all_covers()
+        .release_all_covers(&routing.lock_covers())
         .expect("an unreadable state file must still be treated as a cover to clear");
 
     assert_restored(
@@ -583,7 +610,7 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
         || {
             // The TRANSIENT cover — `recover_cover`'s subject.
             let cover = routing
-                .install_failclosed_cover(server_ip, None)
+                .install_failclosed_cover(&routing.lock_covers(), server_ip, None)
                 .expect("engage real pf transient cover");
             // Read the real enable token back BEFORE overwriting the file, so the rolled-back payload
             // below carries the REAL token and the safety net has one to fall back on.
@@ -609,7 +636,7 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
                 )
                 .run();
 
-            crate::routing::failclosed::recover_cover(dir.path(), false);
+            crate::routing::failclosed::recover_cover(&CoverLock::acquire(dir.path()), false);
 
             // The cover is gone before the verdict is judged; a rerun engages a new token.
             verdict.inspect_err(|_| drop_token(&token)).map(|()| token)
@@ -639,7 +666,12 @@ fn macos_release_all_falls_back_when_the_snapshot_will_not_load() {
     assert_baseline_reachable(dir.path());
 
     let cover = routing
-        .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
+        .install_lockdown(
+            &routing.lock_covers(),
+            server_ip,
+            &TunIdentity::synthetic(0, "utun-absent"),
+            &[],
+        )
         .expect("engage real pf lockdown cover");
     cover.disarm();
 
@@ -654,7 +686,7 @@ fn macos_release_all_falls_back_when_the_snapshot_will_not_load() {
     super::lockdown_pf_state::save(dir.path(), &broken, None).unwrap();
 
     routing
-        .release_all_covers()
+        .release_all_covers(&routing.lock_covers())
         .expect("a snapshot that will not load must fall back to the default ruleset");
 
     assert_restored(

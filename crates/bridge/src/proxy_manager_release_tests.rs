@@ -32,7 +32,7 @@ async fn covered_start_holding_the_cover(
 
     let routing = MockRouting::new(dir.path().to_path_buf());
     let st = routing.state();
-    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
     let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
     let mut cfg = test_config();
     cfg.server.server = closed.ip().to_string().into();
@@ -62,7 +62,7 @@ fn turn_lockdown_off_releases_a_stranded_cover_even_while_a_session_runs() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         pm.start(&test_config()).await.unwrap();
 
@@ -118,7 +118,7 @@ fn turn_lockdown_off_clears_a_stranded_standing_cover() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         // Simulate an OS probe finding a standing cover from a prior run —
         // the realistic shape of the escape's stranded-cover case.
         *st.cover_presence.lock().unwrap() = CoverPresence::Live;
@@ -142,7 +142,7 @@ fn turn_lockdown_off_releases_even_when_presence_reads_absent() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
 
         pm.turn_lockdown_off().expect("a clean manager must not error");
@@ -164,7 +164,7 @@ fn turn_lockdown_off_failure_leaves_the_intent_on() {
         let st = routing.state();
         st.fail_release.store(true, Ordering::SeqCst);
         *st.cover_presence.lock().unwrap() = CoverPresence::Live;
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
 
         let err = pm.turn_lockdown_off().expect_err("a failed release must be reported");
@@ -221,7 +221,7 @@ fn turn_lockdown_off_releases_when_the_target_is_unreadable() {
         // `cover_step` alone would (correctly) hold on. Only the unreadable
         // target should force the release here.
         std::fs::write(dir.path().join(target::STATE_FILE_NAME), b"not json").unwrap();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
 
         pm.turn_lockdown_off()
@@ -246,7 +246,7 @@ fn turn_lockdown_off_releases_when_presence_is_unreachable() {
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
         *st.cover_presence.lock().unwrap() = CoverPresence::Unreachable;
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
 
         pm.turn_lockdown_off()

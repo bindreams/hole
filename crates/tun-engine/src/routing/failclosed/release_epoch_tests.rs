@@ -172,7 +172,7 @@ fn check_runs_inside_a_record_update() {
 
 // The sweeps ==========================================================================================================
 
-use super::super::{sweep_with_witness, Clearance, SweepOutcome};
+use super::super::{sweep_with_witness, Clearance, CoverLock, SweepOutcome};
 
 #[skuld::test]
 fn every_sweep_runs_as_a_release_in_flight() {
@@ -180,7 +180,7 @@ fn every_sweep_runs_as_a_release_in_flight() {
     // so a sweep is announced before its closure makes its first firewall call.
     let d = dir();
     let mut announced = None;
-    let _clearance = sweep_with_witness(d.path(), None, |_| {
+    let _clearance = sweep_with_witness(&CoverLock::acquire(d.path()), None, &[], |_| {
         announced = verdict(&watch_releases(d.path()));
         SweepOutcome::completed(Clearance::proven())
     })
@@ -193,7 +193,10 @@ fn every_sweep_runs_as_a_release_in_flight() {
 fn a_sweep_that_completes_supersedes_a_watch_opened_before_it() {
     let d = dir();
     let watch = watch_releases(d.path());
-    let _clearance = sweep_with_witness(d.path(), None, |_| SweepOutcome::completed(Clearance::proven())).unwrap();
+    let _clearance = sweep_with_witness(&CoverLock::acquire(d.path()), None, &[], |_| {
+        SweepOutcome::completed(Clearance::proven())
+    })
+    .unwrap();
     assert_eq!(verdict(&watch), Some(Overtaken::Superseded));
 }
 
@@ -202,7 +205,9 @@ fn a_sweep_that_completes_supersedes_a_watch_opened_before_it() {
 fn a_sweep_with_nothing_to_delete_still_supersedes_a_watch_opened_before_it() {
     let d = dir();
     let watch = watch_releases(d.path());
-    let result = sweep_with_witness(d.path(), None, |_| SweepOutcome::completed(Clearance::proven()));
+    let result = sweep_with_witness(&CoverLock::acquire(d.path()), None, &[], |_| {
+        SweepOutcome::completed(Clearance::proven())
+    });
     assert!(result.is_ok());
     assert_eq!(verdict(&watch), Some(Overtaken::Superseded));
 }
@@ -211,7 +216,7 @@ fn a_sweep_with_nothing_to_delete_still_supersedes_a_watch_opened_before_it() {
 fn a_sweep_that_failed_after_reaching_the_firewall_supersedes_a_watch_opened_before_it() {
     let d = dir();
     let watch = watch_releases(d.path());
-    let result = sweep_with_witness(d.path(), None, |_| {
+    let result = sweep_with_witness(&CoverLock::acquire(d.path()), None, &[], |_| {
         SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("a delete failed".into()))
     });
     assert!(result.is_err());
@@ -222,7 +227,7 @@ fn a_sweep_that_failed_after_reaching_the_firewall_supersedes_a_watch_opened_bef
 fn a_sweep_that_never_reached_the_firewall_supersedes_nothing() {
     let d = dir();
     let watch = watch_releases(d.path());
-    let result = sweep_with_witness(d.path(), None, |_| {
+    let result = sweep_with_witness(&CoverLock::acquire(d.path()), None, &[], |_| {
         SweepOutcome::unreached(
             Clearance::proven(),
             RoutingError::RouteSetup("the engine would not open".into()),
@@ -235,7 +240,7 @@ fn a_sweep_that_never_reached_the_firewall_supersedes_nothing() {
 #[skuld::test]
 fn a_failing_sweep_ends_its_release_too() {
     let d = dir();
-    let result = sweep_with_witness(d.path(), None, |_| {
+    let result = sweep_with_witness(&CoverLock::acquire(d.path()), None, &[], |_| {
         SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("the sweep failed".into()))
     });
     assert!(result.is_err());

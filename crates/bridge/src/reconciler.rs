@@ -364,15 +364,23 @@ pub async fn reconcile_once<P, R, D>(
             // `Routing::release_all_covers` for why that costs the operator
             // message and not the evidence (the sweep persists the boot-time
             // witness before returning).
-            Phase::Cover(CoverStep::Release) => match pm.routing_handle().release_all_covers() {
-                Ok(()) => pm.set_standing_cover_adopted(false),
-                Err(error) => {
-                    tracing::warn!(
-                        error = &error as &dyn std::error::Error,
-                        "reconcile_once: failed to release a stray standing cover"
-                    );
+            Phase::Cover(CoverStep::Release) => {
+                // A sync section: the cover lock is never held across an `.await`.
+                let released = {
+                    let routing = pm.routing_handle();
+                    let lock = routing.lock_covers();
+                    routing.release_all_covers(&lock)
+                };
+                match released {
+                    Ok(()) => pm.set_standing_cover_adopted(false),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = &error as &dyn std::error::Error,
+                            "reconcile_once: failed to release a stray standing cover"
+                        );
+                    }
                 }
-            },
+            }
             // Engaging happens inside `start_cancellable` below, not here —
             // see the fn doc.
             Phase::Cover(CoverStep::Engage) | Phase::Cover(CoverStep::Hold) => {}

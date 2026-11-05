@@ -89,6 +89,7 @@ use tun::AbstractDevice;
 use hole_test_observability::egress::{rerun_until_network_holds_async, InCover};
 
 use super::cover_oracle::held_covers;
+use super::CoverLock;
 use super::{engage_lockdown, SystemLuidResolver};
 use crate::test_utils::{classify, classify_send, EscapeGuard, OwnedRoute, RecordSpec};
 use crate::{GLOBAL_NET_STATE, TUN};
@@ -655,8 +656,15 @@ fn run_live_tun_permit_core(
             &held,
             async || {
                 // Released when this closure returns, so on every exit and before the judge probes outside it.
-                let _cover = engage_lockdown(server_ip(), dev1.tun_name(), &resolver, &[], guard.state_dir(), None)
-                    .expect("engage real standing lockdown cover naming device 1");
+                let _cover = engage_lockdown(
+                    &CoverLock::acquire(guard.state_dir()),
+                    server_ip(),
+                    dev1.tun_name(),
+                    &resolver,
+                    &[],
+                    None,
+                )
+                .expect("engage real standing lockdown cover naming device 1");
 
                 InCover::new(&server, "with the cover engaged, the server IP must stay reachable")
                     .blocked(
@@ -719,8 +727,15 @@ fn run_live_tun_permit_core(
 
         // Phase 3 — mutation: re-engage naming device 2, a genuinely live but
         // uninvolved interface. The anti-vacuity mechanism (module doc).
-        let cover3 = engage_lockdown(server_ip(), dev2.tun_name(), &resolver, &[], guard.state_dir(), None)
-            .expect("engage real standing lockdown cover naming device 2 (mutation)");
+        let cover3 = engage_lockdown(
+            &CoverLock::acquire(guard.state_dir()),
+            server_ip(),
+            dev2.tun_name(),
+            &resolver,
+            &[],
+            None,
+        )
+        .expect("engage real standing lockdown cover naming device 2 (mutation)");
 
         let send3 = send_udp_probe(3);
         let tcp3 = TcpStream::connect_timeout(
@@ -793,11 +808,11 @@ fn run_live_tun_permit_core(
 #[cfg(target_os = "windows")]
 fn windows_unknown_alias_pin(state_dir: &Path) {
     let bad = engage_lockdown(
+        &CoverLock::acquire(state_dir),
         server_ip(),
         "hole-live-tun-permit-does-not-exist",
         &SystemLuidResolver,
         &[],
-        state_dir,
         None,
     );
     let is_err = bad.is_err();
@@ -1031,7 +1046,7 @@ fn macos_live_tun_permit_cover_carries_a_mid_stream_segment_after_a_state_purge(
         // Leg 2 — POSITIVE CONTROL: the pre-fix, SYN-only permit.
         let mut seen2 = Vec::new();
         let mut covered = establish_over_tun(&dev1, MID_LOCAL_PORT_PREFIX, &mut seen2).await;
-        let cover = super::engage(MID_IP.into(), None, guard.state_dir(), None)
+        let cover = super::engage(&CoverLock::acquire(guard.state_dir()), MID_IP.into(), None, None)
             .expect("engage the real transient cover for the control leg");
         super::platform::real_load_ruleset(&pre_fix).expect("HARNESS: load the pre-fix control ruleset");
         // The engage already purged, and a `no state` permit leaves nothing
@@ -1065,7 +1080,7 @@ fn macos_live_tun_permit_cover_carries_a_mid_stream_segment_after_a_state_purge(
         // Leg 3 — PRODUCTION.
         let mut seen3 = Vec::new();
         let mut production_flow = establish_over_tun(&dev1, MID_LOCAL_PORT_PRODUCTION, &mut seen3).await;
-        let cover = super::engage(MID_IP.into(), None, guard.state_dir(), None)
+        let cover = super::engage(&CoverLock::acquire(guard.state_dir()), MID_IP.into(), None, None)
             .expect("engage the real transient cover for the production leg");
         write_mid_stream(&mut production_flow, 3).await;
         let carried = dev1.capture(MID_BUDGET, &mut seen3, tcp_mark_matches(3)).await;

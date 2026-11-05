@@ -72,6 +72,7 @@ use super::Clearance;
 use super::StateFile;
 use super::SweepOutcome;
 use super::RESOLVER_PERMIT_PORT;
+use super::{CoverKind, CoverLock, InstallStamp};
 
 /// Whether this platform's standing cover arms [`super::KeyLifetime::BootTime`]
 /// keys, and therefore whether an engage has a [`super::boottime_witness`] to
@@ -395,19 +396,12 @@ fn enable_pf_capture_token() -> Result<String, RoutingError> {
         .ok_or_else(|| RoutingError::RouteSetup("pfctl -E returned no token".into()))
 }
 
-/// Which cover a [`Cover`] guard owns — selects its Drop disengage path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CoverKind {
-    Transient,
-    Lockdown,
-}
-
-/// pf-backed cover guard. Drop disengages per [`CoverKind`]: the transient
-/// cover restores `/etc/pf.conf`; the lockdown cover restores the snapshot.
+/// pf-backed cover guard. Drop disengages per its stamp's [`CoverKind`], while its install is the latest
+/// ([`InstallStamp`]): the transient cover restores `/etc/pf.conf`; the lockdown cover restores the snapshot.
 pub struct Cover {
     token: String,
     state_dir: std::path::PathBuf,
-    kind: CoverKind,
+    stamp: InstallStamp,
 }
 
 impl Cover {
@@ -421,6 +415,24 @@ impl Cover {
     /// FWPM engine handle here.
     pub(crate) fn detach(self) {
         std::mem::forget(self);
+    }
+
+    /// Disengage this cover under `lock`; a stale install disengages nothing (its token is already dropped).
+    pub(crate) fn release(self, lock: &CoverLock) {
+        self.stamp.release(lock, || self.disengage());
+        std::mem::forget(self);
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.stamp.is_current()
+    }
+
+    fn disengage(&self) {
+        match self.stamp.kind() {
+            // A user-stop drop never has a standing cover being adopted.
+            CoverKind::Transient => disengage(Some(&self.token), &self.state_dir, false),
+            CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
+        }
     }
 }
 
@@ -540,16 +552,17 @@ pub(crate) trait EngageOps: CoverRulesetOps {
 }
 
 pub fn engage(
+    lock: &CoverLock,
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
-    state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
+    let state_dir = lock.state_dir();
     let token = engage_with(server_ip, resolver_ip, &mut RealEngageOps { state_dir, owner })?;
     Ok(Cover {
         token,
         state_dir: state_dir.to_owned(),
-        kind: CoverKind::Transient,
+        stamp: lock.stamp_install(CoverKind::Transient),
     })
 }
 
@@ -683,11 +696,7 @@ fn engage_with(
 
 impl Drop for Cover {
     fn drop(&mut self) {
-        match self.kind {
-            // A user-stop drop never has a standing cover being adopted.
-            CoverKind::Transient => disengage(Some(&self.token), &self.state_dir, false),
-            CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
-        }
+        self.stamp.release_on_drop(|| self.disengage());
     }
 }
 
@@ -931,11 +940,12 @@ fn persist_baseline(
 /// On load failure the host is restored (`lockdown_disengage`) and Err returned;
 /// the bridge's fail-FATAL caller aborts the start.
 pub fn engage_lockdown(
+    lock: &CoverLock,
     server_ip: IpAddr,
     tun_name: &str,
-    state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
+    let state_dir = lock.state_dir();
     // The `pfctl -s info` read is decision-only — `LockdownPfState` records no
     // `pf_was_enabled` bit (unlike the transient `FailClosedState`).
     let info = pfctl_stdout(pfctl(&["-s", "info"], None, FatalPhase::CoverEngage), "pfctl -s info")?;
@@ -1014,7 +1024,7 @@ pub fn engage_lockdown(
     Ok(Cover {
         token,
         state_dir: state_dir.to_owned(),
-        kind: CoverKind::Lockdown,
+        stamp: lock.stamp_install(CoverKind::Lockdown),
     })
 }
 

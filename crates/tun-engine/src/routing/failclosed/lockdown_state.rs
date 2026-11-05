@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use super::CoverLock;
 use serde::{Deserialize, Serialize};
 use util::versioned_file::{
     Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, VersionedFile, VersionedState,
@@ -134,10 +135,11 @@ pub fn load_enabled(state_dir: &Path) -> bool {
     load_intent(state_dir).reads_armed()
 }
 
-/// Last-writer-wins absolute set, atomic, creating `state_dir`. A file this release cannot read is backed up beside
-/// it first.
-pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
-    file(state_dir)
+/// Last-writer-wins absolute set, atomic, creating `lock`'s state dir. A file this release cannot read is backed up
+/// beside it first. Takes the cover lock because every cover decision reads this record: a write outside it could
+/// land between a decision's read and its act.
+pub fn set_enabled(lock: &CoverLock, enabled: bool, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    file(lock.state_dir())
         .update(&DefaultPlacement { owner }, |_| {
             (Change::Store(LockdownState { enabled }), ())
         })
@@ -149,20 +151,20 @@ pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -
 pub enum PromoteOutcome {
     /// Nothing was recorded: the kill switch is now recorded as armed.
     Wrote,
-    /// The record was left as it is, and this is the intent it classified as (never [`Intent::Unset`]).
-    Declined(Intent),
+    /// The record was left as it is.
+    Declined,
 }
 
 /// Record the kill switch as armed iff nothing is recorded ([`Intent::admits_adoption_promotion`]); the read and the
 /// write are one update, so a concurrent [`set_enabled`] is never overwritten.
-pub fn promote_unrecorded(state_dir: &Path, owner: Option<(u32, u32)>) -> Result<PromoteOutcome, StoreError> {
-    file(state_dir)
+pub fn promote_unrecorded(lock: &CoverLock, owner: Option<(u32, u32)>) -> Result<PromoteOutcome, StoreError> {
+    file(lock.state_dir())
         .update(&DefaultPlacement { owner }, |now| {
             let intent = Intent::of(&now.loaded);
             if intent.admits_adoption_promotion() {
                 (Change::Store(LockdownState { enabled: true }), PromoteOutcome::Wrote)
             } else {
-                (Change::Keep, PromoteOutcome::Declined(intent))
+                (Change::Keep, PromoteOutcome::Declined)
             }
         })
         .map(|(outcome, _)| outcome)
