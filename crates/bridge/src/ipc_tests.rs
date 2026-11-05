@@ -1682,9 +1682,8 @@ async fn a_stop_landing_while_a_start_persists_does_not_get_reverted_to_connecte
 
 #[skuld::test]
 async fn a_second_start_cannot_begin_while_the_first_is_still_persisting() {
-    // `save_startup_preference`'s read-modify-write now shares the target
-    // file's lock, and `handle_start`'s single-occupancy `in_flight` guard
-    // holds until the persist has completed — so two overlapping starts can
+    // `handle_start`'s single-occupancy `in_flight` guard holds until the
+    // persist has completed — so two overlapping starts can
     // never have their persist windows in flight together. A second Start
     // dispatched while the first is mid-persist is rejected with 409.
     let dir = tempfile::tempdir().unwrap().keep();
@@ -3539,11 +3538,32 @@ async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
     );
 }
 
+/// An unblock that could not record `Off` has not unblocked anything a start should yield to: the counter a start
+/// compares against moves only after the target write succeeded.
+#[skuld::test]
+async fn an_unblock_whose_target_save_fails_leaves_the_generation_alone() {
+    // A state directory below a regular file cannot be opened.
+    let blocker = tempfile::NamedTempFile::new().unwrap();
+    let mut state = ipc_state(mock_proxy());
+    Arc::get_mut(&mut state).expect("the state is not shared yet").state_dir = blocker.path().join("state");
+
+    let result = handle_unblock(axum::extract::State(state.clone())).await;
+
+    assert!(result.is_err(), "a failed save must be reported");
+    assert_eq!(
+        state.unblock_generation.load(Ordering::SeqCst),
+        0,
+        "a failed target save announced an unblock"
+    );
+}
+
 /// The start's target and candidate writes, and the unblock's Off, `set_enabled`
 /// and candidate clear, are each several critical sections, so an unblock
 /// committing between a start's two writes (or a start's pair landing between the
 /// unblock's) leaves `Off` beside a candidate, or `Connected` with its candidate
-/// erased. Both sequences run under `intent_persist`.
+/// erased. Both sequences run under `intent_persist`, and so does every access of
+/// `unblock_generation` inside them: the start reads it once before its writes, the
+/// unblock bumps it after the `Off` write succeeded.
 ///
 /// Asserted by source, not by interleaving: neither sequence has a point a test
 /// can park at, and an unbounded wait for "the other side has blocked on the
@@ -3553,16 +3573,25 @@ async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
 fn the_unblock_and_the_start_persist_run_under_the_intent_persist_mutex() {
     let src = include_str!("ipc.rs");
     let ordering_sites = regex::Regex::new(
-        r"\bintent_persist\.lock\(|\btarget::apply\(|\bwrite_start_records\(|\bapply_startup_preference\(|\bset_enabled\(",
+        r"\bintent_persist\.lock\(|\btarget::apply\(|\bwrite_start_records\(|\bapply_startup_preference\(|\bset_enabled\(|\bgeneration\.load\(|\bgeneration\.fetch_add\(",
     )
     .unwrap();
     let sites = crate::reconciler::reconciler_tests::call_sites_by_function(src, &ordering_sites);
-    for function in ["handle_unblock", "persist_after_start"] {
-        let in_function: Vec<&str> = sites
+    let sites_of = |function: &str| -> Vec<&str> {
+        sites
             .iter()
             .filter(|(name, line)| name == function && !line.starts_with("//"))
             .map(|(_, line)| line.as_str())
-            .collect();
+            .collect()
+    };
+    let position = |in_function: &[&str], needle: &str| {
+        in_function
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no site contains `{needle}`: {in_function:?}"))
+    };
+    for function in ["handle_unblock", "persist_after_start"] {
+        let in_function = sites_of(function);
         assert!(
             in_function.len() > 1,
             "{function} must hold the lock and write under it: {in_function:?}"
@@ -3572,6 +3601,19 @@ fn the_unblock_and_the_start_persist_run_under_the_intent_persist_mutex() {
             "{function} must bind the `intent_persist` guard before its first write: {in_function:?}"
         );
     }
+
+    // The start reads the counter under the guard, before its first write.
+    let start = sites_of("persist_after_start");
+    assert!(
+        position(&start, "generation.load(") < position(&start, "write_start_records("),
+        "the start must read `unblock_generation` before its writes: {start:?}"
+    );
+    // The unblock bumps under the guard, and only after the `Off` write that `?` has confirmed.
+    let unblock = sites_of("handle_unblock");
+    assert!(
+        position(&unblock, "target::apply(") < position(&unblock, "generation.fetch_add("),
+        "the unblock must bump `unblock_generation` after its target write: {unblock:?}"
+    );
 }
 
 // Status probe placement ==============================================================================================

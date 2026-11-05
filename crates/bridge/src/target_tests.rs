@@ -36,6 +36,12 @@ fn with_mistyped_password(json: String) -> String {
     json.replace(&quoted, MISTYPED_PW)
 }
 
+/// `payload` as a file of the current version: the framing owns `"version"`, the payload never carries it.
+fn framed(payload: &impl Serialize) -> String {
+    let body = serde_json::to_string(payload).unwrap();
+    format!(r#"{{"version":1,{}"#, &body[1..])
+}
+
 const SECRET_PW: &str = "super-secret-password";
 const MISTYPED_PW: &str = "9876543210";
 
@@ -376,15 +382,11 @@ fn a_corrupt_startup_preference_file_reads_as_default() {
 /// place this can be stopped.
 #[skuld::test]
 fn a_corrupt_target_file_never_echoes_its_contents_into_the_log() {
-    let json = with_mistyped_password(
-        serde_json::to_string(&TargetFile {
-            version: SCHEMA_VERSION,
-            target: PersistedTarget::Connected {
-                config: Box::new(test_config()),
-            },
-        })
-        .unwrap(),
-    );
+    let json = with_mistyped_password(framed(&TargetFile {
+        target: PersistedTarget::Connected {
+            config: Box::new(test_config()),
+        },
+    }));
 
     // Guard: without it this passes against a serde_json that stopped echoing.
     let raw = serde_json::from_str::<TargetFile>(&json)
@@ -413,12 +415,10 @@ fn a_corrupt_target_file_never_echoes_its_contents_into_the_log() {
 #[skuld::test]
 fn a_corrupt_startup_preference_never_echoes_its_contents_into_the_log() {
     const SECRET_TAG: &str = "hunter2-SECRET";
-    let json = serde_json::to_string(&StartupPreferenceFile {
-        version: STARTUP_PREFERENCE_SCHEMA_VERSION,
+    let json = framed(&StartupPreferenceFile {
         on_startup: hole_common::config::StartupBehavior::AlwaysConnect,
         candidate: Some(Box::new(test_config())),
     })
-    .unwrap()
     .replace("\"always_connect\"", &format!("\"{SECRET_TAG}\""));
 
     let raw = serde_json::from_str::<StartupPreferenceFile>(&json)
@@ -577,6 +577,138 @@ fn apply_leaves_an_unreadable_target_file_untouched_when_f_declines() {
     );
 }
 
+// A file this release cannot read =====================================================================================
+
+fn backup_of(dir: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+    std::fs::read(dir.join(format!("{name}.unreadable.bak"))).ok()
+}
+
+#[skuld::test]
+fn apply_over_a_corrupt_target_backs_it_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corrupt: &[u8] = b"not json";
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), corrupt).unwrap();
+
+    let next = apply(tmp.path(), None, |current| {
+        assert_eq!(current, Target::Unreadable);
+        Target::Off
+    })
+    .unwrap();
+
+    assert_eq!(next, Target::Off);
+    assert_eq!(load(tmp.path()), Target::Off);
+    assert_eq!(backup_of(tmp.path(), STATE_FILE_NAME).as_deref(), Some(corrupt));
+}
+
+#[skuld::test]
+fn apply_over_a_newer_target_backs_it_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let newer: &[u8] = br#"{"version":2,"target":{"state":"off"},"later":true}"#;
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), newer).unwrap();
+
+    let next = apply(tmp.path(), None, |_| Target::Off).unwrap();
+
+    assert_eq!(next, Target::Off);
+    assert_eq!(backup_of(tmp.path(), STATE_FILE_NAME).as_deref(), Some(newer));
+    assert_ne!(
+        std::fs::read(tmp.path().join(STATE_FILE_NAME)).unwrap(),
+        newer,
+        "the newer record must have been replaced"
+    );
+}
+
+#[skuld::test]
+fn apply_with_the_current_value_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A compact document, which a rewrite would pretty-print.
+    let on_disk: &[u8] = br#"{"version":1,"target":{"state":"off"}}"#;
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), on_disk).unwrap();
+
+    let before = target_file(tmp.path()).observe().generation;
+
+    let next = apply(tmp.path(), None, |current| current).unwrap();
+
+    assert_eq!(next, Target::Off);
+    assert_eq!(
+        std::fs::read(tmp.path().join(STATE_FILE_NAME)).unwrap(),
+        on_disk,
+        "an unchanged target must not be rewritten"
+    );
+    assert_eq!(
+        target_file(tmp.path()).observe().generation,
+        before,
+        "an unchanged target must not count as a write attempt"
+    );
+}
+
+#[skuld::test]
+fn apply_over_an_absent_target_with_off_creates_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let next = apply(tmp.path(), None, |current| current).unwrap();
+
+    assert_eq!(next, Target::Off);
+    assert!(
+        tmp.path().join(STATE_FILE_NAME).is_file(),
+        "an absent file is not the same as a recorded Off"
+    );
+}
+
+/// `json` with `"extra": 5` added at the top level, as a later release might write it.
+fn with_an_unknown_field(json: &[u8]) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(json).unwrap();
+    value.as_object_mut().unwrap().insert("extra".into(), 5.into());
+    serde_json::to_vec(&value).unwrap()
+}
+
+#[skuld::test]
+fn a_target_file_with_an_unknown_field_still_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let connected = Target::Connected {
+        config: Box::new(test_config()),
+    };
+    save(tmp.path(), &connected, None).unwrap();
+    let path = tmp.path().join(STATE_FILE_NAME);
+    std::fs::write(&path, with_an_unknown_field(&std::fs::read(&path).unwrap())).unwrap();
+
+    assert_eq!(load(tmp.path()), connected);
+}
+
+#[skuld::test]
+fn a_startup_preference_file_with_an_unknown_field_still_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pref = StartupPreference {
+        on_startup: StartupBehavior::AlwaysConnect,
+        candidate: Some(Box::new(test_config())),
+    };
+    save_startup_preference(tmp.path(), &pref, None).unwrap();
+    let path = tmp.path().join(STARTUP_PREFERENCE_FILE_NAME);
+    std::fs::write(&path, with_an_unknown_field(&std::fs::read(&path).unwrap())).unwrap();
+
+    assert_eq!(load_startup_preference(tmp.path()), pref);
+}
+
+#[skuld::test]
+fn the_startup_preference_over_a_corrupt_file_is_backed_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corrupt: &[u8] = b"not json";
+    std::fs::write(tmp.path().join(STARTUP_PREFERENCE_FILE_NAME), corrupt).unwrap();
+
+    apply_startup_preference(tmp.path(), None, |pref| {
+        pref.on_startup = StartupBehavior::AlwaysConnect
+    })
+    .unwrap();
+
+    assert_eq!(
+        load_startup_preference(tmp.path()).on_startup,
+        StartupBehavior::AlwaysConnect
+    );
+    assert_eq!(
+        backup_of(tmp.path(), STARTUP_PREFERENCE_FILE_NAME).as_deref(),
+        Some(corrupt)
+    );
+}
+
 // Windows DACL ========================================================================================================
 
 /// Read `path`'s DACL back as an SDDL string. Round-tripping through SDDL
@@ -707,13 +839,11 @@ fn the_persisted_file_shapes_never_carry_the_secrets() {
     let config = Box::new(test_config());
     let rendered = [
         dump::dump!(&TargetFile {
-            version: 1,
             target: PersistedTarget::Connected { config: config.clone() },
         })
         .to_string(),
         dump::dump!(&PersistedTarget::Connected { config: config.clone() }).to_string(),
         dump::dump!(&StartupPreferenceFile {
-            version: 1,
             on_startup: hole_common::config::StartupBehavior::default(),
             candidate: Some(config),
         })
@@ -743,23 +873,19 @@ fn the_persisted_file_shapes_still_carry_their_non_secret_payload() {
 
     let text = yaml(
         TargetFile {
-            version: 7,
             target: PersistedTarget::Connected { config: config.clone() },
         }
         .dump(),
     );
-    assert!(text.contains('7'), "the schema version: {text}");
     assert!(text.contains("1080"), "and the config's non-secret fields: {text}");
 
     let text = yaml(
         StartupPreferenceFile {
-            version: 9,
             on_startup: hole_common::config::StartupBehavior::AlwaysConnect,
             candidate: Some(config.clone()),
         }
         .dump(),
     );
-    assert!(text.contains('9'), "the schema version: {text}");
     assert!(text.contains("always_connect"), "the startup preference: {text}");
     assert!(text.contains("1080"), "and the candidate's non-secret fields: {text}");
 
@@ -835,7 +961,7 @@ fn a_leftover_temp_file_is_not_kept_when_the_write_fails() {
 
     let err = save(tmp.path(), &Target::Off, None).expect_err("a directory is in the way");
 
-    assert!(matches!(err, TargetError::Write(_)), "{err:?}");
+    assert!(matches!(err, StoreError::Io(_)), "{err:?}");
     let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
         .map(|e| e.unwrap().file_name())
@@ -876,9 +1002,8 @@ fn the_state_file_writers_never_chown_chmod_or_rename_by_path() {
             .filter(|(_, line)| !line.trim_start().starts_with("//"))
             .collect();
         assert!(
-            code.iter().any(|(_, line)| line.contains("write_state_file(")
-                || line.contains("Dir::open")
-                || line.contains(".update(")),
+            code.iter()
+                .any(|(_, line)| line.contains(".update(") || line.contains("write_state_file(")),
             "{writer} no longer writes through the directory handle"
         );
         for (idx, line) in code {

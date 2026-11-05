@@ -122,6 +122,24 @@ fn unlock_records_the_target_off_before_releasing() {
     assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
 }
 
+#[skuld::test]
+fn unlock_over_a_target_it_cannot_read_leaves_off_and_keeps_a_backup() {
+    let newer: &[u8] = br#"{"version":2,"target":{"state":"off"}}"#;
+    for unreadable in [b"not json".as_slice(), newer] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(crate::target::STATE_FILE_NAME), unreadable).unwrap();
+
+        let _clearance = unlock_with(dir.path(), || Ok(Clearance::proven()))
+            .expect("the escape must not be blocked by a bad record");
+
+        assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
+        let backup = dir
+            .path()
+            .join(format!("{}.unreadable.bak", crate::target::STATE_FILE_NAME));
+        assert_eq!(std::fs::read(backup).unwrap(), unreadable);
+    }
+}
+
 // #986: the liveness exclusion is structural (a lock held across the whole
 // sequence), not a point-in-time probe — a bridge that would start mid-unlock
 // must observe the lock as held throughout, not just at the initial check.

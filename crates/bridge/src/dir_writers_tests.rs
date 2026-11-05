@@ -27,7 +27,7 @@ use tun_engine::routing::state as route_state;
 use util::dir::testing::{plant_link, user_dir};
 use util::dir::{Dir, Refusal};
 
-use crate::target::{self, Target, TargetError};
+use crate::target::{self, Target};
 use util::versioned_file::StoreError;
 
 mod scan;
@@ -336,16 +336,7 @@ fn writers() -> Vec<Writer> {
             names: &[target::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, owner| {
-                target::save(dir, &Target::Off, owner).map_err(|err| match err {
-                    // The io error inside is where a refusal of the walk is.
-                    TargetError::CreateDir(err)
-                    | TargetError::Write(err)
-                    | TargetError::SetPermissions(err)
-                    | TargetError::Lock(err) => err,
-                    err => io::Error::other(err),
-                })
-            },
+            run: |dir, owner| target::save(dir, &Target::Off, owner).map_err(io::Error::other),
         },
         Writer {
             name: "the update marker, written",
@@ -417,14 +408,6 @@ fn writers() -> Vec<Writer> {
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
             run: |dir, owner| lockdown_state::set_enabled(dir, true, owner).map_err(io::Error::other),
-        },
-        Writer {
-            name: "the lockdown state, cleared",
-            sources: &[],
-            names: &[lockdown_state::STATE_FILE_NAME],
-            at_a_planted_name: AtAPlantedName::Replaces,
-            runs_here: true,
-            run: |dir, _| lockdown_state::clear(dir).map(drop).map_err(io::Error::other),
         },
         Writer {
             name: "the boot-time witness, recorded",

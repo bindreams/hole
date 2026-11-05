@@ -184,26 +184,3 @@ fn load_enabled_is_the_reads_armed_fold() {
         "a corrupt file reads as ARMED — it is not consent to disarm"
     );
 }
-
-#[skuld::test]
-fn clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
-
-    let err = clear(&state).unwrap_err();
-
-    let StoreError::Io(err) = err else {
-        panic!("expected an I/O refusal, got {err:?}");
-    };
-    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
-}
-
-#[skuld::test]
-fn clear_removes_file_and_tolerates_absence() {
-    let tmp = tempfile::tempdir().unwrap();
-    set_enabled(tmp.path(), true, None).unwrap();
-    assert!(tmp.path().join(STATE_FILE_NAME).exists());
-    clear(tmp.path()).unwrap();
-    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
-    clear(tmp.path()).unwrap(); // second clear is a no-op
-}

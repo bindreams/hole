@@ -30,6 +30,7 @@ use tower::ServiceExt;
 use tracing::warn;
 use tracing::{debug, error, info};
 use util::error_chain::error_chain;
+use util::versioned_file::StoreError;
 
 // IPC state ===========================================================================================================
 
@@ -122,9 +123,9 @@ pub struct IpcState<P: Proxy, R: Routing> {
     pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Orders `persist_after_start`'s target + candidate writes against
     /// `handle_unblock`'s `Off` + `set_enabled` + candidate clear, each a
-    /// sequence of separate file-lock sections. Held only inside a
+    /// sequence of separate record-lock sections. Held only inside a
     /// `spawn_blocking` closure, never across an `.await`, and always taken
-    /// before the target file lock. Other candidate writers run under
+    /// before a record lock. Other candidate writers run under
     /// `BridgeLiveness` and need no ordering against these two.
     pub intent_persist: Arc<std::sync::Mutex<()>>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
@@ -614,8 +615,8 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 /// written. The `on_startup` push is a preference and stands either way.
 ///
 /// Runs in `spawn_blocking`, since both `target::apply` and
-/// `save_startup_preference` are sync (`target::apply`'s lock is a leaf lock
-/// that must never cross an `.await` — see `TargetExclusive`). A failure here
+/// `apply_startup_preference` are sync (the record locks they take are leaf
+/// locks that must never cross an `.await`). A failure here
 /// is logged, never surfaced as a start failure: the tunnel's own outcome is
 /// already decided by the time this runs, and a metadata-write hiccup must
 /// not retroactively turn an established connection into a reported failure.
@@ -640,7 +641,7 @@ async fn persist_after_start<P: Proxy, R: Routing>(
     let config = config.clone();
     let generation = Arc::clone(&state.unblock_generation);
     let intent_persist = Arc::clone(&state.intent_persist);
-    let outcome = tokio::task::spawn_blocking(move || -> Result<(), target::TargetError> {
+    let outcome = tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
         // The mutex guards no data, so a poisoned one carries no broken invariant.
         let _ordered = intent_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if succeeded {
@@ -669,15 +670,15 @@ async fn persist_after_start<P: Proxy, R: Routing>(
 /// the start's snapshot, so the target and candidate are left as it wrote them.
 ///
 /// Two locked read-modify-writes, NOT load-then-save, sequential with (never
-/// nested in) each other — both take the same file lock, and `flock` is per-
-/// open-description, so nesting would deadlock rather than recurse.
+/// nested in) each other: each is a `VersionedFile::update`, whose per-path lock
+/// is a leaf.
 fn write_start_records(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
     config: &ProxyConfig,
     on_startup: Option<StartupBehavior>,
     declined: bool,
-) -> Result<(), target::TargetError> {
+) -> Result<(), StoreError> {
     if declined {
         debug!("start's target and candidate not written: an unblock committed since its snapshot");
     } else {

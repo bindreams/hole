@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use util::versioned_file::{
-    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
+    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, VersionedFile, VersionedState,
 };
 
 /// Filename under `state_dir`.
@@ -132,13 +132,6 @@ pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -
             (Change::Store(LockdownState { enabled }), ())
         })
         .map(|_| ())
-}
-
-/// Delete the state file; tolerates absence.
-pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
-    file(state_dir)
-        .update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
-        .map(|((), outcome)| outcome)
 }
 
 #[cfg(test)]
