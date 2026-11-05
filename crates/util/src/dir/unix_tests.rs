@@ -591,6 +591,19 @@ fn a_file_with_another_name_is_not_trusted_whoever_owns_it() {
 }
 
 #[skuld::test]
+fn a_regular_file_with_one_name_is_the_only_one_the_predicate_accepts() {
+    let with = |regular, links| Facts {
+        regular,
+        uid: 1000,
+        links,
+    };
+    assert!(with(true, 1).is_a_regular_file_with_one_name());
+    assert!(!with(true, 2).is_a_regular_file_with_one_name());
+    assert!(!with(false, 1).is_a_regular_file_with_one_name());
+    assert!(!with(false, 2).is_a_regular_file_with_one_name());
+}
+
+#[skuld::test]
 fn a_file_that_is_not_regular_is_never_trusted() {
     assert!(!trusted_appender(facts(false, 1000), Some((1000, 1000))));
     assert!(!trusted_appender(facts(false, 1000), None));

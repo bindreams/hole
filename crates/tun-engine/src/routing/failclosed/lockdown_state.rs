@@ -144,18 +144,28 @@ pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -
         .map(|_| ())
 }
 
+/// How one [`promote_unrecorded`] went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromoteOutcome {
+    /// Nothing was recorded: the kill switch is now recorded as armed.
+    Wrote,
+    /// The record was left as it is, and this is the intent it classified as (never [`Intent::Unset`]).
+    Declined(Intent),
+}
+
 /// Record the kill switch as armed iff nothing is recorded ([`Intent::admits_adoption_promotion`]); the read and the
-/// write are one update, so a concurrent [`set_enabled`] is never overwritten. `true` when it wrote.
-pub fn promote_unrecorded(state_dir: &Path, owner: Option<(u32, u32)>) -> Result<bool, StoreError> {
+/// write are one update, so a concurrent [`set_enabled`] is never overwritten.
+pub fn promote_unrecorded(state_dir: &Path, owner: Option<(u32, u32)>) -> Result<PromoteOutcome, StoreError> {
     file(state_dir)
         .update(&DefaultPlacement { owner }, |now| {
-            if Intent::of(&now.loaded).admits_adoption_promotion() {
-                (Change::Store(LockdownState { enabled: true }), true)
+            let intent = Intent::of(&now.loaded);
+            if intent.admits_adoption_promotion() {
+                (Change::Store(LockdownState { enabled: true }), PromoteOutcome::Wrote)
             } else {
-                (Change::Keep, false)
+                (Change::Keep, PromoteOutcome::Declined(intent))
             }
         })
-        .map(|(wrote, _)| wrote)
+        .map(|(outcome, _)| outcome)
 }
 
 #[cfg(test)]
