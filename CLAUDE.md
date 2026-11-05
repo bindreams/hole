@@ -271,7 +271,7 @@ before editing; the sections linked below are the authoritative source.
 - **Per-variant policy lives on the type, never at a call site** — a decision
   keyed to an enum variant belongs in ONE exhaustive match on that type
   (`SessionEvent::preserves_death_reason`, `CoverPresence::is_present`,
-  `StaleKeyPolicy::refuses_a_stale_key`, `Coverage::plan`), and
+  `StaleKeyPolicy::refuses_a_stale_key`, `Coverage::plan`, `CoverPlan::expects_cover`), and
   two variants are never grouped because they happen to share a consequence.
   Grouping by consequence is what let `ProcessExiting` inherit an answer chosen
   for a cutover; re-deriving the rule at each site is what let `== Live` drop

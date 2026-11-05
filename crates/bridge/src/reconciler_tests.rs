@@ -851,9 +851,12 @@ fn session_event_policy_lives_on_the_type_not_at_call_sites() {
     );
 }
 
-/// The same rule for [`crate::coverage::Coverage`]: whether a start engages, hands over or releases the transient
-/// cover is decided once, by `Coverage::plan`, and a call site that matched a `Coverage` variant would make its
-/// own decision (the resolve-failure warning did, and was false under a standing cover).
+/// The same rule for [`crate::coverage::Coverage`] and the [`crate::coverage::CoverPlan`] it yields: whether a
+/// start engages, hands over or releases the transient cover is decided once, by `Coverage::plan`, and a call
+/// site that matched a `Coverage` variant would make its own decision (the resolve-failure warning did, and was
+/// false under a standing cover). `CoverPlan` carries per-variant policy too, asked through its methods; the one
+/// sanctioned `match` is the dispatch in `ProxyManager::start_cancellable`, and each of its arms must appear
+/// exactly once.
 #[skuld::test]
 fn coverage_policy_lives_on_the_type_not_at_call_sites() {
     let offenders = decisions_outside(&["coverage.rs"], "Coverage::");
@@ -861,6 +864,31 @@ fn coverage_policy_lives_on_the_type_not_at_call_sites() {
         offenders.is_empty(),
         "per-variant Coverage policy decided outside `coverage.rs`:\n  {}\n\
          Ask `Coverage::plan` instead.",
+        offenders.join("\n  ")
+    );
+
+    const DISPATCH_ARMS: [&str; 3] = [
+        "CoverPlan::Engage { unblock_snapshot } => {",
+        "CoverPlan::HandToLockdown => {",
+        "CoverPlan::FailOpen => {",
+    ];
+    let mut offenders = decisions_outside(&["coverage.rs"], "CoverPlan::");
+    for arm in DISPATCH_ARMS {
+        let sanctioned = offenders
+            .iter()
+            .position(|o| o.contains("proxy_manager.rs:") && o.ends_with(&format!(": {arm}")));
+        match sanctioned {
+            Some(i) => {
+                offenders.remove(i);
+            }
+            None => offenders.push(format!("the dispatch arm `{arm}` is not in `proxy_manager.rs`")),
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "per-variant CoverPlan policy decided outside `coverage.rs` and the one dispatch match in \
+         `start_cancellable`:\n  {}\n\
+         Add a method to `CoverPlan` (one exhaustive match) and ask it instead.",
         offenders.join("\n  ")
     );
 }
