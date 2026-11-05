@@ -4773,6 +4773,18 @@ mod self_test {
                 None,
                 "the restored cover permits the OLD value, not the corrected one that failed to engage"
             );
+            // The whole repair is one section under the cover lock: the held cover is released inside it, the
+            // corrected engage fails, and the restore engages, without the section waiting on the lock it holds.
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "the held cover the repair released; the restored one is still held"
+            );
+            assert_eq!(
+                st.cover_engage_attempts.load(Ordering::SeqCst),
+                3,
+                "first engage, corrected, restore"
+            );
         });
     }
 
