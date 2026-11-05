@@ -69,7 +69,7 @@
 //!   path that does not run through `super::sweep_with_witness`, because the
 //!   guard carries no `state_dir` to write to. It fires when an engage COMMITS
 //!   (so the record is already `Armed`) and a later fatal phase of the same
-//!   start fails, unwinding `ProxyManager`'s locally-owned guard; an ordinary
+//!   start fails, or a release overtakes the engage, unwinding the guard; an ordinary
 //!   disconnect is unaffected, since that releases through
 //!   `Routing::release_all_covers` first and drops an already-swept cover. The
 //!   twins were genuinely watched going, so this is an OVER-report: the record
@@ -77,6 +77,10 @@
 //!   that `state_dir` names the two twin keys. Safe direction, and the same
 //!   one this file has always failed in — but not the same claim as "only a
 //!   non-sweep cause leaves a stale record", which is why it is spelled out.
+//! - **A disarm is dropped when this process wrote the record after the sweep's snapshot.** The sweep's proof covers
+//!   the twins it deleted, not the one an engage just armed (nor a concurrent sweep's finding), so the record stays
+//!   as that write left it and the next sweep disarms it. A write attempt counts even when its directory would not
+//!   open. Over-report, the safe direction.
 //! - Other causes with the same shape and no fix here at all: an external FWPM
 //!   delete, a firewall reset, an image restore. No sweep ever held the
 //!   evidence, so nothing could have copied it — which is the case
@@ -102,7 +106,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use util::versioned_file::{
-    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, VersionedFile, VersionedState,
+    Change, DefaultPlacement, Generation, Loaded, Obsolete, Role, Schema, StoreError, VersionedFile, VersionedState,
 };
 
 use super::ArmingWitness;
@@ -146,7 +150,12 @@ fn file(state_dir: &Path) -> VersionedFile<BootTimeState> {
 /// `Unreadable` — which REPORTS — rather than discarded as absence: losing the
 /// record is not evidence that nothing was armed.
 pub fn load(state_dir: &Path) -> ArmingWitness {
-    match file(state_dir).observe().loaded {
+    arming_of(&file(state_dir).observe().loaded)
+}
+
+/// The one reading of a record: `load`, `snapshot` and `apply`'s decision all classify through it.
+fn arming_of(loaded: &Loaded<BootTimeState>) -> ArmingWitness {
+    match loaded {
         Loaded::Absent => ArmingWitness::Unset,
         Loaded::Current { value, .. } if value.armed => ArmingWitness::Armed,
         Loaded::Current { .. } => ArmingWitness::Disarmed,
@@ -234,17 +243,17 @@ pub(crate) enum WitnessUpdate {
 
 /// The record's next value, or `None` when nothing needs writing.
 ///
-/// Pure, and a table rather than a condition spread over the write site,
-/// because the two rules that matter are both about which CURRENT values a
-/// write may land on: an `Arm` never rewrites an existing `Armed` (pointless
-/// I/O that can only fail), and a `Disarm` never writes `false` over `Unset`
-/// or `Disarmed` — the first would litter every host that never armed a twin
-/// with a file saying so, on every `release-covers` it ever runs.
-fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
+/// Pure, and a table rather than a condition spread over the write site. An `Arm` never rewrites an existing
+/// `Armed` (pointless I/O that can only fail), a `Disarm` never writes `false` over `Unset` or `Disarmed` (the first
+/// would litter every host that never armed a twin with a file saying so, on every `release-covers` it ever runs),
+/// and a `Disarm` never lands when `generation_moved`: this process wrote the record after the sweep's snapshot,
+/// and the sweep's proof covers only the twins it deleted.
+fn next_record(current: ArmingWitness, update: WitnessUpdate, generation_moved: bool) -> Option<bool> {
     match update {
         WitnessUpdate::Leave => None,
         // Already recorded; rewriting it would only risk an I/O failure.
         WitnessUpdate::Arm => (current != ArmingWitness::Armed).then_some(true),
+        WitnessUpdate::Disarm if generation_moved => None,
         // `Unset` is a host with no file and nothing outstanding — writing
         // `false` there would litter every host that never armed a twin.
         // `Unreadable` IS written, because a corrupt file reports forever
@@ -253,24 +262,57 @@ fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
     }
 }
 
-/// Apply a sweep's [`WitnessUpdate`] to the record it was folded against.
-pub(crate) fn apply(state_dir: &Path, current: ArmingWitness, update: WitnessUpdate, owner: Option<(u32, u32)>) {
-    if let Some(armed) = next_record(current, update) {
-        write_or_warn(state_dir, armed, owner);
+/// What a sweep read before it deleted anything: the record, and the generation [`apply`] later compares to learn
+/// whether this process wrote the record in between.
+#[derive(Debug)]
+pub(crate) struct Snapshot {
+    pub(crate) witness: ArmingWitness,
+    generation: Generation,
+}
+
+/// Read the record and its generation as one pair.
+pub(crate) fn snapshot(state_dir: &Path) -> Snapshot {
+    let observed = file(state_dir).observe();
+    Snapshot {
+        witness: arming_of(&observed.loaded),
+        generation: observed.generation,
+    }
+}
+
+/// Apply a sweep's [`WitnessUpdate`], decided against the record as it is NOW and the generation as it was at
+/// `since`; the read and the write are one `update`, so nothing in this process writes between them.
+pub(crate) fn apply(state_dir: &Path, since: Snapshot, update: WitnessUpdate, owner: Option<(u32, u32)>) {
+    let mut decided = None;
+    let written = file(state_dir).update(&DefaultPlacement { owner }, |now| {
+        match next_record(arming_of(&now.loaded), update, now.generation != since.generation) {
+            Some(armed) => {
+                decided = Some(armed);
+                (Change::Store(BootTimeState { armed }), ())
+            }
+            None => (Change::Keep, ()),
+        }
+    });
+    if let Err(e) = written {
+        warn_unwritten(&e, decided);
     }
 }
 
 /// Warn, never propagate — see the module doc's residuals.
 fn write_or_warn(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) {
     if let Err(e) = save(state_dir, armed, owner) {
-        tracing::warn!(
-            error = &e as &dyn std::error::Error,
-            armed,
-            file = STATE_FILE_NAME,
-            "the boot-time witness could not be written; a later sweep that can no longer see a \
-             standing cover's PERSISTENT sibling will have nothing to fall back on"
-        );
+        warn_unwritten(&e, Some(armed));
     }
+}
+
+/// `armed` is the value that was to be written; `None` when the write failed before one was chosen.
+fn warn_unwritten(e: &StoreError, armed: Option<bool>) {
+    tracing::warn!(
+        error = e as &dyn std::error::Error,
+        armed = ?armed,
+        file = STATE_FILE_NAME,
+        "the boot-time witness could not be written; a later sweep that can no longer see a \
+         standing cover's PERSISTENT sibling will have nothing to fall back on"
+    );
 }
 
 // Deliberately NOT platform-gated, for the reason `clearance_tests` gives: the
