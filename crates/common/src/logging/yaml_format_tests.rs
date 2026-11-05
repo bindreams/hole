@@ -221,35 +221,17 @@ fn error_items(out: &str, key: &str) -> Vec<String> {
     let body: String = out
         .lines()
         .skip(1)
-        .map(|line| {
-            format!(
-                "{}
-",
-                line.strip_prefix("  ").unwrap_or(line)
-            )
-        })
+        .map(|line| format!("{}\n", line.strip_prefix("  ").unwrap_or(line)))
         .collect();
-    let map: Mapping = yaml_serde::from_str(&body).unwrap_or_else(|e| {
-        panic!(
-            "not YAML ({e}):
-{out}"
-        )
-    });
-    let seq = map.get(key).and_then(Value::as_sequence).unwrap_or_else(|| {
-        panic!(
-            "no sequence under `{key}`:
-{out}"
-        )
-    });
+    let map: Mapping = yaml_serde::from_str(&body).unwrap_or_else(|e| panic!("not YAML ({e}):\n{out}"));
+    let seq = map
+        .get(key)
+        .and_then(Value::as_sequence)
+        .unwrap_or_else(|| panic!("no sequence under `{key}`:\n{out}"));
     seq.iter()
         .map(|v| {
             v.as_str()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "non-string item {v:?}:
-{out}"
-                    )
-                })
+                .unwrap_or_else(|| panic!("non-string item {v:?}:\n{out}"))
                 .to_owned()
         })
         .collect()
@@ -278,8 +260,7 @@ fn record_error_uses_display_not_debug() {
     assert_eq!(error_items(&out, "err"), ["display-text"], "{out}");
     assert!(
         !out.contains("MyErr"),
-        "did not expect Debug text `MyErr` in output, got:
-{out}"
+        "did not expect Debug text `MyErr` in output, got:\n{out}"
     );
 }
 
@@ -310,16 +291,8 @@ fn record_error_renders_an_io_error_wrapping_a_typed_payload_once() {
 
 #[skuld::test]
 fn record_error_keeps_a_multiline_link_as_one_item() {
-    let out = log_error(&std::io::Error::other(
-        "line1
-line2",
-    ));
-    assert_eq!(
-        error_items(&out, "err"),
-        ["line1
-line2"],
-        "{out}"
-    );
+    let out = log_error(&std::io::Error::other("line1\nline2"));
+    assert_eq!(error_items(&out, "err"), ["line1\nline2"], "{out}");
 }
 
 #[skuld::test]

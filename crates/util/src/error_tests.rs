@@ -10,12 +10,8 @@ struct Outer(#[source] Middle);
 #[error("middle")]
 struct Middle(#[source] io::Error);
 
-/// Carries an `io::Error` as its `source()` and has no code of its own.
-#[derive(Debug, thiserror::Error)]
-#[error("wrapper")]
-struct Wraps(#[source] io::Error);
-
-/// A typed payload that an `io::Error` can hold; it has a cause of its own.
+/// A typed payload that an `io::Error` can hold; it carries an `io::Error` as its `source()` and has no code of
+/// its own.
 #[derive(Debug, thiserror::Error)]
 #[error("payload")]
 struct Payload(#[source] io::Error);
@@ -133,27 +129,30 @@ fn an_error_without_a_code_or_a_source_reports_none() {
 
 #[skuld::test]
 fn the_code_of_a_wrapped_os_error_is_found() {
-    let wrapped = io::Error::new(io::ErrorKind::PermissionDenied, Wraps(io::Error::from_raw_os_error(5)));
+    let wrapped = io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        Payload(io::Error::from_raw_os_error(5)),
+    );
     assert_eq!(wrapped.raw_os_error(), None, "guard: the outer error has no code");
     assert_eq!(raw_os_error(&wrapped), Some(5));
 }
 
 #[skuld::test]
 fn the_code_is_found_through_every_level_of_wrapping() {
-    let inner = io::Error::other(Wraps(io::Error::from_raw_os_error(32)));
-    let outer = io::Error::other(Wraps(inner));
+    let inner = io::Error::other(Payload(io::Error::from_raw_os_error(32)));
+    let outer = io::Error::other(Payload(inner));
     assert_eq!(raw_os_error(&outer), Some(32));
 }
 
 #[skuld::test]
 fn a_wrapped_error_without_a_code_reports_none() {
-    let wrapped = io::Error::other(Wraps(io::Error::other("no code")));
+    let wrapped = io::Error::other(Payload(io::Error::other("no code")));
     assert_eq!(raw_os_error(&wrapped), None);
 }
 
 #[skuld::test]
 fn raw_os_error_reads_a_code_behind_a_non_io_error() {
-    let e = Wraps(io::Error::from_raw_os_error(5));
+    let e = Payload(io::Error::from_raw_os_error(5));
     assert_eq!(raw_os_error(&e), Some(5));
 }
 
