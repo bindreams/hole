@@ -1,4 +1,4 @@
-//! `StateFile::from(Loaded)`, the one fold of a read into the sweep's trichotomy. Not platform-gated: the fold is
+//! `StateFile::view(&Loaded)`, the one fold of a read into the sweep's trichotomy. Not platform-gated: the fold is
 //! platform-free, and only macOS has a record that uses it.
 
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,7 @@ use util::versioned_file::{Obsolete, Role, Schema, VersionedFile, VersionedState
 
 use super::StateFile;
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Probe {
     pf_token: String,
 }
@@ -28,7 +28,7 @@ impl VersionedState for Probe {
 util::assert_contiguous!(Probe);
 
 fn read(dir: &std::path::Path) -> StateFile<Probe> {
-    StateFile::from(VersionedFile::<Probe>::new(dir).observe().loaded)
+    StateFile::view(&VersionedFile::<Probe>::new(dir).observe().loaded)
 }
 
 fn read_bytes(bytes: &[u8]) -> StateFile<Probe> {
@@ -88,9 +88,9 @@ fn a_record_below_the_floor_is_unusable_and_gives_up_its_token() {
     );
 }
 
-/// An I/O failure has no bytes to salvage from.
+/// An I/O failure has no bytes to salvage from, and is neither a record nor an absent one.
 #[skuld::test]
-fn a_read_that_failed_is_unusable_with_no_token() {
+fn a_read_that_failed_is_unreadable() {
     let tmp = tempfile::tempdir().unwrap();
     // The state directory is a regular file: the directory does not open.
     let not_a_dir = tmp.path().join("a-file");
@@ -98,5 +98,5 @@ fn a_read_that_failed_is_unusable_with_no_token() {
 
     let found = read(&not_a_dir);
 
-    assert!(matches!(&found, StateFile::Unusable { pf_token: None }), "{found:?}");
+    assert!(matches!(&found, StateFile::Unreadable), "{found:?}");
 }

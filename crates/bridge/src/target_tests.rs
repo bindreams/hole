@@ -980,9 +980,8 @@ fn the_state_file_writers_never_chown_chmod_or_rename_by_path() {
         "bridge/src/target.rs",
         "bridge/src/plugin_state.rs",
         "tun-engine/src/routing/failclosed/boottime_witness.rs",
-        "tun-engine/src/routing/failclosed/failclosed_state.rs",
-        "tun-engine/src/routing/failclosed/lockdown_pf_state.rs",
         "tun-engine/src/routing/failclosed/lockdown_state.rs",
+        "tun-engine/src/routing/failclosed/pf_record.rs",
     ];
     // Each of these resolves a path again (or follows it) after the directory was chosen.
     let by_path = [

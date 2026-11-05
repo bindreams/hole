@@ -605,7 +605,7 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
 /// The automatic sweep's half of the same rule the test above proves for the
 /// manual escape: an UNREADABLE record is a cover to clear, not an absence.
 ///
-/// `recover_cover` used to go through `failclosed_state::load`, which collapses
+/// `recover_cover` used to go through a read that collapses
 /// `Unusable` into `None` alongside `Absent`, and then logged "no
 /// failclosed-state file, nothing to recover" over a host still behind
 /// `block out all`. The reachable production cause is a ROLLBACK, and the
@@ -657,14 +657,17 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
                 .expect("engage real pf transient cover");
             // Read the real enable token back BEFORE overwriting the file, so the rolled-back payload
             // below carries the REAL token and the safety net has one to fall back on.
-            let token = super::failclosed_state::load(dir.path())
-                .expect("the engage must have persisted a state file")
-                .pf_token;
+            let super::StateFile::Present(persisted) =
+                super::pf_record::read::<super::failclosed_state::FailClosedState>(dir.path())
+            else {
+                panic!("the engage must have persisted a state file");
+            };
+            let token = persisted.pf_token;
             cover.disarm(); // stand in for the crash: no guard remains
 
             let rolled_back = format!(r#"{{"version":2,"pf_token":"{token}","pf_was_enabled":false}}"#);
             std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();
-            let presence = super::failclosed_state::load_presence(dir.path());
+            let presence = super::pf_record::read::<super::failclosed_state::FailClosedState>(dir.path());
             assert!(
                 matches!(presence, super::StateFile::Unusable { .. }),
                 "this test's premise: the payload must be UNREADABLE to this binary. On `Present` the \
@@ -721,12 +724,16 @@ fn macos_release_all_falls_back_when_the_snapshot_will_not_load() {
     // Rewrite the state file as valid JSON at the current schema version, but
     // with a `main_snapshot` that is not something `pfctl -f -` will accept —
     // a REAL `pfctl` failure driving the real fallback, not a mock.
-    let existing = super::lockdown_pf_state::load(dir.path()).expect("state file must exist after engage");
+    let super::StateFile::Present(existing) =
+        super::pf_record::read::<super::lockdown_pf_state::LockdownPfState>(dir.path())
+    else {
+        panic!("state file must exist after engage");
+    };
     let broken = super::lockdown_pf_state::LockdownPfState {
         main_snapshot: "this is not a valid pf ruleset {{{".into(),
         ..existing
     };
-    super::lockdown_pf_state::save(dir.path(), &broken, None).unwrap();
+    super::pf_record::swap(dir.path(), &broken, None).unwrap();
 
     routing
         .release_all_covers(&routing.lock_covers())

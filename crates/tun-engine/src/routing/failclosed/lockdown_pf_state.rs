@@ -6,12 +6,8 @@
 //! Sweep to restore the host without `-Fa`, matching the engaged-without-flush
 //! contract).
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
-use util::versioned_file::{
-    Change, DefaultPlacement, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
-};
+use util::versioned_file::{Obsolete, Role, Schema, VersionedState};
 
 pub const STATE_FILE_NAME: &str = "bridge-lockdown-pf.json";
 
@@ -61,7 +57,7 @@ impl Schema for LockdownPfState {
 }
 
 /// A cover's evidence: one this release cannot read is moved aside by a clear and backed up by a store, and its
-/// token is still salvaged for the sweep ([`super::StateFile::from`]).
+/// token is still salvaged for the sweep ([`super::StateFile::view`]).
 impl VersionedState for LockdownPfState {
     const FILE_NAME: &'static str = STATE_FILE_NAME;
     const ROLE: Role = Role::Cover;
@@ -69,51 +65,8 @@ impl VersionedState for LockdownPfState {
 
 util::assert_contiguous!(LockdownPfState);
 
-/// The record file. Every read and write of it goes through this type.
-pub type LockdownPfFile = VersionedFile<LockdownPfState>;
-
-pub fn file(state_dir: &Path) -> LockdownPfFile {
-    VersionedFile::new(state_dir)
-}
-
-/// Atomically persist `state`, creating `state_dir`. A file this release cannot read is backed up beside it first.
-pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
-    file(state_dir)
-        .update(&DefaultPlacement { owner }, |_| (Change::Store(state.clone()), ()))
-        .map(|_| ())
-}
-
-/// Trichotomy read distinguishing "no cover was ever engaged" (`Absent`) from
-/// "a cover's evidence exists but we cannot read it" (`Unusable`) — a corrupt,
-/// unparseable, or version-skewed file. Collapsing `Unusable` into `Absent`
-/// would make a release read a live, blocking cover as nothing to clear (see
-/// `release_all`'s doc). `Absent` is ONLY `ErrorKind::NotFound`; every other
-/// read/parse/version failure is `Unusable`. The parse failure is logged by the
-/// read as a category and a position: `main_snapshot` is a captured `pfctl -sr`
-/// ruleset, which holds the server IP whenever it captured Hole's own cover.
-pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
-    super::StateFile::from(file(state_dir).observe().loaded)
-}
-
-/// Load the state file, or `None` on any error (absent / corrupt / version
-/// mismatch). Thin wrapper over [`load_presence`], collapsing
-/// `Unusable` into `None` alongside `Absent` — every existing caller treats
-/// the two identically.
-pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
-    match load_presence(state_dir) {
-        super::StateFile::Present(s) => Some(s),
-        super::StateFile::Absent | super::StateFile::Unusable { .. } => None,
+impl super::pf_record::PfRecord for LockdownPfState {
+    fn pf_token(&self) -> &str {
+        &self.pf_token
     }
 }
-
-/// Remove the state file; absence is [`UpdateOutcome::Absent`]. A record this release cannot read is moved aside, and
-/// one whose read failed is [`UpdateOutcome::Kept`]. `Err` only on a real I/O error.
-pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
-    file(state_dir)
-        .update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
-        .map(|((), outcome)| outcome)
-}
-
-#[cfg(test)]
-#[path = "lockdown_pf_state_tests.rs"]
-mod lockdown_pf_state_tests;
