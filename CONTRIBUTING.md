@@ -3182,7 +3182,8 @@ holds the gap, so consent is moot.
 
 Leak-correctness rides the **standing lockdown cover**, not a transient one. The
 bridge's marker-conditional shutdown sees the marker and `disarm`s the cover
-(persist-without-disengage via `std::mem::forget`) instead of dropping it, so the
+(persist-without-disengage: the guard is consumed and emptied, so its `Drop`
+disengages nothing) instead of dropping it, so the
 WFP/pf filters survive the restart and the new bridge re-adopts them
 (`decide_cover_recovery == Adopt`). The `cutover::os::CutoverOs` effects trait
 exposes no cover-mutating method, so a cutover structurally cannot engage a

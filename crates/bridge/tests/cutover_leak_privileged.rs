@@ -62,8 +62,8 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 
 /// The standing lockdown cover's egress block must SURVIVE a `disarm` -- that is
 /// the cutover leak invariant on the real ruleset. The bridge's marker-
-/// conditional shutdown `disarm`s the cover (persist-without-disengage via
-/// `std::mem::forget`) instead of dropping it, so the WFP/pf filters hold across
+/// conditional shutdown `disarm`s the cover (persist-without-disengage: the guard
+/// is consumed and emptied, so its `Drop` disengages nothing) instead of dropping it, so the WFP/pf filters hold across
 /// the restart gap and the new bridge re-adopts them. A `disarm` that actually
 /// disengaged would open the host mid-cutover (a leak).
 ///
