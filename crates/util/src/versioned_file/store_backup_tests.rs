@@ -1,13 +1,15 @@
 //! The backups `store`, `remove` and `move_aside` leave, and what they do when
 //! a rename or a delete is refused.
 
+use crate::versioned_file::fixtures::UpdateShortcuts;
+use crate::versioned_file::UpdateOutcome;
 use std::io;
 use std::sync::Arc;
 
 use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
-use super::{DefaultPlacement, Fs, Removal, VersionedFile};
+use super::{DefaultPlacement, Fs, VersionedFile};
 use crate::versioned_file::fixtures::{dir, names, put, unreadable_bytes, DecisionFile};
 use crate::versioned_file::CannotRead;
 
@@ -31,7 +33,7 @@ fn remove_and_move_aside_in_a_missing_directory_find_nothing_and_create_nothing(
     let missing = dir.path().join("not-there");
     let file = VersionedFile::<DecisionFile>::new(&missing);
 
-    assert_eq!(file.remove().unwrap(), Removal::Absent);
+    assert_eq!(file.remove().unwrap(), UpdateOutcome::Absent);
     assert_eq!(file.move_aside().unwrap(), None);
     assert!(!missing.exists(), "a removal must not create the directory");
 }
@@ -55,24 +57,6 @@ impl Fs for FailsPublish {
     }
 }
 
-/// A platform without a no-clobber rename, whose `remove_file` then fails.
-struct NoRenameAndNoDelete;
-
-impl Fs for NoRenameAndNoDelete {
-    fn rename_noreplace(
-        &self,
-        _dir: &crate::dir::Dir,
-        _from: &std::ffi::OsStr,
-        _to: &std::ffi::OsStr,
-    ) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-
-    fn remove_file(&self, _dir: &crate::dir::Dir, _name: &std::ffi::OsStr) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::PermissionDenied))
-    }
-}
-
 struct NoRename;
 
 impl Fs for NoRename {
@@ -87,7 +71,7 @@ impl Fs for NoRename {
 }
 
 #[skuld::test]
-fn a_backup_is_logged_even_when_the_publish_after_it_fails() {
+fn a_backup_is_logged_only_once_the_publish_after_it_has_succeeded() {
     let (subscriber, log) = capture();
     let _guard = set_default_in_current_thread(subscriber);
     let dir = dir();
@@ -97,13 +81,20 @@ fn a_backup_is_logged_even_when_the_publish_after_it_fails() {
         VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsPublish)).store(&decision("new"), &plain());
 
     assert!(result.is_err());
+    let after_failure = log.snapshot();
+    assert!(
+        !after_failure.contains("backed up a state file"),
+        "a backup taken back is not logged: {after_failure}"
+    );
+    assert_eq!(names(&dir), ["decision.json"]);
+
+    VersionedFile::<DecisionFile>::new(dir.path())
+        .store(&decision("new"), &plain())
+        .unwrap();
+
     let log = log.snapshot();
     assert_eq!(log.matches("backed up a state file").count(), 1, "{log}");
     assert!(log.contains("decision.json.unreadable.bak"), "{log}");
-    assert!(
-        names(&dir).contains(&"decision.json.unreadable.bak".to_string()),
-        "a logged backup is kept, not cleaned up"
-    );
 }
 
 #[skuld::test]
@@ -120,42 +111,43 @@ fn move_aside_logs_the_backup_it_makes() {
     assert!(log.contains("decision.json.unreadable.bak"), "{log}");
 }
 
+/// A filesystem with no no-replace rename is an error that names the file and says why; nothing is moved and no
+/// backup is made, since a link and a delete would race the writers the rename exists to exclude.
 #[skuld::test]
-fn without_a_no_clobber_rename_move_aside_links_then_removes() {
+fn without_a_no_clobber_rename_move_aside_fails_naming_the_file_and_moves_nothing() {
     let dir = dir();
     let original = unreadable_bytes(CannotRead::Newer);
     put(&dir, "decision.json", original);
 
-    let moved = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(NoRename))
-        .move_aside()
-        .unwrap();
-
-    let backup = moved.expect("a file to move");
-    assert_eq!(backup, dir.path().join("decision.json.unreadable.bak"));
-    assert_eq!(std::fs::read(&backup).unwrap(), original);
-    assert_eq!(names(&dir), ["decision.json.unreadable.bak"]);
-}
-
-#[skuld::test]
-fn a_failed_delete_after_the_link_leaves_a_logged_backup() {
-    let (subscriber, log) = capture();
-    let _guard = set_default_in_current_thread(subscriber);
-    let dir = dir();
-    let original = unreadable_bytes(CannotRead::Newer);
-    put(&dir, "decision.json", original);
-
-    let err = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(NoRenameAndNoDelete))
+    let err = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(NoRename))
         .move_aside()
         .unwrap_err();
 
-    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    let text = err.to_string();
+    assert!(text.contains("decision.json"), "{text}");
+    assert!(!text.contains(&dir.path().display().to_string()), "{text}");
+    assert!(text.contains("no-replace rename"), "{text}");
     assert_eq!(read(&dir, "decision.json"), original, "the original is still there");
-    assert_eq!(read(&dir, "decision.json.unreadable.bak"), original);
+    assert_eq!(names(&dir), ["decision.json"], "no backup");
+}
+
+/// `create_new` has no `Fs` seam for its claim, so the error it returns where the claim's rename answers `Unsupported`
+/// is checked where it is made.
+#[skuld::test]
+fn the_error_for_a_filesystem_with_no_noreplace_rename_names_the_file_not_the_directory() {
+    let dir = dir();
+
+    let err = VersionedFile::<DecisionFile>::new(dir.path()).no_noreplace_rename();
+
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    let text = err.to_string();
     assert!(
-        log.snapshot().contains("decision.json.unreadable.bak"),
-        "{}",
-        log.snapshot()
+        text.contains(<DecisionFile as crate::versioned_file::VersionedState>::FILE_NAME),
+        "{text}"
     );
+    assert!(!text.contains(&dir.path().display().to_string()), "{text}");
+    assert!(text.contains("no-replace rename"), "{text}");
 }
 
 /// A refusal of the rename itself, as a sticky directory or a security module

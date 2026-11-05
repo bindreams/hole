@@ -52,6 +52,8 @@
 use std::net::IpAddr;
 use std::path::Path;
 
+use util::versioned_file::UpdateOutcome;
+
 use crate::dns::system;
 use crate::dns_state::{self, AdapterId};
 
@@ -156,11 +158,22 @@ fn finish(state_dir: &Path, fully_settled: bool) {
         // way. Falling back to `supersede` keeps that promise AND keeps the
         // file itself alive as `scripts/network-reset.py`'s escape hatch,
         // even though the restore actually succeeded.
-        if let Err(e) = dns_state::clear(state_dir) {
-            tracing::warn!(
-                error = %util::error_chain::error_chain(&e),
-                "dns_recovery: failed to clear bridge-dns.json after full restore; superseding it instead"
-            );
+        let cleared = match dns_state::clear(state_dir) {
+            Ok(UpdateOutcome::Removed | UpdateOutcome::Absent) => true,
+            Ok(outcome) => {
+                tracing::warn!(
+                    ?outcome,
+                    "dns_recovery: bridge-dns.json was not cleared after full restore"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(error = %util::error_chain::error_chain(&e), "dns_recovery: failed to clear bridge-dns.json after full restore");
+                false
+            }
+        };
+        if !cleared {
+            tracing::warn!("dns_recovery: superseding bridge-dns.json instead");
             if let Err(e) = dns_state::supersede(state_dir) {
                 tracing::warn!(error = %util::error_chain::error_chain(&e), "dns_recovery: failed to rename bridge-dns.json to the superseded name");
             }

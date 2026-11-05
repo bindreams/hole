@@ -1,21 +1,18 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::*;
+use util::versioned_file::{Change, DefaultPlacement};
 
-/// Write `state` to `<dir>/bridge-dns.json` directly via `serde_json`, NOT
-/// through `dns_state::save` — that function is gone (the bridge no longer
-/// writes this file; see the module doc). This is what every fixture in
-/// this file uses in its place; it is deliberately the only place besides
-/// `crate::dns::recovery_tests` that constructs a `bridge-dns.json` on
-/// disk.
+/// Write `state` to `<dir>/bridge-dns.json` through the versioned file. The only place besides
+/// `crate::dns::recovery_tests` that constructs a `bridge-dns.json` on disk.
 fn write_state(dir: &std::path::Path, state: &DnsState) {
-    let json = serde_json::to_vec_pretty(state).unwrap();
-    std::fs::write(dir.join(STATE_FILE_NAME), json).unwrap();
+    file(dir)
+        .update(&DefaultPlacement::default(), |_| (Change::Store(state.clone()), ()))
+        .unwrap();
 }
 
 fn sample_windows_state() -> DnsState {
     DnsState {
-        version: SCHEMA_VERSION,
         advertised: vec![
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
@@ -50,7 +47,6 @@ fn sample_windows_state() -> DnsState {
 
 fn sample_macos_state() -> DnsState {
     DnsState {
-        version: SCHEMA_VERSION,
         advertised: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
         adapters: vec![DnsPriorAdapter {
             id: AdapterId::MacosServiceName { value: "Wi-Fi".into() },
@@ -83,7 +79,6 @@ fn write_then_load_roundtrip_macos() {
 fn write_then_load_roundtrip_empty_advertised() {
     let dir = tempfile::tempdir().unwrap();
     let state = DnsState {
-        version: SCHEMA_VERSION,
         advertised: vec![],
         adapters: vec![],
     };
@@ -118,13 +113,13 @@ fn load_wrong_version_returns_none() {
 }
 
 #[skuld::test]
-fn load_tolerates_unknown_top_level_field() {
+fn a_v1_record_with_the_obsolete_chosen_loopback_key_still_loads() {
     // DnsState dropped `deny_unknown_fields` so a v1 file's obsolete
     // `chosen_loopback` key (and any future stray top-level key) is
     // ignored rather than failing recovery.
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
-        "version": SCHEMA_VERSION,
+        "version": 1,
         "chosen_loopback": "127.0.0.1:53", // obsolete v1 key — ignored
         "adapters": [],
     });
@@ -135,10 +130,10 @@ fn load_tolerates_unknown_top_level_field() {
 }
 
 #[skuld::test]
-fn load_unknown_adapter_field_returns_none() {
+fn load_tolerates_an_unknown_adapter_field() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
-        "version": SCHEMA_VERSION,
+        "version": 1,
         "advertised": ["1.1.1.1"],
         "adapters": [{
             "id": { "kind": "windows_alias", "value": "Ethernet" },
@@ -149,14 +144,14 @@ fn load_unknown_adapter_field_returns_none() {
         }],
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
-    assert!(load(dir.path()).is_none());
+    assert!(load(dir.path()).is_some());
 }
 
 #[skuld::test]
 fn load_unknown_dns_prior_variant_returns_none() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
-        "version": SCHEMA_VERSION,
+        "version": 1,
         "advertised": ["1.1.1.1"],
         "adapters": [{
             "id": { "kind": "windows_alias", "value": "Ethernet" },
@@ -200,10 +195,10 @@ fn adapter_id_variants_serialize_snake_case() {
 }
 
 #[skuld::test]
-fn load_rejects_unknown_field_in_static_variant() {
+fn load_tolerates_an_unknown_field_in_the_static_variant() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
-        "version": SCHEMA_VERSION,
+        "version": 1,
         "advertised": ["1.1.1.1"],
         "adapters": [{
             "id": { "kind": "windows_alias", "value": "Ethernet" },
@@ -213,14 +208,14 @@ fn load_rejects_unknown_field_in_static_variant() {
         }],
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
-    assert!(load(dir.path()).is_none());
+    assert!(load(dir.path()).is_some());
 }
 
 #[skuld::test]
-fn load_rejects_unknown_field_in_macos_service_name() {
+fn load_tolerates_an_unknown_field_in_macos_service_name() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
-        "version": SCHEMA_VERSION,
+        "version": 1,
         "advertised": ["1.1.1.1"],
         "adapters": [{
             "id": { "kind": "macos_service_name", "value": "abc", "extra": 1 },
@@ -230,14 +225,14 @@ fn load_rejects_unknown_field_in_macos_service_name() {
         }],
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
-    assert!(load(dir.path()).is_none());
+    assert!(load(dir.path()).is_some());
 }
 
 #[skuld::test]
 fn load_rejects_missing_required_field() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
-        "version": SCHEMA_VERSION,
+        "version": 1,
         "advertised": ["1.1.1.1"],
         // adapters missing — still required (no serde default)
     });
@@ -249,13 +244,45 @@ fn load_rejects_missing_required_field() {
 fn write_then_load_roundtrip_ipv6_advertised() {
     let dir = tempfile::tempdir().unwrap();
     let state = DnsState {
-        version: SCHEMA_VERSION,
         advertised: vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
         adapters: vec![],
     };
     write_state(dir.path(), &state);
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
+}
+
+/// A record this release cannot read: newer, corrupt, and one whose read fails (a directory at the name).
+/// What a record is called and how it is planted in a folder.
+type Planting = (&'static str, fn(&std::path::Path));
+
+fn plant_unreadable_records() -> [Planting; 3] {
+    [
+        ("newer", |dir| {
+            std::fs::write(dir.join(STATE_FILE_NAME), br#"{"version":99,"adapters":[]}"#).unwrap()
+        }),
+        ("corrupt", |dir| {
+            std::fs::write(dir.join(STATE_FILE_NAME), b"not valid json { .").unwrap()
+        }),
+        ("a failed read", |dir| {
+            std::fs::create_dir_all(dir.join(STATE_FILE_NAME)).unwrap()
+        }),
+    ]
+}
+
+#[skuld::test]
+fn a_dns_record_that_cannot_be_read_loads_as_none_and_is_kept() {
+    for (what, plant) in plant_unreadable_records() {
+        let dir = tempfile::tempdir().unwrap();
+        plant(dir.path());
+
+        assert!(load(dir.path()).is_none(), "{what}");
+        assert_eq!(clear(dir.path()).unwrap(), UpdateOutcome::Kept, "{what}");
+        assert!(
+            dir.path().join(STATE_FILE_NAME).exists(),
+            "{what}: the record was removed"
+        );
+    }
 }
 
 #[skuld::test]
@@ -280,6 +307,9 @@ fn clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
 
     let err = clear(&state).unwrap_err();
 
+    let util::versioned_file::StoreError::Io(err) = err else {
+        panic!("expected an I/O refusal, got {err:?}");
+    };
     assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
 }
 

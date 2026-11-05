@@ -18,13 +18,11 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use util::versioned_file::{
+    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
+};
 
 // Types ===============================================================================================================
-
-/// Schema version for [`DnsState`]. Bump when the struct changes in a
-/// backwards-incompatible way; [`load`] rejects mismatched versions to force
-/// a fresh run rather than corrupt recovery.
-pub const SCHEMA_VERSION: u32 = 1;
 
 /// Filename of the persisted state file under `state_dir`. Exported so
 /// external tooling (notably `scripts/network-reset.py`) can reference the
@@ -40,14 +38,11 @@ pub const STATE_FILE_NAME: &str = "bridge-dns.json";
 /// load-bearing.
 pub const SUPERSEDED_FILE_NAME: &str = "bridge-dns.superseded.json";
 
+// No `deny_unknown_fields`, here or in the types below: a v1 file from an older crashed run carries the obsolete
+// `chosen_loopback` key. Tolerating it (ignore the unknown key, default `advertised` to empty) keeps crash+upgrade
+// recovery working: `load` still returns the state and recovery restores from `adapters`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-// NOTE: NO `deny_unknown_fields` — a v1 file from an older crashed run
-// carries the obsolete `chosen_loopback` key. Tolerating it (ignore the
-// unknown key, default `advertised` to empty) keeps crash+upgrade recovery
-// working: `load` still returns the state and recovery restores from
-// `adapters`.
 pub struct DnsState {
-    pub version: u32,
     /// The upstream resolver IPs the writing build advertised to its
     /// adapters. NOT diagnostic-only: the upgrade sweep's ONLY evidence
     /// that a live adapter's current DNS is still what that old build left
@@ -63,7 +58,6 @@ pub struct DnsState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DnsPriorAdapter {
     pub id: AdapterId,
     /// Friendly adapter name captured at `capture` time, for diagnostic
@@ -88,7 +82,7 @@ pub struct DnsPriorAdapter {
 /// names survive reboots. Rename mid-session is the only failure mode,
 /// matching the plan's "skip silently on restore" semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AdapterId {
     /// Windows adapter friendly name (alias), e.g. "Ethernet" or "Wi-Fi".
     /// Passed directly to `netsh interface ... name="<value>"`.
@@ -100,7 +94,7 @@ pub enum AdapterId {
 
 /// Prior DNS configuration for a single adapter + address family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DnsPrior {
     /// No DNS was configured for this family (restore: clear to empty). On
     /// macOS the restore operation is identical to [`DnsPrior::Dhcp`] —
@@ -113,46 +107,57 @@ pub enum DnsPrior {
     Static { servers: Vec<IpAddr> },
 }
 
+/// Schema 1, the only one: no release has written this file since the bridge stopped saving it.
+impl Schema for DnsState {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+/// A legacy record: a past release wrote it and none does now, so one this release cannot read is kept, never
+/// overwritten, and never blocks a connect.
+impl VersionedState for DnsState {
+    const FILE_NAME: &'static str = STATE_FILE_NAME;
+    const ROLE: Role = Role::LegacyRecord;
+}
+
+util::assert_contiguous!(DnsState);
+
 // I/O =================================================================================================================
 //
 // No `save` — the bridge no longer writes this file (see the module doc).
 // Only `load`, `clear`, and `supersede` remain, all for the upgrade sweep.
 
-/// Load the state file. Returns `None` for any error — missing file,
-/// corrupted JSON, unknown fields, version mismatch — and logs at `warn`
-/// level. Crash recovery is best-effort and should never fail the caller.
+/// The legacy DNS record's file.
+pub type DnsFile = VersionedFile<DnsState>;
+
+pub fn file(state_dir: &Path) -> DnsFile {
+    VersionedFile::new(state_dir)
+}
+
+/// Load the state file. Returns `None` for anything but a readable record — missing file, corrupt JSON, a newer or
+/// obsolete version, a failed read — and the read logs the cause at `warn`. Crash recovery is best-effort and
+/// should never fail the caller.
 pub fn load(state_dir: &Path) -> Option<DnsState> {
-    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), file = STATE_FILE_NAME, "dns-state read failed");
-            return None;
-        }
-    };
-    match serde_json::from_slice::<DnsState>(&bytes) {
-        Ok(state) if state.version == SCHEMA_VERSION => Some(state),
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = SCHEMA_VERSION,
-                "dns-state schema mismatch, discarding"
-            );
-            None
-        }
-        Err(e) => {
-            // The error quotes the file, which the user may have put there: keep its position, not its text.
-            let e = util::parse_error::ParseFailure::from(&e);
-            tracing::warn!(error = %e, file = STATE_FILE_NAME, "dns-state parse failed");
-            None
-        }
+    match file(state_dir).observe().loaded {
+        Loaded::Current { value, .. } => Some(value),
+        Loaded::Absent => None,
+        Loaded::Obsolete { .. } => None,
+        Loaded::Newer { .. } => None,
+        Loaded::Corrupt { .. } => None,
+        Loaded::Unreadable { .. } => None,
     }
 }
 
-/// Delete the state file. Tolerates a missing file (returns `Ok`). Returns
-/// `Err` only on actual I/O errors (permissions, etc.).
-pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
+/// Delete the state file. A missing file is [`UpdateOutcome::Absent`]; one this release cannot read is
+/// [`UpdateOutcome::Kept`]. `Err` only on actual I/O errors (permissions, etc.).
+pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
+        .map(|((), outcome)| outcome)
 }
 
 /// Filename for the `n`th superseded file: [`SUPERSEDED_FILE_NAME`] for `n == 1`, else an ARCHIVE name, used only

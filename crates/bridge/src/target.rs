@@ -8,41 +8,56 @@
 //! connection parameters live here rather than being read from the user's
 //! own config file at reconcile time.
 //!
-//! Modeled on `crate::routing`'s sibling `lockdown_state.rs` (schema
-//! version, atomic save, load-classifies-failure), imported here as
-//! `tun_engine::routing::failclosed::lockdown_state` for the pattern this
-//! module mirrors — but note the *opposite* lean on load failure: an
+//! Both files here are `VersionedFile`s of role `Decision`, like the sibling
+//! `lockdown_state.rs`, but note the *opposite* lean on load failure: an
 //! unreadable lockdown intent is conservatively read as armed (keep
 //! protecting); an unreadable target is conservatively read as `Off` (not
 //! authority to connect, and not authority to disarm either — see
 //! [`Target::Unreadable`]).
 
+use std::fs::File;
 use std::io;
-use std::marker::PhantomData;
 use std::path::Path;
 
-use file_lock::Exclusive;
 use hole_common::config::StartupBehavior;
 use hole_common::protocol::ProxyConfig;
 use serde::{Deserialize, Serialize};
+use util::dir::Dir;
+use util::versioned_file::{
+    Change, Loaded, Obsolete, Placement, Role, Schema, StoreError, VersionedFile, VersionedState,
+};
 
 // Schema ==============================================================================================================
-
-/// Schema version. [`load`] discards a mismatched or corrupt file as
-/// [`Target::Unreadable`] rather than risk acting on a partially-understood
-/// record.
-pub const SCHEMA_VERSION: u32 = 1;
 
 /// Filename under the bridge's root-owned state directory.
 pub const STATE_FILE_NAME: &str = "bridge-target.json";
 
-/// On-disk shape. Only ever holds a *decided* target — [`Target::Unreadable`]
+/// On-disk payload. Only ever holds a *decided* target — [`Target::Unreadable`]
 /// is a read-time classification, never a value written to disk.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TargetFile {
-    version: u32,
     target: PersistedTarget,
+}
+
+impl Schema for TargetFile {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+/// The user's latest decision: a file this release cannot read is backed up, then replaced.
+impl VersionedState for TargetFile {
+    const FILE_NAME: &'static str = STATE_FILE_NAME;
+    const ROLE: Role = Role::Decision;
+}
+
+util::assert_contiguous!(TargetFile);
+
+fn target_file(state_dir: &Path) -> VersionedFile<TargetFile> {
+    VersionedFile::new(state_dir)
 }
 
 /// The two states that are ever actually persisted. Kept separate from
@@ -69,11 +84,8 @@ enum PersistedTarget {
 impl dump::Dump for TargetFile {
     fn dump(&self) -> dump::DumpValue {
         use dump::DumpValue;
-        let TargetFile { version, target } = self;
-        DumpValue::Map(vec![
-            (DumpValue::String("version".into()), dump::from_serialize(version)),
-            (DumpValue::String("target".into()), target.dump()),
-        ])
+        let TargetFile { target } = self;
+        DumpValue::Map(vec![(DumpValue::String("target".into()), target.dump())])
     }
 }
 
@@ -122,152 +134,70 @@ impl From<PersistedTarget> for Target {
     }
 }
 
-/// The one read+parse of the target file, mirroring `lockdown_state`'s
-/// `read_state`/[`Intent`](tun_engine::routing::failclosed::lockdown_state::Intent) split so a version mismatch and a missing file are
-/// classified rather than collapsed together in the log.
-fn read_target(state_dir: &Path) -> Target {
-    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Target::Off,
-        Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), file = STATE_FILE_NAME, "target-state read failed; treating as no authority to connect");
-            return Target::Unreadable;
-        }
-    };
-    match serde_json::from_slice::<TargetFile>(&bytes) {
-        Ok(f) if f.version == SCHEMA_VERSION => f.target.into(),
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = SCHEMA_VERSION,
-                "target-state schema mismatch; treating as no authority to connect"
-            );
-            Target::Unreadable
-        }
-        Err(e) => {
-            // Converted immediately, never held as a `serde_json::Error`:
-            // this file holds a `ProxyConfig` -> a `Password` and a
-            // `ServerAddress` (see [`save`]'s doc), and `serde_json::Error`'s
-            // `Display` quotes the offending value back. The sink is
-            // `bridge.log`, which the support bundle collects, and the
-            // password has no redacting writer under it. See
-            // `util::parse_error::ParseFailure`'s own doc for why shadowing
-            // `e` here (rather than only calling `describe_parse_error` where
-            // it's logged) is what makes that safe by construction.
-            let e = hole_common::config::ParseFailure::from(&e);
-            tracing::warn!(
-                error = %e,
-                file = STATE_FILE_NAME,
-                "target-state parse failed; treating as no authority to connect"
-            );
-            Target::Unreadable
-        }
+/// The one `Loaded` -> [`Target`] match. A missing file is a fresh install or a wiped state dir, not consent to
+/// connect (`Off`); every file this release cannot read is `Unreadable`, which additionally refuses to authorise a
+/// disarm, as a bare `Off` would not.
+fn target_of(loaded: &Loaded<TargetFile>) -> Target {
+    match loaded {
+        Loaded::Absent => Target::Off,
+        Loaded::Current { value, .. } => value.target.clone().into(),
+        Loaded::Obsolete { .. } => Target::Unreadable,
+        Loaded::Newer { .. } => Target::Unreadable,
+        Loaded::Corrupt { .. } => Target::Unreadable,
+        Loaded::Unreadable { .. } => Target::Unreadable,
     }
 }
 
-/// Load the target. Absent reads [`Target::Off`] — an absent file is a fresh
-/// install or a wiped state dir, not consent to connect. Corrupt or
-/// schema-mismatched reads [`Target::Unreadable`] — deliberately NOT folded
-/// into `Off`'s "no authority to connect" alone: `Unreadable` additionally
-/// refuses to authorise a disarm, which a bare `Off` would not distinguish.
+/// Load the target. See [`target_of`] for how each failure reads.
 ///
 /// `pub(crate)`, not `pub`: [`apply`] is the only write surface, but a *read*
 /// still has legitimate callers outside it (boot-time reporting, `Status`) —
 /// only the write side is the thing multiple racing callers must not bypass.
 pub(crate) fn load(state_dir: &Path) -> Target {
-    read_target(state_dir)
+    target_of(&target_file(state_dir).observe().loaded)
 }
 
-// Errors ==============================================================================================================
+// Placement ===========================================================================================================
 
-#[derive(Debug, thiserror::Error)]
-pub enum TargetError {
-    #[error("failed to create target-state directory: {0}")]
-    CreateDir(std::io::Error),
-    #[error("failed to serialize target state: {0}")]
-    Serialize(serde_json::Error),
-    #[error("failed to write target-state file: {0}")]
-    Write(std::io::Error),
-    #[error("failed to set target-state file permissions: {0}")]
-    SetPermissions(std::io::Error),
-    #[error("failed to acquire the target-state lock: {0}")]
-    Lock(std::io::Error),
-}
-
-// Save ================================================================================================================
-
-/// Atomically persist `target` (temp file + same-dir rename, `sync_all`
-/// before persist — same discipline as `lockdown_state::save`). Creates
-/// `state_dir` at 0700 and the file at 0600 (unix): this file holds a
-/// shadowsocks password via `ProxyConfig`'s `ServerEntry`, the same secret
-/// the user's own config already keeps at 0600 in a 0700 directory
-/// (`CONTRIBUTING.md#server-address-redaction`; `config.rs`'s
-/// `ensure_config_dir`). Unlike `lockdown_state::save`, this module does not
-/// rely on the temp file's default mode: it sets both permissions
-/// explicitly and unconditionally.
-///
 /// Passing [`Target::Unreadable`] is a caller error — there is no on-disk
 /// representation for "couldn't read it", so this asserts in debug builds
 /// and, in release, is treated as [`Target::Off`] rather than silently
 /// writing nothing.
-///
-/// `pub(crate)`, not `pub`: see [`load`]'s doc — [`apply`] is the only write
-/// surface for the target file.
-pub(crate) fn save(state_dir: &Path, target: &Target, owner: Option<(u32, u32)>) -> Result<(), TargetError> {
-    let persisted = match target {
+fn persisted(target: &Target) -> PersistedTarget {
+    match target {
         Target::Off => PersistedTarget::Off,
         Target::Connected { config } => PersistedTarget::Connected { config: config.clone() },
         Target::Unreadable => {
-            debug_assert!(
-                false,
-                "save() called with Target::Unreadable, which has no on-disk form"
-            );
+            debug_assert!(false, "Target::Unreadable has no on-disk form");
             PersistedTarget::Off
         }
-    };
-
-    let file = TargetFile {
-        version: SCHEMA_VERSION,
-        target: persisted,
-    };
-    let json = serde_json::to_vec_pretty(&file).map_err(TargetError::Serialize)?;
-    write_state_file(state_dir, STATE_FILE_NAME, json, owner)
+    }
 }
 
-/// Atomic temp-file-then-rename write shared by [`save`] and
-/// [`save_startup_preference`].
-///
-/// The state directory may belong to the interactive user, so it is opened
-/// once without following a symlink (`util::dir::Dir`: created if missing,
-/// handed to `owner`, 0700 on unix / the state DACL on Windows) and the file is
-/// written through that handle. The temp file's owner and mode are set on its
-/// own handle before the rename, and nothing touches the final name afterwards:
-/// a name swapped for a hard link or symlink after the rename would otherwise
-/// be re-permissioned or chowned instead of our file.
-fn write_state_file(state_dir: &Path, name: &str, json: Vec<u8>, owner: Option<(u32, u32)>) -> Result<(), TargetError> {
-    let dir = open_state_dir(state_dir, owner).map_err(TargetError::CreateDir)?;
-    dir.secure(owner, Some(0o700)).map_err(TargetError::SetPermissions)?;
-    protect_dir(&dir).map_err(TargetError::SetPermissions)?;
-
-    let permissions_failed = std::cell::Cell::new(false);
-    dir.write_atomic(name.as_ref(), &json, owner, |temp| {
-        protect_file(temp).inspect_err(|_| permissions_failed.set(true))
-    })
-    .map_err(|e| match permissions_failed.get() {
-        true => TargetError::SetPermissions(e),
-        false => TargetError::Write(e),
-    })
+/// Where the state files are written: the directory is handed to `owner` at 0700 (unix) or given the state DACL
+/// (Windows, opened with the right to rewrite it), and each file is sealed through its own handle before the rename,
+/// because the directory may belong to the interactive user.
+struct TargetPlacement {
+    owner: Option<(u32, u32)>,
 }
 
-#[cfg(not(windows))]
-fn open_state_dir(state_dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<util::dir::Dir> {
-    util::dir::Dir::open(state_dir, true, owner)
-}
+impl Placement for TargetPlacement {
+    fn owner(&self) -> Option<(u32, u32)> {
+        self.owner
+    }
 
-/// Opened with the right to rewrite its ACL, which [`protect_dir`] does.
-#[cfg(windows)]
-fn open_state_dir(state_dir: &Path, _owner: Option<(u32, u32)>) -> std::io::Result<util::dir::Dir> {
-    util::dir::Dir::open_for_acl(state_dir, true)
+    fn prepare_dir(&self, dir: &Dir) -> io::Result<()> {
+        dir.secure(self.owner, Some(0o700))?;
+        protect_dir(dir)
+    }
+
+    fn prepare_tmp(&self, tmp: &File) -> io::Result<()> {
+        protect_file(tmp)
+    }
+
+    fn open_for_acl(&self) -> bool {
+        true
+    }
 }
 
 /// The SID of the user this process runs as, as an SDDL string.
@@ -388,70 +318,22 @@ fn protect_file(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
-// Locking / apply =====================================================================================================
+// Apply ===============================================================================================================
 
-/// Filename of the [`TargetExclusive`] lock file, alongside `STATE_FILE_NAME`
-/// in the same root-owned state directory. Never itself holds any state —
-/// its only role is `flock`/`LockFileEx`'s target.
-const LOCK_FILE_NAME: &str = "bridge-target.json.lock";
-
-/// The bridge's one leaf lock. Held only across [`apply`]'s
-/// load-apply-save critical section — microseconds of pure file I/O, never
-/// for a session's lifetime — over the shared [`file_lock::Exclusive`]
-/// core (see its module doc for the open discipline: a state directory opened
-/// without following a symlink, `O_EXCL`, a vet of the opened file, then
-/// `fchmod` + `fchown` on the fd, all security-relevant on the user-writable
-/// elevation-mode state directory).
+/// The only write surface for `bridge-target.json`. Reads the current target
+/// *fresh* under the file's in-process lock — never a value captured before
+/// it, which is what makes a session-event write and the `hole bridge
+/// unlock` escape's write compose correctly instead of racing — applies `f`,
+/// and stores the result, all inside one `VersionedFile::update`. The lock is a
+/// leaf: `f` does no I/O and takes no other lock. Another process is excluded
+/// by `BridgeLiveness`, not here.
 ///
-/// **Leaf-lock contract (1): nothing may be acquired while this is held, and
-/// the critical section stays pure file I/O** — no `Routing`/OS/network/
-/// subprocess call. This is what keeps a *blocking* acquisition safe: the
-/// reconciler may hold another lock and then block on this one, `hole bridge
-/// unlock` blocks on it holding nothing, and neither closes a deadlock cycle.
-/// It is a contract on every future editor of `apply`'s body, not a property
-/// of today's code — an edit that adds an OS call inside the critical section
-/// would break this silently.
-///
-/// **Leaf-lock contract (2): no `.await` inside the critical section, and
-/// this half is compiler-enforced.** The `PhantomData<*const ()>` field makes
-/// this type `!Send`; holding a `!Send` value across an `.await` inside a
-/// `Send` future is a compile error, so an `.await` later added inside
-/// `apply`'s body fails the build instead of silently invalidating the
-/// "blocking cannot wedge" argument. `apply` is a synchronous free function
-/// that constructs and drops this token within one synchronous body, so the
-/// non-`Send` token never crosses an `.await`; async callers reach `apply`
-/// only via `spawn_blocking`, capturing `state_dir`/`owner`/`f` (all
-/// `Send + 'static`) rather than the token itself. If an implementation
-/// shape is ever found that needs to move a constructed token across a
-/// boundary instead of building it in place, that is a stop-and-flag case —
-/// tell the deputy — not a silent drop of this marker.
-struct TargetExclusive {
-    _inner: Exclusive,
-    // !Send — see the doc above. Never constructed with a real pointer.
-    _not_send: PhantomData<*const ()>,
-}
-
-impl TargetExclusive {
-    /// Block until the lock is held. The only acquisition path on this type
-    /// — no `try_acquire` counterpart, since every caller (`apply`) always
-    /// wants to wait, never to poll; see the leaf-lock contract above for why
-    /// blocking here cannot deadlock.
-    fn acquire(state_dir: &Path, owner: Option<(u32, u32)>) -> io::Result<Self> {
-        let inner = Exclusive::acquire(&state_dir.join(LOCK_FILE_NAME), owner)?;
-        Ok(TargetExclusive {
-            _inner: inner,
-            _not_send: PhantomData,
-        })
-    }
-}
-
-/// The only write surface for `bridge-target.json`. Acquires
-/// [`TargetExclusive`], loads the current target *fresh* — never a value
-/// captured before the lock, which is what makes a session-event write and
-/// the `hole bridge unlock` escape's write compose correctly instead of
-/// racing (a write that read its `current` before acquiring could overwrite
-/// a concurrent write that landed inside the critical section) — applies
-/// `f`, saves, and releases, all inside one synchronous critical section.
+/// A target `f` leaves as it found it is not rewritten, and one it returns as
+/// [`Target::Unreadable`] (e.g. `target_after`'s `CutoverRestart`/`Blipped`/
+/// `ProcessExiting` arms passing an already-unreadable target through) leaves
+/// the file untouched — a real, reachable case, not a caller error, and one
+/// that has no on-disk form. A file this release cannot read is backed up
+/// before a decided target replaces it.
 ///
 /// Every writer of the target goes through this: the session-event path
 /// (`apply(state_dir, owner, |current| target_after(current, event))`, called
@@ -463,20 +345,21 @@ pub fn apply(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
     f: impl FnOnce(Target) -> Target,
-) -> Result<Target, TargetError> {
-    let _lock = TargetExclusive::acquire(state_dir, owner).map_err(TargetError::Lock)?;
-    let current = load(state_dir);
-    let next = f(current);
-    if next == Target::Unreadable {
-        // `f` declined to decide (e.g. `target_after`'s `CutoverRestart`/
-        // `Blipped`/`ProcessExiting` arms passing an already-unreadable
-        // target through unchanged) — a real, reachable case, not a caller
-        // error. `save` has no on-disk form for `Unreadable`; leave the file
-        // untouched instead of downgrading it to `Off`.
-        return Ok(next);
-    }
-    save(state_dir, &next, owner)?;
-    Ok(next)
+) -> Result<Target, StoreError> {
+    target_file(state_dir)
+        .update(&TargetPlacement { owner }, |observed| {
+            let current = target_of(&observed.loaded);
+            let next = f(current.clone());
+            let change = match (&next, &observed.loaded) {
+                (Target::Unreadable, _) => Change::Keep,
+                (_, Loaded::Current { .. }) if next == current => Change::Keep,
+                _ => Change::Store(TargetFile {
+                    target: persisted(&next),
+                }),
+            };
+            (change, next)
+        })
+        .map(|(next, _)| next)
 }
 
 // Startup preference ==================================================================================================
@@ -525,25 +408,38 @@ pub fn resolve_startup_target(
     }
 }
 
-/// Schema version for [`STARTUP_PREFERENCE_FILE_NAME`], independent of
-/// [`SCHEMA_VERSION`] — the two files are unrelated on disk and evolve
-/// separately.
-const STARTUP_PREFERENCE_SCHEMA_VERSION: u32 = 1;
-
 /// Filename for the GUI-pushed startup preference, alongside
 /// `STATE_FILE_NAME` in the same root-owned state directory. A separate file
-/// rather than a field on the target file: unlike the target (governed by
-/// [`TargetExclusive`]/[`apply`] because multiple writers race it),
-/// this is written by exactly one path (`handle_start`, on every connect) and
-/// read by exactly one (boot reconciliation), so it needs no shared lock.
+/// rather than a field on the target file: it is written by exactly one path
+/// (`handle_start`, on every connect) and read by exactly one (boot
+/// reconciliation).
 pub(crate) const STARTUP_PREFERENCE_FILE_NAME: &str = "bridge-startup.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StartupPreferenceFile {
-    version: u32,
     on_startup: StartupBehavior,
     candidate: Option<Box<ProxyConfig>>,
+}
+
+impl Schema for StartupPreferenceFile {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+/// The user's latest decision: a file this release cannot read is backed up, then replaced.
+impl VersionedState for StartupPreferenceFile {
+    const FILE_NAME: &'static str = STARTUP_PREFERENCE_FILE_NAME;
+    const ROLE: Role = Role::Decision;
+}
+
+util::assert_contiguous!(StartupPreferenceFile);
+
+fn startup_file(state_dir: &Path) -> VersionedFile<StartupPreferenceFile> {
+    VersionedFile::new(state_dir)
 }
 
 /// Same live trap as [`TargetFile`]'s: `Serialize` derived, `ProxyConfig`
@@ -551,17 +447,12 @@ struct StartupPreferenceFile {
 impl dump::Dump for StartupPreferenceFile {
     fn dump(&self) -> dump::DumpValue {
         use dump::DumpValue;
-        let StartupPreferenceFile {
-            version,
-            on_startup,
-            candidate,
-        } = self;
+        let StartupPreferenceFile { on_startup, candidate } = self;
         let candidate = match candidate {
             Some(config) => config.dump(),
             None => DumpValue::Null,
         };
         DumpValue::Map(vec![
-            (DumpValue::String("version".into()), dump::from_serialize(version)),
             (DumpValue::String("on_startup".into()), dump::from_serialize(on_startup)),
             (DumpValue::String("candidate".into()), candidate),
         ])
@@ -580,84 +471,60 @@ pub struct StartupPreference {
     pub candidate: Option<Box<ProxyConfig>>,
 }
 
-/// Load the startup preference. Absent, corrupt, or schema-mismatched all
-/// read the default (`RestoreLastState`, no candidate) — the same
-/// conservative lean as an absent target: no authority to always-connect
-/// without an explicit push.
-pub(crate) fn load_startup_preference(state_dir: &Path) -> StartupPreference {
-    let bytes = match util::dir::read_state_file(state_dir, STARTUP_PREFERENCE_FILE_NAME.as_ref()) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StartupPreference::default(),
-        Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), file = STARTUP_PREFERENCE_FILE_NAME, "startup-preference read failed; using defaults");
-            return StartupPreference::default();
-        }
-    };
-    match serde_json::from_slice::<StartupPreferenceFile>(&bytes) {
-        Ok(f) if f.version == STARTUP_PREFERENCE_SCHEMA_VERSION => StartupPreference {
-            on_startup: f.on_startup,
-            candidate: f.candidate,
-        },
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = STARTUP_PREFERENCE_SCHEMA_VERSION,
-                "startup-preference schema mismatch; using defaults"
-            );
-            StartupPreference::default()
-        }
-        Err(e) => {
-            // Converted immediately, never held as a `serde_json::Error`:
-            // same secrets as the target file, in `candidate`. See
-            // [`read_target`]'s parse arm.
-            let e = hole_common::config::ParseFailure::from(&e);
-            tracing::warn!(
-                error = %e,
-                file = STARTUP_PREFERENCE_FILE_NAME,
-                "startup-preference parse failed; using defaults"
-            );
-            StartupPreference::default()
+impl From<&StartupPreference> for StartupPreferenceFile {
+    fn from(pref: &StartupPreference) -> Self {
+        StartupPreferenceFile {
+            on_startup: pref.on_startup,
+            candidate: pref.candidate.clone(),
         }
     }
 }
 
-/// The only read-modify-write surface for `bridge-startup.json`.
+/// The one `Loaded` -> [`StartupPreference`] match. Absent and every file this release cannot read give the default
+/// (`RestoreLastState`, no candidate) — the same conservative lean as an absent target: no authority to
+/// always-connect without an explicit push.
+fn preference_of(loaded: &Loaded<StartupPreferenceFile>) -> StartupPreference {
+    match loaded {
+        Loaded::Current { value, .. } => StartupPreference {
+            on_startup: value.on_startup,
+            candidate: value.candidate.clone(),
+        },
+        Loaded::Absent => StartupPreference::default(),
+        Loaded::Obsolete { .. } => StartupPreference::default(),
+        Loaded::Newer { .. } => StartupPreference::default(),
+        Loaded::Corrupt { .. } => StartupPreference::default(),
+        Loaded::Unreadable { .. } => StartupPreference::default(),
+    }
+}
+
+/// Load the startup preference. See [`preference_of`] for how each failure reads.
+pub(crate) fn load_startup_preference(state_dir: &Path) -> StartupPreference {
+    preference_of(&startup_file(state_dir).observe().loaded)
+}
+
+/// The only read-modify-write surface for `bridge-startup.json`: reads the
+/// preference fresh under the file's in-process lock, applies `f` and stores
+/// the result. A file this release cannot read is backed up before it is
+/// replaced.
 ///
-/// Takes the SAME [`TargetExclusive`] lock the target file uses, because the
-/// two records are read together by `resolve_startup_target` and a torn pair
-/// is what lets an escape be undone: `handle_unblock` clearing the candidate
-/// while a concurrent `persist_after_start` re-adds it leaves `Off` plus a
-/// live candidate, which `AlwaysConnect` then reconnects from.
-///
-/// A single lock rather than a second one: these files are always mutated in
-/// the same breath, and a second lock ordered against the first is a deadlock
-/// waiting to be written. The leaf-lock contract in [`TargetExclusive`] still
-/// applies — `f` must stay pure file I/O.
+/// The target and the preference are read together by `resolve_startup_target`,
+/// and a torn pair is what lets an escape be undone: `handle_unblock` clearing
+/// the candidate while a concurrent `persist_after_start` re-adds it leaves
+/// `Off` plus a live candidate, which `AlwaysConnect` then reconnects from.
+/// Each file has its own lock, so the pair is made atomic by `IpcState`'s
+/// `intent_persist` mutex, which every IPC writer of both holds across them.
 pub(crate) fn apply_startup_preference(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
     f: impl FnOnce(&mut StartupPreference),
-) -> Result<(), TargetError> {
-    let _lock = TargetExclusive::acquire(state_dir, owner).map_err(TargetError::Lock)?;
-    let mut pref = load_startup_preference(state_dir);
-    f(&mut pref);
-    save_startup_preference(state_dir, &pref, owner)
-}
-
-/// Persist the startup preference (same atomic-write + 0600/0700 discipline
-/// as [`save`], via the same [`write_state_file`] helper).
-pub(crate) fn save_startup_preference(
-    state_dir: &Path,
-    pref: &StartupPreference,
-    owner: Option<(u32, u32)>,
-) -> Result<(), TargetError> {
-    let file = StartupPreferenceFile {
-        version: STARTUP_PREFERENCE_SCHEMA_VERSION,
-        on_startup: pref.on_startup,
-        candidate: pref.candidate.clone(),
-    };
-    let json = serde_json::to_vec_pretty(&file).map_err(TargetError::Serialize)?;
-    write_state_file(state_dir, STARTUP_PREFERENCE_FILE_NAME, json, owner)
+) -> Result<(), StoreError> {
+    startup_file(state_dir)
+        .update(&TargetPlacement { owner }, |observed| {
+            let mut pref = preference_of(&observed.loaded);
+            f(&mut pref);
+            (Change::Store(StartupPreferenceFile::from(&pref)), ())
+        })
+        .map(|_| ())
 }
 
 // Dump ================================================================================================================

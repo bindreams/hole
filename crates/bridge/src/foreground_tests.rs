@@ -74,13 +74,12 @@ fn post_bind_sweep_clears_marker() {
     // marker is a completed cutover and is cleared unconditionally. Mirrors the
     // service-path `platform::{macos,windows}::sweep_marker` post-bind clear.
     let marker = hole_common::update_marker::MarkerInfo {
-        version: hole_common::update_marker::MARKER_VERSION,
         driver: cosca::identity::ProcessId::current()
             .to_record()
             .expect("persist this process's identity"),
     };
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &marker, None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &marker, None).unwrap();
     super::sweep_marker(dir.path());
     assert!(!hole_common::update_marker::is_present(dir.path()));
     super::sweep_marker(dir.path()); // idempotent: absent marker is a no-op

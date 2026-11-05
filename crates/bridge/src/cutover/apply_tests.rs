@@ -2,7 +2,6 @@ use super::*;
 
 fn sample_marker() -> hole_common::update_marker::MarkerInfo {
     hole_common::update_marker::MarkerInfo {
-        version: hole_common::update_marker::MARKER_VERSION,
         driver: cosca::identity::ProcessId::current()
             .to_record()
             .expect("persist this process's identity"),
@@ -23,7 +22,7 @@ fn lockdown_off_without_consent_is_refused() {
 fn concurrent_cutover_detected_via_existing_marker() {
     let dir = tempfile::tempdir().unwrap();
     assert!(!cutover_in_progress(dir.path()), "no marker -> not in progress");
-    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &sample_marker(), None).unwrap();
     assert!(cutover_in_progress(dir.path()), "marker present -> in progress (409)");
 }
 
@@ -67,7 +66,7 @@ fn macos_actor_failure_clears_the_injected_log_dir() {
     // bridge.log), NOT re-resolve `service_log_dir()` — a marker stranded in the
     // wrong dir would make the GUI mask Disconnected forever.
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &sample_marker(), None).unwrap();
     macos::clear_marker_on_actor_failure(Err(std::io::Error::other("swap failed")), dir.path());
     assert!(
         !hole_common::update_marker::is_present(dir.path()),
@@ -93,7 +92,7 @@ fn breakaway_only_when_in_job_and_job_permits() {
 #[skuld::test]
 fn record_spawned_driver_stamps_a_resolved_child() {
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &sample_marker(), None).unwrap();
     let me = cosca::identity::ProcessId::current();
 
     windows::record_spawned_driver(
@@ -118,7 +117,7 @@ fn record_spawned_driver_refuses_an_unresolvable_child() {
     // kills the still-suspended child rather than claiming an unverifiable
     // identity.
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
+    hole_common::update_marker::claim(dir.path(), &sample_marker(), None).unwrap();
     assert!(windows::record_spawned_driver(dir.path(), cosca::identity::Resolved::Gone).is_err());
     assert!(windows::record_spawned_driver(dir.path(), cosca::identity::Resolved::Unknown).is_err());
 }

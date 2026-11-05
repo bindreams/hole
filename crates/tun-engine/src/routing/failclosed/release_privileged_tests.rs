@@ -589,10 +589,7 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
                 .pf_token;
             cover.disarm(); // stand in for the crash: no guard remains
 
-            let rolled_back = format!(
-                r#"{{"version":{},"pf_token":"{token}","pf_was_enabled":false}}"#,
-                super::failclosed_state::SCHEMA_VERSION + 1
-            );
+            let rolled_back = format!(r#"{{"version":2,"pf_token":"{token}","pf_was_enabled":false}}"#);
             std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();
             let presence = super::failclosed_state::load_presence(dir.path());
             assert!(

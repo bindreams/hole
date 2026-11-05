@@ -1,10 +1,11 @@
+use crate::versioned_file::fixtures::UpdateShortcuts;
 use std::io;
 use std::sync::Arc;
 
 use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
-use super::{CannotRead, Loaded, Raw, WhyUnreadable};
+use super::{CannotRead, Loaded, Raw, UnreadableKind, WhyUnreadable};
 use crate::parse_error::ParseFailure;
 use crate::versioned_file::fixtures::{dir, put, DroppedFile, MaxVersionFile, NoteV3, OsRecordFile, UnversionedConfig};
 use crate::versioned_file::store::Fs;
@@ -278,7 +279,7 @@ fn load_maps_io_failure_to_unreadable_never_corrupt() {
     );
     let file = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(DeniedFs));
     match file.load() {
-        Loaded::Unreadable(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+        Loaded::Unreadable { error: e, .. } => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
         other => panic!("{other:?}"),
     }
 }
@@ -296,10 +297,11 @@ fn a_failed_read_logs_the_error_text() {
     let (subscriber, log) = capture();
     let _guard = set_default_in_current_thread(subscriber);
     let dir = dir();
+    put(&dir, "note.json", b"{}");
 
     let loaded = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(Fails)).load();
 
-    assert!(matches!(loaded, Loaded::Unreadable(_)), "{loaded:?}");
+    assert!(matches!(loaded, Loaded::Unreadable { .. }), "{loaded:?}");
     let log = log.snapshot();
     assert_eq!(log.matches("WARN").count(), 1, "{log}");
     assert!(log.contains("disk on fire"), "{log}");
@@ -327,7 +329,7 @@ fn load_of_a_held_file_carries_the_ntstatus_in_the_error_and_the_log() {
 
     // STATUS_SHARING_VIOLATION
     match loaded {
-        Loaded::Unreadable(e) => assert!(e.to_string().contains("NTSTATUS 0xC0000043"), "{e}"),
+        Loaded::Unreadable { error: e, .. } => assert!(e.to_string().contains("NTSTATUS 0xC0000043"), "{e}"),
         other => panic!("{other:?}"),
     }
     let log = log.snapshot();
@@ -347,7 +349,7 @@ fn a_directory_where_the_file_should_be_is_unreadable_not_absent() {
     std::fs::create_dir(dir.path().join("note.json")).unwrap();
     assert!(matches!(
         VersionedFile::<NoteV3>::new(dir.path()).load(),
-        Loaded::Unreadable(_)
+        Loaded::Unreadable { .. }
     ));
 }
 
@@ -359,7 +361,10 @@ fn cannot_read_covers_exactly_newer_and_corrupt() {
     let all: Vec<(Loaded<NoteV3>, Option<CannotRead>)> = vec![
         (Loaded::Absent, None),
         (
-            Loaded::Unreadable(io::Error::from(io::ErrorKind::PermissionDenied)),
+            Loaded::Unreadable {
+                error: io::Error::from(io::ErrorKind::PermissionDenied),
+                kind: UnreadableKind::File,
+            },
             None,
         ),
         (
@@ -404,7 +409,10 @@ fn into_actionable_names_why_a_file_that_exists_is_not_one_to_act_on() {
         found: Some(9),
         raw: raw(),
     };
-    let unreadable = || Loaded::<NoteV3>::Unreadable(io::Error::from(io::ErrorKind::PermissionDenied));
+    let unreadable = || Loaded::<NoteV3>::Unreadable {
+        error: io::Error::from(io::ErrorKind::PermissionDenied),
+        kind: UnreadableKind::File,
+    };
 
     assert_eq!(
         Loaded::<NoteV3>::Current {

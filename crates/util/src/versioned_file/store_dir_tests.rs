@@ -1,12 +1,15 @@
 //! The directory of a versioned file is the user's to swap: the type opens it once without following a symlink
 //! and acts only inside that handle, never back through the path.
 
+use crate::versioned_file::fixtures::UpdateShortcuts;
+use crate::versioned_file::UpdateOutcome;
 use std::path::Path;
 
-use super::{DefaultPlacement, Loaded, Removal, VersionedFile};
+use super::{DefaultPlacement, VersionedFile};
 use crate::dir::testing::{plant_link, user_dir, SystemScratch};
 use crate::dir::Refusal;
 use crate::versioned_file::fixtures::{dir, DecisionFile};
+use crate::versioned_file::Loaded;
 
 fn decision(value: &str) -> DecisionFile {
     DecisionFile {
@@ -78,7 +81,7 @@ fn load_remove_and_move_aside_through_a_link_to_a_folder_the_system_owns_touch_n
     let file = VersionedFile::<DecisionFile>::new(&state);
 
     assert!(
-        matches!(file.load(), Loaded::Unreadable(_)),
+        matches!(file.load(), Loaded::Unreadable { .. }),
         "the system's folder was read"
     );
     assert!(file.remove().is_err(), "a record in the system's folder was removed");
@@ -94,7 +97,7 @@ fn a_directory_that_is_not_there_is_an_absent_file_and_is_not_made_by_a_read() {
     let file = VersionedFile::<DecisionFile>::new(&missing);
 
     assert!(matches!(file.load(), Loaded::Absent));
-    assert_eq!(file.remove().unwrap(), Removal::Absent);
+    assert_eq!(file.remove().unwrap(), UpdateOutcome::Absent);
     assert_eq!(file.move_aside().unwrap(), None);
     assert!(!missing.exists());
 }
@@ -235,7 +238,7 @@ fn a_remove_after_the_directory_is_swapped_removes_inside_the_opened_directory()
         .remove()
         .unwrap();
 
-    assert_eq!(removal, Removal::Removed);
+    assert_eq!(removal, UpdateOutcome::Removed);
     assert_outside_untouched(root.path(), CURRENT);
     assert!(names_in(&root.path().join("moved")).is_empty());
 }
@@ -255,7 +258,7 @@ fn a_move_aside_after_the_directory_is_swapped_moves_inside_the_opened_directory
         .remove()
         .unwrap();
 
-    assert!(matches!(removal, Removal::MovedAside(_)), "{removal:?}");
+    assert!(matches!(removal, UpdateOutcome::MovedAside(_)), "{removal:?}");
     assert_outside_untouched(root.path(), corrupt);
     assert_eq!(names_in(&root.path().join("moved")), ["decision.json.unreadable.bak"]);
 }

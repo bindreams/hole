@@ -1,6 +1,8 @@
 //! Windows-only properties of the stored file: its attributes, and a state
 //! directory whose plain path is `MAX_PATH` or longer.
 
+use crate::versioned_file::fixtures::UpdateShortcuts;
+use crate::versioned_file::{Loaded, UpdateOutcome};
 use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -16,8 +18,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use super::{
-    no_directory_flush, sync_dir_with, tolerate_missing_directory_flush, CannotRead, DefaultPlacement, Loaded,
-    Placement, Removal, VersionedFile,
+    no_directory_flush, sync_dir_with, tolerate_missing_directory_flush, CannotRead, DefaultPlacement, Placement,
+    VersionedFile,
 };
 use crate::dir::Dir;
 use crate::versioned_file::fixtures::{dir, long_dir, unreadable_bytes, DecisionFile, OsRecordFile};
@@ -225,7 +227,10 @@ fn remove_moves_a_corrupt_decision_file_aside_in_a_directory_of_260_characters_o
 
     let removal = file.remove().unwrap();
 
-    assert_eq!(removal, Removal::MovedAside(long.join("decision.json.unreadable.bak")));
+    assert_eq!(
+        removal,
+        UpdateOutcome::MovedAside(long.join("decision.json.unreadable.bak"))
+    );
     assert_eq!(listing(&long), ["decision.json.unreadable.bak"]);
 }
 

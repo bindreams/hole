@@ -402,7 +402,11 @@ fn a_checkpoint_over_a_record_whose_read_fails_is_refused() {
     );
     let error = failure.to_string();
     assert!(!error.contains(&dir.path().display().to_string()), "{error}");
-    assert!(logs.contains(&path.display().to_string()), "{logs}");
+    assert!(logs.contains(STATE_FILE_NAME), "{logs}");
+    assert!(
+        !logs.contains(&dir.path().display().to_string()),
+        "the log names the file, not its folder: {logs}"
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), WITH_UNKNOWN_FIELD);
     assert!(
         persisted.installed.is_empty(),
@@ -428,7 +432,8 @@ impl util::versioned_file::Fs for DeniedAfterFirstRead {
 #[skuld::test]
 fn a_checkpoint_refused_mid_install_fails_the_install_as_state_unreadable() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(STATE_FILE_NAME);
+    // A record is at the name, so the failed read is on a file that is there.
+    let path = write_record(dir.path(), NEWER);
     let routing = SystemRouting::new(dir.path().to_path_buf(), None)
         .with_record_fs(Arc::new(DeniedAfterFirstRead(AtomicBool::new(false))));
     let ran = Cell::new(false);
@@ -476,7 +481,7 @@ fn teardown_over_a_record_whose_read_fails_leaves_it_and_names_it() {
         );
     });
 
-    assert!(logs.contains(&path.display().to_string()), "{logs}");
+    assert!(logs.contains(STATE_FILE_NAME), "{logs}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), WITH_UNKNOWN_FIELD);
 }
 
@@ -498,29 +503,16 @@ fn a_checkpoint_over_a_record_that_turned_unreadable_is_refused() {
     );
     let error = failure.to_string();
     assert!(!error.contains(&dir.path().display().to_string()), "{error}");
-    assert!(logs.contains(&path.display().to_string()), "{logs}");
+    assert!(logs.contains(STATE_FILE_NAME), "{logs}");
+    assert!(
+        !logs.contains(&dir.path().display().to_string()),
+        "the log names the file, not its folder: {logs}"
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), NEWER);
     assert!(
         persisted.installed.is_empty(),
         "a refused write must not advance the in-memory value"
     );
-}
-
-/// A checkpoint whose record was replaced but is not known durable has landed:
-/// memory follows the disk, so no recovery reads ids memory never installed.
-#[skuld::test]
-fn a_checkpoint_published_but_not_finalized_has_landed() {
-    let path = PathBuf::from("/state/bridge-routes.json");
-    let mut persisted = persisted_with_no_routes();
-
-    let result = checkpoint_installed_with(&mut persisted, &path, &[RouteId::SplitV4Low], |_| {
-        Err(StoreError::PublishedNotFinalized(std::io::Error::from(
-            std::io::ErrorKind::TimedOut,
-        )))
-    });
-
-    result.unwrap();
-    assert_eq!(persisted.installed, vec![RouteId::SplitV4Low]);
 }
 
 /// Any other write failure leaves the in-memory value where it was.

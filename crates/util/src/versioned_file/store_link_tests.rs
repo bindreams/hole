@@ -3,9 +3,11 @@
 //! `remove` and `move_aside` act on the name, never on what it points at, and
 //! none of them calls it absent while the name is taken.
 
+use crate::versioned_file::fixtures::UpdateShortcuts;
+use crate::versioned_file::UpdateOutcome;
 use std::path::Path;
 
-use super::{Removal, VersionedFile};
+use super::VersionedFile;
 use crate::versioned_file::fixtures::{dir, put, DecisionFile};
 
 const STATE: &[u8] = br#"{"version":1,"value":"v"}"#;
@@ -30,7 +32,7 @@ fn remove_of_a_dangling_symlink_state_path_moves_the_link_aside() {
 
     let removal = VersionedFile::<DecisionFile>::new(dir.path()).remove().unwrap();
 
-    let Removal::MovedAside(backup) = removal else {
+    let UpdateOutcome::MovedAside(backup) = removal else {
         panic!("a link is a file the role moves aside, not an absent one: {removal:?}");
     };
     assert!(std::fs::symlink_metadata(&state).is_err(), "the link is still there");
@@ -50,7 +52,7 @@ fn remove_of_a_symlink_state_path_leaves_the_file_it_points_at() {
 
     let removal = VersionedFile::<DecisionFile>::new(dir.path()).remove().unwrap();
 
-    assert!(matches!(removal, Removal::MovedAside(_)), "{removal:?}");
+    assert!(matches!(removal, UpdateOutcome::MovedAside(_)), "{removal:?}");
     assert!(std::fs::symlink_metadata(&state).is_err(), "the link is still there");
     assert_eq!(std::fs::read(&target).unwrap(), STATE);
 }
@@ -65,7 +67,7 @@ fn a_symlink_state_path_is_not_read_through() {
     let loaded = VersionedFile::<DecisionFile>::new(dir.path()).load();
 
     assert!(
-        matches!(loaded, crate::versioned_file::Loaded::Unreadable(_)),
+        matches!(loaded, crate::versioned_file::Loaded::Unreadable { .. }),
         "{loaded:?}"
     );
 }

@@ -7,9 +7,9 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::loaded::{CannotRead, Loaded};
-use super::{frame, Chain, ChainError, RemoveOver, StoreOver, VersionedState};
-use crate::dir::{Dir, ReadDir, Staged};
+use super::{frame, CannotRead, Chain, ChainError, VersionedState};
+use crate::dir::{Dir, EntryKind, ReadDir, Staged};
+use crate::error_chain::error_chain;
 use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
@@ -28,8 +28,14 @@ pub trait Fs: Send + Sync {
         dir.rename_noreplace(from, to)
     }
 
+    /// The vouched read: a file the folder's owner cannot vouch for is refused (`Refusal::ForeignFile`).
     fn read(&self, dir: &ReadDir, name: &OsStr) -> io::Result<Vec<u8>> {
-        dir.read(name)
+        dir.read_vouched(name)
+    }
+
+    /// What the name holds, asked once after a read of it failed.
+    fn kind_of(&self, dir: &ReadDir, name: &OsStr) -> io::Result<Option<EntryKind>> {
+        dir.kind_of(name)
     }
 
     fn hard_link(&self, dir: &Dir, original: &OsStr, link: &OsStr) -> io::Result<()> {
@@ -75,6 +81,12 @@ pub trait Placement {
     /// by anything but the handle: it is the user's to swap.
     fn after_publish(&self, _dir: &Dir, _name: &OsStr) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Whether `update` and `create_new` open the directory with the right to rewrite its ACL (Windows), for a
+    /// `prepare_dir` that protects it. Not consulted on other platforms; `observe` never asks for it.
+    fn open_for_acl(&self) -> bool {
+        false
     }
 
     /// Makes the rename durable: the directory's buffers are flushed. On
@@ -139,36 +151,21 @@ impl Placement for DefaultPlacement {
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The file on disk is newer or corrupt and its role refuses to replace it.
-    /// The text carries the full path: fine for the bridge log, but redact it
-    /// before it reaches a toast.
-    #[error("{} cannot be read ({cause}); it is left as it is", path.display())]
-    Unreadable { path: PathBuf, cause: CannotRead },
+    /// The text names the file, never its directory: a state directory can sit
+    /// in a user's profile.
+    #[error("{} cannot be read ({cause}); it is left as it is", file.to_string_lossy())]
+    Unreadable { file: OsString, cause: CannotRead },
     /// The read failed with an I/O error and the role refuses to replace a file
-    /// it could not read. The text carries the full path, like
+    /// it could not read. The text names the file only, like
     /// [`Unreadable`](Self::Unreadable).
-    #[error("{} could not be read ({kind}); it is left as it is", path.display())]
-    ReadFailed { path: PathBuf, kind: io::ErrorKind },
+    #[error("{} could not be read ({kind}); it is left as it is", file.to_string_lossy())]
+    ReadFailed { file: OsString, kind: io::ErrorKind },
     /// The value cannot be framed, or would not read back as `S`. The reason
     /// is a fixed label, never content; the error's category is logged.
     #[error("cannot encode the state file: {0}")]
     Encode(&'static str),
-    /// The new file is already in place, but a step after the rename failed:
-    /// the value IS stored, though not known to be durable or finalized.
-    #[error("the state file was replaced, but finishing the write failed: {0}")]
-    PublishedNotFinalized(io::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
-}
-
-/// What [`VersionedFile::remove`] did.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Removal {
-    Removed,
-    Absent,
-    /// A file this role never removes when it cannot read it.
-    Kept,
-    /// Moved to this path instead of removed.
-    MovedAside(PathBuf),
 }
 
 /// An absent `version` must read as a version this schema can have: not 0,
@@ -184,9 +181,9 @@ const fn assert_unversioned_as_valid<S: VersionedState>() {
 
 /// One state file, `S::FILE_NAME` in a directory.
 pub struct VersionedFile<S: VersionedState> {
-    dir: PathBuf,
-    path: PathBuf,
-    fs: Arc<dyn Fs>,
+    pub(super) dir: PathBuf,
+    pub(super) path: PathBuf,
+    pub(super) fs: Arc<dyn Fs>,
     _schema: PhantomData<fn() -> S>,
 }
 
@@ -218,161 +215,14 @@ impl<S: VersionedState> VersionedFile<S> {
         &self.path
     }
 
-    /// Reads the file. Never rewrites it. A directory that is not there is an
-    /// absent file; one that cannot be opened (a link in its path that [`Dir`]
-    /// does not follow) is a read that failed.
-    pub fn load(&self) -> Loaded<S> {
-        match ReadDir::open(&self.dir) {
-            Ok(dir) => self.load_in(&dir),
-            Err(err) => Loaded::from_read(Err(err)),
-        }
-    }
-
-    fn load_in(&self, dir: &ReadDir) -> Loaded<S> {
-        Loaded::from_read(self.fs.read(dir, self.file_name()))
-    }
-
-    /// [`Self::load_in`] for the directory a writer already holds.
-    fn load_through(&self, dir: &Dir) -> Loaded<S> {
-        match dir.reader() {
-            Ok(reader) => self.load_in(&reader),
-            Err(err) => Loaded::from_read(Err(err)),
-        }
-    }
-
-    /// Writes `value`, framed with `S::VERSION`. In this order, so nothing is
-    /// removed before its replacement is durable:
+    /// Moves the file to the first free `<name>.unreadable[.N].bak` and returns that path, whatever the file holds and
+    /// whatever the role: the caller has decided. `None` when there is no file, and then nothing is made. Never replaces
+    /// a backup that exists, and logs the one it makes.
     ///
-    /// 1. Write a same-directory temp file, sync it and have `place` set its
-    ///    mode, owner and ACL, all through the temp file's own handle.
-    /// 2. Probe the current file. Absent, older or obsolete goes straight to
-    ///    4. A newer or corrupt file, and one whose read failed with an I/O
-    ///    error, is decided by `S::ROLE`: refused (nothing touched, the temp
-    ///    file deleted, [`StoreError::ReadFailed`] for the I/O error),
-    ///    overwritten, or backed up in 3. A read that failed says nothing
-    ///    about the bytes, and no role overwrites them.
-    /// 3. Back the old file up as `<name>.unreadable[.N].bak`, by hard link
-    ///    (the same file object, so its mode and ACL stay). Every backup made
-    ///    is logged and kept, even if 4 then fails.
-    /// 4. Rename the temp over the file.
-    ///
-    /// A failure at 1, 2, 3 or 4 leaves the original at its name, so a
-    /// decision file is never absent between its backup and its replacement.
-    /// Once 4 has happened the value is stored: a failure after it is
-    /// [`StoreError::PublishedNotFinalized`], not `Io`.
-    ///
-    /// # Exclusion
-    ///
-    /// The type probes the file (2) and then acts on what it found (3, 4); it
-    /// takes no lock. The caller must ensure that no other process or task
-    /// writes, removes or moves aside this file between the two: the probe is
-    /// not rechecked, so a concurrent writer's file can be overwritten or
-    /// backed up on the strength of a stale probe. For the bridge's state
-    /// files that is the bridge's liveness lock
-    /// (`crates/bridge/src/liveness.rs`: held by the running bridge and by
-    /// the CLIs that write state, one holder per state directory) plus the
-    /// caller's own ordering within the process. The directory is opened once
-    /// without following a symlink and every step names a file inside that
-    /// handle, so a directory another principal can write is not a way to make
-    /// the type act on a file outside it; a name changed under the type inside
-    /// it is still the caller's exclusion to prevent.
-    /// [`load`](Self::load) needs none of this and reads either file whole.
-    ///
-    /// On Windows the replace is a POSIX-semantics rename, which a reader that
-    /// shares delete (every [`load`](Self::load), and `std`) cannot block; one
-    /// that does not share delete makes the store fail with the OS error
-    /// (a sharing violation). A volume that rejects POSIX rename (FAT, exFAT,
-    /// some network shares) gets `MoveFileExW` instead, where any reader that
-    /// has the file open at the instant of the replace can make the store fail
-    /// with the OS error (`PermissionDenied`). The old file is then still in
-    /// place. The file is published without `FILE_ATTRIBUTE_TEMPORARY` and
-    /// with every other attribute `place.prepare_tmp` set, and a state
-    /// directory path longer than `MAX_PATH` works. A volume with no directory
-    /// flush does not fail the store (see [`Placement::sync_dir`]).
-    ///
-    /// Blocks the calling thread on file I/O: from async code call it where
-    /// blocking is allowed. `serde_json` writes a non-finite float as `null`, so an
-    /// `Option<f64>` holding NaN is stored, and read back, as `None`; a plain
-    /// float that would do so is refused with [`StoreError::Encode`].
-    pub fn store(&self, value: &S, place: &dyn Placement) -> Result<(), StoreError> {
-        let bytes = encode(value)?;
-        let dir = Dir::open(&self.dir, true, place.owner())?;
-        place.prepare_dir(&dir)?;
-
-        let staged = dir.stage(self.file_name(), &bytes, place.owner(), |tmp| place.prepare_tmp(tmp))?;
-
-        let back_up = store_over(&self.path, &self.load_through(&dir))?;
-
-        if back_up {
-            self.link_to_free_backup(&dir)?;
-        }
-
-        self.fs.publish(staged)?;
-        // The directory is flushed even when `after_publish` failed: the rename
-        // happened either way. The first failure is the one reported.
-        let finalized = place.after_publish(&dir, self.file_name());
-        let flushed = place.sync_dir(&dir);
-        finalized.and(flushed).map_err(StoreError::PublishedNotFinalized)
-    }
-
-    /// Removes the file, or does what `S::ROLE` says for one that cannot be
-    /// read, or whose read failed with an I/O error (kept, or moved aside:
-    /// never deleted unread). When the file is not there, or its directory is
-    /// not, it returns `Absent` without making anything. A link at the name
-    /// is an entry: it is removed, never what it points at.
-    ///
-    /// The type probes the file and then acts on what it found. The caller
-    /// must ensure that no other process or task writes, removes or moves
-    /// aside this file in between; see [`store`](Self::store), "Exclusion".
-    ///
-    /// The directory is the caller's to write: where it cannot, `remove` of a
-    /// file this role removes or moves aside fails with the OS error.
-    pub fn remove(&self) -> io::Result<Removal> {
-        let Some(dir) = self.open_existing()? else {
-            return Ok(Removal::Absent);
-        };
-        match remove_over(&self.load_through(&dir)) {
-            RemoveOver::Keep => Ok(Removal::Kept),
-            RemoveOver::MoveAside => Ok(match self.move_aside_in(&dir)? {
-                Some(backup) => Removal::MovedAside(backup),
-                None => Removal::Absent,
-            }),
-            RemoveOver::Remove => match self.fs.remove_file(&dir, self.file_name()) {
-                Ok(()) => Ok(Removal::Removed),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Removal::Absent),
-                Err(e) => Err(e),
-            },
-        }
-    }
-
-    /// Moves the file to the first free `<name>.unreadable[.N].bak` and
-    /// returns that path, whatever the file holds and whatever the role: the
-    /// caller has decided. `None` when there is no file, and then nothing is
-    /// made. Never replaces a backup that exists, and logs the one it makes.
-    ///
-    /// The move is one rename that refuses to replace, so the file backed up
-    /// is the file moved even if another writer renames over it meanwhile. On
-    /// a platform or filesystem without such a rename it is a hard link and
-    /// then a delete, and a writer that replaces the file between the two
-    /// loses its file. The caller must ensure there is none; see
-    /// [`store`](Self::store), "Exclusion".
-    pub fn move_aside(&self) -> io::Result<Option<PathBuf>> {
-        let Some(dir) = self.open_existing()? else {
-            return Ok(None);
-        };
-        self.move_aside_in(&dir)
-    }
-
-    /// The directory, or `None` when it is not there (and then nothing is made).
-    fn open_existing(&self) -> io::Result<Option<Dir>> {
-        match Dir::open(&self.dir, false, None) {
-            Ok(dir) => Ok(Some(dir)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn move_aside_in(&self, dir: &Dir) -> io::Result<Option<PathBuf>> {
+    /// The move is one rename that refuses to replace, so the file backed up is the file moved. A filesystem with no
+    /// such rename is an `Unsupported` error ([`Self::no_noreplace_rename`]): a link and a delete would leave the file
+    /// under two names, and the path lock does not cover another process.
+    pub(super) fn move_aside_in(&self, dir: &Dir) -> io::Result<Option<PathBuf>> {
         let mut attempt = 1u64;
         loop {
             let backup = self.backup_name(attempt);
@@ -383,41 +233,37 @@ impl<S: VersionedState> VersionedFile<S> {
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(e) if e.kind() == io::ErrorKind::Unsupported => return self.move_aside_by_link(dir),
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => return Err(self.no_noreplace_rename()),
                 Err(e) => return Err(e),
             }
         }
     }
 
-    fn move_aside_by_link(&self, dir: &Dir) -> io::Result<Option<PathBuf>> {
-        let Some(backup) = self.link_to_free_backup(dir)? else {
-            return Ok(None);
-        };
-        match self.fs.remove_file(dir, self.file_name()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        Ok(Some(self.dir.join(backup)))
+    /// The error where the directory's filesystem has no rename that refuses to replace (`Unsupported` from
+    /// [`Dir::rename_noreplace`]): the claim and the move-aside need it, and neither falls back to a second name.
+    pub(super) fn no_noreplace_rename(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "the filesystem holding {} has no no-replace rename, which it needs",
+                S::FILE_NAME
+            ),
+        )
     }
 
-    fn file_name(&self) -> &OsStr {
+    pub(super) fn file_name(&self) -> &OsStr {
         OsStr::new(S::FILE_NAME)
     }
 
-    /// Hard-links the file to the first free backup name and logs it.
-    /// `hard_link` fails atomically on an existing name, so two writers never
-    /// take the same name and no backup is ever replaced. `None` when the file
-    /// is not there.
-    fn link_to_free_backup(&self, dir: &Dir) -> io::Result<Option<OsString>> {
+    /// Hard-links the file to the first free backup name; the caller logs it once the write it precedes has
+    /// published. `hard_link` fails atomically on an existing name, so two writers never take the same name and no
+    /// backup is ever replaced. `None` when the file is not there.
+    pub(super) fn link_to_free_backup(&self, dir: &Dir) -> io::Result<Option<OsString>> {
         let mut attempt = 1u64;
         loop {
             let backup = self.backup_name(attempt);
             match self.fs.hard_link(dir, self.file_name(), &backup) {
-                Ok(()) => {
-                    self.log_backup("backed up a state file", &backup);
-                    return Ok(Some(backup));
-                }
+                Ok(()) => return Ok(Some(backup)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e),
@@ -425,7 +271,21 @@ impl<S: VersionedState> VersionedFile<S> {
         }
     }
 
-    fn log_backup(&self, what: &str, backup: &OsStr) {
+    /// Unlinks a backup made for a write that then failed to publish, so the original keeps one name: the vouched
+    /// read refuses a file with two. A failed unlink leaves the backup (a second name, nothing lost) and is logged;
+    /// the caller returns the publish error either way.
+    pub(super) fn take_back_backup(&self, dir: &Dir, backup: &OsStr) {
+        if let Err(e) = self.fs.remove_file(dir, backup) {
+            tracing::warn!(
+                file = S::FILE_NAME,
+                backup = %backup.to_string_lossy(),
+                error = %error_chain(&e),
+                "a write failed after its backup was made, and the backup could not be removed"
+            );
+        }
+    }
+
+    pub(super) fn log_backup(&self, what: &str, backup: &OsStr) {
         tracing::warn!(file = S::FILE_NAME, backup = %backup.to_string_lossy(), "{what}");
     }
 
@@ -438,65 +298,11 @@ impl<S: VersionedState> VersionedFile<S> {
     }
 }
 
-/// Whether `store` backs up the file as `loaded` found it before it writes,
-/// or the error that refuses the write.
-fn store_over<S: VersionedState>(path: &Path, loaded: &Loaded<S>) -> Result<bool, StoreError> {
-    let (over, refusal) = match loaded {
-        Loaded::Unreadable(e) => (
-            S::ROLE.on_store_io_failure(),
-            StoreError::ReadFailed {
-                path: path.to_owned(),
-                kind: e.kind(),
-            },
-        ),
-        // Nothing a release cannot read is at the name: nothing to protect.
-        Loaded::Absent => return Ok(false),
-        // Dropped on purpose by the chain's floor.
-        Loaded::Obsolete { .. } => return Ok(false),
-        // This release reads it; the store replaces it with the newer value.
-        Loaded::Current { .. } => return Ok(false),
-        Loaded::Newer { .. } => (
-            S::ROLE.on_store(CannotRead::Newer),
-            StoreError::Unreadable {
-                path: path.to_owned(),
-                cause: CannotRead::Newer,
-            },
-        ),
-        Loaded::Corrupt { .. } => (
-            S::ROLE.on_store(CannotRead::Corrupt),
-            StoreError::Unreadable {
-                path: path.to_owned(),
-                cause: CannotRead::Corrupt,
-            },
-        ),
-    };
-    match over {
-        StoreOver::Refuse => Err(refusal),
-        StoreOver::MoveAside => Ok(true),
-        StoreOver::Overwrite => Ok(false),
-    }
-}
-
-/// What `remove` does with a file as `loaded` found it.
-fn remove_over<S: VersionedState>(loaded: &Loaded<S>) -> RemoveOver {
-    match loaded {
-        Loaded::Unreadable(_) => S::ROLE.on_remove_io_failure(),
-        // Removing nothing is still the decision to remove.
-        Loaded::Absent => RemoveOver::Remove,
-        // Dropped on purpose by the chain's floor.
-        Loaded::Obsolete { .. } => RemoveOver::Remove,
-        // This release reads it and asked for it gone.
-        Loaded::Current { .. } => RemoveOver::Remove,
-        Loaded::Newer { .. } => S::ROLE.on_remove(CannotRead::Newer),
-        Loaded::Corrupt { .. } => S::ROLE.on_remove(CannotRead::Corrupt),
-    }
-}
-
 /// The value as one flat JSON object with `"version"` first, proven to read
 /// back as `S` before it is returned: anything `load` would call corrupt
 /// (a float that serializes as `null`, a top-level enum whose tag lands beside
 /// `version`, a payload with a `version` key of its own) is refused here.
-fn encode<S: VersionedState>(value: &S) -> Result<Vec<u8>, StoreError> {
+pub(super) fn encode<S: VersionedState>(value: &S) -> Result<Vec<u8>, StoreError> {
     #[derive(serde::Serialize)]
     struct Framed<'a, S> {
         version: u32,

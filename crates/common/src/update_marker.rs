@@ -12,24 +12,22 @@
 //! counts as a cutover claim — but a read that could not establish whether a
 //! marker exists at all does not, since it carries no evidence of one.
 
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use util::dir::{Dir, EntryKind, ReadDir, Staged};
+use util::versioned_file::{
+    Change, CreateOutcome, Loaded, Obsolete, Placement, Role, Schema, StoreError, UnreadableKind, UpdateOutcome,
+    VersionedFile, VersionedState,
+};
 
 /// Fixed marker filename (single-occupancy: one cutover per machine). The GUI
 /// finds it by this constant, not by enumeration.
 pub const MARKER_FILE: &str = "update-in-progress.json";
 
-/// Schema version. Bump on a breaking shape change; `read` answers
-/// [`Marker::Unreadable`] for an unknown version, but `clear` is remove-by-name
-/// and ignores the schema entirely.
-pub const MARKER_VERSION: u32 = 3;
-
-/// What [`read`] found. Unlike `plugin_state::Loaded`'s sibling variant,
-/// `Unreadable` carries no reason: every reader treats "present but
-/// unidentifiable" the same way, so the reason is logged where it is detected.
+/// What [`read`] found. `Unreadable` carries no reason: every reader treats
+/// "present but unidentifiable" the same way, so the reason is logged where it is detected.
 #[derive(Debug)]
 pub enum Marker {
     Absent,
@@ -37,24 +35,72 @@ pub enum Marker {
     /// that could not be opened, an unparseable body, or a version this build
     /// does not know. A cutover claim either way.
     Unreadable,
-    /// Whether a marker exists could not be established: the existence probe
-    /// failed, or it found something that is not a regular file. NOT a claim —
-    /// neither a failed read nor a directory is evidence a marker is there — so
-    /// readers pass it through rather than report a cutover they could never
-    /// retract.
+    /// Whether a marker exists could not be established: the directory did not
+    /// open, the name holds something that is not a regular file, or the name
+    /// could not be examined after a failed read. NOT a claim — none of these is
+    /// evidence a marker is there — so readers pass it through rather than
+    /// report a cutover they could never retract.
     Indeterminate,
     Present(MarkerInfo),
 }
 
+/// The marker's payload. The file is `{"version": 3, "driver": ...}`: the version is the framing's, and the previous
+/// release (which declares `deny_unknown_fields`) reads exactly these two keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MarkerInfo {
-    pub version: u32,
     /// The cutover DRIVER's persisted identity — the process whose death means
     /// the cutover is abandoned (the detached child on Windows; the inline actor
     /// on macOS). `(pid, raw kernel start token)`, so a recycled pid never
     /// restores to it and there is no failed-probe value to special-case.
     pub driver: cosca::identity::ProcessIdRecord,
+}
+
+impl Schema for MarkerInfo {
+    const VERSION: u32 = 3;
+    type Prev = Obsolete<2>;
+
+    fn upgrade(prev: Obsolete<2>) -> Self {
+        match prev {}
+    }
+}
+
+/// A claim on the name: a store is refused over a marker this release cannot read, and a remove takes it whatever it
+/// holds, so a schema bump across the cutover never strands it.
+impl VersionedState for MarkerInfo {
+    const FILE_NAME: &'static str = MARKER_FILE;
+    const ROLE: Role = Role::Claim;
+}
+
+util::assert_contiguous!(MarkerInfo);
+
+fn marker_file(log_dir: &Path) -> VersionedFile<MarkerInfo> {
+    VersionedFile::new(log_dir)
+}
+
+/// Where the marker is written: the log directory is handed to `owner` (never secured further), and the file is
+/// `0o644` on unix, because the GUI reads it across the privilege boundary and the default `0o600` from a root-daemon
+/// umask would silently break that read.
+struct MarkerPlacement {
+    owner: Option<(u32, u32)>,
+}
+
+impl Placement for MarkerPlacement {
+    fn owner(&self) -> Option<(u32, u32)> {
+        self.owner
+    }
+
+    fn prepare_dir(&self, _dir: &util::dir::Dir) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn prepare_tmp(&self, _tmp: &File) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            _tmp.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        }
+        Ok(())
+    }
 }
 
 /// The SERVICE log directory (where the privileged bridge writes its logs and
@@ -77,142 +123,53 @@ pub fn service_log_dir() -> PathBuf {
     }
 }
 
-/// Atomically write the marker into `log_dir`. Temp-file + same-dir rename so a
-/// reader never sees a partial write; on Unix the file is set to mode 0o644
-/// (GUI-readable across the privilege boundary — the default 0o600 from a
-/// root-daemon umask would silently break the cross-privilege read).
+/// Claim the marker as the single-occupancy cutover claim: `Taken` if anything is already at the name, a marker this
+/// release cannot read included. Collapses the check and the claim into one atomic op, so two concurrent cutover
+/// requests cannot both win (the loser gets `Taken` → 409). A reader never sees a partial file.
 ///
-/// `owner` chowns the persisted marker to the elevated-run user (a user-scoped
-/// elevated bridge writes into the user's profile); `None` for the root daemon,
-/// whose service log dir is root-owned by design. The chown lands on the temp
-/// in [`stage_marker`], whose inode the rename publishes unchanged.
-///
-/// Overwrites an existing marker. For the single-occupancy claim use
-/// [`write_new`], which fails if the marker already exists.
-pub fn write(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io::Result<()> {
-    let dir = Dir::open(log_dir, true, owner)?;
-    let staged = stage_marker(&dir, info, owner)?;
-    staged.publish()
-}
-
-/// Atomically write the marker as a single-occupancy CLAIM: fails with
-/// `AlreadyExists` if a marker is already present. Collapses the check and the
-/// claim into one atomic op, so two concurrent cutover requests cannot both win
-/// (the loser gets `AlreadyExists` → 409). [`Staged::claim`] is a hard link
-/// (`link(2)`/`CreateHardLink` fail `EEXIST`/`ERROR_ALREADY_EXISTS` when the
-/// destination exists) of the fully-written temp file, so a reader never sees a
-/// partial file.
-///
-/// `owner` chowns the marker to the elevated-run user (see [`write()`]); `None`
-/// for the root daemon. A lost claim (`AlreadyExists`) only removes its own
-/// staged temp, so the existing marker's ownership is never disturbed.
-pub fn write_new(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io::Result<()> {
-    let dir = Dir::open(log_dir, true, owner)?;
-    let staged = stage_marker(&dir, info, owner)?;
-    staged.claim()
-}
-
-/// The marker JSON in a uniquely-named same-dir temp file with the
-/// cross-privilege mode (a unique name so two concurrent claims do not corrupt
-/// a shared temp). The caller publishes it (`publish` = overwrite, `claim` =
-/// claim). The temp is dropped, and removed, if it is not.
-///
-/// `owner` chowns the temp BEFORE it is published, through its own handle. Both
-/// publishers keep the same inode (rename moves it, the link shares it and the
-/// temp name is then unlinked), so the persisted marker carries this owner;
-/// `None` leaves it root-owned for the daemon. The directory is the one `dir`
-/// was opened on, never the path again: the log directory sits in the user's
-/// profile when the bridge is user-scoped.
-fn stage_marker<'a>(dir: &'a Dir, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io::Result<Staged<'a>> {
-    let json = serde_json::to_vec(info).map_err(io::Error::other)?;
-    dir.stage(MARKER_FILE.as_ref(), &json, owner, readable_by_the_gui)
-}
-
-/// Widens the staged file from the `0o600` it is sealed to, to `0o644`: the GUI reads the marker across the
-/// privilege boundary, and the default from a root-daemon umask would silently break that read.
-fn readable_by_the_gui(_staged: &std::fs::File) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        _staged.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-    }
-    Ok(())
+/// `owner` hands the marker to the elevated-run user (a user-scoped elevated bridge writes into the user's profile);
+/// `None` for the root daemon, whose service log dir is root-owned by design. A lost claim only removes its own staged
+/// temp, so the existing marker's ownership is never disturbed.
+pub fn claim(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> Result<CreateOutcome, StoreError> {
+    marker_file(log_dir).create_new(info, &MarkerPlacement { owner })
 }
 
 /// Read the marker, distinguishing "no cutover was claimed" from "a cutover was
 /// claimed by a driver this build cannot identify" from "whether one was claimed
 /// could not be established".
 ///
-/// Through a [`ReadDir`], for the GUI and the bridge alike: the bridge reads it as root
+/// Through a [`util::dir::ReadDir`], for the GUI and the bridge alike: the bridge reads it as root
 /// or SYSTEM in a log directory a user may own, where a link or a FIFO planted at
 /// the name must be neither followed nor waited for.
 pub fn read(log_dir: &Path) -> Marker {
-    let dir = match ReadDir::open(log_dir) {
-        Ok(dir) => dir,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Marker::Absent,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "whether an update marker exists could not be determined: the log directory could not be opened"
-            );
-            return Marker::Indeterminate;
-        }
-    };
-    let bytes = match dir.read(MARKER_FILE.as_ref()) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Marker::Absent,
-        Err(e) => return unopened(&dir, &e),
-    };
-    let info: MarkerInfo = match serde_json::from_slice(&bytes) {
-        Ok(info) => info,
-        Err(e) => {
-            // Shadowed so the raw error, which quotes the file, cannot be logged; see `ParseFailure`.
-            let e = util::parse_error::ParseFailure::from(&e);
-            tracing::warn!(error = %e, "update marker could not be parsed");
-            return Marker::Unreadable;
-        }
-    };
-    if info.version != MARKER_VERSION {
-        tracing::warn!(
-            got = info.version,
-            want = MARKER_VERSION,
-            "update marker schema mismatch"
-        );
-        return Marker::Unreadable;
-    }
-    Marker::Present(info)
+    marker_of(marker_file(log_dir).observe().loaded)
 }
 
-/// Classify a marker that could not be READ. Presence comes from asking the directory what the name is, never from
-/// the read's error: a failed read is not evidence a file is there. A claim requires a regular FILE; anything else
-/// at the name (a link, a FIFO, a directory) is not a marker and asserts nothing about a cutover. The name is never
-/// followed, so a link is classified as the anomaly it is instead of being resolved to whatever it points at; the
-/// marker is only ever published by rename or hard link, so hole never creates one.
-fn unopened(dir: &ReadDir, read_error: &io::Error) -> Marker {
-    match dir.kind_of(MARKER_FILE.as_ref()) {
-        Ok(Some(EntryKind::File)) => {
-            tracing::warn!(error = %read_error, "update marker exists but could not be read");
-            Marker::Unreadable
-        }
-        // `error!`, not `warn!`: unlike a failed probe this is not an environmental
-        // io failure, it is a name nothing in hole can produce.
-        Ok(Some(kind)) => {
-            tracing::error!(
-                ?kind,
-                read_error = %read_error,
-                "the update marker name holds something that is not a regular file; it claims no cutover"
-            );
-            Marker::Indeterminate
-        }
-        Ok(None) => Marker::Absent,
-        Err(e) => {
-            tracing::warn!(
-                read_error = %read_error,
-                probe_error = %e,
-                "whether an update marker exists could not be determined"
-            );
-            Marker::Indeterminate
-        }
+/// What a read of the marker file means: the one place a [`Loaded`] becomes a [`Marker`].
+fn marker_of(loaded: Loaded<MarkerInfo>) -> Marker {
+    match loaded {
+        Loaded::Absent => Marker::Absent,
+        Loaded::Current { value, .. } => Marker::Present(value),
+        Loaded::Obsolete { .. } => Marker::Unreadable,
+        Loaded::Newer { .. } => Marker::Unreadable,
+        Loaded::Corrupt { .. } => Marker::Unreadable,
+        Loaded::Unreadable { kind, .. } => match kind {
+            // The directory did not open: nothing established that a marker is there.
+            UnreadableKind::Directory => Marker::Indeterminate,
+            // A claim requires a regular FILE; anything else at the name (a link, a FIFO, a directory) is not a
+            // marker and asserts nothing about a cutover. `error!`, not `warn!`: it is not an environmental io
+            // failure, it is a name nothing in hole can produce.
+            UnreadableKind::NotAFile => {
+                tracing::error!(
+                    "the update marker name holds something that is not a regular file; it claims no cutover"
+                );
+                Marker::Indeterminate
+            }
+            // The file is there and could not be read (a Windows sharing violation): a claim.
+            UnreadableKind::File => Marker::Unreadable,
+            // The read failed and the name could not be examined: no evidence a marker is there.
+            UnreadableKind::Unprobed => Marker::Indeterminate,
+        },
     }
 }
 
@@ -229,17 +186,32 @@ pub fn is_present(log_dir: &Path) -> bool {
 /// Unconditionally remove the marker by known path. NOT parse-then-clear: a
 /// from->to schema bump across the cutover must never strand it. Absent is Ok.
 pub fn clear(log_dir: &Path) -> io::Result<()> {
-    let dir = match Dir::open(log_dir, false, None) {
-        Ok(dir) => dir,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    match dir.unlink(MARKER_FILE.as_ref()) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    let ((), outcome) = marker_file(log_dir)
+        .update(&MarkerPlacement { owner: None }, |_| (Change::Remove, ()))
+        .map_err(io_error)?;
+    match outcome {
+        UpdateOutcome::Removed | UpdateOutcome::Absent => Ok(()),
+        // `Role::Claim` removes whatever it finds, and a `Remove` neither stores nor leaves unchanged.
+        UpdateOutcome::Kept | UpdateOutcome::MovedAside(_) | UpdateOutcome::Stored | UpdateOutcome::Unchanged => {
+            debug_assert!(false, "clearing the update marker answered {outcome:?}");
+            Err(io::Error::other(format!(
+                "clearing the update marker answered {outcome:?}"
+            )))
+        }
     }
 }
+
+/// What [`stamp_driver`] refuses with: there is no readable marker to name the driver in.
+#[derive(Debug)]
+pub struct NoMarkerToStamp;
+
+impl std::fmt::Display for NoMarkerToStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no readable update marker to stamp the cutover driver into")
+    }
+}
+
+impl std::error::Error for NoMarkerToStamp {}
 
 /// Overwrite the marker's driver identity in place. The Windows cutover
 /// initiator stamps the frozen child's identity here so the marker names the
@@ -251,13 +223,24 @@ pub fn clear(log_dir: &Path) -> io::Result<()> {
 /// one. Failing costs nothing: the caller kills the still-suspended child and
 /// clears the marker, so no cutover is claimed.
 pub fn stamp_driver(log_dir: &Path, driver: &cosca::identity::ProcessIdRecord) -> io::Result<()> {
-    let Marker::Present(mut info) = read(log_dir) else {
-        return Err(io::Error::other(
-            "no readable update marker to stamp the cutover driver into",
-        ));
-    };
-    info.driver = driver.clone();
-    write(log_dir, &info, None)
+    let (_, outcome) = marker_file(log_dir)
+        .update(&MarkerPlacement { owner: None }, |observed| match &observed.loaded {
+            Loaded::Current { .. } => (Change::Store(MarkerInfo { driver: driver.clone() }), ()),
+            _ => (Change::Keep, ()),
+        })
+        .map_err(io_error)?;
+    match matches!(outcome, UpdateOutcome::Stored) {
+        true => Ok(()),
+        false => Err(io::Error::other(NoMarkerToStamp)),
+    }
+}
+
+/// The error of an `io::Result` function of this module: an I/O error as it is, anything else wrapped.
+fn io_error(e: StoreError) -> io::Error {
+    match e {
+        StoreError::Io(e) => e,
+        other => io::Error::other(other),
+    }
 }
 
 #[cfg(test)]

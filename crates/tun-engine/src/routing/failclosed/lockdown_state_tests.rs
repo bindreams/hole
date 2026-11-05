@@ -1,14 +1,11 @@
 use super::*;
+use util::versioned_file::UnreadableKind;
 
 #[skuld::test]
-fn save_then_load_roundtrips() {
+fn set_then_load_roundtrips() {
     let tmp = tempfile::tempdir().unwrap();
-    let st = LockdownState {
-        version: SCHEMA_VERSION,
-        enabled: true,
-    };
-    save(tmp.path(), &st, None).unwrap();
-    assert_eq!(load(tmp.path()), Some(st));
+    set_enabled(tmp.path(), true, None).unwrap();
+    assert_eq!(load(tmp.path()), Some(LockdownState { enabled: true }));
 }
 
 #[skuld::test]
@@ -21,11 +18,7 @@ fn load_absent_is_none_and_load_enabled_is_false() {
 #[skuld::test]
 fn load_rejects_schema_mismatch() {
     let tmp = tempfile::tempdir().unwrap();
-    let st = LockdownState {
-        version: SCHEMA_VERSION + 1,
-        enabled: true,
-    };
-    save(tmp.path(), &st, None).unwrap();
+    write_raw(tmp.path(), br#"{"version":2,"enabled":true}"#);
     assert_eq!(load(tmp.path()), None, "future schema must be discarded");
 }
 
@@ -40,7 +33,7 @@ fn set_enabled_is_last_writer_wins() {
 
 // Intent ==============================================================================================================
 
-/// Write `bytes` verbatim as the intent file, bypassing [`save`]'s serializer.
+/// Write `bytes` verbatim as the intent file, bypassing the serializer.
 fn write_raw(dir: &Path, bytes: &[u8]) {
     std::fs::write(dir.join(STATE_FILE_NAME), bytes).unwrap();
 }
@@ -69,27 +62,85 @@ fn load_intent_unparseable_file_is_unreadable() {
     let tmp = tempfile::tempdir().unwrap();
     write_raw(tmp.path(), b"{not json");
     assert_eq!(load_intent(tmp.path()), Intent::Unreadable);
-    write_raw(tmp.path(), br#"{"version":1,"enabled":true,"stray":1}"#);
+    write_raw(tmp.path(), br#"{"version":1,"enabled":"yes"}"#);
     assert_eq!(
         load_intent(tmp.path()),
         Intent::Unreadable,
-        "deny_unknown_fields is a parse failure, not an off intent"
+        "a field of the wrong type is a parse failure, not an off intent"
     );
 }
 
 #[skuld::test]
 fn load_intent_future_schema_is_unreadable() {
     let tmp = tempfile::tempdir().unwrap();
-    save(
-        tmp.path(),
-        &LockdownState {
-            version: SCHEMA_VERSION + 1,
-            enabled: true,
-        },
-        None,
-    )
-    .unwrap();
+    write_raw(tmp.path(), br#"{"version":2,"enabled":true}"#);
     assert_eq!(load_intent(tmp.path()), Intent::Unreadable);
+}
+
+#[skuld::test]
+fn a_stray_field_does_not_make_the_intent_unreadable() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_raw(tmp.path(), br#"{"version":1,"enabled":true,"stray":1}"#);
+    assert_eq!(load_intent(tmp.path()), Intent::On);
+}
+
+#[skuld::test]
+fn every_unreadable_intent_classifies_as_unreadable() {
+    // Newer, corrupt, obsolete (version 0 is at the chain's floor) and a read that fails (a directory at the name).
+    for (what, plant) in [
+        (
+            "newer",
+            Box::new(|dir: &Path| write_raw(dir, br#"{"version":2,"enabled":true}"#)) as Box<dyn Fn(&Path)>,
+        ),
+        ("corrupt", Box::new(|dir: &Path| write_raw(dir, b"{not json"))),
+        (
+            "obsolete",
+            Box::new(|dir: &Path| write_raw(dir, br#"{"version":0,"enabled":true}"#)),
+        ),
+        (
+            "a failed read",
+            Box::new(|dir: &Path| std::fs::create_dir(dir.join(STATE_FILE_NAME)).unwrap()),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        plant(tmp.path());
+        assert_eq!(load_intent(tmp.path()), Intent::Unreadable, "{what}");
+    }
+}
+
+#[skuld::test]
+fn set_enabled_over_a_corrupt_intent_backs_it_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_raw(tmp.path(), b"{not json");
+
+    set_enabled(tmp.path(), true, None).unwrap();
+
+    assert_eq!(load_intent(tmp.path()), Intent::On);
+    let backup = tmp.path().join(format!("{STATE_FILE_NAME}.unreadable.bak"));
+    assert_eq!(std::fs::read(backup).unwrap(), b"{not json");
+}
+
+#[skuld::test]
+fn set_enabled_over_a_newer_intent_backs_it_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let newer: &[u8] = br#"{"version":2,"enabled":false}"#;
+    write_raw(tmp.path(), newer);
+
+    set_enabled(tmp.path(), true, None).unwrap();
+
+    assert_eq!(load_intent(tmp.path()), Intent::On);
+    let backup = tmp.path().join(format!("{STATE_FILE_NAME}.unreadable.bak"));
+    assert_eq!(std::fs::read(backup).unwrap(), newer);
+}
+
+#[skuld::test]
+fn a_directory_at_the_name_is_an_unreadable_intent_of_kind_not_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(STATE_FILE_NAME)).unwrap();
+    let Loaded::Unreadable { kind, .. } = file(tmp.path()).observe().loaded else {
+        panic!("a directory at the name must not read");
+    };
+    assert_eq!(kind, UnreadableKind::NotAFile);
 }
 
 #[skuld::test]
@@ -132,24 +183,4 @@ fn load_enabled_is_the_reads_armed_fold() {
         load_enabled(tmp.path()),
         "a corrupt file reads as ARMED — it is not consent to disarm"
     );
-}
-
-#[skuld::test]
-fn clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
-
-    let err = clear(&state).unwrap_err();
-
-    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
-}
-
-#[skuld::test]
-fn clear_removes_file_and_tolerates_absence() {
-    let tmp = tempfile::tempdir().unwrap();
-    set_enabled(tmp.path(), true, None).unwrap();
-    assert!(tmp.path().join(STATE_FILE_NAME).exists());
-    clear(tmp.path()).unwrap();
-    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
-    clear(tmp.path()).unwrap(); // second clear is a no-op
 }
