@@ -587,7 +587,11 @@ impl Routing for MockRouting {
 
     fn release_all_covers(&self) -> Result<(), RoutingError> {
         self.state.release_all_calls.fetch_add(1, Ordering::SeqCst);
+        // As `failclosed::release_all`: the guard supersedes when it ends, unless the release failed before it
+        // changed anything.
+        let release = tun_engine::routing::failclosed::begin_release(&self.state_dir);
         if self.state.fail_release.load(Ordering::SeqCst) {
+            release.changed_nothing();
             return Err(RoutingError::RouteSetup("mock release_all_covers failure".into()));
         }
         // Unconditional clear, mirroring `failclosed::release_all`.

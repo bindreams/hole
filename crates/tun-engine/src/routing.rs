@@ -1730,6 +1730,17 @@ pub trait Routing: Send + Sync {
     /// persists that evidence (`failclosed::boottime_witness`) before
     /// returning, which is what makes the discard here cost a message and not
     /// the finding.
+    ///
+    /// Release-epoch contract: an implementation that changes the firewall
+    /// does so inside its own release guard (`failclosed::begin_release`),
+    /// opened before its first delete. The guard supersedes every start that
+    /// began earlier when it ends; an implementation that fails before it
+    /// changes anything consumes it with `ReleaseInFlight::changed_nothing`.
+    /// The caller leans on this: `handle_unblock` calls `changed_nothing` on
+    /// its own guard when this returns `Err`, because the implementation's
+    /// guard already carries what happened to the firewall. `SystemRouting`
+    /// meets it through `failclosed::sweep_with_witness`; a test double that
+    /// releases a cover opens a guard too.
     fn release_all_covers(&self) -> Result<(), RoutingError>;
 
     /// Measure whether a standing lockdown cover is present on the host right
