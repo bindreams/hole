@@ -862,10 +862,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     match persisted {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            error!(
-                error = &*e as &dyn std::error::Error,
-                "unblock: failed to persist target/intent off"
-            );
+            error!(error = &*e, "unblock: failed to persist target/intent off");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {

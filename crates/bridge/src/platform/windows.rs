@@ -95,7 +95,7 @@ windows_service::define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_arguments: Vec<OsString>) {
     if let Err(e) = run_service() {
-        error!(error = &*e as &dyn std::error::Error, "service failed");
+        error!(error = &*e, "service failed");
     }
 }
 
@@ -313,7 +313,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     if let Err(e) = &run_result {
-        error!(error = &**e as &dyn std::error::Error, "bridge runtime error");
+        error!(error = &**e, "bridge runtime error");
     }
 
     // Dropping the runtime joins blocking tasks, so `Stopped` follows it. Report
