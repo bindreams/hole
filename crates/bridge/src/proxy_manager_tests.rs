@@ -2218,6 +2218,64 @@ fn doh_bootstrap_failure_sets_last_error() {
     });
 }
 
+/// A covered start that cannot resolve the server warns the host is not blocked only when no standing cover
+/// holds it: with the kill switch on, the standing cover already blocks the host, so that warning would be false.
+#[skuld::test]
+fn a_covered_start_that_cannot_resolve_warns_unblocked_only_without_a_standing_cover() {
+    use crate::dns::bootstrap::DohQuerier;
+    use crate::dns::forwarder::UpstreamCause;
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    struct NeverQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for NeverQuerier {
+        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            Err(UpstreamCause::Unreachable)
+        }
+    }
+
+    for (lockdown, expect_warning) in [(false, true), (true, false)] {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
+                pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+                let mut config = test_config();
+                // RFC 2606 reserves .invalid for guaranteed non-resolution.
+                config.server.server = "test.invalid".into();
+
+                let err = pm
+                    .start_cancellable(&config, covered_now(&pm), CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, ProxyError::DohBootstrap(_)), "{err:?}");
+
+                let output = writer.snapshot_string();
+                assert_eq!(
+                    output.contains("host NOT blocked"),
+                    expect_warning,
+                    "lockdown={lockdown}: the unblocked warning must appear exactly when no standing cover holds the host; got:
+{output}"
+                );
+            });
+    }
+}
+
 #[skuld::test]
 fn gateway_failure_sets_last_error() {
     rt().block_on(async {

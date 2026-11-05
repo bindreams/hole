@@ -3,8 +3,9 @@
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{CoverPresence, Routing};
 
+use crate::coverage::Coverage;
 use crate::proxy::{Proxy, ProxyError};
-use crate::proxy_manager::{Coverage, ProxyManager, ProxyState};
+use crate::proxy_manager::{ProxyManager, ProxyState};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use crate::target::{self, Target};

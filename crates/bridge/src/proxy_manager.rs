@@ -48,6 +48,7 @@ use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
 use tun_engine::routing::failclosed::CoverLock;
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
 
+use crate::coverage::{CoverPlan, Coverage};
 use crate::reconciler::{teardown_cover_disposition, transient_cover_disposition, CoverDisposition};
 use crate::service_stop::{run_phase, StopPhase};
 use crate::target::{self, target_after, SessionEvent, Target};
@@ -286,19 +287,6 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// derivation is otherwise observable only through the plugin it spawns.
     #[cfg(test)]
     last_ech_doh: Option<String>,
-}
-
-/// Whether a start runs under the transient block-until-connected cover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Coverage {
-    Uncovered,
-    /// `unblock_snapshot` is the Unblock count the caller read when the start began, before it waited for this
-    /// manager (the IPC handler reads it before locking `state.proxy`). An Unblock committed since is concurrent
-    /// with the start, and the transient cover section compares against this one value (see
-    /// `engage_transient_cover`); the start takes no snapshot of its own.
-    Covered {
-        unblock_snapshot: u64,
-    },
 }
 
 /// A held block-until-connected cover plus the server identity it permits —
@@ -920,15 +908,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Err(ProxyError::Cancelled) => return Err(self.cancelled_start()),
                 Err(e) => {
                     self.last_error = Some(e.to_string());
-                    // A covered start that can't resolve has no IP to permit, so no
-                    // cover can engage: the block-until-connected intent falls open
-                    // here — logged so the gap is visible, not silent.
-                    match coverage {
-                        Coverage::Covered { .. } => warn!(
+                    // A start that relies on the transient cover and can't resolve has no IP to permit, so
+                    // no cover can engage: the block-until-connected intent falls open here — logged so the
+                    // gap is visible, not silent.
+                    if coverage.plan(self.standing_cover_expected()).needs_transient_cover() {
+                        warn!(
                             error = &e as &dyn std::error::Error,
                             "covered start could not resolve the server; host NOT blocked (no IP to permit)"
-                        ),
-                        Coverage::Uncovered => {}
+                        );
                     }
                     return Err(e);
                 }
@@ -998,39 +985,34 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             "failclosed cover resolver permit"
         );
 
-        // Engage the block-until-connected cover for a covered start UNLESS a
-        // standing cover is expected: that cohort installs the lockdown cover
-        // at routing.install, and engaging the transient cover too would (on macOS)
-        // clobber the singular pf ruleset. A corrupt or absent lockdown-state
-        // file resolves to NOT STANDING — the fail-SAFE direction (we engage,
-        // blocking not leaking).
+        // A corrupt or absent lockdown-state file resolves to NOT STANDING — the
+        // fail-SAFE direction (we engage, blocking not leaking).
         let lockdown_on = self.standing_cover_expected();
 
-        match coverage {
-            Coverage::Covered { unblock_snapshot } => {
-                if lockdown_on {
-                    // Covered retry after the user enabled lockdown mid-blocked-state:
-                    // release the held cover. This opens egress until the standing lockdown
-                    // cover engages at routing.install — a brief, disclosed open window
-                    // (bindreams/hole#758: not closed by the macOS pf work).
-                    if self.posture.take_pending().is_some() {
-                        warn!(
-                            "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
-                             uncovered until the standing lockdown cover engages at connect"
-                        );
-                    }
-                } else {
-                    self.engage_transient_cover(
-                        config.server.server.expose(),
-                        server_ip,
-                        pin,
-                        ech_resolver_permit,
-                        &effective_ech_doh,
-                        unblock_snapshot,
+        match coverage.plan(lockdown_on) {
+            CoverPlan::Engage { unblock_snapshot } => {
+                self.engage_transient_cover(
+                    config.server.server.expose(),
+                    server_ip,
+                    pin,
+                    ech_resolver_permit,
+                    &effective_ech_doh,
+                    unblock_snapshot,
+                );
+            }
+            CoverPlan::HandToLockdown => {
+                // Covered retry after the user enabled lockdown mid-blocked-state:
+                // release the held cover. This opens egress until the standing lockdown
+                // cover engages at routing.install — a brief, disclosed open window
+                // (bindreams/hole#758: not closed by the macOS pf work).
+                if self.posture.take_pending().is_some() {
+                    warn!(
+                        "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
+                         uncovered until the standing lockdown cover engages at connect"
                     );
                 }
             }
-            Coverage::Uncovered => {
+            CoverPlan::FailOpen => {
                 // Manual (uncovered) connect or reload-while-blocked: fail-open by
                 // design. Releasing the held cover opens egress — logged so the fail-open
                 // has a visible disposition, never a silent drop.

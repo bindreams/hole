@@ -14,9 +14,10 @@ use tokio_util::sync::CancellationToken;
 use tun_engine::routing::failclosed::lockdown_state::Intent;
 use tun_engine::routing::{CoverPresence, Routing};
 
+use crate::coverage::Coverage;
 use crate::dns::system::Dns;
 use crate::proxy::Proxy;
-use crate::proxy_manager::{Coverage, ProxyManager, ProxyState};
+use crate::proxy_manager::{ProxyManager, ProxyState};
 use crate::target::{self, SessionEvent, Target};
 #[cfg(test)]
 use hole_common::protocol::ProxyConfig;
