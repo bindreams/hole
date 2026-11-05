@@ -156,7 +156,8 @@ impl Placement for DefaultPlacement {
 
 /// [`Placement`] that leaves a replaced file with its owner: the staged file takes the owner of the file it replaces
 /// (a new file: the writer's), and the directory is never chowned. For a file a user's account may own, where the
-/// writer rewrites it without changing whose it is.
+/// writer rewrites it without changing whose it is. A file that is not a regular file with one name (a symlink, a hard
+/// link a user planted) has no owner to keep, and the write fails: it would otherwise let that entry choose the owner.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KeepOwner;
 

@@ -52,6 +52,7 @@ fn root_is_the_system_and_every_other_uid_a_user() {
         uid,
         gid: 0,
         mode: 0,
+        links: 1,
     };
 
     assert_eq!(meta(0).owner(), Owner::Privileged);

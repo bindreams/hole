@@ -120,6 +120,42 @@ fn a_placement_that_keeps_the_owner_stages_the_new_file_as_the_old_one() {
     assert_eq!(owner_of(dir.path()), dir_before);
 }
 
+/// The owner a writer keeps is that of a regular file with one name: a hard link planted at the name, or a symlink
+/// there, fails the write and leaves everything as it was. Runs unprivileged.
+#[cfg(unix)]
+#[skuld::test]
+fn a_placement_that_keeps_the_owner_refuses_a_hard_link_and_a_symlink_at_the_name() {
+    use crate::dir::Refusal;
+    use crate::versioned_file::KeepOwner;
+    let refused = |file: &VersionedFile<DecisionFile>| match file
+        .update(&KeepOwner, |_| {
+            (Change::Store(DecisionFile { value: "new".into() }), ())
+        })
+        .unwrap_err()
+    {
+        StoreError::Io(ref e) => Refusal::from_error(e).copied(),
+        other => panic!("{other:?}"),
+    };
+    let old: &[u8] = br#"{"version":1,"value":"old"}"#;
+
+    let linked = dir();
+    let path = put(&linked, "decision.json", old);
+    std::fs::hard_link(&path, linked.path().join("planted")).unwrap();
+    let file = VersionedFile::<DecisionFile>::new(linked.path());
+    assert_eq!(refused(&file), Some(Refusal::ForeignFile));
+    assert_eq!(std::fs::read(&path).unwrap(), old);
+
+    let symlinked = dir();
+    let target = put(&symlinked, "target.json", old);
+    std::os::unix::fs::symlink(&target, symlinked.path().join("decision.json")).unwrap();
+    let file = VersionedFile::<DecisionFile>::new(symlinked.path());
+    assert_eq!(refused(&file), Some(Refusal::NotRegular));
+    assert_eq!(std::fs::read(&target).unwrap(), old);
+    assert!(std::fs::symlink_metadata(symlinked.path().join("decision.json"))
+        .unwrap()
+        .is_symlink());
+}
+
 // create_new ----------------------------------------------------------------------------------------------------------
 
 #[skuld::test]

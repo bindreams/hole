@@ -378,20 +378,30 @@ fn owner_of_says_none_for_an_absent_name() {
     assert_eq!(dir.owner_of(&name("absent")).unwrap(), None);
 }
 
-/// A link is itself: its owner, not its target's. Told apart from the target's on a root lane, where `own` gives the
-/// link away; unprivileged both are the runner's.
+/// A link is not a file whose owner a writer may keep: refused, never followed to its target's owner.
+#[cfg(unix)]
 #[skuld::test]
-fn owner_of_does_not_follow_a_link() {
+fn owner_of_refuses_a_link() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = Dir::open(tmp.path(), false, None).unwrap();
     std::fs::write(tmp.path().join("target"), b"x").unwrap();
     plant_file_symlink(&tmp.path().join("target"), &tmp.path().join("link"));
-    super::testing::own(&tmp.path().join("link"));
 
-    assert_eq!(
-        dir.owner_of(&name("link")).unwrap(),
-        lstat_owner(&tmp.path().join("link"))
-    );
+    let err = dir.owner_of(&name("link")).unwrap_err();
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular), "{err:?}");
+}
+
+/// A second name is what a hard link a user planted adds; the owner of such a file is not the writer's to keep.
+#[cfg(unix)]
+#[skuld::test]
+fn owner_of_refuses_a_file_with_a_second_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("f"), b"x").unwrap();
+    std::fs::hard_link(tmp.path().join("f"), tmp.path().join("second")).unwrap();
+
+    let err = dir.owner_of(&name("f")).unwrap_err();
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::ForeignFile), "{err:?}");
 }
 
 #[skuld::test]
