@@ -96,9 +96,8 @@ impl CoverLock {
     /// Block until the lock for `state_dir` is free, then hold it.
     ///
     /// Panics if this thread already holds it: a std mutex is not reentrant, so the alternative is a hang with the
-    /// lock held and the user's Unblock waiting on it. A cover is released under a held lock with
-    /// [`InstallStamp::release`] (the guard's `release`), or by dropping it, which is
-    /// [`InstallStamp::release_on_drop`]; neither acquires.
+    /// lock held and the user's Unblock waiting on it. A guard releases under a held lock when dropped
+    /// ([`InstallStamp::release_on_drop`]), and its explicit `release(&lock)` is that drop; neither acquires.
     pub fn acquire(state_dir: &Path) -> CoverLock {
         Self::lock_slot(slot(state_dir))
     }
@@ -190,27 +189,14 @@ impl InstallStamp {
         );
     }
 
-    /// Run `delete` iff this stamp is current. Takes the lock as proof it is held; panics if it is another
-    /// directory's. A stamp is a fact about one install, so asking twice is harmless: the guard that owns it
-    /// decides when to ask.
-    pub fn release(&self, lock: &CoverLock, delete: impl FnOnce()) {
-        self.assert_held_under(lock);
+    /// A guard's `Drop`: run `delete` iff this stamp is current, under the lock this thread already holds for the
+    /// directory (a drop inside a section), else after acquiring it. A stamp is a fact about one install, so
+    /// asking twice is harmless: the guard that owns it decides when to ask.
+    pub fn release_on_drop(&self, delete: impl FnOnce()) {
+        let _acquired = (!held_by_this_thread(self.slot)).then(|| CoverLock::lock_slot(self.slot));
         if self.is_current() {
             delete();
         }
-    }
-
-    /// [`Self::release`] for a guard's `Drop`: under the lock this thread already holds for the directory (a
-    /// drop inside a section), else after acquiring it.
-    pub fn release_on_drop(&self, delete: impl FnOnce()) {
-        if held_by_this_thread(self.slot) {
-            if self.is_current() {
-                delete();
-            }
-            return;
-        }
-        let lock = CoverLock::lock_slot(self.slot);
-        self.release(&lock, delete);
     }
 }
 

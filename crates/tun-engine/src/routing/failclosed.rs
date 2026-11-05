@@ -158,12 +158,15 @@ impl crate::routing::CoverGuard for Cover {
         self._inner.detach();
     }
 
+    /// Under `lock`, which must be its own state dir's, the guard's `Drop` (the only code that deletes) is the
+    /// release, so it runs inside the caller's section.
     fn release(self, lock: &CoverLock) {
-        self._inner.release(lock);
+        self._inner.stamp().assert_held_under(lock);
+        drop(self);
     }
 
     fn is_current(&self) -> bool {
-        self._inner.is_current()
+        self._inner.stamp().is_current()
     }
 }
 
