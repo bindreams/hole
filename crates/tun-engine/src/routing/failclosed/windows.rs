@@ -2296,6 +2296,7 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witne
                 "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
                  cover could not be disengaged"
             )),
+            &[],
         );
     }
     let codes: Vec<(&'static str, u32)> = swept.iter().map(|(k, code)| (k.label, *code)).collect();
@@ -2306,8 +2307,8 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witne
     // does not make the observations beside it any less real (#1010 F1).
     let clearance = Clearance::from_observations(&observations(swept), witness);
     match first_delete_failure(&codes) {
-        Some(e) => SweepOutcome::failed(clearance, e),
-        None => SweepOutcome::completed(clearance),
+        Some(e) => SweepOutcome::failed(clearance, e, &[]),
+        None => SweepOutcome::completed(clearance, &[CoverKind::Lockdown]),
     }
 }
 
@@ -2379,53 +2380,83 @@ unsafe fn delete_all(engine: HANDLE) {
 /// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
 /// two lets the MSI delete `hole.exe` over a key it never observed.
 pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
-    unsafe {
+    let (lockdown, transient) = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return SweepOutcome::failed(
-                // The empty fold: nothing was issued, so nothing was observed.
-                Clearance::from_observations(&[], witness),
-                RoutingError::RouteSetup(format!(
-                    "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so nothing could have been deleted"
-                )),
-            );
+            return release_all_verdict(Some(rc), &[], &[], witness);
         }
 
         // One pass, both folds: each key carries its lifetime out of the
         // sweep list, so the failure verdict and the clearance are derived
         // from the SAME observation rather than from two walks that could
-        // disagree about which key answered what.
-        let mut swept: Vec<(SweptKey, u32)> = Vec::new();
+        // disagree about which key answered what. Every delete is issued
+        // before any code is read.
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for k in swept_lockdown_keys() {
-            let code = FwpmFilterDeleteByKey0(engine, &k.guid);
-            swept.push((k, code));
-        }
+        let lockdown: Vec<(SweptKey, u32)> = swept_lockdown_keys()
+            .into_iter()
+            .map(|k| {
+                let code = FwpmFilterDeleteByKey0(engine, &k.guid);
+                (k, code)
+            })
+            .collect();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for k in swept_transient_keys() {
-            let code = FwpmFilterDeleteByKey0(engine, &k.guid);
-            swept.push((k, code));
-        }
+        let transient: Vec<(SweptKey, u32)> = swept_transient_keys()
+            .into_iter()
+            .map(|k| {
+                let code = FwpmFilterDeleteByKey0(engine, &k.guid);
+                (k, code)
+            })
+            .collect();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
+        (lockdown, transient)
+    };
+    release_all_verdict(None, &lockdown, &transient, witness)
+}
 
-        let codes: Vec<(&'static str, u32)> = swept.iter().map(|(k, code)| (k.label, *code)).collect();
-        // Folded before the failure verdict is consulted, for the reason
-        // `disengage_verdict` gives: every delete above was ISSUED before any
-        // code was read, so a sweep that ends in `Err` is still holding a
-        // complete observation set — including the sibling it just removed
-        // (#1010 F1).
-        let clearance = Clearance::from_observations(&observations(&swept), witness);
-        match first_delete_failure(&codes) {
-            Some(e) => SweepOutcome::failed(clearance, e),
-            None => SweepOutcome::completed(clearance),
-        }
+/// `release_all`'s verdict, pure and separated from the FFI as [`disengage_verdict`] is. The failure is the first
+/// refused delete (lockdown keys first); the clearance is folded from every key either way (#1010 F1, see
+/// [`disengage_verdict`]). A kind is released when none of ITS keys' deletes failed, whatever the other kind's did,
+/// so a held guard of the kind that is gone stops deleting and one of the kind that is not still retries.
+fn release_all_verdict(
+    open_failure: Option<u32>,
+    lockdown: &[(SweptKey, u32)],
+    transient: &[(SweptKey, u32)],
+    witness: ArmingWitness,
+) -> SweepOutcome {
+    if let Some(rc) = open_failure {
+        return SweepOutcome::failed(
+            // The empty fold: nothing was issued, so nothing was observed.
+            Clearance::from_observations(&[], witness),
+            RoutingError::RouteSetup(format!(
+                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so nothing could have been deleted"
+            )),
+            &[],
+        );
+    }
+    let labelled = |swept: &[(SweptKey, u32)]| -> Vec<(&'static str, u32)> {
+        swept.iter().map(|(k, code)| (k.label, *code)).collect()
+    };
+    let lockdown_failure = first_delete_failure(&labelled(lockdown));
+    let transient_failure = first_delete_failure(&labelled(transient));
+    let all: Vec<(SweptKey, u32)> = lockdown.iter().chain(transient).cloned().collect();
+    let clearance = Clearance::from_observations(&observations(&all), witness);
+    let mut released = Vec::new();
+    if lockdown_failure.is_none() {
+        released.push(CoverKind::Lockdown);
+    }
+    if transient_failure.is_none() {
+        released.push(CoverKind::Transient);
+    }
+    match lockdown_failure.or(transient_failure) {
+        Some(e) => SweepOutcome::failed(clearance, e, &released),
+        None => SweepOutcome::completed(clearance, &released),
     }
 }
 

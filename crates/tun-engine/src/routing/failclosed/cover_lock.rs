@@ -16,8 +16,9 @@
 //!
 //! A guard keeps the [`InstallStamp`] its install produced. Windows filter keys are fixed and a macOS cover owns
 //! one pf token, so a guard that outlived its cover must delete nothing: its release or drop runs its delete only
-//! while the stamp is current, that is, until the next install of that [`CoverKind`] or the next sweep of it that
-//! completed. A sweep that failed leaves the stamps current, so a held guard's drop still retries its deletes.
+//! while the stamp is current, that is, until the next install of that [`CoverKind`] or the next sweep that released
+//! it. A sweep outdates the stamps of the kinds it released, even when it failed on the other kind; a kind it did not
+//! release keeps its stamps, so a held guard's drop still retries its deletes.
 //!
 //! A guard dropped on a thread that already holds the lock (an early return or an unwind inside a section) deletes
 //! under that held lock ([`InstallStamp::release_on_drop`]); it can neither deadlock nor panic while unwinding.
@@ -127,8 +128,8 @@ impl CoverLock {
         }
     }
 
-    /// Make every stamp of `kind` stale: a sweep of that kind COMPLETED, so whatever a guard still holds is gone.
-    /// A sweep that failed does not call this; the held guard's drop retries.
+    /// Make every stamp of `kind` stale: a sweep RELEASED that kind, so whatever a guard still holds is gone.
+    /// A kind whose release failed is not outdated; the held guard's drop retries.
     pub fn outdate_stamps(&self, kind: CoverKind) {
         self.bump(kind);
     }
@@ -172,7 +173,7 @@ impl InstallStamp {
         self.kind
     }
 
-    /// Whether no install or completed sweep of this kind has happened since this stamp was minted. A lock-free
+    /// Whether no install or sweep that released this kind has happened since this stamp was minted. A lock-free
     /// read: a report (status) may call it, but a decision must call it under the lock, where the answer cannot
     /// change.
     pub fn is_current(&self) -> bool {

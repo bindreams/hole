@@ -1427,6 +1427,9 @@ struct RecordingPfOps {
     /// assertable and not merely that one was.
     dropped: Vec<String>,
     fail_reload_default: bool,
+    /// `reload_default` succeeds this many times, then fails: the transient block reloads first, so a test can
+    /// let it succeed and fail the standing block's fallback.
+    reload_default_ok_calls: Option<usize>,
     fail_load_ruleset: bool,
     fail_clear_transient: bool,
     fail_clear_standing: bool,
@@ -1435,8 +1438,9 @@ struct RecordingPfOps {
 
 impl PfOps for RecordingPfOps {
     fn reload_default(&mut self) -> Result<(), RoutingError> {
+        let earlier_reloads = self.log.iter().filter(|call| **call == "reload_default").count();
         self.log.push("reload_default");
-        if self.fail_reload_default {
+        if self.fail_reload_default || self.reload_default_ok_calls.is_some_and(|ok| earlier_reloads >= ok) {
             Err(RoutingError::RouteSetup("mock reload_default failure".into()))
         } else {
             Ok(())
@@ -1509,13 +1513,79 @@ fn release_all_attempts_the_standing_cover_after_a_transient_failure() {
         StateFile::Present(transient_state()),
         StateFile::Present(standing_state()),
         &mut ops,
-    );
+    )
+    .into_result();
     assert!(
         ops.log.contains(&"load_ruleset"),
         "the standing cover must still be attempted: {:?}",
         ops.log
     );
     assert!(result.is_err());
+}
+
+// `release_all`'s per-kind release ------------------------------------------------------------------------------------
+//
+// A held guard stops deleting once a sweep released its kind (its pf token is dropped and `/etc/pf.conf` reloaded,
+// so a second `pfctl -X` and reload would hit another install's state) and keeps retrying while a sweep did not.
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn release_all_whose_standing_block_failed_still_releases_the_transient_kind() {
+    // The transient reload is `reload_default` call 0 and succeeds; the standing snapshot load fails and its
+    // fallback `reload_default` (call 1) fails too.
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        reload_default_ok_calls: Some(1),
+        ..Default::default()
+    };
+    let outcome = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert_eq!(outcome.released(), [CoverKind::Transient]);
+    assert!(outcome.into_result().is_err(), "the standing failure still travels");
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn release_all_whose_transient_block_failed_still_releases_the_lockdown_kind() {
+    // The transient reload fails; the standing snapshot loads, so its block never reloads.
+    let mut ops = RecordingPfOps {
+        fail_reload_default: true,
+        ..Default::default()
+    };
+    let outcome = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert_eq!(outcome.released(), [CoverKind::Lockdown]);
+    assert!(outcome.into_result().is_err(), "the transient failure still travels");
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn release_all_whose_both_blocks_failed_releases_neither_kind() {
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        fail_reload_default: true,
+        ..Default::default()
+    };
+    let outcome = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert_eq!(outcome.released(), []);
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn release_all_that_cleared_both_covers_releases_both_kinds() {
+    let mut ops = RecordingPfOps::default();
+    let outcome = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert_eq!(outcome.released(), [CoverKind::Transient, CoverKind::Lockdown]);
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
@@ -1541,7 +1611,7 @@ fn release_all_keeps_the_standing_state_file_when_restore_and_fallback_both_fail
         fail_reload_default: true,
         ..Default::default()
     };
-    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops);
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops).into_result();
     assert!(
         !ops.log.contains(&"clear_standing"),
         "must not clear the state file when both the snapshot restore and the fallback failed: {:?}",
@@ -1556,7 +1626,7 @@ fn release_all_falls_back_to_the_default_ruleset_when_the_snapshot_will_not_load
         fail_load_ruleset: true,
         ..Default::default()
     };
-    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops);
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops).into_result();
     assert!(result.is_ok(), "a successful fallback is not an error: {result:?}");
     assert!(
         ops.log.contains(&"clear_standing"),
@@ -1582,7 +1652,7 @@ fn release_all_touches_nothing_when_both_state_files_are_absent() {
     // A blanket /etc/pf.conf reload here would destroy a healthy host's live
     // third-party ruleset.
     let mut ops = RecordingPfOps::default();
-    let result = release_all_with(StateFile::Absent, StateFile::Absent, &mut ops);
+    let result = release_all_with(StateFile::Absent, StateFile::Absent, &mut ops).into_result();
     assert!(ops.log.is_empty(), "must touch nothing on a clean host: {:?}", ops.log);
     assert!(result.is_ok());
 }
@@ -1594,7 +1664,7 @@ fn release_all_treats_an_unusable_transient_state_file_as_a_cover_to_clear() {
     // reloads the default ruleset rather than trying a restore first) — the
     // standing-side counterpart above does not exercise it.
     let mut ops = RecordingPfOps::default();
-    let result = release_all_with(unusable(), StateFile::Absent, &mut ops);
+    let result = release_all_with(unusable(), StateFile::Absent, &mut ops).into_result();
     assert!(
         ops.log.contains(&"reload_default"),
         "an Unusable transient state must still trigger the default-ruleset reload: {:?}",
@@ -1622,7 +1692,9 @@ fn release_all_drops_the_token_salvaged_from_an_unusable_record_on_both_arms() {
     }
 
     let mut ops = RecordingPfOps::default();
-    release_all_with(with_token("111"), StateFile::Absent, &mut ops).expect("a clean transient release");
+    let _ = release_all_with(with_token("111"), StateFile::Absent, &mut ops)
+        .into_result()
+        .expect("a clean transient release");
     assert_eq!(
         ops.dropped,
         vec!["111".to_owned()],
@@ -1631,7 +1703,9 @@ fn release_all_drops_the_token_salvaged_from_an_unusable_record_on_both_arms() {
     );
 
     let mut ops = RecordingPfOps::default();
-    release_all_with(StateFile::Absent, with_token("222"), &mut ops).expect("a clean standing release");
+    let _ = release_all_with(StateFile::Absent, with_token("222"), &mut ops)
+        .into_result()
+        .expect("a clean standing release");
     assert_eq!(
         ops.dropped,
         vec!["222".to_owned()],
@@ -1650,7 +1724,8 @@ fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
         StateFile::Present(transient_state()),
         StateFile::Present(standing_state()),
         &mut ops,
-    );
+    )
+    .into_result();
     assert!(result.is_ok(), "everything succeeded: {result:?}");
     assert_eq!(
         ops.log,
@@ -1677,7 +1752,7 @@ fn release_all_logs_a_swallowed_transient_clear_failure_but_still_reports_ok() {
         fail_clear_transient: true,
         ..Default::default()
     };
-    let result = release_all_with(StateFile::Present(transient_state()), StateFile::Absent, &mut ops);
+    let result = release_all_with(StateFile::Present(transient_state()), StateFile::Absent, &mut ops).into_result();
     assert!(
         result.is_ok(),
         "a failed state-file clear must not fail the call: {result:?}"
@@ -1694,7 +1769,7 @@ fn release_all_logs_a_swallowed_standing_clear_failure_but_still_reports_ok() {
         fail_clear_standing: true,
         ..Default::default()
     };
-    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops);
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops).into_result();
     assert!(
         result.is_ok(),
         "a failed state-file clear must not fail the call: {result:?}"
@@ -1994,7 +2069,9 @@ fn an_uncaptured_baseline_restores_the_default_ruleset() {
     st.main_snapshot_captured = false;
     st.main_snapshot = String::new();
     let mut ops = RecordingPfOps::default();
-    release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops).unwrap();
+    let _ = release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops)
+        .into_result()
+        .unwrap();
 
     assert!(
         ops.log.contains(&"reload_default"),
@@ -2018,7 +2095,9 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
     st.main_snapshot = String::new();
     assert!(st.main_snapshot_captured, "sample state is a captured baseline");
     let mut ops = RecordingPfOps::default();
-    release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops).unwrap();
+    let _ = release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops)
+        .into_result()
+        .unwrap();
 
     assert!(
         ops.log.contains(&"load_ruleset"),
