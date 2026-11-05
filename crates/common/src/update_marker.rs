@@ -186,6 +186,18 @@ pub fn clear(log_dir: &Path) -> io::Result<()> {
         .map_err(io_error)
 }
 
+/// What [`stamp_driver`] refuses with: there is no readable marker to name the driver in.
+#[derive(Debug)]
+pub struct NoMarkerToStamp;
+
+impl std::fmt::Display for NoMarkerToStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no readable update marker to stamp the cutover driver into")
+    }
+}
+
+impl std::error::Error for NoMarkerToStamp {}
+
 /// Overwrite the marker's driver identity in place. The Windows cutover
 /// initiator stamps the frozen child's identity here so the marker names the
 /// driver, not the initiator.
@@ -204,9 +216,7 @@ pub fn stamp_driver(log_dir: &Path, driver: &cosca::identity::ProcessIdRecord) -
         .map_err(io_error)?;
     match matches!(outcome, UpdateOutcome::Stored) {
         true => Ok(()),
-        false => Err(io::Error::other(
-            "no readable update marker to stamp the cutover driver into",
-        )),
+        false => Err(io::Error::other(NoMarkerToStamp)),
     }
 }
 

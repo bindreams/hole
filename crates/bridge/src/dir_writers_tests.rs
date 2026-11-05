@@ -96,8 +96,8 @@ impl std::fmt::Display for LeftAsItIs {
 
 impl std::error::Error for LeftAsItIs {}
 
-/// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's,
-/// or a versioned file's decision to leave a file it cannot read as it is.
+/// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's, a
+/// versioned file's decision to leave a file it cannot read as it is, or the update marker's refusal to stamp one.
 fn is_a_refusal(err: &io::Error) -> bool {
     let mut current = err.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static));
     while let Some(error) = current {
@@ -108,6 +108,7 @@ fn is_a_refusal(err: &io::Error) -> bool {
         if error.downcast_ref::<Refusal>().is_some()
             || error.downcast_ref::<file_lock::Refused>().is_some()
             || error.downcast_ref::<LeftAsItIs>().is_some()
+            || error.downcast_ref::<update_marker::NoMarkerToStamp>().is_some()
             || versioned_file_left_it
         {
             return true;
@@ -352,6 +353,18 @@ fn writers() -> Vec<Writer> {
                 CreateOutcome::Created => Ok(()),
                 CreateOutcome::Taken => Err(io::ErrorKind::AlreadyExists.into()),
             },
+        },
+        Writer {
+            name: "the update marker, stamped",
+            sources: &[],
+            names: &[MARKER_FILE],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            run: |dir, owner| {
+                // A fresh layout holds a marker to stamp; at a planted name the claim is lost and the stamp refused.
+                update_marker::claim(dir, &marker_info(), owner).map_err(io::Error::other)?;
+                update_marker::stamp_driver(dir, &marker_info().driver)
+            },
+            runs_here: true,
         },
         Writer {
             name: "the update marker, cleared",

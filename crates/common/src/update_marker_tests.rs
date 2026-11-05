@@ -225,6 +225,29 @@ fn a_marker_with_a_second_name_is_an_unreadable_claim() {
     }
 }
 
+/// A regular file whose read fails is a claim (`UnreadableKind::File`), as opposed to a name that is not a file.
+/// A runner that ignores mode bits (root) reads it, so the case states both outcomes.
+#[cfg(unix)]
+#[skuld::test]
+fn a_regular_marker_file_that_cannot_be_read_is_an_unreadable_claim() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    claim(dir.path(), &info(4242), None).unwrap();
+    let path = dir.path().join(MARKER_FILE);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    match std::fs::File::open(&path) {
+        Err(_) => {
+            assert!(matches!(read(dir.path()), Marker::Unreadable), "{:?}", read(dir.path()));
+            assert!(
+                is_present(dir.path()),
+                "a file that is there and unreadable is a cutover claim"
+            );
+        }
+        Ok(_) => assert_eq!(present(dir.path()), info(4242)),
+    }
+}
+
 #[skuld::test]
 fn a_marker_written_by_the_previous_release_reads_present() {
     let dir = tempfile::tempdir().unwrap();
@@ -308,9 +331,10 @@ fn stamp_driver_refuses_anything_but_a_present_marker() {
     // Pins [`stamp_driver`]'s contract: nothing but `Present` may be stamped, and a refusal leaves the file as it was.
     let newer = br#"{"version":99,"driver":{}}"#.as_slice();
     let absent = tempfile::tempdir().unwrap();
+    let refused = stamp_driver(absent.path(), &info(1).driver).expect_err("an absent marker must fail the stamp");
     assert!(
-        stamp_driver(absent.path(), &info(1).driver).is_err(),
-        "an absent marker must fail the stamp"
+        refused.get_ref().is_some_and(|e| e.is::<NoMarkerToStamp>()),
+        "the refusal is the typed one: {refused:?}"
     );
     assert!(listing(absent.path()).is_empty(), "the stamp must not create a marker");
 
@@ -318,9 +342,11 @@ fn stamp_driver_refuses_anything_but_a_present_marker() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(MARKER_FILE), unreadable).unwrap();
 
+        let refused = stamp_driver(dir.path(), &info(1).driver)
+            .expect_err("a marker that could not be read must fail the stamp, not be warned past");
         assert!(
-            stamp_driver(dir.path(), &info(1).driver).is_err(),
-            "a marker that could not be read must fail the stamp, not be warned past"
+            refused.get_ref().is_some_and(|e| e.is::<NoMarkerToStamp>()),
+            "the refusal is the typed one: {refused:?}"
         );
 
         assert_eq!(std::fs::read(dir.path().join(MARKER_FILE)).unwrap(), unreadable);
