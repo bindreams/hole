@@ -43,17 +43,17 @@
 //! rerun (creation reads before `t0`). A FALSIFIED is therefore read against the
 //! `t0`, `t1` and creation time the probe prints.
 //!
-//! S is read once, after C's restarted instance is up, and there is no wait: its
-//! pid log, then one `QueryServiceStatusEx` (state and process id, in every
-//! state: the SCM assigns the process id when it creates the process, before the
-//! helper runs). In the `running` variant a state other than STOPPED, or a
-//! second pid in the log, is FALSIFIED. In the `queued` variant:
+//! S is read once, after C's restarted instance is up, and there is no wait: one
+//! `QueryServiceStatusEx` (state and process id, in every state), the restarted
+//! instance's creation time at once (before its pid can be reused), then its pid
+//! log. State before log: a restart that comes and goes between the two reads
+//! still shows in the log. In the `running` variant a state other than STOPPED,
+//! or a second pid in the log, is FALSIFIED. In the `queued` variant:
 //! - S not STOPPED: its process is the restarted instance, placed as above; a
-//!   process missing from the process list fails the probe;
-//! - S STOPPED with a second pid in the log: an instance started and is gone
-//!   before it could be placed. That fails the probe, never a rerun: the helper
-//!   exits only when killed, so nothing here expects it, and an unplaceable
-//!   restart must not pass for a lost race;
+//!   process missing from the process list, or no process id yet, fails the probe;
+//! - S STOPPED with a second pid in the log: an instance started after the status
+//!   read, or came and went, so it cannot be placed. That fails the probe, never a
+//!   rerun: an unplaceable restart must not pass for a lost race;
 //! - otherwise NOT FALSIFIED.
 
 use std::ffi::OsString;
@@ -546,23 +546,29 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
     eprintln!("P1 {name}: S disabled; killed C (process {c_pid}); waiting for C's restarted instance");
     c_running.wait();
 
-    // S is read once (see the module doc).
-    let s_pids = left_behind::logged(&s_log);
+    // S is read once (see the module doc): state, then the creation time, then the pid log.
     let s_status = raw_scm::query(&s.name);
     let s_stopped = s_status.dwCurrentState == SERVICE_STOPPED;
+    let s_state = raw_scm::state_name(s_status.dwCurrentState.0);
+    let s_created = (!s_stopped && disable_window.is_some()).then(|| {
+        creation_time_of(
+            s_status.dwProcessId,
+            &format!("S state {s_state}, process id {}", s_status.dwProcessId),
+        )
+    });
+    let s_pids = left_behind::logged(&s_log);
     let c_starts = left_behind::logged(&c_log).len();
+    let scm_entries = scm_entries_dump(&s.display_name);
     let s_read = format!(
-        "S read after C's restarted instance was up: state {}, process id {} (0 is none), pid log {s_pids:?}",
-        raw_scm::state_name(s_status.dwCurrentState.0),
+        "S read after C's restarted instance was up: state {s_state}, process id {} (0 is none), \
+         pid log {s_pids:?}; SCM log entries naming S, newest first: {scm_entries}",
         s_status.dwProcessId
     );
-    let scm_entries = scm_entries_dump(&s.display_name);
     let restarted = s_pids.len() > 1 || !s_stopped;
     let timing_line = match disable_window {
         None => String::from("S disabled before the crash, no timing read"),
         Some(window) if s_stopped && s_pids.len() > 1 => panic!(
-            "P1 {name}: S restarted and exited before it could be placed: {s_read}; {}; SCM log entries naming S, \
-             newest first: {scm_entries}",
+            "P1 {name}: S restarted but could not be placed: {s_read}; {}",
             window.describe_window()
         ),
         Some(window) if s_stopped => format!(
@@ -570,11 +576,7 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
             window.describe_window()
         ),
         Some(window) => {
-            let read = format!(
-                "{s_read}; {}; SCM log entries naming S, newest first: {scm_entries}",
-                window.describe_window()
-            );
-            let created = creation_time_of(s_status.dwProcessId, &read);
+            let created = s_created.expect("read above for a queued S that is not STOPPED");
             let timing_line = window.describe(created);
             let loss = match window.timing_of(created) {
                 RestartTiming::Before => {
@@ -587,9 +589,7 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
             };
             if let Some(loss) = loss {
                 return AttemptOutcome::RaceLost {
-                    evidence: format!(
-                        "{loss}; {timing_line}; {s_read}; SCM log entries naming S, newest first: {scm_entries}"
-                    ),
+                    evidence: format!("{loss}; {timing_line}; {s_read}"),
                 };
             }
             timing_line
@@ -597,7 +597,7 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
     };
     eprintln!(
         "P1 {name} RESULT: {s_read}; {timing_line}; S's start type read back afterwards {:?}; C starts {c_starts} (2 is \
-         the original and its restart). SCM log entries naming S, newest first: {scm_entries}",
+         the original and its restart).",
         s.start_type()
     );
     let verdict = if restarted {
