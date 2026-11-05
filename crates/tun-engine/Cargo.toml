@@ -97,6 +97,8 @@ rand = { version = "0.10", optional = true }
 
 [dev-dependencies]
 skuld = { workspace = true }
+# Pins the compile-time properties of `CoverLock` (`!Send`).
+static_assertions = "1.1"
 # `test-support`: lets route-record tests fail a read, and gives the state-directory tests their links.
 util = { path = "../util", features = ["test-support"] }
 hole-test-observability = { path = "../test-observability" }
