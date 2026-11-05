@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use util::dir::testing::{plant_link, user_dir, SystemScratch};
 
-use super::{boottime_witness, lockdown_state};
+use super::{boottime_witness, lockdown_state, CoverLock};
 
 /// A state directory that is a link to the folder the system owns, and the system's folder to look in: it is
 /// shared, so what it held before is what it must hold after.
@@ -28,7 +28,7 @@ fn lockdown_state_is_not_written_through_a_symlinked_state_directory() {
     let names = [lockdown_state::STATE_FILE_NAME];
     let before = present(&scratch, &names);
 
-    assert!(lockdown_state::set_enabled(&state_dir, true, None).is_err());
+    assert!(lockdown_state::set_enabled(&CoverLock::acquire(&state_dir), true, None).is_err());
 
     assert_eq!(
         present(&scratch, &names),
@@ -44,7 +44,7 @@ fn the_boottime_witness_is_not_written_through_a_symlinked_state_directory() {
     let before = present(&scratch, &names);
 
     // Reports no error by design; it must still write nothing.
-    boottime_witness::record_armed(&state_dir, None);
+    boottime_witness::record_armed(&CoverLock::acquire(&state_dir), None);
 
     assert_eq!(
         present(&scratch, &names),
@@ -103,7 +103,7 @@ fn lockdown_state_is_written_through_a_users_link_to_the_users_folder() {
     let state_dir = tmp.path().join("state");
     plant_link(&real, &state_dir);
 
-    lockdown_state::set_enabled(&state_dir, true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(&state_dir), true, None).unwrap();
 
     assert!(real.join(lockdown_state::STATE_FILE_NAME).is_file());
 }
@@ -132,7 +132,7 @@ fn readers() -> Vec<(&'static str, Reader<'static>)> {
             "lockdown_state::load_intent",
             Reader {
                 file: lockdown_state::STATE_FILE_NAME,
-                write_valid: &|dir| lockdown_state::set_enabled(dir, true, None).unwrap(),
+                write_valid: &|dir| lockdown_state::set_enabled(&CoverLock::acquire(dir), true, None).unwrap(),
                 reads_it: &|dir| lockdown_state::load_intent(dir) == lockdown_state::Intent::On,
             },
         ),
@@ -140,7 +140,7 @@ fn readers() -> Vec<(&'static str, Reader<'static>)> {
             "boottime_witness::load",
             Reader {
                 file: boottime_witness::STATE_FILE_NAME,
-                write_valid: &|dir| boottime_witness::record_armed(dir, None),
+                write_valid: &|dir| boottime_witness::record_armed(&CoverLock::acquire(dir), None),
                 reads_it: &|dir| boottime_witness::load(dir) == super::ArmingWitness::Armed,
             },
         ),

@@ -160,21 +160,32 @@ impl crate::routing::CoverGuard for Cover {
     fn disarm(self) {
         self._inner.detach();
     }
+
+    fn release(self, lock: &CoverLock) {
+        self._inner.release(lock);
+    }
+
+    fn is_current(&self) -> bool {
+        self._inner.is_current()
+    }
 }
 
 /// Engage the cover blocking all egress except loopback, `server_ip`, and
 /// (when `Some`) `resolver_ip` — see [`crate::routing::Routing::install_failclosed_cover`]
 /// for what a caller must already have demonstrated to pass `Some` here.
 /// `state_dir` is where macOS persists its enable token for crash recovery
-/// (unused on Windows). On failure the host is left uncovered.
+/// (unused on Windows), taken from `lock`. On failure the host is left uncovered.
+///
+/// The returned guard is stamped by `lock`: it releases only while no later install or completed sweep of the
+/// transient cover has happened ([`CoverLock::stamp_install`]).
 pub fn engage(
+    lock: &CoverLock,
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
-    state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     Ok(Cover {
-        _inner: platform::engage(server_ip, resolver_ip, state_dir, owner)?,
+        _inner: platform::engage(lock, server_ip, resolver_ip, owner)?,
     })
 }
 
@@ -183,8 +194,12 @@ pub fn engage(
 /// startup. When `adopting` is true a standing lockdown cover is being adopted,
 /// so the transient restore must leave the lockdown ruleset in force (macOS
 /// skips the `/etc/pf.conf` reload).
-pub fn recover_cover(state_dir: &Path, adopting: bool) {
-    platform::recover_cover(state_dir, adopting);
+///
+/// Returns no outcome, so it outdates the transient stamps unconditionally; no guard exists at its one
+/// production call (bridge startup).
+pub fn recover_cover(lock: &CoverLock, adopting: bool) {
+    platform::recover_cover(lock.state_dir(), adopting);
+    lock.outdate_stamps(CoverKind::Transient);
 }
 
 /// Engage the standing lockdown cover (loopback + TUN + onward-server + —on
@@ -209,22 +224,22 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// the platform engage, bound to the commit — see `windows.rs`'s
 /// `commit_and_record`.
 pub fn engage_lockdown(
+    lock: &CoverLock,
     server_ip: IpAddr,
     tun_name: &str,
     resolver: &dyn LuidResolver,
     app_ids: &[std::path::PathBuf],
-    state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     #[cfg(target_os = "windows")]
     let inner = {
         let luid = resolver.resolve(tun_name)?;
-        platform::engage_lockdown(server_ip, luid, app_ids, state_dir, owner)?
+        platform::engage_lockdown(lock, server_ip, luid, app_ids, owner)?
     };
     #[cfg(target_os = "macos")]
     let inner = {
         let _ = (resolver, app_ids);
-        platform::engage_lockdown(server_ip, tun_name, state_dir, owner)?
+        platform::engage_lockdown(lock, server_ip, tun_name, owner)?
     };
     Ok(Cover { _inner: inner })
 }
@@ -273,7 +288,7 @@ pub(crate) fn recovery_dispatch(decision: crate::routing::CoverRecovery) -> Reco
 /// doc — the file's absence is not evidence the reclaim is unneeded). On
 /// `Adopt` it gates a narrow reclaim (see [`reclaim_stale_tun_permit`]); the
 /// rest of the decision's OS behaviour is unaffected by it.
-pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path, tun_name: Option<&str>) {
+pub fn recover_lockdown(lock: &CoverLock, decision: crate::routing::CoverRecovery, tun_name: Option<&str>) {
     match recovery_dispatch(decision) {
         RecoveryDispatch::Inert => {
             // The standing cover itself is untouched: it must survive the
@@ -307,7 +322,7 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Pat
             // deletes that sibling, so no later sweep can re-derive it. "The
             // next start sweeps again" — the justification this discard used
             // to carry — is false for exactly that reason.
-            match disengage_lockdown(state_dir) {
+            match disengage_lockdown(lock) {
                 Ok(_clearance_is_persisted_not_reported_at_startup) => {}
                 Err(e) => {
                     tracing::warn!(
@@ -365,9 +380,9 @@ pub fn reclaim_stale_tun_permit(tun_name: &str) {
 /// and this is the last moment anything will look at one. macOS answers
 /// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
 /// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
-pub fn disengage_lockdown(state_dir: &Path) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(state_dir, None, |witness| {
-        platform::disengage_lockdown(state_dir, witness)
+pub fn disengage_lockdown(lock: &CoverLock) -> Result<Clearance, RoutingError> {
+    sweep_with_witness(lock, None, &[CoverKind::Lockdown], |witness| {
+        platform::disengage_lockdown(lock.state_dir(), witness)
     })
 }
 
@@ -441,8 +456,10 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// Windows keeps no cover state file at all: the filter set is compiled-in
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or
 /// version-skewed and nothing to erase — only GUID sweeps run there.
-pub fn release_all(state_dir: &Path) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(state_dir, None, |witness| platform::release_all(state_dir, witness))
+pub fn release_all(lock: &CoverLock) -> Result<Clearance, RoutingError> {
+    sweep_with_witness(lock, None, &[CoverKind::Transient, CoverKind::Lockdown], |witness| {
+        platform::release_all(lock.state_dir(), witness)
+    })
 }
 
 // Release clearance ===================================================================================================
@@ -1005,10 +1022,12 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 /// too, and the sequence where that matters is equally undrivable from a type
 /// that throws them away.
 fn sweep_with_witness(
-    state_dir: &Path,
+    lock: &CoverLock,
     owner: Option<(u32, u32)>,
+    swept: &[CoverKind],
     sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
+    let state_dir = lock.state_dir();
     // Announced before the sweep's first firewall call, held through the
     // witness write: an engage that overlaps any of it backs out. It supersedes
     // by default; only a sweep that reports it never reached the firewall
@@ -1031,7 +1050,14 @@ fn sweep_with_witness(
     }
     match failure {
         Some(e) => Err(e),
-        None => Ok(clearance),
+        None => {
+            // Only a sweep that completed took what a held guard holds. A failed one leaves the stamps, so the
+            // guard's drop still retries its deletes.
+            for kind in swept {
+                lock.outdate_stamps(*kind);
+            }
+            Ok(clearance)
+        }
     }
 }
 

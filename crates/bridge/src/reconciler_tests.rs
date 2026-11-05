@@ -7,7 +7,7 @@ use crate::proxy_manager::proxy_manager_tests::{MockProxy, MockRouting};
 use crate::proxy_manager::ProxyState;
 use crate::test_support::rt;
 use crate::test_support::target_records;
-use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::failclosed::{lockdown_state, CoverLock};
 use tun_engine::routing::{CoverRecovery, Recovery};
 
 fn test_config() -> ProxyConfig {
@@ -271,7 +271,7 @@ fn connectable() -> Target {
 fn a_persisted_connected_target_reconciles_at_startup_with_no_gui() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -617,8 +617,8 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
 /// destroyed: shifting a call site's line must not change its identity.
 #[skuld::test]
 fn the_sanctioned_caller_guard_survives_line_shifts() {
-    let src = "fn alpha() {\n    something();\n}\n\nfn beta() {\n    routing.release_all_covers()?;\n}\n";
-    let shifted = "fn alpha() {\n    something();\n}\n\n// an unrelated comment\n\nfn beta() {\n    routing.release_all_covers()?;\n}\n";
+    let src = "fn alpha() {\n    something();\n}\n\nfn beta() {\n    routing.release_all_covers(&routing.lock_covers())?;\n}\n";
+    let shifted = "fn alpha() {\n    something();\n}\n\n// an unrelated comment\n\nfn beta() {\n    routing.release_all_covers(&routing.lock_covers())?;\n}\n";
 
     let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
     let before = call_sites_by_function(src, &pattern);
@@ -641,7 +641,7 @@ fn the_sanctioned_caller_guard_survives_line_shifts() {
 #[skuld::test]
 fn the_cover_release_pattern_catches_the_free_function_too() {
     let src = "fn stray() {\n    tun_engine::routing::failclosed::release_all(&state_dir)?;\n}\n\n\
-               fn viaz_trait() {\n    routing.release_all_covers()?;\n}\n";
+               fn viaz_trait() {\n    routing.release_all_covers(&routing.lock_covers())?;\n}\n";
     let sites = call_sites_by_function(src, &cover_release_pattern());
 
     let names: Vec<&str> = sites.iter().map(|(f, _)| f.as_str()).collect();
@@ -663,7 +663,7 @@ fn the_cover_release_pattern_ignores_the_release_internals() {
 /// walk must not stop early or attribute it to the previous function.
 #[skuld::test]
 fn a_call_inside_a_closure_belongs_to_its_enclosing_function() {
-    let src = "fn alpha() {\n    noop();\n}\n\nasync fn gamma() {\n    let f = || {\n        routing.release_all_covers()?;\n    };\n}\n";
+    let src = "fn alpha() {\n    noop();\n}\n\nasync fn gamma() {\n    let f = || {\n        routing.release_all_covers(&routing.lock_covers())?;\n    };\n}\n";
     let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
     let sites = call_sites_by_function(src, &pattern);
     assert_eq!(sites.len(), 1, "expected exactly one call site, got {sites:?}");
@@ -681,7 +681,7 @@ fn a_call_inside_a_closure_belongs_to_its_enclosing_function() {
 fn a_cancelled_boot_reconcile_abandons_the_start() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -1077,7 +1077,7 @@ fn a_failed_boot_connect_leaves_the_host_reachable() {
         let dir = tempfile::tempdir().unwrap();
         // Kill switch OFF — the only case where the transient cover decides
         // the outcome. With it on, the standing cover governs instead.
-        lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
         target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());

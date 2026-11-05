@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
-use tun_engine::routing::failclosed::{watch_releases, Overtaken, ReleaseWatch};
+use tun_engine::routing::failclosed::{watch_releases, CoverLock, Overtaken, ReleaseWatch};
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
 
 use crate::reconciler::{teardown_cover_disposition, transient_cover_disposition, CoverDisposition};
@@ -749,13 +749,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// cannot honor a kill switch it cannot persist (a silent `Ok(())` would be
     /// a fail-open footgun — the GUI would believe lockdown is armed when
     /// nothing was written).
-    pub fn set_lockdown_intent(&self, enabled: bool) -> Result<(), ProxyError> {
+    pub fn set_lockdown_intent(&self, lock: &CoverLock, enabled: bool) -> Result<(), ProxyError> {
         let dir = self.state_dir.as_deref().ok_or_else(|| {
             ProxyError::Runtime(std::io::Error::other(
                 "cannot set lockdown intent: bridge has no state_dir to persist it",
             ))
         })?;
-        lockdown_state::set_enabled(dir, enabled, self.state_owner)
+        assert_eq!(
+            lock.state_dir(),
+            dir,
+            "the lockdown intent is written under the cover lock of its own state dir"
+        );
+        lockdown_state::set_enabled(lock, enabled, self.state_owner)
             .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
     }
 
@@ -790,6 +795,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// (`cutover::release_covers`) is the one caller for which it is not, and
     /// it reads the `Clearance` this path drops.
     pub fn turn_lockdown_off(&mut self) -> Result<(), ProxyError> {
+        let lock = self.routing.lock_covers();
         // Drop any held transient guard's in-process authority first. Not a
         // condition — a no-op when nothing is pending — it exists so no live
         // guard outlives the OS objects `release_all_covers` is about to
@@ -800,7 +806,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // gating it on a presence probe is a check-then-act guard on an
         // operation that needs none — and at an explicit disarm a stale
         // `Absent` is the one wrong answer that matters.
-        self.routing.release_all_covers()?;
+        self.routing.release_all_covers(&lock)?;
         // The clear confirmed, so the host is open: an adopted cover no
         // longer holds it. Dropping this claim is what stops the tray
         // from rendering `Lockdown: On` over an open host for the life
@@ -811,7 +817,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // the host is open, or `cover_step` said none needed releasing; a
         // persist failure here means only the SETTING did not save, which
         // the caller must be able to say distinctly from a failed release.
-        self.set_lockdown_intent(false)
+        self.set_lockdown_intent(&lock, false)
             .map_err(|source| ProxyError::LockdownIntentNotPersisted {
                 source: Box::new(source),
             })
@@ -1100,7 +1106,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // engage has no prior cover to preserve, so `pin` (fresh
                 // from resolve, or a first same-host reuse) is correct as-is.
                 let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
-                match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
+                match self.engage_transient_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
                         // Any verdict drops the fresh cover: a release in flight may already have run its
                         // deletes before this install, so keeping the cover could strand a live block no
@@ -1124,7 +1130,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             return Err(self.cancelled_start(StartCancel::Overtaken(verdict)));
                         }
                         if let Some((old_permit, original_pin)) = repair_fallback {
-                            match self.routing.install_failclosed_cover(server_ip, old_permit) {
+                            match self.engage_transient_cover(server_ip, old_permit) {
                                 Ok(cover) => {
                                     if let Err(verdict) = overtaken_by_release(release_watch.as_ref()) {
                                         drop(cover);
@@ -1315,6 +1321,16 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Err(e)
             }
         }
+    }
+
+    /// Engage the transient cover under the cover lock. No `.await` while it is held.
+    fn engage_transient_cover(
+        &self,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+    ) -> Result<R::Cover, tun_engine::RoutingError> {
+        let lock = self.routing.lock_covers();
+        self.routing.install_failclosed_cover(&lock, server_ip, resolver_ip)
     }
 
     /// The one exit of a cancelled start, whether the user or a release cancelled it, early or late. A user cancel
@@ -1895,26 +1911,21 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // unwind, tearing down — the opposite of the transient cover's
         // fail-open. Committed only on the Ok path (the field below).
         let lockdown = if standing_cover_expected {
-            match routing.install_lockdown(server_ip, &tun_identity, &app_ids) {
-                Ok(cover) => {
-                    // One read; any verdict drops the fresh cover (never `disarm`): a release in flight may
-                    // have run its deletes before this install, and the intent is still on, so the next start
-                    // installs again. A held cover is never decided this way (`BlockedStart::stands`).
-                    if let Err(verdict) = overtaken_by_release(release_watch) {
-                        drop(cover);
-                        if let Some(mut d) = dispatcher.take() {
-                            d.shutdown().await;
-                        }
-                        return Err(ProxyError::Overtaken(verdict));
-                    }
-                    promote_adopted_claim(state_dir, owner);
-                    Some(cover)
-                }
+            match install_standing_cover(
+                routing,
+                server_ip,
+                &tun_identity,
+                &app_ids,
+                release_watch,
+                state_dir,
+                owner,
+            ) {
+                Ok(cover) => Some(cover),
                 Err(e) => {
                     if let Some(mut d) = dispatcher.take() {
                         d.shutdown().await;
                     }
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         } else {
@@ -2186,7 +2197,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // the claim only on a CONFIRMED open host: a false clear here
                 // is Rule #0 territory, the Unblock item disappearing exactly
                 // when it is still needed.
-                match self.routing.release_all_covers() {
+                let lock = self.routing.lock_covers();
+                match self.routing.release_all_covers(&lock) {
                     Ok(()) => self.set_standing_cover_adopted(false),
                     Err(e) => tracing::warn!(
                         error = &e as &dyn std::error::Error,
@@ -2194,6 +2206,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     ),
                 }
                 drop(cover);
+                drop(lock);
             }
             CoverDisposition::KeepEngaged => {
                 if let Some(c) = cover {
@@ -2382,6 +2395,29 @@ fn overtaken_by_release(watch: Option<&ReleaseWatch>) -> Result<(), Overtaken> {
     }
 }
 
+/// Install the standing cover under the cover lock, a sync section so the lock is never held across an `.await`.
+/// One read; any verdict drops the fresh cover (never `disarm`): a release in flight may have run its deletes
+/// before this install, and the intent is still on, so the next start installs again. A held cover is never
+/// decided this way (`BlockedStart::stands`).
+fn install_standing_cover<R: Routing>(
+    routing: &R,
+    server_ip: IpAddr,
+    tun: &tun_engine::TunIdentity,
+    app_ids: &[std::path::PathBuf],
+    release_watch: Option<&ReleaseWatch>,
+    state_dir: Option<&std::path::Path>,
+    owner: Option<(u32, u32)>,
+) -> Result<R::Cover, ProxyError> {
+    let lock = routing.lock_covers();
+    let cover = routing.install_lockdown(&lock, server_ip, tun, app_ids)?;
+    if let Err(verdict) = overtaken_by_release(release_watch) {
+        drop(cover);
+        return Err(ProxyError::Overtaken(verdict));
+    }
+    promote_adopted_claim(&lock, state_dir, owner);
+    Ok(cover)
+}
+
 /// Write the armed state to `bridge-lockdown.json` the moment an adopted claim
 /// is first honoured by a real `install_lockdown`. A cover this bridge just
 /// installed is first-hand evidence, stronger than the startup measurement
@@ -2397,12 +2433,17 @@ fn overtaken_by_release(watch: Option<&ReleaseWatch>) -> Result<(), Overtaken> {
 ///
 /// Best-effort: the write only makes the preference durable, and failing the
 /// connect over a bookkeeping error would be the worse trade.
-fn promote_adopted_claim(state_dir: Option<&std::path::Path>, owner: Option<(u32, u32)>) {
+fn promote_adopted_claim(lock: &CoverLock, state_dir: Option<&std::path::Path>, owner: Option<(u32, u32)>) {
     let Some(dir) = state_dir else {
         warn!("lockdown: standing cover installed with no state_dir; the kill switch cannot be persisted");
         return;
     };
-    if let Err(e) = lockdown_state::promote_unrecorded(dir, owner) {
+    assert_eq!(
+        lock.state_dir(),
+        dir,
+        "the adopted claim is promoted under the cover lock of its own state dir"
+    );
+    if let Err(e) = lockdown_state::promote_unrecorded(lock, owner) {
         warn!(
             error = &e as &dyn std::error::Error,
             "lockdown: could not persist the adopted kill switch; it will not survive this run"

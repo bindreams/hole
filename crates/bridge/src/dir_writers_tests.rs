@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use hole_common::logging::dir_rotate::DirRotate;
 use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE};
+use tun_engine::routing::failclosed::CoverLock;
 use tun_engine::routing::state as route_state;
 use util::dir::testing::{plant_link, user_dir};
 use util::dir::{Dir, Refusal};
@@ -431,7 +432,9 @@ fn writers() -> Vec<Writer> {
             names: &[lockdown_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, owner| lockdown_state::set_enabled(dir, true, owner).map_err(io::Error::other),
+            run: |dir, owner| {
+                lockdown_state::set_enabled(&CoverLock::acquire(dir), true, owner).map_err(io::Error::other)
+            },
         },
         Writer {
             name: "the lockdown state, promoted",
@@ -441,9 +444,9 @@ fn writers() -> Vec<Writer> {
             runs_here: true,
             run: |dir, owner| {
                 // It writes only where nothing is recorded, and leaves what it cannot read as it found it.
-                match lockdown_state::promote_unrecorded(dir, owner).map_err(io::Error::other)? {
+                match lockdown_state::promote_unrecorded(&CoverLock::acquire(dir), owner).map_err(io::Error::other)? {
                     lockdown_state::PromoteOutcome::Wrote => Ok(()),
-                    lockdown_state::PromoteOutcome::Declined(intent) => match intent {
+                    lockdown_state::PromoteOutcome::Declined => match lockdown_state::load_intent(dir) {
                         lockdown_state::Intent::Unreadable => Err(io::Error::other(LeftAsItIs)),
                         lockdown_state::Intent::On | lockdown_state::Intent::Off | lockdown_state::Intent::Unset => {
                             Ok(())
@@ -459,7 +462,7 @@ fn writers() -> Vec<Writer> {
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
             run: |dir, owner| {
-                boottime_witness::record_armed_for_test(dir, owner);
+                boottime_witness::record_armed_for_test(&CoverLock::acquire(dir), owner);
                 Ok(())
             },
         },

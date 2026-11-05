@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tun_engine::gateway::{GatewayInfo, NextHop};
-use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::failclosed::{lockdown_state, CoverKind, CoverLock, InstallStamp};
 use tun_engine::routing::{self, state as route_state, RouteId, RoutedFamilies, RoutesInstalled, Routing};
 use tun_engine::{RoutingError, TunIdentity};
 
@@ -527,6 +527,7 @@ impl Routing for MockRouting {
 
     fn install_failclosed_cover(
         &self,
+        lock: &CoverLock,
         server_ip: IpAddr,
         resolver_ip: Option<IpAddr>,
     ) -> Result<MockCover, RoutingError> {
@@ -561,11 +562,13 @@ impl Routing for MockRouting {
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: false,
+            stamp: lock.stamp_install(CoverKind::Transient),
         })
     }
 
     fn install_lockdown(
         &self,
+        lock: &CoverLock,
         _server_ip: IpAddr,
         tun: &TunIdentity,
         _app_ids: &[std::path::PathBuf],
@@ -582,10 +585,15 @@ impl Routing for MockRouting {
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: true,
+            stamp: lock.stamp_install(CoverKind::Lockdown),
         })
     }
 
-    fn release_all_covers(&self) -> Result<(), RoutingError> {
+    fn lock_covers(&self) -> CoverLock {
+        CoverLock::acquire(&self.state_dir)
+    }
+
+    fn release_all_covers(&self, lock: &CoverLock) -> Result<(), RoutingError> {
         self.state.release_all_calls.fetch_add(1, Ordering::SeqCst);
         // As `failclosed::release_all`: the guard supersedes when it ends, unless the release failed before it
         // changed anything.
@@ -594,8 +602,10 @@ impl Routing for MockRouting {
             release.changed_nothing();
             return Err(RoutingError::RouteSetup("mock release_all_covers failure".into()));
         }
-        // Unconditional clear, mirroring `failclosed::release_all`.
+        // Unconditional clear, mirroring `failclosed::release_all`: a completed sweep outdates every guard.
         *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
+        lock.outdate_stamps(CoverKind::Transient);
+        lock.outdate_stamps(CoverKind::Lockdown);
         Ok(())
     }
 
@@ -640,6 +650,30 @@ pub(crate) struct MockCover {
     /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
     /// the kind-aware `failclosed::Cover`.
     lockdown: bool,
+    /// Which install this guard came from, as the real guards carry it: a guard a later install or a completed
+    /// sweep outdated disengages nothing.
+    stamp: InstallStamp,
+}
+
+impl MockCover {
+    /// What a disengage does, as the real guard's does: counted and, for the standing cover, the presence probe
+    /// stops finding it.
+    fn disengage(state: &MockRoutingState, lockdown: bool) {
+        if lockdown {
+            state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
+            state.teardown_order.lock().unwrap().push("lockdown");
+            // Mirrors the real OS: an actual disengage (not `disarm`, which
+            // `mem::forget`s this guard and never runs `Drop`) is what a
+            // subsequent `lockdown_cover_presence` probe would no longer find
+            // — UNLESS this Drop's own disengage attempt is simulated as
+            // failing to confirm too (`fail_lockdown_disengage_on_drop`).
+            if !state.fail_lockdown_disengage_on_drop.load(Ordering::SeqCst) {
+                *state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
+            }
+        } else {
+            state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Drop for MockCover {
@@ -648,20 +682,8 @@ impl Drop for MockCover {
         if let Some(hook) = hook {
             hook();
         }
-        if self.lockdown {
-            self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
-            self.state.teardown_order.lock().unwrap().push("lockdown");
-            // Mirrors the real OS: an actual disengage (not `disarm`, which
-            // `mem::forget`s this guard and never runs `Drop`) is what a
-            // subsequent `lockdown_cover_presence` probe would no longer find
-            // — UNLESS this Drop's own disengage attempt is simulated as
-            // failing to confirm too (`fail_lockdown_disengage_on_drop`).
-            if !self.state.fail_lockdown_disengage_on_drop.load(Ordering::SeqCst) {
-                *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
-            }
-        } else {
-            self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
-        }
+        self.stamp
+            .release_on_drop(|| Self::disengage(&self.state, self.lockdown));
     }
 }
 
@@ -671,6 +693,15 @@ impl tun_engine::routing::CoverGuard for MockCover {
     /// cover instead of disengaging it.
     fn disarm(self) {
         std::mem::forget(self);
+    }
+
+    /// Under the held lock a drop IS the explicit release, so this is one.
+    fn release(self, _lock: &CoverLock) {
+        drop(self);
+    }
+
+    fn is_current(&self) -> bool {
+        self.stamp.is_current()
     }
 }
 
@@ -688,6 +719,7 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
 
     let cover = routing
         .install_lockdown(
+            &routing.lock_covers(),
             IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
             &TunIdentity::synthetic(0xFEED, "hole-tun"),
             &[],
@@ -704,12 +736,59 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
 }
 
 #[skuld::test]
+fn a_stale_guard_release_after_a_completed_sweep_deletes_nothing() {
+    // The stamp rule the real guards follow: a completed sweep took what the guard held, so its later drop (or
+    // release) must not disengage a second time.
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let transient = routing
+        .install_failclosed_cover(&routing.lock_covers(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None)
+        .unwrap();
+    let standing = routing
+        .install_lockdown(
+            &routing.lock_covers(),
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            &TunIdentity::synthetic(0xFEED, "hole-tun"),
+            &[],
+        )
+        .unwrap();
+    assert!(transient.is_current() && standing.is_current());
+
+    routing.release_all_covers(&routing.lock_covers()).unwrap();
+    assert!(!transient.is_current() && !standing.is_current());
+    drop(transient);
+    drop(standing);
+
+    assert_eq!(state.cover_disengage_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+}
+
+#[skuld::test]
+fn a_failed_release_leaves_a_guard_current_so_its_drop_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let transient = routing
+        .install_failclosed_cover(&routing.lock_covers(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None)
+        .unwrap();
+    state.fail_release.store(true, Ordering::SeqCst);
+
+    assert!(routing.release_all_covers(&routing.lock_covers()).is_err());
+    assert!(transient.is_current());
+    drop(transient);
+
+    assert_eq!(state.cover_disengage_calls.load(Ordering::SeqCst), 1);
+}
+
+#[skuld::test]
 fn mock_failing_lockdown_returns_err_without_recording() {
     let dir = tempfile::tempdir().unwrap();
     let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
     let state = routing.state();
 
     let result = routing.install_lockdown(
+        &routing.lock_covers(),
         IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
         &TunIdentity::synthetic(0xFEED, "hole-tun"),
         &[],
@@ -783,7 +862,7 @@ fn new_manager_with_lockdown(
     dir: tempfile::TempDir,
     enabled: bool,
 ) -> (ProxyManager<MockProxy, MockRouting>, tempfile::TempDir) {
-    lockdown_state::set_enabled(dir.path(), enabled, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), enabled, None).unwrap();
     let pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
     (pm, dir)
 }
@@ -905,7 +984,7 @@ fn install_and_lockdown_name_the_device_dns_was_given() {
         let dns_state = dns.state_handle();
 
         let dir = tempfile::tempdir().unwrap();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let routing_state = routing.state();
         let (pm, dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
@@ -1628,7 +1707,7 @@ fn mock_cover_engage_disengage_never_spawns() {
     let st = routing.state();
     for _ in 0..10 {
         let cover = routing
-            .install_failclosed_cover("1.2.3.4".parse().unwrap(), None)
+            .install_failclosed_cover(&routing.lock_covers(), "1.2.3.4".parse().unwrap(), None)
             .unwrap();
         drop(cover);
     }
@@ -1646,13 +1725,13 @@ fn mock_install_failclosed_cover_records_the_resolver_argument() {
     let resolver: IpAddr = "9.9.9.9".parse().unwrap();
 
     let cover = routing
-        .install_failclosed_cover("1.2.3.4".parse().unwrap(), Some(resolver))
+        .install_failclosed_cover(&routing.lock_covers(), "1.2.3.4".parse().unwrap(), Some(resolver))
         .unwrap();
     assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver));
     drop(cover);
 
     let cover = routing
-        .install_failclosed_cover("1.2.3.4".parse().unwrap(), None)
+        .install_failclosed_cover(&routing.lock_covers(), "1.2.3.4".parse().unwrap(), None)
         .unwrap();
     assert_eq!(
         *st.last_cover_resolver_ip.lock().unwrap(),
@@ -6331,7 +6410,9 @@ mod self_test {
 
             let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
             let second_routing = MockRouting::new(dir.path().to_path_buf());
-            let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
+            let cover = second_routing
+                .install_failclosed_cover(&second_routing.lock_covers(), server_ip, None)
+                .unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
                 host: cfg.server.server.expose().to_string(),
@@ -6359,7 +6440,9 @@ mod self_test {
 
             let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
             let second_routing = MockRouting::new(dir.path().to_path_buf());
-            let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
+            let cover = second_routing
+                .install_failclosed_cover(&second_routing.lock_covers(), server_ip, None)
+                .unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
                 host: cfg.server.server.expose().to_string(),
@@ -6768,7 +6851,7 @@ fn lockdown_reads_honor_an_out_of_process_off_over_a_stale_claim() {
     let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
     pm.set_standing_cover_adopted(true);
 
-    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
 
     assert!(
         !pm.lockdown_enabled(),
@@ -6792,7 +6875,7 @@ fn an_out_of_process_unlock_prevents_the_next_start_from_re_engaging_the_cover()
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         pm.set_standing_cover_adopted(true);
 
-        lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
 
         pm.start(&test_config()).await.unwrap();
         assert_eq!(
@@ -6812,9 +6895,9 @@ fn promote_adopted_claim_does_not_clobber_a_recorded_off() {
     // `lockdown_state::set_enabled` call `cutover::unlock_with` makes on the
     // running bridge's state_dir, bypassing every in-process setter.
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
 
-    promote_adopted_claim(Some(dir.path()), None);
+    promote_adopted_claim(&CoverLock::acquire(dir.path()), Some(dir.path()), None);
 
     assert_eq!(
         lockdown_state::load_intent(dir.path()),
@@ -6826,7 +6909,7 @@ fn promote_adopted_claim_does_not_clobber_a_recorded_off() {
 #[skuld::test]
 fn promote_adopted_claim_arms_an_unset_intent() {
     let unset = tempfile::tempdir().unwrap();
-    promote_adopted_claim(Some(unset.path()), None);
+    promote_adopted_claim(&CoverLock::acquire(unset.path()), Some(unset.path()), None);
     assert_eq!(lockdown_state::load_intent(unset.path()), lockdown_state::Intent::On);
 }
 
@@ -6838,7 +6921,7 @@ fn promote_adopted_claim_leaves_an_unreadable_intent_as_it_is() {
     let bytes: &[u8] = br#"{"version":2,"enabled":false}"#;
     std::fs::write(&path, bytes).unwrap();
 
-    promote_adopted_claim(Some(unreadable.path()), None);
+    promote_adopted_claim(&CoverLock::acquire(unreadable.path()), Some(unreadable.path()), None);
 
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert_eq!(

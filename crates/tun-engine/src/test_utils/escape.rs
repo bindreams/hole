@@ -3,7 +3,7 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use crate::routing::failclosed::release_all;
+use crate::routing::failclosed::{release_all, CoverLock};
 
 /// What one test's recovery record is called and what it says may be engaged.
 /// A file name per test so two lanes never overwrite each other's evidence.
@@ -139,7 +139,7 @@ impl Drop for EscapeGuard {
     fn drop(&mut self) {
         // Must not panic: this may run during an unwind.
         let dir = self.state_dir().to_path_buf();
-        let Err(e) = release_all(&dir) else {
+        let Err(e) = release_all(&CoverLock::acquire(&dir)) else {
             if let Err(e) = std::fs::remove_file(&self.record_path) {
                 eprintln!("HARNESS: failed to remove recovery record {:?}: {e}", self.record_path);
             }

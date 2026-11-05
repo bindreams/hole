@@ -60,14 +60,17 @@ use crate::{GLOBAL_NET_STATE, TUN};
 /// Test-only: wraps [`RealEngageOps`] rather than reimplementing it, and leaves
 /// production `engage`/`engage_with` untouched.
 fn engage_publishing(
+    lock: &CoverLock,
     server_ip: IpAddr,
-    state_dir: &std::path::Path,
     permitted_idx: &std::sync::atomic::AtomicUsize,
     commit_gen: &std::sync::atomic::AtomicUsize,
     server_idx: usize,
 ) -> Result<Cover, RoutingError> {
     let mut ops = PublishOnCommit {
-        inner: RealEngageOps { state_dir, owner: None },
+        inner: RealEngageOps {
+            state_dir: lock.state_dir(),
+            owner: None,
+        },
         permitted_idx,
         commit_gen,
         server_idx,
@@ -75,8 +78,8 @@ fn engage_publishing(
     let token = engage_with(server_ip, None, &mut ops)?;
     Ok(Cover {
         token,
-        state_dir: state_dir.to_owned(),
-        kind: CoverKind::Transient,
+        state_dir: lock.state_dir().to_owned(),
+        stamp: lock.stamp_install(CoverKind::Transient),
     })
 }
 
@@ -407,7 +410,8 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
             // after it: the host is KNOWN blocked from this point on, so the prober
             // pool spawned below needs no phase carve-out.
             let mut held: Option<Cover> = Some(
-                engage(addrs[0].parse().unwrap(), None, dir.path(), None).expect("cold engage real pf transient cover"),
+                engage(&CoverLock::acquire(dir.path()), addrs[0].parse().unwrap(), None, None)
+                    .expect("cold engage real pf transient cover"),
             );
             // The permitted server answers on both sides of the block probe, so a network loss cannot
             // pass for a block. The cover is released by `held` on an early return.
@@ -576,8 +580,14 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                     // `engage_publishing` publishes `permitted_idx` and `commit_gen`
                     // itself, synchronously at the real `pfctl -f -` commit — see its
                     // doc comment.
-                    let new_cover = engage_publishing(server_ip, dir.path(), &permitted_idx, &commit_gen, server_idx)
-                        .expect("engage real pf transient cover");
+                    let new_cover = engage_publishing(
+                        &CoverLock::acquire(dir.path()),
+                        server_ip,
+                        &permitted_idx,
+                        &commit_gen,
+                        server_idx,
+                    )
+                    .expect("engage real pf transient cover");
                     if let Some(old) = held.take() {
                         // Retire the OLD cover's pf enable refcount only — never its
                         // normal Drop, which would reload /etc/pf.conf (a pass-all host)
@@ -828,7 +838,8 @@ fn macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage() {
 
     // 3. Engage the transient cover over that live flow, and read the state
     //    table back while the cover is still the loaded ruleset.
-    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let cover = engage(&CoverLock::acquire(dir.path()), PERMITTED.parse().unwrap(), None, None)
+        .expect("engage the transient cover");
     let after = states();
     // Restore before asserting: a failure must not leave the machine behind a
     // block-all cover while the panic unwinds.
@@ -990,7 +1001,8 @@ fn macos_failclosed_cover_load_never_drops_a_loopback_datagram() {
     // A real cover: pf enabled, a blocking ruleset live, state file written.
     // RAII, so every exit path restores `/etc/pf.conf` — the guarded leg below
     // consumes it deliberately, inside the probe.
-    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let cover = engage(&CoverLock::acquire(dir.path()), PERMITTED.parse().unwrap(), None, None)
+        .expect("engage the transient cover");
 
     // The pre-fix ruleset shape: `set skip on lo0` and nothing else exempting
     // loopback.
@@ -1111,7 +1123,8 @@ fn macos_failclosed_cover_engage_does_not_sever_established_loopback_flows() {
         .expect("NETWORK/ENVIRONMENT problem (not the cover): a pre-cover loopback byte must arrive");
 
     let dir = tempfile::tempdir().unwrap();
-    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let cover = engage(&CoverLock::acquire(dir.path()), PERMITTED.parse().unwrap(), None, None)
+        .expect("engage the transient cover");
 
     // The actual assertion: a MID-STREAM segment, the exact packet a
     // `flags S/SA` pass rule could not match after the purge. Write and read

@@ -109,7 +109,7 @@ use util::versioned_file::{
     Change, DefaultPlacement, Generation, Loaded, Obsolete, Role, Schema, StoreError, VersionedFile, VersionedState,
 };
 
-use super::ArmingWitness;
+use super::{ArmingWitness, CoverLock};
 
 /// Filename under `state_dir`.
 pub const STATE_FILE_NAME: &str = "bridge-boottime.json";
@@ -196,8 +196,8 @@ fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> Result<(), 
 /// reason `readback` gives: the rule it encodes is platform-free and a rule
 /// proved only where the hazard lives is proved nowhere else.
 #[cfg(any(target_os = "windows", test, feature = "test-utils"))]
-pub(crate) fn record_armed(state_dir: &Path, owner: Option<(u32, u32)>) {
-    write_or_warn(state_dir, true, owner);
+pub(crate) fn record_armed(lock: &CoverLock, owner: Option<(u32, u32)>) {
+    write_or_warn(lock.state_dir(), true, owner);
 }
 
 /// Arm the record from a test in a DOWNSTREAM crate, which cannot reach
@@ -211,8 +211,8 @@ pub(crate) fn record_armed(state_dir: &Path, owner: Option<(u32, u32)>) {
 /// `owner` is passed through to the write, so a writer-table row can supply one.
 /// Behind `test-utils`, so no production build can reach it.
 #[cfg(feature = "test-utils")]
-pub fn record_armed_for_test(state_dir: &Path, owner: Option<(u32, u32)>) {
-    record_armed(state_dir, owner);
+pub fn record_armed_for_test(lock: &CoverLock, owner: Option<(u32, u32)>) {
+    record_armed(lock, owner);
 }
 
 /// What a sweep's own observations say the record should now hold.

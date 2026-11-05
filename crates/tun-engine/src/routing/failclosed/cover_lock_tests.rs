@@ -15,14 +15,14 @@ fn dir() -> tempfile::TempDir {
 
 /// A fake cover guard: its drop runs `deleted` through the stamp exactly as a platform guard's does.
 struct FakeCover {
-    stamp: Option<InstallStamp>,
+    stamp: InstallStamp,
     deleted: Rc<Cell<u32>>,
 }
 
 impl FakeCover {
     fn install(lock: &CoverLock, kind: CoverKind, deleted: &Rc<Cell<u32>>) -> FakeCover {
         FakeCover {
-            stamp: Some(lock.stamp_install(kind)),
+            stamp: lock.stamp_install(kind),
             deleted: Rc::clone(deleted),
         }
     }
@@ -31,10 +31,7 @@ impl FakeCover {
 impl Drop for FakeCover {
     fn drop(&mut self) {
         let deleted = Rc::clone(&self.deleted);
-        self.stamp
-            .take()
-            .unwrap()
-            .release_on_drop(move || deleted.set(deleted.get() + 1));
+        self.stamp.release_on_drop(move || deleted.set(deleted.get() + 1));
     }
 }
 
@@ -296,4 +293,93 @@ fn a_panic_under_the_lock_releases_it() {
 
     let lock = CoverLock::acquire(d.path());
     assert_eq!(lock.state_dir(), d.path());
+}
+
+// The sweeps ==========================================================================================================
+
+use super::super::{sweep_with_witness, Clearance, SweepOutcome};
+use crate::error::RoutingError;
+
+#[skuld::test]
+fn a_sweep_holds_the_lock_while_it_runs() {
+    // The sweep takes the lock as a parameter; the proof is that a second `acquire` from the sweep body would
+    // panic, so nothing inside a sweep can re-enter.
+    let d = dir();
+    let lock = CoverLock::acquire(d.path());
+    let reentered = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
+        let attempt = catch_unwind(AssertUnwindSafe(|| {
+            CoverLock::acquire(d.path()).state_dir().to_path_buf()
+        }));
+        assert!(attempt.is_err());
+        SweepOutcome::completed(Clearance::proven())
+    });
+    assert!(reentered.is_ok());
+}
+
+#[skuld::test]
+fn a_sweep_that_completes_makes_an_earlier_stamp_stale() {
+    let d = dir();
+    let lock = CoverLock::acquire(d.path());
+    let stamp = lock.stamp_install(CoverKind::Lockdown);
+    let _clearance = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
+        SweepOutcome::completed(Clearance::proven())
+    })
+    .unwrap();
+    assert!(!stamp.is_current());
+}
+
+#[skuld::test]
+fn a_sweep_with_nothing_to_delete_makes_an_earlier_stamp_stale() {
+    // A macOS sweep has no unreached exit: a successful sweep over nothing to restore is a release too.
+    let d = dir();
+    let lock = CoverLock::acquire(d.path());
+    let stamp = lock.stamp_install(CoverKind::Transient);
+    let result = sweep_with_witness(&lock, None, &[CoverKind::Transient], |_| {
+        SweepOutcome::completed(Clearance::proven())
+    });
+    assert!(result.is_ok());
+    assert!(!stamp.is_current());
+}
+
+#[skuld::test]
+fn a_sweep_that_failed_after_reaching_the_firewall_leaves_a_stamp_current() {
+    let d = dir();
+    let lock = CoverLock::acquire(d.path());
+    let stamp = lock.stamp_install(CoverKind::Lockdown);
+    let result = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
+        SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("a delete failed".into()))
+    });
+    assert!(result.is_err());
+    assert!(
+        stamp.is_current(),
+        "the held guard's drop retries what the sweep could not delete"
+    );
+}
+
+#[skuld::test]
+fn a_sweep_that_never_reached_the_firewall_leaves_a_stamp_current() {
+    let d = dir();
+    let lock = CoverLock::acquire(d.path());
+    let stamp = lock.stamp_install(CoverKind::Lockdown);
+    let result = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
+        SweepOutcome::unreached(
+            Clearance::proven(),
+            RoutingError::RouteSetup("the engine would not open".into()),
+        )
+    });
+    assert!(result.is_err());
+    assert!(stamp.is_current());
+}
+
+#[skuld::test]
+fn a_failing_sweep_releases_the_lock() {
+    let d = dir();
+    {
+        let lock = CoverLock::acquire(d.path());
+        let result = sweep_with_witness(&lock, None, &[CoverKind::Lockdown], |_| {
+            SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("the sweep failed".into()))
+        });
+        assert!(result.is_err());
+    }
+    let _again = CoverLock::acquire(d.path());
 }

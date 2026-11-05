@@ -765,7 +765,8 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
             }
         };
     }
-    match pm.set_lockdown_intent(true) {
+    let lock = state.routing.lock_covers();
+    match pm.set_lockdown_intent(&lock, true) {
         Ok(()) => {
             info!(enabled = true, "lockdown intent set");
             Ok(Json(EmptyResponse {}))
@@ -821,7 +822,11 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     // hatch a stale `Absent` is the one wrong answer that matters. Sharing
     // that rule with `turn_lockdown_off` is what removes the discrepancy the
     // two bespoke `must_release` expressions used to carry.
-    if let Err(e) = state.routing.release_all_covers() {
+    let released = {
+        let lock = state.routing.lock_covers();
+        state.routing.release_all_covers(&lock)
+    };
+    if let Err(e) = released {
         error!(error = &e as &dyn std::error::Error, "unblock: release failed");
         // The sweep's own guard carries what it did to the firewall; this one has changed nothing else.
         release.changed_nothing();
@@ -841,6 +846,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     let owner = state.owner;
     let generation = Arc::clone(&state.unblock_generation);
     let intent_persist = Arc::clone(&state.intent_persist);
+    let routing = Arc::clone(&state.routing);
     let persisted = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _release = release;
         // Holds `intent_persist` across all three writes, so a start's target +
@@ -853,7 +859,15 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
         // save and the bump.
         target::apply(&state_dir, owner, |_current| Target::Off)?;
         generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        lockdown_state::set_enabled(&state_dir, false, owner)?;
+        // The release above ran under its own lock section; the persist takes the lock again for the record write.
+        let lock = routing.lock_covers();
+        assert_eq!(
+            lock.state_dir(),
+            state_dir,
+            "the unblock persists under the cover lock of its own state dir"
+        );
+        lockdown_state::set_enabled(&lock, false, owner)?;
+        drop(lock);
         // Clear the auto-connect candidate too: `resolve_startup_target` feeds
         // it to `AlwaysConnect` over an `Off` target, so leaving it would let
         // the next boot reconnect to the server the user just escaped from.

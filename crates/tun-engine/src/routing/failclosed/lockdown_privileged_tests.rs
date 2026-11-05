@@ -185,11 +185,11 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
         // source to exercise the real resolve + `LocalInterface` filter path.
         let cover = engage_lockdown(
+            &CoverLock::acquire(dir.path()),
             server_ip,
             "Loopback Pseudo-Interface 1",
             &resolver,
             &[],
-            dir.path(),
             None,
         )
         .expect("engage real WFP lockdown cover");
@@ -257,8 +257,15 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     );
 
     permit_scenario("lockdown permit", dir.path(), PERMITTED, BLOCKED, || {
-        let cover = engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path(), None)
-            .expect("engage real pf lockdown cover");
+        let cover = engage_lockdown(
+            &CoverLock::acquire(dir.path()),
+            server_ip,
+            "utun-absent",
+            &resolver,
+            &[],
+            None,
+        )
+        .expect("engage real pf lockdown cover");
 
         // (a) The live main ruleset carries our authoritative block rule.
         let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
@@ -350,8 +357,15 @@ fn a_simulated_reboot_rearms_the_cover() {
 
     permit_scenario("rearm", dir.path(), PERMITTED, BLOCKED, || {
         // First engage: FreshEnable (no persisted state yet).
-        let cover = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
-            .expect("engage real pf lockdown cover");
+        let cover = engage_lockdown(
+            &CoverLock::acquire(dir.path()),
+            server_ip,
+            "utun-absent",
+            &SystemLuidResolver,
+            &[],
+            None,
+        )
+        .expect("engage real pf lockdown cover");
         // The cover is released by its guard on this early return, as on every other.
         InCover::new(
             PERMITTED,
@@ -427,12 +441,19 @@ fn a_simulated_reboot_rearms_the_cover() {
             crate::routing::CoverRecovery::Adopt,
             "an On intent with a recorded-but-unconfirmed cover must adopt, not sweep, across the simulated reboot"
         );
-        recover_lockdown(decision.action, dir.path(), None);
+        recover_lockdown(&CoverLock::acquire(dir.path()), decision.action, None);
 
         // The rearm itself: same call `start_cancellable`'s `standing_cover_expected`
         // gate makes on a persisted `Connected` target, driven directly here.
-        let rearmed = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
-            .expect("re-engage after simulated reboot");
+        let rearmed = engage_lockdown(
+            &CoverLock::acquire(dir.path()),
+            server_ip,
+            "utun-absent",
+            &SystemLuidResolver,
+            &[],
+            None,
+        )
+        .expect("re-engage after simulated reboot");
 
         let verdict = InCover::new(
             PERMITTED,
@@ -444,12 +465,10 @@ fn a_simulated_reboot_rearms_the_cover() {
         )
         .run();
 
-        // Both guards disengage on drop via `lockdown_disengage(state_dir)`, which
-        // reads the state file rather than the guard's own (stale, pre-reboot for
-        // `cover`) token — `rearmed` drops first (reverse declaration order),
-        // clearing the state file and restoring the host; `cover`'s later drop
-        // then sees an absent cover and is a no-op, per `lockdown_disengage`'s own
-        // doc. No manual cleanup is needed.
+        // `rearmed`'s install is the latest, so its drop disengages: it clears the
+        // state file and restores the host. `cover` is the pre-reboot install, a
+        // stale stamp after the re-engage, so its later drop deletes nothing. No
+        // manual cleanup is needed.
         drop(rearmed);
         drop(cover);
         verdict
@@ -477,7 +496,8 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
     wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
     permit_scenario("transient permit", dir.path(), PERMITTED, BLOCKED, || {
-        let cover = engage(server_ip, None, dir.path(), None).expect("engage real WFP transient cover");
+        let cover =
+            engage(&CoverLock::acquire(dir.path()), server_ip, None, None).expect("engage real WFP transient cover");
 
         let verdict = transient_probes().run();
 
@@ -508,7 +528,7 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
         PERMITTED,
         RESOLVER_BLOCKED,
         || {
-            let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
+            let cover = engage(&CoverLock::acquire(dir.path()), server_ip, Some(resolver_ip), None)
                 .expect("engage real WFP transient cover with a resolver permit");
 
             let verdict = resolver_probes().run();
@@ -537,7 +557,8 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
     wait_for_baseline(dir.path(), &[PERMITTED, NON_PERMITTED]);
 
     permit_scenario("transient permit", dir.path(), PERMITTED, BLOCKED, || {
-        let cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
+        let cover =
+            engage(&CoverLock::acquire(dir.path()), server_ip, None, None).expect("engage real pf transient cover");
 
         // (a) The live ruleset carries our block-all.
         let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
@@ -574,7 +595,7 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
         PERMITTED,
         RESOLVER_BLOCKED,
         || {
-            let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
+            let cover = engage(&CoverLock::acquire(dir.path()), server_ip, Some(resolver_ip), None)
                 .expect("engage real pf transient cover with a resolver permit");
 
             let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();

@@ -239,7 +239,10 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::RESOLVER_PERMIT_PORT;
-use super::{ArmingWitness, Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, SweepOutcome};
+use super::{
+    ArmingWitness, Clearance, CoverKind, CoverLock, InstallStamp, KeyLifetime, KeyObservation, KeyOutcome, KeyRole,
+    SweepOutcome,
+};
 use crate::error::RoutingError;
 
 // Fixed Hole identifiers. Compiled in so recovery can delete by key with no
@@ -1301,17 +1304,11 @@ fn first_delete_failure(codes: &[(&'static str, u32)]) -> Option<RoutingError> {
     })
 }
 
-/// Which cover a [`Cover`] guard owns — selects the GUID set its Drop deletes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CoverKind {
-    Transient,
-    Lockdown,
-}
-
-/// WFP-backed cover guard. Drop deletes the filters it installed by GUID.
+/// WFP-backed cover guard. Drop deletes the filters it installed by GUID, while its install is the latest
+/// ([`InstallStamp`]); the stamp's [`CoverKind`] selects the GUID set.
 pub struct Cover {
     engine: HANDLE,
-    kind: CoverKind,
+    stamp: InstallStamp,
 }
 
 // SAFETY: the FWPM engine handle is owned exclusively by this guard and only
@@ -1412,9 +1409,9 @@ fn pre_delete_verdict(policy: StaleKeyPolicy, codes: &[(&'static str, u32)]) -> 
 
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
 pub fn engage(
+    lock: &CoverLock,
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
-    _state_dir: &Path,
     _owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     let spec = build_cover_spec(server_ip, resolver_ip);
@@ -1431,7 +1428,7 @@ pub fn engage(
 
         // Wrap the mutating steps so any failure aborts the transaction and
         // closes the engine before returning.
-        let result = (|| -> Result<(), RoutingError> {
+        let result = (|| -> Result<InstallStamp, RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             // Refresh the runtime-valued permits (server IP, resolver IP) in
             // this same transaction — see `transient_pre_delete_guids` and
@@ -1443,27 +1440,26 @@ pub fn engage(
                 add_filter(engine, spec.provider, spec.sublayer, f, spec.stale_key)?;
             }
             wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
-            Ok(())
+            Ok(lock.stamp_install(CoverKind::Transient))
         })();
 
-        if let Err(e) = result {
-            let _ = FwpmTransactionAbort0(engine);
-            let _ = FwpmEngineClose0(engine);
-            return Err(e);
+        match result {
+            Ok(stamp) => Ok(Cover { engine, stamp }),
+            Err(e) => {
+                let _ = FwpmTransactionAbort0(engine);
+                let _ = FwpmEngineClose0(engine);
+                Err(e)
+            }
         }
-        Ok(Cover {
-            engine,
-            kind: CoverKind::Transient,
-        })
     }
 }
 
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
 pub fn engage_lockdown(
+    lock: &CoverLock,
     server_ip: IpAddr,
     tun_luid: u64,
     app_ids: &[std::path::PathBuf],
-    state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     let spec = build_lockdown_spec(server_ip, tun_luid, app_ids);
@@ -1473,7 +1469,7 @@ pub fn engage_lockdown(
             FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
             "FwpmEngineOpen0",
         )?;
-        let result = (|| -> Result<(), RoutingError> {
+        let result = (|| -> Result<InstallStamp, RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             // Refresh every runtime-valued permit AND re-arm the boot-time
             // twins: delete their fixed keys before the adds, in this same
@@ -1535,7 +1531,7 @@ pub fn engage_lockdown(
             for f in &spec.filters {
                 add_filter(engine, spec.provider, spec.sublayer, f, spec.stale_key)?;
             }
-            commit_and_record(engine, state_dir, owner)?;
+            let stamp = commit_and_record(engine, lock, owner)?;
             // A commit code is not evidence about a boot-time key: it says the
             // transaction reached the FWPM object store, not that the next
             // boot's pre-BFE window is covered. Read the twins back out of the
@@ -1545,17 +1541,16 @@ pub fn engage_lockdown(
             // The record is already written by then, deliberately: see
             // `commit_and_record`.
             verify_boottime_twins(engine)?;
-            Ok(())
+            Ok(stamp)
         })();
-        if let Err(e) = result {
-            let _ = FwpmTransactionAbort0(engine);
-            let _ = FwpmEngineClose0(engine);
-            return Err(e);
+        match result {
+            Ok(stamp) => Ok(Cover { engine, stamp }),
+            Err(e) => {
+                let _ = FwpmTransactionAbort0(engine);
+                let _ = FwpmEngineClose0(engine);
+                Err(e)
+            }
         }
-        Ok(Cover {
-            engine,
-            kind: CoverKind::Lockdown,
-        })
     }
 }
 
@@ -1577,13 +1572,21 @@ pub fn engage_lockdown(
 /// this is the Windows file: retiring the twins must retire the record with
 /// them, not leave an engage writing a witness for a key class that no longer
 /// exists.
+///
+/// The install is stamped at the commit too, not when the guard is returned: the read-back after it can fail over
+/// a cover that stands, and a guard held from an earlier install must not then delete it.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-unsafe fn commit_and_record(engine: HANDLE, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<(), RoutingError> {
+unsafe fn commit_and_record(
+    engine: HANDLE,
+    lock: &CoverLock,
+    owner: Option<(u32, u32)>,
+) -> Result<InstallStamp, RoutingError> {
     wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
+    let stamp = lock.stamp_install(CoverKind::Lockdown);
     if STANDING_COVER_ARMS_BOOT_TIME {
-        super::boottime_witness::record_armed(state_dir, owner);
+        super::boottime_witness::record_armed(lock, owner);
     }
-    Ok(())
+    Ok(stamp)
 }
 
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -1969,12 +1972,13 @@ impl Cover {
     }
 }
 
-impl Drop for Cover {
-    fn drop(&mut self) {
+impl Cover {
+    /// Delete the filters of this guard's kind. The caller holds the cover lock.
+    fn delete_filters(engine: HANDLE, kind: CoverKind) {
         unsafe {
-            match self.kind {
+            match kind {
                 // Transient: today's full sweep (filters + sublayer + provider).
-                CoverKind::Transient => delete_all(self.engine),
+                CoverKind::Transient => delete_all(engine),
                 // Lockdown: delete only the lockdown + App-ID filters; the
                 // shared sublayer/provider are owned by the transient sweep.
                 // A user stop RELIES on this Drop to open the host, and Drop
@@ -1985,7 +1989,7 @@ impl Drop for Cover {
                 CoverKind::Lockdown => {
                     let codes: Vec<(&'static str, u32)> = swept_lockdown_keys()
                         .into_iter()
-                        .map(|k| (k.label, FwpmFilterDeleteByKey0(self.engine, &k.guid)))
+                        .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
                         .collect();
                     if let Some(e) = first_delete_failure(&codes) {
                         tracing::warn!(
@@ -1995,14 +1999,39 @@ impl Drop for Cover {
                     }
                 }
             }
+        }
+    }
+
+    fn close_engine(engine: HANDLE) {
+        unsafe {
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let rc = FwpmEngineClose0(self.engine);
+            let rc = FwpmEngineClose0(engine);
             if rc != ERROR_SUCCESS.0 {
                 // Leaks the handle for the life of the process; the deletes
                 // above already committed, so the host's posture is unaffected.
                 tracing::warn!("FwpmEngineClose0 failed: 0x{rc:08x}");
             }
         }
+    }
+
+    /// Delete this cover under `lock`, then close the engine. A stale install deletes nothing but still closes it.
+    pub(crate) fn release(self, lock: &CoverLock) {
+        let (engine, kind) = (self.engine, self.stamp.kind());
+        self.stamp.release(lock, || Self::delete_filters(engine, kind));
+        Self::close_engine(engine);
+        std::mem::forget(self);
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.stamp.is_current()
+    }
+}
+
+impl Drop for Cover {
+    fn drop(&mut self) {
+        let (engine, kind) = (self.engine, self.stamp.kind());
+        self.stamp.release_on_drop(|| Self::delete_filters(engine, kind));
+        Self::close_engine(engine);
     }
 }
 

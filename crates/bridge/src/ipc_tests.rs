@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::{GatewayInfo, NextHop};
-use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::failclosed::{lockdown_state, CoverLock};
 use tun_engine::routing::{self as routing, state as route_state, RoutedFamilies, RoutesInstalled, Routing};
 use tun_engine::{RoutingError, TunIdentity};
 
@@ -325,6 +325,7 @@ impl Routing for MockRouting {
 
     fn install_failclosed_cover(
         &self,
+        _lock: &tun_engine::routing::failclosed::CoverLock,
         _server_ip: IpAddr,
         _resolver_ip: Option<IpAddr>,
     ) -> Result<MockCover, RoutingError> {
@@ -333,6 +334,7 @@ impl Routing for MockRouting {
 
     fn install_lockdown(
         &self,
+        _lock: &tun_engine::routing::failclosed::CoverLock,
         _server_ip: IpAddr,
         _tun: &TunIdentity,
         _app_ids: &[PathBuf],
@@ -340,7 +342,11 @@ impl Routing for MockRouting {
         Ok(MockCover)
     }
 
-    fn release_all_covers(&self) -> Result<(), RoutingError> {
+    fn lock_covers(&self) -> tun_engine::routing::failclosed::CoverLock {
+        tun_engine::routing::failclosed::CoverLock::acquire(&self.state_dir)
+    }
+
+    fn release_all_covers(&self, _lock: &tun_engine::routing::failclosed::CoverLock) -> Result<(), RoutingError> {
         self.release_all_calls.fetch_add(1, Ordering::SeqCst);
         if tun_engine::routing::failclosed::watch_releases(&self.state_dir)
             .check()
@@ -371,6 +377,10 @@ impl Drop for MockCover {
 
 impl tun_engine::routing::CoverGuard for MockCover {
     fn disarm(self) {}
+    fn release(self, _lock: &tun_engine::routing::failclosed::CoverLock) {}
+    fn is_current(&self) -> bool {
+        true
+    }
 }
 
 struct MockRoutes {
@@ -964,8 +974,10 @@ async fn parse_error_body(resp: http::Response<hyper::body::Incoming>) -> hole_c
 fn unblock_clears_covers_and_returns_ok() {
     rt().block_on(async {
         let path = test_socket_path("unblock-ok");
-        let (proxy, release_all_calls, _fail_release, _dir) = mock_proxy_with_release_state();
-        let server = IpcServer::bind(&path, proxy, "test").unwrap();
+        let (proxy, release_all_calls, _fail_release, dir) = mock_proxy_with_release_state();
+        // The handler persists through `IpcState::state_dir` under the routing's cover lock: one directory, as in
+        // production wiring.
+        let server = IpcServer::bind_with_dirs(&path, proxy, "test", dir.clone(), dir.clone(), None).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -995,7 +1007,7 @@ fn a_wedged_teardown_with_an_off_target_releases_the_cover() {
         // bridge-lockdown.json already reads `false`, which would let that
         // assertion pass vacuously regardless of whether the handler wrote
         // anything.
-        lockdown_state::set_enabled(&dir, true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(&dir), true, None).unwrap();
         // `handle_unblock` persists through `IpcState::state_dir`, not the
         // proxy manager's own — `bind_with_dirs` with the SAME `dir` mirrors
         // production wiring (`foreground.rs` passes one `state_dir` to both).
@@ -1262,7 +1274,7 @@ fn the_unblock_handler_hands_its_release_to_the_persist() {
     let begin = body
         .find("let release = ")
         .expect("the guard must be a named binding, not `_`");
-    let released = body.find("release_all_covers()").expect("the handler releases covers");
+    let released = body.find("release_all_covers(").expect("the handler releases covers");
     let spawn = body.find("spawn_blocking").expect("the persist runs off-thread");
     let moved = body
         .find("let _release = release;")

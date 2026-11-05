@@ -180,8 +180,9 @@ impl InstallStamp {
     }
 
     /// Run `delete` iff this stamp is current. Takes the lock as proof it is held; panics if it is another
-    /// directory's.
-    pub fn release(self, lock: &CoverLock, delete: impl FnOnce()) {
+    /// directory's. A stamp is a fact about one install, so asking twice is harmless: the guard that owns it
+    /// decides when to ask.
+    pub fn release(&self, lock: &CoverLock, delete: impl FnOnce()) {
         assert!(
             std::ptr::eq(self.slot, lock.slot),
             "a cover is released under the lock of its own state dir"
@@ -193,7 +194,7 @@ impl InstallStamp {
 
     /// [`Self::release`] for a guard's `Drop`: under the lock this thread already holds for the directory (a
     /// drop inside a section), else after acquiring it.
-    pub fn release_on_drop(self, delete: impl FnOnce()) {
+    pub fn release_on_drop(&self, delete: impl FnOnce()) {
         if held_by_this_thread(self.slot) {
             if self.is_current() {
                 delete();
