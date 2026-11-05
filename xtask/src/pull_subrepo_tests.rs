@@ -2,7 +2,8 @@
 use std::process::{Command, Output};
 
 use super::pull_subrepo::test_support::{
-    git, git_output, install_rejecting_pre_commit_hook, Conflict, ConflictKind, Fixture,
+    git, git_output, install_fetch_ref_resetting_post_commit_hook, install_rejecting_pre_commit_hook, Conflict,
+    ConflictKind, Fixture,
 };
 use super::pull_subrepo::{self, Outcome, PullRecord, StaleParentRetry};
 
@@ -22,7 +23,7 @@ fn a_clean_outcome_carries_the_pull_that_produced_it() {
         .expect("pull should succeed")
         .expect_clean();
     // git-subrepo exits 0 for a merge that applied without conflicts.
-    assert_eq!(clean.pull.exit_code, Some(0), "{clean:?}");
+    assert_eq!(clean.pull.status.code(), Some(0), "{clean:?}");
     // git-subrepo prints its success line on stdout.
     assert!(clean.pull.stdout.contains("pulled from"), "{clean:?}");
     assert!(clean.stale_parent_retry.is_none(), "{clean:?}");
@@ -37,55 +38,46 @@ fn a_clean_outcome_after_auto_resolving_carries_the_failed_merge_and_the_paths_i
     let clean = pull_subrepo::run(&fx.downstream, "vendor", "v2")
         .expect("pull should succeed")
         .expect_clean();
-    assert_eq!(clean.pull.exit_code, Some(1), "{clean:?}");
+    assert_eq!(clean.pull.status.code(), Some(1), "{clean:?}");
     assert!(clean.pull.stdout.contains("go.mod"), "{clean:?}");
     assert!(clean.auto_resolved.contains(&"go.mod".to_string()), "{clean:?}");
     assert!(format!("{clean:?}").contains("go.mod"), "{clean:?}");
 }
 #[skuld::test]
-fn a_pull_record_holds_the_exit_code_and_both_streams_of_the_output() {
+fn a_pull_record_holds_the_exit_status_and_both_streams_of_the_output() {
     let record = PullRecord::from_output(&Output {
         status: exit_status(3),
         stdout: b"OUT".to_vec(),
         stderr: b"ERR".to_vec(),
     });
-    assert_eq!(record.exit_code, Some(3));
+    assert_eq!(record.status, exit_status(3));
     assert_eq!(record.stdout, "OUT");
     assert_eq!(record.stderr, "ERR");
 }
 #[skuld::test]
 fn debug_of_a_pull_record_prints_the_streams_with_real_line_breaks() {
     let record = PullRecord {
-        exit_code: Some(3),
+        status: exit_status(3),
         stdout: "OUT1\nOUT2".to_string(),
         stderr: "ERR1\nERR2".to_string(),
     };
     let shown = format!("{record:?}");
-    assert!(shown.contains("exit code: 3"), "{shown}");
+    assert!(shown.contains(&exit_status(3).to_string()), "{shown}");
     assert!(shown.contains("OUT1\nOUT2"), "{shown}");
     assert!(shown.contains("ERR1\nERR2"), "{shown}");
-}
-#[skuld::test]
-fn debug_of_a_pull_record_without_an_exit_code_says_so() {
-    let record = PullRecord {
-        exit_code: None,
-        stdout: String::new(),
-        stderr: String::new(),
-    };
-    assert!(format!("{record:?}").contains("signal"), "{record:?}");
 }
 #[skuld::test]
 fn debug_of_an_outcome_shows_every_field_with_real_line_breaks() {
     let clean = Outcome::Clean {
         pull: PullRecord {
-            exit_code: Some(0),
+            status: exit_status(0),
             stdout: "OUT1\nOUT2".to_string(),
             stderr: String::new(),
         },
         stale_parent_retry: Some(StaleParentRetry {
             fixup_commit: "FIXUP".to_string(),
             failed_pull: PullRecord {
-                exit_code: Some(1),
+                status: exit_status(1),
                 stdout: String::new(),
                 stderr: "FAILED1\nFAILED2".to_string(),
             },
@@ -158,9 +150,9 @@ fn clean_pull_after_squash_merge_auto_fixes_stale_parent() {
         .expect_clean();
 
     // The result is the retry's pull, and it keeps the failed pull and the fixup that led to it.
-    assert_eq!(clean.pull.exit_code, Some(0), "{clean:?}");
+    assert_eq!(clean.pull.status.code(), Some(0), "{clean:?}");
     let retry = clean.stale_parent_retry.as_ref().expect("a stale-parent retry");
-    assert_ne!(retry.failed_pull.exit_code, Some(0), "{clean:?}");
+    assert_ne!(retry.failed_pull.status.code(), Some(0), "{clean:?}");
     assert!(retry.failed_pull.stderr.contains("is not an ancestor"), "{clean:?}");
     // The fixup commit realigns `.gitrepo` and nothing else.
     let touched = git_output(
@@ -281,12 +273,12 @@ fn up_to_date_pull_still_realigns_the_branch_pin() {
     git(&upstream, &["tag", "v3", "v2"]);
 
     let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v3").expect("re-tag pull to v3 should succeed");
-    outcome.expect_clean();
+    let clean = outcome.expect_clean();
 
     let gitrepo = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
     assert!(
         gitrepo.contains("branch = v3"),
-        "the tag pin must be realigned even when git-subrepo itself no-ops: {gitrepo}"
+        "the tag pin must be realigned even when git-subrepo itself no-ops: {gitrepo}\n{clean:?}"
     );
 }
 #[skuld::test]
@@ -364,7 +356,7 @@ fn a_clean_outcome_after_a_stale_parent_fixup_and_an_auto_resolve_carries_all_th
         .expect("pull should succeed")
         .expect_clean();
     // The retried pull is the one that reported the go.mod conflict.
-    assert_eq!(clean.pull.exit_code, Some(1), "{clean:?}");
+    assert_eq!(clean.pull.status.code(), Some(1), "{clean:?}");
     assert!(clean.auto_resolved.contains(&"go.mod".to_string()), "{clean:?}");
     let retry = clean.stale_parent_retry.as_ref().expect("a stale-parent retry");
     assert!(retry.failed_pull.stderr.contains("is not an ancestor"), "{clean:?}");
@@ -528,4 +520,202 @@ fn a_nonexistent_tag_stops_the_run_at_the_fetch_phase() {
     let result = pull_subrepo::run(&fx.downstream, "vendor", "this-tag-does-not-exist");
     let err = result.expect_err("a nonexistent tag must be an error");
     assert!(format!("{err:#}").contains("does not exist upstream"), "{err:#}");
+}
+
+fn gitrepo_commit(fx: &Fixture) -> String {
+    let gitrepo = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
+    pull_subrepo::gitrepo_field(&gitrepo, "commit").expect("`.gitrepo` has a `commit =` line")
+}
+
+#[skuld::test]
+fn a_real_merge_pull_is_accepted() {
+    let fx = Fixture::build(ConflictKind::None);
+    let v1 = gitrepo_commit(&fx);
+
+    let clean = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("a real merge must be accepted")
+        .expect_clean();
+
+    assert_ne!(gitrepo_commit(&fx), v1, "the pull must have moved the pin: {clean:?}");
+}
+
+#[skuld::test]
+fn an_up_to_date_pull_is_accepted() {
+    let fx = Fixture::build(ConflictKind::None);
+    pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("the merge")
+        .expect_clean();
+    let pinned = gitrepo_commit(&fx);
+
+    let clean = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("an up-to-date pull must be accepted")
+        .expect_clean();
+
+    assert!(
+        format!("{}{}", clean.pull.stdout, clean.pull.stderr).contains("up to date"),
+        "the second pull must be the no-op case: {clean:?}"
+    );
+    assert_eq!(gitrepo_commit(&fx), pinned);
+}
+
+fn assert_pull_did_not_land(err: &anyhow::Error, pin: &str, fetch_ref_at: &str) {
+    let shown = format!("{err:#}");
+    assert!(shown.contains("exited 0 but did not land"), "{shown}");
+    for expected in ["refs/subrepo/vendor/fetch", pin, fetch_ref_at] {
+        assert!(shown.contains(expected), "{expected} missing from {shown}");
+    }
+}
+
+fn exit_0_pull() -> Output {
+    Output {
+        status: exit_status(0),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
+/// `git subrepo pull`'s `subrepo:commit` up to, but not including, its final `git commit`: the upstream tree
+/// and the new pin are staged, HEAD has not moved.
+fn stage_the_fold_in_without_committing(fx: &Fixture) {
+    let repo = &fx.downstream;
+    pull_subrepo::fetch_upstream(repo, "vendor", "v2").unwrap();
+    let gitrepo = std::fs::read_to_string(repo.join("vendor/.gitrepo")).unwrap();
+    git(repo, &["rm", "-r", "-q", "vendor"]);
+    git(
+        repo,
+        &["read-tree", "--prefix=vendor", "-u", "refs/subrepo/vendor/fetch"],
+    );
+    std::fs::write(repo.join("vendor/.gitrepo"), gitrepo).unwrap();
+    let fetched = git_output(repo, &["rev-parse", "refs/subrepo/vendor/fetch"]);
+    git(
+        repo,
+        &["config", "--file", "vendor/.gitrepo", "subrepo.commit", fetched.trim()],
+    );
+    git(repo, &["add", "-f", "vendor/.gitrepo"]);
+}
+
+#[skuld::test]
+fn a_first_pull_that_exits_0_with_the_fetch_ref_behind_the_pin_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    let v1 = gitrepo_commit(&fx);
+    install_fetch_ref_resetting_post_commit_hook(&fx.downstream, "vendor", &v1);
+
+    let err = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect_err("the pull did not land");
+
+    let pin = gitrepo_commit(&fx);
+    assert_ne!(pin, v1);
+    assert_pull_did_not_land(&err, &pin, &v1);
+}
+
+#[skuld::test]
+fn a_stale_parent_retry_that_exits_0_with_the_fetch_ref_behind_the_pin_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    let v1 = gitrepo_commit(&fx);
+    fx.corrupt_parent();
+    install_fetch_ref_resetting_post_commit_hook(&fx.downstream, "vendor", &v1);
+
+    let err = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect_err("the retried pull did not land");
+
+    let pin = gitrepo_commit(&fx);
+    assert_ne!(pin, v1);
+    assert_pull_did_not_land(&err, &pin, &v1);
+    assert!(
+        format!("{err:#}").contains("parent-realignment commit"),
+        "the retry's disclosure is missing: {err:#}"
+    );
+}
+
+// `ensure_pull_landed`, called directly. A pull cannot be driven to these states through `attempt_pull`
+// without a stand-in for `git subrepo`: where a silent exit-0 pull stops is unknown, and its stages that
+// exit 0 early are not reachable from a fixture.
+
+/// A pull that exited 0 having merged nothing: the fetch ref is ahead of the committed pin.
+#[skuld::test]
+fn a_fetch_ref_ahead_of_the_committed_pin_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    let v1 = gitrepo_commit(&fx);
+    pull_subrepo::fetch_upstream(&fx.downstream, "vendor", "v2").unwrap();
+    let v2 = git_output(&fx.downstream, &["rev-parse", "refs/subrepo/vendor/fetch"]);
+    assert_ne!(v1, v2.trim());
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("a pull that merged nothing did not land");
+
+    assert_pull_did_not_land(&err, &v1, v2.trim());
+}
+
+/// A pull that stopped after staging its fold-in has the new pin on disk and in the index, but not in HEAD.
+#[skuld::test]
+fn a_fold_in_staged_but_not_committed_did_not_land() {
+    let fx = Fixture::build(ConflictKind::None);
+    let v1 = gitrepo_commit(&fx);
+    stage_the_fold_in_without_committing(&fx);
+    let v2 = gitrepo_commit(&fx);
+    assert_ne!(v1, v2, "the fixture must have moved the on-disk pin");
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("a staged, uncommitted fold-in did not land");
+
+    assert_pull_did_not_land(&err, &v1, &v2);
+}
+
+/// The pin agrees, but the subrepo's tracked files carry changes HEAD does not.
+#[skuld::test]
+fn uncommitted_tracked_changes_under_the_subrepo_did_not_land() {
+    let fx = Fixture::build(ConflictKind::None);
+    pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("the merge")
+        .expect_clean();
+    std::fs::write(fx.downstream.join("vendor/other.txt"), "staged, not committed\n").unwrap();
+    git(&fx.downstream, &["add", "vendor/other.txt"]);
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("uncommitted changes under the subrepo did not land");
+
+    let shown = format!("{err:#}");
+    assert!(shown.contains("uncommitted"), "{shown}");
+    assert!(shown.contains("vendor/other.txt"), "{shown}");
+}
+
+#[skuld::test]
+fn a_missing_fetch_ref_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    git(&fx.downstream, &["update-ref", "-d", "refs/subrepo/vendor/fetch"]);
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("a pull with no fetch ref to compare against did not land");
+
+    let shown = format!("{err:#}");
+    assert!(shown.contains("refs/subrepo/vendor/fetch"), "{shown}");
+    assert!(shown.contains("missing"), "{shown}");
+}
+
+#[skuld::test]
+fn a_committed_gitrepo_without_a_commit_line_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    let gitrepo = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
+    let without_commit: String = gitrepo
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("commit ="))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(fx.downstream.join("vendor/.gitrepo"), without_commit).unwrap();
+    git(&fx.downstream, &["commit", "-a", "-q", "-m", "test: drop the pin"]);
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("a `.gitrepo` with no pin cannot show the pull landed");
+
+    assert!(format!("{err:#}").contains("no `commit = ` line"), "{err:#}");
+}
+
+#[skuld::test]
+fn a_gitrepo_missing_from_head_is_an_error() {
+    let fx = Fixture::build(ConflictKind::None);
+    git(&fx.downstream, &["rm", "-q", "vendor/.gitrepo"]);
+    git(&fx.downstream, &["commit", "-q", "-m", "test: drop .gitrepo"]);
+
+    let err = pull_subrepo::ensure_pull_landed(&fx.downstream, "vendor", &exit_0_pull())
+        .expect_err("with no committed `.gitrepo` there is no pin to compare");
+
+    assert!(format!("{err:#}").contains("vendor/.gitrepo"), "{err:#}");
 }

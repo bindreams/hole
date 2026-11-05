@@ -479,14 +479,42 @@ pub(crate) fn git_output(cwd: &Path, args: &[&str]) -> String {
 /// after its preceding `git add` already succeeded, for tests exercising
 /// the disclosure wrapped around exactly that gap.
 pub(crate) fn install_rejecting_pre_commit_hook(repo: &Path) {
+    install_hook(
+        repo,
+        "pre-commit",
+        "exit 1
+",
+    );
+}
+
+/// Installs a `post-commit` hook that puts `refs/subrepo/<subdir>/fetch` back on `commit`, so a pull
+/// whose final `git commit` runs it exits 0 with the fetch ref behind the pin `git subrepo` just wrote.
+pub(crate) fn install_fetch_ref_resetting_post_commit_hook(repo: &Path, subdir: &str, commit: &str) {
+    install_hook(
+        repo,
+        "post-commit",
+        &format!(
+            "git update-ref refs/subrepo/{subdir}/fetch {commit}
+"
+        ),
+    );
+}
+
+fn install_hook(repo: &Path, name: &str, body: &str) {
     let hooks_dir = repo.join(".git/hooks");
     std::fs::create_dir_all(&hooks_dir).unwrap();
-    let hook_path = hooks_dir.join("pre-commit");
-    std::fs::write(&hook_path, "#!/bin/sh\nexit 1\n").unwrap();
+    let hook_path = hooks_dir.join(name);
+    std::fs::write(
+        &hook_path,
+        format!(
+            "#!/bin/sh
+{body}"
+        ),
+    )
+    .unwrap();
     // On POSIX (core.fileMode defaults to true), git silently skips a
     // non-executable hook instead of running it — without the exec bit
-    // this hook never fires and the commit it's supposed to block
-    // succeeds instead, on every unix CI runner.
+    // the hook never fires, on every unix CI runner.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
