@@ -22,9 +22,8 @@
 //! so a reader that has it open neither fails nor makes the write fail. That holds for a reader that opens the file
 //! with delete sharing, as `observe` and `std` do; one that does not (some editors and scanners) makes the write fail
 //! with a sharing violation. A volume that lacks POSIX rename (FAT, exFAT, some network shares) gets a plain
-//! replace, where a reader can make the write fail; see [`VersionedFile::update`]. Windows durability of the replace
-//! rests on flushing the directory handle, which Microsoft does not document as committing a rename, and which a
-//! volume without a directory flush (SMB, 9P) does not offer at all (`Placement::sync_dir`).
+//! replace, where a reader can make the write fail; see [`VersionedFile::update`]. Durability of the replace is
+//! described at `Placement::sync_dir`.
 //!
 //! # Compatibility
 //!
@@ -47,8 +46,7 @@
 //! # Template
 //!
 //! `versioned_file_tests.rs` is a complete `Role::OsRecord` schema with
-//! `assert_contiguous!`, an update and an observe. It is a test, so CI runs it: copy
-//! it, not a snippet that can rot.
+//! `assert_contiguous!`, an update and an observe.
 
 mod chain;
 #[cfg(test)]

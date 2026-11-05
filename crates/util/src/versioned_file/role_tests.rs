@@ -115,7 +115,7 @@ fn blocks_connect_takes_the_cell_of_its_cause() {
     }
 }
 
-/// The spec's `Claim` column (rev 4, rule 2), cell by cell.
+/// The `Claim` role's cells, written out by hand.
 #[skuld::test]
 fn claim_role_cells_match_the_spec_table() {
     let role = Role::Claim;
@@ -132,7 +132,7 @@ fn claim_role_cells_match_the_spec_table() {
     assert!(!role.io_failure_blocks_connect());
 }
 
-/// The spec's `Cover` column (rev 4, rule 2), cell by cell.
+/// The `Cover` role's cells, written out by hand.
 #[skuld::test]
 fn cover_role_cells_match_the_spec_table() {
     let role = Role::Cover;

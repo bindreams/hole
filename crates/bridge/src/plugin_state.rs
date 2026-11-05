@@ -55,8 +55,9 @@ pub fn file(state_dir: &Path) -> PluginFile {
     VersionedFile::new(state_dir)
 }
 
-/// Appends a single record, creating the file if missing. A record this release cannot read is refused
-/// ([`StoreError`]) and left as it is: rewriting it with one record would drop the plugins it tracks.
+/// Appends a single record, creating the file if missing. A newer, corrupt or unreadable record is refused
+/// ([`StoreError`]) and left as it is: rewriting it with one record would drop the plugins it tracks. An obsolete
+/// one is replaced without a backup.
 pub fn append_record(
     state_dir: &Path,
     record: cosca::identity::ProcessIdRecord,
@@ -66,7 +67,8 @@ pub fn append_record(
         .update(&DefaultPlacement { owner }, |observed| {
             let mut state = match &observed.loaded {
                 Loaded::Current { value, .. } => value.clone(),
-                // Nothing to extend. The role refuses a store over what it cannot read, so these never replace one.
+                // Nothing to extend. The role refuses a store over a newer, corrupt or unreadable record; an obsolete
+                // one is replaced without a backup, by design.
                 Loaded::Absent
                 | Loaded::Obsolete { .. }
                 | Loaded::Newer { .. }

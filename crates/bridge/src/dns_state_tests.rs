@@ -3,8 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use super::*;
 use util::versioned_file::{Change, DefaultPlacement};
 
-/// Write `state` to `<dir>/bridge-dns.json` through the versioned file. The bridge no longer writes this file (see
-/// the module doc); this is what every fixture in this file uses in its place, and the only place besides
+/// Write `state` to `<dir>/bridge-dns.json` through the versioned file. The only place besides
 /// `crate::dns::recovery_tests` that constructs a `bridge-dns.json` on disk.
 fn write_state(dir: &std::path::Path, state: &DnsState) {
     file(dir)

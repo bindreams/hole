@@ -1,5 +1,5 @@
 //! Every cell of what `update` does: a change over each state a file can be in, per role. The expectations are
-//! written out by hand from the role table (spec rev 4, rule 2), not computed from `Role`, and each is checked on
+//! written out by hand from the role table, not computed from `Role`, and each is checked on
 //! the outcome and on the bytes left on disk.
 
 use std::ffi::OsStr;

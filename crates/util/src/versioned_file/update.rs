@@ -162,7 +162,10 @@ impl<S: VersionedState> VersionedFile<S> {
             Ok(Some(EntryKind::File)) => Some(UnreadableKind::File),
             // The name is gone: the read failed on a file that was removed meanwhile.
             Ok(None) => None,
-            Err(_) => Some(UnreadableKind::Unprobed),
+            Err(err) => {
+                tracing::debug!(file = %name.to_string_lossy(), kind = ?err.kind(), "the name of a state file that failed to read could not be examined");
+                Some(UnreadableKind::Unprobed)
+            }
         })
     }
 
@@ -175,25 +178,14 @@ impl<S: VersionedState> VersionedFile<S> {
     /// 2. `decide`. A [`Change::Store`] value is encoded now; one that would not read back is
     ///    [`StoreError::Encode`] and nothing is touched.
     /// 3. [`step`] turns the change and what was read into an action. A refusal touches nothing.
-    /// 4. The generation moves, then the action runs. A write stages a same-directory temp file (synced, with
-    ///    mode, owner and ACL set through its own handle by `place`), backs the old file up as
-    ///    `<name>.unreadable[.N].bak` by hard link if the role says so, and renames the temp over the name. A
-    ///    failure before the rename leaves the original at its name, so a decision file is never absent between its
-    ///    backup and its replacement. Once the rename has happened the write is complete and the result is `Ok`: a
-    ///    failure of `after_publish` or of the directory flush after it is logged at warn.
+    /// 4. The generation moves, then the action runs. A failure before the rename leaves the original at its name;
+    ///    once the rename has happened the result is `Ok`, and a failed `after_publish` or directory flush is logged
+    ///    at warn.
     ///
-    /// The lock is in-process. Another process writing the same file is the caller's to exclude (for the bridge's
-    /// state files: `BridgeLiveness`). The directory is opened once without following a symlink and every step names
-    /// a file inside that handle.
+    /// The directory is opened once without following a symlink and every step names a file inside that handle.
     ///
-    /// On Windows the replace is a POSIX-semantics rename, which a reader that shares delete (every
-    /// [`observe`](Self::observe), and `std`) cannot block; one that does not makes the write fail with the OS error
-    /// (a sharing violation). A volume that rejects POSIX rename (FAT, exFAT, some network shares) gets
-    /// `MoveFileExW`, where any reader with the file open at that instant can make the write fail with
-    /// `PermissionDenied`; the old file is then still in place. A volume with no directory flush does not fail the
-    /// write (see [`Placement::sync_dir`]). `serde_json` writes a non-finite float as `null`, so an `Option<f64>`
-    /// holding NaN is stored, and read back, as `None`; a plain float that would do so is refused with
-    /// [`StoreError::Encode`].
+    /// On Windows the replace and its failure modes are described in the module doc. A non-finite `Option<f64>` is
+    /// stored, and read back, as `None`; a plain float is refused with [`StoreError::Encode`].
     ///
     /// Blocks the calling thread on file I/O: from async code call it where blocking is allowed.
     pub fn update<R>(

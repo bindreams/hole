@@ -267,7 +267,7 @@ impl Fs for CannotBeProbed {
     }
 
     fn kind_of(&self, _dir: &ReadDir, _name: &OsStr) -> io::Result<Option<crate::dir::EntryKind>> {
-        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        Err(io::Error::from(io::ErrorKind::TimedOut))
     }
 }
 
@@ -279,6 +279,27 @@ fn observe_says_a_name_that_cannot_be_examined_after_a_failed_read_is_unprobed()
     let observed = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(CannotBeProbed)).observe();
 
     assert_eq!(unreadable_kind(&observed.loaded), UnreadableKind::Unprobed);
+}
+
+#[skuld::test]
+fn a_failed_probe_of_the_name_is_logged_with_its_kind() {
+    let writer = garter::test_utils::WaitableWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(
+        tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish(),
+    );
+    let dir = dir();
+    put(&dir, "decision.json", br#"{"version":1,"value":"v"}"#);
+
+    VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(CannotBeProbed)).observe();
+
+    let log = writer.snapshot();
+    assert_eq!(log.matches("DEBUG").count(), 1, "{log}");
+    assert!(log.contains("TimedOut"), "{log}");
+    assert!(log.contains("decision.json"), "{log}");
 }
 
 #[skuld::test]

@@ -186,10 +186,19 @@ pub fn is_present(log_dir: &Path) -> bool {
 /// Unconditionally remove the marker by known path. NOT parse-then-clear: a
 /// from->to schema bump across the cutover must never strand it. Absent is Ok.
 pub fn clear(log_dir: &Path) -> io::Result<()> {
-    marker_file(log_dir)
+    let ((), outcome) = marker_file(log_dir)
         .update(&MarkerPlacement { owner: None }, |_| (Change::Remove, ()))
-        .map(|_| ())
-        .map_err(io_error)
+        .map_err(io_error)?;
+    match outcome {
+        UpdateOutcome::Removed | UpdateOutcome::Absent => Ok(()),
+        // `Role::Claim` removes whatever it finds, and a `Remove` neither stores nor leaves unchanged.
+        UpdateOutcome::Kept | UpdateOutcome::MovedAside(_) | UpdateOutcome::Stored | UpdateOutcome::Unchanged => {
+            debug_assert!(false, "clearing the update marker answered {outcome:?}");
+            Err(io::Error::other(format!(
+                "clearing the update marker answered {outcome:?}"
+            )))
+        }
+    }
 }
 
 /// What [`stamp_driver`] refuses with: there is no readable marker to name the driver in.
