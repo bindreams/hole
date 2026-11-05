@@ -17,9 +17,6 @@
 //! SCM queued it. S's disable is written either while its restart is queued
 //! (variant `queued`) or before the crash (variant `running`).
 //!
-//! In the `running` variant any restart of S is a falsification: a state of S
-//! other than STOPPED when C's restart is up is read as one at once.
-//!
 //! The `queued` variant needs the disable to land before the SCM's restart
 //! timer fires, which the test cannot guarantee: only the SCM runs that timer.
 //! No read of S's state can place a restart against the disable (the disable
@@ -27,7 +24,7 @@
 //! open), so the restart is placed by when it happened. The system time is read
 //! just before the disable is written (`t0`) and just after it returns (`t1`),
 //! and the creation time of S's restarted instance is read from the process
-//! list, by the last process id in S's pid log:
+//! list, by the process id the SCM reports for S:
 //! - created before `t0`: the timer fired first, nothing was measured: rerun;
 //! - created after `t1`: the SCM started a disabled service: FALSIFIED;
 //! - created within `[t0, t1]`: the order is unknowable, so it is no
@@ -46,13 +43,18 @@
 //! rerun (creation reads before `t0`). A FALSIFIED is therefore read against the
 //! `t0`, `t1` and creation time the probe prints.
 //!
-//! The restarted instance is alive when it is read (the helper exits only when
-//! killed, and only teardown kills it), so no creation time recorded by the
-//! helper is needed; an instance the list does not have fails the probe. In the
-//! `queued` variant a restart seen in S's state is placed only once S is
-//! RUNNING, by re-reading the state: the helper logs its pid when it starts,
-//! before it reports RUNNING, so RUNNING implies the line. S back at STOPPED
-//! leaves no instance to place, and nothing was measured.
+//! S is read once, after C's restarted instance is up, and there is no wait: its
+//! pid log, then one `QueryServiceStatusEx` (state and process id, in every
+//! state: the SCM assigns the process id when it creates the process, before the
+//! helper runs). In the `running` variant a state other than STOPPED, or a
+//! second pid in the log, is FALSIFIED. In the `queued` variant:
+//! - S not STOPPED: its process is the restarted instance, placed as above; a
+//!   process missing from the process list fails the probe;
+//! - S STOPPED with a second pid in the log: an instance started and is gone
+//!   before it could be placed. That fails the probe, never a rerun: the helper
+//!   exits only when killed, so nothing here expects it, and an unplaceable
+//!   restart must not pass for a lost race;
+//! - otherwise NOT FALSIFIED.
 
 use std::ffi::OsString;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -61,15 +63,16 @@ use hole_bridge::disable_record::Stamp;
 use windows::core::PCWSTR;
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, ENUM_SERVICE_TYPE, SC_HANDLE, SERVICE_DISABLED, SERVICE_ERROR, SERVICE_NO_CHANGE,
-    SERVICE_START_TYPE,
+    SERVICE_START_TYPE, SERVICE_STOPPED,
 };
 use windows_service::service::{
     Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
-    ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceType,
+    ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::named_event::NamedEvent;
+use super::raw_scm;
 use super::{left_behind, scm_deletion, scm_probe, GLOBAL_NET_STATE, TUN};
 
 /// How long the SCM waits before it restarts S, and C. C's is the longer, and C
@@ -140,11 +143,13 @@ impl DisableWindow {
     }
 }
 
-/// The creation time of the live process `pid`, from the process list.
-fn creation_time_of(pid: u32) -> u64 {
+/// The creation time of the live process `pid`, from the process list. `read`
+/// is what was read of the service, for the failure.
+fn creation_time_of(pid: u32, read: &str) -> u64 {
+    assert_ne!(pid, 0, "the service is not STOPPED but reports no process: {read}");
     Stamp::of_listed_process(pid)
         .expect("read the process list")
-        .unwrap_or_else(|| panic!("the restarted instance (process {pid}) is not in the process list"))
+        .unwrap_or_else(|| panic!("the restarted instance (process {pid}) is not in the process list: {read}"))
         .created()
 }
 
@@ -245,13 +250,6 @@ impl ProbeService {
             .expect("query the probe service")
             .process_id
             .expect("a running service has a process")
-    }
-
-    fn state(&self) -> ServiceState {
-        self.handle()
-            .query_status()
-            .expect("query the probe service")
-            .current_state
     }
 
     fn start_type(&self) -> ServiceStartType {
@@ -548,44 +546,35 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
     eprintln!("P1 {name}: S disabled; killed C (process {c_pid}); waiting for C's restarted instance");
     c_running.wait();
 
-    // The state is read before the log, so a restart the state shows is never
-    // missing from the log for longer than its helper's start. In the running
-    // variant any state but STOPPED is the falsification already; in the queued
-    // one the restarted instance must be RUNNING to be placed (see the module doc).
-    let mut s_state = s.state();
-    if let Some(window) = disable_window {
-        let restart_seen = s_state != ServiceState::Stopped;
-        while !matches!(s_state, ServiceState::Running | ServiceState::Stopped) {
-            // Paced re-check (CONTRIBUTING, test invariants): every return re-reads the state.
-            std::thread::sleep(Duration::from_millis(50));
-            s_state = s.state();
-        }
-        if restart_seen && s_state == ServiceState::Stopped {
-            return AttemptOutcome::RaceLost {
-                evidence: format!(
-                    "S's restarted instance was gone before it could be placed; {}; SCM log entries naming S, newest first: {}",
-                    window.describe_window(),
-                    scm_entries_dump(&s.display_name)
-                ),
-            };
-        }
-    }
+    // S is read once (see the module doc).
     let s_pids = left_behind::logged(&s_log);
-    let (s_starts, c_starts) = (s_pids.len(), left_behind::logged(&c_log).len());
-    let restarted = s_starts > 1 || s_state != ServiceState::Stopped;
-    let timing_line = match (disable_window, restarted) {
-        (None, _) => String::from("S disabled before the crash, no timing read"),
-        (Some(window), false) => format!(
+    let s_status = raw_scm::query(&s.name);
+    let s_stopped = s_status.dwCurrentState == SERVICE_STOPPED;
+    let c_starts = left_behind::logged(&c_log).len();
+    let s_read = format!(
+        "S read after C's restarted instance was up: state {}, process id {} (0 is none), pid log {s_pids:?}",
+        raw_scm::state_name(s_status.dwCurrentState.0),
+        s_status.dwProcessId
+    );
+    let scm_entries = scm_entries_dump(&s.display_name);
+    let restarted = s_pids.len() > 1 || !s_stopped;
+    let timing_line = match disable_window {
+        None => String::from("S disabled before the crash, no timing read"),
+        Some(window) if s_stopped && s_pids.len() > 1 => panic!(
+            "P1 {name}: S restarted and exited before it could be placed: {s_read}; {}; SCM log entries naming S, \
+             newest first: {scm_entries}",
+            window.describe_window()
+        ),
+        Some(window) if s_stopped => format!(
             "no restarted instance of S, disable written at {}",
             window.describe_window()
         ),
-        (Some(window), true) => {
-            // RUNNING implies the helper's pid line, so a second start is logged.
-            assert!(
-                s_starts > 1,
-                "S is {s_state:?} but its pid log has no second start: {s_pids:?}"
+        Some(window) => {
+            let read = format!(
+                "{s_read}; {}; SCM log entries naming S, newest first: {scm_entries}",
+                window.describe_window()
             );
-            let created = creation_time_of(*s_pids.last().expect("the log holds a pid"));
+            let created = creation_time_of(s_status.dwProcessId, &read);
             let timing_line = window.describe(created);
             let loss = match window.timing_of(created) {
                 RestartTiming::Before => {
@@ -599,8 +588,7 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
             if let Some(loss) = loss {
                 return AttemptOutcome::RaceLost {
                     evidence: format!(
-                        "{loss}; {timing_line}; SCM log entries naming S, newest first: {}",
-                        scm_entries_dump(&s.display_name)
+                        "{loss}; {timing_line}; {s_read}; SCM log entries naming S, newest first: {scm_entries}"
                     ),
                 };
             }
@@ -608,12 +596,9 @@ fn restart_probe(variant: Variant, attempt: u32) -> AttemptOutcome {
         }
     };
     eprintln!(
-        "P1 {name} RESULT: S's start type read back {:?}; {timing_line}; S state when C's restarted instance was up \
-         (read after the crash and the log wait, not at the disable; in the queued variant after S's restart was RUNNING) {s_state:?}; S starts {s_starts} (1 is the \
-         original); C starts {c_starts} (2 is the original and its restart). \
-         SCM log entries naming S, newest first: {}",
-        s.start_type(),
-        scm_entries_dump(&s.display_name)
+        "P1 {name} RESULT: {s_read}; {timing_line}; S's start type read back afterwards {:?}; C starts {c_starts} (2 is \
+         the original and its restart). SCM log entries naming S, newest first: {scm_entries}",
+        s.start_type()
     );
     let verdict = if restarted {
         "FALSIFIED: the disabled service was restarted"
