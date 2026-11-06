@@ -1220,7 +1220,7 @@ pub(crate) trait PfOps {
 
 /// The disclosure for an unusable record that yielded no token at all — the
 /// one case where nothing can be done about the refcount. Shared by
-/// [`clear_record`], so every release discloses the same leak the same way.
+/// [`release`], so every release discloses the same leak the same way.
 fn warn_unsalvageable_token(what: &str) {
     tracing::warn!(
         "{what} file is unusable and no pf token could be read out of it — a pf enable refcount \
