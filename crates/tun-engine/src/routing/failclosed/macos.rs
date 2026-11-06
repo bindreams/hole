@@ -55,8 +55,7 @@
 //!   took the record that named it ([`release`]). A clear that cannot write is the release's error and
 //!   drops nothing, so the retry still has its token. A failed restore is the release's error and
 //!   touches neither record nor token: the cover stays in force, evidence and refcount together, until
-//!   a later release restores. An escape's error says what the user can do about the restore that ran
-//!   ([`RestoreSource::advise`]); `pfctl -d` is the way out of either. A drop that fails is only
+//!   a later release restores. A drop that fails is only
 //!   logged: the refcount stays until a reboot resets it, and with the host's rules restored it
 //!   blocks nothing. Dropping Hole's token releases Hole's hold only: the block lifts when no other
 //!   refcount keeps pf enabled. Every `pfctl -X` goes through [`drop_or_warn`] over the caller's ops
@@ -1076,18 +1075,7 @@ fn disengage_lockdown_with(
         CoverPresence::Live | CoverPresence::Recorded => {}
     }
 
-    // No captured baseline (or no state at all — presence was established by
-    // pf's label alone) means there is no snapshot to restore from, so
-    // `/etc/pf.conf` IS the restore target — see
-    // `LockdownPfState::main_snapshot_captured`.
-    let (restored, source) = match &st {
-        StateFile::Present(st) if st.main_snapshot_captured => (
-            ops.load_ruleset(&build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot)),
-            RestoreSource::CapturedSnapshot,
-        ),
-        _ => (ops.reload_default(), RestoreSource::DefaultRuleset),
-    };
-    let restored = restored.map_err(|e| source.advise(e));
+    let restored = restore_standing(&st, ops);
 
     // The escape hatch (`bridge unlock`, the intent-off sweep): after a good restore it drops the token the record
     // names, an UNUSABLE record's included, once the record no longer names it.
@@ -1221,8 +1209,7 @@ fn refused(cleared: Cleared) -> Result<(), RoutingError> {
 /// after, and only once the clear took the record that named it:
 ///
 /// - A restore that failed is the error, as it came, and touches neither record nor token: the cover is still in
-///   force, and the record and the refcount are what a later release acts by. Only an escape adds advice for the user
-///   ([`RestoreSource::advise`]); the callers that log the error do not.
+///   force, and the record and the refcount are what a later release acts by.
 /// - A restore that held clears the record, and drops the token only if that clear took the record that named it. A
 ///   clear that cannot write is the error and drops nothing: the record still names a token Hole holds, and the retry
 ///   works. A clear that finds another token's record or none drops nothing either: the engage that displaced it
@@ -1256,24 +1243,39 @@ fn release(
     refused(cleared)
 }
 
-/// What a restore loaded, which decides what the user can do when it fails.
-#[derive(Debug, Clone, Copy)]
-enum RestoreSource {
-    /// The canonical `/etc/pf.conf`.
-    DefaultRuleset,
-    /// The ruleset the standing cover captured before it engaged.
-    CapturedSnapshot,
-}
-
-impl RestoreSource {
-    /// The restore's error as a user reads it: its redacted text, then what to do. For an escape (`release_all`,
-    /// `disengage_lockdown`), which returns it to the user.
-    fn advise(self, e: RoutingError) -> RoutingError {
-        let advice = match self {
-            RestoreSource::DefaultRuleset => "Fix /etc/pf.conf and unblock again, or run `sudo pfctl -d`",
-            RestoreSource::CapturedSnapshot => "Run `sudo pfctl -d` to turn pf off",
-        };
-        RoutingError::RouteSetup(format!("{}; the block is still in place. {advice}", e.redacted()))
+/// The standing cover's restore, shared by both escapes (`release_all`, `disengage_lockdown`): its captured snapshot,
+/// else `/etc/pf.conf`. No captured baseline (or no usable record: presence was established by pf's label alone)
+/// means there is no snapshot to restore from, so `/etc/pf.conf` IS the restore target (the empty snapshot would leave
+/// a pass-all host) — see `LockdownPfState::main_snapshot_captured`. A snapshot that will not load falls back to `/etc/pf.conf`; when that
+/// fails too, the fallback's error is the answer (the last restore that ran) and the snapshot's is logged.
+fn restore_standing(
+    standing: &StateFile<lockdown_state::LockdownPfState>,
+    ops: &mut dyn PfOps,
+) -> Result<(), RoutingError> {
+    let st = match standing {
+        StateFile::Present(st) if st.main_snapshot_captured => st,
+        _ => return ops.reload_default(),
+    };
+    let snapshot_err = match ops.load_ruleset(&build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot)) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    match ops.reload_default() {
+        Ok(()) => {
+            tracing::warn!(
+                error = &snapshot_err as &dyn std::error::Error,
+                "captured pf snapshot could not load; fell back to the default ruleset — \
+                 the host's captured pf rules could not be restored"
+            );
+            Ok(())
+        }
+        Err(fallback_err) => {
+            tracing::error!(
+                error = &snapshot_err as &dyn std::error::Error,
+                "captured pf snapshot could not load, and neither could the default ruleset"
+            );
+            Err(fallback_err)
+        }
     }
 }
 
@@ -1291,14 +1293,10 @@ pub(crate) fn release_all_with(
     ops: &mut dyn PfOps,
 ) -> SweepOutcome {
     // Each cover's release after its restore.
-    // Every restore here ends in a reload of `/etc/pf.conf`, the snapshot's fallback included, so that is what a
-    // failure sends the user to fix.
     let release_transient = |ops: &mut dyn PfOps, restored: Result<(), RoutingError>| {
-        let restored = restored.map_err(|e| RestoreSource::DefaultRuleset.advise(e));
         release(ops, CoverKind::Transient, transient.release_token(), restored).err()
     };
     let release_standing = |ops: &mut dyn PfOps, restored: Result<(), RoutingError>| {
-        let restored = restored.map_err(|e| RestoreSource::DefaultRuleset.advise(e));
         release(ops, CoverKind::Lockdown, standing.release_token(), restored).err()
     };
 
@@ -1328,32 +1326,8 @@ pub(crate) fn release_all_with(
     // Block 2 — standing cover.
     let standing_err = match &standing {
         StateFile::Absent => None,
-        StateFile::Present(st) if !st.main_snapshot_captured => {
-            // No baseline was captured, so there is no snapshot to load — see
-            // `LockdownPfState::main_snapshot_captured`. Loading the empty one
-            // would leave a pass-all host.
-            let restored = ops.reload_default();
-            release_standing(ops, restored)
-        }
-        StateFile::Present(st) => {
-            let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
-            let restored = match ops.load_ruleset(&restore) {
-                Ok(()) => Ok(()),
-                Err(snapshot_err) => match ops.reload_default() {
-                    Ok(()) => {
-                        tracing::warn!(
-                            error = &snapshot_err as &dyn std::error::Error,
-                            "captured pf snapshot could not load; fell back to the default ruleset — \
-                             the host's captured pf rules could not be restored"
-                        );
-                        Ok(())
-                    }
-                    Err(fallback_err) => Err(RoutingError::RouteSetup(format!(
-                        "snapshot restore failed ({snapshot_err}); default-ruleset fallback also failed \
-                         ({fallback_err})"
-                    ))),
-                },
-            };
+        StateFile::Present(_) => {
+            let restored = restore_standing(&standing, ops);
             release_standing(ops, restored)
         }
         StateFile::Unusable { .. } => {
@@ -1361,7 +1335,7 @@ pub(crate) fn release_all_with(
                 "standing lockdown-pf-state file is unusable; no snapshot to restore, falling back to \
                  the default ruleset"
             );
-            let restored = ops.reload_default();
+            let restored = restore_standing(&standing, ops);
             release_standing(ops, restored)
         }
         StateFile::Unreadable => {
@@ -1369,7 +1343,7 @@ pub(crate) fn release_all_with(
                 "standing lockdown-pf-state file could not be read; no snapshot to restore, falling back to \
                  the default ruleset"
             );
-            let restored = ops.reload_default();
+            let restored = restore_standing(&standing, ops);
             release_standing(ops, restored)
         }
     };

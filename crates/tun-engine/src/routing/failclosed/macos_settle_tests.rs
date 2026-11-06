@@ -123,14 +123,9 @@ fn a_token_that_will_not_drop_is_logged_with_what_was_being_released() {
     );
 }
 
-/// The advice an escape adds to a failed restore, and where it ends: it names what fixes the restore that ran.
-const FIX_PF_CONF: &str = "; the block is still in place. Fix /etc/pf.conf and unblock again, or run `sudo pfctl -d`";
-const TURN_PF_OFF: &str = "; the block is still in place. Run `sudo pfctl -d` to turn pf off";
-
-/// A restore that reloaded `/etc/pf.conf` and failed is the error the user reads: the restore's own words, then the
-/// fix for `/etc/pf.conf`. Every escape path that reloads it says so, the standing cover's included.
+/// A restore that failed is the error the escape returns, as it came: the restore's own typed error, not wrapped.
 #[skuld::test]
-fn an_escape_whose_default_reload_failed_says_to_fix_pf_conf() {
+fn an_escape_returns_a_failed_restore_as_it_came() {
     let standing_without_baseline = lockdown_state::LockdownPfState {
         main_snapshot_captured: false,
         ..standing_state()
@@ -167,68 +162,116 @@ fn an_escape_whose_default_reload_failed_says_to_fix_pf_conf() {
             .expect_err("the restore failed")
             .to_string();
 
-        assert!(text.contains("mock reload_default failure"), "{name}: {text}");
-        assert!(text.ends_with(FIX_PF_CONF), "{name}: {text}");
+        assert_eq!(text, "route setup failed: mock reload_default failure", "{name}");
     }
-}
 
-/// A standing cover whose snapshot and fallback both failed is repaired by `/etc/pf.conf`: the fallback is the last
-/// restore that ran.
-#[skuld::test]
-fn a_standing_release_whose_snapshot_and_fallback_failed_says_to_fix_pf_conf() {
-    let mut ops = RecordingPfOps {
-        fail_load_ruleset: true,
-        fail_reload_default: true,
-        ..Default::default()
-    };
-
-    let text = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops)
-        .into_result()
-        .expect_err("both restores failed")
-        .to_string();
-
-    assert!(text.contains("mock load_ruleset failure"), "{text}");
-    assert!(text.ends_with(FIX_PF_CONF), "{text}");
-}
-
-/// A lockdown disengage that loads the captured snapshot and fails is not repaired by `/etc/pf.conf`, so the advice
-/// does not name it.
-#[skuld::test]
-fn a_lockdown_disengage_whose_snapshot_failed_does_not_send_the_user_to_pf_conf() {
-    let mut ops = RecordingPfOps {
-        fail_load_ruleset: true,
-        ..Default::default()
-    };
-
-    let text = disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops)
-        .expect_err("the snapshot did not load")
-        .to_string();
-
-    assert!(text.contains("mock load_ruleset failure"), "{text}");
-    assert!(text.ends_with(TURN_PF_OFF), "{text}");
-    assert!(!text.contains("/etc/pf.conf"), "{text}");
-}
-
-/// A lockdown disengage with no snapshot to load reloads `/etc/pf.conf`, and says to fix it.
-#[skuld::test]
-fn a_lockdown_disengage_whose_default_reload_failed_says_to_fix_pf_conf() {
     let mut ops = RecordingPfOps {
         fail_reload_default: true,
         ..Default::default()
     };
-
     let text = disengage_lockdown_with(CoverPresence::Live, StateFile::Absent, &mut ops)
         .expect_err("the reload failed")
         .to_string();
-
-    assert!(text.contains("mock reload_default failure"), "{text}");
-    assert!(text.ends_with(FIX_PF_CONF), "{text}");
+    assert_eq!(
+        text, "route setup failed: mock reload_default failure",
+        "disengage_lockdown"
+    );
 }
 
-/// The advice goes with a restore that failed and nothing else: a clear that fails after a good restore is its own
-/// error.
+/// A captured snapshot that will not load falls back to `/etc/pf.conf` in both escapes, so `bridge unlock` can leave
+/// the block where it once could not: the fallback restores the host, and the record clears and the token drops.
 #[skuld::test]
-fn an_escape_whose_clear_failed_after_a_good_restore_carries_no_restore_advice() {
+fn an_escape_whose_snapshot_failed_falls_back_to_pf_conf() {
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        ..Default::default()
+    };
+
+    let result = disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        ops.log,
+        vec!["load_ruleset", "reload_default", "clear_standing", "drop_token"]
+    );
+    assert_eq!(ops.dropped, vec!["222".to_owned()]);
+
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        ..Default::default()
+    };
+
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops).into_result();
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        ops.log,
+        vec!["load_ruleset", "reload_default", "clear_standing", "drop_token"]
+    );
+    assert_eq!(ops.dropped, vec!["222".to_owned()]);
+}
+
+/// A snapshot and a fallback that both fail leave the cover in force: the error is the fallback's (the last restore
+/// that ran), the snapshot's is logged, and the record and token are kept for the next release.
+#[skuld::test]
+fn an_escape_whose_snapshot_and_fallback_both_failed_returns_the_fallbacks_error_and_logs_the_snapshots() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+    let failing = || RecordingPfOps {
+        fail_load_ruleset: true,
+        fail_reload_default: true,
+        ..Default::default()
+    };
+
+    let mut ops = failing();
+    let from_disengage =
+        disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops)
+            .expect_err("both restores failed");
+    assert_eq!(ops.log, vec!["load_ruleset", "reload_default"]);
+    assert!(
+        ops.dropped.is_empty() && ops.cleared.is_empty(),
+        "{:?} {:?}",
+        ops.dropped,
+        ops.cleared
+    );
+
+    let mut ops = failing();
+    let from_release_all = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops)
+        .into_result()
+        .expect_err("both restores failed");
+    assert_eq!(ops.log, vec!["load_ruleset", "reload_default"]);
+    assert!(
+        ops.dropped.is_empty() && ops.cleared.is_empty(),
+        "{:?} {:?}",
+        ops.dropped,
+        ops.cleared
+    );
+
+    for (name, e) in [
+        ("disengage_lockdown", from_disengage),
+        ("release_all", from_release_all),
+    ] {
+        assert_eq!(
+            e.to_string(),
+            "route setup failed: mock reload_default failure",
+            "{name}"
+        );
+    }
+    let log = writer.snapshot();
+    assert_eq!(log.matches("mock load_ruleset failure").count(), 2, "{log}");
+}
+
+/// A clear that fails after a good restore is its own error.
+#[skuld::test]
+fn an_escape_whose_clear_failed_after_a_good_restore_returns_the_clears_error() {
     let mut ops = RecordingPfOps {
         fail_clear_standing: true,
         ..Default::default()
@@ -238,12 +281,10 @@ fn an_escape_whose_clear_failed_after_a_good_restore_carries_no_restore_advice()
         .expect_err("the clear failed")
         .to_string();
 
-    assert!(text.contains("mock clear_standing failure"), "{text}");
-    assert!(!text.contains("pfctl -d"), "{text}");
+    assert_eq!(text, "route setup failed: mock clear_standing failure");
 }
 
-/// A release that is not an escape (the transient guard's `Drop`, `recover_cover`, the engage back-out) returns the
-/// restore's error as it came: nobody reads advice there.
+/// A release returns a failed restore's error as it came, whoever calls it.
 #[skuld::test]
 fn a_release_returns_a_failed_restore_unchanged() {
     for kind in [CoverKind::Transient, CoverKind::Lockdown] {
@@ -255,21 +296,6 @@ fn a_release_returns_a_failed_restore_unchanged() {
             .to_string();
 
         assert_eq!(text, "route setup failed: the restore's own words", "{kind:?}");
-    }
-}
-
-/// The advice is built from the error's redacted text, so a restore error that carries a path (the one variant that
-/// does) does not put it in the user's text.
-#[skuld::test]
-fn the_advice_carries_no_path() {
-    for source in [RestoreSource::DefaultRuleset, RestoreSource::CapturedSnapshot] {
-        let named = RoutingError::StateUnreadable {
-            path: PathBuf::from("/Users/someone/private/x.json"),
-        };
-
-        let text = source.advise(named).to_string();
-
-        assert!(!text.contains("someone"), "{source:?}: {text}");
     }
 }
 
@@ -488,11 +514,12 @@ fn the_retry_of_a_failed_lockdown_disengage_releases_the_record_and_token_it_kep
     pf_record::swap(tmp.path(), &standing_state(), None).unwrap();
     let mut first = RecordingPfOps {
         fail_load_ruleset: true,
+        fail_reload_default: true,
         ..RecordingPfOps::over_records(tmp.path())
     };
     let failed = disengage_lockdown_with(CoverPresence::Recorded, pf_record::read(tmp.path()), &mut first);
     assert!(failed.is_err());
-    assert_eq!(first.log, vec!["load_ruleset"]);
+    assert_eq!(first.log, vec!["load_ruleset", "reload_default"]);
     assert_eq!(
         pf_record::read::<lockdown_state::LockdownPfState>(tmp.path()),
         StateFile::Present(standing_state()),

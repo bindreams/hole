@@ -2064,6 +2064,12 @@ examined), never reports success over a host it left closed, and never erases
 a cover's state file after a restore that did not confirm — a corrupt or
 version-skewed file is treated as a cover to clear, not as absence.
 
+A macOS restore that fails (`/etc/pf.conf` or the captured snapshot will not load) leaves the block, its record and its
+token in place, and both escapes return the restore's own error. The standing cover restores its captured snapshot
+and, when that will not load, `/etc/pf.conf`; the error is the fallback's and the snapshot's is logged. The ways out:
+fix `/etc/pf.conf` and unblock again (the restore is retried); `sudo pfctl -d` turns pf off, and the record stays
+until a later restore succeeds; a reboot resets pf, and with the target already off nothing re-arms it.
+
 Inside a live bridge, `Routing::release_all_covers` — the same primitive —
 has four sanctioned callers, guarded by a structural test
 (`cover_release_has_the_known_sanctioned_caller_set`,
