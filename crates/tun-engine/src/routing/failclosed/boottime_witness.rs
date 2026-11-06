@@ -63,24 +63,10 @@
 //!
 //! # Disclosed residuals
 //!
-//! - **A host cleaned up by `Cover::drop` keeps reporting.** The Windows guard's
-//!   `Drop` (`failclosed/windows.rs`, the `Lockdown` arm) deletes the whole
-//!   `swept_lockdown_keys` list — twins included — and is the ONE twin-removing
-//!   path that does not run through `super::sweep_with_witness`, because the
-//!   guard carries no `state_dir` to write to. It fires when an engage COMMITS
-//!   (so the record is already `Armed`) and a later fatal phase of the same
-//!   start fails, unwinding the guard; an ordinary
-//!   disconnect is unaffected, since that releases through
-//!   `Routing::release_all_covers` first and drops an already-swept cover. The
-//!   twins were genuinely watched going, so this is an OVER-report: the record
-//!   stays `Armed`, the sibling is gone, and every later `release-covers` on
-//!   that `state_dir` names the two twin keys. Safe direction, and the same
-//!   one this file has always failed in — but not the same claim as "only a
-//!   non-sweep cause leaves a stale record", which is why it is spelled out.
-//! - Other causes with the same shape and no fix here at all: an external FWPM
-//!   delete, a firewall reset, an image restore. No sweep ever held the
-//!   evidence, so nothing could have copied it — which is the case
-//!   `record_armed`-at-engage exists for in the first place.
+//! - **A host whose twins went without a sweep watching keeps reporting.** Causes
+//!   with no fix here at all: an external FWPM delete, a firewall reset, an image
+//!   restore. No sweep ever held the evidence, so nothing could have copied it —
+//!   which is the case `record_armed`-at-engage exists for in the first place.
 //! - A `record` write that FAILS (an unwritable `state_dir`) loses the witness
 //!   with nothing left to re-derive it from. The sweep that failed to write
 //!   still reports — it holds the sibling evidence itself — but a later one
@@ -96,7 +82,7 @@
 //!   writes its `Disarm` only to its OWN dir, so a peer's `Armed` — one a
 //!   user-profile bridge wrote — survives a SYSTEM sweep that watched those
 //!   very twins go, and keeps reporting. Over-report, the same direction as
-//!   `Cover::drop` above.
+//!   the residual above.
 
 use std::path::Path;
 
@@ -258,14 +244,15 @@ fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
 }
 
 /// Apply a sweep's [`WitnessUpdate`], decided against the record as it is NOW; the read and the write are one
-/// `update`.
-pub(crate) fn apply(lock: &CoverLock, update: WitnessUpdate, owner: Option<(u32, u32)>) {
+/// `update`. Takes no owner: a sweep writes only on a boot-time sighting, which exists only on Windows, where
+/// placement ignores unix ids.
+pub(crate) fn apply(lock: &CoverLock, update: WitnessUpdate) {
     // `Leave` writes nothing for any record, so it must not even open the directory.
     if update == WitnessUpdate::Leave {
         return;
     }
     let mut decided = None;
-    let written = file(lock.state_dir()).update(&DefaultPlacement { owner }, |now| {
+    let written = file(lock.state_dir()).update(&DefaultPlacement::default(), |now| {
         match next_record(arming_of(&now.loaded), update) {
             Some(armed) => {
                 decided = Some(armed);

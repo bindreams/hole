@@ -1028,24 +1028,19 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 /// One sweep's whole interaction with the persisted boot-time record: consult
 /// it before the fold, then update it from what the sweep itself observed.
 ///
-/// Every SWEEP that can remove a standing cover's `PERSISTENT` sibling goes
+/// Every path that removes a standing cover's `PERSISTENT` sibling goes
 /// through here, which is what makes the sites that DISCARD the returned
-/// [`Clearance`] safe — `recover_lockdown`'s `Sweep` arm, `SystemRouting::
-/// release_all_covers`, and the reconciler's `CoverStep::Release` through it.
-///
-/// Not every DELETE does. The Windows guard's `Drop` (`platform::Cover`'s
-/// `Lockdown` arm) removes the same key list with no `state_dir` to write to,
-/// so it can neither arm nor retract; the residual that leaves is disclosed in
-/// [`boottime_witness`]'s module doc, and it is an over-report.
+/// [`Clearance`] safe: `recover_lockdown`'s `Sweep` arm, `SystemRouting::
+/// release_all_covers`, the reconciler's `CoverStep::Release` through it, and
+/// the standing guard's `Drop` on each platform (Windows' `Cover::delete_filters`,
+/// macOS's `lockdown_disengage`, which also serves the engage's back-out),
+/// which log the `Err` and drop the `Ok`. macOS has no `PERSISTENT` sibling
+/// and no boot-time key, so its record is never written, but it takes the
+/// same path.
 /// The evidence is persisted before anything is returned AT ALL — before the
 /// `Ok` those sites drop, and before the `Err` a failing sweep hands its
 /// caller — so dropping the value costs an operator message on that one call
 /// and nothing beyond it.
-///
-/// macOS's best-effort `lockdown_disengage` (the standing guard's `Drop` and
-/// the engage's back-out) also logs the `Err` and drops the `Ok`. It has no
-/// `PERSISTENT` sibling and no boot-time key, so there is nothing to persist
-/// and the discard is safe.
 ///
 /// Generic over the sweep so the SEQUENCE this exists for — a sweep that
 /// removes the sibling, followed by one that can no longer see it — is
@@ -1070,7 +1065,7 @@ fn sweep_with_witness(
     // codebase's own sweeps issue every delete before inspecting any code, so
     // `Err` arrives after the sibling's delete already succeeded — see
     // [`SweepOutcome`].
-    boottime_witness::apply(lock, clearance.witness_update(), None);
+    boottime_witness::apply(lock, clearance.witness_update());
     // A kind the sweep released took what its held guards hold, whatever the other kind did. A kind it did not
     // keeps its stamps, so a guard's drop still retries what the sweep could not delete.
     for kind in &released {

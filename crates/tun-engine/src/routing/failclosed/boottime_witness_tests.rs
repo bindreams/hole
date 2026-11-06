@@ -432,7 +432,7 @@ fn a_sweep_that_leaves_the_record_does_no_i_o() {
     );
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-        super::apply(&CoverLock::acquire(&state), WitnessUpdate::Leave, None);
+        super::apply(&CoverLock::acquire(&state), WitnessUpdate::Leave);
     }
     let logs = writer.snapshot();
 

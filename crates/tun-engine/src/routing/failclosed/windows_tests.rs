@@ -2145,7 +2145,7 @@ fn reclaim_stale_tun_permit_does_not_discard_delete_codes() {
     // `let _ = FwpmFilterDeleteByKey0(...)`, silently discarding the exact
     // return code that means a filter is STILL blocking egress. Assert the
     // source routes the TUN-permit deletes through the same
-    // `first_delete_failure` fold `Cover::drop`'s Lockdown arm and
+    // `first_delete_failure` fold `disengage_lockdown` and
     // `delete_all` use, rather than re-running the real FWPM call under an
     // access-denied DACL to observe it (this file has no such fixture).
     let src = include_str!("windows.rs");

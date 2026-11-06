@@ -724,3 +724,39 @@ fn boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_
         );
     }
 }
+
+/// The standing guard's `Drop` removes the twins through the same witnessed sweep every other remover uses, so the
+/// record an engage armed reads `Disarmed` once the guard is gone. A `Drop` that deleted the keys without writing
+/// the record would leave it `Armed` over a host with no sibling left, and every later `release-covers` on that
+/// `state_dir` would name two twins nobody can find.
+///
+/// COUPLED NAMES: `.config/nextest.toml`'s `global_net_state` filter matches the `boottime_global_net_state_` prefix.
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn boottime_global_net_state_dropping_the_standing_guard_disarms_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let cover = engage_lockdown(
+        &CoverLock::acquire(dir.path()),
+        "1.1.1.1".parse().unwrap(),
+        "Loopback Pseudo-Interface 1",
+        &SystemLuidResolver,
+        &[],
+        None,
+    )
+    .expect("engage of the real WFP lockdown cover");
+    let armed = crate::routing::failclosed::boottime_witness::load(dir.path());
+
+    // Dropped before asserting, so a failed precondition does not strand the real block-all on the host.
+    drop(cover);
+    let after_drop = crate::routing::failclosed::boottime_witness::load(dir.path());
+
+    assert_eq!(
+        armed,
+        crate::routing::failclosed::ArmingWitness::Armed,
+        "the engage must arm the record, or the drop below proves nothing"
+    );
+    assert_eq!(
+        after_drop,
+        crate::routing::failclosed::ArmingWitness::Disarmed,
+        "the guard's drop removed the twins (and the sibling) but did not record having watched them go"
+    );
+}

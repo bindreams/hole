@@ -1878,19 +1878,13 @@ observation set and the record keeps what it held.
 Disclosed residuals. **A host whose twins went without a sweep watching keeps
 reporting**: the record stays `Armed`, the sibling is gone, and every later
 `bridge release-covers` on that `state_dir` names the two twin keys for the life
-of the dir. Two causes. One is outside Hole entirely — an external FWPM delete,
-a firewall reset, an image restore — and is the case `record_armed`-at-engage
-exists for, since no sweep ever held the evidence to copy. The other is Hole's
-own: the Windows guard's `Drop` (`Cover`'s `Lockdown` arm) deletes the whole
-`swept_lockdown_keys` list, twins included, and is the one twin-removing path
-that does not run through `sweep_with_witness` — it carries no `state_dir`. It
-fires when an engage commits and a *later* fatal phase of the same start fails,
-unwinding `ProxyManager`'s locally-owned guard; an ordinary disconnect releases
-through `Routing::release_all_covers` first and then drops an already-swept
-cover, so it is unaffected. Both are over-reports — an over-report costs an
-operator a paragraph, where the silence it replaces costs #1003's unrecoverable
-host — and both are bounded to hosts that ever armed a twin; one that never did
-has no record and no live sibling and stays silent. The record is
+of the dir. The cause is outside Hole: an external FWPM delete, a firewall reset,
+an image restore. It is the case `record_armed`-at-engage exists for, since no
+sweep ever held the evidence to copy. Every Hole path that removes the twins,
+the Windows guard's `Drop` included, runs through `sweep_with_witness`. An
+over-report costs an operator a paragraph, where the silence it replaces costs
+#1003's unrecoverable host, and it is bounded to hosts that ever armed a twin;
+one that never did has no record and no live sibling and stays silent. The record is
 per-`state_dir` while the WFP filters it
 describes are machine-wide, so the uninstall gate folds in every peer dir it
 already locks against a live bridge (`cutover::release_covers_with`); a bridge
