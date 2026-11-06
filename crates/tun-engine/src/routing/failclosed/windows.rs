@@ -172,9 +172,8 @@
 //!
 //! Deletion needs no new path. A boot-time filter is removed by the same
 //! `FwpmFilterDeleteByKey0` call a persistent one is — no lifetime-specific
-//! delete API exists — so every fixed-GUID sweep here (`Cover::drop`'s
-//! Lockdown arm, [`disengage_lockdown`], [`release_all`],
-//! [`swept_lockdown_keys`]) covers the twins once their GUIDs are in the array.
+//! delete API exists — so every fixed-GUID sweep here ([`disengage_lockdown`],
+//! [`release_all`], [`swept_lockdown_keys`]) covers the twins once their GUIDs are in the array.
 //!
 //! ## What no test here can reach
 //!
@@ -1983,29 +1982,20 @@ impl Cover {
 
 impl Cover {
     /// Delete the filters of this guard's kind.
-    fn delete_filters(_lock: &CoverLock, engine: HANDLE, kind: CoverKind) {
-        unsafe {
-            match kind {
-                // Transient: today's full sweep (filters + sublayer + provider).
-                CoverKind::Transient => delete_all(engine),
-                // Lockdown: delete only the lockdown + App-ID filters; the
-                // shared sublayer/provider are owned by the transient sweep.
-                // A user stop RELIES on this Drop to open the host, and Drop
-                // cannot return an error, so a code that is neither success nor
-                // not-found is warned: silence there is indistinguishable from
-                // a clean release.
-                #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-                CoverKind::Lockdown => {
-                    let codes: Vec<(&'static str, u32)> = swept_lockdown_keys()
-                        .into_iter()
-                        .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
-                        .collect();
-                    if let Some(e) = first_delete_failure(&codes) {
-                        tracing::warn!(
-                            error = &e as &dyn std::error::Error,
-                            "lockdown cover release left a filter installed; egress may still be blocked"
-                        );
-                    }
+    fn delete_filters(lock: &CoverLock, engine: HANDLE, kind: CoverKind) {
+        match kind {
+            // Transient: today's full sweep (filters + sublayer + provider).
+            CoverKind::Transient => unsafe { delete_all(engine) },
+            // Lockdown: the same witnessed sweep as `bridge unlock`, so the boot-time record is written. The
+            // shared sublayer/provider are owned by the transient sweep. A user stop RELIES on this Drop to open
+            // the host, and Drop cannot return an error, so a failure is warned: silence there is
+            // indistinguishable from a clean release.
+            CoverKind::Lockdown => {
+                if let Err(e) = super::sweep_with_witness(lock, |witness| disengage_lockdown(lock, witness)) {
+                    tracing::warn!(
+                        error = &e as &dyn std::error::Error,
+                        "lockdown cover release failed; egress may still be blocked"
+                    );
                 }
             }
         }
@@ -2055,7 +2045,7 @@ pub(crate) fn should_reclaim_tun_permit(resolved: bool) -> bool {
 /// not an error, but a code that is neither success nor not-found means a
 /// filter is STILL installed — the exact staleness this reclaim exists to
 /// close — so it is folded through [`first_delete_failure`] and warned, same
-/// as `Cover::drop`'s Lockdown arm and [`delete_all`]: a DACL-denied delete
+/// as [`disengage_lockdown`] and [`delete_all`]: a DACL-denied delete
 /// must not read as a successful reclaim.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 pub fn reclaim_stale_tun_permit(_lock: &CoverLock, resolver: &dyn super::LuidResolver, tun_name: &str) {
@@ -2208,16 +2198,14 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
     }
 }
 
-/// Fail-loud disengage for the `bridge unlock` escape hatch. Deletes all
-/// lockdown + App-ID filters by their fixed GUIDs (idempotent — a "not found"
-/// delete is a no-op, so a clean host reports no failure). The failure that
-/// means "cannot disengage" is the ENGINE OPEN: the Base Filtering Engine could
-/// not be reached, so nothing could have been issued → the outcome carries the
-/// failure. That is NOT "not elevated" — FWPM opens without elevation
-/// (`release_all`'s doc records the same measurement); a failed open means BFE
-/// is not running or RPC failed. There is no persisted Windows state to key
-/// absence on (delete-by-GUID is idempotent), so a successful open always
-/// reports no failure.
+/// Fail-loud disengage for the `bridge unlock` escape hatch and the standing guard's `Drop`. Deletes all
+/// lockdown + App-ID filters by their fixed GUIDs (idempotent: a "not found" delete is a no-op, so a clean host
+/// reports no failure). The outcome carries a failure in two cases: the ENGINE OPEN failed, so nothing was
+/// issued (the Base Filtering Engine is not running or RPC failed, which is NOT "not elevated": FWPM opens
+/// without elevation, as `release_all`'s doc records), or a delete was refused (a code neither success nor
+/// not-found, per [`first_delete_failure`], e.g. the unelevated run, which opens the engine but cannot write).
+/// There is no persisted Windows state to key absence on, so a clean open with no refused delete is the only
+/// no-failure outcome.
 ///
 /// Returns a [`SweepOutcome`], not the facade's `Result`: the facade
 /// (`failclosed::disengage_lockdown`) turns it into `Ok(Clearance)` or `Err`.
@@ -2228,30 +2216,19 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
 /// deletes nothing it can see and learns nothing about what may sit behind
 /// those two keys.
 ///
-/// **That qualification used to be dropped here, defended by an argument that
-/// is false on this exact path.** The claim was that nothing is unrecoverable
-/// because `hole.exe` is still on disk and "the next engage re-arms the key,
-/// pre-deleting it first". [`crate::routing::failclosed::disengage_lockdown`]'s
-/// caller is `hole bridge unlock`, which exists precisely so that there is no
-/// next engage: `cutover::unlock_with` writes the kill-switch intent OFF in
-/// the statement after this one, and the pre-delete that would clean the key
-/// up runs only from [`engage_lockdown`], which an off intent prevents. So the
-/// one path where the recovery argument was needed is the one where it does
-/// not hold, and the verdict travels to the caller instead of being collapsed
-/// here.
+/// A next engage does not clean those keys up on `hole bridge unlock`'s path: `cutover::unlock_with` records
+/// the target `Off` before this sweep and the lockdown intent off after it, and the pre-delete that would clear
+/// a key runs only from [`engage_lockdown`], which an off intent prevents. So the verdict travels to the caller
+/// instead of being collapsed here.
 ///
-/// It still does not FAIL the disengage — see [`Clearance`] for why a bounded
+/// It still does not FAIL the disengage over an unproven twin — see [`Clearance`] for why a bounded
 /// boot-window block must not block the escape hatch from a hard-blocked host.
 /// The caller surfaces it, and `Clearance::leftover_keys` is what decides
 /// whether an operator hears about it at all.
 ///
-/// What it IS gated on is every delete's return code. A no-failure outcome here
-/// means the host is genuinely open: `hole bridge unlock` flips the persisted
-/// intent off only on the facade's `Ok` (`cutover::unlock_with`), so an `Ok`
-/// returned over deletes that were refused — the unelevated run, which reaches the
-/// engine open but not the write — would leave the kill switch engaged while
-/// the intent reads "off", with nothing left to reconcile it. The macOS arm
-/// has always propagated its `pfctl` failures; this is the same rule.
+/// A refused delete does fail it: `unlock_with` flips the persisted lockdown intent off only after the facade's
+/// `Ok`, so an `Ok` over refused deletes would tell the operator the host is open while the kill switch is still
+/// engaged. The macOS arm has always propagated its `pfctl` failures; this is the same rule.
 pub(super) fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
     let swept = unsafe {
         let mut engine = HANDLE::default();
