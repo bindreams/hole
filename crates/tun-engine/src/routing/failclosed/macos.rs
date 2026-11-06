@@ -389,6 +389,20 @@ enum PfEngageAction {
     Reenable,
 }
 
+impl PfEngageAction {
+    /// Whether a failed ruleset load unwinds the engage (`lockdown_disengage`). `FreshEnable` and `Reenable` took a
+    /// token and wrote a record this engage owns. `ReuseToken` is a live cover with the live token and record, and
+    /// `pfctl -f` commits a whole ruleset or none, so a failed load leaves the standing cover in force: a back-out
+    /// would remove the kill switch the user armed.
+    fn backs_out_a_failed_load(self) -> bool {
+        match self {
+            PfEngageAction::FreshEnable => true,
+            PfEngageAction::ReuseToken => false,
+            PfEngageAction::Reenable => true,
+        }
+    }
+}
+
 /// Decide how to (re)enable pf for a lockdown engage. `pf_enabled` is read from
 /// `pfctl -s info`; `has_persisted` is whether a valid `bridge-lockdown-pf.json`
 /// exists. The persisted-but-disabled case is the connected-session fail-open this
@@ -907,8 +921,9 @@ fn persist_baseline(
 /// function's doc), and a cold engage has no window that reordering could close
 /// (this module's doc).
 ///
-/// On load failure the host is restored (`lockdown_disengage`) and Err returned;
-/// the bridge's fail-FATAL caller aborts the start.
+/// On load failure Err is returned and the bridge's fail-FATAL caller aborts the start. `FreshEnable` and `Reenable`
+/// first restore the host (`lockdown_disengage`); `ReuseToken` leaves the live cover untouched
+/// ([`PfEngageAction::backs_out_a_failed_load`]).
 pub fn engage_lockdown(
     lock: &CoverLock,
     server_ip: IpAddr,
@@ -929,7 +944,8 @@ pub fn engage_lockdown(
     };
     let mut ops = RealCoverRulesetOps;
 
-    let (token, nat_snapshot) = match engage_pf_action(pf_enabled, persisted.is_some()) {
+    let action = engage_pf_action(pf_enabled, persisted.is_some());
+    let (token, nat_snapshot) = match action {
         // Live Adopt re-engage within one boot: pf still enabled and we hold the
         // token+snapshot. Reuse both so the real host policy is preserved for the
         // eventual restore. ReuseToken assumes our refcount is still live (the
@@ -990,9 +1006,12 @@ pub fn engage_lockdown(
     // standing up a full `RealEngageOps` with a `lock`/`owner` this call
     // never reads.
     if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, &mut ops) {
-        // Restore the host (the restore, the record's clear, the token's drop) before
-        // failing, so a partially-loaded ruleset never strands the host.
-        lockdown_disengage(lock);
+        // The back-out (the restore, the record's clear, the token's drop) unwinds the token and record this engage
+        // just took, so none outlives a cover that never loaded. A `ReuseToken` engage took neither: the live cover
+        // stays and the start fails.
+        if action.backs_out_a_failed_load() {
+            lockdown_disengage(lock);
+        }
         return Err(e);
     }
 

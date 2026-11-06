@@ -2012,8 +2012,11 @@ three axes:
 - **Failure mode.** A failed lockdown engage during a lockdown-on start is
   **fail-FATAL** — it aborts the start and tears everything down; the transient
   cover fails *open* on its own engage error so a half-loaded ruleset never
-  strands the host. Lockdown is **last-writer-wins**: an absolute set via
-  `POST /v1/lockdown`, system-wide.
+  strands the host. On macOS a failed re-engage over a live standing cover
+  (`PfEngageAction::ReuseToken`) leaves that cover in force and fails the start:
+  `pfctl -f` commits a whole ruleset or none, and only an engage that took a
+  fresh token and record backs them out. Lockdown is **last-writer-wins**: an
+  absolute set via `POST /v1/lockdown`, system-wide.
 
 Intent persists to `bridge-lockdown.json`; macOS additionally records the
 pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
