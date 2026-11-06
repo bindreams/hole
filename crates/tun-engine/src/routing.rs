@@ -1224,6 +1224,20 @@ impl CoverPresence {
     pub fn is_confirmed_live(self) -> bool {
         matches!(self, CoverPresence::Live)
     }
+
+    /// Whether an engage that fails to load its ruleset unwinds what it just wrote, read off the presence measured
+    /// BEFORE the engage. Only `Absent` and `Recorded` back out: no cover was in force, so the unwind removes only
+    /// what this engage took. Over `Live`, `Indeterminate` or `Unreachable` a cover is, or cannot be ruled out as,
+    /// in force, and a back-out would remove the user's armed kill switch on a failure that did not touch it.
+    pub fn backs_out_a_failed_engage(self) -> bool {
+        match self {
+            CoverPresence::Live => false,
+            CoverPresence::Recorded => true,
+            CoverPresence::Absent => true,
+            CoverPresence::Indeterminate => false,
+            CoverPresence::Unreachable => false,
+        }
+    }
 }
 
 /// The outcome of [`decide_cover_recovery`]: one action, plus whether the

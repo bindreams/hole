@@ -389,20 +389,6 @@ enum PfEngageAction {
     Reenable,
 }
 
-impl PfEngageAction {
-    /// Whether a failed ruleset load unwinds the engage (`lockdown_disengage`). `FreshEnable` and `Reenable` took a
-    /// token and wrote a record this engage owns. `ReuseToken` is a live cover with the live token and record, and
-    /// `pfctl -f` commits a whole ruleset or none, so a failed load leaves the standing cover in force: a back-out
-    /// would remove the kill switch the user armed.
-    fn backs_out_a_failed_load(self) -> bool {
-        match self {
-            PfEngageAction::FreshEnable => true,
-            PfEngageAction::ReuseToken => false,
-            PfEngageAction::Reenable => true,
-        }
-    }
-}
-
 /// Decide how to (re)enable pf for a lockdown engage. `pf_enabled` is read from
 /// `pfctl -s info`; `has_persisted` is whether a valid `bridge-lockdown-pf.json`
 /// exists. The persisted-but-disabled case is the connected-session fail-open this
@@ -849,16 +835,16 @@ fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, o
 /// exist yet. A mutation ahead of this capture therefore destroys the only copy
 /// of the baseline, permanently — every later engage re-reads its own cover.
 ///
-/// The presence probe leads: if OUR OWN cover is already the loaded ruleset,
-/// `pfctl -sr` would hand back our block-all as if it were the host's policy.
-/// Detection asks [`lockdown_cover_presence`] rather than parsing rule text, so
-/// it depends on no claim about `pfctl -sr`'s print format.
+/// `presence` is the engage's one measurement, taken before it changed anything: if OUR OWN cover is already the
+/// loaded ruleset, `pfctl -sr` would hand back our block-all as if it were the host's policy. Detection asks
+/// [`lockdown_cover_presence`] rather than parsing rule text, so it depends on no claim about `pfctl -sr`'s print
+/// format.
 fn capture_and_persist(
     token: &str,
     lock: &CoverLock,
     owner: Option<(u32, u32)>,
+    presence: crate::routing::CoverPresence,
 ) -> Result<(String, Option<String>), RoutingError> {
-    let presence = lockdown_cover_presence(lock.state_dir());
     let main_snapshot = pfctl_stdout(pfctl(&["-sr"], None, FatalPhase::CoverEngage), "pfctl -sr")?;
     let nat_snapshot = pfctl_stdout(pfctl(&["-sn"], None, FatalPhase::CoverEngage), "pfctl -sn")?;
     persist_baseline(token, lock, owner, presence, main_snapshot, nat_snapshot)
@@ -921,9 +907,12 @@ fn persist_baseline(
 /// function's doc), and a cold engage has no window that reordering could close
 /// (this module's doc).
 ///
-/// On load failure Err is returned and the bridge's fail-FATAL caller aborts the start. `FreshEnable` and `Reenable`
-/// first restore the host (`lockdown_disengage`); `ReuseToken` leaves the live cover untouched
-/// ([`PfEngageAction::backs_out_a_failed_load`]).
+/// On load failure Err is returned and the bridge's fail-FATAL caller aborts the start. The engage first restores the
+/// host (`lockdown_disengage`) only when the presence measured before it says no cover was in force
+/// ([`CoverPresence::backs_out_a_failed_engage`](crate::routing::CoverPresence::backs_out_a_failed_engage)); over a
+/// cover that is, or may be, in force it leaves it. `pfctl -f` commits a whole ruleset or none, so the rules of a
+/// cover in force survive a failed load; pf applies `set` options outside that transaction, and they are identical
+/// across lockdown engages.
 pub fn engage_lockdown(
     lock: &CoverLock,
     server_ip: IpAddr,
@@ -934,9 +923,11 @@ pub fn engage_lockdown(
     // `pf_was_enabled` bit (unlike the transient `FailClosedState`).
     let info = pfctl_stdout(pfctl(&["-s", "info"], None, FatalPhase::CoverEngage), "pfctl -s info")?;
     let pf_enabled = parse_pf_enabled(&info);
-    // The record as a `StateFile`: an unusable or unreadable one is no baseline to reuse, and its token is dropped when
-    // the engage's own record replaces it.
-    let persisted = match pf_record::read::<lockdown_state::LockdownPfState>(lock.state_dir()) {
+    // The engage's one presence measurement, with the record it was folded from: taken before anything changes, it
+    // decides the baseline capture and the back-out of a failed load. An unusable or unreadable record is no baseline
+    // to reuse, and its token is dropped when the engage's own record replaces it.
+    let (presence, record) = lockdown_presence_and_state(lock.state_dir());
+    let persisted = match record {
         StateFile::Present(st) => Some(st),
         StateFile::Absent => None,
         StateFile::Unusable { .. } => None,
@@ -985,7 +976,7 @@ pub fn engage_lockdown(
             // The refcount is now held. Capture + persist may fail, so undo the
             // `-E` on any error before propagating — else the refcount leaks with
             // no state file to recover it from.
-            match capture_and_persist(&token, lock, owner) {
+            match capture_and_persist(&token, lock, owner, presence) {
                 Ok((nat_snapshot, displaced)) => {
                     drop_displaced(displaced.as_deref(), &token, |old| ops.drop_token(old));
                     (token, nat_snapshot)
@@ -1006,10 +997,9 @@ pub fn engage_lockdown(
     // standing up a full `RealEngageOps` with a `lock`/`owner` this call
     // never reads.
     if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, &mut ops) {
-        // The back-out (the restore, the record's clear, the token's drop) unwinds the token and record this engage
-        // just took, so none outlives a cover that never loaded. A `ReuseToken` engage took neither: the live cover
-        // stays and the start fails.
-        if action.backs_out_a_failed_load() {
+        // The back-out (the restore, the record's clear, the token's drop) unwinds what this engage took so it does not
+        // outlive a cover that never loaded. Over a cover in force it would remove the user's kill switch instead.
+        if presence.backs_out_a_failed_engage() {
             lockdown_disengage(lock);
         }
         return Err(e);

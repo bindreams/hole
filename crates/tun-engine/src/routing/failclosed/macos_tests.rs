@@ -520,17 +520,6 @@ fn engage_action_persisted_and_pf_enabled_reuses_token() {
     assert_eq!(engage_pf_action(true, true), PfEngageAction::ReuseToken);
 }
 
-#[skuld::test]
-fn a_failed_load_backs_out_only_the_engages_that_just_took_the_token() {
-    // FreshEnable took a token and wrote a record this engage owns, and Reenable swapped in a fresh token and
-    // record over a pf that was disabled: unwinding them is real work. ReuseToken is a live cover whose token and
-    // record are the live ones: `pfctl -f` commits a ruleset or leaves the old one, so a failed load leaves the
-    // kill switch in force and a back-out would remove it.
-    assert!(PfEngageAction::FreshEnable.backs_out_a_failed_load());
-    assert!(PfEngageAction::Reenable.backs_out_a_failed_load());
-    assert!(!PfEngageAction::ReuseToken.backs_out_a_failed_load());
-}
-
 // ensure_trailing_nl ==================================================================================================
 
 #[skuld::test]
