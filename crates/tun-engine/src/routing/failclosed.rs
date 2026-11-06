@@ -146,7 +146,7 @@ pub(crate) mod platform;
 #[path = "failclosed/macos.rs"]
 mod platform;
 
-// The pf cover's sequencing (engage, unwind, release, recovery) runs over
+// The pf cover's sequencing (engage, back-out, release, recovery) runs over
 // injected `pfctl` and record seams, so its tests build on every host. This is
 // the same module as `platform` above, compiled a second time for test builds
 // on hosts that have no `pfctl`: the sequencing is proved where the tests run,
@@ -1033,7 +1033,7 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 /// [`Clearance`] safe: `recover_lockdown`'s `Sweep` arm, `SystemRouting::
 /// release_all_covers`, the reconciler's `CoverStep::Release` through it, and
 /// the standing guard's `Drop` on each platform (Windows' `Cover::delete_filters`,
-/// macOS's `lockdown_disengage`),
+/// macOS's `lockdown_disengage`, which also serves the engage's back-out),
 /// which log the `Err` and drop the `Ok`. macOS has no `PERSISTENT` sibling
 /// and no boot-time key, so its record is never written, but it takes the
 /// same path.

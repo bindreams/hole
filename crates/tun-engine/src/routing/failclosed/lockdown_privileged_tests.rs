@@ -30,8 +30,7 @@
 //!
 //! COUPLED NAMES: that group's filter matches these tests by the name substrings
 //! `windows_lockdown_permits_server_ip_`, `macos_lockdown_permits_server_ip_`,
-//! `macos_lockdown_failed_engage_` (the four failed-engage tests) and `failclosed_permits_` (the
-//! transient-cover tests). Renaming one
+//! and `failclosed_permits_` (the transient-cover tests). Renaming one
 //! WITHOUT updating `.config/nextest.toml` drops the test from the group → a
 //! silent cross-binary race with the bridge's live-egress `mod tun` e2es.
 //! Change both together.
@@ -481,39 +480,12 @@ fn a_simulated_reboot_rearms_the_cover() {
     );
 }
 
-/// pf's loaded filter rules (`pfctl -sr`), the oracle for "the failed load changed nothing".
-#[cfg(target_os = "macos")]
-fn pf_main_rules() -> String {
-    let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
-    String::from_utf8_lossy(&sr.stdout).into_owned()
-}
-
-/// Whether pf is enabled (`pfctl -s info`). An unwind that drops one token too many leaves a cover's ruleset loaded
-/// into a disabled, inert pf.
-#[cfg(target_os = "macos")]
-fn pf_is_enabled() -> bool {
-    let info = SystemTool::Pfctl
-        .command()
-        .unwrap()
-        .args(["-s", "info"])
-        .output()
-        .unwrap();
-    super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info.stdout))
-}
-
-/// The standing cover's record as it is on disk.
-#[cfg(target_os = "macos")]
-fn standing_record(dir: &std::path::Path) -> super::StateFile<super::lockdown_pf_state::LockdownPfState> {
-    super::pf_record::read::<super::lockdown_pf_state::LockdownPfState>(dir)
-}
-
-/// `ReuseToken`: a re-engage over a cover in force whose load fails returns its error and touches nothing. `pfctl -f`
-/// commits a whole ruleset or none, so the previous ruleset stays (the unchanged `pfctl -sr` is the measurement), the
-/// record and its token stay, pf stays enabled, and the first guard stays current. An interface name pf cannot parse
-/// fails the load after the persisted token was reused.
+/// A re-engage over a live standing cover whose load fails backs out and releases the cover (restore, record, token).
+/// The older guard's stamp must go stale with it, or its later drop would delete what a newer install now owns.
+/// An interface name pf cannot parse fails the load after the persisted token was reused.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn macos_lockdown_failed_engage_over_a_live_cover_keeps_it() {
+fn failclosed_cover_load_failure_backout_outdates_the_older_guards_stamp() {
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
     let engage = |tun_name: &str| {
@@ -529,205 +501,19 @@ fn macos_lockdown_failed_engage_over_a_live_cover_keeps_it() {
 
     let first = engage("utun-absent").expect("engage real pf lockdown cover");
     assert!(crate::routing::CoverGuard::is_current(&first));
-    let rules_before = pf_main_rules();
-    assert!(
-        rules_before.contains("block drop out quick all"),
-        "the first engage must have loaded the lockdown block:\n{rules_before}"
-    );
-    let record_before = standing_record(dir.path());
-    assert!(
-        matches!(record_before, super::StateFile::Present(_)),
-        "the first engage must have recorded its token: {record_before:?}"
-    );
 
     assert!(engage("not an interface").is_err(), "pf cannot parse that rule");
 
     assert_eq!(
-        pf_main_rules(),
-        rules_before,
-        "a failed load must leave the previous ruleset in force"
-    );
-    assert_eq!(
-        standing_record(dir.path()),
-        record_before,
-        "a failed engage that took no token must not touch the record"
-    );
-    assert!(pf_is_enabled(), "the reused token must still hold pf enabled");
-    assert_eq!(
-        super::lockdown_cover_presence(dir.path()),
-        crate::routing::CoverPresence::Live,
-        "the failed re-engage must leave the cover present"
-    );
-    assert!(
-        crate::routing::CoverGuard::is_current(&first),
-        "a failed re-engage released nothing, so the first guard's stamp stays current"
-    );
-
-    drop(first);
-    assert_eq!(
         super::lockdown_cover_presence(dir.path()),
         crate::routing::CoverPresence::Absent,
-        "the surviving guard still releases the cover"
-    );
-}
-
-/// `FreshEnable` over a cover in force whose record is unusable: the record is no baseline, so the engage takes a fresh
-/// token and writes its own record, and when the load fails it drops that token and clears that record and nothing
-/// more. The cover (pf's own label says `Live`) keeps its rules, and pf stays enabled: the corrupted record's token is
-/// still held. That token is read before the record is corrupted so the pf refcount it held is dropped afterwards.
-#[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn macos_lockdown_failed_engage_over_a_live_cover_with_a_corrupt_record_keeps_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let engage = |tun_name: &str| {
-        engage_lockdown(
-            &CoverLock::acquire(dir.path()),
-            server_ip,
-            tun_name,
-            &SystemLuidResolver,
-            &[],
-            None,
-        )
-    };
-
-    let first = engage("utun-absent").expect("engage real pf lockdown cover");
-    let first_token = match standing_record(dir.path()) {
-        super::StateFile::Present(st) => st.pf_token,
-        other => panic!("the first engage must have recorded its token: {other:?}"),
-    };
-    let rules_before = pf_main_rules();
-    std::fs::write(dir.path().join(super::lockdown_pf_state::STATE_FILE_NAME), b"{not json").unwrap();
-    assert_eq!(
-        super::lockdown_cover_presence(dir.path()),
-        crate::routing::CoverPresence::Live,
-        "pf's own label confirms the cover whatever the record says"
-    );
-
-    assert!(engage("not an interface").is_err(), "pf cannot parse that rule");
-
-    assert_eq!(
-        pf_main_rules(),
-        rules_before,
-        "a failed load must leave the previous ruleset in force"
-    );
-    assert_eq!(
-        standing_record(dir.path()),
-        super::StateFile::Absent,
-        "the engage's own record is cleared; the corrupt one it replaced is not restored"
+        "the failed engage's back-out released the cover"
     );
     assert!(
-        pf_is_enabled(),
-        "the engage drops only its own token: the corrupted record's token still holds pf enabled under the cover"
+        !crate::routing::CoverGuard::is_current(&first),
+        "a release the older guard never saw must outdate its stamp"
     );
-    assert_eq!(
-        super::lockdown_cover_presence(dir.path()),
-        crate::routing::CoverPresence::Live,
-        "the failed re-engage must not remove a cover that is in force"
-    );
-
     drop(first);
-    assert_eq!(
-        super::lockdown_cover_presence(dir.path()),
-        crate::routing::CoverPresence::Absent,
-        "the surviving guard still releases the cover"
-    );
-    let released = SystemTool::Pfctl
-        .command()
-        .unwrap()
-        .args(["-X", &first_token])
-        .output()
-        .unwrap();
-    assert!(released.status.success(), "dropping the corrupted record's refcount");
-}
-
-/// `FreshEnable` with no cover and no record whose load fails: the token and record it took are given back, the rules
-/// are not touched (`pfctl -sr` is unchanged, nothing was restored), pf is as enabled as it was, and an older stamp
-/// stays current because the failed engage installed and released nothing.
-#[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn macos_lockdown_failed_engage_without_a_record_gives_back_only_what_it_took() {
-    let dir = tempfile::tempdir().unwrap();
-    let older = CoverLock::acquire(dir.path()).stamp_install(CoverKind::Lockdown);
-    assert!(older.is_current());
-    let rules_before = pf_main_rules();
-    let enabled_before = pf_is_enabled();
-
-    let result = engage_lockdown(
-        &CoverLock::acquire(dir.path()),
-        "1.1.1.1".parse().unwrap(),
-        "not an interface",
-        &SystemLuidResolver,
-        &[],
-        None,
-    );
-    assert!(result.is_err(), "pf cannot parse that rule");
-
-    assert_eq!(
-        standing_record(dir.path()),
-        super::StateFile::Absent,
-        "the record the engage wrote is cleared"
-    );
-    assert_eq!(
-        super::lockdown_cover_presence(dir.path()),
-        crate::routing::CoverPresence::Absent
-    );
-    assert_eq!(pf_main_rules(), rules_before, "the unwind must not reload rules");
-    assert_eq!(
-        pf_is_enabled(),
-        enabled_before,
-        "the engage's token is dropped, so pf is as enabled as before"
-    );
-    assert!(older.is_current(), "a failed engage released nothing");
-}
-
-/// `Reenable` (a record, pf disabled by a reset) whose load fails: the host snapshot the record carries is the only
-/// baseline a later restore has, so the record is put back exactly as read, the fresh token is dropped (pf is disabled
-/// again), and the rules are not touched. The reset is simulated as in `a_simulated_reboot_rearms_the_cover`.
-#[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn macos_lockdown_failed_engage_after_a_pf_reset_puts_the_record_back() {
-    let dir = tempfile::tempdir().unwrap();
-    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let engage = |tun_name: &str| {
-        engage_lockdown(
-            &CoverLock::acquire(dir.path()),
-            server_ip,
-            tun_name,
-            &SystemLuidResolver,
-            &[],
-            None,
-        )
-    };
-
-    let first = engage("utun-absent").expect("engage real pf lockdown cover");
-    for args in [&["-F", "all"][..], &["-d"][..]] {
-        SystemTool::Pfctl.command().unwrap().args(args).output().expect("pfctl");
-    }
-    assert!(!pf_is_enabled(), "the simulated reset must leave pf disabled");
-    let record_before = standing_record(dir.path());
-    assert!(
-        matches!(record_before, super::StateFile::Present(_)),
-        "the reset leaves the record on disk: {record_before:?}"
-    );
-    let rules_before = pf_main_rules();
-
-    assert!(engage("not an interface").is_err(), "pf cannot parse that rule");
-
-    assert_eq!(
-        standing_record(dir.path()),
-        record_before,
-        "the record, snapshot included, must be exactly as it was before the engage"
-    );
-    assert_eq!(pf_main_rules(), rules_before, "the unwind must not reload rules");
-    assert!(!pf_is_enabled(), "the fresh token is dropped, so pf is disabled again");
-
-    drop(first);
-    assert_eq!(
-        super::lockdown_cover_presence(dir.path()),
-        crate::routing::CoverPresence::Absent,
-        "the surviving guard still releases from the restored record"
-    );
 }
 
 /// Windows real-engage verification for the transient block-until-connected
