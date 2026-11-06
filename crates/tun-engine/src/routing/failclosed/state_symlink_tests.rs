@@ -59,7 +59,7 @@ fn failclosed_state_is_not_written_through_a_symlinked_state_directory() {
     let (_tmp, scratch, state_dir) = state_dir_linked_to_the_system();
     let before = present(&scratch, &[STATE_FILE_NAME]);
     let state = FailClosedState {
-        pf_token: "1".into(),
+        pf_token: Some("1".into()),
         pf_was_enabled: true,
     };
 
@@ -78,7 +78,7 @@ fn lockdown_pf_state_is_not_written_through_a_symlinked_state_directory() {
     let (_tmp, scratch, state_dir) = state_dir_linked_to_the_system();
     let before = present(&scratch, &[STATE_FILE_NAME]);
     let state = LockdownPfState {
-        pf_token: "1".into(),
+        pf_token: Some("1".into()),
         main_snapshot: String::new(),
         nat_snapshot: String::new(),
         main_snapshot_captured: false,

@@ -213,7 +213,7 @@ fn macos_writers() -> Vec<Writer> {
             runs_here: true,
             run: |dir, owner| {
                 let state = failclosed_state::FailClosedState {
-                    pf_token: "0".to_owned(),
+                    pf_token: Some("0".to_owned()),
                     pf_was_enabled: false,
                 };
                 pf_record::swap(dir, &state, owner)
@@ -242,7 +242,7 @@ fn macos_writers() -> Vec<Writer> {
             runs_here: true,
             run: |dir, owner| {
                 let state = lockdown_pf_state::LockdownPfState {
-                    pf_token: "0".to_owned(),
+                    pf_token: Some("0".to_owned()),
                     main_snapshot: String::new(),
                     nat_snapshot: String::new(),
                     main_snapshot_captured: true,

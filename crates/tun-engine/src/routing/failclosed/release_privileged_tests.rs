@@ -662,7 +662,7 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
             else {
                 panic!("the engage must have persisted a state file");
             };
-            let token = persisted.pf_token;
+            let token = persisted.pf_token.expect("a fresh engage holds a token");
             cover.disarm(); // stand in for the crash: no guard remains
 
             let rolled_back = format!(r#"{{"version":2,"pf_token":"{token}","pf_was_enabled":false}}"#);
