@@ -4,7 +4,7 @@
 //!   `pfctl -E`) and loads a self-contained ruleset (see `build_pf_ruleset`,
 //!   via `pfctl -f -`, NO `-Fa`) blocking everything but loopback, the
 //!   server, and the pinned resolver. Disengage restores the canonical
-//!   `/etc/pf.conf` and drops the refcount. Dropping `-Fa` is load-bearing:
+//!   `/etc/pf.conf`, clears the record and drops the refcount. Dropping `-Fa` is load-bearing:
 //!   `-Fa` flushes ALL pf state as its own, separately committed kernel
 //!   operation, so `-Fa -f -` was two transactions with a
 //!   pass-all host briefly live between them — including across a cover
@@ -44,8 +44,10 @@
 //! - **Standing lockdown** (`engage_lockdown`/`lockdown_disengage`): loads a
 //!   self-contained MAIN ruleset (NO `-Fa`) that carries the host's translation
 //!   rules forward and blocks all egress except the TUN and server IP. Disengage
-//!   restores the host's pre-lockdown filter+nat from the persisted snapshot —
-//!   not a blind `/etc/pf.conf` reload — and drops the refcount. Engage
+//!   restores the host's pre-lockdown filter+nat from the persisted snapshot,
+//!   clears the record and drops the refcount. A record with no captured baseline
+//!   reloads `/etc/pf.conf` instead, and so does a snapshot that will not load
+//!   ([`restore_standing`]). Engage
 //!   idempotently ENSURES pf is enabled (pf is disabled — and its refcount reset
 //!   — across a reboot, but the state file persists), so a reconnect re-enables
 //!   pf and loads a live ruleset instead of an inert one.
@@ -55,18 +57,20 @@
 //!   took the record that named it ([`release`]). A clear that cannot write is the release's error and
 //!   drops nothing, so the retry still has its token. A failed restore is the release's error and
 //!   touches neither record nor token: the cover stays in force, evidence and refcount together, until
-//!   a later release restores. A drop that fails is only
+//!   a later release restores. A record that could not be read is left in place: after a good restore the
+//!   release answers an error, never success. A drop that fails is only
 //!   logged: the refcount stays until a reboot resets it, and with the host's rules restored it
-//!   blocks nothing. Dropping Hole's token releases Hole's hold only: the block lifts when no other
-//!   refcount keeps pf enabled. Every `pfctl -X` goes through [`drop_or_warn`] over the caller's ops
+//!   blocks nothing. Dropping Hole's token releases Hole's hold only: pf stays enabled over the restored
+//!   rules while any other refcount holds it. Every `pfctl -X` goes through [`drop_or_warn`] over the caller's ops
 //!   seam. An engage whose record write replaced one naming another token drops that token
 //!   ([`drop_displaced`]). Every one of these runs under the cover lock.
 //!
 //! Documented caveats (pf has no programmatic API — `pfctl` text I/O IS the
 //! interface, as `netsh`/`route` are for routing):
 //! - The transient restore reloads `/etc/pf.conf`; the lockdown restore reloads
-//!   the captured snapshot. Neither can recover prior `set` options (pf exposes
-//!   no dump of them), so both restore under pf defaults.
+//!   the captured snapshot, or `/etc/pf.conf` when none was captured or it will
+//!   not load. Neither can recover prior `set` options (pf exposes no dump of
+//!   them), so both restore under pf defaults.
 //! - The `pfctl -E` token is parsed from stderr — its only exposure.
 
 // Test builds on other hosts compile this module to drive its sequencers; the
@@ -424,7 +428,8 @@ fn enable_pf_capture_token() -> Result<String, RoutingError> {
 }
 
 /// pf-backed cover guard. Drop disengages per its stamp's [`CoverKind`], while its install is the latest
-/// ([`InstallStamp`]): the transient cover restores `/etc/pf.conf`; the lockdown cover restores the snapshot.
+/// ([`InstallStamp`]): the transient cover restores `/etc/pf.conf`; the lockdown cover restores the captured snapshot
+/// (else `/etc/pf.conf`, [`restore_standing`]).
 pub struct Cover {
     /// `None` once `detach` has consumed the claim, which makes `Drop` a no-op.
     held: Option<Held>,
@@ -759,8 +764,8 @@ fn drop_or_warn(token: &str, context: &str, drop: impl FnOnce(&str) -> Result<()
 }
 
 /// Restore the host and give up the transient cover's record and refcount. When `adopting` is false it reloads the
-/// canonical `/etc/pf.conf`: the cover's own block-all ruleset is still live, so the reload is what returns the host to
-/// it. When a standing cover is being adopted the reload is skipped, because it would wipe the standing lockdown ruleset
+/// canonical `/etc/pf.conf`: the cover's own block-all ruleset is still live, so the reload is what lifts the block.
+/// When a standing cover is being adopted the reload is skipped, because it would wipe the standing lockdown ruleset
 /// (the live main ruleset) before Adopt.
 ///
 /// A failed restore keeps the token and the record, so the next sweep still sees a cover rather than a clean host over
@@ -995,8 +1000,8 @@ pub fn engage_lockdown(
     // standing up a full `RealEngageOps` with a `state_dir`/`owner` this call
     // never reads.
     if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, &mut ops) {
-        // Restore the host (snapshot reload + drop refcount) before failing, so
-        // a partially-loaded ruleset never strands the host.
+        // Restore the host (the restore, the record's clear, the token's drop) before
+        // failing, so a partially-loaded ruleset never strands the host.
         lockdown_disengage(state_dir);
         return Err(e);
     }
@@ -1010,8 +1015,10 @@ pub fn engage_lockdown(
     })
 }
 
-/// Fail-loud disengage: restore the pre-lockdown ruleset from the snapshot, drop
-/// our pf refcount, clear the state. Powers the `bridge unlock` escape hatch.
+/// Fail-loud disengage of the standing cover: restore the host ([`restore_standing`]: the captured snapshot, else
+/// `/etc/pf.conf`), clear the record, drop our pf refcount ([`release`]). Every release of the standing cover that is
+/// not `release_all` comes here: `bridge unlock`, the startup sweep when the intent is off, the standing guard's `Drop`
+/// and the back-out of a failed engage.
 ///
 /// Gates on [`lockdown_cover_presence`] — pf's own answer folded with the
 /// state file — not on the file alone (#882): a state file that is absent or
@@ -1077,8 +1084,8 @@ fn disengage_lockdown_with(
 
     let restored = restore_standing(&st, ops);
 
-    // The escape hatch (`bridge unlock`, the intent-off sweep): after a good restore it drops the token the record
-    // names, an UNUSABLE record's included, once the record no longer names it.
+    // After a good restore it drops the token the record names, an UNUSABLE record's included, once the record no
+    // longer names it.
     release(ops, CoverKind::Lockdown, st.release_token(), restored)
 }
 
@@ -1130,8 +1137,8 @@ fn lockdown_presence_and_state(
     (fold_presence(pf_label, &file), file)
 }
 
-/// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
-/// no caller to surface an error to.
+/// Best-effort wrapper for the standing guard's `Drop` (user-stop) and the engage's back-out: disengage and log.
+/// Neither has a caller to surface an error to.
 fn lockdown_disengage(state_dir: &Path) {
     // `Unset`: this platform arms no boot-time key
     // ([`STANDING_COVER_ARMS_BOOT_TIME`]), so there is never a record to
@@ -1162,9 +1169,8 @@ pub(crate) trait PfOps {
     /// `pfctl -X <token>`: drop a pf enable refcount. Callers go through [`drop_or_warn`]; a failure is never a
     /// release's error.
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
-    /// Clear the transient cover's record that a release settled under `token`
-    /// ([`pf_record::clear_if_token`]): only a record naming it. What it found is a
-    /// [`Cleared`]; a record that could not be read is `Kept`.
+    /// Clear the transient cover's record under `token` ([`pf_record::clear_if_token`]): only a record naming it.
+    /// What it found is a [`Cleared`]; a record that could not be read is `Kept`.
     fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError>;
     /// The same for the standing lockdown cover's record.
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError>;
@@ -1215,8 +1221,8 @@ fn refused(cleared: Cleared) -> Result<(), RoutingError> {
 ///   works. A clear that finds another token's record or none drops nothing either: the engage that displaced it
 ///   dropped it already. A record that could not be read stays and is the error.
 ///
-/// A record that could not be read has no token to drop or clear by. The host is restored all the same, and the
-/// answer is the refusal, never success.
+/// A record that could not be read has no token to drop or clear by: it is left in place. After a good restore the
+/// answer is the refusal, never success; a failed restore is the error, as above.
 fn release(
     ops: &mut dyn PfOps,
     kind: CoverKind,
@@ -1247,8 +1253,8 @@ fn release(
 /// goes through it: `release_all`, and `disengage_lockdown_with` for all its callers (the standing guard's `Drop`,
 /// the back-out of a failed engage, the startup sweep when the intent is off, and `bridge unlock`).
 ///
-/// A record with no captured baseline (or none usable: presence was established by pf's label alone) has no snapshot,
-/// so `/etc/pf.conf` IS the restore target; loading the empty snapshot would leave a pass-all host (see
+/// [`StateFile::captured_snapshot`] chooses: only a record with a captured baseline has a snapshot to load, and every
+/// other record reloads `/etc/pf.conf` (loading an empty snapshot would leave a pass-all host; see
 /// `LockdownPfState::main_snapshot_captured`). A snapshot that will not load falls back to `/etc/pf.conf` rather than
 /// leave the host blocked; when that fails too, the fallback's error is the answer (the last restore that ran) and
 /// the snapshot's is logged.
@@ -1288,8 +1294,8 @@ fn restore_standing(
 ///
 /// Two blocks, one error per cover, no `?` — a `?` would short-circuit the block
 /// that had not run yet. Each block's failure decides only its own cover's
-/// release. Each cover is restored, then its token dropped, then its record
-/// cleared ([`release`]).
+/// release. Each cover is restored, then its record cleared, then its token dropped if that clear took the record
+/// ([`release`]).
 pub(crate) fn release_all_with(
     transient: StateFile<state::FailClosedState>,
     standing: StateFile<lockdown_state::LockdownPfState>,

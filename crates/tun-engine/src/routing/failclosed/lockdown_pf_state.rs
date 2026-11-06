@@ -17,7 +17,8 @@ pub struct LockdownPfState {
     pub pf_token: String,
     /// The host's filter ruleset (`pfctl -sr`) captured before we replaced the
     /// main ruleset with the lockdown policy. Re-loaded on Sweep so the host
-    /// returns to its pre-lockdown policy (NOT a blind `/etc/pf.conf` reload).
+    /// returns to its pre-lockdown policy. A record with no captured baseline (below), or a snapshot that will not
+    /// load, reloads `/etc/pf.conf` instead ([`StateFile::captured_snapshot`](super::StateFile)).
     pub main_snapshot: String,
     /// The host's translation rules (`pfctl -sn`: nat/rdr) captured alongside
     /// `main_snapshot`. Carried forward into the lockdown ruleset (so the
@@ -25,8 +26,8 @@ pub struct LockdownPfState {
     pub nat_snapshot: String,
     /// `false` when the host's filter ruleset at engage time was our OWN cover,
     /// so there was no pre-lockdown baseline to capture; a restore then reloads
-    /// `/etc/pf.conf` instead of `main_snapshot`. Read by `disengage_lockdown`
-    /// and by `release_all_with`'s standing `Present` arm.
+    /// `/etc/pf.conf` instead of `main_snapshot`. Read by
+    /// [`StateFile::captured_snapshot`](super::StateFile), which every standing release asks.
     ///
     /// A bool, not `main_snapshot.is_empty()`: a host really can have an empty
     /// filter ruleset, and that IS its policy — keying on emptiness would
