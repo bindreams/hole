@@ -5,8 +5,9 @@
 //! every record step is the production one (`pf_record`); only pf is modelled: which tokens it holds, which ruleset is
 //! loaded, and whether `pfctl -X` works. The entry states are the ones a past run can leave behind: no record, a live
 //! one, an unusable one with and without a salvageable token, one that cannot be read, and a live one whose token pf
-//! no longer holds (a reboot, or a drop the record never saw). When `-X` fails it fails for the first operation only:
-//! a failed drop is the case the order matters for.
+//! no longer holds (a reboot, or a drop the record never saw). When `-X` fails, or a restore (`reload_default`,
+//! `load_ruleset` of a snapshot) fails, it fails for the first operation only: a failed drop or restore is the case the
+//! order matters for.
 //!
 //! The standing engage is not a party. It shares `drop_displaced` and `pf_record` with the transient engage, which is a
 //! party, so an order "standing engage, then X" differs only in which record type it writes and which `pfctl` calls it
@@ -21,7 +22,8 @@
 //!   unusable file never named and the ones whose drop failed (a release clears its record whatever the drop did, an
 //!   engage's displaced-token drop is best-effort; both are warned);
 //! - a blocked host has a record to recover it from;
-//! - a release or disengage leaves no readable record behind, and returns `Ok` only over none at all;
+//! - a release or disengage leaves no readable record behind, and returns `Ok` only over none at all, except over a
+//!   failed restore: the cover is still in force, so it returns `Err` and clears nothing (record and token stay);
 //! - a failed drop is never a release's error: a release or disengage returns `Err` only over a record it could not
 //!   read.
 
@@ -53,6 +55,9 @@ struct Pf {
     dropped_while_named: Vec<String>,
     minted: u32,
     drops_fail: bool,
+    restores_fail: bool,
+    /// Restores that were asked for and failed, so a party that hit one can be told apart from one that did not.
+    failed_restores: u32,
 }
 
 impl Pf {
@@ -61,6 +66,16 @@ impl Pf {
         let token = format!("new{}", self.minted);
         self.live.insert(token.clone());
         token
+    }
+
+    /// A restore of the host's rules: on failure the rules stay as they were.
+    fn restore(&mut self) -> Result<(), RoutingError> {
+        if self.restores_fail {
+            self.failed_restores += 1;
+            return Err(RoutingError::RouteSetup("mock restore failure".into()));
+        }
+        self.rules = Rules::Open;
+        Ok(())
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -133,13 +148,11 @@ impl EngageOps for Host<'_> {
 
 impl PfOps for Host<'_> {
     fn reload_default(&mut self) -> Result<(), RoutingError> {
-        self.pf.rules = Rules::Open;
-        Ok(())
+        self.pf.restore()
     }
 
     fn load_ruleset(&mut self, _text: &str) -> Result<(), RoutingError> {
-        self.pf.rules = Rules::Open;
-        Ok(())
+        self.pf.restore()
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
@@ -246,13 +259,7 @@ const STANDING_LIVE: &str =
     r#"{"version":1,"pf_token":"s-old","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":true}"#;
 
 /// Runs one cell and returns what it broke.
-fn violations_of(
-    first: Party,
-    second: Party,
-    transient: Entry,
-    standing: Entry,
-    first_drops_fail: bool,
-) -> Vec<String> {
+fn violations_of(first: Party, second: Party, transient: Entry, standing: Entry, fault: Fault) -> Vec<String> {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let lock = CoverLock::acquire(dir);
@@ -267,6 +274,8 @@ fn violations_of(
         dropped_while_named: Vec::new(),
         minted: 0,
         drops_fail: false,
+        restores_fail: false,
+        failed_restores: 0,
     };
     for (entry, file, live_record, token) in [
         (transient, state::STATE_FILE_NAME, TRANSIENT_LIVE, "t-old"),
@@ -283,19 +292,34 @@ fn violations_of(
 
     let mut found = Vec::new();
     for (index, party) in [first, second].into_iter().enumerate() {
-        pf.drops_fail = first_drops_fail && index == 0;
-        let result = party.run(&mut Host {
-            lock: &lock,
-            pf: &mut pf,
-        });
-        pf.drops_fail = false;
+        pf.drops_fail = fault == Fault::DropsFail && index == 0;
+        pf.restores_fail = fault == Fault::RestoresFail && index == 0;
         let covered: &[&str] = match party {
             Party::Engage => &[],
             Party::Release => &[state::STATE_FILE_NAME, lockdown_state::STATE_FILE_NAME],
             Party::Disengage => &[lockdown_state::STATE_FILE_NAME],
         };
-        // A release restores before it clears, and the model's restores never fail: what it leaves is a record it
-        // could not read (a directory), and then only with an error.
+        let existed: Vec<bool> = covered.iter().map(|file| dir.join(file).exists()).collect();
+        let failed_restores = pf.failed_restores;
+        let result = party.run(&mut Host {
+            lock: &lock,
+            pf: &mut pf,
+        });
+        pf.drops_fail = false;
+        pf.restores_fail = false;
+        if pf.failed_restores > failed_restores {
+            // The cover is still in force: the party says so, and clears nothing.
+            if result.is_ok() {
+                found.push(format!("{party:?} returned Ok over a failed restore"));
+            }
+            let kept: Vec<bool> = covered.iter().map(|file| dir.join(file).exists()).collect();
+            if kept != existed {
+                found.push(format!("{party:?} cleared a record over a failed restore"));
+            }
+            continue;
+        }
+        // A release restores before it clears: what it leaves is a record it could not read (a directory), and
+        // then only with an error.
         let left: Vec<&&str> = covered
             .iter()
             .filter(|file| dir.join(file).is_file() || (result.is_ok() && dir.join(file).exists()))
@@ -349,7 +373,15 @@ fn violations_of(
     found
 }
 
-fn every_cell(first_drops_fail: bool) {
+/// What fails during the first operation of a cell, if anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    None,
+    DropsFail,
+    RestoresFail,
+}
+
+fn every_cell(fault: Fault) {
     let mut red = Vec::new();
     let mut cells = 0;
     for first in Party::ALL {
@@ -357,7 +389,7 @@ fn every_cell(first_drops_fail: bool) {
             for transient in Entry::ALL {
                 for standing in Entry::ALL {
                     cells += 1;
-                    let found = violations_of(first, second, transient, standing, first_drops_fail);
+                    let found = violations_of(first, second, transient, standing, fault);
                     if !found.is_empty() {
                         red.push(format!(
                             "{first:?} then {second:?} | transient {transient:?}, standing {standing:?}\n    {}",
@@ -378,10 +410,15 @@ fn every_cell(first_drops_fail: bool) {
 
 #[skuld::test]
 fn no_order_of_two_cover_operations_breaks_a_record_invariant() {
-    every_cell(false);
+    every_cell(Fault::None);
 }
 
 #[skuld::test]
 fn no_order_of_two_cover_operations_breaks_a_record_invariant_after_a_failed_token_drop() {
-    every_cell(true);
+    every_cell(Fault::DropsFail);
+}
+
+#[skuld::test]
+fn no_order_of_two_cover_operations_breaks_a_record_invariant_after_a_failed_restore() {
+    every_cell(Fault::RestoresFail);
 }
