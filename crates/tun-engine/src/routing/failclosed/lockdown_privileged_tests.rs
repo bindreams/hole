@@ -30,7 +30,8 @@
 //!
 //! COUPLED NAMES: that group's filter matches these tests by the name substrings
 //! `windows_lockdown_permits_server_ip_`, `macos_lockdown_permits_server_ip_`,
-//! and `failclosed_permits_` (the transient-cover tests). Renaming one
+//! `macos_lockdown_failed_engage_` (the two failed-engage tests) and `failclosed_permits_` (the
+//! transient-cover tests). Renaming one
 //! WITHOUT updating `.config/nextest.toml` drops the test from the group → a
 //! silent cross-binary race with the bridge's live-egress `mod tun` e2es.
 //! Change both together.
@@ -480,12 +481,14 @@ fn a_simulated_reboot_rearms_the_cover() {
     );
 }
 
-/// A re-engage over a live standing cover whose load fails backs out and releases the cover (restore, record, token).
-/// The older guard's stamp must go stale with it, or its later drop would delete what a newer install now owns.
-/// An interface name pf cannot parse fails the load after the persisted token was reused.
+/// A re-engage over a live standing cover (`PfEngageAction::ReuseToken`) whose load fails returns its error and
+/// touches nothing: `pfctl -f` commits a whole ruleset or none, so the previous ruleset stays in force, the record
+/// and token stay, and the first guard stays current. An interface name pf cannot parse fails the load after the
+/// persisted token was reused. The unchanged `pfctl -sr` is also the measurement that a failed load leaves the
+/// previous ruleset.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn failclosed_cover_load_failure_backout_outdates_the_older_guards_stamp() {
+fn macos_lockdown_failed_engage_over_a_live_cover_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
     let engage = |tun_name: &str| {
@@ -498,22 +501,71 @@ fn failclosed_cover_load_failure_backout_outdates_the_older_guards_stamp() {
             None,
         )
     };
+    let main_rules = || {
+        let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
+        String::from_utf8_lossy(&sr.stdout).into_owned()
+    };
 
     let first = engage("utun-absent").expect("engage real pf lockdown cover");
     assert!(crate::routing::CoverGuard::is_current(&first));
+    let before = main_rules();
+    assert!(
+        before.contains("block drop out quick all"),
+        "the first engage must have loaded the lockdown block:\n{before}"
+    );
 
     assert!(engage("not an interface").is_err(), "pf cannot parse that rule");
 
     assert_eq!(
+        main_rules(),
+        before,
+        "a failed load must leave the previous ruleset in force"
+    );
+    assert_eq!(
         super::lockdown_cover_presence(dir.path()),
-        crate::routing::CoverPresence::Absent,
-        "the failed engage's back-out released the cover"
+        crate::routing::CoverPresence::Live,
+        "the failed re-engage must leave the cover present"
     );
     assert!(
-        !crate::routing::CoverGuard::is_current(&first),
-        "a release the older guard never saw must outdate its stamp"
+        crate::routing::CoverGuard::is_current(&first),
+        "a failed re-engage released nothing, so the first guard's stamp stays current"
     );
+
     drop(first);
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "the surviving guard still releases the cover"
+    );
+}
+
+/// A fresh engage (`PfEngageAction::FreshEnable`, no record) whose load fails backs out: the token and record it just
+/// took are released, and the release outdates an older stamp (the same stamp a guard minted over a cover since
+/// released), or that guard's later drop would delete what a newer install now owns. An interface name pf cannot
+/// parse fails the load.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn macos_lockdown_failed_engage_without_a_record_backs_out_and_outdates_an_older_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let older = CoverLock::acquire(dir.path()).stamp_install(CoverKind::Lockdown);
+    assert!(older.is_current());
+
+    let result = engage_lockdown(
+        &CoverLock::acquire(dir.path()),
+        "1.1.1.1".parse().unwrap(),
+        "not an interface",
+        &SystemLuidResolver,
+        &[],
+        None,
+    );
+    assert!(result.is_err(), "pf cannot parse that rule");
+
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "the failed engage's back-out released the token and record it took"
+    );
+    assert!(!older.is_current(), "a confirmed release must outdate the older stamp");
 }
 
 /// Windows real-engage verification for the transient block-until-connected
