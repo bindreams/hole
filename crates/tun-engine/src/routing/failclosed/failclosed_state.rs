@@ -21,12 +21,7 @@ pub const STATE_FILE_NAME: &str = "bridge-failclosed.json";
 pub struct FailClosedState {
     /// Opaque enable token returned by `pfctl -E`, replayed to `pfctl -X` on
     /// recovery. Stored as a string — it is an opaque handle, not arithmetic.
-    /// `None`: the cover holds no token any more (see [`super::pf_record`]).
-    ///
-    /// No schema bump for `String` -> `Option<String>`: every record that names a token is byte-identical to
-    /// the old form, so a rolled-back release still reads it. The one new form, a `null`, it reads as a record it
-    /// cannot use, which it sweeps (restore, clear).
-    pub pf_token: Option<String>,
+    pub pf_token: String,
     /// Whether pf reported `Status: Enabled` before we engaged; `false` also
     /// when that read failed (the engage warns and does not fail on it). Diagnostic
     /// only: recovery restores `/etc/pf.conf` and drops our refcount regardless.
@@ -57,21 +52,7 @@ impl VersionedState for FailClosedState {
 util::assert_contiguous!(FailClosedState);
 
 impl super::pf_record::PfRecord for FailClosedState {
-    fn pf_token(&self) -> Option<&str> {
-        self.pf_token.as_deref()
-    }
-
-    fn without_token(&self) -> Self {
-        Self {
-            pf_token: None,
-            ..self.clone()
-        }
-    }
-
-    fn tokenless() -> Self {
-        Self {
-            pf_token: None,
-            pf_was_enabled: false,
-        }
+    fn pf_token(&self) -> &str {
+        &self.pf_token
     }
 }

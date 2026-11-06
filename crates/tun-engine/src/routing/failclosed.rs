@@ -468,18 +468,18 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
 ///    warning on failure and do not fail the call: once the host's rules are
 ///    restored, a refcount that will not drop blocks nothing, and a record kept
-///    for it would fail the same way on every retry. After a restore that
-///    failed the block is still loaded, and the refcount keeps pf enforcing it
-///    until it is dropped or a reboot resets it. A cover's state-file clear is
-///    different: it is *skipped* whenever that cover's replacement ruleset did
+///    for it would fail the same way on every retry. A cover's state-file clear
+///    is different: it is *skipped* whenever that cover's replacement ruleset did
 ///    not confirm, because the file is the cover's only record — clearing it
 ///    after an unconfirmed restore would make the next call read a clean host
 ///    while the block persists (a manufactured, permanent lockout). After a
 ///    confirmed restore, a clear that cannot write is that cover's error.
 ///    macOS orders the two so that `pfctl -X` never runs while a record names
 ///    its token (pf may hand the value to another app): the clear comes first,
-///    and after an unconfirmed restore the record forgets the token before it
-///    is dropped.
+///    and the token is dropped only if it took the record. After an unconfirmed
+///    restore the cover stays in force with its record and its refcount both
+///    held, and the error tells the user to fix `/etc/pf.conf` and unblock
+///    again, or run `pfctl -d`.
 ///
 /// Windows keeps no cover state file at all: the filter set is compiled-in
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or

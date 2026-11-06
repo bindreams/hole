@@ -106,6 +106,10 @@ impl CoverRulesetOps for Host<'_> {
     fn flush_states(&mut self) -> Result<(), RoutingError> {
         Ok(())
     }
+
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.drop_checked(token)
+    }
 }
 
 impl EngageOps for Host<'_> {
@@ -120,10 +124,6 @@ impl EngageOps for Host<'_> {
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError> {
         pf_record::swap(self.dir, st, None)
             .map_err(|e| RoutingError::state_op_failed(StateOp::Write, "failclosed-state", &e))
-    }
-
-    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        self.drop_checked(token)
     }
 
     fn transient_restore(&mut self, token: &str) {
@@ -152,14 +152,6 @@ impl PfOps for Host<'_> {
 
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         RealPfOps { state_dir: self.dir }.clear_standing(token)
-    }
-
-    fn forget_transient(&mut self, token: &str) -> Result<Forgot, RoutingError> {
-        RealPfOps { state_dir: self.dir }.forget_transient(token)
-    }
-
-    fn forget_standing(&mut self, token: &str) -> Result<Forgot, RoutingError> {
-        RealPfOps { state_dir: self.dir }.forget_standing(token)
     }
 }
 
@@ -201,19 +193,16 @@ enum Entry {
     Unreadable,
     /// A live record whose token pf does not hold: `-X` of it fails whatever else is true.
     Stale,
-    /// A record an escape's failed restore left: it names no token, and the block it could not lift is still loaded.
-    Forgotten,
 }
 
 impl Entry {
-    const ALL: [Entry; 7] = [
+    const ALL: [Entry; 6] = [
         Entry::Absent,
         Entry::Live,
         Entry::UnusableWithToken,
         Entry::UnusableWithoutToken,
         Entry::Unreadable,
         Entry::Stale,
-        Entry::Forgotten,
     ];
 
     /// Writes the record `file` in `dir` this way and sets pf to hold what that record's past run left it holding.
@@ -240,9 +229,6 @@ impl Entry {
                 std::fs::create_dir(&path).unwrap();
                 pf.live.insert(anonymous.clone());
                 pf.anonymous.insert(anonymous);
-            }
-            Entry::Forgotten => {
-                std::fs::write(&path, live_record.replace(&format!("\"{token}\""), "null")).unwrap();
             }
             Entry::Stale => {
                 std::fs::write(&path, live_record).unwrap();
