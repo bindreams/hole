@@ -1125,19 +1125,14 @@ fn lockdown_presence_and_state(
 }
 
 /// Best-effort wrapper for the standing guard's `Drop` (user-stop) and the engage's back-out: disengage and log.
-/// Neither has a caller to surface an error to.
+/// Neither has a caller to surface an error to. It goes through the facade's [`super::disengage_lockdown`], so a
+/// confirmed release outdates the kind's stamps like every other sweep.
 fn lockdown_disengage(lock: &CoverLock) {
-    // `Unset`: this platform arms no boot-time key
-    // ([`STANDING_COVER_ARMS_BOOT_TIME`]), so there is never a record to
-    // consult and the argument is inert.
-    match disengage_lockdown(lock, super::ArmingWitness::Unset).into_result() {
-        // Always `Clearance::proven` on macOS, and `Drop` has no reader for
-        // it either way.
-        Ok(_clearance_is_unconditional_here) => {}
-        Err(e) => tracing::warn!(
+    if let Err(e) = super::disengage_lockdown(lock) {
+        tracing::warn!(
             error = &e as &dyn std::error::Error,
-            "lockdown disengage failed during Drop"
-        ),
+            "lockdown disengage failed during Drop or an engage's back-out"
+        );
     }
 }
 
