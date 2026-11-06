@@ -30,7 +30,8 @@
 //!
 //! COUPLED NAMES: that group's filter matches these tests by the name substrings
 //! `windows_lockdown_permits_server_ip_`, `macos_lockdown_permits_server_ip_`,
-//! and `failclosed_permits_` (the transient-cover tests). Renaming one
+//! `failclosed_permits_` (the transient-cover tests), and
+//! `macos_lockdown_failed_engage_` (the back-out stamp test). Renaming one
 //! WITHOUT updating `.config/nextest.toml` drops the test from the group → a
 //! silent cross-binary race with the bridge's live-egress `mod tun` e2es.
 //! Change both together.
@@ -480,12 +481,14 @@ fn a_simulated_reboot_rearms_the_cover() {
     );
 }
 
-/// A re-engage over a live standing cover whose load fails backs out and releases the cover (restore, record, token).
-/// The older guard's stamp must go stale with it, or its later drop would delete what a newer install now owns.
-/// An interface name pf cannot parse fails the load after the persisted token was reused.
+/// Pins only the stamp bookkeeping: the back-out of a failed re-engage releases the cover (restore, record, token),
+/// and the older guard's stamp must go stale with it, or its later drop would delete what a newer install now owns.
+/// That the back-out removes a cover that was in force is the known defect #1203, not the desired behaviour: when it
+/// is fixed this test's presence assertion changes with it. An interface name pf cannot parse fails the load after
+/// the persisted token was reused.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn failclosed_cover_load_failure_backout_outdates_the_older_guards_stamp() {
+fn macos_lockdown_failed_engage_backout_outdates_the_older_guards_stamp() {
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
     let engage = |tun_name: &str| {
@@ -507,11 +510,11 @@ fn failclosed_cover_load_failure_backout_outdates_the_older_guards_stamp() {
     assert_eq!(
         super::lockdown_cover_presence(dir.path()),
         crate::routing::CoverPresence::Absent,
-        "the failed engage's back-out released the cover"
+        "the back-out released the cover (known defect #1203: a cover in force should survive a failed engage)"
     );
     assert!(
         !crate::routing::CoverGuard::is_current(&first),
-        "a release the older guard never saw must outdate its stamp"
+        "the back-out's confirmed release must outdate the older guard's stamp"
     );
     drop(first);
 }

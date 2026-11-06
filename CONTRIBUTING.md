@@ -2013,7 +2013,9 @@ three axes:
   **fail-FATAL** — it aborts the start and tears everything down; the transient
   cover fails *open* on its own engage error so a half-loaded ruleset never
   strands the host. Lockdown is **last-writer-wins**: an absolute set via
-  `POST /v1/lockdown`, system-wide.
+  `POST /v1/lockdown`, system-wide. On macOS a failed re-engage over a live
+  cover removes it (the engage's back-out releases the cover, not only the
+  token and record it took; bindreams/hole#1203).
 
 Intent persists to `bridge-lockdown.json`; macOS additionally records the
 pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
