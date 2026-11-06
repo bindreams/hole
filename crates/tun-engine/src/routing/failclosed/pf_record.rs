@@ -51,7 +51,9 @@ impl<T: PfRecord> StateFile<T> {
 /// The answer for a record a release could not read. The text names no path: it reaches a toast.
 fn unread_record() -> RoutingError {
     RoutingError::RouteSetup(
-        "the cover record could not be read, so it was left in place and the host may still be blocked".into(),
+        "the host's rules are restored, but the cover record could not be read and was left in place, so the release is \
+         not confirmed"
+            .into(),
     )
 }
 
@@ -62,7 +64,7 @@ pub enum Cleared {
     Removed,
     /// Nothing there, or a record that names another token: nothing of the caller's to clear.
     Gone,
-    /// The record could not be read, so it was left in place. The host may still be blocked.
+    /// The record could not be read, so it was left in place and the release is not confirmed.
     Kept,
 }
 

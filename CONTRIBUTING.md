@@ -3164,11 +3164,12 @@ Every mutation of a fail-closed cover inside the bridge process runs under one l
 - **What it excludes.** An engage, a guard's release or drop, a sweep (`release_all`, `disengage_lockdown`,
   `recover_cover`) and crash recovery. A decision that reads cover state (the kill-switch intent, the target, the
   measured presence) is made from a fresh read taken inside the section that acts on it, so nothing changes between the
-  read and the act. The engage, release and sweep functions, the Windows TUN-permit reclaim
-  (`reclaim_stale_tun_permit`) and the writers of the records such a decision reads
+  read and the act. The public facade's engage, release and sweep functions, including the TUN-permit reclaim
+  (`reclaim_stale_tun_permit`), and the writers of the records such a decision reads
   (`lockdown_state::{set_enabled, promote_unrecorded}`, the boot-time witness's arming write) take `&CoverLock`, so a
-  call without the lock does not compile. The pf records' `swap` and `clear_if_token` take a directory and are called
-  only from those functions.
+  call without the lock does not compile. The platform layer below the facade is crate-private and called only from
+  the facade; the pf records' `swap` and `clear_if_token` take a directory and are
+  called only from those functions.
 - **Order.** `state.proxy` (X), then the cover lock, then the record files' own locks and the witness lock. A section
   is a synchronous function or a `spawn_blocking` closure: `CoverLock` is `!Send` (`a_cover_lock_is_not_send`), so a
   future cannot hold it across an `.await`. `Routing::lock_covers` takes the lock for the provider's own directory;

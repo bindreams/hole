@@ -380,11 +380,11 @@ pub fn recover_lockdown(lock: &CoverLock, decision: crate::routing::CoverRecover
 /// there is no macOS analogue and this is a no-op there.
 ///
 /// Takes the cover lock: the delete is a cover mutation, like an engage or a sweep.
-pub fn reclaim_stale_tun_permit(lock: &CoverLock, tun_name: &str) {
+pub fn reclaim_stale_tun_permit(_lock: &CoverLock, tun_name: &str) {
     #[cfg(target_os = "windows")]
-    platform::reclaim_stale_tun_permit(lock, &luid::SystemLuidResolver, tun_name);
+    platform::reclaim_stale_tun_permit(&luid::SystemLuidResolver, tun_name);
     #[cfg(not(target_os = "windows"))]
-    let _ = (lock, tun_name);
+    let _ = tun_name;
 }
 
 /// Fail-loud disengage of a standing lockdown cover, with no running bridge.
