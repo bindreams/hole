@@ -899,22 +899,28 @@ fn a_failed_restore_over_an_unusable_record_leaves_its_bytes_and_drops_nothing()
     assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
 }
 
-/// Which restore a standing record asks for is the record's one decision: only a captured baseline loads a snapshot,
-/// every other record reloads `/etc/pf.conf`, and one that is unusable or unreadable says it has no snapshot to restore.
-/// Every escape that restores the standing cover logs the same.
+/// Which release a standing record gets is the record's one decision: only a captured baseline loads a snapshot, every
+/// other record reloads `/etc/pf.conf`, an unreadable record is left alone and answers an error, and one that is
+/// unusable or unreadable says it has no snapshot to restore. Every escape that releases the standing cover runs the
+/// same pf calls and logs the same.
 #[skuld::test]
-fn every_standing_restore_follows_the_records_choice_and_logs_it_the_same() {
+fn every_standing_release_runs_the_records_whole_sequence_and_logs_it_the_same() {
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
     type Standing = StateFile<lockdown_state::LockdownPfState>;
-    type Case = (&'static str, fn() -> Standing, &'static str, Option<&'static str>);
+    type Case = (
+        &'static str,
+        fn() -> Standing,
+        &'static [&'static str],
+        Option<&'static str>,
+    );
     type Caller = (&'static str, fn(Standing, &mut RecordingPfOps));
-    // (record, first restore call, the warning it must log)
+    // (record, every pf call the release makes, the warning it must log)
     let cases: [Case; 5] = [
         (
             "a captured baseline",
             || StateFile::Present(standing_state()),
-            "load_ruleset",
+            &["load_ruleset", "clear_standing", "drop_token"],
             None,
         ),
         (
@@ -925,25 +931,30 @@ fn every_standing_restore_follows_the_records_choice_and_logs_it_the_same() {
                     ..standing_state()
                 })
             },
-            "reload_default",
+            &["reload_default", "clear_standing", "drop_token"],
             None,
         ),
-        ("no record", || StateFile::Absent, "reload_default", None),
+        (
+            "no record",
+            || StateFile::Absent,
+            &["reload_default", "clear_standing"],
+            None,
+        ),
         (
             "an unusable record",
             || StateFile::Unusable { pf_token: None },
-            "reload_default",
+            &["reload_default", "clear_standing"],
             Some("lockdown-pf-state file is unusable; no snapshot to restore"),
         ),
         (
             "an unreadable record",
             || StateFile::Unreadable,
-            "reload_default",
+            &["reload_default"],
             Some("lockdown-pf-state file could not be read; no snapshot to restore"),
         ),
     ];
 
-    for (record, make, first_call, warning) in cases {
+    for (record, make, calls, warning) in cases {
         let callers: [Caller; 2] = [
             ("release_all", |standing, ops| {
                 let _ = release_all_with(StateFile::Absent, standing, ops);
@@ -970,7 +981,7 @@ fn every_standing_restore_follows_the_records_choice_and_logs_it_the_same() {
                 run(make(), &mut ops);
             }
 
-            assert_eq!(ops.log.first().copied(), Some(first_call), "{caller} over {record}");
+            assert_eq!(ops.log, calls, "{caller} over {record}");
             let log = writer.snapshot();
             for text in [
                 "lockdown-pf-state file is unusable; no snapshot to restore",
@@ -983,5 +994,84 @@ fn every_standing_restore_follows_the_records_choice_and_logs_it_the_same() {
                 );
             }
         }
+    }
+}
+
+/// A transient record that is unusable or unreadable is not evidence there is no cover to clear, and a release that
+/// goes ahead on it says so. Every release that reads the transient record logs the same, for each kind of record.
+#[skuld::test]
+fn every_transient_release_logs_an_unusable_or_unreadable_record_the_same() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    type Transient = StateFile<state::FailClosedState>;
+    type Case = (&'static str, fn() -> Transient, Option<&'static str>);
+    type Caller = (&'static str, fn(Transient, &mut RecordingPfOps));
+    let cases: [Case; 5] = [
+        ("a record", || StateFile::Present(transient_state()), None),
+        ("no record", || StateFile::Absent, None),
+        (
+            "an unusable record with a token",
+            || StateFile::Unusable {
+                pf_token: Some("9".into()),
+            },
+            Some("failclosed-state file is unusable"),
+        ),
+        (
+            "an unusable record without a token",
+            || StateFile::Unusable { pf_token: None },
+            Some("failclosed-state file is unusable"),
+        ),
+        (
+            "an unreadable record",
+            || StateFile::Unreadable,
+            Some("failclosed-state file could not be read"),
+        ),
+    ];
+    let callers: [Caller; 2] = [
+        ("release_all", |transient, ops| {
+            let _ = release_all_with(transient, StateFile::Absent, ops);
+        }),
+        ("recover_cover", |transient, ops| {
+            recover_cover_with(transient, false, ops);
+        }),
+    ];
+
+    for (record, make, warning) in cases {
+        let mut logs = Vec::new();
+        for (caller, run) in callers {
+            let writer = garter::test_utils::WaitableWriter::new();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_ansi(false)
+                    .without_time()
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            );
+            {
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+                run(make(), &mut RecordingPfOps::default());
+            }
+            let log = writer.snapshot();
+            // The two texts name what is wrong with the record; "unsalvageable token" is another warning, about the
+            // refcount, and is not what this test is about.
+            for text in [
+                "failclosed-state file is unusable",
+                "failclosed-state file could not be read",
+            ] {
+                assert_eq!(
+                    log.contains(text),
+                    warning == Some(text),
+                    "{caller} over {record}: {text:?} in {log}"
+                );
+            }
+            // A release's own failure is another line, not the record's.
+            logs.push(
+                log.lines()
+                    .filter(|line| line.contains("failclosed-state file"))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(logs[0], logs[1], "release_all and recover_cover over {record}");
     }
 }

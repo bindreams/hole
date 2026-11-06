@@ -809,6 +809,7 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// declining to act, and only the manual `bridge unlock` left to escape — the
 /// same conflation `release_all_with` already refuses to make.
 fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, ops: &mut dyn PfOps) {
+    file.warn_if_not_evidence();
     match &file {
         StateFile::Absent => {
             tracing::debug!("no failclosed-state file, nothing to recover");
@@ -818,15 +819,8 @@ fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, o
             was_enabled = ?st.pf_was_enabled,
             "recovering fail-closed cover from crashed run"
         ),
-        StateFile::Unusable { pf_token } => tracing::warn!(
-            token_salvaged = pf_token.is_some(),
-            "failclosed-state file is unusable; recovering the cover anyway — an unreadable record is not evidence \
-             there is no cover to clear"
-        ),
-        StateFile::Unreadable => tracing::warn!(
-            "failclosed-state file could not be read; recovering the cover anyway — an unreadable record is not \
-             evidence there is no cover to clear"
-        ),
+        StateFile::Unusable { .. } => {}
+        StateFile::Unreadable => {}
     }
     disengage_with(file.release_token(), adopting, ops);
 }
@@ -1312,6 +1306,7 @@ pub(crate) fn release_all_with(
     // Block 1 — transient cover. A reload failure is recorded but does NOT
     // stop block 2: the standing cover is the one that blocks indefinitely
     // and must be attempted regardless.
+    transient.warn_if_not_evidence();
     let transient_err = match &transient {
         StateFile::Absent => None,
         StateFile::Present(_) => {
@@ -1323,10 +1318,6 @@ pub(crate) fn release_all_with(
             release_transient(ops, restored)
         }
         StateFile::Unreadable => {
-            tracing::warn!(
-                "transient failclosed-state file could not be read; restoring the default ruleset anyway — \
-                 an unreadable record is not evidence there is no cover to clear"
-            );
             let restored = ops.reload_default();
             release_transient(ops, restored)
         }
