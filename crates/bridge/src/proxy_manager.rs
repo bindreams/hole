@@ -362,6 +362,14 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
         }
     }
 
+    /// Drop the held cover whatever its state, and report whether it was still the OS's when this call began: the
+    /// answer for a log that says a cover was released. A cover an Unblock already took is dropped silently.
+    fn release_pending(&mut self) -> bool {
+        let in_force = self.pending().is_some();
+        drop(self.take_pending());
+        in_force
+    }
+
     /// Take the pending-start payload, leaving `Idle`. `None`, and the
     /// posture left untouched, on any other variant — in particular this
     /// must not disturb a live session.
@@ -891,7 +899,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .is_some_and(|b| b.host != config.server.server.expose());
         if stale {
             debug_assert!(self.posture.pending().is_some(), "stale implies a held cover");
-            self.posture.take_pending();
+            self.posture.release_pending();
             warn!("start for a different server while blocked: releasing the held cover before re-resolving");
         }
 
@@ -1002,9 +1010,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             CoverPlan::HandToLockdown => {
                 // Covered retry after the user enabled lockdown mid-blocked-state:
                 // release the held cover. This opens egress until the standing lockdown
-                // cover engages at routing.install — a brief, disclosed open window
-                // (bindreams/hole#758: not closed by the macOS pf work).
-                if self.posture.take_pending().is_some() {
+                // cover engages at routing.install — a brief, disclosed open window.
+                if self.posture.release_pending() {
                     warn!(
                         "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
                          uncovered until the standing lockdown cover engages at connect"
@@ -1015,7 +1022,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // Manual (uncovered) connect or reload-while-blocked: fail-open by
                 // design. Releasing the held cover opens egress — logged so the fail-open
                 // has a visible disposition, never a silent drop.
-                if self.posture.take_pending().is_some() {
+                if self.posture.release_pending() {
                     warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
                 }
             }
@@ -1185,8 +1192,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .filter(|b| b.host == host && b.resolver_permit != ech_resolver_permit)
             .map(|b| (b.resolver_permit, b.pin));
         if repair_fallback.is_some() {
-            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below;
-            // re-engaging over the live cover instead is bindreams/hole#758.
+            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below.
             if let Some(held) = self.posture.take_pending() {
                 held.cover.release(&lock);
             }

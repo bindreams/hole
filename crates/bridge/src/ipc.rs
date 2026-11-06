@@ -814,8 +814,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
         );
         // Unconditional, with no presence probe in front of it. `release_all_covers` is documented idempotent,
         // so a check here would be check-then-act on an operation that needs none — and at the escape hatch a
-        // stale `Absent` is the one wrong answer that matters. Sharing that rule with `turn_lockdown_off` is
-        // what removes the discrepancy the two bespoke `must_release` expressions used to carry.
+        // stale `Absent` is the one wrong answer that matters.
         routing.release_all_covers(&lock).map_err(UnblockFailure::Release)?;
 
         // Only once the release above is confirmed (or confirmed unneeded) does the record move: recording

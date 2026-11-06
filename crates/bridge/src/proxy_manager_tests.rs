@@ -726,6 +726,36 @@ fn a_stale_guard_release_after_a_completed_sweep_deletes_nothing() {
     assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
 }
 
+/// A disposition log says a cover was released only when this call released a cover still in force: a cover an
+/// Unblock already took is dropped silently.
+#[skuld::test]
+fn releasing_a_held_cover_reports_it_only_when_it_was_still_in_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let held = |routing: &MockRouting| {
+        Posture::<MockProxy, MockRouting, SystemDns>::PendingStart(BlockedStart {
+            cover: routing
+                .install_failclosed_cover(&routing.lock_covers(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None)
+                .unwrap(),
+            host: "proxy.example".into(),
+            server_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            pin: crate::dns::ech::PinSource::NoQueryNeeded,
+            resolver_permit: None,
+        })
+    };
+
+    let mut current = held(&routing);
+    assert!(current.release_pending());
+    assert!(matches!(current, Posture::Idle));
+
+    let mut taken = held(&routing);
+    routing.release_all_covers(&routing.lock_covers()).unwrap();
+    assert!(!taken.release_pending());
+    assert!(matches!(taken, Posture::Idle));
+
+    assert!(!Posture::<MockProxy, MockRouting, SystemDns>::Idle.release_pending());
+}
+
 #[skuld::test]
 fn a_failed_release_leaves_a_guard_current_so_its_drop_retries() {
     let dir = tempfile::tempdir().unwrap();
