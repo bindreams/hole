@@ -67,12 +67,10 @@ impl super::StateFile<FailClosedState> {
             StateFile::Absent => {}
             StateFile::Unusable { pf_token } => tracing::warn!(
                 token_salvaged = pf_token.is_some(),
-                "the transient cover's record is unusable, so it is no evidence there is no cover to clear; the \
-                 release goes on as if a cover were held"
+                "the transient cover's record is unusable, so it is no evidence there is no cover to clear"
             ),
             StateFile::Unreadable => tracing::warn!(
-                "the transient cover's record could not be read, so it is no evidence there is no cover to clear; \
-                 the release goes on as if a cover were held"
+                "the transient cover's record could not be read, so it is no evidence there is no cover to clear"
             ),
         }
     }
