@@ -138,7 +138,7 @@ impl Drop for Held {
             outermost
         });
         if let (true, Some(change)) = (outermost, &self.change) {
-            if let Err(error) = change.end() {
+            if let Err(error) = change.end(&Stamp::current()) {
                 warn!(%error, "could not mark the service's change as ended; a status read may take it for one in progress");
             }
         }
