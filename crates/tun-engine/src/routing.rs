@@ -1505,10 +1505,14 @@ where
     // fallback — once the cover is torn down the measurement reads `Absent`.
     if decision.record_intent_on {
         match failclosed::lockdown_state::promote_unrecorded(&lock, owner) {
-            Ok(
-                failclosed::lockdown_state::PromoteOutcome::Wrote
-                | failclosed::lockdown_state::PromoteOutcome::Declined,
-            ) => {}
+            Ok(failclosed::lockdown_state::PromoteOutcome::Wrote) => {}
+            // The decision and the promotion read the same file under the same lock.
+            Ok(failclosed::lockdown_state::PromoteOutcome::Declined) => {
+                debug_assert!(
+                    false,
+                    "the lockdown intent file declined the promotion the decision asked for"
+                )
+            }
             Err(e) => warn!(
                 error = &e as &dyn std::error::Error,
                 "could not repair the lockdown intent over a measured live cover"

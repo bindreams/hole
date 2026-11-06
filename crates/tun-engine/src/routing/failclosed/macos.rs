@@ -768,18 +768,30 @@ fn drop_or_warn(token: &str, context: &str, drop: impl FnOnce(&str) -> Result<()
 /// A failed restore keeps the token and the record, so the next sweep still sees a cover rather than a clean host over
 /// a block ([`release`]). Shared by `Drop`, `recover_cover` and the transient engage's back-out.
 fn disengage_with(token: Result<Option<&str>, RoutingError>, adopting: bool, ops: &mut dyn PfOps) {
+    let _ = release_transient(token, adopting, ops);
+}
+
+/// [`disengage_with`]'s release, with the outcome kept for a caller that must know whether the cover is gone.
+/// A failure is logged here.
+fn release_transient(
+    token: Result<Option<&str>, RoutingError>,
+    adopting: bool,
+    ops: &mut dyn PfOps,
+) -> Result<(), RoutingError> {
     let restored = if adopting {
         tracing::info!("standing lockdown cover being adopted; skipping /etc/pf.conf reload during transient sweep");
         Ok(())
     } else {
         ops.reload_default()
     };
-    if let Err(e) = release(ops, CoverKind::Transient, token, restored) {
+    let released = release(ops, CoverKind::Transient, token, restored);
+    if let Err(e) = &released {
         tracing::warn!(
-            error = &e as &dyn std::error::Error,
+            error = e as &dyn std::error::Error,
             "the transient cover was not released during cover disengage; its record is left for recovery"
         );
     }
+    released
 }
 
 /// [`disengage_with`] over the real `pfctl` and record, for the cover whose token is `token`.
@@ -787,15 +799,16 @@ fn disengage(token: &str, lock: &CoverLock) {
     disengage_with(Ok(Some(token)), false, &mut RealPfOps { lock });
 }
 
-pub fn recover_cover(lock: &CoverLock, adopting: bool) {
+pub fn recover_cover(lock: &CoverLock, adopting: bool) -> Result<(), RoutingError> {
     recover_cover_with(
         pf_record::read::<state::FailClosedState>(lock.state_dir()),
         adopting,
         &mut RealPfOps { lock },
-    );
+    )
 }
 
-/// `recover_cover`'s trichotomy over [`StateFile`], with the [`PfOps`] injected.
+/// `recover_cover`'s trichotomy over [`StateFile`], with the [`PfOps`] injected. `Ok` when the cover is gone or
+/// there was none; a release that left it in force (a failed restore, a record that stays) is the error.
 ///
 /// Reads the record as a [`StateFile`], which keeps `Unusable` apart from `Absent`,
 /// and for a SWEEP those two are opposite facts. `Absent` is "no cover was ever engaged". `Unusable` is
@@ -805,12 +818,16 @@ pub fn recover_cover(lock: &CoverLock, adopting: bool) {
 /// crashed covered run's `block out all` on the host with the automatic sweep
 /// declining to act, and only the manual `bridge unlock` left to escape — the
 /// same conflation `release_all_with` already refuses to make.
-fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, ops: &mut dyn PfOps) {
+fn recover_cover_with(
+    file: StateFile<state::FailClosedState>,
+    adopting: bool,
+    ops: &mut dyn PfOps,
+) -> Result<(), RoutingError> {
     file.warn_if_not_evidence();
     match &file {
         StateFile::Absent => {
             tracing::debug!("no failclosed-state file, nothing to recover");
-            return;
+            return Ok(());
         }
         StateFile::Present(st) => tracing::info!(
             was_enabled = ?st.pf_was_enabled,
@@ -819,7 +836,7 @@ fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, o
         StateFile::Unusable { .. } => {}
         StateFile::Unreadable => {}
     }
-    disengage_with(file.release_token(), adopting, ops);
+    release_transient(file.release_token(), adopting, ops)
 }
 
 // --- lockdown layer ---

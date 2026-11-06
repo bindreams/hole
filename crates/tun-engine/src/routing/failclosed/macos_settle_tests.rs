@@ -595,7 +595,7 @@ fn a_release_never_drops_a_token_a_record_still_names() {
             name: "recover_cover",
             standing: false,
             run: |dir, ops| {
-                recover_cover_with(pf_record::read(dir), false, ops);
+                let _ = recover_cover_with(pf_record::read(dir), false, ops);
                 None
             },
         },
@@ -774,7 +774,7 @@ fn a_baseline_persisted_over_a_record_names_the_token_it_replaced() {
 fn a_record_that_could_not_be_read_still_drives_a_restore_of_the_host() {
     let mut ops = RecordingPfOps::default();
 
-    recover_cover_with(unreadable(), false, &mut ops);
+    let _ = recover_cover_with(unreadable(), false, &mut ops);
 
     assert_eq!(
         ops.log,
@@ -798,7 +798,7 @@ fn a_sweep_clears_a_transient_record_naming_a_token_pf_no_longer_holds() {
         ..Default::default()
     };
 
-    recover_cover_with(StateFile::Present(recorded_cover("111")), false, &mut ops);
+    let _ = recover_cover_with(StateFile::Present(recorded_cover("111")), false, &mut ops);
 
     assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
 }
@@ -828,7 +828,7 @@ fn every_removed_record_that_named_no_token_is_disclosed_as_one_that_leaks_a_ref
         {
             let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
             let mut ops = RecordingPfOps::over_records(&lock);
-            recover_cover_with(pf_record::read(tmp.path()), false, &mut ops);
+            let _ = recover_cover_with(pf_record::read(tmp.path()), false, &mut ops);
         }
         writer.snapshot().contains("no pf token could be read")
     };
@@ -1032,7 +1032,7 @@ fn every_transient_release_logs_an_unusable_or_unreadable_record_the_same() {
             let _ = release_all_with(transient, StateFile::Absent, ops);
         }),
         ("recover_cover", |transient, ops| {
-            recover_cover_with(transient, false, ops);
+            let _ = recover_cover_with(transient, false, ops);
         }),
     ];
 

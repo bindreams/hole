@@ -218,11 +218,12 @@ pub fn engage(
 /// so the transient restore must leave the lockdown ruleset in force (macOS
 /// skips the `/etc/pf.conf` reload).
 ///
-/// Returns no outcome, so it outdates the transient stamps unconditionally; no guard exists at its one
-/// production call (bridge startup).
+/// Outdates the transient stamps only when the sweep released the cover: one that failed leaves it in force, so a
+/// guard still holding it keeps its stamp and its drop retries.
 pub fn recover_cover(lock: &CoverLock, adopting: bool) {
-    platform::recover_cover(lock, adopting);
-    lock.outdate_stamps(CoverKind::Transient);
+    if platform::recover_cover(lock, adopting).is_ok() {
+        lock.outdate_stamps(CoverKind::Transient);
+    }
 }
 
 /// Engage the standing lockdown cover (loopback + TUN + onward-server + —on

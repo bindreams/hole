@@ -788,7 +788,7 @@ fn recorded_cover(token: &str) -> state::FailClosedState {
 #[skuld::test]
 fn recover_cover_with_no_state_file_does_nothing() {
     let mut ops = RecordingPfOps::default();
-    recover_cover_with(StateFile::Absent, false, &mut ops);
+    recover_cover_with(StateFile::Absent, false, &mut ops).unwrap();
     assert!(
         ops.log.is_empty(),
         "an absent file means no cover was ever engaged; a sweep must spawn nothing: {:?}",
@@ -801,7 +801,7 @@ fn recover_cover_with_no_state_file_does_nothing() {
 #[skuld::test]
 fn recover_cover_with_a_recorded_cover_drops_its_token_and_skips_the_reload_when_adopting() {
     let mut ops = RecordingPfOps::default();
-    recover_cover_with(StateFile::Present(recorded_cover("42")), true, &mut ops);
+    recover_cover_with(StateFile::Present(recorded_cover("42")), true, &mut ops).unwrap();
     assert_eq!(ops.log, vec!["clear_transient", "drop_token"]);
     assert_eq!(ops.dropped, vec!["42".to_owned()]);
 }
@@ -809,9 +809,24 @@ fn recover_cover_with_a_recorded_cover_drops_its_token_and_skips_the_reload_when
 #[skuld::test]
 fn recover_cover_with_a_recorded_cover_restores_then_drops_its_token() {
     let mut ops = RecordingPfOps::default();
-    recover_cover_with(StateFile::Present(recorded_cover("42")), false, &mut ops);
+    recover_cover_with(StateFile::Present(recorded_cover("42")), false, &mut ops).unwrap();
     assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
     assert_eq!(ops.dropped, vec!["42".to_owned()]);
+}
+
+/// The sweep reports whether it released the cover: a failed restore keeps the record and token, so a guard that
+/// still holds the cover must keep its stamp and retry.
+#[skuld::test]
+fn recover_cover_with_reports_a_failed_restore_and_a_clean_sweep() {
+    let mut failing = RecordingPfOps {
+        fail_reload_default: true,
+        ..Default::default()
+    };
+    assert!(recover_cover_with(StateFile::Present(recorded_cover("42")), false, &mut failing).is_err());
+
+    let mut clean = RecordingPfOps::default();
+    assert!(recover_cover_with(StateFile::Present(recorded_cover("42")), false, &mut clean).is_ok());
+    assert!(recover_cover_with(StateFile::Absent, false, &mut RecordingPfOps::default()).is_ok());
 }
 
 /// An UNUSABLE record that named no token is a cover to clear, not an absence. (A record whose read failed is the
@@ -826,7 +841,7 @@ fn recover_cover_with_a_recorded_cover_restores_then_drops_its_token() {
 #[skuld::test]
 fn recover_cover_with_an_unusable_record_naming_no_token_still_restores_the_host() {
     let mut ops = RecordingPfOps::default();
-    recover_cover_with(unusable(), false, &mut ops);
+    let _ = recover_cover_with(unusable(), false, &mut ops);
     assert_eq!(
         ops.log,
         vec!["reload_default", "clear_transient"],
@@ -847,7 +862,7 @@ fn recover_cover_with_an_unusable_record_naming_no_token_still_restores_the_host
 #[skuld::test]
 fn recover_cover_with_an_unusable_record_still_drops_the_token_it_could_read() {
     let mut ops = RecordingPfOps::default();
-    recover_cover_with(
+    let _ = recover_cover_with(
         StateFile::Unusable {
             pf_token: Some("7".into()),
         },
@@ -906,7 +921,7 @@ fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
     );
 
     let mut ops = RecordingPfOps::default();
-    recover_cover_with(file, false, &mut ops);
+    let _ = recover_cover_with(file, false, &mut ops);
     assert_eq!(
         ops.dropped,
         vec!["7".to_owned()],

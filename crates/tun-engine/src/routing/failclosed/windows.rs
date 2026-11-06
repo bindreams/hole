@@ -1985,7 +1985,9 @@ impl Cover {
     fn delete_filters(lock: &CoverLock, engine: HANDLE, kind: CoverKind) {
         match kind {
             // Transient: today's full sweep (filters + sublayer + provider).
-            CoverKind::Transient => unsafe { delete_all(engine) },
+            CoverKind::Transient => {
+                let _ = unsafe { delete_all(engine) };
+            }
             // Lockdown: the same witnessed sweep as `bridge unlock`, so the boot-time record is written. The
             // shared sublayer/provider are owned by the transient sweep. A user stop RELIES on this Drop to open
             // the host, and Drop cannot return an error, so a failure is warned: silence there is
@@ -2293,7 +2295,9 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witne
     SweepOutcome::per_kind(clearance, [(CoverKind::Lockdown, first_delete_failure(&codes))])
 }
 
-pub fn recover_cover(_lock: &CoverLock, adopting: bool) {
+/// `Ok` when every transient filter is gone. The engine not opening is an error too: nothing was swept, so a guard
+/// that still holds the cover must keep its stamp.
+pub fn recover_cover(_lock: &CoverLock, adopting: bool) -> Result<(), RoutingError> {
     // Windows is structurally safe regardless: the transient cover and the
     // standing lockdown use disjoint WFP filter GUIDs, so deleting the transient
     // filters cannot touch the lockdown ones (the shared sublayer/provider
@@ -2304,13 +2308,18 @@ pub fn recover_cover(_lock: &CoverLock, adopting: bool) {
         // FwpmEngineOpen0 returns u32 — compare to ERROR_SUCCESS.0, NOT `.is_ok()`.
         // A failed open means the Base Filtering Engine could not be reached
         // (not "not elevated" — FWPM opens without elevation), so nothing could
-        // have been swept anyway; skipping is a benign no-op.
+        // have been swept anyway.
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        if FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine) == ERROR_SUCCESS.0 {
-            delete_all(engine);
-            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let _ = FwpmEngineClose0(engine);
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            return Err(RoutingError::RouteSetup(format!(
+                "FwpmEngineOpen0 failed (0x{rc:08x}): the transient cover could not be swept"
+            )));
         }
+        let swept = delete_all(engine);
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmEngineClose0(engine);
+        swept
     }
 }
 
@@ -2323,19 +2332,24 @@ pub fn recover_cover(_lock: &CoverLock, adopting: bool) {
 /// warned here. The sublayer/provider deletes stay best-effort: an orphaned
 /// empty sublayer holds no traffic.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-unsafe fn delete_all(engine: HANDLE) {
+unsafe fn delete_all(engine: HANDLE) -> Result<(), RoutingError> {
     let codes: Vec<(&'static str, u32)> = swept_transient_keys()
         .into_iter()
         .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
         .collect();
-    if let Some(e) = first_delete_failure(&codes) {
-        tracing::warn!(
-            error = &e as &dyn std::error::Error,
-            "transient cover sweep left a filter installed; egress may still be blocked"
-        );
-    }
+    let swept = match first_delete_failure(&codes) {
+        Some(e) => {
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "transient cover sweep left a filter installed; egress may still be blocked"
+            );
+            Err(e)
+        }
+        None => Ok(()),
+    };
     let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
     let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
+    swept
 }
 
 /// Clear every fail-closed cover Windows can install — both the lockdown

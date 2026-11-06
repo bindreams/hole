@@ -1863,6 +1863,28 @@ fn recovery_does_not_adopt_over_an_off_that_lands_during_route_recovery() {
     );
 }
 
+/// Under the cover lock the decision's `Unset` is the file's: a promotion the file declines means the two disagree,
+/// which is a contract violation and not a state to carry on from.
+#[cfg(debug_assertions)]
+#[skuld::test(should_panic = "declined the promotion")]
+fn a_promotion_the_file_declines_is_a_contract_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let lock = failclosed::CoverLock::acquire(dir.path());
+        failclosed::lockdown_state::set_enabled(&lock, false, None).unwrap();
+    }
+    recover_routes_with(
+        dir.path(),
+        None,
+        Some("hole-tun"),
+        |_, _c, _p| Ok(()),
+        |_lock, _adopting| {},
+        || Intent::Unset,
+        || Live,
+        |_lock, _action, _tun_name| {},
+    );
+}
+
 /// The same window with an `On` landing over a recorded `Off`: the cover is adopted as the `On` says, not swept on
 /// the `Off` a read taken before route recovery would have seen.
 #[skuld::test]
