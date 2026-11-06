@@ -480,6 +480,42 @@ fn a_simulated_reboot_rearms_the_cover() {
     );
 }
 
+/// A re-engage over a live standing cover whose load fails backs out and releases the cover (restore, record, token).
+/// The older guard's stamp must go stale with it, or its later drop would delete what a newer install now owns.
+/// An interface name pf cannot parse fails the load after the persisted token was reused.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn failclosed_cover_load_failure_backout_outdates_the_older_guards_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let engage = |tun_name: &str| {
+        engage_lockdown(
+            &CoverLock::acquire(dir.path()),
+            server_ip,
+            tun_name,
+            &SystemLuidResolver,
+            &[],
+            None,
+        )
+    };
+
+    let first = engage("utun-absent").expect("engage real pf lockdown cover");
+    assert!(crate::routing::CoverGuard::is_current(&first));
+
+    assert!(engage("not an interface").is_err(), "pf cannot parse that rule");
+
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "the failed engage's back-out released the cover"
+    );
+    assert!(
+        !crate::routing::CoverGuard::is_current(&first),
+        "a release the older guard never saw must outdate its stamp"
+    );
+    drop(first);
+}
+
 /// Windows real-engage verification for the transient block-until-connected
 /// cover. Engages the REAL WFP transient cover with `server_ip = 1.1.1.1` and
 /// proves it is SELECTIVE: egress to the permitted server IP stays Ok (the permit

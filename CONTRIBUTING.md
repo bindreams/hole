@@ -3168,11 +3168,13 @@ Every mutation of a fail-closed cover inside the bridge process runs under one l
   The mutators are the facade's engage, release, sweep and TUN-permit reclaim (`reclaim_stale_tun_permit`) functions,
   the platform functions beneath them, the pf records' `swap` and `clear_if_token`, and the record writers
   (`lockdown_state::{set_enabled, promote_unrecorded}`, the boot-time witness's writes). Every function that only reads
-  takes a path (`lockdown_cover_presence`, `pf_record::read`, `boottime_witness::load` and the intent loads are some): a
-  read outside the lock races a locked writer as the old or the new state, and a read that decides a write is taken
-  again under the lock.
-  The platform `release_all` and `disengage_lockdown` are called only through the facade's `sweep_with_witness`, which
-  adds the boot-time witness and `outdate_stamps`; a direct call skips both.
+  cover records or OS state takes a path (`lockdown_cover_presence`, `pf_record::read`, `boottime_witness::load` and the
+  intent loads are some): a read outside the lock races a locked writer as the old or the new state, and a read that
+  decides a write is taken again under the lock.
+  The platform `release_all` and `disengage_lockdown` are called only through the facade's `sweep_with_witness`, on
+  every platform (the macOS guard's `Drop` and failed-engage back-out call the facade's `disengage_lockdown`). The
+  sweep calls `outdate_stamps` for every kind it confirmed released, and adds the boot-time witness where a platform
+  arms boot-time keys (Windows, `STANDING_COVER_ARMS_BOOT_TIME`).
 - **Order.** `state.proxy` (X), then the cover lock, then the record files' own locks and the witness lock. A section
   is a synchronous function or a `spawn_blocking` closure: `CoverLock` is `!Send` (`a_cover_lock_is_not_send`), so a
   future cannot hold it across an `.await`. `Routing::lock_covers` takes the lock for the provider's own directory;

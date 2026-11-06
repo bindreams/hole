@@ -1151,13 +1151,12 @@ impl SweepOutcome {
     ///
     /// [`sweep_with_witness`] deliberately does NOT use this: it destructures
     /// the struct so the observations reach the record before the failure
-    /// reaches the caller. This is for the two callers that have no record in
-    /// play at all — macOS's `Drop` wrapper (no boot-time key class) and the
-    /// unit tests of the verdict folds.
+    /// reaches the caller. This is for the unit tests of the verdict folds,
+    /// which have no record in play.
     ///
     /// What it is NOT for is the sweeps: reaching for it there is how the
     /// observations got discarded in the first place.
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn into_result(self) -> Result<Clearance, RoutingError> {
         match self.failure {
             Some(e) => Err(e),
