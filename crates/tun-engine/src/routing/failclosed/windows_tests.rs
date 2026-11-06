@@ -1025,33 +1025,33 @@ fn release_verdict_over(lockdown_code: u32, transient_code: u32) -> SweepOutcome
     )
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn a_release_all_whose_lockdown_deletes_failed_still_releases_the_transient_kind() {
     let outcome = release_verdict_over(ACCESS_DENIED, ERROR_SUCCESS.0);
     assert_eq!(outcome.released(), [CoverKind::Transient]);
     assert!(outcome.into_result().is_err(), "the failure still travels");
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn a_release_all_whose_transient_deletes_failed_still_releases_the_lockdown_kind() {
     let outcome = release_verdict_over(ERROR_SUCCESS.0, ACCESS_DENIED);
     assert_eq!(outcome.released(), [CoverKind::Lockdown]);
     assert!(outcome.into_result().is_err(), "the failure still travels");
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn a_release_all_whose_deletes_failed_for_both_kinds_releases_neither() {
     assert_eq!(release_verdict_over(ACCESS_DENIED, ACCESS_DENIED).released(), []);
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn a_release_all_that_found_nothing_to_delete_releases_both_kinds() {
     let outcome = release_verdict_over(FWP_E_FILTER_NOT_FOUND_DWORD, FWP_E_FILTER_NOT_FOUND_DWORD);
     assert_eq!(outcome.released(), [CoverKind::Lockdown, CoverKind::Transient]);
     assert!(outcome.into_result().is_ok());
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn a_release_all_that_could_not_reach_the_firewall_releases_neither_kind() {
     let outcome = release_all_verdict(Some(0x8032_0001), &[], &[], ArmingWitness::Unset);
     assert_eq!(outcome.released(), []);

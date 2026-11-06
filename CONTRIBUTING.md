@@ -2073,6 +2073,16 @@ leaves the block. The standing cover restores its captured snapshot; a record wi
 again (the restore is retried); `sudo pfctl -d` turns pf off, and the record stays until a later restore succeeds; a
 reboot resets pf, and with the target already off nothing re-arms it.
 
+A macOS release restores the host, then clears the cover's record, then drops the `pfctl -E` token, and drops it only if
+that clear took the record that named it. A record names only a token Hole holds: pf can hand a freed token's value to
+the next `pfctl -E` of any app, so `pfctl -X` never runs while a record names the token it drops. Hence a clear that
+cannot write is the cover's error and drops nothing (the retry still has its token), a clear that finds another token's
+record or none drops nothing (the engage that displaced the record dropped its token, `drop_displaced`), and a token
+that will not drop is logged only: with the host's rules restored it blocks nothing. A cover record that could not be
+read is never absent and never removed: a release over one restores the host, leaves the record in place and answers an
+error, never success. Every record is written under the [cover lock](#the-cover-lock); nothing out of process writes
+them while a bridge runs.
+
 Inside a live bridge, `Routing::release_all_covers` — the same primitive —
 has four sanctioned callers, guarded by a structural test
 (`cover_release_has_the_known_sanctioned_caller_set`,
@@ -2083,7 +2093,7 @@ Lockdown-off toggle, which reads no session posture — it decides via
 already `Off` is released too, not just an idle bridge; session teardown's
 own `apply_cover_disposition`, ordered after routes so the release never precedes
 the tunnel it covered; and the tray's Unblock action (`handle_unblock`,
-below), which deliberately bypasses `ProxyManager` (and the lock a wedged
+below), which deliberately bypasses `ProxyManager` (and the proxy lock a wedged
 teardown may hold) rather than routing through one of the other three.
 Turning the kill switch off, from either surface, now releases immediately
 rather than waiting for the next bridge start.
@@ -3143,6 +3153,40 @@ Disclosed residuals:
    The standing kill switch is what #881 made conditional; the narrow true
    claim is that it is never touched at startup without an explicit recorded
    "off".
+
+#### The cover lock
+
+Every mutation of a fail-closed cover inside the bridge process runs under one lock per state directory,
+`failclosed::CoverLock` ([`cover_lock.rs`](crates/tun-engine/src/routing/failclosed/cover_lock.rs)).
+
+- **What it excludes.** An engage, a guard's release or drop, a sweep (`release_all`, `disengage_lockdown`,
+  `recover_cover`) and crash recovery. A decision that reads cover state (the kill-switch intent, the target, the
+  measured presence) is made from a fresh read taken inside the section that acts on it, so nothing changes between the
+  read and the act. The engage, release and sweep functions and the writers of the records such a decision reads
+  (`lockdown_state::{set_enabled, promote_unrecorded}`, the boot-time witness's arming write) take `&CoverLock`, so a
+  call without the lock does not compile. The pf records' `swap` and `clear_if_token` take a directory and are called
+  only from those functions.
+- **Order.** `state.proxy` (X), then the cover lock, then the record files' own locks and the witness lock. A section
+  is a synchronous function or a `spawn_blocking` closure: `CoverLock` is `!Send` (`a_cover_lock_is_not_send`), so a
+  future cannot hold it across an `.await`. `Routing::lock_covers` takes the lock for the provider's own directory;
+  `CoverLock::acquire` is for code with no provider (the cutover, crash recovery, a test's escape). The tray's Unblock
+  takes no X.
+- **Stamps.** A guard keeps the `InstallStamp` of its install: `stamp_install(kind)` runs after the OS step succeeded,
+  and `outdate_stamps(kind)` after a completed sweep released that kind (a kind whose release failed keeps its stamp, so
+  a held guard's drop retries). A release or drop deletes only while its stamp is current, so a guard that outlived its
+  cover deletes nothing: Windows keys are fixed and a macOS cover owns one pf token. `CoverGuard::is_current` is the
+  lock-free read, for a report; a decision reads it inside the section.
+- **Drop rule.** A guard's `Drop` is the only code that deletes. On a thread that already holds the lock for that
+  directory it deletes under it, so a cover dropped by an early return or an unwind inside a section neither deadlocks
+  nor panics while unwinding; on any other thread `InstallStamp::release_on_drop` acquires. `CoverGuard::release(self, &CoverLock)` is the explicit form: it asserts the lock is the guard's directory's, then drops. `CoverLock::acquire` on
+  a directory this thread already holds panics, where a std mutex would hang.
+- **In-process only.** `hole bridge unlock`, the uninstall and the cutover run with no live bridge (`BridgeLiveness`),
+  so nothing out of process writes a cover record while a bridge runs, and the lock does not try to exclude it.
+- **Cost, disclosed.** An Unblock waits for an engage in flight, and a start's persist waits for an Unblock's release.
+  A start that begins during an Unblock waits, then decides from the persisted state: it reads `Off`, installs no cover
+  and proceeds uncovered. A covered start whose Unblock committed between its handler
+  and the lock installs no transient cover: `unblock_generation` is read by the handler before the proxy lock and
+  compared under the cover lock.
 
 #### Cover ownership
 
