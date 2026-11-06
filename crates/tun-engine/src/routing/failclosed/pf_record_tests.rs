@@ -27,7 +27,7 @@ impl Case for FailClosedState {
 
     fn sample(token: &str) -> Self {
         FailClosedState {
-            pf_token: token.into(),
+            pf_token: Some(token.into()),
             pf_was_enabled: true,
         }
     }
@@ -46,7 +46,7 @@ impl Case for LockdownPfState {
 
     fn sample(token: &str) -> Self {
         LockdownPfState {
-            pf_token: token.into(),
+            pf_token: Some(token.into()),
             main_snapshot: "scrub-anchor \"com.apple/*\" all fragment reassemble\n".into(),
             nat_snapshot: "nat-anchor \"com.apple/*\" all\n".into(),
             main_snapshot_captured: true,
@@ -110,6 +110,12 @@ over_both_records!(
     clear_over_an_unusable_record_that_names_another_token_leaves_it,
     clear_over_a_record_whose_read_fails_keeps_it_and_reports_kept,
     clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder,
+    forget_token_rewrites_the_record_that_names_the_token_and_only_that,
+    a_forgotten_token_is_written_as_null_and_the_record_is_cleared_by_none,
+    forget_over_an_unusable_record_that_names_the_token_replaces_it_and_keeps_a_backup,
+    forget_over_an_unusable_record_that_names_another_token_or_none_leaves_it,
+    forget_over_a_record_whose_read_fails_keeps_it_and_reports_kept,
+    forget_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder,
 );
 
 mod both {
@@ -168,7 +174,7 @@ mod both {
         let with_stray = R::json(1, "7").trim_end_matches('}').to_owned() + r#","stray":true}"#;
         write_raw::<R>(tmp.path(), with_stray.as_bytes());
 
-        assert!(matches!(read::<R>(tmp.path()), StateFile::Present(r) if r.pf_token() == "7"));
+        assert!(matches!(read::<R>(tmp.path()), StateFile::Present(r) if r.pf_token() == Some("7")));
     }
 
     /// An I/O failure has no bytes to salvage from, and is not an absent record.
@@ -249,7 +255,7 @@ mod both {
         assert_eq!(read::<R>(tmp.path()), StateFile::Present(R::sample("5")));
 
         write_raw::<R>(tmp.path(), b"{not json");
-        assert_eq!(clear_if_token::<R>(tmp.path(), None).unwrap(), Cleared::Removed);
+        assert_eq!(clear_if_token::<R>(tmp.path(), None).unwrap(), Cleared::MovedAside);
         assert!(!tmp.path().join(R::FILE).exists());
     }
 
@@ -274,7 +280,7 @@ mod both {
 
             let cleared = clear_if_token::<R>(tmp.path(), token).unwrap();
 
-            assert_eq!(cleared, Cleared::Removed, "{what}");
+            assert_eq!(cleared, Cleared::MovedAside, "{what}");
             assert!(!tmp.path().join(R::FILE).exists(), "{what}");
             assert_eq!(std::fs::read(backup_of::<R>(tmp.path())).unwrap(), bytes, "{what}");
         }
@@ -305,6 +311,106 @@ mod both {
         }
     }
 
+    /// The third member beside `swap` and `clear_if_token`: only the record that names the token, and it keeps the rest.
+    pub fn forget_token_rewrites_the_record_that_names_the_token_and_only_that<R: Case>() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(forget_token::<R>(tmp.path(), "5").unwrap(), Forgot::Gone, "no record");
+        swap(tmp.path(), &R::sample("5"), None).unwrap();
+
+        assert_eq!(forget_token::<R>(tmp.path(), "6").unwrap(), Forgot::Gone);
+        assert_eq!(
+            read::<R>(tmp.path()),
+            StateFile::Present(R::sample("5")),
+            "another token's forget"
+        );
+
+        assert_eq!(forget_token::<R>(tmp.path(), "5").unwrap(), Forgot::Forgotten);
+        let StateFile::Present(kept) = read::<R>(tmp.path()) else {
+            panic!("the record stays: it is the evidence of the block");
+        };
+        assert_eq!(kept.pf_token(), None);
+        assert_eq!(kept, R::sample("5").without_token(), "everything else is kept");
+        assert_ne!(
+            kept,
+            R::tokenless(),
+            "the snapshot of a readable record is not thrown away"
+        );
+
+        assert_eq!(
+            forget_token::<R>(tmp.path(), "5").unwrap(),
+            Forgot::Gone,
+            "a second forget finds no token"
+        );
+    }
+
+    /// What reaches the disk is a `null` that this release reads back, and a clear by no token takes it: the next
+    /// sweep of a record with nothing to drop.
+    pub fn a_forgotten_token_is_written_as_null_and_the_record_is_cleared_by_none<R: Case>() {
+        let tmp = tempfile::tempdir().unwrap();
+        swap(tmp.path(), &R::sample("5"), None).unwrap();
+        forget_token::<R>(tmp.path(), "5").unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join(R::FILE)).unwrap()).unwrap();
+        assert_eq!(written["pf_token"], serde_json::Value::Null);
+        assert_eq!(written["version"], 1);
+
+        assert_eq!(clear_if_token::<R>(tmp.path(), Some("5")).unwrap(), Cleared::Gone);
+        assert_eq!(clear_if_token::<R>(tmp.path(), None).unwrap(), Cleared::Removed);
+        assert!(!tmp.path().join(R::FILE).exists());
+    }
+
+    /// The bytes cannot be rewritten in place, so the record they were is replaced by one that names no token and
+    /// restores from `/etc/pf.conf`, as it did from the unreadable one; the bytes stay beside it.
+    pub fn forget_over_an_unusable_record_that_names_the_token_replaces_it_and_keeps_a_backup<R: Case>() {
+        let tmp = tempfile::tempdir().unwrap();
+        let newer = R::json(2, "3");
+        write_raw::<R>(tmp.path(), newer.as_bytes());
+
+        assert_eq!(forget_token::<R>(tmp.path(), "3").unwrap(), Forgot::Forgotten);
+
+        assert_eq!(read::<R>(tmp.path()), StateFile::Present(R::tokenless()));
+        assert_eq!(std::fs::read(backup_of::<R>(tmp.path())).unwrap(), newer.as_bytes());
+    }
+
+    pub fn forget_over_an_unusable_record_that_names_another_token_or_none_leaves_it<R: Case>() {
+        let newer = R::json(2, "3");
+        for (what, bytes, token) in [
+            ("another token", newer.as_bytes(), "9"),
+            ("no token", b"{not json".as_slice(), "3"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_raw::<R>(tmp.path(), bytes);
+
+            assert_eq!(forget_token::<R>(tmp.path(), token).unwrap(), Forgot::Gone, "{what}");
+
+            assert_eq!(std::fs::read(tmp.path().join(R::FILE)).unwrap(), bytes, "{what}");
+            assert!(!backup_of::<R>(tmp.path()).exists(), "{what}");
+        }
+    }
+
+    pub fn forget_over_a_record_whose_read_fails_keeps_it_and_reports_kept<R: Case>() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_unreadable::<R>(tmp.path());
+
+        assert_eq!(forget_token::<R>(tmp.path(), "1").unwrap(), Forgot::Kept);
+
+        assert!(tmp.path().join(R::FILE).is_dir());
+        assert!(!backup_of::<R>(tmp.path()).exists());
+    }
+
+    pub fn forget_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder<R: Case>() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+
+        let err = forget_token::<R>(&state, "1").unwrap_err();
+
+        let StoreError::Io(err) = err else {
+            panic!("expected an I/O refusal, got {err:?}");
+        };
+        assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+    }
+
     pub fn clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder<R: Case>() {
         let tmp = tempfile::tempdir().unwrap();
         let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
@@ -332,7 +438,7 @@ fn a_transient_record_an_older_release_wrote_reads_unchanged() {
         assert_eq!(
             read::<FailClosedState>(tmp.path()),
             StateFile::Present(FailClosedState {
-                pf_token: "5".into(),
+                pf_token: Some("5".into()),
                 pf_was_enabled: written,
             }),
             "{older}"
@@ -430,6 +536,10 @@ fn present(token: &str) -> StateFile<FailClosedState> {
     StateFile::Present(FailClosedState::sample(token))
 }
 
+fn forgotten() -> StateFile<FailClosedState> {
+    StateFile::Present(FailClosedState::sample("1").without_token())
+}
+
 fn unusable(token: Option<&str>) -> StateFile<FailClosedState> {
     StateFile::Unusable {
         pf_token: token.map(str::to_owned),
@@ -443,6 +553,7 @@ fn unreadable() -> StateFile<FailClosedState> {
 #[skuld::test]
 fn a_record_names_a_token_in_every_state_it_can_be_in() {
     assert_eq!(present("1").pf_token(), Some("1"));
+    assert_eq!(forgotten().pf_token(), None);
     assert_eq!(unusable(Some("2")).pf_token(), Some("2"));
     assert_eq!(unusable(None).pf_token(), None);
     assert_eq!(absent().pf_token(), None);
@@ -454,6 +565,7 @@ fn a_record_names_a_token_in_every_state_it_can_be_in() {
 #[skuld::test]
 fn a_release_acts_by_the_token_a_record_names_and_is_refused_by_one_it_cannot_read() {
     assert_eq!(present("1").release_token().unwrap(), Some("1"));
+    assert_eq!(forgotten().release_token().unwrap(), None);
     assert_eq!(unusable(Some("2")).release_token().unwrap(), Some("2"));
     assert_eq!(unusable(None).release_token().unwrap(), None);
     assert_eq!(absent().release_token().unwrap(), None);
@@ -466,6 +578,8 @@ fn naming_matches_any_record_with_the_token_and_an_unusable_one_with_none_but_ne
     assert!(names(&present("1"), Some("1")));
     assert!(!names(&present("1"), Some("2")));
     assert!(!names(&present("1"), None));
+    assert!(names(&forgotten(), None));
+    assert!(!names(&forgotten(), Some("1")));
     assert!(names(&unusable(Some("1")), Some("1")));
     assert!(names(&unusable(None), None));
     assert!(!names(&unusable(None), Some("1")));
@@ -483,6 +597,8 @@ fn a_sweep_clear_removes_what_names_the_token_and_keeps_what_it_cannot_read() {
     assert_eq!(sweep_clear(&unusable(Some("1")), Some("1")), Cleared::Removed);
     assert_eq!(sweep_clear(&unusable(None), None), Cleared::Removed);
     assert_eq!(sweep_clear(&unusable(None), Some("1")), Cleared::Gone);
+    assert_eq!(sweep_clear(&forgotten(), None), Cleared::Removed);
+    assert_eq!(sweep_clear(&forgotten(), Some("1")), Cleared::Gone);
     assert_eq!(sweep_clear(&unreadable(), Some("1")), Cleared::Kept);
     assert_eq!(sweep_clear(&unreadable(), None), Cleared::Kept);
 }
@@ -505,7 +621,7 @@ fn a_clear_is_what_the_write_did_and_otherwise_what_was_decided() {
     );
     assert_eq!(
         Cleared::after_update(Cleared::Removed, UpdateOutcome::MovedAside(PathBuf::from("x"))),
-        Cleared::Removed
+        Cleared::MovedAside
     );
     assert_eq!(
         Cleared::after_update(Cleared::Removed, UpdateOutcome::Kept),
@@ -513,9 +629,47 @@ fn a_clear_is_what_the_write_did_and_otherwise_what_was_decided() {
     );
 }
 
+/// What a forget decides for each record, and the change it asks for: the pure half of [`forget_token`].
+#[skuld::test]
+fn a_forget_rewrites_what_names_the_token_and_keeps_what_it_cannot_read() {
+    let verdict = |current: &StateFile<FailClosedState>, token: &str| forget_decision(current, token).1;
+    assert_eq!(verdict(&absent(), "1"), Forgot::Gone);
+    assert_eq!(verdict(&present("1"), "1"), Forgot::Forgotten);
+    assert_eq!(verdict(&present("2"), "1"), Forgot::Gone);
+    assert_eq!(verdict(&forgotten(), "1"), Forgot::Gone);
+    assert_eq!(verdict(&unusable(Some("1")), "1"), Forgot::Forgotten);
+    assert_eq!(verdict(&unusable(Some("2")), "1"), Forgot::Gone);
+    assert_eq!(verdict(&unusable(None), "1"), Forgot::Gone);
+    assert_eq!(verdict(&unreadable(), "1"), Forgot::Kept);
+    assert!(matches!(
+        forget_decision(&present("1"), "1").0,
+        Change::Store(r) if r == FailClosedState::sample("1").without_token()
+    ));
+    assert!(matches!(
+        forget_decision(&unusable(Some("1")), "1").0,
+        Change::Store(r) if r == FailClosedState::tokenless()
+    ));
+    assert!(matches!(forget_decision(&present("2"), "1").0, Change::Keep));
+    assert!(matches!(forget_decision(&unreadable(), "1").0, Change::Keep));
+}
+
+/// The token is Hole's to drop only when the clear or forget took the record that named it: any other answer means the
+/// token was dropped already (another record's engage displaced it) or the record still names it.
+#[skuld::test]
+fn a_token_is_dropped_only_after_the_record_that_named_it_stopped_naming_it() {
+    assert!(Cleared::Removed.may_drop_the_token());
+    assert!(Cleared::MovedAside.may_drop_the_token());
+    assert!(!Cleared::Gone.may_drop_the_token());
+    assert!(!Cleared::Kept.may_drop_the_token());
+    assert!(Forgot::Forgotten.may_drop_the_token());
+    assert!(!Forgot::Gone.may_drop_the_token());
+    assert!(!Forgot::Kept.may_drop_the_token());
+}
+
 #[skuld::test]
 fn kept_is_a_refusal_that_names_no_path() {
     assert!(Cleared::Removed.refusal().is_none());
+    assert!(Cleared::MovedAside.refusal().is_none());
     assert!(Cleared::Gone.refusal().is_none());
     let kept = Cleared::Kept.refusal().expect("a refusal").to_string();
     assert!(kept.contains("could not be read"), "{kept}");

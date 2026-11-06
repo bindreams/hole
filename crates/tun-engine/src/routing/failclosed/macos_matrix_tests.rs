@@ -15,6 +15,8 @@
 //! After a cell, for any order:
 //!
 //! - a token pf holds is dropped at most once, and one it never held is asked for at most once;
+//! - no `pfctl -X` while a record names that token: a crash between the drop and the write that follows would leave a
+//!   record for a token pf may hand to another app;
 //! - every record names a token pf held, and every token pf holds is named by a record, but for the anonymous one an
 //!   unusable file never named and the ones whose drop failed (a release clears its record whatever the drop did, an
 //!   engage's displaced-token drop is best-effort; both are warned);
@@ -47,6 +49,8 @@ struct Pf {
     stale: BTreeSet<String>,
     started_stale: BTreeSet<String>,
     double_drops: Vec<String>,
+    /// Tokens `-X` was asked for while a record still named them.
+    dropped_while_named: Vec<String>,
     minted: u32,
     drops_fail: bool,
 }
@@ -81,6 +85,18 @@ struct Host<'a> {
     pf: &'a mut Pf,
 }
 
+impl Host<'_> {
+    /// `pfctl -X`, noting a record that still names the token.
+    fn drop_checked(&mut self, token: &str) -> Result<(), RoutingError> {
+        let transient = pf_record::read::<state::FailClosedState>(self.dir);
+        let standing = pf_record::read::<lockdown_state::LockdownPfState>(self.dir);
+        if transient.pf_token() == Some(token) || standing.pf_token() == Some(token) {
+            self.pf.dropped_while_named.push(token.to_owned());
+        }
+        self.pf.drop_token(token)
+    }
+}
+
 impl CoverRulesetOps for Host<'_> {
     fn load_ruleset(&mut self, _text: &str) -> Result<(), RoutingError> {
         self.pf.rules = Rules::Transient;
@@ -102,11 +118,12 @@ impl EngageOps for Host<'_> {
     }
 
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError> {
-        pf_record::swap(self.dir, st, None).map_err(|e| RoutingError::state_write_failed("failclosed-state", &e))
+        pf_record::swap(self.dir, st, None)
+            .map_err(|e| RoutingError::state_op_failed(StateOp::Write, "failclosed-state", &e))
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        self.pf.drop_token(token)
+        self.drop_checked(token)
     }
 
     fn transient_restore(&mut self, token: &str) {
@@ -126,17 +143,23 @@ impl PfOps for Host<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        self.pf.drop_token(token)
+        self.drop_checked(token)
     }
 
     fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
-        pf_record::clear_if_token::<state::FailClosedState>(self.dir, token)
-            .map_err(|e| RoutingError::state_write_failed("failclosed-state", &e))
+        RealPfOps { state_dir: self.dir }.clear_transient(token)
     }
 
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
-        pf_record::clear_if_token::<lockdown_state::LockdownPfState>(self.dir, token)
-            .map_err(|e| RoutingError::state_write_failed("lockdown-pf-state", &e))
+        RealPfOps { state_dir: self.dir }.clear_standing(token)
+    }
+
+    fn forget_transient(&mut self, token: &str) -> Result<Forgot, RoutingError> {
+        RealPfOps { state_dir: self.dir }.forget_transient(token)
+    }
+
+    fn forget_standing(&mut self, token: &str) -> Result<Forgot, RoutingError> {
+        RealPfOps { state_dir: self.dir }.forget_standing(token)
     }
 }
 
@@ -178,16 +201,19 @@ enum Entry {
     Unreadable,
     /// A live record whose token pf does not hold: `-X` of it fails whatever else is true.
     Stale,
+    /// A record an escape's failed restore left: it names no token, and the block it could not lift is still loaded.
+    Forgotten,
 }
 
 impl Entry {
-    const ALL: [Entry; 6] = [
+    const ALL: [Entry; 7] = [
         Entry::Absent,
         Entry::Live,
         Entry::UnusableWithToken,
         Entry::UnusableWithoutToken,
         Entry::Unreadable,
         Entry::Stale,
+        Entry::Forgotten,
     ];
 
     /// Writes the record `file` in `dir` this way and sets pf to hold what that record's past run left it holding.
@@ -214,6 +240,9 @@ impl Entry {
                 std::fs::create_dir(&path).unwrap();
                 pf.live.insert(anonymous.clone());
                 pf.anonymous.insert(anonymous);
+            }
+            Entry::Forgotten => {
+                std::fs::write(&path, live_record.replace(&format!("\"{token}\""), "null")).unwrap();
             }
             Entry::Stale => {
                 std::fs::write(&path, live_record).unwrap();
@@ -248,6 +277,7 @@ fn violations_of(
         stale: BTreeSet::new(),
         started_stale: BTreeSet::new(),
         double_drops: Vec::new(),
+        dropped_while_named: Vec::new(),
         minted: 0,
         drops_fail: false,
     };
@@ -295,6 +325,11 @@ fn violations_of(
         pf.double_drops
             .iter()
             .map(|t| format!("pf was asked to drop {t} twice")),
+    );
+    found.extend(
+        pf.dropped_while_named
+            .iter()
+            .map(|t| format!("pfctl -X {t} ran while a record still named it")),
     );
     let transient_named = pf_record::read::<state::FailClosedState>(dir);
     let standing_named = pf_record::read::<lockdown_state::LockdownPfState>(dir);

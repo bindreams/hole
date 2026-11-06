@@ -1,5 +1,8 @@
 use super::*;
 use std::net::IpAddr;
+use std::path::PathBuf;
+
+use pf_record::PfRecord;
 
 use crate::GLOBAL_NET_STATE;
 
@@ -455,7 +458,7 @@ fn a_live_presence_with_a_captured_snapshot_restores_it_and_drops_the_token() {
     let mut ops = RecordingPfOps::default();
     let result = disengage_lockdown_with(CoverPresence::Live, StateFile::Present(standing_state()), &mut ops);
     assert!(result.is_ok(), "{result:?}");
-    assert_eq!(ops.log, vec!["load_ruleset", "drop_token", "clear_standing"]);
+    assert_eq!(ops.log, vec!["load_ruleset", "clear_standing", "drop_token"]);
 }
 
 // pfctl_stdout (non-zero exit must not read as an empty success) ======================================================
@@ -500,22 +503,37 @@ fn pfctl_stdout_does_not_surface_stdout_text_from_a_failed_run() {
 #[skuld::test]
 fn engage_action_no_persisted_state_is_fresh_enable() {
     // First engage: snapshot the host + `pfctl -E`, regardless of pf's current state.
-    assert_eq!(engage_pf_action(false, false), PfEngageAction::FreshEnable);
-    assert_eq!(engage_pf_action(true, false), PfEngageAction::FreshEnable);
+    assert_eq!(engage_pf_action(false, None), PfEngageAction::FreshEnable);
+    assert_eq!(engage_pf_action(true, None), PfEngageAction::FreshEnable);
 }
 
 #[skuld::test]
 fn engage_action_persisted_but_pf_disabled_reenables() {
     // Reboot reset pf + its refcount but the state file survived: the old token is
     // stale, so re-enable and capture a fresh one — else the ruleset loads inert.
-    assert_eq!(engage_pf_action(false, true), PfEngageAction::Reenable);
+    assert_eq!(
+        engage_pf_action(false, Some(&standing_state())),
+        PfEngageAction::Reenable
+    );
 }
 
 #[skuld::test]
 fn engage_action_persisted_and_pf_enabled_reuses_token() {
     // Live Adopt re-engage within one boot: pf still enabled and we hold the token —
     // reuse it, do NOT double `-E` (that would inflate the refcount).
-    assert_eq!(engage_pf_action(true, true), PfEngageAction::ReuseToken);
+    assert_eq!(
+        engage_pf_action(true, Some(&standing_state())),
+        PfEngageAction::ReuseToken
+    );
+}
+
+/// An escape that forgot the token left the snapshots: the engage takes a fresh `-E` under them, whatever pf says
+/// (another app may keep it enabled), and neither snapshots the host afresh nor reuses a token it does not hold.
+#[skuld::test]
+fn engage_action_persisted_without_a_token_reenables_under_its_snapshot() {
+    let forgotten = standing_state().without_token();
+    assert_eq!(engage_pf_action(true, Some(&forgotten)), PfEngageAction::Reenable);
+    assert_eq!(engage_pf_action(false, Some(&forgotten)), PfEngageAction::Reenable);
 }
 
 // ensure_trailing_nl ==================================================================================================
@@ -778,7 +796,7 @@ fn output_with_status(code: i32) -> Result<std::process::Output, RoutingError> {
 /// A recorded transient cover holding `token`.
 fn recorded_cover(token: &str) -> state::FailClosedState {
     state::FailClosedState {
-        pf_token: token.to_owned(),
+        pf_token: Some(token.to_owned()),
         pf_was_enabled: false,
     }
 }
@@ -800,7 +818,7 @@ fn recover_cover_with_no_state_file_does_nothing() {
 fn recover_cover_with_a_recorded_cover_drops_its_token_and_skips_the_reload_when_adopting() {
     let mut ops = RecordingPfOps::default();
     recover_cover_with(StateFile::Present(recorded_cover("42")), true, &mut ops);
-    assert_eq!(ops.log, vec!["drop_token", "clear_transient"]);
+    assert_eq!(ops.log, vec!["clear_transient", "drop_token"]);
     assert_eq!(ops.dropped, vec!["42".to_owned()]);
 }
 
@@ -808,11 +826,12 @@ fn recover_cover_with_a_recorded_cover_drops_its_token_and_skips_the_reload_when
 fn recover_cover_with_a_recorded_cover_restores_then_drops_its_token() {
     let mut ops = RecordingPfOps::default();
     recover_cover_with(StateFile::Present(recorded_cover("42")), false, &mut ops);
-    assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
+    assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
     assert_eq!(ops.dropped, vec!["42".to_owned()]);
 }
 
-/// An UNREADABLE record is a cover to clear, not an absence.
+/// An UNUSABLE record that named no token is a cover to clear, not an absence. (A record whose read failed is the
+/// settle tests' `a_record_that_could_not_be_read_still_drives_a_restore_of_the_host`.)
 ///
 /// `Absent` and `Unusable` are opposite facts for a sweep: the first says no
 /// cover was ever engaged, the second is Hole's own unreconciled record that
@@ -821,7 +840,7 @@ fn recover_cover_with_a_recorded_cover_restores_then_drops_its_token() {
 /// not read it as "nothing to recover" while the crashed run's `block out all`
 /// still holds the host. Only the manual `bridge unlock` would escape it.
 #[skuld::test]
-fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
+fn recover_cover_with_an_unusable_record_naming_no_token_still_restores_the_host() {
     let mut ops = RecordingPfOps::default();
     recover_cover_with(unusable(), false, &mut ops);
     assert_eq!(
@@ -856,7 +875,7 @@ fn recover_cover_with_an_unusable_record_still_drops_the_token_it_could_read() {
         vec!["7".to_owned()],
         "a salvaged token is the only one there is: the sweep must drop it or the refcount leaks"
     );
-    assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
+    assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
 }
 
 /// [`StateFile::unusable`]'s two answers, driven from bytes.
@@ -909,7 +928,7 @@ fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
         vec!["7".to_owned()],
         "the token the newer record still holds"
     );
-    assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
+    assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
 }
 
 // engage_with =========================================================================================================
@@ -1432,10 +1451,48 @@ struct RecordingPfOps {
     fail_clear_transient: bool,
     fail_clear_standing: bool,
     fail_drop_token: bool,
+    fail_forget_transient: bool,
+    fail_forget_standing: bool,
     /// Every token handed to `clear_transient` / `clear_standing`, so WHICH record a clear was keyed to is assertable.
     cleared: Vec<Option<String>>,
     /// What every clear reports finding; `Removed` when unset.
     cleared_as: Option<Cleared>,
+    /// Every token handed to `forget_transient` / `forget_standing`.
+    forgot: Vec<String>,
+    /// What every forget reports finding; `Forgotten` when unset.
+    forgot_as: Option<Forgot>,
+    /// The state dir whose real records the clears and forgets act on, and `drop_token` reads: it fails the test when a
+    /// record still names the token being dropped, the one thing a call-order assertion cannot show (a crash between
+    /// the drop and the write leaves exactly that record).
+    records: Option<PathBuf>,
+}
+
+impl RecordingPfOps {
+    /// A double over real records in `dir`.
+    fn over_records(dir: &Path) -> Self {
+        Self {
+            records: Some(dir.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn assert_no_record_names(&self, token: &str) {
+        let Some(dir) = &self.records else { return };
+        let named = [
+            pf_record::read::<state::FailClosedState>(dir)
+                .pf_token()
+                .map(str::to_owned),
+            pf_record::read::<lockdown_state::LockdownPfState>(dir)
+                .pf_token()
+                .map(str::to_owned),
+        ];
+        assert!(
+            !named.iter().flatten().any(|named| named == token),
+            "pfctl -X {token} while a record still names it: {named:?}; a crash here leaves a record for a token pf \
+             may hand to another app; calls so far: {:?}",
+            self.log
+        );
+    }
 }
 
 impl PfOps for RecordingPfOps {
@@ -1459,6 +1516,7 @@ impl PfOps for RecordingPfOps {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.assert_no_record_names(token);
         self.log.push("drop_token");
         self.dropped.push(token.to_owned());
         if self.fail_drop_token {
@@ -1471,34 +1529,54 @@ impl PfOps for RecordingPfOps {
     fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         self.log.push("clear_transient");
         self.cleared.push(token.map(str::to_owned));
-        if self.fail_clear_transient {
-            Err(RoutingError::RouteSetup("mock clear_transient failure".into()))
-        } else {
-            Ok(self.cleared_as.unwrap_or(Cleared::Removed))
+        match (&self.records, self.fail_clear_transient) {
+            (_, true) => Err(RoutingError::RouteSetup("mock clear_transient failure".into())),
+            (Some(dir), false) => RealPfOps { state_dir: dir }.clear_transient(token),
+            (None, false) => Ok(self.cleared_as.unwrap_or(Cleared::Removed)),
         }
     }
 
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         self.log.push("clear_standing");
         self.cleared.push(token.map(str::to_owned));
-        if self.fail_clear_standing {
-            Err(RoutingError::RouteSetup("mock clear_standing failure".into()))
-        } else {
-            Ok(self.cleared_as.unwrap_or(Cleared::Removed))
+        match (&self.records, self.fail_clear_standing) {
+            (_, true) => Err(RoutingError::RouteSetup("mock clear_standing failure".into())),
+            (Some(dir), false) => RealPfOps { state_dir: dir }.clear_standing(token),
+            (None, false) => Ok(self.cleared_as.unwrap_or(Cleared::Removed)),
+        }
+    }
+
+    fn forget_transient(&mut self, token: &str) -> Result<Forgot, RoutingError> {
+        self.log.push("forget_transient");
+        self.forgot.push(token.to_owned());
+        match (&self.records, self.fail_forget_transient) {
+            (_, true) => Err(RoutingError::RouteSetup("mock forget_transient failure".into())),
+            (Some(dir), false) => RealPfOps { state_dir: dir }.forget_transient(token),
+            (None, false) => Ok(self.forgot_as.unwrap_or(Forgot::Forgotten)),
+        }
+    }
+
+    fn forget_standing(&mut self, token: &str) -> Result<Forgot, RoutingError> {
+        self.log.push("forget_standing");
+        self.forgot.push(token.to_owned());
+        match (&self.records, self.fail_forget_standing) {
+            (_, true) => Err(RoutingError::RouteSetup("mock forget_standing failure".into())),
+            (Some(dir), false) => RealPfOps { state_dir: dir }.forget_standing(token),
+            (None, false) => Ok(self.forgot_as.unwrap_or(Forgot::Forgotten)),
         }
     }
 }
 
 fn transient_state() -> state::FailClosedState {
     state::FailClosedState {
-        pf_token: "111".into(),
+        pf_token: Some("111".into()),
         pf_was_enabled: false,
     }
 }
 
 fn standing_state() -> lockdown_state::LockdownPfState {
     lockdown_state::LockdownPfState {
-        pf_token: "222".into(),
+        pf_token: Some("222".into()),
         main_snapshot: String::new(),
         nat_snapshot: String::new(),
         main_snapshot_captured: true,
@@ -1735,11 +1813,11 @@ fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
         ops.log,
         vec![
             "reload_default",
-            "drop_token",
             "clear_transient",
-            "load_ruleset",
             "drop_token",
+            "load_ruleset",
             "clear_standing",
+            "drop_token",
         ],
         "the full transient-then-standing sequence must run in order: {:?}",
         ops.log
