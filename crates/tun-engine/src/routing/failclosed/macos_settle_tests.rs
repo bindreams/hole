@@ -123,21 +123,154 @@ fn a_token_that_will_not_drop_is_logged_with_what_was_being_released() {
     );
 }
 
-/// A failed restore is the error the user reads: it keeps the restore's own words and says what to do about it.
+/// The advice an escape adds to a failed restore, and where it ends: it names what fixes the restore that ran.
+const FIX_PF_CONF: &str = "; the block is still in place. Fix /etc/pf.conf and unblock again, or run `sudo pfctl -d`";
+const TURN_PF_OFF: &str = "; the block is still in place. Run `sudo pfctl -d` to turn pf off";
+
+/// A restore that reloaded `/etc/pf.conf` and failed is the error the user reads: the restore's own words, then the
+/// fix for `/etc/pf.conf`. Every escape path that reloads it says so, the standing cover's included.
 #[skuld::test]
-fn a_failed_restore_tells_the_user_how_to_get_out() {
+fn an_escape_whose_default_reload_failed_says_to_fix_pf_conf() {
+    let standing_without_baseline = lockdown_state::LockdownPfState {
+        main_snapshot_captured: false,
+        ..standing_state()
+    };
+    for (name, transient, standing) in [
+        (
+            "release_all, transient",
+            StateFile::Present(transient_state()),
+            StateFile::Absent,
+        ),
+        (
+            "release_all, standing without a baseline",
+            StateFile::Absent,
+            StateFile::Present(standing_without_baseline),
+        ),
+        (
+            "release_all, standing unusable",
+            StateFile::Absent,
+            StateFile::Unusable { pf_token: None },
+        ),
+        (
+            "release_all, standing unreadable",
+            StateFile::Absent,
+            StateFile::Unreadable,
+        ),
+    ] {
+        let mut ops = RecordingPfOps {
+            fail_reload_default: true,
+            ..Default::default()
+        };
+
+        let text = release_all_with(transient, standing, &mut ops)
+            .into_result()
+            .expect_err("the restore failed")
+            .to_string();
+
+        assert!(text.contains("mock reload_default failure"), "{name}: {text}");
+        assert!(text.ends_with(FIX_PF_CONF), "{name}: {text}");
+    }
+}
+
+/// A standing cover whose snapshot and fallback both failed is repaired by `/etc/pf.conf`: the fallback is the last
+/// restore that ran.
+#[skuld::test]
+fn a_standing_release_whose_snapshot_and_fallback_failed_says_to_fix_pf_conf() {
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        fail_reload_default: true,
+        ..Default::default()
+    };
+
+    let text = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops)
+        .into_result()
+        .expect_err("both restores failed")
+        .to_string();
+
+    assert!(text.contains("mock load_ruleset failure"), "{text}");
+    assert!(text.ends_with(FIX_PF_CONF), "{text}");
+}
+
+/// A lockdown disengage that loads the captured snapshot and fails is not repaired by `/etc/pf.conf`, so the advice
+/// does not name it.
+#[skuld::test]
+fn a_lockdown_disengage_whose_snapshot_failed_does_not_send_the_user_to_pf_conf() {
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        ..Default::default()
+    };
+
+    let text = disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops)
+        .expect_err("the snapshot did not load")
+        .to_string();
+
+    assert!(text.contains("mock load_ruleset failure"), "{text}");
+    assert!(text.ends_with(TURN_PF_OFF), "{text}");
+    assert!(!text.contains("/etc/pf.conf"), "{text}");
+}
+
+/// A lockdown disengage with no snapshot to load reloads `/etc/pf.conf`, and says to fix it.
+#[skuld::test]
+fn a_lockdown_disengage_whose_default_reload_failed_says_to_fix_pf_conf() {
     let mut ops = RecordingPfOps {
         fail_reload_default: true,
         ..Default::default()
     };
 
-    let result = release_all_with(StateFile::Present(transient_state()), StateFile::Absent, &mut ops).into_result();
+    let text = disengage_lockdown_with(CoverPresence::Live, StateFile::Absent, &mut ops)
+        .expect_err("the reload failed")
+        .to_string();
 
-    assert_eq!(
-        result.expect_err("the restore failed").to_string(),
-        "route setup failed: mock reload_default failure; the block is still in place. Fix /etc/pf.conf and unblock \
-         again, or run `sudo pfctl -d`"
-    );
+    assert!(text.contains("mock reload_default failure"), "{text}");
+    assert!(text.ends_with(FIX_PF_CONF), "{text}");
+}
+
+/// The advice goes with a restore that failed and nothing else: a clear that fails after a good restore is its own
+/// error.
+#[skuld::test]
+fn an_escape_whose_clear_failed_after_a_good_restore_carries_no_restore_advice() {
+    let mut ops = RecordingPfOps {
+        fail_clear_standing: true,
+        ..Default::default()
+    };
+
+    let text = disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops)
+        .expect_err("the clear failed")
+        .to_string();
+
+    assert!(text.contains("mock clear_standing failure"), "{text}");
+    assert!(!text.contains("pfctl -d"), "{text}");
+}
+
+/// A release that is not an escape (the transient guard's `Drop`, `recover_cover`, the engage back-out) returns the
+/// restore's error as it came: nobody reads advice there.
+#[skuld::test]
+fn a_release_returns_a_failed_restore_unchanged() {
+    for kind in [CoverKind::Transient, CoverKind::Lockdown] {
+        let mut ops = RecordingPfOps::default();
+        let restore = Err(RoutingError::RouteSetup("the restore's own words".into()));
+
+        let text = release(&mut ops, kind, Ok(Some("111")), restore)
+            .expect_err("the restore failed")
+            .to_string();
+
+        assert_eq!(text, "route setup failed: the restore's own words", "{kind:?}");
+    }
+}
+
+/// The advice is built from the error's redacted text, so a restore error that carries a path (the one variant that
+/// does) does not put it in the user's text.
+#[skuld::test]
+fn the_advice_carries_no_path() {
+    for source in [RestoreSource::DefaultRuleset, RestoreSource::CapturedSnapshot] {
+        let named = RoutingError::StateUnreadable {
+            path: PathBuf::from("/Users/someone/private/x.json"),
+        };
+
+        let text = source.advise(named).to_string();
+
+        assert!(!text.contains("someone"), "{source:?}: {text}");
+    }
 }
 
 /// The record is the release's last step. A write that fails after a restore that held leaves a record over a host
