@@ -212,16 +212,13 @@ impl InstallStamp {
     /// the lock is acquired for the call. A stamp is a fact about one install, so asking twice is harmless: the
     /// guard that owns it decides when to ask.
     pub fn release_on_drop(&self, delete: impl FnOnce(&CoverLock)) {
-        if held_by_this_thread(self.slot) {
-            let view = CoverLock::view_of_held(self.slot);
-            if self.is_current() {
-                delete(&view);
-            }
-            return;
-        }
-        let acquired = CoverLock::lock_slot(self.slot);
+        let lock = if held_by_this_thread(self.slot) {
+            CoverLock::view_of_held(self.slot)
+        } else {
+            CoverLock::lock_slot(self.slot)
+        };
         if self.is_current() {
-            delete(&acquired);
+            delete(&lock);
         }
     }
 }

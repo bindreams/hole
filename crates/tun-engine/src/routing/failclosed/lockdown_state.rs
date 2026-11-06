@@ -40,9 +40,9 @@ impl VersionedState for LockdownState {
 util::assert_contiguous!(LockdownState);
 
 /// The intent file. Every read and write of it goes through this type.
-pub type LockdownFile = VersionedFile<LockdownState>;
+type LockdownFile = VersionedFile<LockdownState>;
 
-pub fn file(state_dir: &Path) -> LockdownFile {
+fn file(state_dir: &Path) -> LockdownFile {
     VersionedFile::new(state_dir)
 }
 
