@@ -52,9 +52,7 @@ impl<T: PfRecord> StateFile<T> {
 /// The answer for a record a release could not read. The text names no path: it reaches a toast.
 fn unread_record() -> RoutingError {
     RoutingError::RouteSetup(
-        "the host's rules are restored, but the cover record could not be read and was left in place, so the release is \
-         not confirmed"
-            .into(),
+        "the cover record could not be read and was left in place, so the release is not confirmed".into(),
     )
 }
 
