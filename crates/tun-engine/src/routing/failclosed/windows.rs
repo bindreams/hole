@@ -2248,7 +2248,7 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
 /// engine open but not the write — would leave the kill switch engaged while
 /// the intent reads "off", with nothing left to reconcile it. The macOS arm
 /// has always propagated its `pfctl` failures; this is the same rule.
-pub fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
+pub(super) fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
     let swept = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -2275,11 +2275,6 @@ pub fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> SweepOut
         swept
     };
     disengage_verdict(None, &swept, witness)
-}
-
-/// [`disengage_lockdown`] under the shared `sweep_with_witness`; the facade's `disengage_lockdown` calls this.
-pub(super) fn disengage_lockdown_swept(lock: &CoverLock) -> Result<Clearance, RoutingError> {
-    super::sweep_with_witness(lock, None, |witness| disengage_lockdown(lock, witness))
 }
 
 /// Whether a lockdown disengage may report success. Pure and separated from
@@ -2384,7 +2379,7 @@ unsafe fn delete_all(engine: HANDLE) {
 /// that this call can see — but it is only *proof of absence* for a
 /// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
 /// two lets the MSI delete `hole.exe` over a key it never observed.
-pub fn release_all(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
+pub(super) fn release_all(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
     let (lockdown, transient) = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site

@@ -1028,7 +1028,7 @@ pub fn engage_lockdown(
 /// survive a reboot at all — so every macOS cover key is
 /// [`super::KeyLifetime::Persistent`] and a disengage has nothing to leave
 /// unproven.
-pub fn disengage_lockdown(lock: &CoverLock, _witness: super::ArmingWitness) -> SweepOutcome {
+pub(super) fn disengage_lockdown(lock: &CoverLock, _witness: super::ArmingWitness) -> SweepOutcome {
     // `Clearance::proven` on both arms: this platform has no boot-time key
     // class, so a macOS disengage carries nothing for the record to learn
     // from whether it succeeded or failed. The failing arm's clearance is
@@ -1124,17 +1124,12 @@ fn lockdown_presence_and_state(
     (fold_presence(pf_label, &file), file)
 }
 
-/// [`disengage_lockdown`] under the shared `sweep_with_witness`, so a confirmed release outdates the kind's stamps like
-/// every other sweep. The facade's `disengage_lockdown` and [`lockdown_disengage`] both call this, so a `pf_on_any_host`
-/// build (the module compiled on another host) reaches its own `pfctl`, never another host's sweep.
-pub(super) fn disengage_lockdown_swept(lock: &CoverLock) -> Result<Clearance, RoutingError> {
-    super::sweep_with_witness(lock, None, |witness| disengage_lockdown(lock, witness))
-}
-
 /// Best-effort wrapper for the standing guard's `Drop` (user-stop) and the engage's back-out: disengage and log.
-/// Neither has a caller to surface an error to.
+/// Neither has a caller to surface an error to. It runs this module's [`disengage_lockdown`] under the shared
+/// `sweep_with_witness`, so a confirmed release outdates the kind's stamps like every other sweep. Not the facade's
+/// cfg-dispatched sweep: a `pf_on_any_host` build must reach this module's `pfctl`, not another host's.
 fn lockdown_disengage(lock: &CoverLock) {
-    if let Err(e) = disengage_lockdown_swept(lock) {
+    if let Err(e) = super::sweep_with_witness(lock, None, |witness| disengage_lockdown(lock, witness)) {
         tracing::warn!(
             error = &e as &dyn std::error::Error,
             "lockdown disengage failed during Drop or an engage's back-out"
@@ -1506,7 +1501,7 @@ impl PfOps for RealPfOps<'_> {
 /// release can leave unproven. macOS's own "`Ok` over a still-blocked host" residual is a
 /// different one (an entirely absent state file, clause 1) and is not what
 /// this type tracks.
-pub fn release_all(lock: &CoverLock, _witness: super::ArmingWitness) -> SweepOutcome {
+pub(super) fn release_all(lock: &CoverLock, _witness: super::ArmingWitness) -> SweepOutcome {
     let transient = pf_record::read::<state::FailClosedState>(lock.state_dir());
     let standing = pf_record::read::<lockdown_state::LockdownPfState>(lock.state_dir());
     // Both arms `Clearance::proven`, for the reason `disengage_lockdown`
