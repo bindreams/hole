@@ -1700,24 +1700,6 @@ fn recover_passes_adopting_only_on_adopt() {
     }
 }
 
-/// Each variant's answer, spelled out with no wildcard: a failed engage keeps a cover that is or may be in force.
-#[skuld::test]
-fn a_failed_engage_backs_out_only_when_no_cover_was_in_force() {
-    for (presence, backs_out) in [
-        (Live, false),
-        (Indeterminate, false),
-        (Unreachable, false),
-        (Absent, true),
-        (Recorded, true),
-    ] {
-        assert_eq!(
-            presence.backs_out_a_failed_engage(),
-            backs_out,
-            "{presence:?}: a back-out over a cover that may be in force removes the kill switch"
-        );
-    }
-}
-
 // Recovery dispatch ===================================================================================================
 
 #[skuld::test]

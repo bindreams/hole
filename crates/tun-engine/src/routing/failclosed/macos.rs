@@ -907,12 +907,14 @@ fn persist_baseline(
 /// function's doc), and a cold engage has no window that reordering could close
 /// (this module's doc).
 ///
-/// On load failure Err is returned and the bridge's fail-FATAL caller aborts the start. The engage first restores the
-/// host (`lockdown_disengage`) only when the presence measured before it says no cover was in force
-/// ([`CoverPresence::backs_out_a_failed_engage`](crate::routing::CoverPresence::backs_out_a_failed_engage)); over a
-/// cover that is, or may be, in force it leaves it. `pfctl -f` commits a whole ruleset or none, so the rules of a
-/// cover in force survive a failed load; pf applies `set` options outside that transaction, and they are identical
-/// across lockdown engages.
+/// On load failure Err is returned and the bridge's fail-FATAL caller aborts the start. A failed engage never touches
+/// the rules: `pfctl -f` commits a whole ruleset or none (measured by the privileged `macos_lockdown_failed_engage_`
+/// tests, which compare `pfctl -sr` across a failed load), so whatever was loaded before stays, and a cover in force
+/// stays in force. pf applies `set` options outside that transaction, and they are identical across lockdown engages.
+/// It gives back only what it took, through [`unwind_engage`]: the fresh token (`FreshEnable`, `Reenable`) and its
+/// record write, which is put back as read before the engage, or cleared if there was none. `ReuseToken` took
+/// nothing. The token the engage's record write displaced is dropped only once the load succeeded, so the put-back
+/// never names a token that was dropped.
 pub fn engage_lockdown(
     lock: &CoverLock,
     server_ip: IpAddr,
@@ -924,10 +926,10 @@ pub fn engage_lockdown(
     let info = pfctl_stdout(pfctl(&["-s", "info"], None, FatalPhase::CoverEngage), "pfctl -s info")?;
     let pf_enabled = parse_pf_enabled(&info);
     // The engage's one presence measurement, with the record it was folded from: taken before anything changes, it
-    // decides the baseline capture and the back-out of a failed load. An unusable or unreadable record is no baseline
-    // to reuse, and its token is dropped when the engage's own record replaces it.
+    // decides the baseline capture. An unusable or unreadable record is no baseline to reuse, and its token is
+    // dropped when the engage's own record replaces it.
     let (presence, record) = lockdown_presence_and_state(lock.state_dir());
-    let persisted = match record {
+    let prior = match record {
         StateFile::Present(st) => Some(st),
         StateFile::Absent => None,
         StateFile::Unusable { .. } => None,
@@ -935,40 +937,42 @@ pub fn engage_lockdown(
     };
     let mut ops = RealCoverRulesetOps;
 
-    let action = engage_pf_action(pf_enabled, persisted.is_some());
-    let (token, nat_snapshot) = match action {
+    let action = engage_pf_action(pf_enabled, prior.is_some());
+    // `fresh` is whether this engage took the token (`ReuseToken` takes none), `displaced` the token its record write
+    // replaced.
+    let (token, nat_snapshot, fresh, displaced) = match action {
         // Live Adopt re-engage within one boot: pf still enabled and we hold the
         // token+snapshot. Reuse both so the real host policy is preserved for the
         // eventual restore. ReuseToken assumes our refcount is still live (the
         // reboot case is `Reenable`); do not double `-E`.
         PfEngageAction::ReuseToken => {
-            let st = persisted.expect("ReuseToken implies persisted state");
-            (st.pf_token, st.nat_snapshot)
+            let st = prior.as_ref().expect("ReuseToken implies persisted state");
+            (st.pf_token.clone(), st.nat_snapshot.clone(), false, None)
         }
         // Persisted state survived but pf was disabled (reboot reset pf and its
         // refcount). Enable afresh and re-persist the SAME host snapshot under the
         // fresh token — never re-snapshot the live lockdown ruleset. The single
         // `pfctl -X <fresh-token>` on disengage matches this single `-E`.
         PfEngageAction::Reenable => {
-            let st = persisted.expect("Reenable implies persisted state");
+            let st = prior.as_ref().expect("Reenable implies persisted state");
             let token = enable_pf_capture_token()?;
             let fresh = lockdown_state::LockdownPfState {
                 pf_token: token.clone(),
-                main_snapshot: st.main_snapshot,
+                main_snapshot: st.main_snapshot.clone(),
                 nat_snapshot: st.nat_snapshot.clone(),
                 // Carried, not re-asserted: this re-persists the SAME baseline
                 // under a fresh token, so claiming a capture that never
                 // happened would restore an empty pass-all ruleset.
                 main_snapshot_captured: st.main_snapshot_captured,
             };
-            match pf_record::swap(lock, &fresh, owner) {
-                Ok(displaced) => drop_displaced(displaced.as_deref(), &token, |old| ops.drop_token(old)),
+            let displaced = match pf_record::swap(lock, &fresh, owner) {
+                Ok(displaced) => displaced,
                 Err(e) => {
-                    drop_or_warn(&token, "unwinding a failed lockdown re-enable", |t| ops.drop_token(t));
+                    unwind_engage(lock, owner, Some(&token), prior.as_ref(), |t| ops.drop_token(t));
                     return Err(RoutingError::state_op_failed(StateOp::Write, "lockdown-pf-state", &e));
                 }
-            }
-            (token, st.nat_snapshot)
+            };
+            (token, st.nat_snapshot.clone(), true, displaced)
         }
         // First engage: enable + snapshot the host.
         PfEngageAction::FreshEnable => {
@@ -977,12 +981,9 @@ pub fn engage_lockdown(
             // `-E` on any error before propagating — else the refcount leaks with
             // no state file to recover it from.
             match capture_and_persist(&token, lock, owner, presence) {
-                Ok((nat_snapshot, displaced)) => {
-                    drop_displaced(displaced.as_deref(), &token, |old| ops.drop_token(old));
-                    (token, nat_snapshot)
-                }
+                Ok((nat_snapshot, displaced)) => (token, nat_snapshot, true, displaced),
                 Err(e) => {
-                    drop_or_warn(&token, "unwinding a failed lockdown engage", |t| ops.drop_token(t));
+                    unwind_engage(lock, owner, Some(&token), None, |t| ops.drop_token(t));
                     return Err(e);
                 }
             }
@@ -997,13 +998,12 @@ pub fn engage_lockdown(
     // standing up a full `RealEngageOps` with a `lock`/`owner` this call
     // never reads.
     if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, &mut ops) {
-        // The back-out (the restore, the record's clear, the token's drop) unwinds what this engage took so it does not
-        // outlive a cover that never loaded. Over a cover in force it would remove the user's kill switch instead.
-        if presence.backs_out_a_failed_engage() {
-            lockdown_disengage(lock);
-        }
+        unwind_engage(lock, owner, fresh.then_some(token.as_str()), prior.as_ref(), |t| {
+            ops.drop_token(t)
+        });
         return Err(e);
     }
+    drop_displaced(displaced.as_deref(), &token, |old| ops.drop_token(old));
 
     Ok(Cover {
         held: Some(Held { token }),
@@ -1011,10 +1011,43 @@ pub fn engage_lockdown(
     })
 }
 
+/// What a failed [`engage_lockdown`] gives back: the `fresh` token it took (`None`: it took none) and the record it
+/// wrote for it. `prior` is the record read before the engage, `None` if there was no usable one: it is written back,
+/// or the record is cleared when there is none. The record goes first and the token after, once the record no longer
+/// names it ([`super::pf_record`]); a record that cannot be written back still names the token, which stays held. A
+/// record that does not name `fresh` (the engage failed before writing it) is not the engage's to change. It never
+/// reloads rules: a failed load changed none, and the cover in force before the engage, if any, is the user's.
+fn unwind_engage(
+    lock: &CoverLock,
+    owner: Option<(u32, u32)>,
+    fresh: Option<&str>,
+    prior: Option<&lockdown_state::LockdownPfState>,
+    drop: impl FnOnce(&str) -> Result<(), RoutingError>,
+) {
+    let Some(fresh) = fresh else { return };
+    let current = pf_record::read::<lockdown_state::LockdownPfState>(lock.state_dir());
+    if pf_record::names(&current, Some(fresh)) {
+        let put_back = match prior {
+            Some(prior) => pf_record::swap(lock, prior, owner).map(|_| ()),
+            None => pf_record::clear_if_token::<lockdown_state::LockdownPfState>(lock, Some(fresh)).map(|_| ()),
+        };
+        if let Err(e) = put_back {
+            let e = RoutingError::state_op_failed(StateOp::Write, "lockdown-pf-state", &e);
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "a failed lockdown engage could not undo its record; the record still names the engage's pf token, \
+                 which stays held"
+            );
+            return;
+        }
+    }
+    drop_or_warn(fresh, "unwinding a failed lockdown engage", drop);
+}
+
 /// Fail-loud disengage of the standing cover: restore the host ([`restore_standing`]: the captured snapshot, else
 /// `/etc/pf.conf`), clear the record, drop our pf refcount ([`release`]). Every release of the standing cover that is
-/// not `release_all` comes here: `bridge unlock`, the startup sweep when the intent is off, the standing guard's `Drop`
-/// and the back-out of a failed engage.
+/// not `release_all` comes here: `bridge unlock`, the startup sweep when the intent is off and the standing guard's
+/// `Drop`. A failed engage does not: it gives back only what it took ([`unwind_engage`]).
 ///
 /// Gates on [`lockdown_cover_presence`] — pf's own answer folded with the
 /// state file — not on the file alone (#882): a state file that is absent or
@@ -1133,15 +1166,15 @@ fn lockdown_presence_and_state(
     (fold_presence(pf_label, &file), file)
 }
 
-/// Best-effort wrapper for the standing guard's `Drop` (user-stop) and the engage's back-out: disengage and log.
-/// Neither has a caller to surface an error to. It runs this module's [`disengage_lockdown`] under the shared
+/// Best-effort wrapper for the standing guard's `Drop` (user-stop): disengage and log. `Drop` has no caller to surface
+/// an error to. It runs this module's [`disengage_lockdown`] under the shared
 /// `sweep_with_witness`, so a confirmed release outdates the kind's stamps like every other sweep. Not the facade's
 /// cfg-dispatched sweep: a `pf_on_any_host` build must reach this module's `pfctl`, not another host's.
 fn lockdown_disengage(lock: &CoverLock) {
     if let Err(e) = super::sweep_with_witness(lock, |witness| disengage_lockdown(lock, witness)) {
         tracing::warn!(
             error = &e as &dyn std::error::Error,
-            "lockdown disengage failed during Drop or an engage's back-out"
+            "lockdown disengage failed during Drop"
         );
     }
 }
@@ -1243,7 +1276,7 @@ fn release(
 
 /// The standing cover's restore: its captured snapshot, else `/etc/pf.conf`. Every release of the standing cover
 /// goes through it: `release_all`, and `disengage_lockdown_with` for all its callers (the standing guard's `Drop`,
-/// the back-out of a failed engage, the startup sweep when the intent is off, and `bridge unlock`).
+/// the startup sweep when the intent is off, and `bridge unlock`).
 ///
 /// [`StateFile::restore_choice`] chooses: only a record with a captured baseline has a snapshot to load, and every
 /// other record reloads `/etc/pf.conf` (loading an empty snapshot would leave a pass-all host; see
