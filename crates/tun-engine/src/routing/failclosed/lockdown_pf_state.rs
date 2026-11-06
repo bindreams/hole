@@ -70,3 +70,34 @@ impl super::pf_record::PfRecord for LockdownPfState {
         &self.pf_token
     }
 }
+
+impl super::StateFile<LockdownPfState> {
+    /// The baseline a standing release restores, or `None` when it must reload `/etc/pf.conf`. The one place the
+    /// standing restore is chosen: every release of the standing cover asks it, and an unusable or unreadable record
+    /// says here that it has no snapshot to restore.
+    ///
+    /// A record with no captured baseline has none to load: its `main_snapshot` is empty, and loading that would leave a
+    /// pass-all host. No record at all means presence was established by pf's label alone.
+    pub fn captured_snapshot(&self) -> Option<&LockdownPfState> {
+        use super::StateFile;
+        match self {
+            StateFile::Present(st) if st.main_snapshot_captured => Some(st),
+            StateFile::Present(_) => None,
+            StateFile::Absent => None,
+            StateFile::Unusable { .. } => {
+                tracing::warn!(
+                    "standing lockdown-pf-state file is unusable; no snapshot to restore, falling back to the \
+                     default ruleset"
+                );
+                None
+            }
+            StateFile::Unreadable => {
+                tracing::warn!(
+                    "standing lockdown-pf-state file could not be read; no snapshot to restore, falling back to \
+                     the default ruleset"
+                );
+                None
+            }
+        }
+    }
+}

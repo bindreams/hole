@@ -1256,11 +1256,8 @@ fn restore_standing(
     standing: &StateFile<lockdown_state::LockdownPfState>,
     ops: &mut dyn PfOps,
 ) -> Result<(), RoutingError> {
-    let st = match standing {
-        StateFile::Present(st) if st.main_snapshot_captured => st,
-        StateFile::Present(_) | StateFile::Absent | StateFile::Unusable { .. } | StateFile::Unreadable => {
-            return ops.reload_default();
-        }
+    let Some(st) = standing.captured_snapshot() else {
+        return ops.reload_default();
     };
     let snapshot_err = match ops.load_ruleset(&build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot)) {
         Ok(()) => return Ok(()),
@@ -1337,18 +1334,10 @@ pub(crate) fn release_all_with(
             release_standing(ops, restored)
         }
         StateFile::Unusable { .. } => {
-            tracing::warn!(
-                "standing lockdown-pf-state file is unusable; no snapshot to restore, falling back to \
-                 the default ruleset"
-            );
             let restored = restore_standing(&standing, ops);
             release_standing(ops, restored)
         }
         StateFile::Unreadable => {
-            tracing::warn!(
-                "standing lockdown-pf-state file could not be read; no snapshot to restore, falling back to \
-                 the default ruleset"
-            );
             let restored = restore_standing(&standing, ops);
             release_standing(ops, restored)
         }

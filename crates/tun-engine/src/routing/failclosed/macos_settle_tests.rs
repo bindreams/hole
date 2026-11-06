@@ -898,3 +898,90 @@ fn a_failed_restore_over_an_unusable_record_leaves_its_bytes_and_drops_nothing()
     assert_eq!(ops.log, vec!["reload_default"]);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
 }
+
+/// Which restore a standing record asks for is the record's one decision: only a captured baseline loads a snapshot,
+/// every other record reloads `/etc/pf.conf`, and one that is unusable or unreadable says it has no snapshot to restore.
+/// Every escape that restores the standing cover logs the same.
+#[skuld::test]
+fn every_standing_restore_follows_the_records_choice_and_logs_it_the_same() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    type Standing = StateFile<lockdown_state::LockdownPfState>;
+    type Case = (&'static str, fn() -> Standing, &'static str, Option<&'static str>);
+    type Caller = (&'static str, fn(Standing, &mut RecordingPfOps));
+    // (record, first restore call, the warning it must log)
+    let cases: [Case; 5] = [
+        (
+            "a captured baseline",
+            || StateFile::Present(standing_state()),
+            "load_ruleset",
+            None,
+        ),
+        (
+            "a record without a baseline",
+            || {
+                StateFile::Present(lockdown_state::LockdownPfState {
+                    main_snapshot_captured: false,
+                    ..standing_state()
+                })
+            },
+            "reload_default",
+            None,
+        ),
+        ("no record", || StateFile::Absent, "reload_default", None),
+        (
+            "an unusable record",
+            || StateFile::Unusable { pf_token: None },
+            "reload_default",
+            Some("lockdown-pf-state file is unusable; no snapshot to restore"),
+        ),
+        (
+            "an unreadable record",
+            || StateFile::Unreadable,
+            "reload_default",
+            Some("lockdown-pf-state file could not be read; no snapshot to restore"),
+        ),
+    ];
+
+    for (record, make, first_call, warning) in cases {
+        let callers: [Caller; 2] = [
+            ("release_all", |standing, ops| {
+                let _ = release_all_with(StateFile::Absent, standing, ops);
+            }),
+            ("disengage_lockdown", |standing, ops| {
+                let _ = disengage_lockdown_with(CoverPresence::Live, standing, ops);
+            }),
+        ];
+        for (caller, run) in callers {
+            // `release_all` does nothing for a cover that has no record.
+            if caller == "release_all" && make() == StateFile::Absent {
+                continue;
+            }
+            let writer = garter::test_utils::WaitableWriter::new();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            );
+            let mut ops = RecordingPfOps::default();
+            {
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+                run(make(), &mut ops);
+            }
+
+            assert_eq!(ops.log.first().copied(), Some(first_call), "{caller} over {record}");
+            let log = writer.snapshot();
+            for text in [
+                "lockdown-pf-state file is unusable; no snapshot to restore",
+                "lockdown-pf-state file could not be read; no snapshot to restore",
+            ] {
+                assert_eq!(
+                    log.contains(text),
+                    warning == Some(text),
+                    "{caller} over {record}: {text:?} in {log}"
+                );
+            }
+        }
+    }
+}
