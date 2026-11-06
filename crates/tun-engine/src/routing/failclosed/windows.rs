@@ -152,8 +152,9 @@
 //!   on any boot where no object is live the key answers empty whether or not
 //!   a record survives behind it — on a host that armed the switch years ago
 //!   and on one that never armed it. That asymmetry is the whole reason
-//!   [`release_all`] AND [`disengage_lockdown`] both return a [`Clearance`]
-//!   rather than a bare `Ok`: the ordinary uninstall sees exactly that answer.
+//!   [`release_all`] AND [`disengage_lockdown`] both carry a [`Clearance`] in
+//!   their [`SweepOutcome`] (the facade's `Ok` holds it) rather than a bare
+//!   `Ok`: the ordinary uninstall sees exactly that answer.
 //! - **That a record could exist on this host AT ALL** — the twins'
 //!   `Persistent` sibling, the other half of the same rule
 //!   ([`KeyRole::BootTimeSibling`]). BFE re-adds it from its own store at every
@@ -2209,16 +2210,19 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
 
 /// Fail-loud disengage for the `bridge unlock` escape hatch. Deletes all
 /// lockdown + App-ID filters by their fixed GUIDs (idempotent — a "not found"
-/// delete is a no-op, so a clean host returns `Ok`). The failure that means
-/// "cannot disengage" is the ENGINE OPEN: the Base Filtering Engine could not
-/// be reached, so nothing could have been issued → `Err`. That is NOT "not
-/// elevated" — FWPM opens without elevation (`release_all`'s doc records the
-/// same measurement); a failed open means BFE is not running or RPC failed.
-/// There is no persisted Windows state to key absence on (delete-by-GUID is
-/// idempotent), so a successful open always reports `Ok`.
+/// delete is a no-op, so a clean host reports no failure). The failure that
+/// means "cannot disengage" is the ENGINE OPEN: the Base Filtering Engine could
+/// not be reached, so nothing could have been issued → the outcome carries the
+/// failure. That is NOT "not elevated" — FWPM opens without elevation
+/// (`release_all`'s doc records the same measurement); a failed open means BFE
+/// is not running or RPC failed. There is no persisted Windows state to key
+/// absence on (delete-by-GUID is idempotent), so a successful open always
+/// reports no failure.
 ///
-/// Its `Ok` is a [`Clearance`], not a bare unit, for the same reason
-/// [`release_all`]'s is: a `FWPM_FILTER_FLAG_BOOTTIME` key answers
+/// Returns a [`SweepOutcome`], not the facade's `Result`: the facade
+/// (`failclosed::disengage_lockdown`) turns it into `Ok(Clearance)` or `Err`.
+/// The [`Clearance`] is not a bare unit, for the same reason [`release_all`]'s
+/// is: a `FWPM_FILTER_FLAG_BOOTTIME` key answers
 /// `FWP_E_FILTER_NOT_FOUND` on any boot where its runtime object is not live,
 /// so turning the kill switch off in a boot where the bridge never engaged
 /// deletes nothing it can see and learns nothing about what may sit behind
@@ -2241,10 +2245,10 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
 /// The caller surfaces it, and `Clearance::leftover_keys` is what decides
 /// whether an operator hears about it at all.
 ///
-/// What it IS gated on is every delete's return code. `Ok` here means the host
-/// is genuinely open: `hole bridge unlock` flips the persisted intent off only
-/// on this function's success (`cutover::unlock_with`), so an `Ok` returned
-/// over deletes that were refused — the unelevated run, which reaches the
+/// What it IS gated on is every delete's return code. A no-failure outcome here
+/// means the host is genuinely open: `hole bridge unlock` flips the persisted
+/// intent off only on the facade's `Ok` (`cutover::unlock_with`), so an `Ok`
+/// returned over deletes that were refused — the unelevated run, which reaches the
 /// engine open but not the write — would leave the kill switch engaged while
 /// the intent reads "off", with nothing left to reconcile it. The macOS arm
 /// has always propagated its `pfctl` failures; this is the same rule.

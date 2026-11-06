@@ -1129,7 +1129,7 @@ fn lockdown_presence_and_state(
 /// `sweep_with_witness`, so a confirmed release outdates the kind's stamps like every other sweep. Not the facade's
 /// cfg-dispatched sweep: a `pf_on_any_host` build must reach this module's `pfctl`, not another host's.
 fn lockdown_disengage(lock: &CoverLock) {
-    if let Err(e) = super::sweep_with_witness(lock, None, |witness| disengage_lockdown(lock, witness)) {
+    if let Err(e) = super::sweep_with_witness(lock, |witness| disengage_lockdown(lock, witness)) {
         tracing::warn!(
             error = &e as &dyn std::error::Error,
             "lockdown disengage failed during Drop or an engage's back-out"

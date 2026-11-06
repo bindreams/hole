@@ -62,7 +62,7 @@ fn sweep(state_dir: &Path, observations: &[KeyObservation]) -> Clearance {
 
 /// [`sweep`] under a lock the caller already holds.
 fn sweep_under(lock: &CoverLock, observations: &[KeyObservation]) -> Clearance {
-    super::super::sweep_with_witness(lock, None, |witness| {
+    super::super::sweep_with_witness(lock, |witness| {
         SweepOutcome::per_kind(Clearance::from_observations(observations, witness), [])
     })
     .expect("the sweep body cannot fail")
@@ -75,7 +75,7 @@ fn sweep_with_lock(
     body: impl FnOnce(&CoverLock, ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
     let lock = CoverLock::acquire(state_dir);
-    super::super::sweep_with_witness(&lock, None, |witness| body(&lock, witness))
+    super::super::sweep_with_witness(&lock, |witness| body(&lock, witness))
 }
 
 /// Arm `state_dir`'s record under its own lock, as an engage's commit does.

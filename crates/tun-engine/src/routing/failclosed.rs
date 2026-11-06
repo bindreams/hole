@@ -405,7 +405,7 @@ pub fn reclaim_stale_tun_permit(lock: &CoverLock, tun_name: &str) {
 /// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
 /// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
 pub fn disengage_lockdown(lock: &CoverLock) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(lock, None, |witness| platform::disengage_lockdown(lock, witness))
+    sweep_with_witness(lock, |witness| platform::disengage_lockdown(lock, witness))
 }
 
 /// Ask the OS whether a standing lockdown cover from a prior run is present,
@@ -488,7 +488,7 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or
 /// version-skewed and nothing to erase — only GUID sweeps run there.
 pub fn release_all(lock: &CoverLock) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(lock, None, |witness| platform::release_all(lock, witness))
+    sweep_with_witness(lock, |witness| platform::release_all(lock, witness))
 }
 
 // Release clearance ===================================================================================================
@@ -1033,11 +1033,6 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 /// [`Clearance`] safe — `recover_lockdown`'s `Sweep` arm, `SystemRouting::
 /// release_all_covers`, and the reconciler's `CoverStep::Release` through it.
 ///
-/// macOS's best-effort `lockdown_disengage` (the standing guard's `Drop` and
-/// the engage's back-out) also logs the `Err` and drops the `Ok`. It has no
-/// `PERSISTENT` sibling and no boot-time key, so there is nothing to persist
-/// and the discard is safe.
-///
 /// Not every DELETE does. The Windows guard's `Drop` (`platform::Cover`'s
 /// `Lockdown` arm) removes the same key list with no `state_dir` to write to,
 /// so it can neither arm nor retract; the residual that leaves is disclosed in
@@ -1046,6 +1041,11 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 /// `Ok` those sites drop, and before the `Err` a failing sweep hands its
 /// caller — so dropping the value costs an operator message on that one call
 /// and nothing beyond it.
+///
+/// macOS's best-effort `lockdown_disengage` (the standing guard's `Drop` and
+/// the engage's back-out) also logs the `Err` and drops the `Ok`. It has no
+/// `PERSISTENT` sibling and no boot-time key, so there is nothing to persist
+/// and the discard is safe.
 ///
 /// Generic over the sweep so the SEQUENCE this exists for — a sweep that
 /// removes the sibling, followed by one that can no longer see it — is
@@ -1057,7 +1057,6 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 /// that throws them away.
 fn sweep_with_witness(
     lock: &CoverLock,
-    owner: Option<(u32, u32)>,
     sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
     let state_dir = lock.state_dir();
@@ -1071,7 +1070,7 @@ fn sweep_with_witness(
     // codebase's own sweeps issue every delete before inspecting any code, so
     // `Err` arrives after the sibling's delete already succeeded — see
     // [`SweepOutcome`].
-    boottime_witness::apply(lock, clearance.witness_update(), owner);
+    boottime_witness::apply(lock, clearance.witness_update(), None);
     // A kind the sweep released took what its held guards hold, whatever the other kind did. A kind it did not
     // keeps its stamps, so a guard's drop still retries what the sweep could not delete.
     for kind in &released {

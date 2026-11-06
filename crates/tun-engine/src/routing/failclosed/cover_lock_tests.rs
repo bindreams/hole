@@ -346,7 +346,7 @@ fn a_sweep_holds_the_lock_while_it_runs() {
     // panic, so nothing inside a sweep can re-enter.
     let d = dir();
     let lock = CoverLock::acquire(d.path());
-    let reentered = sweep_with_witness(&lock, None, |_| {
+    let reentered = sweep_with_witness(&lock, |_| {
         let attempt = catch_unwind(AssertUnwindSafe(|| {
             CoverLock::acquire(d.path()).state_dir().to_path_buf()
         }));
@@ -361,7 +361,7 @@ fn a_sweep_that_completes_makes_an_earlier_stamp_stale() {
     let d = dir();
     let lock = CoverLock::acquire(d.path());
     let stamp = lock.stamp_install(CoverKind::Lockdown);
-    let _clearance = sweep_with_witness(&lock, None, |_| {
+    let _clearance = sweep_with_witness(&lock, |_| {
         SweepOutcome::per_kind(Clearance::proven(), [(CoverKind::Lockdown, None)])
     })
     .unwrap();
@@ -374,7 +374,7 @@ fn a_sweep_with_nothing_to_delete_makes_an_earlier_stamp_stale() {
     let d = dir();
     let lock = CoverLock::acquire(d.path());
     let stamp = lock.stamp_install(CoverKind::Transient);
-    let result = sweep_with_witness(&lock, None, |_| {
+    let result = sweep_with_witness(&lock, |_| {
         SweepOutcome::per_kind(Clearance::proven(), [(CoverKind::Transient, None)])
     });
     assert!(result.is_ok());
@@ -389,7 +389,7 @@ fn stamps_after_a_failed_sweep(outcome: impl FnOnce() -> SweepOutcome) -> (bool,
     let lock = CoverLock::acquire(d.path());
     let transient = lock.stamp_install(CoverKind::Transient);
     let lockdown = lock.stamp_install(CoverKind::Lockdown);
-    let result = sweep_with_witness(&lock, None, |_| outcome());
+    let result = sweep_with_witness(&lock, |_| outcome());
     assert!(result.is_err());
     (transient.is_current(), lockdown.is_current())
 }
@@ -448,7 +448,7 @@ fn a_failing_sweep_releases_the_lock() {
     let d = dir();
     {
         let lock = CoverLock::acquire(d.path());
-        let result = sweep_with_witness(&lock, None, |_| {
+        let result = sweep_with_witness(&lock, |_| {
             SweepOutcome::failed(Clearance::proven(), RoutingError::RouteSetup("the sweep failed".into()))
         });
         assert!(result.is_err());
