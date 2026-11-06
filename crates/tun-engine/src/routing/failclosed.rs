@@ -1029,16 +1029,18 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 /// it before the fold, then update it from what the sweep itself observed.
 ///
 /// Every SWEEP that can remove a standing cover's `PERSISTENT` sibling goes
-/// through here, which is what makes the three sites that DISCARD the returned
+/// through here, which is what makes the sites that DISCARD the returned
 /// [`Clearance`] safe — `recover_lockdown`'s `Sweep` arm, `SystemRouting::
-/// release_all_covers`, and the reconciler's `CoverStep::Release` through it.
+/// release_all_covers`, the reconciler's `CoverStep::Release` through it, and
+/// macOS's best-effort `lockdown_disengage` (the standing guard's `Drop` and
+/// the engage's back-out), which logs the `Err` and drops the `Ok`.
 ///
 /// Not every DELETE does. The Windows guard's `Drop` (`platform::Cover`'s
 /// `Lockdown` arm) removes the same key list with no `state_dir` to write to,
 /// so it can neither arm nor retract; the residual that leaves is disclosed in
 /// [`boottime_witness`]'s module doc, and it is an over-report.
 /// The evidence is persisted before anything is returned AT ALL — before the
-/// `Ok` those three drop, and before the `Err` a failing sweep hands its
+/// `Ok` those sites drop, and before the `Err` a failing sweep hands its
 /// caller — so dropping the value costs an operator message on that one call
 /// and nothing beyond it.
 ///
