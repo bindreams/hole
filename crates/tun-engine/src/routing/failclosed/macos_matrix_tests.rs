@@ -16,10 +16,12 @@
 //!
 //! - a token pf holds is dropped at most once, and one it never held is asked for at most once;
 //! - every record names a token pf held, and every token pf holds is named by a record, but for the anonymous one an
-//!   unusable file never named and the ones whose drop failed (an escape clears its record whatever the drop did, an
+//!   unusable file never named and the ones whose drop failed (a release clears its record whatever the drop did, an
 //!   engage's displaced-token drop is best-effort; both are warned);
 //! - a blocked host has a record to recover it from;
-//! - a release or disengage leaves no readable record behind, and returns `Ok` only over none at all.
+//! - a release or disengage leaves no readable record behind, and returns `Ok` only over none at all;
+//! - a failed drop is never a release's error: a release or disengage returns `Err` only over a record it could not
+//!   read.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -108,7 +110,7 @@ impl EngageOps for Host<'_> {
     }
 
     fn transient_restore(&mut self, token: &str) {
-        disengage_with(Some(token), false, self);
+        disengage_with(Ok(Some(token)), false, self);
     }
 }
 
@@ -280,6 +282,12 @@ fn violations_of(
             .collect();
         if !left.is_empty() {
             found.push(format!("{party:?} returned {result:?} and left {left:?}"));
+        }
+        let unread = covered
+            .iter()
+            .any(|file| dir.join(file).exists() && !dir.join(file).is_file());
+        if result.is_err() && !covered.is_empty() && !unread {
+            found.push(format!("{party:?} returned {result:?} with every record readable"));
         }
     }
 

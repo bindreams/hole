@@ -449,6 +449,18 @@ fn a_record_names_a_token_in_every_state_it_can_be_in() {
     assert_eq!(unreadable().pf_token(), None);
 }
 
+/// The one decision every release path reads: a token to drop (or none to drop), or the refusal for a record that could
+/// not be read. An unread record never answers a token, `None` included.
+#[skuld::test]
+fn a_release_acts_by_the_token_a_record_names_and_is_refused_by_one_it_cannot_read() {
+    assert_eq!(present("1").release_token().unwrap(), Some("1"));
+    assert_eq!(unusable(Some("2")).release_token().unwrap(), Some("2"));
+    assert_eq!(unusable(None).release_token().unwrap(), None);
+    assert_eq!(absent().release_token().unwrap(), None);
+    let refusal = unreadable().release_token().unwrap_err();
+    assert_eq!(refusal.to_string(), Cleared::Kept.refusal().unwrap().to_string());
+}
+
 #[skuld::test]
 fn naming_matches_any_record_with_the_token_and_an_unusable_one_with_none_but_never_an_unread_one() {
     assert!(names(&present("1"), Some("1")));
