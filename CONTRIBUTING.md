@@ -2935,7 +2935,9 @@ Disclosed residuals:
    release falls back to the default ruleset) and, when no token can be read
    out of it, leaks a pf enable refcount until reboot. One that cannot be read
    at all is left in place, and the release answers an error after its
-   restore.
+   restore. Every later release answers that error until the file reads
+   again, and the pf enable refcount stays held meanwhile; once the restore
+   held, a held refcount blocks nothing.
 
 1. An unreadable `bridge-lockdown.json` is read through two named folds of
    `lockdown_state::Intent`, not one bool, because the consumers want
@@ -3162,7 +3164,8 @@ Every mutation of a fail-closed cover inside the bridge process runs under one l
 - **What it excludes.** An engage, a guard's release or drop, a sweep (`release_all`, `disengage_lockdown`,
   `recover_cover`) and crash recovery. A decision that reads cover state (the kill-switch intent, the target, the
   measured presence) is made from a fresh read taken inside the section that acts on it, so nothing changes between the
-  read and the act. The engage, release and sweep functions and the writers of the records such a decision reads
+  read and the act. The engage, release and sweep functions, the Windows TUN-permit reclaim
+  (`reclaim_stale_tun_permit`) and the writers of the records such a decision reads
   (`lockdown_state::{set_enabled, promote_unrecorded}`, the boot-time witness's arming write) take `&CoverLock`, so a
   call without the lock does not compile. The pf records' `swap` and `clear_if_token` take a directory and are called
   only from those functions.

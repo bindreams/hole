@@ -4,7 +4,8 @@
 //!   `pfctl -E`) and loads a self-contained ruleset (see `build_pf_ruleset`,
 //!   via `pfctl -f -`, NO `-Fa`) blocking everything but loopback, the
 //!   server, and the pinned resolver. Disengage restores the canonical
-//!   `/etc/pf.conf`, clears the record and drops the refcount. Dropping `-Fa` is load-bearing:
+//!   `/etc/pf.conf`, clears the record and drops the refcount once that clear took the record (Release order,
+//!   below). Dropping `-Fa` is load-bearing:
 //!   `-Fa` flushes ALL pf state as its own, separately committed kernel
 //!   operation, so `-Fa -f -` was two transactions with a
 //!   pass-all host briefly live between them — including across a cover
@@ -45,7 +46,7 @@
 //!   self-contained MAIN ruleset (NO `-Fa`) that carries the host's translation
 //!   rules forward and blocks all egress except the TUN and server IP. Disengage
 //!   restores the host's pre-lockdown filter+nat from the persisted snapshot,
-//!   clears the record and drops the refcount. A record with no captured baseline
+//!   clears the record and drops the refcount once that clear took the record. A record with no captured baseline
 //!   reloads `/etc/pf.conf` instead, and so does a snapshot that will not load
 //!   ([`restore_standing`]). Engage
 //!   idempotently ENSURES pf is enabled (pf is disabled — and its refcount reset
@@ -1247,7 +1248,7 @@ fn release(
 /// goes through it: `release_all`, and `disengage_lockdown_with` for all its callers (the standing guard's `Drop`,
 /// the back-out of a failed engage, the startup sweep when the intent is off, and `bridge unlock`).
 ///
-/// [`StateFile::captured_snapshot`] chooses: only a record with a captured baseline has a snapshot to load, and every
+/// [`StateFile::restore_choice`] chooses: only a record with a captured baseline has a snapshot to load, and every
 /// other record reloads `/etc/pf.conf` (loading an empty snapshot would leave a pass-all host; see
 /// `LockdownPfState::main_snapshot_captured`). A snapshot that will not load falls back to `/etc/pf.conf` rather than
 /// leave the host blocked; when that fails too, the fallback's error is the answer (the last restore that ran) and
@@ -1256,7 +1257,7 @@ fn restore_standing(
     standing: &StateFile<lockdown_state::LockdownPfState>,
     ops: &mut dyn PfOps,
 ) -> Result<(), RoutingError> {
-    let Some(st) = standing.captured_snapshot() else {
+    let Some(st) = standing.restore_choice() else {
         return ops.reload_default();
     };
     let snapshot_err = match ops.load_ruleset(&build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot)) {

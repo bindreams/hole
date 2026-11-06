@@ -214,7 +214,9 @@ before editing; the sections linked below are the authoritative source.
   escape (`Routing::release_all_covers`) is unconditional, has a
   structurally-guarded set of sanctioned callers, and clears the in-process
   adopted-cover claim only on a confirmed release, never on a guard's silent
-  `Drop`. →
+  `Drop`. Every cover engage, release and sweep runs under one lock per state
+  dir (`CoverLock`, taken as `&CoverLock`;
+  [the cover lock](CONTRIBUTING.md#the-cover-lock)). →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
 - **Server-address redaction.** The configured address — hostname, resolved IP,
   every textual form — is replaced by a `<server:XXXXXXXX>` token before it

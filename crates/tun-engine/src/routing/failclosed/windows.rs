@@ -2056,7 +2056,7 @@ pub(crate) fn should_reclaim_tun_permit(resolved: bool) -> bool {
 /// as `Cover::drop`'s Lockdown arm and [`delete_all`]: a DACL-denied delete
 /// must not read as a successful reclaim.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &str) {
+pub fn reclaim_stale_tun_permit(_lock: &CoverLock, resolver: &dyn super::LuidResolver, tun_name: &str) {
     if !should_reclaim_tun_permit(resolver.resolve(tun_name).is_ok()) {
         // A live `hole-tun` exists — some bridge may be relying on this
         // permit. Never delete it out from under a running bridge.
