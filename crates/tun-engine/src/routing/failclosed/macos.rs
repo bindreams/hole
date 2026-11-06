@@ -577,7 +577,7 @@ pub(crate) trait EngageOps: CoverRulesetOps {
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError>;
     /// `pfctl -X <token>`: drop a pf enable refcount.
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
-    /// The transient cover's full restore, `disengage(token, .., false)`.
+    /// The transient cover's full restore, `disengage(token, state_dir)`.
     fn transient_restore(&mut self, token: &str);
 }
 
@@ -800,23 +800,15 @@ fn disengage(token: &str, state_dir: &Path) {
     disengage_with(Ok(Some(token)), false, &mut RealPfOps { state_dir });
 }
 
-/// Seam over the one mutation [`recover_cover`] performs, so its trichotomy
-/// over the persisted record is table-tested without shelling out to `pfctl`.
-pub(crate) trait RecoverOps {
-    /// [`disengage_with`]: restore the replacement ruleset, drop the token the record names, and clear the record on
-    /// a confirmed restore. `token` is [`StateFile::release_token`]'s answer.
-    fn restore(&mut self, token: Result<Option<&str>, RoutingError>, adopting: bool);
-}
-
 pub fn recover_cover(state_dir: &Path, adopting: bool) {
     recover_cover_with(
         pf_record::read::<state::FailClosedState>(state_dir),
         adopting,
-        &mut PfRecover(&mut RealPfOps { state_dir }),
+        &mut RealPfOps { state_dir },
     );
 }
 
-/// `recover_cover`'s trichotomy over [`StateFile`], with the mutation injected.
+/// `recover_cover`'s trichotomy over [`StateFile`], with the [`PfOps`] injected.
 ///
 /// Reads the record as a [`StateFile`], which keeps `Unusable` apart from `Absent`,
 /// and for a SWEEP those two are opposite facts. `Absent` is "no cover was ever engaged". `Unusable` is
@@ -826,7 +818,7 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// crashed covered run's `block out all` on the host with the automatic sweep
 /// declining to act, and only the manual `bridge unlock` left to escape — the
 /// same conflation `release_all_with` already refuses to make.
-fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, ops: &mut dyn RecoverOps) {
+fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, ops: &mut dyn PfOps) {
     match &file {
         StateFile::Absent => {
             tracing::debug!("no failclosed-state file, nothing to recover");
@@ -846,16 +838,7 @@ fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, o
              evidence there is no cover to clear"
         ),
     }
-    ops.restore(file.release_token(), adopting);
-}
-
-/// Production [`RecoverOps`]: [`disengage_with`] over a [`PfOps`].
-struct PfRecover<'a>(&'a mut dyn PfOps);
-
-impl RecoverOps for PfRecover<'_> {
-    fn restore(&mut self, token: Result<Option<&str>, RoutingError>, adopting: bool) {
-        disengage_with(token, adopting, self.0);
-    }
+    disengage_with(file.release_token(), adopting, ops);
 }
 
 // --- lockdown layer ---
@@ -1314,10 +1297,13 @@ fn release(
     };
     if restored.is_ok() || on_failed_restore.drops_the_token() {
         if let Some(Err(e)) = token.map(|token| ops.drop_token(token)) {
+            let cost = match restored {
+                Ok(()) => "with the host's rules restored it blocks nothing",
+                Err(_) => "the host's rules are not restored, so the block stays loaded",
+            };
             tracing::warn!(
                 error = &e as &dyn std::error::Error,
-                "pfctl -X failed releasing the {} pf refcount; pf keeps it until a reboot resets it, and with the host's rules \
-                 restored it blocks nothing",
+                "pfctl -X failed releasing the {} pf refcount; pf keeps it until a reboot resets it, and {cost}",
                 what(kind)
             );
         }
@@ -1339,6 +1325,28 @@ pub(crate) fn release_all_with(
     standing: StateFile<lockdown_state::LockdownPfState>,
     ops: &mut dyn PfOps,
 ) -> SweepOutcome {
+    // Each cover's release after its restore: the escapes drop the token whatever the restore did.
+    let release_transient = |ops: &mut dyn PfOps, restored| {
+        release(
+            ops,
+            CoverKind::Transient,
+            transient.release_token(),
+            restored,
+            OnFailedRestore::DropToken,
+        )
+        .err()
+    };
+    let release_standing = |ops: &mut dyn PfOps, restored| {
+        release(
+            ops,
+            CoverKind::Lockdown,
+            standing.release_token(),
+            restored,
+            OnFailedRestore::DropToken,
+        )
+        .err()
+    };
+
     // Block 1 — transient cover. A reload failure is recorded but does NOT
     // stop block 2: the standing cover is the one that blocks indefinitely
     // and must be attempted regardless.
@@ -1346,25 +1354,11 @@ pub(crate) fn release_all_with(
         StateFile::Absent => None,
         StateFile::Present(_) => {
             let restored = ops.reload_default();
-            release(
-                ops,
-                CoverKind::Transient,
-                transient.release_token(),
-                restored,
-                OnFailedRestore::DropToken,
-            )
-            .err()
+            release_transient(ops, restored)
         }
         StateFile::Unusable { .. } => {
             let restored = ops.reload_default();
-            release(
-                ops,
-                CoverKind::Transient,
-                transient.release_token(),
-                restored,
-                OnFailedRestore::DropToken,
-            )
-            .err()
+            release_transient(ops, restored)
         }
         StateFile::Unreadable => {
             tracing::warn!(
@@ -1372,14 +1366,7 @@ pub(crate) fn release_all_with(
                  an unreadable record is not evidence there is no cover to clear"
             );
             let restored = ops.reload_default();
-            release(
-                ops,
-                CoverKind::Transient,
-                transient.release_token(),
-                restored,
-                OnFailedRestore::DropToken,
-            )
-            .err()
+            release_transient(ops, restored)
         }
     };
 
@@ -1391,14 +1378,7 @@ pub(crate) fn release_all_with(
             // `LockdownPfState::main_snapshot_captured`. Loading the empty one
             // would leave a pass-all host.
             let restored = ops.reload_default();
-            release(
-                ops,
-                CoverKind::Lockdown,
-                standing.release_token(),
-                restored,
-                OnFailedRestore::DropToken,
-            )
-            .err()
+            release_standing(ops, restored)
         }
         StateFile::Present(st) => {
             let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
@@ -1419,14 +1399,7 @@ pub(crate) fn release_all_with(
                     ))),
                 },
             };
-            release(
-                ops,
-                CoverKind::Lockdown,
-                standing.release_token(),
-                restored,
-                OnFailedRestore::DropToken,
-            )
-            .err()
+            release_standing(ops, restored)
         }
         StateFile::Unusable { .. } => {
             tracing::warn!(
@@ -1434,14 +1407,7 @@ pub(crate) fn release_all_with(
                  the default ruleset"
             );
             let restored = ops.reload_default();
-            release(
-                ops,
-                CoverKind::Lockdown,
-                standing.release_token(),
-                restored,
-                OnFailedRestore::DropToken,
-            )
-            .err()
+            release_standing(ops, restored)
         }
         StateFile::Unreadable => {
             tracing::warn!(
@@ -1449,14 +1415,7 @@ pub(crate) fn release_all_with(
                  the default ruleset"
             );
             let restored = ops.reload_default();
-            release(
-                ops,
-                CoverKind::Lockdown,
-                standing.release_token(),
-                restored,
-                OnFailedRestore::DropToken,
-            )
-            .err()
+            release_standing(ops, restored)
         }
     };
 
@@ -1601,12 +1560,12 @@ impl PfOps for RealPfOps<'_> {
 
     fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         pf_record::clear_if_token::<state::FailClosedState>(self.state_dir, token)
-            .map_err(|e| RoutingError::RouteSetup(format!("failclosed-state clear failed: {e}")))
+            .map_err(|e| RoutingError::state_write_failed("failclosed-state", &e))
     }
 
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         pf_record::clear_if_token::<lockdown_state::LockdownPfState>(self.state_dir, token)
-            .map_err(|e| RoutingError::RouteSetup(format!("lockdown-pf-state clear failed: {e}")))
+            .map_err(|e| RoutingError::state_write_failed("lockdown-pf-state", &e))
     }
 }
 

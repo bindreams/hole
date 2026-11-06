@@ -775,23 +775,6 @@ fn output_with_status(code: i32) -> Result<std::process::Output, RoutingError> {
 
 // recover_cover_with ==================================================================================================
 
-/// [`RecoverOps`] test double: records the token each `restore` was handed
-/// (`None` = "no token on record"), so what the sweep DOES is assertable, not
-/// merely that it did something.
-#[derive(Default)]
-struct RecordingRecoverOps {
-    restores: Vec<(Result<Option<String>, String>, bool)>,
-}
-
-impl RecoverOps for RecordingRecoverOps {
-    fn restore(&mut self, token: Result<Option<&str>, RoutingError>, adopting: bool) {
-        self.restores.push((
-            token.map(|token| token.map(str::to_owned)).map_err(|e| e.to_string()),
-            adopting,
-        ));
-    }
-}
-
 /// A recorded transient cover holding `token`.
 fn recorded_cover(token: &str) -> state::FailClosedState {
     state::FailClosedState {
@@ -802,20 +785,31 @@ fn recorded_cover(token: &str) -> state::FailClosedState {
 
 #[skuld::test]
 fn recover_cover_with_no_state_file_does_nothing() {
-    let mut ops = RecordingRecoverOps::default();
+    let mut ops = RecordingPfOps::default();
     recover_cover_with(StateFile::Absent, false, &mut ops);
     assert!(
-        ops.restores.is_empty(),
+        ops.log.is_empty(),
         "an absent file means no cover was ever engaged; a sweep must spawn nothing: {:?}",
-        ops.restores
+        ops.log
     );
 }
 
+/// A cover being adopted is the standing one's, so the sweep must not reload `/etc/pf.conf` over its ruleset; the
+/// transient token is dropped all the same.
 #[skuld::test]
-fn recover_cover_with_a_recorded_cover_restores_and_drops_its_token() {
-    let mut ops = RecordingRecoverOps::default();
+fn recover_cover_with_a_recorded_cover_drops_its_token_and_skips_the_reload_when_adopting() {
+    let mut ops = RecordingPfOps::default();
     recover_cover_with(StateFile::Present(recorded_cover("42")), true, &mut ops);
-    assert_eq!(ops.restores, vec![(Ok(Some("42".to_owned())), true)]);
+    assert_eq!(ops.log, vec!["drop_token", "clear_transient"]);
+    assert_eq!(ops.dropped, vec!["42".to_owned()]);
+}
+
+#[skuld::test]
+fn recover_cover_with_a_recorded_cover_restores_then_drops_its_token() {
+    let mut ops = RecordingPfOps::default();
+    recover_cover_with(StateFile::Present(recorded_cover("42")), false, &mut ops);
+    assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
+    assert_eq!(ops.dropped, vec!["42".to_owned()]);
 }
 
 /// An UNREADABLE record is a cover to clear, not an absence.
@@ -828,14 +822,14 @@ fn recover_cover_with_a_recorded_cover_restores_and_drops_its_token() {
 /// still holds the host. Only the manual `bridge unlock` would escape it.
 #[skuld::test]
 fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
-    let mut ops = RecordingRecoverOps::default();
+    let mut ops = RecordingPfOps::default();
     recover_cover_with(unusable(), false, &mut ops);
     assert_eq!(
-        ops.restores,
-        vec![(Ok(None), false)],
-        "an unreadable failclosed-state file must still drive a restore — with no token to drop, \
-         but never as a no-op"
+        ops.log,
+        vec!["reload_default", "clear_transient"],
+        "an unusable record naming no token must still drive a restore, never a no-op"
     );
+    assert!(ops.dropped.is_empty(), "no token to drop: {:?}", ops.dropped);
 }
 
 /// An unusable record that STILL HOLDS a readable `pf_token` must hand it to
@@ -849,7 +843,7 @@ fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
 /// pf stays enabled until reboot with nothing left to release it.
 #[skuld::test]
 fn recover_cover_with_an_unusable_record_still_drops_the_token_it_could_read() {
-    let mut ops = RecordingRecoverOps::default();
+    let mut ops = RecordingPfOps::default();
     recover_cover_with(
         StateFile::Unusable {
             pf_token: Some("7".into()),
@@ -858,11 +852,11 @@ fn recover_cover_with_an_unusable_record_still_drops_the_token_it_could_read() {
         &mut ops,
     );
     assert_eq!(
-        ops.restores,
-        vec![(Ok(Some("7".to_owned())), false)],
-        "a token salvaged from an unusable record is the only one there is — the restore must be \
-         handed it, or the pf enable refcount leaks permanently"
+        ops.dropped,
+        vec!["7".to_owned()],
+        "a salvaged token is the only one there is: the sweep must drop it or the refcount leaks"
     );
+    assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
 }
 
 /// [`StateFile::unusable`]'s two answers, driven from bytes.
@@ -908,14 +902,14 @@ fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
          assertion below is exercising some other path: {newer} -> {file:?}"
     );
 
-    let mut ops = RecordingRecoverOps::default();
+    let mut ops = RecordingPfOps::default();
     recover_cover_with(file, false, &mut ops);
     assert_eq!(
-        ops.restores,
-        vec![(Ok(Some("7".to_owned())), false)],
-        "a record this binary cannot read must still drive a restore — AND with the `pf_token` \
-         that record plainly still contains, which is the only copy of the pf enable ticket left"
+        ops.dropped,
+        vec!["7".to_owned()],
+        "the token the newer record still holds"
     );
+    assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
 }
 
 // engage_with =========================================================================================================
