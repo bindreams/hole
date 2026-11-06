@@ -1878,10 +1878,12 @@ observation set and the record keeps what it held.
 Disclosed residuals. **A host whose twins went without a sweep watching keeps
 reporting**: the record stays `Armed`, the sibling is gone, and every later
 `bridge release-covers` on that `state_dir` names the two twin keys for the life
-of the dir. The cause is outside Hole: an external FWPM delete, a firewall reset,
-an image restore. It is the case `record_armed`-at-engage exists for, since no
-sweep ever held the evidence to copy. Every Hole path that removes the twins,
-the Windows guard's `Drop` included, runs through `sweep_with_witness`. An
+of the dir. The cause outside Hole is an external FWPM delete, a firewall reset,
+an image restore: the case `record_armed`-at-engage exists for, since no sweep
+ever held the evidence to copy. Two Hole-side causes leave the same state and are
+described below: a witness write that fails, and a peer dir's `Armed` that a
+SYSTEM sweep of its own dir does not retract. Every Hole path that removes the
+twins, the Windows guard's `Drop` included, runs through `sweep_with_witness`. An
 over-report costs an operator a paragraph, where the silence it replaces costs
 #1003's unrecoverable host, and it is bounded to hosts that ever armed a twin;
 one that never did has no record and no live sibling and stays silent. The record is
@@ -3166,7 +3168,9 @@ Every mutation of a fail-closed cover inside the bridge process runs under one l
   intent loads are some): a read outside the lock races a locked writer as the old or the new state, and a read that
   decides a write is taken again under the lock.
   The platform `release_all` and `disengage_lockdown` are called only through the facade's `sweep_with_witness`, on
-  every platform (the macOS guard's `Drop` and failed-engage back-out call the facade's `disengage_lockdown`). The
+  every platform: through the facade's `disengage_lockdown` and `release_all` (the Windows guard's `Drop` calls
+  `disengage_lockdown`), while the macOS guard's `Drop` and failed-engage back-out call `sweep_with_witness`
+  directly, so a `pf_on_any_host` build reaches macOS's `pfctl` rather than another host's sweep. The
   sweep calls `outdate_stamps` for every kind it confirmed released, and adds the boot-time witness where a platform
   arms boot-time keys (Windows, `STANDING_COVER_ARMS_BOOT_TIME`).
 - **Order.** `state.proxy` (X), then the cover lock, then the record files' own locks and the witness lock. A section

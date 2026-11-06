@@ -1991,7 +1991,7 @@ impl Cover {
             // the host, and Drop cannot return an error, so a failure is warned: silence there is
             // indistinguishable from a clean release.
             CoverKind::Lockdown => {
-                if let Err(e) = super::sweep_with_witness(lock, |witness| disengage_lockdown(lock, witness)) {
+                if let Err(e) = super::disengage_lockdown(lock) {
                     tracing::warn!(
                         error = &e as &dyn std::error::Error,
                         "lockdown cover release failed; egress may still be blocked"
