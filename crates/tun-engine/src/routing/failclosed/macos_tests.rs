@@ -1657,6 +1657,11 @@ fn release_all_keeps_the_transient_state_file_when_the_restore_fails() {
         "must not clear the state file over an unconfirmed restore: {:?}",
         ops.log
     );
+    assert!(
+        ops.dropped.is_empty() && !ops.log.contains(&"drop_token"),
+        "the record names the token, so it is kept with the record: {:?}",
+        ops.log
+    );
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
@@ -1670,6 +1675,11 @@ fn release_all_keeps_the_standing_state_file_when_restore_and_fallback_both_fail
     assert!(
         !ops.log.contains(&"clear_standing"),
         "must not clear the state file when both the snapshot restore and the fallback failed: {:?}",
+        ops.log
+    );
+    assert!(
+        ops.dropped.is_empty() && !ops.log.contains(&"drop_token"),
+        "the record names the token, so it is kept with the record: {:?}",
         ops.log
     );
     assert!(result.is_err());
