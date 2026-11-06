@@ -1475,7 +1475,8 @@ milliseconds.
   `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin
   (`pfctl -f -`, spawned as `SystemTool::Pfctl`, so by absolute path — see
   [System tools](#system-tools-absolute-paths)).
-  Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`);
+  Disengage restores `/etc/pf.conf`, clears the record and drops the refcount
+  (`pfctl -X <token>`);
   the token is persisted to `bridge-failclosed.json` *before* the blocking
   ruleset loads (persist-before-mutate), and a failed persist unwinds the `-E`
   before propagating, mirroring `engage_lockdown`'s `FreshEnable`/`Reenable`
@@ -2064,10 +2065,11 @@ examined), never reports success over a host it left closed, and never erases
 a cover's state file after a restore that did not confirm — a corrupt or
 version-skewed file is treated as a cover to clear, not as absence.
 
-A macOS restore that fails leaves the block, its record and its token in place, and both escapes return the
-restore's own error. The standing cover restores its captured snapshot; a snapshot that will not load falls back to
-`/etc/pf.conf`, so only a failing fallback as well (or a failing `/etc/pf.conf` reload with no snapshot to try) leaves
-the block, and the error is then the fallback's (the snapshot's is logged). The ways out: fix `/etc/pf.conf` and unblock
+A macOS restore that fails leaves the block, its record and its token in place, and the release returns the
+restore's own error. The transient cover's restore is one `/etc/pf.conf` reload with no fallback, so one failed reload
+leaves the block. The standing cover restores its captured snapshot; a record with no captured baseline reloads
+`/etc/pf.conf`, and a snapshot that will not load falls back to it, so only a failing `/etc/pf.conf` reload as well
+(or with no snapshot to try) leaves the block, and the error is then the reload's (the snapshot's is logged). The ways out: fix `/etc/pf.conf` and unblock
 again (the restore is retried); `sudo pfctl -d` turns pf off, and the record stays until a later restore succeeds; a
 reboot resets pf, and with the target already off nothing re-arms it.
 
@@ -2918,9 +2920,12 @@ Disclosed residuals:
    this window — it derives from the running session, not an OS probe of the
    cover.
 
-1. On macOS a state file that cannot be read costs the host its captured
-   pre-cover pf rules (the release falls back to the default ruleset) and
-   leaks a pf enable refcount until reboot.
+1. On macOS a state file that is unusable (corrupt, or at a version this
+   release does not read) costs the host its captured pre-cover pf rules (the
+   release falls back to the default ruleset) and, when no token can be read
+   out of it, leaks a pf enable refcount until reboot. One that cannot be read
+   at all is left in place, and the release answers an error after its
+   restore.
 
 1. An unreadable `bridge-lockdown.json` is read through two named folds of
    `lockdown_state::Intent`, not one bool, because the consumers want

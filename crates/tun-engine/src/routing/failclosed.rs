@@ -152,8 +152,8 @@ mod platform;
 mod pf_on_any_host;
 
 /// RAII guard for an engaged fail-closed cover. Dropping it disengages the
-/// cover (Windows: delete the WFP filters by GUID; macOS: restore
-/// `/etc/pf.conf` and drop the pf enable refcount). `Send` so the PR3 cutover
+/// cover (Windows: delete the WFP filters by GUID; macOS: restore the host's rules, clear the record and drop the pf
+/// enable refcount). `Send` so the PR3 cutover
 /// coordinator can hold it across `.await`.
 ///
 /// Opaque wrapper over the private `platform::Cover` (the platform module can't
@@ -478,7 +478,8 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    its token (pf may hand the value to another app): the clear comes first,
 ///    and the token is dropped only if it took the record. After an unconfirmed
 ///    restore the cover stays in force with its record and its refcount both
-///    held, and the restore's own error is returned as it is.
+///    held, and the restore's own error is returned as it is. A record that could not be read is also kept, after
+///    its restore: the answer is an error, never success.
 ///
 /// Windows keeps no cover state file at all: the filter set is compiled-in
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or

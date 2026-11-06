@@ -36,8 +36,8 @@ impl<T: PfRecord> StateFile<T> {
 
     /// What a release acts by: the token to drop and to clear the record under (`None`: nothing to drop), or, for a
     /// record that could not be read, the refusal. An unread record names no token, and a clear keyed to "no token"
-    /// would call a record that has since become readable not ours. Every release path reads this; none matches
-    /// `Unreadable` itself.
+    /// would call a record that has since become readable not ours. Every release reads its token and its refusal
+    /// here.
     pub fn release_token(&self) -> Result<Option<&str>, RoutingError> {
         match self {
             StateFile::Absent => Ok(None),
