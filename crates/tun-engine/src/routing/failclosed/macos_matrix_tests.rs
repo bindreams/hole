@@ -131,12 +131,12 @@ impl PfOps for Host<'_> {
 
     fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         pf_record::clear_if_token::<state::FailClosedState>(self.dir, token)
-            .map_err(|e| RoutingError::RouteSetup(format!("failclosed-state clear failed: {e}")))
+            .map_err(|e| RoutingError::state_write_failed("failclosed-state", &e))
     }
 
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         pf_record::clear_if_token::<lockdown_state::LockdownPfState>(self.dir, token)
-            .map_err(|e| RoutingError::RouteSetup(format!("lockdown-pf-state clear failed: {e}")))
+            .map_err(|e| RoutingError::state_write_failed("lockdown-pf-state", &e))
     }
 }
 

@@ -179,7 +179,7 @@ mod both {
         assert_eq!(read::<R>(tmp.path()), StateFile::Unreadable);
     }
 
-    /// A release whose `pfctl -X` failed leaves its record; the engage that then overwrites it must drop that token.
+    /// A release whose restore failed leaves its record; the engage that then overwrites it must drop that token.
     pub fn swap_says_which_token_it_displaced<R: Case>() {
         let cases: [(&str, Option<String>, Option<&str>); 5] = [
             ("no record", None, None),

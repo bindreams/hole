@@ -3,10 +3,10 @@
 //! Every writer holds the [`CoverLock`](super::CoverLock), and nothing outside the process writes these records while
 //! a bridge runs (`hole bridge unlock`, the uninstall and the cutover run under `BridgeLiveness`). So no function here
 //! compares what a caller read against what is on disk: there is no concurrent party for the compare to catch.
-//! What a record still guards is a failure a sequential order reaches. A release whose `pfctl -X` failed leaves a
-//! record, so a later engage that overwrites it must drop the token it names ([`swap`]). A clear by a party whose
-//! token a later engage displaced must not remove the newer record ([`clear_if_token`]). A record that cannot be read
-//! is neither absent nor removable ([`StateFile::Unreadable`], [`Cleared::Kept`]).
+//! What a record still guards is a failure a sequential order reaches. A release whose restore failed, or whose clear
+//! could not write, leaves a record, so a later engage that overwrites it must drop the token it names ([`swap`]). A
+//! clear by a party whose token a later engage displaced must not remove the newer record ([`clear_if_token`]). A
+//! record that cannot be read is neither absent nor removable ([`StateFile::Unreadable`], [`Cleared::Kept`]).
 
 use std::path::Path;
 
@@ -24,12 +24,7 @@ impl<T: PfRecord> StateFile<T> {
     /// The token the record names: a `Present` record's, or what an `Unusable` one could still be read for. `None`
     /// for `Absent`, `Unreadable` and a record that yielded no token.
     pub fn pf_token(&self) -> Option<&str> {
-        match self {
-            StateFile::Absent => None,
-            StateFile::Unreadable => None,
-            StateFile::Unusable { pf_token } => pf_token.as_deref(),
-            StateFile::Present(record) => Some(record.pf_token()),
-        }
+        self.release_token().ok().flatten()
     }
 
     /// What a release acts by: the token to drop and to clear the record under (`None`: nothing to drop), or, for a

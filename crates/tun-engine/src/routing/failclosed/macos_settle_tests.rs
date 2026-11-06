@@ -81,6 +81,43 @@ fn a_failed_restore_still_drops_the_token_and_keeps_the_record() {
     );
 }
 
+/// The warning for a token that will not drop says what that costs, and what it costs depends on the restore: with
+/// the host's rules restored the refcount blocks nothing, with a failed restore the block is still loaded.
+#[skuld::test]
+fn the_warning_for_a_token_that_will_not_drop_follows_whether_the_restore_held() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let warning = |restore_ok: bool| {
+        let writer = garter::test_utils::WaitableWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        {
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+            let mut ops = RecordingPfOps {
+                fail_reload_default: !restore_ok,
+                fail_drop_token: true,
+                ..Default::default()
+            };
+            let _ = release_all_with(StateFile::Present(transient_state()), StateFile::Absent, &mut ops);
+        }
+        writer.snapshot()
+    };
+
+    let held = warning(true);
+    assert!(held.contains("blocks nothing"), "{held}");
+    let failed = warning(false);
+    assert!(failed.contains("pfctl -X failed releasing"), "{failed}");
+    assert!(
+        !failed.contains("blocks nothing"),
+        "the block is still loaded: {failed}"
+    );
+    assert!(failed.contains("are not restored"), "{failed}");
+}
+
 /// The record is the release's last step. A write that fails after a restore that held leaves a record over a host
 /// that is open, so the answer is that cover's error, not a success.
 #[skuld::test]
@@ -107,6 +144,30 @@ fn a_clear_that_errors_after_a_good_restore_is_the_covers_error() {
             "{name}: the other cover is still attempted"
         );
     }
+}
+
+/// The clear's error reaches a toast, so it names the io kind and never a path.
+#[skuld::test]
+fn a_clear_that_cannot_write_tells_the_caller_its_kind_and_no_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
+    let kind = match pf_record::clear_if_token::<state::FailClosedState>(&state, Some("1")).unwrap_err() {
+        util::versioned_file::StoreError::Io(e) => e.kind(),
+        other => panic!("expected an I/O refusal, got {other:?}"),
+    };
+    let mut ops = RealPfOps { state_dir: &state };
+
+    let transient = ops.clear_transient(Some("1")).unwrap_err().to_string();
+    let standing = ops.clear_standing(Some("1")).unwrap_err().to_string();
+
+    assert_eq!(
+        transient,
+        format!("route setup failed: failclosed-state could not be written ({kind})")
+    );
+    assert_eq!(
+        standing,
+        format!("route setup failed: lockdown-pf-state could not be written ({kind})")
+    );
 }
 
 /// A record that could not be read is left in place, so the release did not finish: a false success is the one wrong
@@ -324,11 +385,7 @@ fn a_release_clears_its_record_by_its_restore_alone_and_drops_the_token_by_its_c
                 &mut disengage,
             );
             let mut recover = double();
-            recover_cover_with(
-                StateFile::Present(recorded_cover("111")),
-                false,
-                &mut PfRecover(&mut recover),
-            );
+            recover_cover_with(StateFile::Present(recorded_cover("111")), false, &mut recover);
             let mut guard = double();
             disengage_with(Ok(Some("111")), false, &mut guard);
 
@@ -359,8 +416,8 @@ fn a_release_clears_its_record_by_its_restore_alone_and_drops_the_token_by_its_c
 
 // engage_with: the token a record write displaced =====================================================================
 
-/// A release whose `pfctl -X` failed left its record; the engage that overwrites it took the only record that names
-/// the token.
+/// A release whose restore failed left its record; the engage that overwrites it took the only record that names the
+/// token.
 #[skuld::test]
 fn an_engage_drops_the_token_its_record_replaced() {
     let mut ops = RecordingEngageOps {
@@ -472,17 +529,21 @@ fn a_baseline_persisted_over_a_record_names_the_token_it_replaced() {
 
 #[skuld::test]
 fn a_record_that_could_not_be_read_still_drives_a_restore_of_the_host() {
-    let mut ops = RecordingRecoverOps::default();
+    let mut ops = RecordingPfOps::default();
 
     recover_cover_with(unreadable(), false, &mut ops);
 
-    assert_eq!(ops.restores.len(), 1);
-    assert!(
-        ops.restores[0].0.is_err(),
-        "an unread record names no token: {:?}",
-        ops.restores
+    assert_eq!(
+        ops.log,
+        vec!["reload_default"],
+        "restored; no token to drop, no record to clear"
     );
-    assert!(!ops.restores[0].1);
+    assert!(ops.dropped.is_empty(), "{:?}", ops.dropped);
+    assert!(
+        ops.cleared.is_empty(),
+        "an unread record is never cleared: {:?}",
+        ops.cleared
+    );
 }
 
 /// A record naming a token pf no longer holds (a reboot reset it) fails `pfctl -X` on every sweep. The sweep clears the
@@ -494,11 +555,7 @@ fn a_sweep_clears_a_transient_record_naming_a_token_pf_no_longer_holds() {
         ..Default::default()
     };
 
-    recover_cover_with(
-        StateFile::Present(recorded_cover("111")),
-        false,
-        &mut PfRecover(&mut ops),
-    );
+    recover_cover_with(StateFile::Present(recorded_cover("111")), false, &mut ops);
 
     assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
 }

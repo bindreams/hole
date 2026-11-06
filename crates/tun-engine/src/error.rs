@@ -45,7 +45,7 @@ impl RoutingError {
 
 #[cfg(any(target_os = "macos", test))]
 impl RoutingError {
-    /// A state file under `what` could not be written. The toast text names the
+    /// A state file under `what` could not be written or cleared. The toast text names the
     /// error's kind only (`tempfile`'s error text names the path); the full
     /// error goes to the log.
     pub(crate) fn state_write_failed(what: &str, e: &util::versioned_file::StoreError) -> Self {
@@ -54,7 +54,7 @@ impl RoutingError {
         let kind = match e {
             StoreError::Io(e) => e.kind(),
             StoreError::Encode(_) => std::io::ErrorKind::InvalidData,
-            // The pf records' role replaces what it cannot read, so no store of theirs is refused.
+            // The pf records' role replaces what it cannot read, so no store or removal of theirs is refused.
             StoreError::Unreadable { .. } | StoreError::ReadFailed { .. } => {
                 unreachable!("a pf record is never refused a store: {e}")
             }
