@@ -1243,18 +1243,24 @@ fn release(
     refused(cleared)
 }
 
-/// The standing cover's restore, shared by both escapes (`release_all`, `disengage_lockdown`): its captured snapshot,
-/// else `/etc/pf.conf`. No captured baseline (or no usable record: presence was established by pf's label alone)
-/// means there is no snapshot to restore from, so `/etc/pf.conf` IS the restore target (the empty snapshot would leave
-/// a pass-all host) — see `LockdownPfState::main_snapshot_captured`. A snapshot that will not load falls back to `/etc/pf.conf`; when that
-/// fails too, the fallback's error is the answer (the last restore that ran) and the snapshot's is logged.
+/// The standing cover's restore: its captured snapshot, else `/etc/pf.conf`. Every release of the standing cover
+/// goes through it: `release_all`, and `disengage_lockdown_with` for all its callers (the standing guard's `Drop`,
+/// the back-out of a failed engage, the startup sweep when the intent is off, and `bridge unlock`).
+///
+/// A record with no captured baseline (or none usable: presence was established by pf's label alone) has no snapshot,
+/// so `/etc/pf.conf` IS the restore target; loading the empty snapshot would leave a pass-all host (see
+/// `LockdownPfState::main_snapshot_captured`). A snapshot that will not load falls back to `/etc/pf.conf` rather than
+/// leave the host blocked; when that fails too, the fallback's error is the answer (the last restore that ran) and
+/// the snapshot's is logged.
 fn restore_standing(
     standing: &StateFile<lockdown_state::LockdownPfState>,
     ops: &mut dyn PfOps,
 ) -> Result<(), RoutingError> {
     let st = match standing {
         StateFile::Present(st) if st.main_snapshot_captured => st,
-        _ => return ops.reload_default(),
+        StateFile::Present(_) | StateFile::Absent | StateFile::Unusable { .. } | StateFile::Unreadable => {
+            return ops.reload_default();
+        }
     };
     let snapshot_err = match ops.load_ruleset(&build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot)) {
         Ok(()) => return Ok(()),
