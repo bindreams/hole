@@ -478,8 +478,7 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    its token (pf may hand the value to another app): the clear comes first,
 ///    and the token is dropped only if it took the record. After an unconfirmed
 ///    restore the cover stays in force with its record and its refcount both
-///    held, and the error tells the user how to get out: fix `/etc/pf.conf` and
-///    unblock again, or run `pfctl -d`.
+///    held, and the restore's own error is returned as it is.
 ///
 /// Windows keeps no cover state file at all: the filter set is compiled-in
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or
