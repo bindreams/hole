@@ -405,7 +405,7 @@ pub fn reclaim_stale_tun_permit(lock: &CoverLock, tun_name: &str) {
 /// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
 /// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
 pub fn disengage_lockdown(lock: &CoverLock) -> Result<Clearance, RoutingError> {
-    platform::disengage_lockdown_swept(lock)
+    sweep_with_witness(lock, None, |witness| platform::disengage_lockdown(lock, witness))
 }
 
 /// Ask the OS whether a standing lockdown cover from a prior run is present,
@@ -1031,10 +1031,12 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 /// Every SWEEP that can remove a standing cover's `PERSISTENT` sibling goes
 /// through here, which is what makes the sites that DISCARD the returned
 /// [`Clearance`] safe — `recover_lockdown`'s `Sweep` arm, `SystemRouting::
-/// release_all_covers`, the reconciler's `CoverStep::Release` through it, and
+/// release_all_covers`, and the reconciler's `CoverStep::Release` through it.
+///
 /// macOS's best-effort `lockdown_disengage` (the standing guard's `Drop` and
-/// the engage's back-out), which logs the `Err` and drops the `Ok`; there the
-/// witness is inert (no boot-time keys), so the discard holds trivially.
+/// the engage's back-out) also logs the `Err` and drops the `Ok`. It has no
+/// `PERSISTENT` sibling and no boot-time key, so there is nothing to persist
+/// and the discard is safe.
 ///
 /// Not every DELETE does. The Windows guard's `Drop` (`platform::Cover`'s
 /// `Lockdown` arm) removes the same key list with no `state_dir` to write to,
