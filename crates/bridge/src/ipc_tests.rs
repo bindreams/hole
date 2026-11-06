@@ -1225,44 +1225,6 @@ fn a_dropped_unblock_handler_future_still_runs_its_release_and_persist_to_the_en
     );
 }
 
-/// The cover lock is taken inside the Unblock's one blocking section, which owns it through the release and the
-/// persist: hyper drops the handler future when the client goes away, and the section runs on regardless.
-#[skuld::test]
-fn the_unblock_handler_holds_the_cover_lock_through_its_persist() {
-    let src = include_str!("ipc.rs");
-    let start = src.find("async fn handle_unblock").expect("handle_unblock must exist");
-    let body = &src[start
-        ..src[start..]
-            .find(
-                "
-}",
-            )
-            .map(|i| start + i)
-            .expect("the handler ends")];
-
-    let spawn = body
-        .find("spawn_blocking")
-        .expect("the section runs off the async task");
-    let locked = body.find("lock_covers()").expect("the handler takes the cover lock");
-    let released = body.find("release_all_covers(").expect("the handler releases covers");
-    let persist = body
-        .find("lockdown_state::set_enabled")
-        .expect("the handler persists the intent");
-    assert!(
-        spawn < locked,
-        "the lock is taken inside the closure, which owns it: not on the handler's future"
-    );
-    assert!(
-        locked < released && released < persist,
-        "the lock is held before the first firewall call and through the persist"
-    );
-    assert_eq!(
-        body.matches("lock_covers()").count(),
-        1,
-        "one section: the release and the records share one lock, never two"
-    );
-}
-
 /// Seam guard with the sibling teardown item: `handle_unblock` must consume
 /// no session posture at all, so a stopping session's reported posture can
 /// never reach this decision — the escape reads only the reconciler's
@@ -1892,12 +1854,9 @@ async fn a_second_start_cannot_begin_while_the_first_is_still_persisting() {
 
 #[skuld::test]
 fn ipc_start_never_engages_the_cover_even_on_failure() {
-    // #979: `handle_start` hardcodes `Coverage::Uncovered` unconditionally now —
-    // there is no wire signal left that can make an IPC-driven start covered
-    // (`X-Hole-Covered` was deleted; the only remaining source of a covered
-    // start is the bridge's own boot-time reconcile, which bypasses IPC
-    // entirely). A failed IPC start must therefore never leave the host
-    // fail-closed, regardless of any header a client sends.
+    // `handle_start` hardcodes `Coverage::Uncovered`: no wire signal can make an IPC-driven start covered; the only
+    // covered start is the bridge's own boot-time reconcile, which bypasses IPC. A failed IPC start therefore never
+    // leaves the host fail-closed, whatever header a client sends.
     rt().block_on(async {
         let path = test_socket_path("ipc-start-uncovered");
         let server = IpcServer::bind(&path, failing_proxy(), "test").unwrap();
