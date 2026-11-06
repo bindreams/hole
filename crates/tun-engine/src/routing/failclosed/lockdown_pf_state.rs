@@ -9,14 +9,14 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use util::versioned_file::{
+    Change, DefaultPlacement, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
+};
 
-pub const SCHEMA_VERSION: u32 = 1;
 pub const STATE_FILE_NAME: &str = "bridge-lockdown-pf.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LockdownPfState {
-    pub version: u32,
     /// Opaque enable token from `pfctl -E`, replayed to `pfctl -X` on Sweep.
     pub pf_token: String,
     /// The host's filter ruleset (`pfctl -sr`) captured before we replaced the
@@ -37,13 +37,12 @@ pub struct LockdownPfState {
     /// silently reload `/etc/pf.conf` over it.
     ///
     /// Defaults `true` (NO schema bump) so a file written before this field
-    /// existed reads as the captured baseline it was. Bumping
-    /// [`SCHEMA_VERSION`] instead would make every existing file `Unusable`,
-    /// which [`load`] collapses to `None`, which makes `disengage_lockdown`
+    /// existed reads as the captured baseline it was. Bumping the schema
+    /// version instead would make every existing file `Unusable`, which
+    /// [`load`] collapses to `None`, which makes `disengage_lockdown`
     /// early-return `Ok(())` over a still-blocked host — silently breaking
     /// `hole bridge unlock` and the tray's Unblock item on the ordinary macOS
-    /// upgrade path. `deny_unknown_fields` rejects EXTRA fields, not missing
-    /// ones, so the default applies cleanly.
+    /// upgrade path.
     #[serde(default = "default_true")]
     pub main_snapshot_captured: bool,
 }
@@ -52,9 +51,36 @@ fn default_true() -> bool {
     true
 }
 
-pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
+impl Schema for LockdownPfState {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+/// A cover's evidence: one this release cannot read is moved aside by a clear and backed up by a store, and its
+/// token is still salvaged for the sweep ([`super::StateFile::from`]).
+impl VersionedState for LockdownPfState {
+    const FILE_NAME: &'static str = STATE_FILE_NAME;
+    const ROLE: Role = Role::Cover;
+}
+
+util::assert_contiguous!(LockdownPfState);
+
+/// The record file. Every read and write of it goes through this type.
+pub type LockdownPfFile = VersionedFile<LockdownPfState>;
+
+pub fn file(state_dir: &Path) -> LockdownPfFile {
+    VersionedFile::new(state_dir)
+}
+
+/// Atomically persist `state`, creating `state_dir`. A file this release cannot read is backed up beside it first.
+pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement { owner }, |_| (Change::Store(state.clone()), ()))
+        .map(|_| ())
 }
 
 /// Trichotomy read distinguishing "no cover was ever engaged" (`Absent`) from
@@ -62,51 +88,15 @@ pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>
 /// unparseable, or version-skewed file. Collapsing `Unusable` into `Absent`
 /// would make a release read a live, blocking cover as nothing to clear (see
 /// `release_all`'s doc). `Absent` is ONLY `ErrorKind::NotFound`; every other
-/// read/parse/version failure is `Unusable` (keeps the existing `warn!` lines).
+/// read/parse/version failure is `Unusable`. The parse failure is logged by the
+/// read as a category and a position: `main_snapshot` is a captured `pfctl -sr`
+/// ruleset, which holds the server IP whenever it captured Hole's own cover.
 pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
-    use super::StateFile;
-    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
-        Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), file = STATE_FILE_NAME, "lockdown-pf-state read failed");
-            // No bytes, so nothing to salvage a token from.
-            return StateFile::Unusable { pf_token: None };
-        }
-    };
-    match serde_json::from_slice::<LockdownPfState>(&bytes) {
-        Ok(s) if s.version == SCHEMA_VERSION => StateFile::Present(s),
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = SCHEMA_VERSION,
-                "lockdown-pf-state schema mismatch, discarding the record but salvaging its pf token"
-            );
-            StateFile::unusable(&bytes)
-        }
-        Err(e) => {
-            // Converted immediately, never held as a `serde_json::Error`:
-            // `main_snapshot` is a captured `pfctl -sr` ruleset, which
-            // contains the server IP whenever the ruleset it captured was
-            // Hole's own cover, and `serde_json::Error`'s `Display` quotes
-            // the offending bytes back. Shadowing `e` with the source-free
-            // `ParseFailure` here, rather than only calling
-            // `describe_parse_error` where it's logged, means there is no
-            // live `serde_json::Error` left in scope for a later edit to
-            // reach for with `%e`.
-            let e = util::parse_error::ParseFailure::from(&e);
-            tracing::warn!(
-                error = %e,
-                file = STATE_FILE_NAME,
-                "lockdown-pf-state parse failed"
-            );
-            StateFile::unusable(&bytes)
-        }
-    }
+    super::StateFile::from(file(state_dir).observe().loaded)
 }
 
-/// Load the state file, or `None` on any error (absent / corrupt / unknown
-/// field / version mismatch). Thin wrapper over [`load_presence`], collapsing
+/// Load the state file, or `None` on any error (absent / corrupt / version
+/// mismatch). Thin wrapper over [`load_presence`], collapsing
 /// `Unusable` into `None` alongside `Absent` — every existing caller treats
 /// the two identically.
 pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
@@ -116,8 +106,12 @@ pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
     }
 }
 
-pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
+/// Remove the state file; absence is [`UpdateOutcome::Absent`]. A record this release cannot read is moved aside, and
+/// one whose read failed is [`UpdateOutcome::Kept`]. `Err` only on a real I/O error.
+pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
+        .map(|((), outcome)| outcome)
 }
 
 #[cfg(test)]

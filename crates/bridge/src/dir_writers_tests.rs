@@ -22,13 +22,14 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use hole_common::logging::dir_rotate::DirRotate;
-use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE, MARKER_VERSION};
+use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE};
 use tun_engine::routing::state as route_state;
 use util::dir::testing::{plant_link, user_dir};
 use util::dir::{Dir, Refusal};
 
-use crate::target::{self, Target, TargetError};
-use util::versioned_file::StoreError;
+use crate::target::{self, Target};
+use crate::test_support::target_records;
+use util::versioned_file::{CreateOutcome, StoreError};
 
 mod scan;
 
@@ -95,8 +96,8 @@ impl std::fmt::Display for LeftAsItIs {
 
 impl std::error::Error for LeftAsItIs {}
 
-/// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's,
-/// or a versioned file's decision to leave a file it cannot read as it is.
+/// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's, a
+/// versioned file's decision to leave a file it cannot read as it is, or the update marker's refusal to stamp one.
 fn is_a_refusal(err: &io::Error) -> bool {
     let mut current = err.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static));
     while let Some(error) = current {
@@ -107,6 +108,7 @@ fn is_a_refusal(err: &io::Error) -> bool {
         if error.downcast_ref::<Refusal>().is_some()
             || error.downcast_ref::<file_lock::Refused>().is_some()
             || error.downcast_ref::<LeftAsItIs>().is_some()
+            || error.downcast_ref::<update_marker::NoMarkerToStamp>().is_some()
             || versioned_file_left_it
         {
             return true;
@@ -142,7 +144,6 @@ struct Writer {
 }
 
 const LOCK_NAME: &str = "writers.lock";
-const STATE_NAME: &str = "state.json";
 const LOG_NAME: &str = "bridge.log";
 const LOG_ROTATED_NAME: &str = "bridge.log.1";
 const LOG_FALLBACK_NAME: &str = "bridge.log.1.fallback";
@@ -152,7 +153,6 @@ const CRASH_MARKER_NAME: &str = "crash-bridge-4242.marker";
 
 fn marker_info() -> MarkerInfo {
     MarkerInfo {
-        version: MARKER_VERSION,
         driver: cosca::identity::ProcessIdRecord {
             version: cosca::identity::RECORD_VERSION,
             platform: cosca::identity::Platform::Windows,
@@ -161,6 +161,17 @@ fn marker_info() -> MarkerInfo {
             boot_id: None,
             pid_ns: None,
         },
+    }
+}
+
+fn plugin_record() -> cosca::identity::ProcessIdRecord {
+    cosca::identity::ProcessIdRecord {
+        version: cosca::identity::RECORD_VERSION,
+        platform: cosca::identity::Platform::Windows,
+        pid: CRASH_PID,
+        token: 1,
+        boot_id: None,
+        pid_ns: None,
     }
 }
 
@@ -189,11 +200,10 @@ fn macos_writers() -> Vec<Writer> {
             runs_here: true,
             run: |dir, owner| {
                 let state = failclosed_state::FailClosedState {
-                    version: failclosed_state::SCHEMA_VERSION,
                     pf_token: "0".to_owned(),
                     pf_was_enabled: false,
                 };
-                failclosed_state::save(dir, &state, owner)
+                failclosed_state::save(dir, &state, owner).map_err(io::Error::other)
             },
         },
         Writer {
@@ -202,7 +212,10 @@ fn macos_writers() -> Vec<Writer> {
             names: &[failclosed_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| failclosed_state::clear(dir),
+            run: |dir, _| match failclosed_state::clear(dir).map_err(io::Error::other)? {
+                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+                _ => Ok(()),
+            },
         },
         Writer {
             name: "the pf lockdown state, saved",
@@ -212,13 +225,12 @@ fn macos_writers() -> Vec<Writer> {
             runs_here: true,
             run: |dir, owner| {
                 let state = lockdown_pf_state::LockdownPfState {
-                    version: lockdown_pf_state::SCHEMA_VERSION,
                     pf_token: "0".to_owned(),
                     main_snapshot: String::new(),
                     nat_snapshot: String::new(),
                     main_snapshot_captured: true,
                 };
-                lockdown_pf_state::save(dir, &state, owner)
+                lockdown_pf_state::save(dir, &state, owner).map_err(io::Error::other)
             },
         },
         Writer {
@@ -227,7 +239,10 @@ fn macos_writers() -> Vec<Writer> {
             names: &[lockdown_pf_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| lockdown_pf_state::clear(dir),
+            run: |dir, _| match lockdown_pf_state::clear(dir).map_err(io::Error::other)? {
+                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+                _ => Ok(()),
+            },
         },
     ]
 }
@@ -287,17 +302,10 @@ fn writers() -> Vec<Writer> {
             run: |dir, owner| file_lock::Exclusive::acquire(&dir.join(LOCK_NAME), owner).map(drop),
         },
         Writer {
-            name: "write_state_file",
-            sources: &["crates/util/src/dir.rs"],
-            names: &[STATE_NAME],
-            at_a_planted_name: AtAPlantedName::Replaces,
-            runs_here: true,
-            run: |dir, owner| util::dir::write_state_file(dir, OsStr::new(STATE_NAME), b"{}", owner),
-        },
-        Writer {
             name: "the route record, written",
             sources: &[
                 "crates/util/src/versioned_file/store.rs",
+                "crates/util/src/versioned_file/update.rs",
                 "crates/tun-engine/src/routing/state.rs",
             ],
             names: &[route_state::STATE_FILE_NAME],
@@ -313,7 +321,7 @@ fn writers() -> Vec<Writer> {
             names: &[route_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match route_state::remove(&route_state::file(dir))? {
+            run: |dir, _| match route_state::remove(&route_state::file(dir)).map_err(io::Error::other)? {
                 route_state::Cleared::Kept => Err(io::Error::other(LeftAsItIs)),
                 _ => Ok(()),
             },
@@ -324,32 +332,30 @@ fn writers() -> Vec<Writer> {
             names: &[target::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, owner| {
-                target::save(dir, &Target::Off, owner).map_err(|err| match err {
-                    // The io error inside is where a refusal of the walk is.
-                    TargetError::CreateDir(err)
-                    | TargetError::Write(err)
-                    | TargetError::SetPermissions(err)
-                    | TargetError::Lock(err) => err,
-                    err => io::Error::other(err),
-                })
-            },
-        },
-        Writer {
-            name: "the update marker, written",
-            sources: &["crates/common/src/update_marker.rs"],
-            names: &[MARKER_FILE],
-            at_a_planted_name: AtAPlantedName::Replaces,
-            runs_here: true,
-            run: |dir, owner| update_marker::write(dir, &marker_info(), owner),
+            run: |dir, owner| target_records::save(dir, &Target::Off, owner).map_err(io::Error::other),
         },
         Writer {
             name: "the update marker, claimed",
-            sources: &[],
+            sources: &["crates/common/src/update_marker.rs"],
             names: &[MARKER_FILE],
             at_a_planted_name: AtAPlantedName::ClaimedElsewhere,
             runs_here: true,
-            run: |dir, owner| update_marker::write_new(dir, &marker_info(), owner),
+            run: |dir, owner| match update_marker::claim(dir, &marker_info(), owner).map_err(io::Error::other)? {
+                CreateOutcome::Created => Ok(()),
+                CreateOutcome::Taken => Err(io::ErrorKind::AlreadyExists.into()),
+            },
+        },
+        Writer {
+            name: "the update marker, stamped",
+            sources: &[],
+            names: &[MARKER_FILE],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            run: |dir, owner| {
+                // A fresh layout holds a marker to stamp; at a planted name the claim is lost and the stamp refused.
+                update_marker::claim(dir, &marker_info(), owner).map_err(io::Error::other)?;
+                update_marker::stamp_driver(dir, &marker_info().driver)
+            },
+            runs_here: true,
         },
         Writer {
             name: "the update marker, cleared",
@@ -360,18 +366,12 @@ fn writers() -> Vec<Writer> {
             run: |dir, _| update_marker::clear(dir),
         },
         Writer {
-            name: "the plugin state, saved",
+            name: "the plugin state, appended",
             sources: &["crates/bridge/src/plugin_state.rs"],
             names: &[crate::plugin_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, owner| {
-                let state = crate::plugin_state::PluginState {
-                    version: crate::plugin_state::SCHEMA_VERSION,
-                    plugins: Vec::new(),
-                };
-                crate::plugin_state::save(dir, &state, owner)
-            },
+            run: |dir, owner| crate::plugin_state::append_record(dir, plugin_record(), owner).map_err(io::Error::other),
         },
         Writer {
             name: "the plugin state, cleared",
@@ -379,7 +379,10 @@ fn writers() -> Vec<Writer> {
             names: &[crate::plugin_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| crate::plugin_state::clear(dir),
+            run: |dir, _| match crate::plugin_state::clear(dir).map_err(io::Error::other)? {
+                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+                _ => Ok(()),
+            },
         },
         Writer {
             name: "the dns state, cleared",
@@ -387,7 +390,10 @@ fn writers() -> Vec<Writer> {
             names: &[crate::dns_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| crate::dns_state::clear(dir),
+            run: |dir, _| match crate::dns_state::clear(dir).map_err(io::Error::other)? {
+                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+                _ => Ok(()),
+            },
         },
         Writer {
             name: "the dns state, superseded",
@@ -404,15 +410,7 @@ fn writers() -> Vec<Writer> {
             names: &[lockdown_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, owner| lockdown_state::set_enabled(dir, true, owner),
-        },
-        Writer {
-            name: "the lockdown state, cleared",
-            sources: &[],
-            names: &[lockdown_state::STATE_FILE_NAME],
-            at_a_planted_name: AtAPlantedName::Replaces,
-            runs_here: true,
-            run: |dir, _| lockdown_state::clear(dir),
+            run: |dir, owner| lockdown_state::set_enabled(dir, true, owner).map_err(io::Error::other),
         },
         Writer {
             name: "the boot-time witness, recorded",
@@ -427,7 +425,8 @@ fn writers() -> Vec<Writer> {
         },
         Writer {
             name: "the socket, bound",
-            sources: &["crates/bridge/src/socket.rs"],
+            // `dir.rs`: `make_dir_and_free_name`, which the bind makes its room with.
+            sources: &["crates/bridge/src/socket.rs", "crates/util/src/dir.rs"],
             names: &[SOCKET_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
@@ -692,37 +691,28 @@ fn readings() -> Vec<Reading> {
             file: dns_state::STATE_FILE_NAME,
             write_valid: |dir| {
                 let state = dns_state::DnsState {
-                    version: dns_state::SCHEMA_VERSION,
                     advertised: Vec::new(),
                     adapters: Vec::new(),
                 };
-                util::dir::write_state_file(
-                    dir,
-                    OsStr::new(dns_state::STATE_FILE_NAME),
-                    &serde_json::to_vec(&state).unwrap(),
-                    None,
-                )
-                .unwrap();
+                dns_state::file(dir)
+                    .update(&util::versioned_file::DefaultPlacement::default(), |_| {
+                        (util::versioned_file::Change::Store(state), ())
+                    })
+                    .unwrap();
             },
             reads_it: |dir| dns_state::load(dir).is_some(),
         },
         Reading {
             name: "plugin_state::load",
             file: plugin_state::STATE_FILE_NAME,
-            write_valid: |dir| {
-                let state = plugin_state::PluginState {
-                    version: plugin_state::SCHEMA_VERSION,
-                    plugins: Vec::new(),
-                };
-                plugin_state::save(dir, &state, None).unwrap();
-            },
-            reads_it: |dir| matches!(plugin_state::load(dir), plugin_state::Loaded::State(_)),
+            write_valid: |dir| plugin_state::append_record(dir, plugin_record(), None).unwrap(),
+            reads_it: |dir| matches!(plugin_state::load(dir), util::versioned_file::Loaded::Current { .. }),
         },
         Reading {
             name: "target::load",
             file: target::STATE_FILE_NAME,
             // `Off` is what an absent file reads as too, but a planted name is not absent: it reads `Unreadable`.
-            write_valid: |dir| target::save(dir, &Target::Off, None).unwrap(),
+            write_valid: |dir| target_records::save(dir, &Target::Off, None).unwrap(),
             reads_it: |dir| matches!(target::load(dir), Target::Off),
         },
         Reading {
@@ -733,14 +723,16 @@ fn readings() -> Vec<Reading> {
                     on_startup: StartupBehavior::AlwaysConnect,
                     candidate: None,
                 };
-                target::save_startup_preference(dir, &preference, None).unwrap();
+                target_records::save_startup_preference(dir, &preference, None).unwrap();
             },
             reads_it: |dir| target::load_startup_preference(dir).on_startup == StartupBehavior::AlwaysConnect,
         },
         Reading {
             name: "update_marker::read",
             file: MARKER_FILE,
-            write_valid: |dir| update_marker::write(dir, &marker_info(), None).unwrap(),
+            write_valid: |dir| {
+                update_marker::claim(dir, &marker_info(), None).unwrap();
+            },
             reads_it: |dir| matches!(update_marker::read(dir), update_marker::Marker::Present(_)),
         },
     ]
@@ -794,10 +786,11 @@ fn no_reader_waits_on_a_fifo_planted_at_its_name() {
 
 const ECHOED_SECRET: &str = "hunter2-SECRET";
 
-/// The warnings `read` logs when `file` in a fresh folder holds a `version` that is a string where a number belongs:
-/// `serde_json`'s own message for that quotes the string.
-fn warnings_for_a_file_that_quotes_a_secret(file: &str, read: fn(&Path)) -> String {
-    warnings_for_a_file(file, &format!(r#"{{"version":"{ECHOED_SECRET}"}}"#), read)
+/// The warnings `read` logs when `file` in a fresh folder is the object `{ <head> "<secret>" }`: `head` ends at a
+/// key whose value is a string where something else belongs, and `serde_json`'s own message for that quotes the
+/// string.
+fn warnings_for_a_file_that_quotes_a_secret(file: &str, head: &str, read: fn(&Path)) -> String {
+    warnings_for_a_file(file, &format!(r#"{{{head}"{ECHOED_SECRET}"}}"#), read)
 }
 
 /// The warnings `read` logs when `file` in a fresh folder holds `content`.
@@ -820,29 +813,41 @@ fn warnings_for_a_file(file: &str, content: &str, read: fn(&Path)) -> String {
     writer.snapshot_string()
 }
 
-/// A reader that logs a parse failure: its name, the file it reads, and a call of it.
-type ParseFailureReader = (&'static str, &'static str, fn(&Path));
+/// A reader that logs a parse failure: its name, the file it reads, the start of a document of that file that puts a
+/// string where it does not belong (a framed file's payload failure keeps a position; its framing has none), and a
+/// call of it.
+type ParseFailureReader = (&'static str, &'static str, &'static str, fn(&Path));
 
 fn parse_failure_readers() -> [ParseFailureReader; 3] {
     use crate::{dns_state, plugin_state};
     [
-        ("update_marker::read", MARKER_FILE, |dir| {
+        ("update_marker::read", MARKER_FILE, r#""version":3,"driver":"#, |dir| {
             let _ = update_marker::read(dir);
         }),
-        ("dns_state::load", dns_state::STATE_FILE_NAME, |dir| {
-            let _ = dns_state::load(dir);
-        }),
-        ("plugin_state::load", plugin_state::STATE_FILE_NAME, |dir| {
-            let _ = plugin_state::load(dir);
-        }),
+        (
+            "dns_state::load",
+            dns_state::STATE_FILE_NAME,
+            r#""version":1,"adapters":"#,
+            |dir| {
+                let _ = dns_state::load(dir);
+            },
+        ),
+        (
+            "plugin_state::load",
+            plugin_state::STATE_FILE_NAME,
+            r#""version":2,"plugins":"#,
+            |dir| {
+                let _ = plugin_state::load(dir);
+            },
+        ),
     ]
 }
 
 #[skuld::test]
 fn no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse() {
     let mut failures = Vec::new();
-    for (name, file, read) in parse_failure_readers() {
-        let logs = warnings_for_a_file_that_quotes_a_secret(file, read);
+    for (name, file, head, read) in parse_failure_readers() {
+        let logs = warnings_for_a_file_that_quotes_a_secret(file, head, read);
         if logs.contains(ECHOED_SECRET) {
             failures.push(format!("{name} logged the file's content: {logs}"));
         } else if !logs.contains("line 1") {
@@ -851,21 +856,6 @@ fn no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse() {
     }
 
     assert!(failures.is_empty(), "{failures:#?}");
-}
-
-#[skuld::test]
-fn the_update_marker_logs_no_fragment_of_a_marker_with_a_secret_field() {
-    // `deny_unknown_fields`: serde's message for an unknown field quotes the field's name.
-    let content = format!(r#"{{"version":3,"{ECHOED_SECRET}":1}}"#);
-    let logs = warnings_for_a_file(MARKER_FILE, &content, |dir| {
-        let _ = update_marker::read(dir);
-    });
-
-    assert!(
-        !logs.contains(ECHOED_SECRET),
-        "the marker reader logged the file's content: {logs}"
-    );
-    assert!(logs.contains("line 1"), "the warning lost its position: {logs}");
 }
 
 /// The `serde_json` functions that parse a document into a type.
@@ -1181,7 +1171,7 @@ fn no_privileged_state_code_reads_a_file_by_path() {
 
     assert!(
         hits.is_empty(),
-        "a privileged read opens a file by path: use `util::dir::read_state_file` (or a `Dir`), or add the file to BY_PATH_ALLOWED with the reason: {hits:#?}"
+        "a privileged read opens a file by path: use `ReadDir::read_vouched` (or `VersionedFile::observe`), or add the file to BY_PATH_ALLOWED with the reason: {hits:#?}"
     );
 }
 
@@ -1205,7 +1195,7 @@ fn the_by_path_scan_tells_a_read_from_a_comment() {
         ["std::fs::File::open"]
     );
     assert!(by_path_reads("    // `std::fs::read(path)` is what this replaces").is_empty());
-    assert!(by_path_reads("util::dir::read_state_file(dir, name)").is_empty());
+    assert!(by_path_reads("util::dir::ReadDir::open(dir)?.read_vouched(name)").is_empty());
 }
 
 #[skuld::test]
@@ -1620,8 +1610,6 @@ fn sources_in(dir: &Path, found: &mut Vec<PathBuf>) {
 /// write or remove through `util::dir`, or write a versioned file, which stages through one.
 const WRITES_A_DIR: &[&str] = &[
     "Dir::open*",
-    "write_state_file",
-    "remove_state_file",
     "make_dir_and_free_name",
     "VersionedFile::new",
     ".append_own_file",
@@ -1651,8 +1639,8 @@ fn every_file_that_opens_a_dir_has_a_row() {
         .filter(|path| opens_a_dir(&std::fs::read_to_string(path).unwrap()))
         .map(|path| path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
         .collect();
-    // `util::dir` itself is a source file of the walk, not a user of it, but `write_state_file` lives in `dir.rs`:
-    // the scan skips the folder `dir/` and keeps `dir.rs`.
+    // `util::dir` itself is a source file of the walk, not a user of it, but `make_dir_and_free_name` lives in
+    // `dir.rs`: the scan skips the folder `dir/` and keeps `dir.rs`.
     opening.sort();
     let mut listed: Vec<String> = writers()
         .iter()
@@ -1669,27 +1657,25 @@ fn every_file_that_opens_a_dir_has_a_row() {
 
 #[skuld::test]
 fn the_completeness_scan_sees_every_way_to_write_into_a_state_directory() {
-    assert!(opens_a_dir("util::dir::write_state_file(dir, name, bytes, owner)"));
-    assert!(opens_a_dir(
-        "use util::dir::write_state_file;
-write_state_file(dir, name, bytes, owner)?;"
-    ));
-    assert!(opens_a_dir("util::dir::remove_state_file(dir, name)"));
     assert!(opens_a_dir("util::dir::make_dir_and_free_name(dir, name)"));
+    assert!(opens_a_dir(
+        "use util::dir::make_dir_and_free_name;
+make_dir_and_free_name(dir, name)?;"
+    ));
     assert!(opens_a_dir("VersionedFile::<State>::new(dir)"));
     assert!(opens_a_dir(
         "let dir = util::dir::Dir::open_as(path, true, owner, caller)?;"
     ));
     assert!(opens_a_dir("dir.write_atomic(name, bytes, owner, |_| Ok(()))"));
     // A function named as a value, or a type reached through an alias.
-    assert!(opens_a_dir("names.iter().for_each(util::dir::remove_state_file);"));
-    assert!(opens_a_dir("let w = util::dir::write_state_file;"));
+    assert!(opens_a_dir("names.iter().for_each(util::dir::make_dir_and_free_name);"));
+    assert!(opens_a_dir("let w = util::dir::make_dir_and_free_name;"));
     assert!(opens_a_dir(
         "type D = util::dir::Dir;
 let dir = D::open(path, true, None)?;"
     ));
     // Reading a state file writes nothing.
-    assert!(!opens_a_dir("util::dir::read_state_file(dir, name)"));
+    assert!(!opens_a_dir("util::dir::ReadDir::open(dir)?.read_vouched(name)"));
 }
 
 #[skuld::test]
@@ -2254,7 +2240,7 @@ let f = ufs::lchown;"
     assert_eq!(sites("dir.unlink(name)?;"), 0);
     assert_eq!(sites("dir.rename(from, to)?;"), 0);
     assert_eq!(sites("self.fs.remove_file(&dir, name)"), 0);
-    assert_eq!(sites("util::dir::remove_state_file(dir, name)?;"), 0);
+    assert_eq!(sites("crate::socket::remove_name(dir, name)?;"), 0);
     assert_eq!(sites("fs::read_dir(path)?;"), 0);
     assert_eq!(
         sites(

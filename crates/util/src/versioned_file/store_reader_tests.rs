@@ -1,11 +1,13 @@
 //! `load` takes no exclusion: a reader that has the file open never makes a
 //! `store` or a `move_aside` fail.
 
+use crate::versioned_file::fixtures::UpdateShortcuts;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-use super::{DefaultPlacement, Loaded, VersionedFile};
+use super::{DefaultPlacement, VersionedFile};
 use crate::versioned_file::fixtures::{dir, OsRecordFile};
+use crate::versioned_file::Loaded;
 
 /// The writer's whole workload; the loader runs until the writer is done.
 const STORES: usize = 1000;

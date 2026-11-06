@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use util::versioned_file::{
-    DefaultPlacement, Loaded, Obsolete, Removal, Role, Schema, StoreError, VersionedFile, VersionedState, WhyUnreadable,
+    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
+    WhyUnreadable,
 };
 
 use super::{planned_routes, RouteId};
@@ -311,7 +312,7 @@ pub(crate) enum Found {
 
 /// Reads the record and classifies it, for every site that acts on it.
 pub(crate) fn read(file: &RouteFile) -> Found {
-    match file.load().into_actionable() {
+    match file.observe().loaded.into_actionable() {
         Ok(Some(record)) => Found::Records(record),
         Ok(None) => Found::Nothing,
         Err(cause) => Found::Unreadable {
@@ -323,7 +324,7 @@ pub(crate) fn read(file: &RouteFile) -> Found {
 
 /// The raw load of the route record, for callers that need the [`Loaded`] variant.
 pub fn load(state_dir: &Path) -> Loaded<RouteState> {
-    file(state_dir).load()
+    file(state_dir).observe().loaded
 }
 
 /// The record's path, iff the connect gate must refuse to start over it: it
@@ -348,7 +349,8 @@ pub fn blocking(state_dir: &Path) -> Option<PathBuf> {
 /// whose read fails with an I/O error, is refused, never overwritten. An older
 /// record is replaced.
 pub fn write(file: &RouteFile, state: &RouteState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
-    file.store(state, &DefaultPlacement { owner })
+    file.update(&DefaultPlacement { owner }, |_| (Change::Store(state.clone()), ()))
+        .map(|_| ())
 }
 
 /// What [`remove`] left of the record.
@@ -362,12 +364,15 @@ pub enum Cleared {
 }
 
 /// Deletes the record. `Err` only on an I/O error.
-pub fn remove(file: &RouteFile) -> std::io::Result<Cleared> {
-    match file.remove()? {
-        Removal::Removed | Removal::Absent => Ok(Cleared::Gone),
-        Removal::Kept => Ok(Cleared::Kept),
-        // `Role::OsRecord` removes or keeps, never moves aside.
-        Removal::MovedAside(backup) => unreachable!("an OS record is never moved aside, but {backup:?} was"),
+pub fn remove(file: &RouteFile) -> Result<Cleared, StoreError> {
+    let ((), outcome) = file.update(&DefaultPlacement::default(), |_| (Change::Remove, ()))?;
+    match outcome {
+        UpdateOutcome::Removed | UpdateOutcome::Absent => Ok(Cleared::Gone),
+        UpdateOutcome::Kept => Ok(Cleared::Kept),
+        // `Role::OsRecord` removes or keeps, never moves aside, and a `Remove` neither stores nor leaves unchanged.
+        UpdateOutcome::MovedAside(_) | UpdateOutcome::Stored | UpdateOutcome::Unchanged => {
+            unreachable!("removing an OS record answered {outcome:?}")
+        }
     }
 }
 

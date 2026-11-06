@@ -2,7 +2,7 @@
 //!
 //! A file is one flat JSON object, `{"version": N, ...payload}`. Each version
 //! of its payload is its own frozen type, linked to the one before by
-//! [`Schema::Prev`], so [`VersionedFile::load`] reads any version it knows
+//! [`Schema::Prev`], so [`VersionedFile::observe`] reads any version it knows
 //! into the current one and a missing step does not build. A file it cannot
 //! read, whether newer than this release or corrupt, meets one rule per
 //! [`Role`]; so does one whose read failed with an I/O error, under its own
@@ -10,23 +10,20 @@
 //!
 //! # Exclusion
 //!
-//! The type takes no lock. `store` and `remove` probe the file and then act on
-//! what they found, and `move_aside` falls back to a link and then a delete
-//! where the platform has no no-replace rename. The caller must ensure that no
-//! other process or task writes the same file in between (see
-//! [`VersionedFile::store`]).
+//! [`VersionedFile::observe`] and [`VersionedFile::update`] take an in-process lock keyed by the file's path, so two
+//! threads never interleave a read and the write that depends on it, and the [`Generation`] an `observe` returns is
+//! the one that goes with its bytes. The lock is a leaf: nothing is acquired while it is held, and the `decide`
+//! closure of an `update` does no I/O. It does not exclude another process; for the bridge's state files that is
+//! `BridgeLiveness`, held by the running bridge and by every CLI that writes state.
+//! [`VersionedFile::create_new`] takes no lock: the rename that publishes the file (refusing to replace) is atomic
+//! across processes.
 //!
-//! `load` needs no exclusion, on Windows too: `store` replaces the file with
-//! POSIX semantics, so a reader that has it open neither fails nor makes the
-//! store fail. That holds for a reader that opens the file with delete
-//! sharing, as `load` and `std` do; one that does not (some editors and
-//! scanners) makes the store fail with a sharing violation. A volume that
-//! lacks POSIX rename (FAT, exFAT, some network shares) gets a plain replace,
-//! where a reader can make the store fail; see [`VersionedFile::store`].
-//! Windows durability of the replace rests on flushing the directory handle,
-//! which Microsoft does not document as committing a rename, and which a
-//! volume without a directory flush (SMB, 9P) does not offer at all
-//! (`Placement::sync_dir`).
+//! `observe` needs no exclusion from other processes, on Windows too: a write replaces the file with POSIX semantics,
+//! so a reader that has it open neither fails nor makes the write fail. That holds for a reader that opens the file
+//! with delete sharing, as `observe` and `std` do; one that does not (some editors and scanners) makes the write fail
+//! with a sharing violation. A volume that lacks POSIX rename (FAT, exFAT, some network shares) gets a plain
+//! replace, where a reader can make the write fail; see [`VersionedFile::update`]. Durability of the replace is
+//! described at `Placement::sync_dir`.
 //!
 //! # Compatibility
 //!
@@ -49,23 +46,26 @@
 //! # Template
 //!
 //! `versioned_file_tests.rs` is a complete `Role::OsRecord` schema with
-//! `assert_contiguous!`, a store and a load. It is a test, so CI runs it: copy
-//! it, not a snippet that can rot.
+//! `assert_contiguous!`, an update and an observe.
 
 mod chain;
 #[cfg(test)]
 mod fixtures;
 mod frame;
+mod generation;
 mod loaded;
 mod role;
 mod store;
+mod update;
 
 pub use chain::{Chain, ChainError, Obsolete, Schema};
-pub use loaded::{CannotRead, Loaded, Raw, WhyUnreadable};
+pub use generation::Generation;
+pub use loaded::{CannotRead, Loaded, Raw, UnreadableKind, WhyUnreadable};
 pub use role::{RemoveOver, Role, StoreOver};
 #[cfg(feature = "test-support")]
 pub use store::Fs;
-pub use store::{DefaultPlacement, Placement, Removal, StoreError, VersionedFile};
+pub use store::{DefaultPlacement, Placement, StoreError, VersionedFile};
+pub use update::{Change, CreateOutcome, Observed, UpdateOutcome};
 
 #[cfg(test)]
 #[path = "versioned_file_tests.rs"]

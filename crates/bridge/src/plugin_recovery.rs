@@ -18,9 +18,10 @@
 // calls this, and a panic there while a test is already unwinding would abort
 // the whole test binary.
 
-use crate::plugin_state::{self, Loaded};
+use crate::plugin_state::{self, PluginState};
 use cosca::identity::{ProcessId, Resolved};
 use std::path::Path;
+use util::versioned_file::{Loaded, UpdateOutcome};
 
 /// Kill every plugin process recorded under `state_dir`, then clear the record.
 pub fn reap_recorded_plugins(state_dir: &Path) {
@@ -30,7 +31,7 @@ pub fn reap_recorded_plugins(state_dir: &Path) {
 /// The reap's dispositions, over an already-loaded state. Taking `Loaded` by
 /// value makes every arm drivable from a test without a fixture that has to
 /// defeat a real `fs::read`.
-pub(crate) fn reap_loaded(loaded: Loaded, state_dir: &Path) {
+pub(crate) fn reap_loaded(loaded: Loaded<PluginState>, state_dir: &Path) {
     reap_loaded_with(
         loaded,
         state_dir,
@@ -44,30 +45,46 @@ pub(crate) fn reap_loaded(loaded: Loaded, state_dir: &Path) {
 /// host's own unreadable boot session, a kill on a target cosca could not open
 /// or assess — so the accounting rule's failure legs need these seams.
 pub(crate) fn reap_loaded_with(
-    loaded: Loaded,
+    loaded: Loaded<PluginState>,
     state_dir: &Path,
     restore: impl Fn(&cosca::identity::ProcessIdRecord) -> Result<ProcessId, cosca::error::Error>,
     kill: impl Fn(ProcessId) -> Result<(), cosca::error::Error>,
 ) {
     let state = match loaded {
         Loaded::Absent => return,
-        Loaded::Unreadable(e) => {
+        Loaded::Unreadable { error, .. } => {
             tracing::error!(
-                error = %util::error_chain::error_chain(&e),
+                error = %util::error_chain::error_chain(&error),
                 file = plugin_state::STATE_FILE_NAME,
                 "plugin state file could not be read; keeping it so the next start retries"
             );
             return;
         }
-        Loaded::Unusable => {
+        // A newer or a corrupt record may name live plugins nobody here can interpret: forgetting it would leak them
+        // untraceably.
+        Loaded::Newer { .. } => {
             tracing::error!(
                 file = plugin_state::STATE_FILE_NAME,
-                "plugin state file is not usable at this schema; discarding it and accepting a one-time orphan leak"
+                "plugin state file is from a newer release; keeping it, its plugins cannot be accounted for"
+            );
+            return;
+        }
+        Loaded::Corrupt { .. } => {
+            tracing::error!(
+                file = plugin_state::STATE_FILE_NAME,
+                "plugin state file is corrupt; keeping it, its plugins cannot be accounted for"
+            );
+            return;
+        }
+        Loaded::Obsolete { .. } => {
+            tracing::error!(
+                file = plugin_state::STATE_FILE_NAME,
+                "plugin state file is at an obsolete schema; discarding it and accepting a one-time orphan leak"
             );
             clear_or_log(state_dir);
             return;
         }
-        Loaded::State(state) => state,
+        Loaded::Current { value, .. } => value,
     };
 
     // The file may be deleted only once every record in it is accounted for:
@@ -170,8 +187,12 @@ fn settles_the_record(e: &cosca::error::Error) -> bool {
 /// A dropped `clear` failure leaves the file in place forever, which is the
 /// same litter bug one layer down — so state the disposition at every call.
 fn clear_or_log(state_dir: &Path) {
-    if let Err(e) = plugin_state::clear(state_dir) {
-        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear plugin state file");
+    match plugin_state::clear(state_dir) {
+        Ok(UpdateOutcome::Kept) => {
+            tracing::warn!("plugin state file could not be read at the clear, so it was kept")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear plugin state file"),
     }
 }
 

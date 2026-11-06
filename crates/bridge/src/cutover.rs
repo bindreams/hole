@@ -213,10 +213,11 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 ///
 /// Refuses outright against a live bridge instance (#840): a running bridge
 /// already reconciles the target itself, and racing it from an unrelated CLI
-/// invocation is exactly the two-writer hazard `target::apply`'s locking
-/// exists to prevent. The in-app "Unblock Network" action is the live-bridge
-/// equivalent, so refusal names it as the alternative. The exclusion is
-/// structural, not a point-in-time probe: see [`unlock_with`].
+/// invocation is exactly the two-writer hazard `BridgeLiveness` exists to
+/// prevent: the state files' own locks are in-process only. The in-app
+/// "Unblock Network" action is the live-bridge equivalent, so refusal names it
+/// as the alternative. The exclusion is structural, not a point-in-time probe:
+/// see [`unlock_with`].
 /// **`Ok` is qualified, and the caller must surface it.** The returned
 /// [`Clearance`] is what the disengage could not prove — on Windows, the two
 /// boot-time twins on any boot where no bridge engaged. This is the ONE
@@ -263,7 +264,8 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<Cle
     // the host from.
     crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None)
         .map_err(|e| std::io::Error::other(format!("could not clear the auto-connect candidate: {e}")))?;
-    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)?;
+    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
+        .map_err(|e| std::io::Error::other(format!("could not record the lockdown intent off: {e}")))?;
     // Handed back, never dropped. The intent is now off, so nothing after this
     // will pre-delete a boot-time key or look at one again — see [`unlock`].
     Ok(clearance)

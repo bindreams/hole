@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 
-use super::{Obsolete, Role, Schema, VersionedState};
+use super::{
+    Change, DefaultPlacement, Loaded, Obsolete, Placement, Role, Schema, StoreError, UpdateOutcome, VersionedFile,
+    VersionedState,
+};
 
 /// What the three `Note` versions all decode to, hand-written from the
 /// upgrade rules below (v1 gains `tags = ["imported"]`, v2 gains
@@ -105,6 +108,27 @@ role_file!(DecisionFile, "decision.json", Role::Decision);
 role_file!(OsRecordFile, "os-record.json", Role::OsRecord);
 role_file!(LegacyRecordFile, "legacy-record.json", Role::LegacyRecord);
 role_file!(ConfigFile, "config.json", Role::Config);
+role_file!(ClaimFile, "claim.json", Role::Claim);
+role_file!(CoverFile, "cover.json", Role::Cover);
+
+/// A counter, for tests that count lost updates.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Counter {
+    pub n: u64,
+}
+
+impl Schema for Counter {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+impl VersionedState for Counter {
+    const FILE_NAME: &'static str = "counter.json";
+    const ROLE: Role = Role::Decision;
+}
 
 /// The current `Note`, as an `OsRecord`.
 impl VersionedState for NoteV3 {
@@ -323,4 +347,49 @@ impl Schema for MaxVersionFile {
 impl VersionedState for MaxVersionFile {
     const FILE_NAME: &'static str = "max-version.json";
     const ROLE: Role = Role::Config;
+}
+
+/// The calls the older tests spell, each as one `update` or `observe`, so they keep asserting the same behaviours on
+/// the single write path.
+pub(crate) trait UpdateShortcuts<S: VersionedState> {
+    fn store(&self, value: &S, place: &dyn Placement) -> Result<(), StoreError>;
+    fn remove(&self) -> std::io::Result<UpdateOutcome>;
+    fn move_aside(&self) -> std::io::Result<Option<std::path::PathBuf>>;
+    fn load(&self) -> Loaded<S>;
+}
+
+impl<S: VersionedState + Clone> UpdateShortcuts<S> for VersionedFile<S> {
+    fn store(&self, value: &S, place: &dyn Placement) -> Result<(), StoreError> {
+        self.update(place, |_| (Change::Store(value.clone()), ())).map(|_| ())
+    }
+
+    fn remove(&self) -> std::io::Result<UpdateOutcome> {
+        self.update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
+            .map(|(_, outcome)| outcome)
+            .map_err(io_only)
+    }
+
+    fn move_aside(&self) -> std::io::Result<Option<std::path::PathBuf>> {
+        match self
+            .update(&DefaultPlacement::default(), |_| (Change::MoveAside, ()))
+            .map_err(io_only)?
+            .1
+        {
+            UpdateOutcome::MovedAside(backup) => Ok(Some(backup)),
+            UpdateOutcome::Absent => Ok(None),
+            other => unreachable!("a move aside answered {other:?}"),
+        }
+    }
+
+    fn load(&self) -> Loaded<S> {
+        self.observe().loaded
+    }
+}
+
+/// A remove or a move aside fails only by I/O.
+fn io_only(err: StoreError) -> std::io::Error {
+    match err {
+        StoreError::Io(e) => e,
+        other => unreachable!("a remove or move aside failed with {other:?}"),
+    }
 }

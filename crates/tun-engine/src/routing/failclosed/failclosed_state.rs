@@ -10,11 +10,9 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-
-/// Schema version for [`FailClosedState`]. Bumped on backwards-incompatible
-/// changes; [`load`] discards a mismatched file rather than risk a corrupt
-/// recovery.
-pub const SCHEMA_VERSION: u32 = 1;
+use util::versioned_file::{
+    Change, DefaultPlacement, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
+};
 
 /// Filename under `state_dir`. Distinct from `bridge-routes.json` because the
 /// cover lifecycle is independent of the route lifecycle (a cover is active
@@ -24,9 +22,7 @@ pub const STATE_FILE_NAME: &str = "bridge-failclosed.json";
 /// pf state captured at cover-engage time, persisted before the blocking
 /// ruleset is loaded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FailClosedState {
-    pub version: u32,
     /// Opaque enable token returned by `pfctl -E`, replayed to `pfctl -X` on
     /// recovery. Stored as a string — it is an opaque handle, not arithmetic.
     pub pf_token: String,
@@ -41,11 +37,37 @@ pub struct FailClosedState {
     pub pf_was_enabled: bool,
 }
 
-/// Atomically persist `state` to `<state_dir>/bridge-failclosed.json` (temp
-/// file + same-dir rename, `sync_all` before persist). Creates `state_dir`.
-pub fn save(state_dir: &Path, state: &FailClosedState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    util::dir::write_state_file(state_dir, STATE_FILE_NAME.as_ref(), &json, owner)
+impl Schema for FailClosedState {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
+
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
+    }
+}
+
+/// A cover's evidence: one this release cannot read is moved aside by a clear and backed up by a store, and its
+/// token is still salvaged for the sweep ([`super::StateFile::from`]).
+impl VersionedState for FailClosedState {
+    const FILE_NAME: &'static str = STATE_FILE_NAME;
+    const ROLE: Role = Role::Cover;
+}
+
+util::assert_contiguous!(FailClosedState);
+
+/// The record file. Every read and write of it goes through this type.
+pub type FailClosedFile = VersionedFile<FailClosedState>;
+
+pub fn file(state_dir: &Path) -> FailClosedFile {
+    VersionedFile::new(state_dir)
+}
+
+/// Atomically persist `state` to `<state_dir>/bridge-failclosed.json`, creating `state_dir`. A file this release
+/// cannot read is backed up beside it first.
+pub fn save(state_dir: &Path, state: &FailClosedState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement { owner }, |_| (Change::Store(state.clone()), ()))
+        .map(|_| ())
 }
 
 /// Trichotomy read distinguishing "no cover was ever engaged" (`Absent`) from
@@ -53,39 +75,13 @@ pub fn save(state_dir: &Path, state: &FailClosedState, owner: Option<(u32, u32)>
 /// unparseable, or version-skewed file. Collapsing `Unusable` into `Absent`
 /// would make a release read a live, blocking cover as nothing to clear (see
 /// `release_all`'s doc). `Absent` is ONLY `ErrorKind::NotFound`; every other
-/// read/parse/version failure is `Unusable` (keeps the existing `warn!` lines).
+/// read/parse/version failure is `Unusable`.
 pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
-    use super::StateFile;
-    let bytes = match util::dir::read_state_file(state_dir, STATE_FILE_NAME.as_ref()) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
-        Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), file = STATE_FILE_NAME, "failclosed-state read failed");
-            // No bytes, so nothing to salvage a token from.
-            return StateFile::Unusable { pf_token: None };
-        }
-    };
-    match serde_json::from_slice::<FailClosedState>(&bytes) {
-        Ok(s) if s.version == SCHEMA_VERSION => StateFile::Present(s),
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = SCHEMA_VERSION,
-                "failclosed-state schema mismatch, discarding the record but salvaging its pf token"
-            );
-            StateFile::unusable(&bytes)
-        }
-        Err(e) => {
-            // The error quotes the file, which the user may have put there: keep its position, not its text.
-            let e = util::parse_error::ParseFailure::from(&e);
-            tracing::warn!(error = %e, file = STATE_FILE_NAME, "failclosed-state parse failed");
-            StateFile::unusable(&bytes)
-        }
-    }
+    super::StateFile::from(file(state_dir).observe().loaded)
 }
 
-/// Load the state file, or `None` on any error (absent / corrupt / unknown
-/// field / version mismatch); logs at `warn`. Recovery is best-effort. Thin
+/// Load the state file, or `None` on any error (absent / corrupt /
+/// version mismatch); logs at `warn`. Recovery is best-effort. Thin
 /// wrapper over [`load_presence`], collapsing `Unusable` into `None` alongside
 /// `Absent` — every existing caller treats the two identically.
 pub fn load(state_dir: &Path) -> Option<FailClosedState> {
@@ -95,9 +91,12 @@ pub fn load(state_dir: &Path) -> Option<FailClosedState> {
     }
 }
 
-/// Delete the state file; tolerates absence (`Ok`). `Err` only on real I/O error.
-pub fn clear(state_dir: &Path) -> std::io::Result<()> {
-    util::dir::remove_state_file(state_dir, STATE_FILE_NAME.as_ref())
+/// Remove the state file; absence is [`UpdateOutcome::Absent`]. A record this release cannot read is moved aside, and
+/// one whose read failed is [`UpdateOutcome::Kept`]. `Err` only on a real I/O error.
+pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
+        .map(|((), outcome)| outcome)
 }
 
 #[cfg(test)]

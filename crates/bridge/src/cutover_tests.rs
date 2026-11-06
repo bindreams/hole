@@ -122,6 +122,24 @@ fn unlock_records_the_target_off_before_releasing() {
     assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
 }
 
+#[skuld::test]
+fn unlock_over_a_target_it_cannot_read_leaves_off_and_keeps_a_backup() {
+    let newer: &[u8] = br#"{"version":2,"target":{"state":"off"}}"#;
+    for unreadable in [b"not json".as_slice(), newer] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(crate::target::STATE_FILE_NAME), unreadable).unwrap();
+
+        let _clearance = unlock_with(dir.path(), || Ok(Clearance::proven()))
+            .expect("the escape must not be blocked by a bad record");
+
+        assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
+        let backup = dir
+            .path()
+            .join(format!("{}.unreadable.bak", crate::target::STATE_FILE_NAME));
+        assert_eq!(std::fs::read(backup).unwrap(), unreadable);
+    }
+}
+
 // #986: the liveness exclusion is structural (a lock held across the whole
 // sequence), not a point-in-time probe — a bridge that would start mid-unlock
 // must observe the lock as held throughout, not just at the initial check.
@@ -159,12 +177,11 @@ fn the_marker_stays_only_for_a_cutover_a_new_bridge_will_sweep() {
     let marker_after = |result: std::io::Result<CutoverOutcome>| {
         let dir = tempfile::tempdir().unwrap();
         let m = hole_common::update_marker::MarkerInfo {
-            version: hole_common::update_marker::MARKER_VERSION,
             driver: cosca::identity::ProcessId::current()
                 .to_record()
                 .expect("persist this process's identity"),
         };
-        hole_common::update_marker::write(dir.path(), &m, None).unwrap();
+        hole_common::update_marker::claim(dir.path(), &m, None).unwrap();
         settle_marker(&result, dir.path());
         hole_common::update_marker::is_present(dir.path())
     };
@@ -858,12 +875,11 @@ mod child_and_lock {
 
     fn write_marker(dir: &std::path::Path) {
         let info = hole_common::update_marker::MarkerInfo {
-            version: hole_common::update_marker::MARKER_VERSION,
             driver: cosca::identity::ProcessId::current()
                 .to_record()
                 .expect("persist this process's identity"),
         };
-        hole_common::update_marker::write(dir, &info, None).unwrap();
+        hole_common::update_marker::claim(dir, &info, None).unwrap();
     }
 
     /// Holder first: the holder waits for the child's exit (the join) while the
