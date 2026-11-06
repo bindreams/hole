@@ -1124,12 +1124,17 @@ fn lockdown_presence_and_state(
     (fold_presence(pf_label, &file), file)
 }
 
+/// [`disengage_lockdown`] under the shared `sweep_with_witness`, so a confirmed release outdates the kind's stamps like
+/// every other sweep. The facade's `disengage_lockdown` and [`lockdown_disengage`] both call this, so a `pf_on_any_host`
+/// build (the module compiled on another host) reaches its own `pfctl`, never another host's sweep.
+pub(super) fn disengage_lockdown_swept(lock: &CoverLock) -> Result<Clearance, RoutingError> {
+    super::sweep_with_witness(lock, None, |witness| disengage_lockdown(lock, witness))
+}
+
 /// Best-effort wrapper for the standing guard's `Drop` (user-stop) and the engage's back-out: disengage and log.
-/// Neither has a caller to surface an error to. It runs this module's [`disengage_lockdown`] under the shared
-/// `sweep_with_witness`, so a confirmed release outdates the kind's stamps like every other sweep. Not the facade's
-/// cfg-dispatched sweep: a [`super::pf_on_any_host`] build must reach this module's `pfctl`, not another host's.
+/// Neither has a caller to surface an error to.
 fn lockdown_disengage(lock: &CoverLock) {
-    if let Err(e) = super::sweep_with_witness(lock, None, |witness| disengage_lockdown(lock, witness)) {
+    if let Err(e) = disengage_lockdown_swept(lock) {
         tracing::warn!(
             error = &e as &dyn std::error::Error,
             "lockdown disengage failed during Drop or an engage's back-out"
