@@ -2277,6 +2277,11 @@ pub fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> SweepOut
     disengage_verdict(None, &swept, witness)
 }
 
+/// [`disengage_lockdown`] under the shared `sweep_with_witness`; the facade's `disengage_lockdown` calls this.
+pub(super) fn disengage_lockdown_swept(lock: &CoverLock) -> Result<Clearance, RoutingError> {
+    super::sweep_with_witness(lock, None, |witness| disengage_lockdown(lock, witness))
+}
+
 /// Whether a lockdown disengage may report success. Pure and separated from
 /// the FFI above so the fail-loud rule is a table-tested decision rather than
 /// a discarded return value, which is what lets an unelevated `hole bridge
