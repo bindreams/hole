@@ -7,8 +7,9 @@
 //! races a locked writer as the old or the new state; a read that decides a write is taken again under the lock,
 //! inside one synchronous section.
 //!
-//! The lock is per `state_dir`, a std mutex, and never held across an `.await`: [`CoverLock`] is `!Send`, so a
-//! future that held it could not be spawned. Poison is recovered; nothing under the lock is left half-updated by
+//! The lock is per `state_dir`, a std mutex, and never held across an `.await`: [`CoverLock`] is `!Send` and
+//! `!Sync`, so a future that held it could not be spawned and a `&CoverLock` never reaches a thread whose `HELD`
+//! does not list it. Poison is recovered; nothing under the lock is left half-updated by
 //! an unwind (the counters are single atomic writes). In-process only: `hole bridge unlock`, uninstall and the
 //! cutover run with no live bridge (`BridgeLiveness`), so there is nothing to race.
 //!
@@ -30,6 +31,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -53,8 +55,7 @@ impl CoverKind {
     }
 }
 
-/// One `state_dir`'s lock and stamp counters. Leaked once per directory: the map retained the old per-directory
-/// slots for the life of the process too.
+/// One `state_dir`'s lock and stamp counters. Leaked once per directory for the life of the process.
 #[derive(Debug)]
 struct Slot {
     dir: PathBuf,
@@ -86,12 +87,14 @@ fn held_by_this_thread(slot: &'static Slot) -> bool {
     HELD.with(|held| held.borrow().iter().any(|h| std::ptr::eq(*h, slot)))
 }
 
-/// The lock over every cover mutation under one `state_dir`; see the module doc. `!Send`.
+/// The lock over every cover mutation under one `state_dir`; see the module doc. `!Send` and `!Sync`.
 #[must_use = "the cover lock is held only while this value is alive"]
 pub struct CoverLock {
     slot: &'static Slot,
     /// `None` for the non-owning view [`CoverLock::view_of_held`] builds.
     guard: Option<MutexGuard<'static, ()>>,
+    /// `MutexGuard` is `Sync`; this makes the lock `!Sync` so a `&CoverLock` stays on the acquiring thread too.
+    not_sync: PhantomData<*const ()>,
 }
 
 impl CoverLock {
@@ -116,6 +119,7 @@ impl CoverLock {
         CoverLock {
             slot,
             guard: Some(guard),
+            not_sync: PhantomData,
         }
     }
 
@@ -124,7 +128,11 @@ impl CoverLock {
     /// way to acquire. Only [`InstallStamp::release_on_drop`] builds one, after `held_by_this_thread` confirmed it.
     fn view_of_held(slot: &'static Slot) -> CoverLock {
         debug_assert!(held_by_this_thread(slot), "a view is of a lock this thread holds");
-        CoverLock { slot, guard: None }
+        CoverLock {
+            slot,
+            guard: None,
+            not_sync: PhantomData,
+        }
     }
 
     /// The directory this lock is for: the one source of it for every function that takes `&CoverLock`.

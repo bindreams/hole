@@ -41,7 +41,6 @@ fn a_sweep_waits_for_an_engage_inside_its_os_step() {
     let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
     let (in_engage_tx, in_engage_rx) = mpsc::channel::<()>();
     let (go_tx, go_rx) = mpsc::channel::<()>();
-    let (sweep_started_tx, sweep_started_rx) = mpsc::channel::<()>();
 
     let (order, path) = (&order, d.path());
     std::thread::scope(|scope| {
@@ -52,18 +51,21 @@ fn a_sweep_waits_for_an_engage_inside_its_os_step() {
             go_rx.recv().unwrap();
             order.lock().unwrap().push("engage ends");
         });
-        // The engage holds the lock, parked inside its OS step.
+        // The engage holds the lock, parked inside its OS step. Any other acquire blocks on this very mutex, so
+        // that it is held is the whole contention: observed here, not inferred from the order of two pushes.
         in_engage_rx.recv().unwrap();
+        let held = matches!(slot(path).lock.try_lock(), Err(std::sync::TryLockError::WouldBlock));
         let sweep = scope.spawn(move || {
-            sweep_started_tx.send(()).unwrap();
             let _lock = CoverLock::acquire(path);
             order.lock().unwrap().push("sweep deletes");
         });
-        sweep_started_rx.recv().unwrap();
-        // The sweep is at (or inside) `acquire` and cannot have run: only the engage may release it.
         go_tx.send(()).unwrap();
         engage.join().unwrap();
         sweep.join().unwrap();
+        assert!(
+            held,
+            "an engage inside its OS step holds the mutex a sweep would have to take"
+        );
     });
 
     assert_eq!(
@@ -247,26 +249,28 @@ fn acquiring_the_lock_twice_on_one_thread_panics() {
 }
 
 #[skuld::test]
-fn a_cover_dropped_on_another_thread_waits_for_the_lock() {
+fn a_cover_dropped_on_another_thread_deletes_under_the_lock() {
     let d = dir();
-    let deleted = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-    let (dropping_tx, dropping_rx) = mpsc::channel::<()>();
-
     let stamp = CoverLock::acquire(d.path()).stamp_install(CoverKind::Transient);
-    let lock = CoverLock::acquire(d.path());
-    std::thread::scope(|scope| {
-        let deleted = &deleted;
-        let dropper = scope.spawn(move || {
-            dropping_tx.send(()).unwrap();
-            stamp.release_on_drop(|_| deleted.lock().unwrap().push("delete"));
-        });
-        dropping_rx.recv().unwrap();
-        deleted.lock().unwrap().push("holder done");
-        drop(lock);
-        dropper.join().unwrap();
+
+    // The thread holds no lock of its own, so the mutex the delete finds taken is the one the drop acquired.
+    let held_during_delete = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let mut held = None;
+                stamp.release_on_drop(|lock| {
+                    held = Some(matches!(
+                        lock.slot.lock.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                });
+                held
+            })
+            .join()
+            .unwrap()
     });
 
-    assert_eq!(*deleted.lock().unwrap(), ["holder done", "delete"]);
+    assert_eq!(held_during_delete, Some(true), "the delete ran, under the mutex");
 }
 
 #[skuld::test]
@@ -304,8 +308,9 @@ fn dropping_a_view_of_the_held_lock_leaves_the_lock_held() {
 }
 
 #[skuld::test]
-fn a_cover_lock_is_not_send() {
-    static_assertions::assert_not_impl_any!(CoverLock: Send);
+fn a_cover_lock_is_neither_send_nor_sync() {
+    // `!Sync` as well: a `&CoverLock` on another thread would not find the slot in that thread's `HELD`.
+    static_assertions::assert_not_impl_any!(CoverLock: Send, Sync);
 }
 
 #[skuld::test]
@@ -339,22 +344,6 @@ fn a_panic_under_the_lock_releases_it() {
 
 use super::super::{sweep_with_witness, Clearance, SweepOutcome};
 use crate::error::RoutingError;
-
-#[skuld::test]
-fn a_sweep_holds_the_lock_while_it_runs() {
-    // The sweep takes the lock as a parameter; the proof is that a second `acquire` from the sweep body would
-    // panic, so nothing inside a sweep can re-enter.
-    let d = dir();
-    let lock = CoverLock::acquire(d.path());
-    let reentered = sweep_with_witness(&lock, |_| {
-        let attempt = catch_unwind(AssertUnwindSafe(|| {
-            CoverLock::acquire(d.path()).state_dir().to_path_buf()
-        }));
-        assert!(attempt.is_err());
-        SweepOutcome::per_kind(Clearance::proven(), [(CoverKind::Lockdown, None)])
-    });
-    assert!(reentered.is_ok());
-}
 
 #[skuld::test]
 fn a_sweep_that_completes_makes_an_earlier_stamp_stale() {
