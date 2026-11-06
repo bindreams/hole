@@ -31,6 +31,26 @@ impl<T: PfRecord> StateFile<T> {
             StateFile::Present(record) => Some(record.pf_token()),
         }
     }
+
+    /// What a release acts by: the token to drop and to clear the record under (`None`: nothing to drop), or, for a
+    /// record that could not be read, the refusal. An unread record names no token, and a clear keyed to "no token"
+    /// would call a record that has since become readable not ours. Every release path reads this; none matches
+    /// `Unreadable` itself.
+    pub fn release_token(&self) -> Result<Option<&str>, RoutingError> {
+        match self {
+            StateFile::Absent => Ok(None),
+            StateFile::Unreadable => Err(unread_record()),
+            StateFile::Unusable { pf_token } => Ok(pf_token.as_deref()),
+            StateFile::Present(record) => Ok(Some(record.pf_token())),
+        }
+    }
+}
+
+/// The answer for a record a release could not read. The text names no path: it reaches a toast.
+fn unread_record() -> RoutingError {
+    RoutingError::RouteSetup(
+        "the cover record could not be read, so it was left in place and the host may still be blocked".into(),
+    )
 }
 
 /// What a clear of a record under a token found.
@@ -51,9 +71,7 @@ impl Cleared {
         match self {
             Cleared::Removed => None,
             Cleared::Gone => None,
-            Cleared::Kept => Some(RoutingError::RouteSetup(
-                "the cover record could not be read, so it was left in place and the host may still be blocked".into(),
-            )),
+            Cleared::Kept => Some(unread_record()),
         }
     }
 

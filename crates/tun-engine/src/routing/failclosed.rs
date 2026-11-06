@@ -390,7 +390,7 @@ pub fn reclaim_stale_tun_permit(tun_name: &str) {
 /// the `bridge unlock` escape hatch can refuse to claim success (and refuse to
 /// flip the intent off) while the cover is still engaged. An absent cover is
 /// `Ok` (nothing to disengage); a real failure (not elevated / engine open /
-/// pfctl) is `Err`.
+/// pfctl) is `Err`. A pf refcount that will not drop is only logged.
 ///
 /// `Ok` carries a [`Clearance`] for the same reason [`release_all`]'s does,
 /// and this is the path where it matters most. `bridge unlock` writes the
@@ -466,11 +466,14 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    the difference.
 /// 5. **Bookkeeping is best-effort, except the state-file clear.** The macOS
 ///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
-///    warning on failure and do not fail the call. A cover's state-file clear
-///    is different: it is *skipped* whenever that cover's replacement ruleset
-///    did not confirm, because the file is the cover's only record — clearing
-///    it after an unconfirmed restore would make the next call read a clean
-///    host while the block persists (a manufactured, permanent lockout).
+///    warning on failure and do not fail the call: a refcount that will not
+///    drop blocks nothing, and a record kept for it would fail the same way on
+///    every retry. A cover's state-file clear is different: it is *skipped*
+///    whenever that cover's replacement ruleset did not confirm, because the
+///    file is the cover's only record — clearing it after an unconfirmed
+///    restore would make the next call read a clean host while the block
+///    persists (a manufactured, permanent lockout). After a confirmed
+///    restore, a clear that cannot write is that cover's error.
 ///
 /// Windows keeps no cover state file at all: the filter set is compiled-in
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or

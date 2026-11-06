@@ -81,27 +81,32 @@ fn a_failed_restore_still_drops_the_token_and_keeps_the_record() {
     );
 }
 
+/// The record is the release's last step. A write that fails after a restore that held leaves a record over a host
+/// that is open, so the answer is that cover's error, not a success.
 #[skuld::test]
-fn a_clear_that_errors_after_the_drop_is_logged_and_the_release_still_reports_ok() {
-    let mut ops = RecordingPfOps {
-        fail_clear_transient: true,
-        fail_clear_standing: true,
-        ..Default::default()
-    };
+fn a_clear_that_errors_after_a_good_restore_is_the_covers_error() {
+    for (name, transient, standing) in [("transient", true, false), ("standing", false, true)] {
+        let mut ops = RecordingPfOps {
+            fail_clear_transient: transient,
+            fail_clear_standing: standing,
+            ..Default::default()
+        };
 
-    let result = release_all_with(
-        StateFile::Present(transient_state()),
-        StateFile::Present(standing_state()),
-        &mut ops,
-    )
-    .into_result();
+        let result = release_all_with(
+            StateFile::Present(transient_state()),
+            StateFile::Present(standing_state()),
+            &mut ops,
+        )
+        .into_result();
 
-    assert!(result.is_ok(), "the clear is bookkeeping: {result:?}");
-    assert_eq!(
-        ops.dropped,
-        vec!["111".to_owned(), "222".to_owned()],
-        "the tokens were dropped before the clears that failed"
-    );
+        let error = result.expect_err(name).to_string();
+        assert!(error.contains(&format!("mock clear_{name} failure")), "{name}: {error}");
+        assert_eq!(
+            ops.log.last(),
+            Some(&"clear_standing"),
+            "{name}: the other cover is still attempted"
+        );
+    }
 }
 
 /// A record that could not be read is left in place, so the release did not finish: a false success is the one wrong
@@ -148,7 +153,7 @@ fn a_release_over_records_that_could_not_be_read_restores_the_host_and_reports_t
 fn a_disengage_restores_then_drops_then_clears() {
     let mut ops = RecordingPfOps::default();
 
-    disengage_with(Some("111"), false, &mut ops);
+    disengage_with(Ok(Some("111")), false, &mut ops);
 
     assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
     assert_eq!(ops.cleared, vec![Some("111".to_owned())]);
@@ -162,7 +167,7 @@ fn a_disengage_whose_restore_fails_drops_nothing_and_clears_nothing() {
         ..Default::default()
     };
 
-    disengage_with(Some("111"), false, &mut ops);
+    disengage_with(Ok(Some("111")), false, &mut ops);
 
     assert_eq!(
         ops.log,
@@ -175,7 +180,7 @@ fn a_disengage_whose_restore_fails_drops_nothing_and_clears_nothing() {
 fn an_adopting_disengage_skips_the_restore_but_still_drops_and_clears() {
     let mut ops = RecordingPfOps::default();
 
-    disengage_with(Some("111"), true, &mut ops);
+    disengage_with(Ok(Some("111")), true, &mut ops);
 
     assert_eq!(ops.log, vec!["drop_token", "clear_transient"]);
 }
@@ -184,22 +189,22 @@ fn an_adopting_disengage_skips_the_restore_but_still_drops_and_clears() {
 fn a_disengage_with_no_token_on_record_drops_nothing() {
     let mut ops = RecordingPfOps::default();
 
-    disengage_with(None, false, &mut ops);
+    disengage_with(Ok(None), false, &mut ops);
 
     assert_eq!(ops.log, vec!["reload_default", "clear_transient"]);
     assert_eq!(ops.cleared, vec![None]);
 }
 
 #[skuld::test]
-fn a_disengage_whose_token_will_not_drop_keeps_its_record() {
+fn a_disengage_whose_token_will_not_drop_still_clears_its_record() {
     let mut ops = RecordingPfOps {
         fail_drop_token: true,
         ..Default::default()
     };
 
-    disengage_with(Some("111"), false, &mut ops);
+    disengage_with(Ok(Some("111")), false, &mut ops);
 
-    assert_eq!(ops.log, vec!["reload_default", "drop_token"]);
+    assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
 }
 
 // disengage_lockdown_with =============================================================================================
@@ -214,10 +219,10 @@ fn a_lockdown_disengage_drops_before_it_clears_by_the_token_it_dropped() {
     assert_eq!(ops.cleared, vec![Some("222".to_owned())]);
 }
 
-/// Fail-loud, unlike `release_all_with`: a caller who asked to be let out is told the refcount could not be released,
-/// once. The record goes with that answer, so the retry finds nothing to release instead of the same failure.
+/// A refcount pf will not drop blocks nothing, so it is for the log and never the release's error: reporting it would
+/// fail the attempt that let the user out.
 #[skuld::test]
-fn a_lockdown_disengage_that_cannot_drop_its_token_says_so_and_clears_the_record() {
+fn a_lockdown_disengage_whose_token_will_not_drop_is_still_a_clean_release() {
     let mut ops = RecordingPfOps {
         fail_drop_token: true,
         ..Default::default()
@@ -225,8 +230,56 @@ fn a_lockdown_disengage_that_cannot_drop_its_token_says_so_and_clears_the_record
 
     let result = disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops);
 
-    assert!(result.unwrap_err().to_string().contains("mock drop_token failure"));
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(ops.log, vec!["load_ruleset", "drop_token", "clear_standing"]);
+}
+
+/// The same write failure as `release_all`'s: a record left over a restored host is the error, after the token went.
+#[skuld::test]
+fn a_lockdown_disengage_whose_record_cannot_be_cleared_is_an_error() {
+    let mut ops = RecordingPfOps {
+        fail_clear_standing: true,
+        ..Default::default()
+    };
+
+    let result = disengage_lockdown_with(CoverPresence::Recorded, StateFile::Present(standing_state()), &mut ops);
+
+    assert!(result.unwrap_err().to_string().contains("mock clear_standing failure"));
+    assert_eq!(ops.log, vec!["load_ruleset", "drop_token", "clear_standing"]);
+}
+
+/// The retry of a failed restore meets a token the first attempt already dropped: its `-X` fails and the release
+/// still succeeds, once, with the record gone.
+#[skuld::test]
+fn the_retry_of_a_failed_lockdown_disengage_succeeds_over_the_token_it_already_dropped() {
+    let mut first = RecordingPfOps {
+        fail_load_ruleset: true,
+        ..Default::default()
+    };
+    let failed = disengage_lockdown_with(
+        CoverPresence::Recorded,
+        StateFile::Present(standing_state()),
+        &mut first,
+    );
+    assert!(failed.is_err());
+    assert_eq!(
+        first.cleared,
+        Vec::<Option<String>>::new(),
+        "the record waits for the retry"
+    );
+
+    let mut retry = RecordingPfOps {
+        fail_drop_token: true,
+        ..Default::default()
+    };
+    let retried = disengage_lockdown_with(
+        CoverPresence::Recorded,
+        StateFile::Present(standing_state()),
+        &mut retry,
+    );
+
+    assert!(retried.is_ok(), "{retried:?}");
+    assert_eq!(retry.cleared, vec![Some("222".to_owned())]);
 }
 
 /// An entry that could not be read is not the "no token" case: a clear keyed to "no token" that re-reads the record as
@@ -241,11 +294,12 @@ fn a_lockdown_disengage_over_a_record_it_cannot_read_restores_the_host_and_repor
     assert_eq!(ops.log, vec!["reload_default"]);
 }
 
-/// The two escapes over one record, from every outcome of the restore and of `pfctl -X`: the token is dropped whatever
-/// the restore did, and the record is cleared exactly when the restore held. A failed drop is `release_all`'s warning
-/// and `disengage_lockdown`'s one error.
+/// The callers that release a cover, over one record, from every outcome of the restore and of `pfctl -X`. The record
+/// is cleared exactly when the restore held, and a failed drop changes nothing. The token is dropped after a good
+/// restore by all of them; after a failed one by the escapes only, since a failed restore must not keep pf enabled over
+/// the host, while `recover_cover` and the transient guard keep it with the record for the next sweep.
 #[skuld::test]
-fn an_escape_drops_the_token_whatever_the_restore_did_and_clears_only_after_a_good_restore() {
+fn a_release_clears_its_record_by_its_restore_alone_and_drops_the_token_by_its_callers_rule() {
     for restore_ok in [true, false] {
         for drop_ok in [true, false] {
             let double = || RecordingPfOps {
@@ -269,18 +323,36 @@ fn an_escape_drops_the_token_whatever_the_restore_did_and_clears_only_after_a_go
                 StateFile::Present(standing_state()),
                 &mut disengage,
             );
+            let mut recover = double();
+            recover_cover_with(
+                StateFile::Present(recorded_cover("111")),
+                false,
+                &mut PfRecover(&mut recover),
+            );
+            let mut guard = double();
+            disengage_with(Ok(Some("111")), false, &mut guard);
 
-            for (escape, ops) in [("release_all", &release), ("disengage_lockdown", &disengage)] {
-                assert_eq!(ops.dropped, vec!["222".to_owned()], "{escape}, {case}");
-                let cleared = if restore_ok {
-                    vec![Some("222".to_owned())]
+            for (caller, ops, token, drops_after_a_failed_restore) in [
+                ("release_all", &release, "222", true),
+                ("disengage_lockdown", &disengage, "222", true),
+                ("recover_cover", &recover, "111", false),
+                ("transient guard", &guard, "111", false),
+            ] {
+                let dropped = if restore_ok || drops_after_a_failed_restore {
+                    vec![token.to_owned()]
                 } else {
                     vec![]
                 };
-                assert_eq!(ops.cleared, cleared, "{escape}, {case}");
+                assert_eq!(ops.dropped, dropped, "{caller}, {case}");
+                let cleared = if restore_ok {
+                    vec![Some(token.to_owned())]
+                } else {
+                    vec![]
+                };
+                assert_eq!(ops.cleared, cleared, "{caller}, {case}");
             }
             assert_eq!(released.is_ok(), restore_ok, "release_all, {case}");
-            assert_eq!(disengaged.is_ok(), restore_ok && drop_ok, "disengage_lockdown, {case}");
+            assert_eq!(disengaged.is_ok(), restore_ok, "disengage_lockdown, {case}");
         }
     }
 }
@@ -404,5 +476,29 @@ fn a_record_that_could_not_be_read_still_drives_a_restore_of_the_host() {
 
     recover_cover_with(unreadable(), false, &mut ops);
 
-    assert_eq!(ops.restores, vec![(None, false)]);
+    assert_eq!(ops.restores.len(), 1);
+    assert!(
+        ops.restores[0].0.is_err(),
+        "an unread record names no token: {:?}",
+        ops.restores
+    );
+    assert!(!ops.restores[0].1);
+}
+
+/// A record naming a token pf no longer holds (a reboot reset it) fails `pfctl -X` on every sweep. The sweep clears the
+/// record all the same, or it would meet the same failure on every start.
+#[skuld::test]
+fn a_sweep_clears_a_transient_record_naming_a_token_pf_no_longer_holds() {
+    let mut ops = RecordingPfOps {
+        fail_drop_token: true,
+        ..Default::default()
+    };
+
+    recover_cover_with(
+        StateFile::Present(recorded_cover("111")),
+        false,
+        &mut PfRecover(&mut ops),
+    );
+
+    assert_eq!(ops.log, vec!["reload_default", "drop_token", "clear_transient"]);
 }

@@ -50,17 +50,18 @@
 //!   — across a reboot, but the state file persists), so a reconnect re-enables
 //!   pf and loads a live ruleset instead of an inert one.
 //!
-//! - **Release order.** A release restores the host first, then drops the cover's
-//!   `pfctl -E` token, and only then clears the record that names it. The two escapes
-//!   (`release_all`, `disengage_lockdown`) drop the token whatever the restore did,
-//!   so a failed restore never keeps the host blocked, and clear the record whatever
-//!   the drop did once the restore held: a record naming a token pf no longer holds
-//!   fails `pfctl -X` on every retry, and keeping it would be a lockout
-//!   ([`release_escape`]). The transient cover's own `Drop` and `recover_cover` keep
-//!   a stricter order: a restore that fails keeps both, and a drop that fails keeps
-//!   the record ([`settle`]). An engage whose record write replaced one naming
-//!   another token drops that token ([`drop_displaced`]). Every one of these runs
-//!   under the cover lock; the record rules are in [`super::pf_record`].
+//! - **Release order.** A release restores the host, then drops the cover's `pfctl -E`
+//!   token, then clears the record that names it ([`release`]). Once the restore held, the
+//!   record is cleared whatever the drop did: the code cannot tell a token a reboot retired
+//!   from a real failure, and a record that waits on a drop that always fails is a lockout.
+//!   A failed drop is only logged; the refcount stays until a reboot resets it. A failed
+//!   restore keeps the record and is the release's error. It also keeps the token for
+//!   `recover_cover` and the transient guard's `Drop` (next sweep), and drops it for the
+//!   escapes (`release_all`, `disengage_lockdown`), so a failed restore does not keep pf
+//!   enabled over the host. Dropping Hole's token releases Hole's hold only: the block
+//!   lifts when no other refcount keeps pf enabled. An engage whose record write replaced
+//!   one naming another token drops that token ([`drop_displaced`]). Every one of these
+//!   runs under the cover lock; the record rules are in [`super::pf_record`].
 //!
 //! Documented caveats (pf has no programmatic API — `pfctl` text I/O IS the
 //! interface, as `netsh`/`route` are for routing):
@@ -86,7 +87,7 @@ use util::system_tool::SystemTool;
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
-use super::pf_record::{self, Cleared, PfRecord};
+use super::pf_record::{self, Cleared};
 use super::Clearance;
 use super::StateFile;
 use super::SweepOutcome;
@@ -459,7 +460,7 @@ impl Held {
     fn disengage(&self, kind: CoverKind) {
         match kind {
             // A user-stop drop never has a standing cover being adopted.
-            CoverKind::Transient => disengage(Some(&self.token), &self.state_dir, false),
+            CoverKind::Transient => disengage(&self.token, &self.state_dir),
             CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
         }
     }
@@ -776,52 +777,42 @@ fn drop_refcount_or_warn<P: Phase>(token: &str, phase: P, message: &str) {
 /// it. When a standing cover is being adopted the reload is skipped, because it would wipe the standing lockdown ruleset
 /// (the live main ruleset) before Adopt.
 ///
-/// The token is dropped, and the record cleared, only once the restore is confirmed: a failed (but not adopting)
-/// restore leaves both, so the next sweep still sees a cover rather than a clean host over a block. The record goes
-/// only after the token is dropped ([`settle`]), so a drop that fails leaves it for the next sweep. Shared by `Drop`,
-/// `recover_cover` and the transient engage's back-out. These are not the escapes: `release_all` is what lets the
-/// user out of a record this leaves behind.
-fn disengage_with(token: Option<&str>, adopting: bool, ops: &mut dyn PfOps) {
-    if adopting {
+/// A failed restore keeps the token and the record, so the next sweep still sees a cover rather than a clean host over
+/// a block ([`OnFailedRestore::KeepToken`]). Shared by `Drop`, `recover_cover` and the transient engage's back-out.
+/// These are not the escapes: `release_all` is what lets the user out of a record this leaves behind.
+fn disengage_with(token: Result<Option<&str>, RoutingError>, adopting: bool, ops: &mut dyn PfOps) {
+    let restored = if adopting {
         tracing::info!("standing lockdown cover being adopted; skipping /etc/pf.conf reload during transient sweep");
-    } else if let Err(e) = ops.reload_default() {
+        Ok(())
+    } else {
+        ops.reload_default()
+    };
+    if let Err(e) = release(ops, CoverKind::Transient, token, restored, OnFailedRestore::KeepToken) {
         tracing::warn!(
             error = &e as &dyn std::error::Error,
-            "pf ruleset restore failed during cover disengage"
-        );
-        tracing::warn!(
-            "leaving failclosed-state file in place: the /etc/pf.conf restore did not confirm — clearing it \
-             now would make the next sweep read a clean host while the block persists"
-        );
-        return;
-    }
-    if let Err(e) = settle(ops, CoverKind::Transient, token) {
-        tracing::warn!(
-            error = &e as &dyn std::error::Error,
-            "the transient cover's token could not be settled during cover disengage; it is left for recovery"
+            "the transient cover was not released during cover disengage; its record is left for recovery"
         );
     }
 }
 
-/// [`disengage_with`] over the real `pfctl` and record.
-fn disengage(token: Option<&str>, state_dir: &Path, adopting: bool) {
-    disengage_with(token, adopting, &mut RealPfOps { state_dir });
+/// [`disengage_with`] over the real `pfctl` and record, for the cover whose token is `token`.
+fn disengage(token: &str, state_dir: &Path) {
+    disengage_with(Ok(Some(token)), false, &mut RealPfOps { state_dir });
 }
 
 /// Seam over the one mutation [`recover_cover`] performs, so its trichotomy
 /// over the persisted record is table-tested without shelling out to `pfctl`.
 pub(crate) trait RecoverOps {
-    /// [`disengage`]: restore the replacement ruleset, drop `token`'s pf enable
-    /// refcount when one is on record, and clear the state file on a confirmed
-    /// restore.
-    fn restore(&mut self, token: Option<&str>, adopting: bool);
+    /// [`disengage_with`]: restore the replacement ruleset, drop the token the record names, and clear the record on
+    /// a confirmed restore. `token` is [`StateFile::release_token`]'s answer.
+    fn restore(&mut self, token: Result<Option<&str>, RoutingError>, adopting: bool);
 }
 
 pub fn recover_cover(state_dir: &Path, adopting: bool) {
     recover_cover_with(
         pf_record::read::<state::FailClosedState>(state_dir),
         adopting,
-        &mut RealRecoverOps { state_dir },
+        &mut PfRecover(&mut RealPfOps { state_dir }),
     );
 }
 
@@ -836,41 +827,34 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// declining to act, and only the manual `bridge unlock` left to escape — the
 /// same conflation `release_all_with` already refuses to make.
 fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, ops: &mut dyn RecoverOps) {
-    match file {
-        StateFile::Absent => tracing::debug!("no failclosed-state file, nothing to recover"),
-        StateFile::Present(st) => {
-            tracing::info!(
-                was_enabled = ?st.pf_was_enabled,
-                "recovering fail-closed cover from crashed run"
-            );
-            ops.restore(Some(&st.pf_token), adopting);
+    match &file {
+        StateFile::Absent => {
+            tracing::debug!("no failclosed-state file, nothing to recover");
+            return;
         }
-        StateFile::Unusable { pf_token } => {
-            tracing::warn!(
-                token_salvaged = pf_token.is_some(),
-                "failclosed-state file is unusable; recovering the cover anyway — an unreadable \
-                 record is not evidence there is no cover to clear"
-            );
-            ops.restore(pf_token.as_deref(), adopting);
-        }
-        StateFile::Unreadable => {
-            tracing::warn!(
-                "failclosed-state file could not be read; recovering the cover anyway — an unreadable \
-                 record is not evidence there is no cover to clear"
-            );
-            ops.restore(None, adopting);
-        }
+        StateFile::Present(st) => tracing::info!(
+            was_enabled = ?st.pf_was_enabled,
+            "recovering fail-closed cover from crashed run"
+        ),
+        StateFile::Unusable { pf_token } => tracing::warn!(
+            token_salvaged = pf_token.is_some(),
+            "failclosed-state file is unusable; recovering the cover anyway — an unreadable record is not evidence \
+             there is no cover to clear"
+        ),
+        StateFile::Unreadable => tracing::warn!(
+            "failclosed-state file could not be read; recovering the cover anyway — an unreadable record is not \
+             evidence there is no cover to clear"
+        ),
     }
+    ops.restore(file.release_token(), adopting);
 }
 
-/// Production [`RecoverOps`]: the real [`disengage`].
-struct RealRecoverOps<'a> {
-    state_dir: &'a Path,
-}
+/// Production [`RecoverOps`]: [`disengage_with`] over a [`PfOps`].
+struct PfRecover<'a>(&'a mut dyn PfOps);
 
-impl RecoverOps for RealRecoverOps<'_> {
-    fn restore(&mut self, token: Option<&str>, adopting: bool) {
-        disengage(token, self.state_dir, adopting);
+impl RecoverOps for PfRecover<'_> {
+    fn restore(&mut self, token: Result<Option<&str>, RoutingError>, adopting: bool) {
+        disengage_with(token, adopting, self.0);
     }
 }
 
@@ -1079,7 +1063,8 @@ pub fn engage_lockdown(
 /// done nothing. A restore that fails propagates the error and LEAVES the
 /// state file in place, so a retry (or the next start) still sees the cover
 /// rather than reading "disengaged" while the block persists; the pf token is
-/// dropped all the same ([`release_escape`]).
+/// dropped all the same ([`release`]). A token that fails to drop is logged and is
+/// not the answer: it blocks nothing.
 ///
 /// Caveat: pf exposes no dump of prior `set` options, so the restore reloads the
 /// host's filter+nat rules under pf defaults (same class of limitation the
@@ -1141,12 +1126,15 @@ fn disengage_lockdown_with(
         _ => ops.reload_default(),
     };
 
-    // The escape hatch (`bridge unlock`, the intent-off sweep). It drops the pf refcount token the record names, an
-    // UNUSABLE record's included, whatever the restore did, and clears the record once the restore held, whatever the
-    // drop did: a record naming a token pf no longer holds fails `pfctl -X` on every retry, so keeping it would lock
-    // the user out. A drop that failed is the one error the user is told, once; the retry finds the record gone. A
-    // record that cannot be read stays and says so.
-    release_escape(ops, CoverKind::Lockdown, &st, restored, DropFailure::Propagate)
+    // The escape hatch (`bridge unlock`, the intent-off sweep): it drops the token the record names, an UNUSABLE
+    // record's included, whatever the restore did.
+    release(
+        ops,
+        CoverKind::Lockdown,
+        st.release_token(),
+        restored,
+        OnFailedRestore::DropToken,
+    )
 }
 
 /// Fold the two independent presence sources into one answer. `pf_label` is
@@ -1226,8 +1214,8 @@ pub(crate) trait PfOps {
     fn reload_default(&mut self) -> Result<(), RoutingError>;
     /// `pfctl -f -` with `text` on stdin: load a specific ruleset.
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
-    /// `pfctl -X <token>`: drop a pf enable refcount. What a failure does is
-    /// the caller's choice ([`DropFailure`]); no caller may discard it unlogged.
+    /// `pfctl -X <token>`: drop a pf enable refcount. A failure is logged by [`release`] and is never a release's
+    /// error.
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
     /// Clear the transient cover's record that a release settled under `token`
     /// ([`pf_record::clear_if_token`]): only a record naming it. What it found is a
@@ -1239,7 +1227,7 @@ pub(crate) trait PfOps {
 
 /// The disclosure for an unusable record that yielded no token at all — the
 /// one case where nothing can be done about the refcount. Shared by
-/// [`clear_record`], so every sweep discloses the same leak the same way.
+/// [`clear_record`], so every release discloses the same leak the same way.
 fn warn_unsalvageable_token(what: &str) {
     tracing::warn!(
         "{what} file is unusable and no pf token could be read out of it — a pf enable refcount \
@@ -1270,84 +1258,72 @@ fn refused(cleared: Cleared) -> Result<(), RoutingError> {
     cleared.refusal().map_or(Ok(()), Err)
 }
 
-/// Clear the record that names `token`. A clear that could not write is warned and left for recovery: the host is
-/// already restored.
+/// Clear the record that names `token`. A write that fails is the cover's error: the host is restored and a record
+/// still stands over it.
 fn clear_record(ops: &mut dyn PfOps, kind: CoverKind, token: Option<&str>) -> Result<(), RoutingError> {
-    match clear(kind, ops, token) {
+    match clear(kind, ops, token)? {
         // An unusable file that named no token: nothing was dropped, only a file cleared.
-        Ok(Cleared::Removed) if token.is_none() => {
+        Cleared::Removed if token.is_none() => {
             warn_unsalvageable_token(what(kind));
             Ok(())
         }
-        Ok(cleared) => refused(cleared),
-        Err(e) => {
-            tracing::warn!(
-                error = &e as &dyn std::error::Error,
-                "{} clear failed after its restore; it is left for recovery",
-                what(kind)
-            );
-            Ok(())
+        cleared => refused(cleared),
+    }
+}
+
+/// What [`release`] does with a cover's token when the restore failed.
+#[derive(Clone, Copy)]
+enum OnFailedRestore {
+    /// Drop it: a failed restore must not keep pf enabled over the host. The escapes.
+    DropToken,
+    /// Keep it with the record, for the next sweep. `recover_cover` and the transient guard's `Drop`.
+    KeepToken,
+}
+
+impl OnFailedRestore {
+    fn drops_the_token(self) -> bool {
+        match self {
+            OnFailedRestore::DropToken => true,
+            OnFailedRestore::KeepToken => false,
         }
     }
 }
 
-/// Settle a cover's pf enable token once its host is restored, for the callers that are not an escape: drop the
-/// refcount, then clear the record that names it, in that order, so a drop that fails leaves the record for the next
-/// sweep. A record the clear could not read stays and is an error, never a false success.
-fn settle(ops: &mut dyn PfOps, kind: CoverKind, token: Option<&str>) -> Result<(), RoutingError> {
-    if let Some(token) = token {
-        ops.drop_token(token)?;
-    }
-    clear_record(ops, kind, token)
-}
-
-/// What a failed `pfctl -X` does to the answer of a [`release_escape`]. It is warned either way.
-enum DropFailure {
-    /// The host is restored, and a refcount that would not drop is for the log.
-    Warn,
-    /// A caller who asked to be let out is told, once, that the refcount could not be released.
-    Propagate,
-}
-
-/// The release of one cover by an escape (`release_all`, `disengage_lockdown`), after its restore was attempted.
+/// The release of one cover, after its restore was attempted. `token` is [`StateFile::release_token`]'s answer.
 ///
-/// The token `file` names is dropped whatever the restore did: a failed restore must not keep pf enabled over the
-/// host. The record is cleared only when the restore held, whatever the drop did: a record naming a token pf does not
-/// hold fails `pfctl -X` on every retry, so keeping it would lock the user out. After a failed restore the record
-/// stays with a token already dropped; the retry's drop fails on it, and the retry clears all the same.
+/// The token is dropped after a good restore, and after a failed one when `on_failed_restore` says so. A drop that
+/// fails is logged and nothing else: pf may have retired the token (a reboot), the code cannot tell that from a real
+/// failure, and a record that waited on a drop that always fails would be a lockout. A failed restore is the error and
+/// keeps the record. A good one clears the record, whatever the drop did; a clear that cannot write is the error.
 ///
-/// A record that could not be read has no token to drop or clear by, and a clear keyed to "no token" would call a
-/// record that has since become readable not ours. It stays, and the answer is the unread-record error, never
-/// success, whatever a later read finds.
-fn release_escape<R: PfRecord>(
+/// A record that could not be read has no token to drop or clear by. The host is restored all the same, and the
+/// answer is the refusal, never success.
+fn release(
     ops: &mut dyn PfOps,
     kind: CoverKind,
-    file: &StateFile<R>,
+    token: Result<Option<&str>, RoutingError>,
     restored: Result<(), RoutingError>,
-    on_drop_failure: DropFailure,
+    on_failed_restore: OnFailedRestore,
 ) -> Result<(), RoutingError> {
-    let token = match file {
-        StateFile::Unreadable => {
+    let token = match token {
+        Ok(token) => token,
+        Err(unread) => {
             restored?;
-            return refused(Cleared::Kept);
+            return Err(unread);
         }
-        StateFile::Absent | StateFile::Unusable { .. } | StateFile::Present(_) => file.pf_token(),
     };
-    let dropped = token.map_or(Ok(()), |token| ops.drop_token(token));
-    if let Err(e) = &dropped {
-        tracing::warn!(
-            error = e as &dyn std::error::Error,
-            "pfctl -X failed releasing the {} pf refcount",
-            what(kind)
-        );
+    if restored.is_ok() || on_failed_restore.drops_the_token() {
+        if let Some(Err(e)) = token.map(|token| ops.drop_token(token)) {
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "pfctl -X failed releasing the {} pf refcount; pf keeps it until a reboot resets it, and with the host's rules \
+                 restored it blocks nothing",
+                what(kind)
+            );
+        }
     }
     restored?;
-    clear_record(ops, kind, token)?;
-    match (dropped, on_drop_failure) {
-        (Ok(()), _) => Ok(()),
-        (Err(_), DropFailure::Warn) => Ok(()),
-        (Err(e), DropFailure::Propagate) => Err(e),
-    }
+    clear_record(ops, kind, token)
 }
 
 /// The unconditional two-cover clear, factored as a pure sequencer over an
@@ -1357,7 +1333,7 @@ fn release_escape<R: PfRecord>(
 /// Two blocks, one error per cover, no `?` — a `?` would short-circuit the block
 /// that had not run yet. Each block's failure decides only its own cover's
 /// release. Each cover is restored, then its token dropped, then its record
-/// cleared ([`finish_release`]).
+/// cleared ([`release`]).
 pub(crate) fn release_all_with(
     transient: StateFile<state::FailClosedState>,
     standing: StateFile<lockdown_state::LockdownPfState>,
@@ -1370,11 +1346,25 @@ pub(crate) fn release_all_with(
         StateFile::Absent => None,
         StateFile::Present(_) => {
             let restored = ops.reload_default();
-            release_escape(ops, CoverKind::Transient, &transient, restored, DropFailure::Warn).err()
+            release(
+                ops,
+                CoverKind::Transient,
+                transient.release_token(),
+                restored,
+                OnFailedRestore::DropToken,
+            )
+            .err()
         }
         StateFile::Unusable { .. } => {
             let restored = ops.reload_default();
-            release_escape(ops, CoverKind::Transient, &transient, restored, DropFailure::Warn).err()
+            release(
+                ops,
+                CoverKind::Transient,
+                transient.release_token(),
+                restored,
+                OnFailedRestore::DropToken,
+            )
+            .err()
         }
         StateFile::Unreadable => {
             tracing::warn!(
@@ -1382,7 +1372,14 @@ pub(crate) fn release_all_with(
                  an unreadable record is not evidence there is no cover to clear"
             );
             let restored = ops.reload_default();
-            release_escape(ops, CoverKind::Transient, &transient, restored, DropFailure::Warn).err()
+            release(
+                ops,
+                CoverKind::Transient,
+                transient.release_token(),
+                restored,
+                OnFailedRestore::DropToken,
+            )
+            .err()
         }
     };
 
@@ -1394,7 +1391,14 @@ pub(crate) fn release_all_with(
             // `LockdownPfState::main_snapshot_captured`. Loading the empty one
             // would leave a pass-all host.
             let restored = ops.reload_default();
-            release_escape(ops, CoverKind::Lockdown, &standing, restored, DropFailure::Warn).err()
+            release(
+                ops,
+                CoverKind::Lockdown,
+                standing.release_token(),
+                restored,
+                OnFailedRestore::DropToken,
+            )
+            .err()
         }
         StateFile::Present(st) => {
             let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
@@ -1415,7 +1419,14 @@ pub(crate) fn release_all_with(
                     ))),
                 },
             };
-            release_escape(ops, CoverKind::Lockdown, &standing, restored, DropFailure::Warn).err()
+            release(
+                ops,
+                CoverKind::Lockdown,
+                standing.release_token(),
+                restored,
+                OnFailedRestore::DropToken,
+            )
+            .err()
         }
         StateFile::Unusable { .. } => {
             tracing::warn!(
@@ -1423,7 +1434,14 @@ pub(crate) fn release_all_with(
                  the default ruleset"
             );
             let restored = ops.reload_default();
-            release_escape(ops, CoverKind::Lockdown, &standing, restored, DropFailure::Warn).err()
+            release(
+                ops,
+                CoverKind::Lockdown,
+                standing.release_token(),
+                restored,
+                OnFailedRestore::DropToken,
+            )
+            .err()
         }
         StateFile::Unreadable => {
             tracing::warn!(
@@ -1431,7 +1449,14 @@ pub(crate) fn release_all_with(
                  the default ruleset"
             );
             let restored = ops.reload_default();
-            release_escape(ops, CoverKind::Lockdown, &standing, restored, DropFailure::Warn).err()
+            release(
+                ops,
+                CoverKind::Lockdown,
+                standing.release_token(),
+                restored,
+                OnFailedRestore::DropToken,
+            )
+            .err()
         }
     };
 
@@ -1513,7 +1538,7 @@ impl EngageOps for RealEngageOps<'_> {
     }
 
     fn transient_restore(&mut self, token: &str) {
-        disengage(Some(token), self.state_dir, false);
+        disengage(token, self.state_dir);
     }
 }
 

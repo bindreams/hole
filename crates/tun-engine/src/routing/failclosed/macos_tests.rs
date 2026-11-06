@@ -780,12 +780,15 @@ fn output_with_status(code: i32) -> Result<std::process::Output, RoutingError> {
 /// merely that it did something.
 #[derive(Default)]
 struct RecordingRecoverOps {
-    restores: Vec<(Option<String>, bool)>,
+    restores: Vec<(Result<Option<String>, String>, bool)>,
 }
 
 impl RecoverOps for RecordingRecoverOps {
-    fn restore(&mut self, token: Option<&str>, adopting: bool) {
-        self.restores.push((token.map(str::to_owned), adopting));
+    fn restore(&mut self, token: Result<Option<&str>, RoutingError>, adopting: bool) {
+        self.restores.push((
+            token.map(|token| token.map(str::to_owned)).map_err(|e| e.to_string()),
+            adopting,
+        ));
     }
 }
 
@@ -812,7 +815,7 @@ fn recover_cover_with_no_state_file_does_nothing() {
 fn recover_cover_with_a_recorded_cover_restores_and_drops_its_token() {
     let mut ops = RecordingRecoverOps::default();
     recover_cover_with(StateFile::Present(recorded_cover("42")), true, &mut ops);
-    assert_eq!(ops.restores, vec![(Some("42".to_owned()), true)]);
+    assert_eq!(ops.restores, vec![(Ok(Some("42".to_owned())), true)]);
 }
 
 /// An UNREADABLE record is a cover to clear, not an absence.
@@ -829,7 +832,7 @@ fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
     recover_cover_with(unusable(), false, &mut ops);
     assert_eq!(
         ops.restores,
-        vec![(None, false)],
+        vec![(Ok(None), false)],
         "an unreadable failclosed-state file must still drive a restore — with no token to drop, \
          but never as a no-op"
     );
@@ -841,7 +844,7 @@ fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
 /// Version skew — the reachable vector — reaches `Unusable` only AFTER
 /// `serde_json` produced a complete record whose token is intact; the version
 /// check is the last thing to reject it. Dropping the record there discards the
-/// only copy of the `pfctl -E` ticket that exists, and `disengage(None, ..)`
+/// only copy of the `pfctl -E` ticket that exists, and `disengage_with(Ok(None), ..)`
 /// then skips `pfctl -X` and, on a confirmed restore, CLEARS the file — so
 /// pf stays enabled until reboot with nothing left to release it.
 #[skuld::test]
@@ -856,7 +859,7 @@ fn recover_cover_with_an_unusable_record_still_drops_the_token_it_could_read() {
     );
     assert_eq!(
         ops.restores,
-        vec![(Some("7".to_owned()), false)],
+        vec![(Ok(Some("7".to_owned())), false)],
         "a token salvaged from an unusable record is the only one there is — the restore must be \
          handed it, or the pf enable refcount leaks permanently"
     );
@@ -909,7 +912,7 @@ fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
     recover_cover_with(file, false, &mut ops);
     assert_eq!(
         ops.restores,
-        vec![(Some("7".to_owned()), false)],
+        vec![(Ok(Some("7".to_owned())), false)],
         "a record this binary cannot read must still drive a restore — AND with the `pf_token` \
          that record plainly still contains, which is the only copy of the pf enable ticket left"
     );
@@ -1750,38 +1753,29 @@ fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
-fn release_all_logs_a_swallowed_transient_clear_failure_but_still_reports_ok() {
-    // clear_transient/clear_standing are best-effort (contract item 5): a
-    // failure there must not fail the call, but it also must not vanish
-    // silently — every sibling caller of the same underlying clear
-    // (`disengage`, `disengage_lockdown`) logs on failure.
+fn release_all_reports_a_transient_clear_failure() {
     let mut ops = RecordingPfOps {
         fail_clear_transient: true,
         ..Default::default()
     };
     let result = release_all_with(StateFile::Present(transient_state()), StateFile::Absent, &mut ops).into_result();
     assert!(
-        result.is_ok(),
-        "a failed state-file clear must not fail the call: {result:?}"
-    );
-    assert!(
-        ops.log.contains(&"clear_transient"),
-        "the clear must still be attempted"
+        result.is_err(),
+        "a record left over a restored host is the cover's error, not a success: {result:?}"
     );
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
-fn release_all_logs_a_swallowed_standing_clear_failure_but_still_reports_ok() {
+fn release_all_reports_a_standing_clear_failure() {
     let mut ops = RecordingPfOps {
         fail_clear_standing: true,
         ..Default::default()
     };
     let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops).into_result();
     assert!(
-        result.is_ok(),
-        "a failed state-file clear must not fail the call: {result:?}"
+        result.is_err(),
+        "a record left over a restored host is the cover's error, not a success: {result:?}"
     );
-    assert!(ops.log.contains(&"clear_standing"), "the clear must still be attempted");
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
@@ -1789,7 +1783,7 @@ fn release_all_logs_every_failed_token_drop_instead_of_discarding_it() {
     // `release_all` is the emergency clear-every-cover path (`bridge unlock`,
     // the crash-recovery sweep), so a pf enable refcount that fails to drop
     // here leaks exactly as it would anywhere else. Non-propagation is the
-    // documented contract (`DropFailure::Warn`); silence is not — a `let _ =`
+    // documented contract (a failed drop is logged, never the release's error); silence is not — a `let _ =`
     // leaves the operator no trace that pf stayed enabled. Each cover has its
     // own message so a warn in the log still says which one it came from.
     use tracing_subscriber::layer::{Layer, SubscriberExt};
