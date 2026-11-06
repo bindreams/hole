@@ -2151,6 +2151,16 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
     );
 }
 
+// The best-effort disengage must run macOS's own sweep. Through the cfg-dispatched facade, a build of this module
+// on another host would run that host's sweep (the WFP one on Windows) instead of reaching the `pfctl` stub.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test(should_panic = "pfctl exists only on macOS")]
+fn lockdown_disengage_runs_this_modules_sweep_not_the_facades() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = CoverLock::acquire(tmp.path());
+    lockdown_disengage(&lock);
+}
+
 // The order a release and an engage work in, as whole operations over the doubles above.
 #[path = "macos_matrix_tests.rs"]
 mod macos_matrix_tests;
