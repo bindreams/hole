@@ -258,14 +258,14 @@ fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
 }
 
 /// Apply a sweep's [`WitnessUpdate`], decided against the record as it is NOW; the read and the write are one
-/// `update`. The caller's sweep holds the cover lock, so no engage or other sweep writes the record in between.
-pub(crate) fn apply(state_dir: &Path, update: WitnessUpdate, owner: Option<(u32, u32)>) {
+/// `update`.
+pub(crate) fn apply(lock: &CoverLock, update: WitnessUpdate, owner: Option<(u32, u32)>) {
     // `Leave` writes nothing for any record, so it must not even open the directory.
     if update == WitnessUpdate::Leave {
         return;
     }
     let mut decided = None;
-    let written = file(state_dir).update(&DefaultPlacement { owner }, |now| {
+    let written = file(lock.state_dir()).update(&DefaultPlacement { owner }, |now| {
         match next_record(arming_of(&now.loaded), update) {
             Some(armed) => {
                 decided = Some(armed);

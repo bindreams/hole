@@ -31,7 +31,7 @@ impl FakeCover {
 impl Drop for FakeCover {
     fn drop(&mut self) {
         let deleted = Rc::clone(&self.deleted);
-        self.stamp.release_on_drop(move || deleted.set(deleted.get() + 1));
+        self.stamp.release_on_drop(move |_| deleted.set(deleted.get() + 1));
     }
 }
 
@@ -107,8 +107,8 @@ fn a_stale_stamp_releases_nothing() {
     let b = lock.stamp_install(CoverKind::Lockdown);
 
     let mut ran = Vec::new();
-    a.release_on_drop(|| ran.push("a"));
-    b.release_on_drop(|| ran.push("b"));
+    a.release_on_drop(|_| ran.push("a"));
+    b.release_on_drop(|_| ran.push("b"));
 
     assert_eq!(ran, ["b"]);
 }
@@ -258,7 +258,7 @@ fn a_cover_dropped_on_another_thread_waits_for_the_lock() {
         let deleted = &deleted;
         let dropper = scope.spawn(move || {
             dropping_tx.send(()).unwrap();
-            stamp.release_on_drop(|| deleted.lock().unwrap().push("delete"));
+            stamp.release_on_drop(|_| deleted.lock().unwrap().push("delete"));
         });
         dropping_rx.recv().unwrap();
         deleted.lock().unwrap().push("holder done");
@@ -267,6 +267,40 @@ fn a_cover_dropped_on_another_thread_waits_for_the_lock() {
     });
 
     assert_eq!(*deleted.lock().unwrap(), ["holder done", "delete"]);
+}
+
+#[skuld::test]
+fn a_drop_hands_its_delete_the_lock_of_the_stamps_directory() {
+    let d = dir();
+    let stamp = CoverLock::acquire(d.path()).stamp_install(CoverKind::Transient);
+    let mut seen = Vec::new();
+
+    // Outside a section the drop acquires the lock for the delete.
+    stamp.release_on_drop(|lock| seen.push((lock.state_dir().to_owned(), held_by_this_thread(lock.slot))));
+    // Inside one it passes down a view of the lock this thread holds.
+    let held = CoverLock::acquire(d.path());
+    stamp.release_on_drop(|lock| seen.push((lock.state_dir().to_owned(), held_by_this_thread(lock.slot))));
+    drop(held);
+
+    assert_eq!(seen, vec![(d.path().to_owned(), true); 2]);
+    assert!(!held_by_this_thread(slot(d.path())), "neither drop left the lock held");
+}
+
+#[skuld::test]
+fn dropping_a_view_of_the_held_lock_leaves_the_lock_held() {
+    let d = dir();
+    let lock = CoverLock::acquire(d.path());
+
+    drop(CoverLock::view_of_held(lock.slot));
+
+    assert!(
+        held_by_this_thread(lock.slot),
+        "the view's drop left the thread's claim on the lock"
+    );
+    assert!(
+        matches!(lock.slot.lock.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+        "the view's drop left the mutex held, so another thread's acquire still blocks"
+    );
 }
 
 #[skuld::test]

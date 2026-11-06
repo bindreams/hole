@@ -1,6 +1,5 @@
 use super::*;
 use std::net::IpAddr;
-use std::path::PathBuf;
 
 use pf_record::PfRecord;
 
@@ -1308,7 +1307,8 @@ fn what_an_engage_persists_parses_under_the_previous_releases_schema() {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        pf_record::swap(dir.path(), saved, None).expect("persist");
+        let lock = CoverLock::acquire(dir.path());
+        pf_record::swap(&lock, saved, None).expect("persist");
         let bytes = std::fs::read(dir.path().join(state::STATE_FILE_NAME)).unwrap();
         let parsed = serde_json::from_slice::<PreviousReleaseFailClosedState>(&bytes);
         assert!(
@@ -1421,7 +1421,7 @@ fn drop_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
 /// no-short-circuit property, and the clear-only-on-confirm rule are
 /// table-tested without shelling out to `pfctl`.
 #[derive(Default)]
-struct RecordingPfOps {
+struct RecordingPfOps<'a> {
     log: Vec<&'static str>,
     /// Every token handed to `drop_token`, so WHICH refcount was released is
     /// assertable and not merely that one was.
@@ -1441,20 +1441,21 @@ struct RecordingPfOps {
     /// The state dir whose real records the clears act on, and `drop_token` reads: it fails the test when a
     /// record still names the token being dropped, the one thing a call-order assertion cannot show (a crash between
     /// the drop and the write leaves exactly that record).
-    records: Option<PathBuf>,
+    records: Option<&'a CoverLock>,
 }
 
-impl RecordingPfOps {
-    /// A double over real records in `dir`.
-    fn over_records(dir: &Path) -> Self {
+impl<'a> RecordingPfOps<'a> {
+    /// A double over the real records in `lock`'s state dir.
+    fn over_records(lock: &'a CoverLock) -> Self {
         Self {
-            records: Some(dir.to_owned()),
+            records: Some(lock),
             ..Default::default()
         }
     }
 
     fn assert_no_record_names(&self, token: &str) {
-        let Some(dir) = &self.records else { return };
+        let Some(lock) = self.records else { return };
+        let dir = lock.state_dir();
         let named = [
             pf_record::read::<state::FailClosedState>(dir)
                 .pf_token()
@@ -1472,7 +1473,7 @@ impl RecordingPfOps {
     }
 }
 
-impl PfOps for RecordingPfOps {
+impl PfOps for RecordingPfOps<'_> {
     fn reload_default(&mut self) -> Result<(), RoutingError> {
         let earlier_reloads = self.log.iter().filter(|call| **call == "reload_default").count();
         self.log.push("reload_default");
@@ -1508,7 +1509,7 @@ impl PfOps for RecordingPfOps {
         self.cleared.push(token.map(str::to_owned));
         match (&self.records, self.fail_clear_transient) {
             (_, true) => Err(RoutingError::RouteSetup("mock clear_transient failure".into())),
-            (Some(dir), false) => RealPfOps { state_dir: dir }.clear_transient(token),
+            (Some(lock), false) => RealPfOps { lock }.clear_transient(token),
             (None, false) => Ok(self.cleared_as.unwrap_or(Cleared::Removed)),
         }
     }
@@ -1518,7 +1519,7 @@ impl PfOps for RecordingPfOps {
         self.cleared.push(token.map(str::to_owned));
         match (&self.records, self.fail_clear_standing) {
             (_, true) => Err(RoutingError::RouteSetup("mock clear_standing failure".into())),
-            (Some(dir), false) => RealPfOps { state_dir: dir }.clear_standing(token),
+            (Some(lock), false) => RealPfOps { lock }.clear_standing(token),
             (None, false) => Ok(self.cleared_as.unwrap_or(Cleared::Removed)),
         }
     }
@@ -2063,10 +2064,11 @@ fn self_capture_persists_no_baseline_but_keeps_the_nat_rules() {
     // live host NAT (Internet Sharing, a VM bridge) the moment the cover
     // engages, with nothing on disk to restore it from.
     let tmp = tempfile::tempdir().unwrap();
+    let lock = CoverLock::acquire(tmp.path());
     let nat = "nat on en0 from any to any -> (en0)\n";
     let returned = persist_baseline(
         "tok",
-        tmp.path(),
+        &lock,
         None,
         CoverPresence::Live,
         "block drop out quick all label \"hole-lockdown\"\n".into(),
@@ -2095,9 +2097,10 @@ fn persisted(dir: &std::path::Path) -> lockdown_state::LockdownPfState {
 #[skuld::test]
 fn a_measured_clean_host_captures_its_baseline() {
     let tmp = tempfile::tempdir().unwrap();
+    let lock = CoverLock::acquire(tmp.path());
     let main = "scrub-anchor \"com.apple/*\" all fragment reassemble\n";
     let nat = "nat-anchor \"com.apple/*\" all\n";
-    persist_baseline("tok", tmp.path(), None, CoverPresence::Absent, main.into(), nat.into()).unwrap();
+    persist_baseline("tok", &lock, None, CoverPresence::Absent, main.into(), nat.into()).unwrap();
 
     let st = persisted(tmp.path());
     assert!(st.main_snapshot_captured);

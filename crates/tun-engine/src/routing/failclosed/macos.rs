@@ -440,7 +440,6 @@ pub struct Cover {
 /// What a live [`Cover`] must hand to its disengage.
 struct Held {
     token: String,
-    state_dir: std::path::PathBuf,
 }
 
 impl Cover {
@@ -462,11 +461,11 @@ impl Cover {
 }
 
 impl Held {
-    fn disengage(&self, kind: CoverKind) {
+    fn disengage(&self, kind: CoverKind, lock: &CoverLock) {
         match kind {
             // A user-stop drop never has a standing cover being adopted.
-            CoverKind::Transient => disengage(&self.token, &self.state_dir),
-            CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
+            CoverKind::Transient => disengage(&self.token, lock),
+            CoverKind::Lockdown => lockdown_disengage(lock),
         }
     }
 }
@@ -560,7 +559,7 @@ fn load_cover_ruleset<T: CoverRulesetOps + ?Sized>(
 /// [`EngageOps`] (its supertrait) so the one caller that only ever needs
 /// these two calls — `engage_lockdown`'s ruleset-load step — can be handed
 /// exactly this instead of standing up a full `EngageOps` implementation
-/// that also drags in `state_dir`/`owner` for methods it never calls.
+/// that also drags in `lock`/`owner` for methods it never calls.
 pub(crate) trait CoverRulesetOps {
     /// `pfctl -f -` with `text` on stdin.
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
@@ -582,7 +581,7 @@ pub(crate) trait EngageOps: CoverRulesetOps {
     fn enable_capture_token(&mut self) -> Result<String, RoutingError>;
     /// Write `bridge-failclosed.json`. Returns the token the record it replaced named, if any ([`pf_record::swap`]).
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError>;
-    /// The transient cover's full restore, `disengage(token, state_dir)`.
+    /// The transient cover's full restore, `disengage(token, lock)`.
     fn transient_restore(&mut self, token: &str);
 }
 
@@ -602,13 +601,9 @@ pub fn engage(
     resolver_ip: Option<IpAddr>,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    let state_dir = lock.state_dir();
-    let token = engage_with(server_ip, resolver_ip, &mut RealEngageOps { state_dir, owner })?;
+    let token = engage_with(server_ip, resolver_ip, &mut RealEngageOps { lock, owner })?;
     Ok(Cover {
-        held: Some(Held {
-            token,
-            state_dir: state_dir.to_owned(),
-        }),
+        held: Some(Held { token }),
         stamp: lock.stamp_install(CoverKind::Transient),
     })
 }
@@ -743,7 +738,8 @@ fn engage_with(
 impl Drop for Cover {
     fn drop(&mut self) {
         if let Some(held) = self.held.take() {
-            self.stamp.release_on_drop(|| held.disengage(self.stamp.kind()));
+            self.stamp
+                .release_on_drop(|lock| held.disengage(self.stamp.kind(), lock));
         }
     }
 }
@@ -787,15 +783,15 @@ fn disengage_with(token: Result<Option<&str>, RoutingError>, adopting: bool, ops
 }
 
 /// [`disengage_with`] over the real `pfctl` and record, for the cover whose token is `token`.
-fn disengage(token: &str, state_dir: &Path) {
-    disengage_with(Ok(Some(token)), false, &mut RealPfOps { state_dir });
+fn disengage(token: &str, lock: &CoverLock) {
+    disengage_with(Ok(Some(token)), false, &mut RealPfOps { lock });
 }
 
-pub fn recover_cover(state_dir: &Path, adopting: bool) {
+pub fn recover_cover(lock: &CoverLock, adopting: bool) {
     recover_cover_with(
-        pf_record::read::<state::FailClosedState>(state_dir),
+        pf_record::read::<state::FailClosedState>(lock.state_dir()),
         adopting,
-        &mut RealPfOps { state_dir },
+        &mut RealPfOps { lock },
     );
 }
 
@@ -845,13 +841,13 @@ fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, o
 /// it depends on no claim about `pfctl -sr`'s print format.
 fn capture_and_persist(
     token: &str,
-    state_dir: &Path,
+    lock: &CoverLock,
     owner: Option<(u32, u32)>,
 ) -> Result<(String, Option<String>), RoutingError> {
-    let presence = lockdown_cover_presence(state_dir);
+    let presence = lockdown_cover_presence(lock.state_dir());
     let main_snapshot = pfctl_stdout(pfctl(&["-sr"], None, FatalPhase::CoverEngage), "pfctl -sr")?;
     let nat_snapshot = pfctl_stdout(pfctl(&["-sn"], None, FatalPhase::CoverEngage), "pfctl -sn")?;
-    persist_baseline(token, state_dir, owner, presence, main_snapshot, nat_snapshot)
+    persist_baseline(token, lock, owner, presence, main_snapshot, nat_snapshot)
 }
 
 /// Persist the engage-time baseline. Pure over its inputs — the snapshots and
@@ -868,7 +864,7 @@ fn capture_and_persist(
 /// host NAT the moment the cover engages, with nothing on disk to restore from.
 fn persist_baseline(
     token: &str,
-    state_dir: &Path,
+    lock: &CoverLock,
     owner: Option<(u32, u32)>,
     presence: crate::routing::CoverPresence,
     main_snapshot: String,
@@ -882,7 +878,7 @@ fn persist_baseline(
         );
     }
     let displaced = pf_record::swap(
-        state_dir,
+        lock,
         &lockdown_state::LockdownPfState {
             pf_token: token.to_owned(),
             main_snapshot: if captured { main_snapshot } else { String::new() },
@@ -919,14 +915,13 @@ pub fn engage_lockdown(
     tun_name: &str,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    let state_dir = lock.state_dir();
     // The `pfctl -s info` read is decision-only — `LockdownPfState` records no
     // `pf_was_enabled` bit (unlike the transient `FailClosedState`).
     let info = pfctl_stdout(pfctl(&["-s", "info"], None, FatalPhase::CoverEngage), "pfctl -s info")?;
     let pf_enabled = parse_pf_enabled(&info);
     // The record as a `StateFile`: an unusable or unreadable one is no baseline to reuse, and its token is dropped when
     // the engage's own record replaces it.
-    let persisted = match pf_record::read::<lockdown_state::LockdownPfState>(state_dir) {
+    let persisted = match pf_record::read::<lockdown_state::LockdownPfState>(lock.state_dir()) {
         StateFile::Present(st) => Some(st),
         StateFile::Absent => None,
         StateFile::Unusable { .. } => None,
@@ -959,7 +954,7 @@ pub fn engage_lockdown(
                 // happened would restore an empty pass-all ruleset.
                 main_snapshot_captured: st.main_snapshot_captured,
             };
-            match pf_record::swap(state_dir, &fresh, owner) {
+            match pf_record::swap(lock, &fresh, owner) {
                 Ok(displaced) => drop_displaced(displaced.as_deref(), &token, |old| ops.drop_token(old)),
                 Err(e) => {
                     drop_or_warn(&token, "unwinding a failed lockdown re-enable", |t| ops.drop_token(t));
@@ -974,7 +969,7 @@ pub fn engage_lockdown(
             // The refcount is now held. Capture + persist may fail, so undo the
             // `-E` on any error before propagating — else the refcount leaks with
             // no state file to recover it from.
-            match capture_and_persist(&token, state_dir, owner) {
+            match capture_and_persist(&token, lock, owner) {
                 Ok((nat_snapshot, displaced)) => {
                     drop_displaced(displaced.as_deref(), &token, |old| ops.drop_token(old));
                     (token, nat_snapshot)
@@ -992,20 +987,17 @@ pub fn engage_lockdown(
     // [`purges_state`]'s decision rather than the absence of a call here. Only
     // `load_ruleset`/`flush_states` are needed here, so this passes the
     // narrow `CoverRulesetOps` seam (`RealCoverRulesetOps`) rather than
-    // standing up a full `RealEngageOps` with a `state_dir`/`owner` this call
+    // standing up a full `RealEngageOps` with a `lock`/`owner` this call
     // never reads.
     if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, &mut ops) {
         // Restore the host (the restore, the record's clear, the token's drop) before
         // failing, so a partially-loaded ruleset never strands the host.
-        lockdown_disengage(state_dir);
+        lockdown_disengage(lock);
         return Err(e);
     }
 
     Ok(Cover {
-        held: Some(Held {
-            token,
-            state_dir: state_dir.to_owned(),
-        }),
+        held: Some(Held { token }),
         stamp: lock.stamp_install(CoverKind::Lockdown),
     })
 }
@@ -1036,7 +1028,7 @@ pub fn engage_lockdown(
 /// survive a reboot at all — so every macOS cover key is
 /// [`super::KeyLifetime::Persistent`] and a disengage has nothing to leave
 /// unproven.
-pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> SweepOutcome {
+pub fn disengage_lockdown(lock: &CoverLock, _witness: super::ArmingWitness) -> SweepOutcome {
     // `Clearance::proven` on both arms: this platform has no boot-time key
     // class, so a macOS disengage carries nothing for the record to learn
     // from whether it succeeded or failed. The failing arm's clearance is
@@ -1047,8 +1039,8 @@ pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> S
     // ([`lockdown_presence_and_state`]), and the file is passed on as a
     // `StateFile`: collapsing `Unusable` to an absent record here would hide the
     // salvaged `pf_token` that [`disengage_lockdown_with`] hands `pfctl -X`.
-    let (presence, file) = lockdown_presence_and_state(state_dir);
-    let error = disengage_lockdown_with(presence, file, &mut RealPfOps { state_dir }).err();
+    let (presence, file) = lockdown_presence_and_state(lock.state_dir());
+    let error = disengage_lockdown_with(presence, file, &mut RealPfOps { lock }).err();
     SweepOutcome::per_kind(Clearance::proven(), [(CoverKind::Lockdown, error)])
 }
 
@@ -1134,11 +1126,11 @@ fn lockdown_presence_and_state(
 
 /// Best-effort wrapper for the standing guard's `Drop` (user-stop) and the engage's back-out: disengage and log.
 /// Neither has a caller to surface an error to.
-fn lockdown_disengage(state_dir: &Path) {
+fn lockdown_disengage(lock: &CoverLock) {
     // `Unset`: this platform arms no boot-time key
     // ([`STANDING_COVER_ARMS_BOOT_TIME`]), so there is never a record to
     // consult and the argument is inert.
-    match disengage_lockdown(state_dir, super::ArmingWitness::Unset).into_result() {
+    match disengage_lockdown(lock, super::ArmingWitness::Unset).into_result() {
         // Always `Clearance::proven` on macOS, and `Drop` has no reader for
         // it either way.
         Ok(_clearance_is_unconditional_here) => {}
@@ -1353,14 +1345,14 @@ pub(crate) fn release_all_with(
 /// Production [`PfOps`]: maps each method onto the existing `pfctl` helper,
 /// converting a non-success exit status into `Err`.
 struct RealPfOps<'a> {
-    state_dir: &'a Path,
+    lock: &'a CoverLock,
 }
 
 /// Production [`EngageOps`]: the same mapping for the engage layer, one
 /// [`FatalPhase::CoverEngage`] throughout — an engage is fail-fatal in both
 /// covers, unlike [`RealPfOps`]'s best-effort recovery phase.
 struct RealEngageOps<'a> {
-    state_dir: &'a Path,
+    lock: &'a CoverLock,
     owner: Option<(u32, u32)>,
 }
 
@@ -1420,17 +1412,17 @@ impl EngageOps for RealEngageOps<'_> {
     }
 
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError> {
-        pf_record::swap(self.state_dir, st, self.owner)
+        pf_record::swap(self.lock, st, self.owner)
             .map_err(|e| RoutingError::state_op_failed(StateOp::Write, "failclosed-state", &e))
     }
 
     fn transient_restore(&mut self, token: &str) {
-        disengage(token, self.state_dir);
+        disengage(token, self.lock);
     }
 }
 
 /// Production [`CoverRulesetOps`] for a bare ruleset-load-and-purge, with no
-/// `state_dir`/`owner` — unlike [`RealEngageOps`], which the `Lockdown` engage
+/// `lock`/`owner` — unlike [`RealEngageOps`], which the `Lockdown` engage
 /// path does not need for this step (see its call site in
 /// [`engage_lockdown`]).
 struct RealCoverRulesetOps;
@@ -1491,12 +1483,12 @@ impl PfOps for RealPfOps<'_> {
     }
 
     fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
-        pf_record::clear_if_token::<state::FailClosedState>(self.state_dir, token)
+        pf_record::clear_if_token::<state::FailClosedState>(self.lock, token)
             .map_err(|e| RoutingError::state_op_failed(StateOp::Clear, "failclosed-state", &e))
     }
 
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
-        pf_record::clear_if_token::<lockdown_state::LockdownPfState>(self.state_dir, token)
+        pf_record::clear_if_token::<lockdown_state::LockdownPfState>(self.lock, token)
             .map_err(|e| RoutingError::state_op_failed(StateOp::Clear, "lockdown-pf-state", &e))
     }
 }
@@ -1513,13 +1505,13 @@ impl PfOps for RealPfOps<'_> {
 /// release can leave unproven. macOS's own "`Ok` over a still-blocked host" residual is a
 /// different one (an entirely absent state file, clause 1) and is not what
 /// this type tracks.
-pub fn release_all(state_dir: &Path, _witness: super::ArmingWitness) -> SweepOutcome {
-    let transient = pf_record::read::<state::FailClosedState>(state_dir);
-    let standing = pf_record::read::<lockdown_state::LockdownPfState>(state_dir);
+pub fn release_all(lock: &CoverLock, _witness: super::ArmingWitness) -> SweepOutcome {
+    let transient = pf_record::read::<state::FailClosedState>(lock.state_dir());
+    let standing = pf_record::read::<lockdown_state::LockdownPfState>(lock.state_dir());
     // Both arms `Clearance::proven`, for the reason `disengage_lockdown`
     // gives: no boot-time key class here, so nothing a failure could have
     // observed and withheld.
-    release_all_with(transient, standing, &mut RealPfOps { state_dir })
+    release_all_with(transient, standing, &mut RealPfOps { lock })
 }
 
 #[cfg(test)]

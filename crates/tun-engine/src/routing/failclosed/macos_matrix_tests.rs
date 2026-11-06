@@ -81,15 +81,15 @@ impl Pf {
 
 /// The real records at `dir` and a modelled pf: the production sequencers run over this.
 struct Host<'a> {
-    dir: &'a Path,
+    lock: &'a CoverLock,
     pf: &'a mut Pf,
 }
 
 impl Host<'_> {
     /// `pfctl -X`, noting a record that still names the token.
     fn drop_checked(&mut self, token: &str) -> Result<(), RoutingError> {
-        let transient = pf_record::read::<state::FailClosedState>(self.dir);
-        let standing = pf_record::read::<lockdown_state::LockdownPfState>(self.dir);
+        let transient = pf_record::read::<state::FailClosedState>(self.lock.state_dir());
+        let standing = pf_record::read::<lockdown_state::LockdownPfState>(self.lock.state_dir());
         if transient.pf_token() == Some(token) || standing.pf_token() == Some(token) {
             self.pf.dropped_while_named.push(token.to_owned());
         }
@@ -122,7 +122,7 @@ impl EngageOps for Host<'_> {
     }
 
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError> {
-        pf_record::swap(self.dir, st, None)
+        pf_record::swap(self.lock, st, None)
             .map_err(|e| RoutingError::state_op_failed(StateOp::Write, "failclosed-state", &e))
     }
 
@@ -147,11 +147,11 @@ impl PfOps for Host<'_> {
     }
 
     fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
-        RealPfOps { state_dir: self.dir }.clear_transient(token)
+        RealPfOps { lock: self.lock }.clear_transient(token)
     }
 
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
-        RealPfOps { state_dir: self.dir }.clear_standing(token)
+        RealPfOps { lock: self.lock }.clear_standing(token)
     }
 }
 
@@ -166,7 +166,7 @@ impl Party {
     const ALL: [Party; 3] = [Party::Engage, Party::Release, Party::Disengage];
 
     fn run(self, host: &mut Host<'_>) -> Result<(), RoutingError> {
-        let dir = host.dir;
+        let dir = host.lock.state_dir();
         match self {
             Party::Engage => engage_with(v4(), None, host).map(|_| ()),
             Party::Release => {
@@ -255,6 +255,7 @@ fn violations_of(
 ) -> Vec<String> {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    let lock = CoverLock::acquire(dir);
     let mut pf = Pf {
         rules: Rules::Open,
         live: BTreeSet::new(),
@@ -283,7 +284,10 @@ fn violations_of(
     let mut found = Vec::new();
     for (index, party) in [first, second].into_iter().enumerate() {
         pf.drops_fail = first_drops_fail && index == 0;
-        let result = party.run(&mut Host { dir, pf: &mut pf });
+        let result = party.run(&mut Host {
+            lock: &lock,
+            pf: &mut pf,
+        });
         pf.drops_fail = false;
         let covered: &[&str] = match party {
             Party::Engage => &[],

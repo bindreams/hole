@@ -63,7 +63,9 @@ fn failclosed_state_is_not_written_through_a_symlinked_state_directory() {
         pf_was_enabled: true,
     };
 
-    assert!(pf_record::swap(&state_dir, &state, None).is_err());
+    let lock = CoverLock::acquire(&state_dir);
+
+    assert!(pf_record::swap(&lock, &state, None).is_err());
 
     assert_eq!(
         present(&scratch, &[STATE_FILE_NAME]),
@@ -84,7 +86,9 @@ fn lockdown_pf_state_is_not_written_through_a_symlinked_state_directory() {
         main_snapshot_captured: false,
     };
 
-    assert!(pf_record::swap(&state_dir, &state, None).is_err());
+    let lock = CoverLock::acquire(&state_dir);
+
+    assert!(pf_record::swap(&lock, &state, None).is_err());
 
     assert_eq!(
         present(&scratch, &[STATE_FILE_NAME]),

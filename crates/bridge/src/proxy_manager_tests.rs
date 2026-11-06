@@ -642,7 +642,7 @@ impl MockCover {
 impl Drop for MockCover {
     fn drop(&mut self) {
         self.stamp
-            .release_on_drop(|| Self::disengage(&self.state, self.lockdown));
+            .release_on_drop(|_| Self::disengage(&self.state, self.lockdown));
     }
 }
 

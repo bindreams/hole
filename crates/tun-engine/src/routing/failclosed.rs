@@ -3,6 +3,10 @@
 //! guard held across a connect attempt so a failed connect leaves the host
 //! blocked, not leaked. OS specifics live in the platform submodules; this
 //! facade is `#[cfg]`-free for callers.
+//!
+//! Mutators take `&CoverLock`, readers take a path ([`lockdown_cover_presence`], [`boottime_witness::load`]): a read
+//! taken outside the lock races a locked writer as the old or the new state, and a read that decides a write is taken
+//! again under the lock.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -217,7 +221,7 @@ pub fn engage(
 /// Returns no outcome, so it outdates the transient stamps unconditionally; no guard exists at its one
 /// production call (bridge startup).
 pub fn recover_cover(lock: &CoverLock, adopting: bool) {
-    platform::recover_cover(lock.state_dir(), adopting);
+    platform::recover_cover(lock, adopting);
     lock.outdate_stamps(CoverKind::Transient);
 }
 
@@ -379,12 +383,11 @@ pub fn recover_lockdown(lock: &CoverLock, decision: crate::routing::CoverRecover
 /// a numeric index the OS can silently reassign to an unrelated adapter, so
 /// there is no macOS analogue and this is a no-op there.
 ///
-/// Takes the cover lock: the delete is a cover mutation, like an engage or a sweep.
-pub fn reclaim_stale_tun_permit(_lock: &CoverLock, tun_name: &str) {
+pub fn reclaim_stale_tun_permit(lock: &CoverLock, tun_name: &str) {
     #[cfg(target_os = "windows")]
-    platform::reclaim_stale_tun_permit(&luid::SystemLuidResolver, tun_name);
+    platform::reclaim_stale_tun_permit(lock, &luid::SystemLuidResolver, tun_name);
     #[cfg(not(target_os = "windows"))]
-    let _ = tun_name;
+    let _ = (lock, tun_name);
 }
 
 /// Fail-loud disengage of a standing lockdown cover, with no running bridge.
@@ -402,9 +405,7 @@ pub fn reclaim_stale_tun_permit(_lock: &CoverLock, tun_name: &str) {
 /// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
 /// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
 pub fn disengage_lockdown(lock: &CoverLock) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(lock, None, |witness| {
-        platform::disengage_lockdown(lock.state_dir(), witness)
-    })
+    sweep_with_witness(lock, None, |witness| platform::disengage_lockdown(lock, witness))
 }
 
 /// Ask the OS whether a standing lockdown cover from a prior run is present,
@@ -487,7 +488,7 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or
 /// version-skewed and nothing to erase — only GUID sweeps run there.
 pub fn release_all(lock: &CoverLock) -> Result<Clearance, RoutingError> {
-    sweep_with_witness(lock, None, |witness| platform::release_all(lock.state_dir(), witness))
+    sweep_with_witness(lock, None, |witness| platform::release_all(lock, witness))
 }
 
 // Release clearance ===================================================================================================
@@ -1065,7 +1066,7 @@ fn sweep_with_witness(
     // codebase's own sweeps issue every delete before inspecting any code, so
     // `Err` arrives after the sibling's delete already succeeded — see
     // [`SweepOutcome`].
-    boottime_witness::apply(state_dir, clearance.witness_update(), owner);
+    boottime_witness::apply(lock, clearance.witness_update(), owner);
     // A kind the sweep released took what its held guards hold, whatever the other kind did. A kind it did not
     // keeps its stamps, so a guard's drop still retries what the sweep could not delete.
     for kind in &released {

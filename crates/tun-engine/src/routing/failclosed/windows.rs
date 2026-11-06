@@ -1981,8 +1981,8 @@ impl Cover {
 }
 
 impl Cover {
-    /// Delete the filters of this guard's kind. The caller holds the cover lock.
-    fn delete_filters(engine: HANDLE, kind: CoverKind) {
+    /// Delete the filters of this guard's kind.
+    fn delete_filters(_lock: &CoverLock, engine: HANDLE, kind: CoverKind) {
         unsafe {
             match kind {
                 // Transient: today's full sweep (filters + sublayer + provider).
@@ -2033,7 +2033,8 @@ impl Drop for Cover {
             return;
         };
         let kind = self.stamp.kind();
-        self.stamp.release_on_drop(|| Self::delete_filters(engine, kind));
+        self.stamp
+            .release_on_drop(|lock| Self::delete_filters(lock, engine, kind));
         Self::close_engine(engine);
     }
 }
@@ -2056,7 +2057,7 @@ pub(crate) fn should_reclaim_tun_permit(resolved: bool) -> bool {
 /// as `Cover::drop`'s Lockdown arm and [`delete_all`]: a DACL-denied delete
 /// must not read as a successful reclaim.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &str) {
+pub fn reclaim_stale_tun_permit(_lock: &CoverLock, resolver: &dyn super::LuidResolver, tun_name: &str) {
     if !should_reclaim_tun_permit(resolver.resolve(tun_name).is_ok()) {
         // A live `hole-tun` exists — some bridge may be relying on this
         // permit. Never delete it out from under a running bridge.
@@ -2247,7 +2248,7 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
 /// engine open but not the write — would leave the kill switch engaged while
 /// the intent reads "off", with nothing left to reconcile it. The macOS arm
 /// has always propagated its `pfctl` failures; this is the same rule.
-pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
+pub fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
     let swept = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -2311,7 +2312,7 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witne
     SweepOutcome::per_kind(clearance, [(CoverKind::Lockdown, first_delete_failure(&codes))])
 }
 
-pub fn recover_cover(_state_dir: &Path, adopting: bool) {
+pub fn recover_cover(_lock: &CoverLock, adopting: bool) {
     // Windows is structurally safe regardless: the transient cover and the
     // standing lockdown use disjoint WFP filter GUIDs, so deleting the transient
     // filters cannot touch the lockdown ones (the shared sublayer/provider
@@ -2378,7 +2379,7 @@ unsafe fn delete_all(engine: HANDLE) {
 /// that this call can see — but it is only *proof of absence* for a
 /// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
 /// two lets the MSI delete `hole.exe` over a key it never observed.
-pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
+pub fn release_all(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
     let (lockdown, transient) = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
