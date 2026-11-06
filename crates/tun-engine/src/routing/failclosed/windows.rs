@@ -2290,7 +2290,7 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witne
     // fail?" and "what did the empty answers prove?" cannot disagree about
     // which key answered what. The clearance is built EITHER WAY — every
     // delete above was issued before any code was read, so a failure verdict
-    // does not make the observations beside it any less real (#1010 F1).
+    // does not make the observations beside it any less real.
     let clearance = Clearance::from_observations(&observations(swept), witness);
     SweepOutcome::per_kind(clearance, [(CoverKind::Lockdown, first_delete_failure(&codes))])
 }
@@ -2416,7 +2416,7 @@ pub(super) fn release_all(_lock: &CoverLock, witness: ArmingWitness) -> SweepOut
 }
 
 /// `release_all`'s verdict, pure and separated from the FFI as [`disengage_verdict`] is. The failure is the first
-/// refused delete (lockdown keys first); the clearance is folded from every key either way (#1010 F1, see
+/// refused delete (lockdown keys first); the clearance is folded from every key either way (see
 /// [`disengage_verdict`]).
 fn release_all_verdict(
     open_failure: Option<u32>,

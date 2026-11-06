@@ -605,18 +605,13 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
 /// The automatic sweep's half of the same rule the test above proves for the
 /// manual escape: an UNREADABLE record is a cover to clear, not an absence.
 ///
-/// `recover_cover` used to go through a read that collapses
-/// `Unusable` into `None` alongside `Absent`, and then logged "no
-/// failclosed-state file, nothing to recover" over a host still behind
-/// `block out all`. The reachable production cause is a ROLLBACK, and the
-/// payload below is the vector of it THIS binary classifies as `Unusable`: a
-/// record one schema version ahead, as a newer bridge writes and a rolled-back
-/// one reads.
+/// An unreadable record is a cover to clear and must never be logged as "nothing to recover" over a host still
+/// behind `block out all`. The reachable production cause is a ROLLBACK, and the payload below is the vector of it
+/// THIS binary classifies as `Unusable`: a record one schema version ahead, as a newer bridge writes and a
+/// rolled-back one reads.
 ///
-/// The classification is asserted, not assumed: a payload that quietly parses
-/// takes the `Present` arm, which `recover_cover` handled identically before
-/// `Unusable` existed, and this test would then pass against the very
-/// regression it exists to catch.
+/// The classification is asserted, not assumed: a payload that quietly parses takes the `Present` arm, and this
+/// test would then pass without exercising `Unusable` at all.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {

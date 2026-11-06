@@ -803,7 +803,7 @@ fn a_sweep_clears_a_transient_record_naming_a_token_pf_no_longer_holds() {
     assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
 }
 
-// Records that name no token, and the token a displaced record no longer names ========================================
+// Records that name no token ==========================================================================================
 
 /// Every state a record can be in that yields no token to drop, and that a clear removes, is disclosed as a leaked
 /// refcount: the file was Hole's evidence of a cover and its token is unrecoverable. A record that is absent, readable,
