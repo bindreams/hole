@@ -67,20 +67,14 @@ fn engage_publishing(
     server_idx: usize,
 ) -> Result<Cover, RoutingError> {
     let mut ops = PublishOnCommit {
-        inner: RealEngageOps {
-            state_dir: lock.state_dir(),
-            owner: None,
-        },
+        inner: RealEngageOps { lock, owner: None },
         permitted_idx,
         commit_gen,
         server_idx,
     };
     let token = engage_with(server_ip, None, &mut ops)?;
     Ok(Cover {
-        held: Some(Held {
-            token,
-            state_dir: lock.state_dir().to_owned(),
-        }),
+        held: Some(Held { token }),
         stamp: lock.stamp_install(CoverKind::Transient),
     })
 }

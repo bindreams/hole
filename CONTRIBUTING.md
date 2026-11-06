@@ -3164,12 +3164,12 @@ Every mutation of a fail-closed cover inside the bridge process runs under one l
 - **What it excludes.** An engage, a guard's release or drop, a sweep (`release_all`, `disengage_lockdown`,
   `recover_cover`) and crash recovery. A decision that reads cover state (the kill-switch intent, the target, the
   measured presence) is made from a fresh read taken inside the section that acts on it, so nothing changes between the
-  read and the act. The public facade's engage, release and sweep functions, including the TUN-permit reclaim
-  (`reclaim_stale_tun_permit`), and the writers of the records such a decision reads
-  (`lockdown_state::{set_enabled, promote_unrecorded}`, the boot-time witness's arming write) take `&CoverLock`, so a
-  call without the lock does not compile. The platform layer below the facade is crate-private and called only from
-  the facade; the pf records' `swap` and `clear_if_token` take a directory and are
-  called only from those functions.
+  read and the act. Mutators take `&CoverLock`, readers take a path, so a mutation without the lock does not compile.
+  The mutators are the facade's engage, release, sweep and TUN-permit reclaim (`reclaim_stale_tun_permit`) functions,
+  the platform functions beneath them, the pf records' `swap` and `clear_if_token`, and the record writers
+  (`lockdown_state::{set_enabled, promote_unrecorded}`, the boot-time witness's writes). The readers are
+  `lockdown_cover_presence`, `pf_record::read`, `boottime_witness::load` and the intent loads: a read outside the lock
+  races a locked writer as the old or the new state, and a read that decides a write is taken again under the lock.
 - **Order.** `state.proxy` (X), then the cover lock, then the record files' own locks and the witness lock. A section
   is a synchronous function or a `spawn_blocking` closure: `CoverLock` is `!Send` (`a_cover_lock_is_not_send`), so a
   future cannot hold it across an `.await`. `Routing::lock_covers` takes the lock for the provider's own directory;
@@ -3181,8 +3181,9 @@ Every mutation of a fail-closed cover inside the bridge process runs under one l
   cover deletes nothing: Windows keys are fixed and a macOS cover owns one pf token. `CoverGuard::is_current` is the
   lock-free read, for a report; a decision reads it inside the section.
 - **Drop rule.** A guard's `Drop` is the only code that deletes. On a thread that already holds the lock for that
-  directory it deletes under it, so a cover dropped by an early return or an unwind inside a section neither deadlocks
-  nor panics while unwinding; on any other thread `InstallStamp::release_on_drop` acquires. `CoverGuard::release(self, &CoverLock)` is the explicit form: it asserts the lock is the guard's directory's, then drops. `CoverLock::acquire` on
+  directory it deletes under it, through a non-owning view of the held lock that `InstallStamp::release_on_drop` hands
+  to the delete, so a cover dropped by an early return or an unwind inside a section neither deadlocks nor panics while
+  unwinding; on any other thread `release_on_drop` acquires. `CoverGuard::release(self, &CoverLock)` is the explicit form: it asserts the lock is the guard's directory's, then drops. `CoverLock::acquire` on
   a directory this thread already holds panics, where a std mutex would hang.
 - **In-process only.** `hole bridge unlock`, the uninstall and the cutover run with no live bridge (`BridgeLiveness`),
   so nothing out of process writes a cover record while a bridge runs, and the lock does not try to exclude it.

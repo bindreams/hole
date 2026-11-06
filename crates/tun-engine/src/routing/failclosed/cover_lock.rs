@@ -2,9 +2,10 @@
 //!
 //! An engage, a guard's release or drop, a sweep and crash recovery each change the firewall in several steps, and
 //! a decision that reads state those steps write (the kill-switch intent, the target) is only sound if no other
-//! mutation runs between the read and the act. [`CoverLock`] is that exclusion: held, it is the proof every cover
-//! mutation and every record writer a cover decision reads takes by reference, so a mutation without it does not
-//! compile. A caller decides from a fresh read taken under it, inside one synchronous section.
+//! mutation runs between the read and the act. [`CoverLock`] is that exclusion: mutators take `&CoverLock`, readers
+//! take a path, so a mutation without the lock does not compile. A read taken outside the lock is a measurement that
+//! races a locked writer as the old or the new state; a read that decides a write is taken again under the lock,
+//! inside one synchronous section.
 //!
 //! The lock is per `state_dir`, a std mutex, and never held across an `.await`: [`CoverLock`] is `!Send`, so a
 //! future that held it could not be spawned. Poison is recovered; nothing under the lock is left half-updated by
@@ -21,9 +22,9 @@
 //! release keeps its stamps, so a held guard's drop still retries its deletes.
 //!
 //! A guard dropped on a thread that already holds the lock (an early return or an unwind inside a section) deletes
-//! under that held lock ([`InstallStamp::release_on_drop`]); it can neither deadlock nor panic while unwinding.
-//! A guard's explicit release is that same drop, after a check that the lock is its directory's: no second delete
-//! path exists to disagree with it.
+//! under that held lock ([`InstallStamp::release_on_drop`]), handing its delete a non-owning view of it; it can
+//! neither deadlock nor panic while unwinding. A guard's explicit release is that same drop, after a check that the
+//! lock is its directory's: no second delete path exists to disagree with it.
 //! [`CoverLock::acquire`] on a lock this thread already holds is a bug a std mutex would turn into a hang, so it
 //! panics and names the two release paths instead.
 
@@ -89,7 +90,8 @@ fn held_by_this_thread(slot: &'static Slot) -> bool {
 #[must_use = "the cover lock is held only while this value is alive"]
 pub struct CoverLock {
     slot: &'static Slot,
-    _guard: MutexGuard<'static, ()>,
+    /// `None` for the non-owning view [`CoverLock::view_of_held`] builds.
+    guard: Option<MutexGuard<'static, ()>>,
 }
 
 impl CoverLock {
@@ -97,7 +99,8 @@ impl CoverLock {
     ///
     /// Panics if this thread already holds it: a std mutex is not reentrant, so the alternative is a hang with the
     /// lock held and the user's Unblock waiting on it. A guard releases under a held lock when dropped
-    /// ([`InstallStamp::release_on_drop`]), and its explicit `release(&lock)` is that drop; neither acquires.
+    /// ([`InstallStamp::release_on_drop`], through a non-owning view of the held lock), and its explicit
+    /// `release(&lock)` is that drop; neither acquires.
     pub fn acquire(state_dir: &Path) -> CoverLock {
         Self::lock_slot(slot(state_dir))
     }
@@ -110,7 +113,18 @@ impl CoverLock {
         );
         let guard = slot.lock.lock().unwrap_or_else(PoisonError::into_inner);
         HELD.with(|held| held.borrow_mut().push(slot));
-        CoverLock { slot, _guard: guard }
+        CoverLock {
+            slot,
+            guard: Some(guard),
+        }
+    }
+
+    /// A non-owning view of the lock this thread already holds on `slot`, for a drop inside a section that must hand
+    /// a `&CoverLock` down. It owns nothing, so dropping it neither unlocks nor leaves `HELD`: it is not a second
+    /// way to acquire. Only [`InstallStamp::release_on_drop`] builds one, after `held_by_this_thread` confirmed it.
+    fn view_of_held(slot: &'static Slot) -> CoverLock {
+        debug_assert!(held_by_this_thread(slot), "a view is of a lock this thread holds");
+        CoverLock { slot, guard: None }
     }
 
     /// The directory this lock is for: the one source of it for every function that takes `&CoverLock`.
@@ -147,6 +161,10 @@ impl CoverLock {
 
 impl Drop for CoverLock {
     fn drop(&mut self) {
+        // A view owns nothing; the lock it views is released by its owner.
+        if self.guard.is_none() {
+            return;
+        }
         HELD.with(|held| {
             let mut held = held.borrow_mut();
             let at = held.iter().rposition(|h| std::ptr::eq(*h, self.slot));
@@ -189,13 +207,21 @@ impl InstallStamp {
         );
     }
 
-    /// A guard's `Drop`: run `delete` iff this stamp is current, under the lock this thread already holds for the
-    /// directory (a drop inside a section), else after acquiring it. A stamp is a fact about one install, so
-    /// asking twice is harmless: the guard that owns it decides when to ask.
-    pub fn release_on_drop(&self, delete: impl FnOnce()) {
-        let _acquired = (!held_by_this_thread(self.slot)).then(|| CoverLock::lock_slot(self.slot));
+    /// A guard's `Drop`: run `delete` iff this stamp is current, under the lock of the stamp's directory. A drop
+    /// inside a section meets the lock this thread already holds and passes `delete` a non-owning view of it, else
+    /// the lock is acquired for the call. A stamp is a fact about one install, so asking twice is harmless: the
+    /// guard that owns it decides when to ask.
+    pub fn release_on_drop(&self, delete: impl FnOnce(&CoverLock)) {
+        if held_by_this_thread(self.slot) {
+            let view = CoverLock::view_of_held(self.slot);
+            if self.is_current() {
+                delete(&view);
+            }
+            return;
+        }
+        let acquired = CoverLock::lock_slot(self.slot);
         if self.is_current() {
-            delete();
+            delete(&acquired);
         }
     }
 }

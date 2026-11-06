@@ -733,7 +733,7 @@ fn macos_release_all_falls_back_when_the_snapshot_will_not_load() {
         main_snapshot: "this is not a valid pf ruleset {{{".into(),
         ..existing
     };
-    super::pf_record::swap(dir.path(), &broken, None).unwrap();
+    super::pf_record::swap(&routing.lock_covers(), &broken, None).unwrap();
 
     routing
         .release_all_covers(&routing.lock_covers())

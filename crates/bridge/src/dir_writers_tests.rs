@@ -216,7 +216,7 @@ fn macos_writers() -> Vec<Writer> {
                     pf_token: "0".to_owned(),
                     pf_was_enabled: false,
                 };
-                pf_record::swap(dir, &state, owner)
+                pf_record::swap(&CoverLock::acquire(dir), &state, owner)
                     .map(|_| ())
                     .map_err(io::Error::other)
             },
@@ -227,8 +227,11 @@ fn macos_writers() -> Vec<Writer> {
             names: &[failclosed_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match pf_record::clear_if_token::<failclosed_state::FailClosedState>(dir, None)
-                .map_err(io::Error::other)?
+            run: |dir, _| match pf_record::clear_if_token::<failclosed_state::FailClosedState>(
+                &CoverLock::acquire(dir),
+                None,
+            )
+            .map_err(io::Error::other)?
             {
                 Cleared::Kept => Err(io::Error::other(LeftAsItIs)),
                 _ => Ok(()),
@@ -247,7 +250,7 @@ fn macos_writers() -> Vec<Writer> {
                     nat_snapshot: String::new(),
                     main_snapshot_captured: true,
                 };
-                pf_record::swap(dir, &state, owner)
+                pf_record::swap(&CoverLock::acquire(dir), &state, owner)
                     .map(|_| ())
                     .map_err(io::Error::other)
             },
@@ -258,8 +261,11 @@ fn macos_writers() -> Vec<Writer> {
             names: &[lockdown_pf_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match pf_record::clear_if_token::<lockdown_pf_state::LockdownPfState>(dir, None)
-                .map_err(io::Error::other)?
+            run: |dir, _| match pf_record::clear_if_token::<lockdown_pf_state::LockdownPfState>(
+                &CoverLock::acquire(dir),
+                None,
+            )
+            .map_err(io::Error::other)?
             {
                 Cleared::Kept => Err(io::Error::other(LeftAsItIs)),
                 _ => Ok(()),

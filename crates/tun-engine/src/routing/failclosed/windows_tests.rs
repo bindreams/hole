@@ -1931,7 +1931,8 @@ fn reclaim_stale_tun_permit_resolves_the_given_name() {
         result: std::sync::Mutex::new(Some(Ok(0x1234))),
         called_with: std::sync::Mutex::new(None),
     };
-    reclaim_stale_tun_permit(&resolver, "some-other-tun");
+    let dir = tempfile::tempdir().unwrap();
+    reclaim_stale_tun_permit(&CoverLock::acquire(dir.path()), &resolver, "some-other-tun");
     assert_eq!(
         resolver.called_with.into_inner().unwrap().as_deref(),
         Some("some-other-tun"),

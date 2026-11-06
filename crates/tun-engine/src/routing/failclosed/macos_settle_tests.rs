@@ -347,11 +347,12 @@ fn a_clear_that_errors_after_a_good_restore_is_the_covers_error() {
 fn a_clear_that_fails_tells_the_caller_which_operation_and_its_kind_and_no_path() {
     let tmp = tempfile::tempdir().unwrap();
     let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
-    let kind = match pf_record::clear_if_token::<state::FailClosedState>(&state, Some("1")).unwrap_err() {
+    let lock = CoverLock::acquire(&state);
+    let kind = match pf_record::clear_if_token::<state::FailClosedState>(&lock, Some("1")).unwrap_err() {
         util::versioned_file::StoreError::Io(e) => e.kind(),
         other => panic!("expected an I/O refusal, got {other:?}"),
     };
-    let mut ops = RealPfOps { state_dir: &state };
+    let mut ops = RealPfOps { lock: &lock };
 
     let transient = ops.clear_transient(Some("1")).unwrap_err().to_string();
     let standing = ops.clear_standing(Some("1")).unwrap_err().to_string();
@@ -511,11 +512,12 @@ fn a_lockdown_disengage_whose_record_cannot_be_cleared_is_an_error() {
 #[skuld::test]
 fn the_retry_of_a_failed_lockdown_disengage_releases_the_record_and_token_it_kept() {
     let tmp = tempfile::tempdir().unwrap();
-    pf_record::swap(tmp.path(), &standing_state(), None).unwrap();
+    let lock = CoverLock::acquire(tmp.path());
+    pf_record::swap(&lock, &standing_state(), None).unwrap();
     let mut first = RecordingPfOps {
         fail_load_ruleset: true,
         fail_reload_default: true,
-        ..RecordingPfOps::over_records(tmp.path())
+        ..RecordingPfOps::over_records(&lock)
     };
     let failed = disengage_lockdown_with(CoverPresence::Recorded, pf_record::read(tmp.path()), &mut first);
     assert!(failed.is_err());
@@ -526,7 +528,7 @@ fn the_retry_of_a_failed_lockdown_disengage_releases_the_record_and_token_it_kep
         "the record waits for the retry, naming the token still held"
     );
 
-    let mut retry = RecordingPfOps::over_records(tmp.path());
+    let mut retry = RecordingPfOps::over_records(&lock);
     let retried = disengage_lockdown_with(CoverPresence::Recorded, pf_record::read(tmp.path()), &mut retry);
 
     assert!(retried.is_ok(), "{retried:?}");
@@ -617,9 +619,10 @@ fn a_release_never_drops_a_token_a_record_still_names() {
                     );
                     let tmp = tempfile::tempdir().unwrap();
                     let dir = tmp.path();
+                    let lock = CoverLock::acquire(dir);
                     match caller.standing {
-                        true => pf_record::swap(dir, &standing_state(), None).map(|_| ()),
-                        false => pf_record::swap(dir, &transient_state(), None).map(|_| ()),
+                        true => pf_record::swap(&lock, &standing_state(), None).map(|_| ()),
+                        false => pf_record::swap(&lock, &transient_state(), None).map(|_| ()),
                     }
                     .unwrap();
                     let mut ops = RecordingPfOps {
@@ -628,7 +631,7 @@ fn a_release_never_drops_a_token_a_record_still_names() {
                         fail_clear_transient: !write_ok,
                         fail_clear_standing: !write_ok,
                         fail_drop_token: !drop_ok,
-                        ..RecordingPfOps::over_records(dir)
+                        ..RecordingPfOps::over_records(&lock)
                     };
 
                     let reported = (caller.run)(dir, &mut ops);
@@ -753,19 +756,13 @@ fn a_baseline_persisted_over_a_record_names_the_token_it_replaced() {
     ];
     for (what, existing, expected) in cases {
         let tmp = tempfile::tempdir().unwrap();
+        let lock = CoverLock::acquire(tmp.path());
         if let Some(existing) = existing {
             std::fs::write(tmp.path().join(lockdown_state::STATE_FILE_NAME), existing).unwrap();
         }
 
-        let (_, displaced) = persist_baseline(
-            "new",
-            tmp.path(),
-            None,
-            CoverPresence::Absent,
-            String::new(),
-            String::new(),
-        )
-        .unwrap();
+        let (_, displaced) =
+            persist_baseline("new", &lock, None, CoverPresence::Absent, String::new(), String::new()).unwrap();
 
         assert_eq!(displaced.as_deref(), expected, "{what}");
     }
@@ -817,6 +814,7 @@ fn every_removed_record_that_named_no_token_is_disclosed_as_one_that_leaks_a_ref
 
     let disclosed = |bytes: Option<&str>| {
         let tmp = tempfile::tempdir().unwrap();
+        let lock = CoverLock::acquire(tmp.path());
         if let Some(bytes) = bytes {
             std::fs::write(tmp.path().join(state::STATE_FILE_NAME), bytes).unwrap();
         }
@@ -829,7 +827,7 @@ fn every_removed_record_that_named_no_token_is_disclosed_as_one_that_leaks_a_ref
         );
         {
             let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-            let mut ops = RecordingPfOps::over_records(tmp.path());
+            let mut ops = RecordingPfOps::over_records(&lock);
             recover_cover_with(pf_record::read(tmp.path()), false, &mut ops);
         }
         writer.snapshot().contains("no pf token could be read")
@@ -867,8 +865,9 @@ fn every_removed_record_that_named_no_token_is_disclosed_as_one_that_leaks_a_ref
 #[skuld::test]
 fn a_guard_whose_record_a_later_engage_replaced_drops_nothing_and_leaves_the_newer_record() {
     let tmp = tempfile::tempdir().unwrap();
-    pf_record::swap(tmp.path(), &recorded_cover("222"), None).unwrap();
-    let mut ops = RecordingPfOps::over_records(tmp.path());
+    let lock = CoverLock::acquire(tmp.path());
+    pf_record::swap(&lock, &recorded_cover("222"), None).unwrap();
+    let mut ops = RecordingPfOps::over_records(&lock);
 
     disengage_with(Ok(Some("111")), false, &mut ops);
 
@@ -884,12 +883,13 @@ fn a_guard_whose_record_a_later_engage_replaced_drops_nothing_and_leaves_the_new
 #[skuld::test]
 fn a_failed_restore_over_an_unusable_record_leaves_its_bytes_and_drops_nothing() {
     let tmp = tempfile::tempdir().unwrap();
+    let lock = CoverLock::acquire(tmp.path());
     let newer = r#"{"version":2,"pf_token":"9","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":true}"#;
     let path = tmp.path().join(lockdown_state::STATE_FILE_NAME);
     std::fs::write(&path, newer).unwrap();
     let mut ops = RecordingPfOps {
         fail_reload_default: true,
-        ..RecordingPfOps::over_records(tmp.path())
+        ..RecordingPfOps::over_records(&lock)
     };
 
     let result = disengage_lockdown_with(CoverPresence::Recorded, pf_record::read(tmp.path()), &mut ops);

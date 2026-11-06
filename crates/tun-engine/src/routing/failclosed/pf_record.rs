@@ -1,7 +1,8 @@
 //! The two pf cover records (`bridge-failclosed.json`, `bridge-lockdown-pf.json`) as one generic module.
 //!
-//! Every writer holds the [`CoverLock`](super::CoverLock), and nothing outside the process writes these records while
-//! a bridge runs (`hole bridge unlock`, the uninstall and the cutover run under `BridgeLiveness`). So no function here
+//! Mutators ([`swap`], [`clear_if_token`]) take `&CoverLock`, readers ([`read`]) take a path, and nothing outside the
+//! process writes these records while a bridge runs (`hole bridge unlock`, the uninstall and the cutover run under
+//! `BridgeLiveness`). So no function here
 //! compares what a caller read against what is on disk: there is no concurrent party for the compare to catch.
 //! What a record still guards is a failure a sequential order reaches. A release whose restore failed, or whose clear
 //! could not write, leaves a record, so a later engage that overwrites it must drop the token it names ([`swap`]). A
@@ -19,7 +20,7 @@ use std::path::Path;
 
 use util::versioned_file::{Change, DefaultPlacement, Role, StoreError, UpdateOutcome, VersionedFile, VersionedState};
 
-use super::StateFile;
+use super::{CoverLock, StateFile};
 use crate::error::RoutingError;
 
 /// A persisted pf cover record, which names the `pfctl -E` token it holds.
@@ -150,9 +151,9 @@ pub fn read<R: PfRecord>(state_dir: &Path) -> StateFile<R> {
 
 /// Persist `new`, creating `state_dir`; a file this release cannot read is backed up beside it first. Returns the
 /// token the replaced record named, if it named one: the caller drops it (the macOS sequencers), because this write took
-/// the only record that did. The caller holds the cover lock.
-pub fn swap<R: PfRecord>(state_dir: &Path, new: &R, owner: Option<(u32, u32)>) -> Result<Option<String>, StoreError> {
-    record::<R>(state_dir)
+/// the only record that did.
+pub fn swap<R: PfRecord>(lock: &CoverLock, new: &R, owner: Option<(u32, u32)>) -> Result<Option<String>, StoreError> {
+    record::<R>(lock.state_dir())
         .update(&DefaultPlacement { owner }, |now| {
             let displaced = StateFile::view(&now.loaded).pf_token().map(str::to_owned);
             (Change::Store(new.clone()), displaced)
@@ -161,9 +162,9 @@ pub fn swap<R: PfRecord>(state_dir: &Path, new: &R, owner: Option<(u32, u32)>) -
 }
 
 /// Remove the record iff it names `token` (`None`: iff it is an unusable file that yielded none), and say what it
-/// found. A record that cannot be read is kept. The caller holds the cover lock.
-pub fn clear_if_token<R: PfRecord>(state_dir: &Path, token: Option<&str>) -> Result<Cleared, StoreError> {
-    let (verdict, outcome) = record::<R>(state_dir).update(&DefaultPlacement::default(), |now| {
+/// found. A record that cannot be read is kept.
+pub fn clear_if_token<R: PfRecord>(lock: &CoverLock, token: Option<&str>) -> Result<Cleared, StoreError> {
+    let (verdict, outcome) = record::<R>(lock.state_dir()).update(&DefaultPlacement::default(), |now| {
         let verdict = sweep_clear(&StateFile::view(&now.loaded), token);
         match verdict {
             Cleared::Removed => (Change::Remove, verdict),

@@ -117,8 +117,9 @@ mod both {
 
     pub fn swap_then_read_roundtrips<R: Case>() {
         let tmp = tempfile::tempdir().unwrap();
+        let lock = CoverLock::acquire(tmp.path());
 
-        swap(tmp.path(), &R::sample("1234567890"), None).unwrap();
+        swap(&lock, &R::sample("1234567890"), None).unwrap();
 
         assert_eq!(read::<R>(tmp.path()), StateFile::Present(R::sample("1234567890")));
     }
@@ -126,7 +127,8 @@ mod both {
     /// The bytes a swap leaves are what the previous release reads: its `version` first and the same fields.
     pub fn what_a_swap_writes_has_the_previous_releases_shape<R: Case>() {
         let tmp = tempfile::tempdir().unwrap();
-        swap(tmp.path(), &R::sample("5"), None).unwrap();
+        let lock = CoverLock::acquire(tmp.path());
+        swap(&lock, &R::sample("5"), None).unwrap();
 
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(tmp.path().join(R::FILE)).unwrap()).unwrap();
@@ -190,11 +192,12 @@ mod both {
         ];
         for (what, bytes, expected) in cases {
             let tmp = tempfile::tempdir().unwrap();
+            let lock = CoverLock::acquire(tmp.path());
             if let Some(bytes) = &bytes {
                 write_raw::<R>(tmp.path(), bytes.as_bytes());
             }
 
-            let displaced = swap(tmp.path(), &R::sample("9"), None).unwrap();
+            let displaced = swap(&lock, &R::sample("9"), None).unwrap();
 
             assert_eq!(displaced.as_deref(), expected, "{what}");
         }
@@ -202,9 +205,10 @@ mod both {
 
     pub fn swap_over_a_corrupt_pf_record_keeps_a_backup<R: Case>() {
         let tmp = tempfile::tempdir().unwrap();
+        let lock = CoverLock::acquire(tmp.path());
         write_raw::<R>(tmp.path(), b"{not json");
 
-        swap(tmp.path(), &R::sample("9"), None).unwrap();
+        swap(&lock, &R::sample("9"), None).unwrap();
 
         assert_eq!(read::<R>(tmp.path()), StateFile::Present(R::sample("9")));
         assert_eq!(std::fs::read(backup_of::<R>(tmp.path())).unwrap(), b"{not json");
@@ -212,10 +216,11 @@ mod both {
 
     pub fn swap_over_a_newer_pf_record_keeps_a_backup<R: Case>() {
         let tmp = tempfile::tempdir().unwrap();
+        let lock = CoverLock::acquire(tmp.path());
         let newer = R::json(2, "3");
         write_raw::<R>(tmp.path(), newer.as_bytes());
 
-        swap(tmp.path(), &R::sample("9"), None).unwrap();
+        swap(&lock, &R::sample("9"), None).unwrap();
 
         assert_eq!(read::<R>(tmp.path()), StateFile::Present(R::sample("9")));
         assert_eq!(std::fs::read(backup_of::<R>(tmp.path())).unwrap(), newer.as_bytes());
@@ -223,20 +228,21 @@ mod both {
 
     pub fn clear_if_token_clears_the_record_that_carries_the_token_and_only_that<R: Case>() {
         let tmp = tempfile::tempdir().unwrap();
-        swap(tmp.path(), &R::sample("5"), None).unwrap();
+        let lock = CoverLock::acquire(tmp.path());
+        swap(&lock, &R::sample("5"), None).unwrap();
 
-        assert_eq!(clear_if_token::<R>(tmp.path(), Some("6")).unwrap(), Cleared::Gone);
+        assert_eq!(clear_if_token::<R>(&lock, Some("6")).unwrap(), Cleared::Gone);
         assert_eq!(
             read::<R>(tmp.path()),
             StateFile::Present(R::sample("5")),
             "another token's clear"
         );
 
-        assert_eq!(clear_if_token::<R>(tmp.path(), Some("5")).unwrap(), Cleared::Removed);
+        assert_eq!(clear_if_token::<R>(&lock, Some("5")).unwrap(), Cleared::Removed);
         assert!(!tmp.path().join(R::FILE).exists());
 
         assert_eq!(
-            clear_if_token::<R>(tmp.path(), Some("5")).unwrap(),
+            clear_if_token::<R>(&lock, Some("5")).unwrap(),
             Cleared::Gone,
             "a second clear finds nothing"
         );
@@ -244,22 +250,24 @@ mod both {
 
     pub fn clear_if_token_none_clears_only_a_record_that_names_no_token<R: Case>() {
         let tmp = tempfile::tempdir().unwrap();
-        swap(tmp.path(), &R::sample("5"), None).unwrap();
-        assert_eq!(clear_if_token::<R>(tmp.path(), None).unwrap(), Cleared::Gone);
+        let lock = CoverLock::acquire(tmp.path());
+        swap(&lock, &R::sample("5"), None).unwrap();
+        assert_eq!(clear_if_token::<R>(&lock, None).unwrap(), Cleared::Gone);
         assert_eq!(read::<R>(tmp.path()), StateFile::Present(R::sample("5")));
 
         write_raw::<R>(tmp.path(), b"{not json");
-        assert_eq!(clear_if_token::<R>(tmp.path(), None).unwrap(), Cleared::Removed);
+        assert_eq!(clear_if_token::<R>(&lock, None).unwrap(), Cleared::Removed);
         assert!(!tmp.path().join(R::FILE).exists());
     }
 
     /// Engage, engage, then the first one's guard drops with its own token: it must not take the second's record.
     pub fn a_stale_guards_clear_leaves_the_engage_that_displaced_it<R: Case>() {
         let tmp = tempfile::tempdir().unwrap();
-        swap(tmp.path(), &R::sample("a"), None).unwrap();
-        swap(tmp.path(), &R::sample("b"), None).unwrap();
+        let lock = CoverLock::acquire(tmp.path());
+        swap(&lock, &R::sample("a"), None).unwrap();
+        swap(&lock, &R::sample("b"), None).unwrap();
 
-        assert_eq!(clear_if_token::<R>(tmp.path(), Some("a")).unwrap(), Cleared::Gone);
+        assert_eq!(clear_if_token::<R>(&lock, Some("a")).unwrap(), Cleared::Gone);
 
         assert_eq!(read::<R>(tmp.path()), StateFile::Present(R::sample("b")));
     }
@@ -270,9 +278,10 @@ mod both {
             [("corrupt", b"{not json", None), ("newer", newer.as_bytes(), Some("3"))];
         for (what, bytes, token) in cases {
             let tmp = tempfile::tempdir().unwrap();
+            let lock = CoverLock::acquire(tmp.path());
             write_raw::<R>(tmp.path(), bytes);
 
-            let cleared = clear_if_token::<R>(tmp.path(), token).unwrap();
+            let cleared = clear_if_token::<R>(&lock, token).unwrap();
 
             assert_eq!(cleared, Cleared::Removed, "{what}");
             assert!(!tmp.path().join(R::FILE).exists(), "{what}");
@@ -282,10 +291,11 @@ mod both {
 
     pub fn clear_over_an_unusable_record_that_names_another_token_leaves_it<R: Case>() {
         let tmp = tempfile::tempdir().unwrap();
+        let lock = CoverLock::acquire(tmp.path());
         let newer = R::json(2, "3");
         write_raw::<R>(tmp.path(), newer.as_bytes());
 
-        assert_eq!(clear_if_token::<R>(tmp.path(), Some("9")).unwrap(), Cleared::Gone);
+        assert_eq!(clear_if_token::<R>(&lock, Some("9")).unwrap(), Cleared::Gone);
 
         assert_eq!(std::fs::read(tmp.path().join(R::FILE)).unwrap(), newer.as_bytes());
         assert!(!backup_of::<R>(tmp.path()).exists());
@@ -295,9 +305,10 @@ mod both {
     pub fn clear_over_a_record_whose_read_fails_keeps_it_and_reports_kept<R: Case>() {
         for token in [None, Some("1")] {
             let tmp = tempfile::tempdir().unwrap();
+            let lock = CoverLock::acquire(tmp.path());
             make_unreadable::<R>(tmp.path());
 
-            let cleared = clear_if_token::<R>(tmp.path(), token).unwrap();
+            let cleared = clear_if_token::<R>(&lock, token).unwrap();
 
             assert_eq!(cleared, Cleared::Kept, "token {token:?}");
             assert!(tmp.path().join(R::FILE).is_dir(), "token {token:?}");
@@ -309,7 +320,9 @@ mod both {
         let tmp = tempfile::tempdir().unwrap();
         let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
 
-        let err = clear_if_token::<R>(&state, Some("1")).unwrap_err();
+        let lock = CoverLock::acquire(&state);
+
+        let err = clear_if_token::<R>(&lock, Some("1")).unwrap_err();
 
         let StoreError::Io(err) = err else {
             panic!("expected an I/O refusal, got {err:?}");
@@ -343,8 +356,9 @@ fn a_transient_record_an_older_release_wrote_reads_unchanged() {
 #[skuld::test]
 fn the_lockdown_record_roundtrips_the_nat_snapshot_and_the_captured_flag() {
     let tmp = tempfile::tempdir().unwrap();
+    let lock = CoverLock::acquire(tmp.path());
     let mut st = LockdownPfState::sample("1");
-    swap(tmp.path(), &st, None).unwrap();
+    swap(&lock, &st, None).unwrap();
     assert_eq!(
         read::<LockdownPfState>(tmp.path()),
         StateFile::Present(st.clone()),
@@ -353,7 +367,7 @@ fn the_lockdown_record_roundtrips_the_nat_snapshot_and_the_captured_flag() {
 
     st.main_snapshot_captured = false;
     st.main_snapshot = String::new();
-    swap(tmp.path(), &st, None).unwrap();
+    swap(&lock, &st, None).unwrap();
     assert_eq!(read::<LockdownPfState>(tmp.path()), StateFile::Present(st));
 }
 
