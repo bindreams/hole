@@ -152,8 +152,8 @@ mod platform;
 mod pf_on_any_host;
 
 /// RAII guard for an engaged fail-closed cover. Dropping it disengages the
-/// cover (Windows: delete the WFP filters by GUID; macOS: restore the host's rules, clear the record and drop the pf
-/// enable refcount). `Send` so the PR3 cutover
+/// cover (Windows: delete the WFP filters by GUID; macOS: restore the host's rules, then clear the record and, only if
+/// that clear took it, drop the pf enable refcount; a record that cannot be read stays). `Send` so the PR3 cutover
 /// coordinator can hold it across `.await`.
 ///
 /// Opaque wrapper over the private `platform::Cover` (the platform module can't
@@ -321,7 +321,7 @@ pub fn recover_lockdown(lock: &CoverLock, decision: crate::routing::CoverRecover
             // host.
             if decision == crate::routing::CoverRecovery::Adopt {
                 if let Some(tun_name) = tun_name {
-                    reclaim_stale_tun_permit(tun_name);
+                    reclaim_stale_tun_permit(lock, tun_name);
                 }
             }
             tracing::info!(
@@ -378,11 +378,13 @@ pub fn recover_lockdown(lock: &CoverLock, decision: crate::routing::CoverRecover
 /// back, not the fixed `hole-tun` Windows requests), not
 /// a numeric index the OS can silently reassign to an unrelated adapter, so
 /// there is no macOS analogue and this is a no-op there.
-pub fn reclaim_stale_tun_permit(tun_name: &str) {
+///
+/// Takes the cover lock: the delete is a cover mutation, like an engage or a sweep.
+pub fn reclaim_stale_tun_permit(lock: &CoverLock, tun_name: &str) {
     #[cfg(target_os = "windows")]
-    platform::reclaim_stale_tun_permit(&luid::SystemLuidResolver, tun_name);
+    platform::reclaim_stale_tun_permit(lock, &luid::SystemLuidResolver, tun_name);
     #[cfg(not(target_os = "windows"))]
-    let _ = tun_name;
+    let _ = (lock, tun_name);
 }
 
 /// Fail-loud disengage of a standing lockdown cover, with no running bridge.

@@ -1156,9 +1156,9 @@ pub enum CoverRecovery {
     Adopt,
     /// [`Intent::Off`](failclosed::lockdown_state::Intent::Off) with an
     /// actionable presence: fully disengage the leftover cover (Windows: delete
-    /// all lockdown GUIDs; macOS: restore the pre-lockdown snapshot, else `/etc/pf.conf`, clear the record and
-    /// drop the pf token). The only action that removes protection, and the only one
-    /// that mutates the OS at all.
+    /// all lockdown GUIDs; macOS: restore the pre-lockdown snapshot, else `/etc/pf.conf`, then clear the record and,
+    /// only if that clear took it, drop the pf token; a record that cannot be read stays). The only action that
+    /// removes protection, and the only one that mutates the OS at all.
     Sweep,
     /// Nothing to do.
     Noop,
