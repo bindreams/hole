@@ -264,7 +264,7 @@ pub(crate) fn apply(state_dir: &Path, current: ArmingWitness, update: WitnessUpd
 fn write_or_warn(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) {
     if let Err(e) = save(state_dir, armed, owner) {
         tracing::warn!(
-            error = %util::error_chain::error_chain(&e),
+            error = &e as &dyn std::error::Error,
             armed,
             file = STATE_FILE_NAME,
             "the boot-time witness could not be written; a later sweep that can no longer see a \

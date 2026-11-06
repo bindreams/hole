@@ -73,7 +73,10 @@ fn live_main_ruleset_blocks() -> Option<bool> {
     let out = match run_capturing(SystemTool::Pfctl, &["-sr"], None, BestEffortPhase::RecoverCover) {
         Ok(out) => out,
         Err(e) => {
-            tracing::warn!("pfctl -sr could not run, so pf could not be asked: {e}");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "pfctl -sr could not run, so pf could not be asked"
+            );
             return None;
         }
     };

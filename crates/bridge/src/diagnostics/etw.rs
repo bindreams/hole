@@ -663,7 +663,10 @@ fn start_consumer_named_with_spawn(
     let (stats_tx, stats_thread) = match stats_thread_spawn {
         Ok(handle) => (Some(stats_tx), Some(handle)),
         Err(e) => {
-            warn!(error = ?e, "etw: failed to spawn live-stats timer thread; continuing without periodic stats");
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "etw: failed to spawn live-stats timer thread; continuing without periodic stats"
+            );
             (None, None)
         }
     };

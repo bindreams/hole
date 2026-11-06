@@ -8,8 +8,8 @@
 //! `#[error(...)]` below is a bare literal with no payload interpolation, which
 //! makes that structural rather than a habit.
 //!
-//! `source()` carries the diagnostic cause and call sites log it with
-//! `util::error_chain` (which renders `Display` only, so payload held solely in
+//! `source()` carries the diagnostic cause and call sites log it as an error value
+//! (the chain renders `Display` only, so payload held solely in
 //! `Debug` — `HopDetail`, `interface_index` — is not in the chain: the site
 //! that builds the error logs it). Three of the four
 //! sentences point the user at `bridge.log`, so the cause must travel with the

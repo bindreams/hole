@@ -32,7 +32,7 @@ pub fn chown_path(_path: &Path, _uid: u32, _gid: u32) -> std::io::Result<()> {
 pub fn chown_if_some(path: &Path, owner: Option<(u32, u32)>) {
     if let Some((uid, gid)) = owner {
         if let Err(e) = chown_path(path, uid, gid) {
-            tracing::warn!(error = %e, path = %path.display(), "chown failed");
+            tracing::warn!(error = &e as &dyn std::error::Error, path = %path.display(), "chown failed");
         }
     }
 }

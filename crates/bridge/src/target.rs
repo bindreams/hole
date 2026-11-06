@@ -280,7 +280,10 @@ fn state_sddl() -> String {
     match current_user_sid() {
         Ok(sid) => format!("{}(A;;GA;;;{sid})", crate::ipc::SDDL_BASE),
         Err(e) => {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), "could not resolve this process's user SID; state DACL is admin-only");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "could not resolve this process's user SID; state DACL is admin-only"
+            );
             crate::ipc::SDDL_BASE.to_string()
         }
     }

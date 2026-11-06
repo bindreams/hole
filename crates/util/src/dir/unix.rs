@@ -489,7 +489,7 @@ fn chown_best_effort(file: &File, owner: Option<(u32, u32)>) {
     let Some((uid, gid)) = owner else { return };
     // SAFETY: the descriptor is open for the call.
     if let Err(err) = check(unsafe { libc::fchown(file.as_raw_fd(), uid, gid) }) {
-        tracing::warn!(error = %err, "chown failed");
+        tracing::warn!(error = &err as &dyn std::error::Error, "chown failed");
     }
 }
 

@@ -170,7 +170,7 @@ pub(crate) async fn run_hop(
         };
         tracing::info!(
             port = local.port(),
-            error = %cause,
+            error = &cause as &dyn std::error::Error,
             "intermediate port lost; restarting the hop on a fresh port"
         );
         tracing::debug!(attempt_result = ?result, "stopped attempt returned");

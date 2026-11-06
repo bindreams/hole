@@ -486,7 +486,10 @@ impl AppConfig {
         #[cfg(unix)]
         if let Some(parent) = dir {
             if let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all()) {
-                tracing::warn!(error = %e, "could not fsync config directory; rename may not survive power loss");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "could not fsync config directory; rename may not survive power loss"
+                );
             }
         }
 
@@ -518,7 +521,7 @@ fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
     // genuinely unwritable the temp-file create fails with an accurate write
     // error instead of a spurious permission error here.
     if let Err(source) = std::fs::set_permissions(parent, Permissions::from_mode(0o700)) {
-        tracing::warn!(error = %source, dir = %parent.display(),
+        tracing::warn!(error = &source as &dyn std::error::Error, dir = %parent.display(),
             "could not tighten config directory permissions; continuing");
     }
     Ok(())

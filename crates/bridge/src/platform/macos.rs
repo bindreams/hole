@@ -423,7 +423,7 @@ pub fn run(
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir_dns)).await
         {
-            tracing::warn!(error = %e, "recover_dns_config task panicked");
+            tracing::warn!(error = &e as &dyn std::error::Error, "recover_dns_config task panicked");
         }
         // Root cancellation token for the launchd service, wired to the same
         // SIGINT/SIGTERM source `serve_until_signal` consumes below. Created
@@ -452,13 +452,13 @@ pub fn run(
         // blocking thread to match the sibling recover_* calls.
         let log_dir_sweep = log_dir.to_path_buf();
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
-            tracing::warn!(error = %e, "crash sweep task panicked");
+            tracing::warn!(error = &e as &dyn std::error::Error, "crash sweep task panicked");
         }
         // The new bridge is authoritative once it has bound: any update marker is
         // a completed cutover, so clear it unconditionally (remove-by-path).
         let log_dir_marker = log_dir.to_path_buf();
         if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
-            tracing::warn!(error = %e, "marker sweep task panicked");
+            tracing::warn!(error = &e as &dyn std::error::Error, "marker sweep task panicked");
         }
 
         // launchd stops the daemon with SIGTERM; awaiting only ctrl_c (SIGINT)
@@ -474,7 +474,10 @@ pub fn run(
         let mut pm = proxy_shutdown.lock().await;
         let event = crate::foreground::shutdown_reason(hole_common::update_marker::is_present(log_dir));
         if let Err(e) = pm.stop_with(event).await {
-            tracing::error!(error = %util::error_chain::error_chain(&e), "error stopping proxy during shutdown");
+            tracing::error!(
+                error = &e as &dyn std::error::Error,
+                "error stopping proxy during shutdown"
+            );
         }
 
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -488,7 +491,10 @@ pub fn run(
 /// from->to schema bump across the cutover cannot strand it.
 pub(crate) fn sweep_marker(log_dir: &std::path::Path) {
     if let Err(e) = hole_common::update_marker::clear(log_dir) {
-        tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear update-in-progress marker");
+        tracing::warn!(
+            error = &e as &dyn std::error::Error,
+            "failed to clear update-in-progress marker"
+        );
     }
 }
 
@@ -502,7 +508,7 @@ pub(crate) async fn serve_until_signal(
     tokio::select! {
         result = server => {
             if let Err(e) = result {
-                tracing::error!(error = %util::error_chain::error_chain(&e), "IPC server error");
+                tracing::error!(error = &e as &dyn std::error::Error, "IPC server error");
             }
         }
         _ = shutdown => {

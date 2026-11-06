@@ -75,7 +75,10 @@ impl ChangeKey {
         let raw = match self.raw() {
             Ok(raw) => raw,
             Err(error) => {
-                warn!(%error, "could not read the service's change mark; counting it as unset");
+                warn!(
+                    error = &error as &dyn std::error::Error,
+                    "could not read the service's change mark; counting it as unset"
+                );
                 None
             }
         };
@@ -85,7 +88,10 @@ impl ChangeKey {
         let holder = raw.as_deref().and_then(holder_of).map(|stamp| {
             let running = stamp.is_running();
             if let Err(error) = &running {
-                warn!(%error, "could not tell whether the process changing the service is running; counting it as gone");
+                warn!(
+                    error = error as &dyn std::error::Error,
+                    "could not tell whether the process changing the service is running; counting it as gone"
+                );
             }
             Changer::of(running)
         });
@@ -124,7 +130,12 @@ impl ChangeKey {
         let answer = self.open(KEY_QUERY_VALUE.0).and_then(|key| key.get_value(VALUE));
         match answer {
             Ok(value) => Ok(String::try_from(value)
-                .inspect_err(|error| warn!(%error, "the service's change mark is not a string; counting it as unset"))
+                .inspect_err(|error| {
+                    warn!(
+                        error = error as &dyn std::error::Error,
+                        "the service's change mark is not a string; counting it as unset"
+                    )
+                })
                 .ok()),
             Err(error) if missing(&error) => Ok(None),
             Err(error) => Err(error),

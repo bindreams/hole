@@ -53,7 +53,10 @@ pub fn install_service<S: NewServiceSteps>(steps: &mut S) -> io::Result<()> {
     steps.registered();
     steps.configure(&service)?;
     if let Err(e) = steps.failure_actions(&service) {
-        warn!(error = %util::error_chain::error_chain(&e), "could not configure SCM restart-on-failure; service installed without auto-restart");
+        warn!(
+            error = &e as &dyn std::error::Error,
+            "could not configure SCM restart-on-failure; service installed without auto-restart"
+        );
     }
     Ok(())
 }
@@ -78,7 +81,10 @@ pub fn run_startup_repairs() -> StartupRepairs {
     match &service_sid {
         Ok(SidRepairOutcome::Applied) => info!("set the service SID type; the next start of the service carries it"),
         Ok(SidRepairOutcome::AlreadySet) => {}
-        Err(e) => warn!(error = %e, "could not set the service SID type"),
+        Err(e) => warn!(
+            error = e as &dyn std::error::Error,
+            "could not set the service SID type"
+        ),
     }
     StartupRepairs { service_sid }
 }

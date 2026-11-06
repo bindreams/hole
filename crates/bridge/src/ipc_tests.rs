@@ -2369,7 +2369,7 @@ async fn a_failed_network_probe_logs_the_cause() {
 //
 // Each handler answers a failure with a fixed, PII-free sentence; the cause behind
 // it belongs in bridge.log. The causes below are carried by `source()` only, so a
-// site that logs `%e` instead of `error_chain` loses them.
+// site that logs only the error's `Display` loses them.
 
 /// A started session whose stop can be made to fail, or whose liveness can be
 /// made to report dead.
@@ -2499,7 +2499,7 @@ async fn a_kill_switch_off_that_cannot_save_logs_why() {
 }
 
 /// `ProxyError::Runtime` embeds its io cause in `Display` and returns it from
-/// `source()`, so the chain prints it a second time, joined with ` -> `.
+/// `source()`, so the cause appears twice in the logged chain.
 #[skuld::test]
 async fn a_failed_kill_switch_on_logs_the_chain() {
     let (subscriber, writer) = redacting_capture();
@@ -2516,7 +2516,7 @@ async fn a_failed_kill_switch_on_logs_the_chain() {
     let log = writer.snapshot();
     let cause = "cannot set lockdown intent: bridge has no state_dir to persist it";
     assert!(
-        log.contains(&format!("proxy runtime error: {cause} -> {cause}")),
+        log.contains(&format!("error=proxy runtime error: {cause} error.sources=[{cause}]")),
         "bridge.log must carry the chain: {log}"
     );
 }

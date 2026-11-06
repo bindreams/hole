@@ -87,9 +87,9 @@ where
 /// "another process holds a handle that blocks this operation":
 /// `ERROR_ACCESS_DENIED` (5) and `ERROR_SHARING_VIOLATION` (32) on
 /// Windows, `ETXTBSY` / `EBUSY` on macOS. An error that wraps an OS error
-/// (see [`crate::error_chain::raw_os_error`]) matches by the inner code.
+/// (see [`crate::error::raw_os_error`]) matches by the inner code.
 pub fn is_file_contention(err: &io::Error) -> bool {
-    match crate::error_chain::raw_os_error(err) {
+    match crate::error::raw_os_error(err) {
         #[cfg(windows)]
         Some(5 | 32) => true,
         #[cfg(target_os = "macos")]

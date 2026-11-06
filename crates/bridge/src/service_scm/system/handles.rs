@@ -34,7 +34,10 @@ impl Drop for ScHandle {
         // `CloseServiceHandle(NULL)` raises an access violation on Windows).
         // No panic here: one during unwinding aborts the process.
         if let Err(e) = unsafe { CloseServiceHandle(self.0) } {
-            tracing::error!(error = %util::error_chain::error_chain(&e), "CloseServiceHandle failed on a handle this process opened");
+            tracing::error!(
+                error = &e as &dyn std::error::Error,
+                "CloseServiceHandle failed on a handle this process opened"
+            );
         }
     }
 }

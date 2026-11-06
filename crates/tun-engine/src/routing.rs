@@ -425,7 +425,12 @@ fn run_built<P: Phase>(built: std::io::Result<Command>, cmd: String, phase: P) -
 
 /// Log a route command that never ran and wrap the cause.
 fn spawn_failed(phase_name: &str, cmd: &str, e: std::io::Error) -> CommandFailure {
-    warn!(phase = phase_name, cmd, error = %util::error_chain::error_chain(&e), "route command failed to spawn");
+    warn!(
+        phase = phase_name,
+        cmd,
+        error = &e as &dyn std::error::Error,
+        "route command failed to spawn"
+    );
     CommandFailure::Spawn(e)
 }
 
@@ -566,7 +571,7 @@ where
                     "route command failed but is not fatal on this host — continuing"
                 );
                 if let Err(e) = checkpoint(installed) {
-                    warn!(error = %util::error_chain::error_chain(&e), id = ?cmd.id, "failed to checkpoint route-state after non-fatal setup command");
+                    warn!(error = &e as &dyn std::error::Error, id = ?cmd.id, "failed to checkpoint route-state after non-fatal setup command");
                 }
                 continue;
             }
@@ -581,7 +586,7 @@ where
             // is deliberately left uncorrected (see this function's doc).
             if !matches!(failure, CommandFailure::Spawn(_)) {
                 if let Err(e) = checkpoint(installed) {
-                    warn!(error = %util::error_chain::error_chain(&e), id = ?cmd.id, "failed to checkpoint route-state after fatal setup command");
+                    warn!(error = &e as &dyn std::error::Error, id = ?cmd.id, "failed to checkpoint route-state after fatal setup command");
                 }
             }
             return Err(SetupFailure::Command(RouteCommandError {
@@ -592,7 +597,7 @@ where
             }));
         }
         if let Err(e) = checkpoint(installed) {
-            warn!(error = %util::error_chain::error_chain(&e), id = ?cmd.id, "failed to checkpoint route-state after install command");
+            warn!(error = &e as &dyn std::error::Error, id = ?cmd.id, "failed to checkpoint route-state after install command");
         }
     }
     Ok(())
@@ -615,7 +620,7 @@ where
             warn!(
                 phase = phase.name(),
                 id = ?cmd.id,
-                error = %util::error_chain::error_chain(&e),
+                error = &e as &dyn std::error::Error,
                 "route-teardown command did not confirm the route is gone — keeping it recorded"
             );
             false
@@ -844,19 +849,28 @@ where
     // crashes before a single sweep command below runs.
     persisted.stale = groups;
     if let Err(e) = state::write(record_file, persisted, owner) {
-        warn!(error = %util::error_chain::error_chain(&e), "failed to checkpoint carried-forward stale route state before install");
+        warn!(
+            error = &e as &dyn std::error::Error,
+            "failed to checkpoint carried-forward stale route state before install"
+        );
     }
     warn!(groups = ?persisted.stale, "sweeping route records retained from a prior run before this install");
 
     persisted.stale = recover_groups(std::mem::take(&mut persisted.stale), &runner, |updated| {
         persisted.stale = updated.to_vec();
         if let Err(e) = state::write(record_file, persisted, owner) {
-            warn!(error = %util::error_chain::error_chain(&e), "failed to checkpoint stale-route sweep");
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "failed to checkpoint stale-route sweep"
+            );
         }
     });
     persisted.stale.retain(|g| !g.installed.is_empty());
     if let Err(e) = state::write(record_file, persisted, owner) {
-        warn!(error = %util::error_chain::error_chain(&e), "failed to checkpoint stale-route sweep result");
+        warn!(
+            error = &e as &dyn std::error::Error,
+            "failed to checkpoint stale-route sweep result"
+        );
     }
     Ok(())
 }
@@ -921,7 +935,10 @@ where
 
     if changed {
         if let Err(e) = state::write(record_file, &leftover, owner) {
-            warn!(error = %util::error_chain::error_chain(&e), "failed to checkpoint stale server-bypass clear before gateway query");
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "failed to checkpoint stale server-bypass clear before gateway query"
+            );
         }
     }
 }
@@ -999,7 +1016,10 @@ fn checkpoint_installed_with(
 fn checkpoint_failure(e: StoreError, record: &Path) -> CheckpointFailure {
     match e {
         StoreError::Io(e) => {
-            error!(error = %util::error_chain::error_chain(&e), "route record could not be written");
+            error!(
+                error = &e as &dyn std::error::Error,
+                "route record could not be written"
+            );
             CheckpointFailure::Io { kind: e.kind() }
         }
         StoreError::Unreadable { file, cause } => {
@@ -1409,7 +1429,7 @@ where
             persisted.installed = primary.into_iter().next().map(|g| g.installed).unwrap_or_default();
             persisted.stale = stale;
             if let Err(e) = state::write(&record_file, &persisted, owner) {
-                warn!(error = %util::error_chain::error_chain(&e), "failed to checkpoint route-state during recovery — recorded routes may be stale if this process now crashes");
+                warn!(error = &e as &dyn std::error::Error, "failed to checkpoint route-state during recovery — recorded routes may be stale if this process now crashes");
             }
         });
 
@@ -1434,12 +1454,18 @@ where
                     );
                 }
                 Err(e) => {
-                    warn!(error = %util::error_chain::error_chain(&e), "failed to clear route-state file during recovery")
+                    warn!(
+                        error = &e as &dyn std::error::Error,
+                        "failed to clear route-state file during recovery"
+                    )
                 }
             }
         } else {
             if let Err(e) = state::write(&record_file, &persisted, owner) {
-                warn!(error = %util::error_chain::error_chain(&e), "failed to checkpoint route-state after recovery's stale-group sweep");
+                warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to checkpoint route-state after recovery's stale-group sweep"
+                );
             }
             warn!(
                 remaining = ?still_installed,
@@ -1471,7 +1497,10 @@ where
     // fallback — once the cover is torn down the measurement reads `Absent`.
     if decision.record_intent_on {
         if let Err(e) = failclosed::lockdown_state::set_enabled(state_dir, true, owner) {
-            warn!(error = %util::error_chain::error_chain(&e), "could not repair the lockdown intent over a measured live cover");
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "could not repair the lockdown intent over a measured live cover"
+            );
         }
     }
     let adopt = matches!(decision.action, CoverRecovery::Adopt);
@@ -1768,7 +1797,7 @@ impl SystemRouting {
     {
         persisted.installed = union_ids(confirmed, &extra_unconfirmed);
         if let Err(e) = state::write(&self.record_file, &persisted, self.owner) {
-            warn!(error = %util::error_chain::error_chain(&e), "failed to checkpoint route-state before install rollback — recorded routes may be stale if this process now crashes");
+            warn!(error = &e as &dyn std::error::Error, "failed to checkpoint route-state before install rollback — recorded routes may be stale if this process now crashes");
         }
 
         #[allow(clippy::disallowed_methods)] // defensive rollback inside install — we ARE the Routing impl
@@ -1783,7 +1812,7 @@ impl SystemRouting {
             |ids| {
                 persisted.installed = union_ids(ids, &extra_unconfirmed);
                 if let Err(e) = state::write(&self.record_file, &persisted, self.owner) {
-                    warn!(error = %util::error_chain::error_chain(&e), "failed to checkpoint route-state during install rollback — recorded routes may be stale if this process now crashes");
+                    warn!(error = &e as &dyn std::error::Error, "failed to checkpoint route-state during install rollback — recorded routes may be stale if this process now crashes");
                 }
             },
         );
@@ -1803,13 +1832,16 @@ impl SystemRouting {
                     );
                 }
                 Err(e) => {
-                    warn!(error = %util::error_chain::error_chain(&e), "failed to clear route-state after rollback — a stale record will trigger a redundant idempotent teardown next start");
+                    warn!(error = &e as &dyn std::error::Error, "failed to clear route-state after rollback — a stale record will trigger a redundant idempotent teardown next start");
                 }
             }
         } else {
             persisted.installed = final_remaining.clone();
             if let Err(e) = state::write(&self.record_file, &persisted, self.owner) {
-                warn!(error = %util::error_chain::error_chain(&e), "failed to record the retained route-state after rollback — routes may leak untracked");
+                warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to record the retained route-state after rollback — routes may leak untracked"
+                );
             }
             warn!(
                 remaining = ?final_remaining,
@@ -2135,7 +2167,7 @@ impl SystemRoutes {
             |ids| {
                 persisted.installed = ids.to_vec();
                 if let Err(e) = state::write(&self.record_file, &persisted, self.owner) {
-                    warn!(error = %util::error_chain::error_chain(&e), "failed to checkpoint route-state during teardown — recorded routes may be stale if this process now crashes");
+                    warn!(error = &e as &dyn std::error::Error, "failed to checkpoint route-state during teardown — recorded routes may be stale if this process now crashes");
                 }
             },
         );
@@ -2156,7 +2188,10 @@ impl SystemRoutes {
                     );
                 }
                 Err(e) => {
-                    warn!(error = %util::error_chain::error_chain(&e), "state-file clear failed in SystemRoutes::drop")
+                    warn!(
+                        error = &e as &dyn std::error::Error,
+                        "state-file clear failed in SystemRoutes::drop"
+                    )
                 }
             }
         } else {
