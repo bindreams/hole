@@ -3176,8 +3176,8 @@ Every mutation of a fail-closed cover inside the bridge process runs under one l
   sweep calls `outdate_stamps` for every kind it confirmed released, and adds the boot-time witness where a platform
   arms boot-time keys (Windows, `STANDING_COVER_ARMS_BOOT_TIME`).
 - **Order.** `state.proxy` (X), then the cover lock, then the record files' own locks and the witness lock. A section
-  is a synchronous function or a `spawn_blocking` closure: `CoverLock` is `!Send` (`a_cover_lock_is_not_send`), so a
-  future cannot hold it across an `.await`. `Routing::lock_covers` takes the lock for the provider's own directory;
+  is a synchronous function or a `spawn_blocking` closure: `CoverLock` is `!Send` and `!Sync` (`a_cover_lock_is_neither_send_nor_sync`), so a
+  future cannot hold it across an `.await` and a `&CoverLock` stays on the acquiring thread. `Routing::lock_covers` takes the lock for the provider's own directory;
   `CoverLock::acquire` is for code with no provider (the cutover, crash recovery, a test's escape). The tray's Unblock
   takes no X.
 - **Stamps.** A guard keeps the `InstallStamp` of its install: `stamp_install(kind)` runs after the OS step succeeded,
