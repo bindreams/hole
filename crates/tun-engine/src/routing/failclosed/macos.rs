@@ -51,18 +51,16 @@
 //!   pf and loads a live ruleset instead of an inert one.
 //!
 //! - **Release order.** A record names only a token Hole holds ([`super::pf_record`]), so a release
-//!   makes the record safe and then drops the cover's `pfctl -E` token ([`release`]). A restore that
-//!   held clears the record and drops the token only if that clear took the record that named it; a
-//!   clear that cannot write is the release's error and drops nothing, so the retry still has its
-//!   token. A failed restore is the release's error and keeps the record, the evidence of the block.
-//!   The escapes (`release_all`, `disengage_lockdown`) then have the record forget the token and drop
-//!   it, so a failed restore does not keep pf enabled over the host; `recover_cover` and the transient
-//!   guard's `Drop` keep token and record together for the next sweep. A drop that fails is only
+//!   restores the host, clears the record, and drops the cover's `pfctl -E` token only if that clear
+//!   took the record that named it ([`release`]). A clear that cannot write is the release's error and
+//!   drops nothing, so the retry still has its token. A failed restore is the release's error and
+//!   touches neither record nor token: the cover stays in force, evidence and refcount together, until
+//!   the user fixes `/etc/pf.conf` and unblocks again (or runs `pfctl -d`). A drop that fails is only
 //!   logged: the refcount stays until a reboot resets it, and with the host's rules restored it
 //!   blocks nothing. Dropping Hole's token releases Hole's hold only: the block lifts when no other
-//!   refcount keeps pf enabled. An engage whose record write replaced one naming another token drops
-//!   that token ([`drop_displaced`]); a record that names no token is re-enabled under its snapshots
-//!   by the lockdown engage ([`engage_pf_action`]). Every one of these runs under the cover lock.
+//!   refcount keeps pf enabled. Every `pfctl -X` goes through [`drop_or_warn`] over the caller's ops
+//!   seam. An engage whose record write replaced one naming another token drops that token
+//!   ([`drop_displaced`]). Every one of these runs under the cover lock.
 //!
 //! Documented caveats (pf has no programmatic API — `pfctl` text I/O IS the
 //! interface, as `netsh`/`route` are for routing):
@@ -88,7 +86,7 @@ use util::system_tool::SystemTool;
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
-use super::pf_record::{self, Cleared, Forgot};
+use super::pf_record::{self, Cleared};
 use super::Clearance;
 use super::StateFile;
 use super::SweepOutcome;
@@ -387,17 +385,14 @@ enum PfEngageAction {
 }
 
 /// Decide how to (re)enable pf for a lockdown engage. `pf_enabled` is read from
-/// `pfctl -s info`; `persisted` is the valid `bridge-lockdown-pf.json`, if any.
-/// The persisted-but-disabled case is the connected-session fail-open this
-/// closes: always load the ruleset into an ENABLED pf, never an inert one. A record
-/// that names no token (an escape forgot it) holds no refcount whatever pf says, so it
-/// is re-enabled under its own snapshot, never snapshotted afresh and never reused.
-fn engage_pf_action(pf_enabled: bool, persisted: Option<&lockdown_state::LockdownPfState>) -> PfEngageAction {
-    match persisted.map(|st| st.pf_token.is_some()) {
-        None => PfEngageAction::FreshEnable,
-        Some(false) => PfEngageAction::Reenable,
-        Some(true) if pf_enabled => PfEngageAction::ReuseToken,
-        Some(true) => PfEngageAction::Reenable,
+/// `pfctl -s info`; `has_persisted` is whether a valid `bridge-lockdown-pf.json`
+/// exists. The persisted-but-disabled case is the connected-session fail-open this
+/// closes: always load the ruleset into an ENABLED pf, never an inert one.
+fn engage_pf_action(pf_enabled: bool, has_persisted: bool) -> PfEngageAction {
+    match (has_persisted, pf_enabled) {
+        (false, _) => PfEngageAction::FreshEnable,
+        (true, true) => PfEngageAction::ReuseToken,
+        (true, false) => PfEngageAction::Reenable,
     }
 }
 
@@ -565,6 +560,8 @@ pub(crate) trait CoverRulesetOps {
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
     /// `pfctl -F states`: purge pf's state table, host-wide.
     fn flush_states(&mut self) -> Result<(), RoutingError>;
+    /// `pfctl -X <token>`: drop a pf enable refcount. Callers go through [`drop_or_warn`].
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
 }
 
 /// Seam over the pf + state-file mutations an engage performs, so its ordering
@@ -579,26 +576,18 @@ pub(crate) trait EngageOps: CoverRulesetOps {
     fn enable_capture_token(&mut self) -> Result<String, RoutingError>;
     /// Write `bridge-failclosed.json`. Returns the token the record it replaced named, if any ([`pf_record::swap`]).
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError>;
-    /// `pfctl -X <token>`: drop a pf enable refcount.
-    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
     /// The transient cover's full restore, `disengage(token, state_dir)`.
     fn transient_restore(&mut self, token: &str);
 }
 
 /// Drop the token an engage's record write displaced. The write took the only record that named it, so nobody else
-/// will: a leftover from a cover whose release did not finish, or a token salvaged from an unusable file. Best-effort:
-/// a failure (pf no longer holds a token a reboot retired) is logged and never fails the engage.
-fn drop_displaced(displaced: Option<&str>, new: &str, drop_token: impl FnOnce(&str) -> Result<(), RoutingError>) {
+/// will: a leftover from a cover whose release did not finish, or a token salvaged from an unusable file. Skipped when
+/// nothing was displaced or the record named the new token already; a failed drop never fails the engage.
+fn drop_displaced(displaced: Option<&str>, new: &str, drop: impl FnOnce(&str) -> Result<(), RoutingError>) {
     let Some(old) = displaced.filter(|old| *old != new) else {
         return;
     };
-    if let Err(e) = drop_token(old) {
-        tracing::warn!(
-            token = %old,
-            error = &e as &dyn std::error::Error,
-            "pfctl -X failed for the token a new cover's record replaced; pf keeps that refcount until it is reset"
-        );
-    }
+    drop_or_warn(old, "for the token a new cover's record replaced", drop);
 }
 
 pub fn engage(
@@ -671,18 +660,13 @@ fn engage_with(
     //    `Ok`), so a failed save leaves no partial file for a later sweep to
     //    act on.
     let st = state::FailClosedState {
-        pf_token: Some(token.clone()),
+        pf_token: token.clone(),
         pf_was_enabled: was_enabled,
     };
     let displaced = match ops.save_transient(&st) {
         Ok(displaced) => displaced,
         Err(e) => {
-            if let Err(xe) = ops.drop_token(&token) {
-                tracing::warn!(
-                    error = &xe as &dyn std::error::Error,
-                    "pfctl -X failed unwinding a failed transient engage"
-                );
-            }
+            drop_or_warn(&token, "unwinding a failed transient engage", |t| ops.drop_token(t));
             return Err(e);
         }
     };
@@ -758,21 +742,19 @@ impl Drop for Cover {
     }
 }
 
-/// Drop a pf enable refcount (`pfctl -X token`) best-effort: log-and-swallow
-/// on failure rather than propagate, because every call site is already
-/// mid-unwind or mid-teardown with its own outcome (an error, or none) to
-/// return, and a refcount that fails to drop is a leak the caller has no
-/// action left to take beyond logging it. Routed through [`pfctl_status`],
-/// NOT a bare `pfctl(...)?`-then-discard: a spawn can succeed while `pfctl`
-/// itself exits non-zero (e.g. an already-dropped or unknown token), and
-/// reading only the spawn result treats that exit as a silent success — the
-/// refcount then leaks with the log claiming nothing went wrong. `message` is
-/// the call-site-specific warn text (kept distinct per caller rather than
-/// generic, so a `-X` warn in the log still says which of `disengage` /
-/// `engage_lockdown`'s two unwind arms it came from).
-fn drop_refcount_or_warn<P: Phase>(token: &str, phase: P, message: &str) {
-    if let Err(e) = pfctl_status(pfctl(&["-X", token], None, phase), "pfctl -X") {
-        tracing::warn!(error = &e as &dyn std::error::Error, "{message}");
+/// `pfctl -X` for a token Hole holds, best-effort, through the `drop` the caller's ops seam provides (its
+/// `drop_token`): every drop site comes here, so a test double sees every one. A failure is logged and nothing else:
+/// every caller is already mid-unwind or mid-teardown with its own outcome to return, pf may have retired the token (a
+/// reboot) and the code cannot tell that from a real failure, and a record that waited on a drop that always fails
+/// would be a lockout. `drop` reports the exit status as well as the spawn ([`pfctl_status`]), so a token pf rejects is
+/// not read as a success. `context` finishes "pfctl -X failed ...".
+fn drop_or_warn(token: &str, context: &str, drop: impl FnOnce(&str) -> Result<(), RoutingError>) {
+    if let Err(e) = drop(token) {
+        tracing::warn!(
+            token = %token,
+            error = &e as &dyn std::error::Error,
+            "pfctl -X failed {context}; pf keeps that refcount until a reboot resets it"
+        );
     }
 }
 
@@ -782,8 +764,7 @@ fn drop_refcount_or_warn<P: Phase>(token: &str, phase: P, message: &str) {
 /// (the live main ruleset) before Adopt.
 ///
 /// A failed restore keeps the token and the record, so the next sweep still sees a cover rather than a clean host over
-/// a block ([`OnFailedRestore::KeepToken`]). Shared by `Drop`, `recover_cover` and the transient engage's back-out.
-/// These are not the escapes: `release_all` is what lets the user out of a record this leaves behind.
+/// a block ([`release`]). Shared by `Drop`, `recover_cover` and the transient engage's back-out.
 fn disengage_with(token: Result<Option<&str>, RoutingError>, adopting: bool, ops: &mut dyn PfOps) {
     let restored = if adopting {
         tracing::info!("standing lockdown cover being adopted; skipping /etc/pf.conf reload during transient sweep");
@@ -791,7 +772,7 @@ fn disengage_with(token: Result<Option<&str>, RoutingError>, adopting: bool, ops
     } else {
         ops.reload_default()
     };
-    if let Err(e) = release(ops, CoverKind::Transient, token, restored, OnFailedRestore::KeepToken) {
+    if let Err(e) = release(ops, CoverKind::Transient, token, restored) {
         tracing::warn!(
             error = &e as &dyn std::error::Error,
             "the transient cover was not released during cover disengage; its record is left for recovery"
@@ -903,7 +884,7 @@ fn persist_baseline(
     let displaced = pf_record::swap(
         state_dir,
         &lockdown_state::LockdownPfState {
-            pf_token: Some(token.to_owned()),
+            pf_token: token.to_owned(),
             main_snapshot: if captured { main_snapshot } else { String::new() },
             nat_snapshot: nat_snapshot.clone(),
             main_snapshot_captured: captured,
@@ -951,17 +932,16 @@ pub fn engage_lockdown(
         StateFile::Unusable { .. } => None,
         StateFile::Unreadable => None,
     };
-    let drop_replaced = |old: &str| pfctl_status(pfctl(&["-X", old], None, FatalPhase::CoverEngage), "pfctl -X");
+    let mut ops = RealCoverRulesetOps;
 
-    let (token, nat_snapshot) = match engage_pf_action(pf_enabled, persisted.as_ref()) {
+    let (token, nat_snapshot) = match engage_pf_action(pf_enabled, persisted.is_some()) {
         // Live Adopt re-engage within one boot: pf still enabled and we hold the
         // token+snapshot. Reuse both so the real host policy is preserved for the
         // eventual restore. ReuseToken assumes our refcount is still live (the
         // reboot case is `Reenable`); do not double `-E`.
         PfEngageAction::ReuseToken => {
             let st = persisted.expect("ReuseToken implies persisted state");
-            let token = st.pf_token.expect("ReuseToken implies a held token");
-            (token, st.nat_snapshot)
+            (st.pf_token, st.nat_snapshot)
         }
         // Persisted state survived but pf was disabled (reboot reset pf and its
         // refcount). Enable afresh and re-persist the SAME host snapshot under the
@@ -971,7 +951,7 @@ pub fn engage_lockdown(
             let st = persisted.expect("Reenable implies persisted state");
             let token = enable_pf_capture_token()?;
             let fresh = lockdown_state::LockdownPfState {
-                pf_token: Some(token.clone()),
+                pf_token: token.clone(),
                 main_snapshot: st.main_snapshot,
                 nat_snapshot: st.nat_snapshot.clone(),
                 // Carried, not re-asserted: this re-persists the SAME baseline
@@ -980,13 +960,9 @@ pub fn engage_lockdown(
                 main_snapshot_captured: st.main_snapshot_captured,
             };
             match pf_record::swap(state_dir, &fresh, owner) {
-                Ok(displaced) => drop_displaced(displaced.as_deref(), &token, drop_replaced),
+                Ok(displaced) => drop_displaced(displaced.as_deref(), &token, |old| ops.drop_token(old)),
                 Err(e) => {
-                    drop_refcount_or_warn(
-                        &token,
-                        FatalPhase::CoverEngage,
-                        "pfctl -X failed unwinding a failed lockdown re-enable",
-                    );
+                    drop_or_warn(&token, "unwinding a failed lockdown re-enable", |t| ops.drop_token(t));
                     return Err(RoutingError::state_op_failed(StateOp::Write, "lockdown-pf-state", &e));
                 }
             }
@@ -1000,15 +976,11 @@ pub fn engage_lockdown(
             // no state file to recover it from.
             match capture_and_persist(&token, state_dir, owner) {
                 Ok((nat_snapshot, displaced)) => {
-                    drop_displaced(displaced.as_deref(), &token, drop_replaced);
+                    drop_displaced(displaced.as_deref(), &token, |old| ops.drop_token(old));
                     (token, nat_snapshot)
                 }
                 Err(e) => {
-                    drop_refcount_or_warn(
-                        &token,
-                        FatalPhase::CoverEngage,
-                        "pfctl -X failed unwinding a failed lockdown engage",
-                    );
+                    drop_or_warn(&token, "unwinding a failed lockdown engage", |t| ops.drop_token(t));
                     return Err(e);
                 }
             }
@@ -1022,7 +994,7 @@ pub fn engage_lockdown(
     // narrow `CoverRulesetOps` seam (`RealCoverRulesetOps`) rather than
     // standing up a full `RealEngageOps` with a `state_dir`/`owner` this call
     // never reads.
-    if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, &mut RealCoverRulesetOps) {
+    if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, &mut ops) {
         // Restore the host (snapshot reload + drop refcount) before failing, so
         // a partially-loaded ruleset never strands the host.
         lockdown_disengage(state_dir);
@@ -1050,10 +1022,9 @@ pub fn engage_lockdown(
 /// [`CoverPresence::Indeterminate`](crate::routing::CoverPresence::Indeterminate)) refuses rather than claim success having
 /// done nothing. A restore that fails propagates the error and LEAVES the
 /// state file in place, so a retry (or the next start) still sees the cover
-/// rather than reading "disengaged" while the block persists; the record forgets
-/// the pf token and the token is dropped all the same ([`release`]). A token that
-/// fails to drop is logged and is not the answer: after a good restore it blocks
-/// nothing.
+/// rather than reading "disengaged" while the block persists; the token stays
+/// held with it ([`release`]). A token that fails to drop is logged and is not
+/// the answer: after a good restore it blocks nothing.
 ///
 /// Caveat: pf exposes no dump of prior `set` options, so the restore reloads the
 /// host's filter+nat rules under pf defaults (same class of limitation the
@@ -1115,15 +1086,9 @@ fn disengage_lockdown_with(
         _ => ops.reload_default(),
     };
 
-    // The escape hatch (`bridge unlock`, the intent-off sweep): it drops the token the record names, an UNUSABLE
-    // record's included, whatever the restore did, once the record no longer names it.
-    release(
-        ops,
-        CoverKind::Lockdown,
-        st.release_token(),
-        restored,
-        OnFailedRestore::DropToken,
-    )
+    // The escape hatch (`bridge unlock`, the intent-off sweep): after a good restore it drops the token the record
+    // names, an UNUSABLE record's included, once the record no longer names it.
+    release(ops, CoverKind::Lockdown, st.release_token(), restored)
 }
 
 /// Fold the two independent presence sources into one answer. `pf_label` is
@@ -1203,8 +1168,8 @@ pub(crate) trait PfOps {
     fn reload_default(&mut self) -> Result<(), RoutingError>;
     /// `pfctl -f -` with `text` on stdin: load a specific ruleset.
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
-    /// `pfctl -X <token>`: drop a pf enable refcount. A failure is logged by [`release`] and is never a release's
-    /// error.
+    /// `pfctl -X <token>`: drop a pf enable refcount. Callers go through [`drop_or_warn`]; a failure is never a
+    /// release's error.
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
     /// Clear the transient cover's record that a release settled under `token`
     /// ([`pf_record::clear_if_token`]): only a record naming it. What it found is a
@@ -1212,10 +1177,6 @@ pub(crate) trait PfOps {
     fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError>;
     /// The same for the standing lockdown cover's record.
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError>;
-    /// Rewrite the transient cover's record to name no `token`, keeping the rest ([`pf_record::forget_token`]).
-    fn forget_transient(&mut self, token: &str) -> Result<Forgot, RoutingError>;
-    /// The same for the standing lockdown cover's record.
-    fn forget_standing(&mut self, token: &str) -> Result<Forgot, RoutingError>;
 }
 
 /// The disclosure for an unusable record that yielded no token at all — the
@@ -1246,67 +1207,22 @@ fn clear(kind: CoverKind, ops: &mut dyn PfOps, token: Option<&str>) -> Result<Cl
     }
 }
 
-/// Have a cover's record stop naming `token`, keeping the rest of it. Keyed like [`clear`].
-fn forget(kind: CoverKind, ops: &mut dyn PfOps, token: &str) -> Result<Forgot, RoutingError> {
-    match kind {
-        CoverKind::Transient => ops.forget_transient(token),
-        CoverKind::Lockdown => ops.forget_standing(token),
-    }
-}
-
 /// A clear that left a record it could not read is an error, never a success.
 fn refused(cleared: Cleared) -> Result<(), RoutingError> {
     cleared.refusal().map_or(Ok(()), Err)
 }
 
-/// What [`release`] does with a cover's token when the restore failed.
-#[derive(Clone, Copy)]
-enum OnFailedRestore {
-    /// Drop it: a failed restore must not keep pf enabled over the host. The escapes.
-    DropToken,
-    /// Keep it with the record, for the next sweep. `recover_cover` and the transient guard's `Drop`.
-    KeepToken,
-}
-
-impl OnFailedRestore {
-    fn drops_the_token(self) -> bool {
-        match self {
-            OnFailedRestore::DropToken => true,
-            OnFailedRestore::KeepToken => false,
-        }
-    }
-}
-
-/// `pfctl -X` for a cover's token. A drop that fails is logged and nothing else: pf may have retired the token (a
-/// reboot), the code cannot tell that from a real failure, and a record that waited on a drop that always fails
-/// would be a lockout. What the refcount costs depends on the restore.
-fn drop_or_warn(ops: &mut dyn PfOps, kind: CoverKind, token: &str, restore_held: bool) {
-    if let Err(e) = ops.drop_token(token) {
-        let cost = match restore_held {
-            true => "with the host's rules restored it blocks nothing",
-            false => "the host's rules are not restored, so the block stays loaded",
-        };
-        tracing::warn!(
-            error = &e as &dyn std::error::Error,
-            "pfctl -X failed releasing the {} pf refcount; pf keeps it until a reboot resets it, and {cost}",
-            what(kind)
-        );
-    }
-}
-
 /// The release of one cover, after its restore was attempted. `token` is [`StateFile::release_token`]'s answer.
 ///
-/// A record names only a token Hole holds ([`super::pf_record`]), so the record is made safe first and the token
-/// dropped after, and only once the record stopped naming it:
+/// A record names only a token Hole holds ([`super::pf_record`]), so the record is cleared first and the token dropped
+/// after, and only once the clear took the record that named it:
 ///
+/// - A restore that failed is the error, with what the user can do about it, and touches neither record nor token: the
+///   cover is still in force, and the record and the refcount are what a later release acts by.
 /// - A restore that held clears the record, and drops the token only if that clear took the record that named it. A
 ///   clear that cannot write is the error and drops nothing: the record still names a token Hole holds, and the retry
 ///   works. A clear that finds another token's record or none drops nothing either: the engage that displaced it
 ///   dropped it already. A record that could not be read stays and is the error.
-/// - A restore that failed is the error and keeps the record, the evidence of the block. The escapes
-///   ([`OnFailedRestore::DropToken`]) have the record forget the token first, then drop it, so a failed restore does
-///   not keep pf enabled over the host; a forget that cannot write drops nothing. The others keep token and record
-///   together.
 ///
 /// A record that could not be read has no token to drop or clear by. The host is restored all the same, and the
 /// answer is the refusal, never success.
@@ -1315,8 +1231,8 @@ fn release(
     kind: CoverKind,
     token: Result<Option<&str>, RoutingError>,
     restored: Result<(), RoutingError>,
-    on_failed_restore: OnFailedRestore,
 ) -> Result<(), RoutingError> {
+    let restored = restored.map_err(restore_failed);
     let token = match token {
         Ok(token) => token,
         Err(unread) => {
@@ -1324,37 +1240,29 @@ fn release(
             return Err(unread);
         }
     };
-    if let Err(restore_error) = restored {
-        if on_failed_restore.drops_the_token() {
-            forget_then_drop(ops, kind, token);
-        }
-        return Err(restore_error);
-    }
+    restored?;
     let cleared = clear(kind, ops, token)?;
-    // An unusable file that named no token: nothing to drop, only a file moved aside.
-    if let (Cleared::MovedAside, None) = (cleared, token) {
+    if cleared.took_a_record_naming_no_token(token) {
         warn_unsalvageable_token(what(kind));
     }
     if let (Some(token), true) = (token, cleared.may_drop_the_token()) {
-        drop_or_warn(ops, kind, token, true);
+        drop_or_warn(token, &format!("releasing the {} pf refcount", what(kind)), |t| {
+            ops.drop_token(t)
+        });
     }
     refused(cleared)
 }
 
-/// An escape's token after a failed restore: forgotten by the record, which stays, and then dropped. The release
-/// reports the restore's error either way; a record that cannot be rewritten still names the token, so it is kept.
-fn forget_then_drop(ops: &mut dyn PfOps, kind: CoverKind, token: Option<&str>) {
-    let Some(token) = token else { return };
-    match forget(kind, ops, token) {
-        Ok(forgot) if forgot.may_drop_the_token() => drop_or_warn(ops, kind, token, false),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
-            error = &e as &dyn std::error::Error,
-            "the {} record could not be rewritten to forget its pf token after a failed restore; the token is \
-             kept with it, and the next release drops it",
-            what(kind)
-        ),
-    }
+/// A restore that failed leaves the cover in force. The error says what the user can do: the usual cause is a broken
+/// `/etc/pf.conf`, and the record is what lets a later release try again.
+fn restore_failed(e: RoutingError) -> RoutingError {
+    let detail = match e {
+        RoutingError::RouteSetup(detail) => detail,
+        other => other.to_string(),
+    };
+    RoutingError::RouteSetup(format!(
+        "{detail}; the block is still in place. Fix /etc/pf.conf and unblock again, or run `sudo pfctl -d`"
+    ))
 }
 
 /// The unconditional two-cover clear, factored as a pure sequencer over an
@@ -1370,27 +1278,11 @@ pub(crate) fn release_all_with(
     standing: StateFile<lockdown_state::LockdownPfState>,
     ops: &mut dyn PfOps,
 ) -> SweepOutcome {
-    // Each cover's release after its restore: the escapes drop the token whatever the restore did.
-    let release_transient = |ops: &mut dyn PfOps, restored| {
-        release(
-            ops,
-            CoverKind::Transient,
-            transient.release_token(),
-            restored,
-            OnFailedRestore::DropToken,
-        )
-        .err()
-    };
-    let release_standing = |ops: &mut dyn PfOps, restored| {
-        release(
-            ops,
-            CoverKind::Lockdown,
-            standing.release_token(),
-            restored,
-            OnFailedRestore::DropToken,
-        )
-        .err()
-    };
+    // Each cover's release after its restore.
+    let release_transient =
+        |ops: &mut dyn PfOps, restored| release(ops, CoverKind::Transient, transient.release_token(), restored).err();
+    let release_standing =
+        |ops: &mut dyn PfOps, restored| release(ops, CoverKind::Lockdown, standing.release_token(), restored).err();
 
     // Block 1 — transient cover. A reload failure is recorded but does NOT
     // stop block 2: the standing cover is the one that blocks indefinitely
@@ -1503,6 +1395,12 @@ pub(super) fn real_load_ruleset(text: &str) -> Result<(), RoutingError> {
     )
 }
 
+/// `pfctl -X <token>`: the one spawn site of a refcount drop, shared by every real ops impl. Best-effort whichever
+/// phase asked: a token pf no longer holds fails here, and the caller logs it ([`drop_or_warn`]).
+fn real_drop_token(token: &str) -> Result<(), RoutingError> {
+    pfctl_status(pfctl(&["-X", token], None, BestEffortPhase::RecoverCover), "pfctl -X")
+}
+
 /// `pfctl -F states`, same sharing rationale — and same `pub(super)` caveat —
 /// as [`real_load_ruleset`].
 pub(super) fn real_flush_states() -> Result<(), RoutingError> {
@@ -1520,6 +1418,10 @@ impl CoverRulesetOps for RealEngageOps<'_> {
     fn flush_states(&mut self) -> Result<(), RoutingError> {
         real_flush_states()
     }
+
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        real_drop_token(token)
+    }
 }
 
 impl EngageOps for RealEngageOps<'_> {
@@ -1535,10 +1437,6 @@ impl EngageOps for RealEngageOps<'_> {
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError> {
         pf_record::swap(self.state_dir, st, self.owner)
             .map_err(|e| RoutingError::state_op_failed(StateOp::Write, "failclosed-state", &e))
-    }
-
-    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        pfctl_status(pfctl(&["-X", token], None, FatalPhase::CoverEngage), "pfctl -X")
     }
 
     fn transient_restore(&mut self, token: &str) {
@@ -1559,6 +1457,10 @@ impl CoverRulesetOps for RealCoverRulesetOps {
 
     fn flush_states(&mut self) -> Result<(), RoutingError> {
         real_flush_states()
+    }
+
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        real_drop_token(token)
     }
 }
 
@@ -1600,7 +1502,7 @@ impl PfOps for RealPfOps<'_> {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        pfctl_status(pfctl(&["-X", token], None, BestEffortPhase::RecoverCover), "pfctl -X")
+        real_drop_token(token)
     }
 
     fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
@@ -1611,16 +1513,6 @@ impl PfOps for RealPfOps<'_> {
     fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         pf_record::clear_if_token::<lockdown_state::LockdownPfState>(self.state_dir, token)
             .map_err(|e| RoutingError::state_op_failed(StateOp::Clear, "lockdown-pf-state", &e))
-    }
-
-    fn forget_transient(&mut self, token: &str) -> Result<Forgot, RoutingError> {
-        pf_record::forget_token::<state::FailClosedState>(self.state_dir, token)
-            .map_err(|e| RoutingError::state_op_failed(StateOp::Write, "failclosed-state", &e))
-    }
-
-    fn forget_standing(&mut self, token: &str) -> Result<Forgot, RoutingError> {
-        pf_record::forget_token::<lockdown_state::LockdownPfState>(self.state_dir, token)
-            .map_err(|e| RoutingError::state_op_failed(StateOp::Write, "lockdown-pf-state", &e))
     }
 }
 

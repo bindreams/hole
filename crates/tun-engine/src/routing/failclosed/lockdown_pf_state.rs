@@ -13,11 +13,8 @@ pub const STATE_FILE_NAME: &str = "bridge-lockdown-pf.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockdownPfState {
-    /// Opaque enable token from `pfctl -E`, replayed to `pfctl -X` on Sweep. `None`: the cover holds no token
-    /// any more (see [`super::pf_record`]); the next engage takes a fresh one under the same snapshots. No schema
-    /// bump for the `Option`, for the reason [`FailClosedState::pf_token`](super::failclosed_state::FailClosedState::pf_token)
-    /// gives.
-    pub pf_token: Option<String>,
+    /// Opaque enable token from `pfctl -E`, replayed to `pfctl -X` on Sweep.
+    pub pf_token: String,
     /// The host's filter ruleset (`pfctl -sr`) captured before we replaced the
     /// main ruleset with the lockdown policy. Re-loaded on Sweep so the host
     /// returns to its pre-lockdown policy (NOT a blind `/etc/pf.conf` reload).
@@ -69,24 +66,7 @@ impl VersionedState for LockdownPfState {
 util::assert_contiguous!(LockdownPfState);
 
 impl super::pf_record::PfRecord for LockdownPfState {
-    fn pf_token(&self) -> Option<&str> {
-        self.pf_token.as_deref()
-    }
-
-    fn without_token(&self) -> Self {
-        Self {
-            pf_token: None,
-            ..self.clone()
-        }
-    }
-
-    /// No baseline captured: a restore reloads `/etc/pf.conf`, as it does for a record it cannot read.
-    fn tokenless() -> Self {
-        Self {
-            pf_token: None,
-            main_snapshot: String::new(),
-            nat_snapshot: String::new(),
-            main_snapshot_captured: false,
-        }
+    fn pf_token(&self) -> &str {
+        &self.pf_token
     }
 }

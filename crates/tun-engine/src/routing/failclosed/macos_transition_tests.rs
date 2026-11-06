@@ -117,6 +117,10 @@ impl<I: CoverRulesetOps> CoverRulesetOps for PublishOnCommit<'_, I> {
     fn flush_states(&mut self) -> Result<(), RoutingError> {
         self.inner.flush_states()
     }
+
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.inner.drop_token(token)
+    }
 }
 
 impl<I: EngageOps> EngageOps for PublishOnCommit<'_, I> {
@@ -128,9 +132,6 @@ impl<I: EngageOps> EngageOps for PublishOnCommit<'_, I> {
     }
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError> {
         self.inner.save_transient(st)
-    }
-    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        self.inner.drop_token(token)
     }
     fn transient_restore(&mut self, token: &str) {
         self.inner.transient_restore(token)
@@ -171,6 +172,9 @@ fn publish_on_commit_brackets_its_load_with_a_generation_change() {
             }
         }
         fn flush_states(&mut self) -> Result<(), RoutingError> {
+            Ok(())
+        }
+        fn drop_token(&mut self, _token: &str) -> Result<(), RoutingError> {
             Ok(())
         }
     }
