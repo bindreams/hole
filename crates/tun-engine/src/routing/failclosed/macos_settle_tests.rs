@@ -1014,17 +1014,17 @@ fn every_transient_release_logs_an_unusable_or_unreadable_record_the_same() {
             || StateFile::Unusable {
                 pf_token: Some("9".into()),
             },
-            Some("failclosed-state file is unusable"),
+            Some("the transient cover's record is unusable"),
         ),
         (
             "an unusable record without a token",
             || StateFile::Unusable { pf_token: None },
-            Some("failclosed-state file is unusable"),
+            Some("the transient cover's record is unusable"),
         ),
         (
             "an unreadable record",
             || StateFile::Unreadable,
-            Some("failclosed-state file could not be read"),
+            Some("the transient cover's record could not be read"),
         ),
     ];
     let callers: [Caller; 2] = [
@@ -1052,11 +1052,11 @@ fn every_transient_release_logs_an_unusable_or_unreadable_record_the_same() {
                 run(make(), &mut RecordingPfOps::default());
             }
             let log = writer.snapshot();
-            // The two texts name what is wrong with the record; "unsalvageable token" is another warning, about the
-            // refcount, and is not what this test is about.
+            // Only `warn_if_not_evidence` writes these two texts: the refcount warning and a release's own failure
+            // name the file or the error, not "the transient cover's record".
             for text in [
-                "failclosed-state file is unusable",
-                "failclosed-state file could not be read",
+                "the transient cover's record is unusable",
+                "the transient cover's record could not be read",
             ] {
                 assert_eq!(
                     log.contains(text),
@@ -1067,7 +1067,7 @@ fn every_transient_release_logs_an_unusable_or_unreadable_record_the_same() {
             // A release's own failure is another line, not the record's.
             logs.push(
                 log.lines()
-                    .filter(|line| line.contains("failclosed-state file"))
+                    .filter(|line| line.contains("the transient cover's record"))
                     .map(str::to_owned)
                     .collect::<Vec<_>>(),
             );

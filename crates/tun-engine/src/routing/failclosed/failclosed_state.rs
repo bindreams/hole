@@ -60,19 +60,19 @@ impl super::pf_record::PfRecord for FailClosedState {
 impl super::StateFile<FailClosedState> {
     /// The one place a transient release says that the record it read is no evidence there is no cover. Every release
     /// of the transient cover that holds the record as a `StateFile` calls it, so each logs the same.
-    pub fn warn_if_not_evidence(&self) {
+    pub(crate) fn warn_if_not_evidence(&self) {
         use super::StateFile;
         match self {
             StateFile::Present(_) => {}
             StateFile::Absent => {}
             StateFile::Unusable { pf_token } => tracing::warn!(
                 token_salvaged = pf_token.is_some(),
-                "transient failclosed-state file is unusable; releasing the cover anyway — an unreadable record is \
-                 not evidence there is no cover to clear"
+                "the transient cover's record is unusable, so it is no evidence there is no cover to clear; the \
+                 release goes on as if a cover were held"
             ),
             StateFile::Unreadable => tracing::warn!(
-                "transient failclosed-state file could not be read; releasing the cover anyway — an unreadable \
-                 record is not evidence there is no cover to clear"
+                "the transient cover's record could not be read, so it is no evidence there is no cover to clear; \
+                 the release goes on as if a cover were held"
             ),
         }
     }
