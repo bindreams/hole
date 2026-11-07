@@ -17,7 +17,7 @@ workspace = true
 harness = false
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 dump-macros = { path = "../dump-macros" }
 serde = { version = "1", features = ["derive"] }
 

@@ -52,7 +52,7 @@ garter = { path = "../garter" }
 # the cutover needs only the pure name-set fn.
 xtask-lib = { path = "../../xtask-lib" }
 shadowsocks-service = { version = "1", features = ["local", "local-http", "aead-cipher-2022"] }
-shadowsocks = "=1.24.0"
+shadowsocks = "=1.25.0"
 hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "io-util", "net"] }
 serde = { version = "1", features = ["derive"] }
@@ -87,11 +87,11 @@ idna = "1"
 ipnet = "2"
 regex = "1"
 # New crates not previously in the tree.
-lru = "0.18"
+lru = "0.19"
 tls-parser = "0.12"
 # Filter engine runtime deps — smoltcp types leak into HoleRouter for
 # CIDR parsing of the TUN's hard-coded v4/v6 subnets.
-smoltcp = { version = "0.13", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "alloc",
     "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp",
@@ -134,9 +134,9 @@ windows = { version = "0.62", features = ["Win32_System_EventLog"] }
 payload-archive = { path = "../payload-archive" }
 windows-service = "0.8"
 # The service SID is the SHA-1 of the upper-cased service name.
-sha1 = "0.10"
+sha1 = "0.11"
 # Safe HKLM reads for `cutover::windows_profiles` (ProfileList enumeration).
-windows-registry = "0.6"
+windows-registry = "0.100"
 windows = { version = "0.62", features = [
     "Wdk_Foundation",
     "Wdk_System_SystemInformation",
