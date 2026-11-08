@@ -36,7 +36,7 @@ impl Drop for FakeCover {
 }
 
 #[skuld::test]
-fn a_sweep_waits_for_an_engage_inside_its_os_step() {
+fn an_engage_holds_the_lock_through_its_os_step_and_a_later_sweep_runs_after_it() {
     let d = dir();
     let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
     let (in_engage_tx, in_engage_rx) = mpsc::channel::<()>();

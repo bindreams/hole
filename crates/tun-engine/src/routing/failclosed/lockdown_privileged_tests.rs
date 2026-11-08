@@ -484,7 +484,8 @@ fn a_simulated_reboot_rearms_the_cover() {
 /// Pins only the stamp bookkeeping: the back-out of a failed re-engage releases the cover (restore, record, token),
 /// and the older guard's stamp must go stale with it, or its later drop would delete what a newer install now owns.
 /// An interface name pf cannot parse fails the load after the persisted token was reused. The presence assertion
-/// records the current behaviour, not the desired one.
+/// records the current behaviour, not the desired one: the open defect bindreams/hole#1203 (a cover in force should
+/// survive a failed engage) changes it.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_lockdown_failed_engage_backout_outdates_the_older_guards_stamp() {
@@ -509,7 +510,7 @@ fn macos_lockdown_failed_engage_backout_outdates_the_older_guards_stamp() {
     assert_eq!(
         super::lockdown_cover_presence(dir.path()),
         crate::routing::CoverPresence::Absent,
-        "the back-out released the cover (current behaviour: a cover in force does not survive a failed engage)"
+        "the back-out released the cover (current behaviour, open defect bindreams/hole#1203)"
     );
     assert!(
         !crate::routing::CoverGuard::is_current(&first),
