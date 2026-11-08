@@ -1311,11 +1311,14 @@ fails, and releasing it on success, cancel, or a user stop. When the standing
 lockdown intent is ON, a covered start does NOT engage this cover at all — that
 cohort's cover is installed once at `routing.install` instead
 ([Lockdown mode](#lockdown-mode)) — and a HELD transient cover from a prior
-start is released outright. The host is uncovered from that release until the
-standing cover engages after the plugin chain and `routing.install`
+start is released outright. Unless an adopted standing cover already holds the
+host (the release then opens nothing), the host is uncovered from that release
+until the standing cover engages after the plugin chain and `routing.install`.
+A start that fails before then never engages it and holds no cover for the
+retry, so the window lasts as long as the starts keep failing
 ([#1206](https://github.com/bindreams/hole/issues/1206)). It does *not* cover an
-indefinite outage (a bridge that stays down) — without lockdown, default-off Hole fails *open* there; lockdown
-closes that broader gap.
+indefinite outage (a bridge that stays down) — without lockdown, default-off Hole
+fails *open* there; lockdown closes that broader gap.
 
 `resolver_ip` optionally permits ONE more address, scoped to **TCP port 443**
 (not the server permit's unrestricted shape — `doh_url_for_ip` in
@@ -1401,7 +1404,9 @@ engage is delete-then-add, not an atomic in-place update, and on macOS the gap i
 the release itself (the drop reloads `/etc/pf.conf`), although the macOS engage
 is now atomic over a live cover. The same release-first gap applies when lockdown
 is newly enabled on a covered retry, but there the window lasts until the
-standing cover engages ([#1206](https://github.com/bindreams/hole/issues/1206)).
+standing cover engages, which a failing start never reaches, and it opens
+nothing when an adopted standing cover already holds the host
+([#1206](https://github.com/bindreams/hole/issues/1206)).
 The repair's own gap is tracked in
 [#758](https://github.com/bindreams/hole/issues/758). If BOTH the corrected
 engage AND the compensating restore fail — two independent OS-level

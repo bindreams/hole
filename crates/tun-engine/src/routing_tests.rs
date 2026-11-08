@@ -1881,6 +1881,11 @@ fn a_promotion_the_file_declines_is_warned_and_skipped() {
             .with_ansi(false)
             .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
     );
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Recover(CoverRecovery, Option<String>),
+        Sweep { adopting: bool },
+    }
     let steps = std::cell::RefCell::new(Vec::new());
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
@@ -1889,15 +1894,22 @@ fn a_promotion_the_file_declines_is_warned_and_skipped() {
             None,
             Some("hole-tun"),
             |_, _c, _p| Ok(()),
-            |_lock, adopting| steps.borrow_mut().push(format!("sweep(adopting={adopting})")),
+            |_lock, adopting| steps.borrow_mut().push(Step::Sweep { adopting }),
             || Intent::Unset,
             || Live,
-            |_lock, action, tun_name| steps.borrow_mut().push(format!("recover({action:?}, {tun_name:?})")),
+            |_lock, action, tun_name| {
+                steps
+                    .borrow_mut()
+                    .push(Step::Recover(action, tun_name.map(str::to_owned)))
+            },
         );
     }
     assert_eq!(
         steps.into_inner(),
-        ["recover(Adopt, Some(\"hole-tun\"))", "sweep(adopting=true)"],
+        [
+            Step::Recover(Adopt, Some("hole-tun".into())),
+            Step::Sweep { adopting: true }
+        ],
         "the decline must not stop the Adopt or the sweep"
     );
 

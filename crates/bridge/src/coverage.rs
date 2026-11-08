@@ -22,8 +22,9 @@ pub enum CoverPlan {
     /// Engage the transient cover, or keep the held one, comparing the Unblock count to `unblock_snapshot`.
     Engage { unblock_snapshot: u64 },
     /// A standing lockdown cover holds the host or takes over at connect, so the held transient cover is released:
-    /// engaging both would, on macOS, clobber the singular pf ruleset. The host is uncovered from the release until
-    /// the standing cover engages after the plugin chain and `routing.install` (open: bindreams/hole#1206).
+    /// engaging both would, on macOS, clobber the singular pf ruleset. Unless an adopted standing cover holds the
+    /// host, it is uncovered from the release until the standing cover engages after the plugin chain and
+    /// `routing.install`; a start that fails first never engages it (open: bindreams/hole#1206).
     HandToLockdown,
     /// A manual connect or reload: release the held transient cover; the host is fail-open by design.
     FailOpen,

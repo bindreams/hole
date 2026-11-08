@@ -758,7 +758,7 @@ fn releasing_a_held_cover_reports_it_only_when_it_was_still_in_force() {
     assert!(!taken.release_pending(&lock));
     drop(lock);
     assert!(matches!(taken, Posture::Idle));
-    assert_eq!(disengaged(), 1, "the cover an Unblock took is not disengaged again");
+    assert_eq!(disengaged(), 1, "a guard an Unblock outdated disengages nothing itself");
 
     let lock = routing.lock_covers();
     assert!(!Posture::<MockProxy, MockRouting, SystemDns>::Idle.release_pending(&lock));

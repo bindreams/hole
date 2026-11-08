@@ -1012,12 +1012,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             }
             CoverPlan::HandToLockdown => {
                 // Covered retry after the user enabled lockdown mid-blocked-state:
-                // release the held cover. The host is uncovered from here until the standing
-                // lockdown cover engages after the plugin chain and `routing.install` (open: bindreams/hole#1206).
+                // release the held cover. Unless an adopted standing cover already holds the host, it is uncovered
+                // from here until the standing cover engages after the plugin chain and `routing.install`; a start
+                // that fails first never engages it, so the window lasts as long as the starts fail (open:
+                // bindreams/hole#1206).
                 if self.release_held_cover() {
                     warn!(
-                        "covered retry with lockdown newly enabled: releasing the held cover; the host is uncovered \
-                         until the standing lockdown cover engages at connect"
+                        "covered retry with lockdown newly enabled: releasing the held cover; unless an adopted standing \
+                         cover holds the host it is uncovered until the standing lockdown cover engages, which a \
+                         failing start never reaches"
                     );
                 }
             }
