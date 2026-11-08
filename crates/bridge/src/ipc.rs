@@ -3,8 +3,9 @@
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{CoverPresence, Routing};
 
+use crate::coverage::Coverage;
 use crate::proxy::{Proxy, ProxyError};
-use crate::proxy_manager::{ProxyManager, ProxyState};
+use crate::proxy_manager::{LockdownOffError, ProxyManager, ProxyState};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use crate::target::{self, Target};
@@ -80,67 +81,49 @@ fn on_startup_from(headers: &axum::http::HeaderMap) -> Option<StartupBehavior> {
 /// so a stale arm left by a cancel whose start already finished — or never
 /// arrived — can never silently cancel a later, unrelated attempt (#465).
 #[derive(Default)]
-pub struct StartCancelState {
+pub(crate) struct StartCancelState {
     /// Id + token of the currently in-flight start, if any. Single-occupancy:
     /// a concurrent second start is rejected (409) rather than overwriting.
-    pub in_flight: Option<(AttemptId, CancellationToken)>,
+    pub(crate) in_flight: Option<(AttemptId, CancellationToken)>,
     /// A cancel that found no matching in-flight start pre-arms here, scoped to
     /// the exact attempt it named. Consumed only by a start carrying the same
     /// id; superseded (cleared) by any other *proceeding* start. Last-writer-wins.
-    pub pre_armed: Option<AttemptId>,
+    pub(crate) pre_armed: Option<AttemptId>,
 }
 
 /// Shared state for IPC handlers, holding the proxy manager and the
 /// start-cancellation handoff struct.
-pub struct IpcState<P: Proxy, R: Routing> {
-    pub proxy: Arc<Mutex<ProxyManager<P, R>>>,
+pub(crate) struct IpcState<P: Proxy, R: Routing> {
+    /// Where a cover-lock section runs. A section that holds this mutex is single-flight, so at most one worker waits
+    /// on the cover lock for it and it may run inline on the runtime worker (`handle_lockdown`). Using
+    /// `spawn_blocking` under the mutex is allowed, not required (`persist_after_start`, the boot reconcile). A
+    /// section that does not hold it (`handle_unblock`) is not single-flight: concurrent requests could each park a
+    /// worker, so it runs in `spawn_blocking`.
+    pub(crate) proxy: Arc<Mutex<ProxyManager<P, R>>>,
     /// The SAME `Arc<R>` `proxy`'s `ProxyManager` holds internally, cloned
     /// once at bind time via `ProxyManager::routing_handle`. Lets
     /// `handle_unblock` act on routing (read presence, release covers)
     /// WITHOUT taking `proxy.lock()` — the escape must work even while a
     /// teardown wedges that lock.
-    pub routing: Arc<R>,
-    /// The SAME `Arc<AtomicBool>` `proxy`'s `ProxyManager` holds internally,
-    /// cloned once at bind time via `ProxyManager::cover_invalidation_handle`
-    /// — the same derivation pattern as `routing` above. `handle_unblock`
-    /// sets this after releasing every OS-level cover, lock-free, so a
-    /// concurrent `start_cancellable` (which does hold `proxy.lock()`) can
-    /// tell its own `Posture::PendingStart` guard is a zombie the next time
-    /// it looks.
-    pub cover_invalidated: Arc<std::sync::atomic::AtomicBool>,
-    /// Bumped by `handle_unblock` right after its `Off` save succeeds, under
-    /// [`Self::intent_persist`], so a failed save never announces an unblock.
-    /// `handle_start`/`handle_reload` snapshot it before touching the proxy;
-    /// `persist_after_start` re-reads it under `intent_persist` and declines the
-    /// start's records if it moved. Every read is a pre-persist snapshot or sits
-    /// under that mutex. A counter rather than `cover_invalidated`, which
-    /// `start_cancellable` consumes: `reload`'s hot-swap path never calls that,
-    /// so one stale unblock would wedge every later hot-swap write.
+    pub(crate) routing: Arc<R>,
+    /// Bumped by `handle_unblock` right after its `Off` save succeeds, under the cover lock, so a failed save never
+    /// announces an unblock. `handle_start`/`handle_reload` snapshot it before touching the proxy;
+    /// `persist_after_start` re-reads it under the cover lock and declines the start's records if it moved. Every
+    /// read is a pre-persist snapshot or sits under that lock. A counter, not a flag a start consumes: `reload`'s
+    /// hot-swap path would never consume it, so one stale unblock would wedge every later hot-swap write.
     ///
-    /// The compare-and-set the proxy lock cannot give, because `handle_unblock`
-    /// deliberately takes no proxy lock.
-    pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Orders `persist_after_start`'s target + candidate writes against
-    /// `handle_unblock`'s `Off` + `set_enabled` + candidate clear, each a
-    /// sequence of separate record-lock sections. Held only inside a
-    /// `spawn_blocking` closure, never across an `.await`, and always taken
-    /// before a record lock. Other candidate writers run under
-    /// `BridgeLiveness` and need no ordering against these two.
-    pub intent_persist: Arc<std::sync::Mutex<()>>,
+    /// The compare-and-set the proxy lock cannot give, because `handle_unblock` deliberately takes no proxy lock.
+    /// It is the persisted `Off` the start reads: it decides whether a start or reload may record `Connected` and
+    /// its candidate, and only the tray's Unblock moves it.
+    pub(crate) unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
-    pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
+    pub(crate) start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
     /// This bridge's build version, stamped on every response
     /// (`X-Hole-Bridge-Version`) and served at `/v1/version` so a
     /// freshly-updated GUI can detect a still-old bridge.
-    pub version: String,
+    pub(crate) version: String,
     /// Service log dir — where the cutover marker is written (GUI-readable).
-    pub log_dir: PathBuf,
-    /// Service state dir — the same-volume parent for the cutover staging.
-    pub state_dir: PathBuf,
-    /// Real-user uid/gid for a user-scoped elevated run, so writes into the
-    /// user's profile (e.g. the cutover marker) are chowned back to them.
-    /// `None` for the `--service` daemon, whose dirs are root-owned by design.
-    pub owner: Option<(u32, u32)>,
+    pub(crate) log_dir: PathBuf,
     /// Test-only rendezvous, mirroring `MockProxy`'s `start_gate`/
     /// `start_entered`: if set, `persist_after_start` fires `persist_entered`
     /// on entry, then awaits `persist_gate`, before doing any write. Lets a
@@ -150,6 +133,32 @@ pub struct IpcState<P: Proxy, R: Routing> {
     pub(crate) persist_gate: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     pub(crate) persist_entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl<P: Proxy, R: Routing> IpcState<P, R> {
+    /// The state a server shares across its handlers, derived from `proxy`. The state directory is not a parameter:
+    /// handlers read it from `routing`, the one place it lives.
+    ///
+    /// `try_lock` is safe here: `proxy` is freshly constructed and not yet shared with any other task at this call
+    /// site, in every production and test caller, so it is uncontended by construction.
+    pub(crate) fn new(proxy: Arc<Mutex<ProxyManager<P, R>>>, version: &str, log_dir: PathBuf) -> Self {
+        let (routing, unblock_generation) = {
+            let pm = proxy.try_lock().expect("proxy mutex must be uncontended at bind time");
+            (pm.routing_handle(), pm.unblock_generation_handle())
+        };
+        Self {
+            proxy,
+            routing,
+            unblock_generation,
+            start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
+            version: version.to_owned(),
+            log_dir,
+            #[cfg(test)]
+            persist_gate: None,
+            #[cfg(test)]
+            persist_entered: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 // Server ==============================================================================================================
@@ -170,13 +179,11 @@ impl IpcServer {
     /// Removes any stale socket file, creates parent directories, binds with
     /// restrictive initial permissions (umask on macOS, DACL on Windows), and
     /// then applies the final OS-level access control (adding the `hole` group).
-    pub fn bind_with_dirs<P: Proxy + 'static, R: Routing + 'static>(
+    pub fn bind_with_log_dir<P: Proxy + 'static, R: Routing + 'static>(
         path: &Path,
         proxy: Arc<Mutex<ProxyManager<P, R>>>,
         version: &str,
         log_dir: PathBuf,
-        state_dir: PathBuf,
-        owner: Option<(u32, u32)>,
     ) -> std::io::Result<Self> {
         #[cfg(not(test))]
         let listener = LocalListener::bind_restricted(path)?;
@@ -186,32 +193,7 @@ impl IpcServer {
         #[cfg(not(test))]
         apply_socket_permissions(path);
 
-        // `try_lock` is safe here: `proxy` is freshly constructed and not yet
-        // shared with any other task at this call site, in every production
-        // and test caller — uncontended by construction. Deriving the
-        // routing handle this way (rather than threading a new parameter)
-        // keeps every existing `bind`/`bind_with_dirs` call site unchanged.
-        let (routing, cover_invalidated) = {
-            let guard = proxy.try_lock().expect("proxy mutex must be uncontended at bind time");
-            (guard.routing_handle(), guard.cover_invalidation_handle())
-        };
-
-        let state = Arc::new(IpcState {
-            proxy,
-            routing,
-            cover_invalidated,
-            unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            intent_persist: Arc::new(std::sync::Mutex::new(())),
-            start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
-            version: version.to_owned(),
-            log_dir,
-            state_dir,
-            owner,
-            #[cfg(test)]
-            persist_gate: None,
-            #[cfg(test)]
-            persist_entered: std::sync::Mutex::new(None),
-        });
+        let state = Arc::new(IpcState::new(proxy, version, log_dir));
         let router = build_router(state, version);
         Ok(Self {
             listener,
@@ -220,9 +202,8 @@ impl IpcServer {
         })
     }
 
-    /// Test-only shim: production calls `bind_with_dirs`. The cutover dirs
-    /// default to a fresh temp dir so per-test markers/staging don't collide
-    /// across the shared skuld process.
+    /// Test-only shim: production calls `bind_with_log_dir`. The log dir defaults to a fresh temp dir so per-test
+    /// markers don't collide across the shared skuld process.
     #[cfg(test)]
     pub fn bind<P: Proxy + 'static, R: Routing + 'static>(
         path: &Path,
@@ -230,7 +211,7 @@ impl IpcServer {
         version: &str,
     ) -> std::io::Result<Self> {
         let tmp = tempfile::tempdir()?.keep();
-        Self::bind_with_dirs(path, proxy, version, tmp.clone(), tmp, None)
+        Self::bind_with_log_dir(path, proxy, version, tmp)
     }
 
     /// Accept and handle one client connection, then return.
@@ -415,14 +396,9 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     // presence after it is what stops a reply advertising a cover that no
     // longer exists.
     //
-    // In `spawn_blocking`, because the probe is an OS call — `pfctl -s labels`
-    // through a blocking `std::process::Command` on macOS, `FwpmEngineOpen0`
-    // plus one `FwpmFilterGetByKey0` per swept GUID on Windows — and status is
-    // a POLL: the tray reconciler ticks it every 5s and the dashboard polls it
-    // every 5s. Run inline it forks a subprocess on a runtime worker twice
-    // that often, which is what `foreground.rs`'s own `spawn_blocking` comment
-    // means by keeping OS work off the runtime. The predecessor this replaced
-    // was an in-memory `Posture` read, so nothing here used to block.
+    // In `spawn_blocking`: the probe blocks (it forks `pfctl -s labels` on macOS; it opens the WFP engine on
+    // Windows), and status takes no `state.proxy`, so polls (every 5 s from the tray and the dashboard) can overlap.
+    // Inline, each would block a runtime worker.
     let routing = Arc::clone(&state.routing);
     let presence = tokio::task::spawn_blocking(move || routing.lockdown_cover_presence())
         .await
@@ -516,7 +492,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // bridge's own boot-time reconciliation (#617, `reconcile_once`), which
     // calls `ProxyManager` directly and never goes through this handler at
     // all.
-    let covered = false;
+    let coverage = Coverage::Uncovered;
     #[allow(clippy::disallowed_methods)]
     // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
     let token = CancellationToken::new();
@@ -559,11 +535,13 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // since single-occupancy (the 409 above) will not admit the next start
     // until `in_flight` clears below, after this persist has completed.
     // Snapshot BEFORE the proxy lock: any unblock from here on is concurrent
-    // with this start and must win the target write.
+    // with this start and must win the target write. It reads the user's decision
+    // to be Off (`unblock_generation`). A covered start would carry the same value in
+    // `Coverage::Covered`, so the records and the transient cover decide against one start-begin.
     let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let result = {
         let mut pm = state.proxy.lock().await;
-        let result = pm.start_cancellable(&config, covered, token).await;
+        let result = pm.start_cancellable(&config, coverage, token).await;
         persist_after_start(&state, &config, on_startup, result.is_ok(), unblock_snapshot).await;
         result
     };
@@ -614,10 +592,9 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 ///   precedes any config change).
 ///
 /// Invariant: a candidate never sits beside an `Off` target, because
-/// `AlwaysConnect` reconnects from it. The start's records are written under
-/// `intent_persist`, so one reading of `unblock_generation` decides both: if an
-/// unblock committed since the snapshot, neither the target nor the candidate is
-/// written. The `on_startup` push is a preference and stands either way.
+/// `AlwaysConnect` reconnects from it. The start's records are written under the cover lock, which the tray's
+/// Unblock holds through its release and its own records, so one reading of `unblock_generation` decides both: if
+/// an unblock committed since the snapshot, neither the target nor the candidate is written. The `on_startup` push is a preference and stands either way.
 ///
 /// Runs in `spawn_blocking`, since both `target::apply` and
 /// `apply_startup_preference` are sync (the record locks they take are leaf
@@ -625,7 +602,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 /// is logged, never surfaced as a start failure: the tunnel's own outcome is
 /// already decided by the time this runs, and a metadata-write hiccup must
 /// not retroactively turn an established connection into a reported failure.
-async fn persist_after_start<P: Proxy, R: Routing>(
+async fn persist_after_start<P: Proxy, R: Routing + 'static>(
     state: &IpcState<P, R>,
     config: &ProxyConfig,
     on_startup: Option<StartupBehavior>,
@@ -641,19 +618,20 @@ async fn persist_after_start<P: Proxy, R: Routing>(
             gate.notified().await;
         }
     }
-    let state_dir = state.state_dir.clone();
-    let owner = state.owner;
+    let owner = state.routing.owner();
     let config = config.clone();
     let generation = Arc::clone(&state.unblock_generation);
-    let intent_persist = Arc::clone(&state.intent_persist);
+    let routing = Arc::clone(&state.routing);
     let outcome = tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
-        // The mutex guards no data, so a poisoned one carries no broken invariant.
-        let _ordered = intent_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The same lock the tray's Unblock holds through its release and its records: a start's target + candidate
+        // pair lands wholly before or wholly after them.
+        let lock = routing.lock_covers();
+        let state_dir = lock.state_dir();
         if succeeded {
             let declined = generation.load(std::sync::atomic::Ordering::SeqCst) != unblock_snapshot;
-            write_start_records(&state_dir, owner, &config, on_startup, declined)
+            write_start_records(state_dir, owner, &config, on_startup, declined)
         } else if let Some(on_startup) = on_startup {
-            target::apply_startup_preference(&state_dir, owner, |pref| {
+            target::apply_startup_preference(state_dir, owner, |pref| {
                 pref.on_startup = on_startup;
             })
         } else {
@@ -747,6 +725,7 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<LockdownRequest>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // A cover-lock section under `state.proxy`: inline (see `IpcState::proxy`).
     let mut pm = state.proxy.lock().await;
     if !req.enabled {
         return match pm.turn_lockdown_off() {
@@ -762,13 +741,13 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
                 Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
-                        message: unblock_error_message(&e),
+                        message: lockdown_off_error_message(&e).into(),
                     }),
                 ))
             }
         };
     }
-    match pm.set_lockdown_intent(true) {
+    match pm.turn_lockdown_on() {
         Ok(()) => {
             info!(enabled = true, "lockdown intent set");
             Ok(Json(EmptyResponse {}))
@@ -777,7 +756,9 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
             error!(error = &e as &dyn std::error::Error, "failed to set lockdown intent");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { message: e.to_string() }),
+                Json(ErrorResponse {
+                    message: KILL_SWITCH_NOT_SAVED.into(),
+                }),
             ))
         }
     }
@@ -806,67 +787,56 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
 async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Invalidate any transient cover guard a concurrent, lock-holding
-    // `start_cancellable` may still be tracking internally — set
-    // unconditionally, a no-op if nothing is tracked, reachable without
-    // `&mut self`, unlike `turn_lockdown_off`'s own equivalent first step.
-    // Must happen before the release below, not after: `start_cancellable`
-    // only reads this signal at its own entry, so setting it late (after a
-    // concurrent start has already passed that check) would miss the very
-    // race it exists to close.
-    state.cover_invalidated.store(true, std::sync::atomic::Ordering::SeqCst);
-
-    // Unconditional, with no presence probe in front of it.
-    // `release_all_covers` is documented idempotent, so a check here would be
-    // check-then-act on an operation that needs none — and at the escape
-    // hatch a stale `Absent` is the one wrong answer that matters. Sharing
-    // that rule with `turn_lockdown_off` is what removes the discrepancy the
-    // two bespoke `must_release` expressions used to carry.
-    if let Err(e) = state.routing.release_all_covers() {
-        error!(error = &e as &dyn std::error::Error, "unblock: release failed");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                message: "the network could not be fully unblocked".into(),
-            }),
-        ));
-    }
-
-    // Only once the release above is confirmed (or confirmed unneeded) does
-    // the record move: recording target/intent off before a FAILED release
-    // would delete the user's only retry affordance — the tray still
-    // offering Unblock — while the host stays held closed.
-    let state_dir = state.state_dir.clone();
-    let owner = state.owner;
+    // One section under the cover lock: the release and the records that say so, release first. A start that
+    // begins meanwhile waits for it and then decides from the persisted `Off`; an engage in flight finishes before
+    // the release deletes. A failed release returns before any record is written, and the lock is dropped with
+    // the closure. It takes no `state.proxy`, so requests are not single-flight and the section runs on the blocking
+    // pool (see `IpcState::proxy`).
+    let routing = Arc::clone(&state.routing);
+    let owner = routing.owner();
     let generation = Arc::clone(&state.unblock_generation);
-    let intent_persist = Arc::clone(&state.intent_persist);
-    let persisted = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Holds `intent_persist` across all three writes, so a start's target +
-        // candidate pair lands wholly before or wholly after this sequence:
-        // never between the `Off` and the candidate clear, where it would have
-        // its newer candidate erased. (A poisoned mutex guards no data.)
-        let _ordered = intent_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The bump follows the `?`, so a failed `Off` save never announces an
-        // unblock; the mutex keeps a start from reading the counter between the
-        // save and the bump.
-        target::apply(&state_dir, owner, |_current| Target::Off)?;
-        generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        lockdown_state::set_enabled(&state_dir, false, owner)?;
-        // Clear the auto-connect candidate too: `resolve_startup_target` feeds
-        // it to `AlwaysConnect` over an `Off` target, so leaving it would let
-        // the next boot reconnect to the server the user just escaped from.
-        target::apply_startup_preference(&state_dir, owner, |pref| pref.candidate = None)?;
-        Ok(())
+    let outcome = tokio::task::spawn_blocking(move || -> Result<(), UnblockFailure> {
+        let lock = routing.lock_covers();
+        let state_dir = lock.state_dir();
+        // Unconditional, with no presence probe in front of it. `release_all_covers` is documented idempotent,
+        // so a check here would be check-then-act on an operation that needs none — and at the escape hatch a
+        // stale `Absent` is the one wrong answer that matters.
+        routing.release_all_covers(&lock).map_err(UnblockFailure::Release)?;
+
+        // Only once the release above is confirmed (or confirmed unneeded) does the record move: recording
+        // target/intent off before a FAILED release would delete the user's only retry affordance — the tray
+        // still offering Unblock — while the host stays held closed.
+        let persist = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // The bump follows the `?`, so a failed `Off` save never announces an unblock.
+            target::apply(state_dir, owner, |_current| Target::Off)?;
+            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            lockdown_state::set_enabled(&lock, false, owner)?;
+            // Clear the auto-connect candidate too: `resolve_startup_target` feeds it to `AlwaysConnect` over an
+            // `Off` target, so leaving it would let the next boot reconnect to the server the user just escaped
+            // from.
+            target::apply_startup_preference(state_dir, owner, |pref| pref.candidate = None)?;
+            Ok(())
+        };
+        persist().map_err(UnblockFailure::Persist)
     })
     .await;
-    match persisted {
+    match outcome {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => {
+        Ok(Err(UnblockFailure::Release(e))) => {
+            error!(error = &e as &dyn std::error::Error, "unblock: release failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: NOT_FULLY_UNBLOCKED.into(),
+                }),
+            ));
+        }
+        Ok(Err(UnblockFailure::Persist(e))) => {
             error!(error = &*e, "unblock: failed to persist target/intent off");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    message: "the network could not be fully unblocked".into(),
+                    message: NOT_FULLY_UNBLOCKED.into(),
                 }),
             ));
         }
@@ -875,7 +845,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    message: "the network could not be fully unblocked".into(),
+                    message: NOT_FULLY_UNBLOCKED.into(),
                 }),
             ));
         }
@@ -885,18 +855,29 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     Ok(Json(EmptyResponse {}))
 }
 
-/// PII-free 500 body for a failed `turn_lockdown_off`. Never formats the
-/// underlying error verbatim — a `RoutingError::RouteSetup` converted into
-/// `ProxyError` can embed a state-file path, and an IPC message reaches a GUI
-/// toast verbatim. `LockdownIntentNotPersisted`'s `Display` is already a
-/// fixed, PII-free sentence (see its doc), so that one case is reused as-is;
-/// every other failure means the release itself did not confirm, which gets
-/// its own fixed sentence.
-fn unblock_error_message(e: &ProxyError) -> String {
-    if matches!(e, ProxyError::LockdownIntentNotPersisted { .. }) {
-        e.to_string()
-    } else {
-        "the network could not be fully unblocked".into()
+/// Why an Unblock did not complete, in the order its steps run.
+enum UnblockFailure {
+    /// The release did not confirm; the target and intent are unchanged.
+    Release(tun_engine::RoutingError),
+    /// The release was confirmed, but a record write failed.
+    Persist(Box<dyn std::error::Error + Send + Sync>),
+}
+
+// The 500 bodies of the kill-switch handlers. The GUI shows an IPC message verbatim, so each is a fixed sentence,
+// never formatted from an error; the error's chain goes to bridge.log.
+
+/// A release did not confirm, or the Unblock's own records could not be written.
+const NOT_FULLY_UNBLOCKED: &str = "the network could not be fully unblocked";
+/// Turning the switch off: the cover is released, the setting is not saved.
+const UNBLOCKED_BUT_NOT_SAVED: &str = "the network was unblocked, but the kill-switch setting could not be saved";
+/// Turning the switch on: the setting is not saved.
+const KILL_SWITCH_NOT_SAVED: &str = "the kill-switch setting could not be saved";
+
+/// The 500 body for a failed kill-switch OFF: an exhaustive match, so a new way to fail must choose its sentence.
+fn lockdown_off_error_message(e: &LockdownOffError) -> &'static str {
+    match e {
+        LockdownOffError::Release(_) => NOT_FULLY_UNBLOCKED,
+        LockdownOffError::IntentNotSaved(_) => UNBLOCKED_BUT_NOT_SAVED,
     }
 }
 
@@ -994,7 +975,8 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         }
     };
     let marker = build_cutover_marker(driver);
-    match hole_common::update_marker::claim(log_dir, &marker, state.owner) {
+    // The log dir belongs to the same user as the state dir.
+    match hole_common::update_marker::claim(log_dir, &marker, state.routing.owner()) {
         Ok(CreateOutcome::Created) => {}
         Ok(CreateOutcome::Taken) => {
             return Err((
@@ -1022,7 +1004,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // bytes the extracted bytes. The marker claimed above guarantees a single
     // occupant, so the fixed staging path is never raced. The copy and the marker
     // are cleared on every exit path below.
-    let private_dir = match crate::cutover::extract::private_payload_dir(&state.state_dir) {
+    let private_dir = match crate::cutover::extract::private_payload_dir(state.routing.state_dir()) {
         Ok(d) => d,
         Err(e) => {
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
@@ -1110,7 +1092,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // Windows, untar-gz on macOS), so run it on a blocking thread to keep it off
     // the async worker. A failure clears the marker so the GUI does not mask
     // Disconnected forever.
-    let state_dir = state.state_dir.clone();
+    let state_dir = state.routing.state_dir().to_path_buf();
     info!(target_version = %req.target_version, "extracting update payload...");
     let extracted = tokio::task::spawn_blocking(move || crate::cutover::extract::extract(&payload, &state_dir)).await;
     let staged = match extracted {
@@ -1216,6 +1198,7 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     // would otherwise put the configured address in clear into both
     // `bridge.log` and this handler's error body.
     hole_common::logging::redact_arm::arm_server(&config.server);
+    // The user's decision to be Off (`unblock_generation`), as in `handle_start`.
     let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let mut pm = state.proxy.lock().await;
     let result = pm.reload(&config).await;

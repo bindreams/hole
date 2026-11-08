@@ -193,13 +193,11 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(hole_common::paths::default_state_dir);
         let log_dir = LOG_DIR_OVERRIDE.get().cloned().unwrap_or_else(service_log_dir);
 
-        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::proxy_manager::ProxyManager::new(
-                crate::proxy::ShadowsocksProxy::new(),
-                tun_engine::routing::SystemRouting::new(state_dir.clone(), None),
-            )
-            .with_state_dir(state_dir.clone()),
-        ));
+        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
+            crate::proxy::ShadowsocksProxy::new(),
+            // No owner: the service daemon runs as SYSTEM and its dirs are SYSTEM-owned by design.
+            tun_engine::routing::SystemRouting::new(state_dir.clone(), None),
+        )));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
         let socket_path = SOCKET_PATH_OVERRIDE
@@ -215,17 +213,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // command cannot wedge the runtime while the IPC socket is bound but
         // not yet serving.
         let version = VERSION_OVERRIDE.get().cloned().unwrap_or_else(|| "unknown".to_string());
-        // The `--service` daemon runs as SYSTEM and its dirs are SYSTEM-owned by
-        // design; no real user to chown writes back to. (chown is a macOS no-op
-        // anyway, but pass `None` to keep the daemon contract explicit.)
-        let server = crate::ipc::IpcServer::bind_with_dirs(
-            &socket_path,
-            proxy,
-            &version,
-            log_dir.clone(),
-            state_dir.clone(),
-            None,
-        )?;
+        let server = crate::ipc::IpcServer::bind_with_log_dir(&socket_path, proxy, &version, log_dir.clone())?;
 
         // Held for this bridge's entire run — see crate::liveness's module
         // doc and foreground.rs's identical acquisition.
@@ -254,7 +242,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // Service entry point — see clippy.toml's CancellationToken::new list.
         let shutdown = tokio_util::sync::CancellationToken::new();
         registration::run_startup_steps(&mut ServiceStartup {
-            state_dir: state_dir.clone(),
             log_dir: log_dir.clone(),
             proxy: std::sync::Arc::clone(&proxy_shutdown),
             shutdown: shutdown.clone(),
@@ -331,7 +318,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 /// The startup steps of the real service, taken in the order
 /// [`registration::run_startup_steps`] gives.
 struct ServiceStartup<F> {
-    state_dir: PathBuf,
     log_dir: PathBuf,
     proxy: std::sync::Arc<tokio::sync::Mutex<crate::proxy_manager::ProxyManager>>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -355,7 +341,8 @@ where
     async fn recover_dns(&mut self) {
         // DNS recovery runs first of the state recoveries; see crate::dns::recovery
         // docs for ordering.
-        let state_dir = self.state_dir.clone();
+        use tun_engine::routing::Routing;
+        let state_dir = self.proxy.lock().await.routing_handle().state_dir().to_path_buf();
         if let Err(e) = tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir)).await
         {
             tracing::warn!(error = &e as &dyn std::error::Error, "recover_dns_config task panicked");
@@ -376,7 +363,7 @@ where
 
     async fn boot_sequence(&mut self) {
         // Reconcile the persisted target before any GUI or client can connect.
-        crate::boot::recover_then_reconcile(&self.state_dir, None, &self.proxy, &self.shutdown).await;
+        crate::boot::recover_then_reconcile(&self.proxy, &self.shutdown).await;
     }
 
     async fn sweep_crash_markers(&mut self) {

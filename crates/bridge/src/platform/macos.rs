@@ -386,13 +386,11 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::proxy_manager::ProxyManager::new(
-                crate::proxy::ShadowsocksProxy::new(),
-                tun_engine::routing::SystemRouting::new(state_dir.to_path_buf(), None),
-            )
-            .with_state_dir(state_dir.to_path_buf()),
-        ));
+        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
+            crate::proxy::ShadowsocksProxy::new(),
+            // No owner: the launchd daemon runs as root and its dirs are root-owned by design.
+            tun_engine::routing::SystemRouting::new(state_dir.to_path_buf(), None),
+        )));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
         // Bind BEFORE the liveness acquire and BEFORE recovery — a second
@@ -401,16 +399,7 @@ pub fn run(
         // invariant. Route recovery is offloaded via spawn_blocking so a hung
         // netsh/route command cannot wedge the runtime while the IPC socket
         // is bound but not yet serving.
-        let server = crate::ipc::IpcServer::bind_with_dirs(
-            socket_path,
-            proxy,
-            version,
-            log_dir.to_path_buf(),
-            state_dir.to_path_buf(),
-            // The `--service` daemon runs as root and its dirs are root-owned by
-            // design; no real user to chown writes back to.
-            None,
-        )?;
+        let server = crate::ipc::IpcServer::bind_with_log_dir(socket_path, proxy, version, log_dir.to_path_buf())?;
 
         // Held for this bridge's entire run — see crate::liveness's module
         // doc and foreground.rs's identical acquisition.
@@ -446,7 +435,7 @@ pub fn run(
 
         // Reconcile the persisted target before any client can connect (narrows,
         // does not close, the boot->first-connect gap).
-        crate::boot::recover_then_reconcile(state_dir, None, &proxy_shutdown, &shutdown).await;
+        crate::boot::recover_then_reconcile(&proxy_shutdown, &shutdown).await;
         // Native-crash observability (bindreams/hole#438): sweep crash
         // markers left by a previously-crashed bridge. Offloaded to a
         // blocking thread to match the sibling recover_* calls.

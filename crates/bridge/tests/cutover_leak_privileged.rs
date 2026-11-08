@@ -62,8 +62,8 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 
 /// The standing lockdown cover's egress block must SURVIVE a `disarm` -- that is
 /// the cutover leak invariant on the real ruleset. The bridge's marker-
-/// conditional shutdown `disarm`s the cover (persist-without-disengage via
-/// `std::mem::forget`) instead of dropping it, so the WFP/pf filters hold across
+/// conditional shutdown `disarm`s the cover (persist-without-disengage: the guard
+/// is consumed and emptied, so its `Drop` disengages nothing) instead of dropping it, so the WFP/pf filters hold across
 /// the restart gap and the new bridge re-adopts them. A `disarm` that actually
 /// disengaged would open the host mid-cutover (a leak).
 ///
@@ -86,7 +86,9 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
-    use tun_engine::routing::failclosed::{disengage_lockdown, engage_lockdown, lockdown_state, SystemLuidResolver};
+    use tun_engine::routing::failclosed::{
+        disengage_lockdown, engage_lockdown, lockdown_state, CoverLock, SystemLuidResolver,
+    };
     use tun_engine::routing::CoverGuard;
 
     #[cfg(target_os = "windows")]
@@ -114,9 +116,16 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
         &[NON_PERMITTED],
         &held_hole,
         || {
-            lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-            let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path(), None)
-                .expect("engage the real standing lockdown cover");
+            lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+            let cover = engage_lockdown(
+                &CoverLock::acquire(dir.path()),
+                server_ip,
+                tun_name,
+                &resolver,
+                &[],
+                None,
+            )
+            .expect("engage the real standing lockdown cover");
 
             // Engaged: server permitted (permit beats block-all), others blocked (no leak). The cover is
             // released by its guard on an early return.
@@ -139,9 +148,9 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
 
             // Cleanup before any verdict: no live guard remains after disarm, so fully disengage via the
             // persisted state, restoring egress so the box is left open whatever the verdict.
-            lockdown_state::set_enabled(dir.path(), false, None).unwrap();
-            let _clearance_has_no_reader_in_cleanup =
-                disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
+            lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
+            let _clearance_has_no_reader_in_cleanup = disengage_lockdown(&CoverLock::acquire(dir.path()))
+                .expect("disengage the persisted cover to restore egress");
 
             after_disarm
         },

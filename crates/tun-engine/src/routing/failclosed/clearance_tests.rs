@@ -110,9 +110,12 @@ fn a_failing_sweep_outcome_carries_its_observations_beside_the_error() {
     // the first — which is what happened while the sweeps returned a
     // `Result`, on a codebase whose sweeps issue every delete before reading
     // any code.
-    let outcome = SweepOutcome::failed(
+    let outcome = SweepOutcome::per_kind(
         fold(&[sibling(KeyOutcome::Removed), unproven_twin()]),
-        RoutingError::RouteSetup("one delete was refused".into()),
+        [(
+            CoverKind::Lockdown,
+            Some(RoutingError::RouteSetup("one delete was refused".into())),
+        )],
     );
     assert_eq!(
         outcome.clearance().witness_update(),
@@ -123,7 +126,7 @@ fn a_failing_sweep_outcome_carries_its_observations_beside_the_error() {
     assert_eq!(outcome.clearance().leftover_keys(), ["lockdown boot-time block-all V4"]);
     assert!(outcome.into_result().is_err(), "and the failure still travels");
 
-    let clean = SweepOutcome::completed(Clearance::proven());
+    let clean = SweepOutcome::per_kind(Clearance::proven(), []);
     assert!(clean.clearance().is_proven());
     assert!(clean.into_result().is_ok());
 }

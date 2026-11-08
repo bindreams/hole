@@ -50,7 +50,9 @@ fn root_is_the_system_and_every_other_uid_a_user() {
         dev: 1,
         ino: 1,
         uid,
+        gid: 0,
         mode: 0,
+        links: 1,
     };
 
     assert_eq!(meta(0).owner(), Owner::Privileged);
@@ -491,6 +493,28 @@ fn a_symlink_below_a_directory_the_caller_can_only_search_is_followed_by_the_sam
     });
 }
 
+// owner_of ------------------------------------------------------------------------------------------------------------
+
+/// A name inside a directory the caller cannot search cannot be examined: the error is the answer, not `None`.
+#[skuld::test]
+fn owner_of_fails_for_a_name_it_cannot_examine() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("f"), b"x").unwrap();
+    let _restore = Restore(tmp.path().to_path_buf(), 0o755);
+
+    as_unprivileged(tmp.path(), || {
+        let dir = Dir::open(tmp.path(), false, None).unwrap();
+        // Through the held handle: the directory is no longer searchable, and the handle is still open.
+        dir.file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+
+        let err = dir.owner_of("f".as_ref()).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err:?}");
+    });
+}
+
 // rename_noreplace ----------------------------------------------------------------------------------------------------
 
 /// Only an answer that says the flag is unavailable is `Unsupported`. `EPERM` is a real refusal (a sticky directory,
@@ -564,6 +588,19 @@ fn a_file_with_another_name_is_not_trusted_whoever_owns_it() {
     };
     assert!(!trusted_appender(linked(1000), Some((1000, 1000))));
     assert!(!trusted_appender(linked(1000), None));
+}
+
+#[skuld::test]
+fn a_regular_file_with_one_name_is_the_only_one_the_predicate_accepts() {
+    let with = |regular, links| Facts {
+        regular,
+        uid: 1000,
+        links,
+    };
+    assert!(with(true, 1).is_a_regular_file_with_one_name());
+    assert!(!with(true, 2).is_a_regular_file_with_one_name());
+    assert!(!with(false, 1).is_a_regular_file_with_one_name());
+    assert!(!with(false, 2).is_a_regular_file_with_one_name());
 }
 
 #[skuld::test]

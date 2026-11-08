@@ -4,7 +4,7 @@ use util::versioned_file::UnreadableKind;
 #[skuld::test]
 fn set_then_load_roundtrips() {
     let tmp = tempfile::tempdir().unwrap();
-    set_enabled(tmp.path(), true, None).unwrap();
+    set_enabled(&CoverLock::acquire(tmp.path()), true, None).unwrap();
     assert_eq!(load(tmp.path()), Some(LockdownState { enabled: true }));
 }
 
@@ -25,9 +25,9 @@ fn load_rejects_schema_mismatch() {
 #[skuld::test]
 fn set_enabled_is_last_writer_wins() {
     let tmp = tempfile::tempdir().unwrap();
-    set_enabled(tmp.path(), true, None).unwrap();
+    set_enabled(&CoverLock::acquire(tmp.path()), true, None).unwrap();
     assert!(load_enabled(tmp.path()));
-    set_enabled(tmp.path(), false, None).unwrap();
+    set_enabled(&CoverLock::acquire(tmp.path()), false, None).unwrap();
     assert!(!load_enabled(tmp.path()), "second writer wins");
 }
 
@@ -51,9 +51,9 @@ fn load_intent_absent_file_is_unset() {
 #[skuld::test]
 fn load_intent_reads_the_persisted_bool() {
     let tmp = tempfile::tempdir().unwrap();
-    set_enabled(tmp.path(), true, None).unwrap();
+    set_enabled(&CoverLock::acquire(tmp.path()), true, None).unwrap();
     assert_eq!(load_intent(tmp.path()), Intent::On);
-    set_enabled(tmp.path(), false, None).unwrap();
+    set_enabled(&CoverLock::acquire(tmp.path()), false, None).unwrap();
     assert_eq!(load_intent(tmp.path()), Intent::Off);
 }
 
@@ -113,7 +113,7 @@ fn set_enabled_over_a_corrupt_intent_backs_it_up() {
     let tmp = tempfile::tempdir().unwrap();
     write_raw(tmp.path(), b"{not json");
 
-    set_enabled(tmp.path(), true, None).unwrap();
+    set_enabled(&CoverLock::acquire(tmp.path()), true, None).unwrap();
 
     assert_eq!(load_intent(tmp.path()), Intent::On);
     let backup = tmp.path().join(format!("{STATE_FILE_NAME}.unreadable.bak"));
@@ -126,7 +126,7 @@ fn set_enabled_over_a_newer_intent_backs_it_up() {
     let newer: &[u8] = br#"{"version":2,"enabled":false}"#;
     write_raw(tmp.path(), newer);
 
-    set_enabled(tmp.path(), true, None).unwrap();
+    set_enabled(&CoverLock::acquire(tmp.path()), true, None).unwrap();
 
     assert_eq!(load_intent(tmp.path()), Intent::On);
     let backup = tmp.path().join(format!("{STATE_FILE_NAME}.unreadable.bak"));
@@ -183,4 +183,120 @@ fn load_enabled_is_the_reads_armed_fold() {
         load_enabled(tmp.path()),
         "a corrupt file reads as ARMED — it is not consent to disarm"
     );
+}
+
+// promote_unrecorded --------------------------------------------------------------------------------------------------
+
+/// Each intent the promotion can meet, planted as bytes, with whether it must write and what the file reads as
+/// afterwards. Only an absent file is promoted: a recorded `On` or `Off` is a decision, and a file this release cannot
+/// read may hold one (a newer or obsolete `enabled: false` is a user's `Off`).
+#[skuld::test]
+fn update_decides_on_the_classified_intent_and_writes_only_some() {
+    let cases: [(&str, Option<&[u8]>, bool, Intent); 6] = [
+        ("unset", None, true, Intent::On),
+        ("on", Some(br#"{"version":1,"enabled":true}"#), false, Intent::On),
+        ("off", Some(br#"{"version":1,"enabled":false}"#), false, Intent::Off),
+        ("corrupt", Some(b"{not json"), false, Intent::Unreadable),
+        (
+            "newer",
+            Some(br#"{"version":2,"enabled":false}"#),
+            false,
+            Intent::Unreadable,
+        ),
+        (
+            "obsolete",
+            Some(br#"{"version":0,"enabled":false}"#),
+            false,
+            Intent::Unreadable,
+        ),
+    ];
+    for (what, planted, wrote, after) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        if let Some(bytes) = planted {
+            write_raw(tmp.path(), bytes);
+        }
+
+        assert_eq!(
+            promote_unrecorded(&CoverLock::acquire(tmp.path()), None).unwrap() == PromoteOutcome::Wrote,
+            wrote,
+            "{what}"
+        );
+
+        assert_eq!(load_intent(tmp.path()), after, "{what}");
+        if !wrote {
+            let kept = std::fs::read(tmp.path().join(STATE_FILE_NAME)).unwrap();
+            assert_eq!(
+                Some(kept.as_slice()),
+                planted,
+                "{what}: a recorded intent is not rewritten"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn promote_declines_over_a_recorded_off_and_on() {
+    for (enabled, want) in [(false, Intent::Off), (true, Intent::On)] {
+        let tmp = tempfile::tempdir().unwrap();
+        set_enabled(&CoverLock::acquire(tmp.path()), enabled, None).unwrap();
+        assert_eq!(
+            promote_unrecorded(&CoverLock::acquire(tmp.path()), None).unwrap(),
+            PromoteOutcome::Declined
+        );
+        assert_eq!(load_intent(tmp.path()), want, "a recorded value is never rewritten");
+    }
+}
+
+#[skuld::test]
+fn promote_writes_over_unset_only() {
+    let unset = tempfile::tempdir().unwrap();
+    assert_eq!(
+        promote_unrecorded(&CoverLock::acquire(unset.path()), None).unwrap(),
+        PromoteOutcome::Wrote
+    );
+    assert_eq!(load_intent(unset.path()), Intent::On);
+}
+
+#[skuld::test]
+fn promote_over_a_read_that_fails_declines_and_leaves_the_name_alone() {
+    // A directory at the name: the read fails with something other than "not found", so the intent is unknown, not
+    // unset. Declining is `Ok(Declined)`, not a refusal, and nothing is written or backed up.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(STATE_FILE_NAME)).unwrap();
+
+    assert_eq!(
+        promote_unrecorded(&CoverLock::acquire(tmp.path()), None).unwrap(),
+        PromoteOutcome::Declined
+    );
+
+    assert!(tmp.path().join(STATE_FILE_NAME).is_dir());
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        1,
+        "nothing was written beside it"
+    );
+}
+
+#[skuld::test]
+fn unblock_then_promote_leaves_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    set_enabled(&CoverLock::acquire(tmp.path()), false, None).unwrap();
+    promote_unrecorded(&CoverLock::acquire(tmp.path()), None).unwrap();
+    assert_eq!(load_intent(tmp.path()), Intent::Off);
+}
+
+#[skuld::test]
+fn promote_then_unblock_leaves_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    promote_unrecorded(&CoverLock::acquire(tmp.path()), None).unwrap();
+    set_enabled(&CoverLock::acquire(tmp.path()), false, None).unwrap();
+    assert_eq!(load_intent(tmp.path()), Intent::Off);
+}
+
+#[skuld::test]
+fn admits_adoption_promotion_is_exhaustive_per_variant() {
+    assert!(Intent::Unset.admits_adoption_promotion());
+    assert!(!Intent::Unreadable.admits_adoption_promotion());
+    assert!(!Intent::On.admits_adoption_promotion());
+    assert!(!Intent::Off.admits_adoption_promotion());
 }

@@ -102,10 +102,10 @@ pub enum Refusal {
     /// The final directory is owned by neither the expected owner nor this process.
     #[cfg(unix)]
     ForeignOwner { uid: u32 },
-    /// A file that is read where it is not a regular file (a FIFO, a device).
+    /// A file that is read or whose owner is asked for where it is not a regular file (a link, a FIFO, a device).
     NotRegular,
     /// A file that is read where the folder's owner cannot vouch for it: another user's, or a second name of a file
-    /// the system owns (a hard link a user planted).
+    /// the system owns (a hard link a user planted). Also a file whose owner is asked for that has a second name.
     ForeignFile,
 }
 
@@ -215,6 +215,14 @@ impl Dir {
     pub fn id_of(&self, name: &OsStr) -> io::Result<Option<FileId>> {
         single_component(name)?;
         platform::id_of(&self.file, name).map(|id| id.map(FileId))
+    }
+
+    /// The `(uid, gid)` that owns the file `name` right now, or `None` if there is nothing there. Only a regular file
+    /// with no other name has an owner worth keeping: a link is [`Refusal::NotRegular`] and a second name (a hard link
+    /// a user planted) is [`Refusal::ForeignFile`]. Windows has no such pair and answers `None`.
+    pub fn owner_of(&self, name: &OsStr) -> io::Result<Option<(u32, u32)>> {
+        single_component(name)?;
+        platform::ids_of(&self.file, name)
     }
 
     /// What `name` is right now, or `None` if there is nothing.

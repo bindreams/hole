@@ -210,9 +210,9 @@ fn recover_over(dir: &Path) -> (Vec<String>, bool) {
             Ok(())
         },
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| cover_reached.set(true),
+        |_lock, _, _| cover_reached.set(true),
     );
     (commands.into_inner(), cover_reached.get())
 }
@@ -749,9 +749,9 @@ fn recover_while(dir: &Path, during: impl Fn()) -> String {
                 Ok(())
             },
             |_, _| {},
-            failclosed::lockdown_state::Intent::Off,
+            || failclosed::lockdown_state::Intent::Off,
             || CoverPresence::Absent,
-            |_, _| {},
+            |_lock, _, _| {},
         );
     })
 }

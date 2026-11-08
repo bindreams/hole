@@ -788,13 +788,13 @@ impl Drop for StepOnDrop {
     }
 }
 
-fn idle_manager_with_state_dir() -> (
+fn idle_manager() -> (
     Arc<tokio::sync::Mutex<ProxyManager<MockProxy, MockRouting>>>,
     tempfile::TempDir,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let routing = MockRouting::new(dir.path().to_path_buf());
-    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    let pm = ProxyManager::new(MockProxy::new(), routing);
     (Arc::new(tokio::sync::Mutex::new(pm)), dir)
 }
 
@@ -802,7 +802,7 @@ fn idle_manager_with_state_dir() -> (
 fn service_teardown_probes_the_event_before_waiting_on_the_proxy_and_drops_in_phase_order() {
     let log = Log::default();
     let progress = Arc::new(log.progress());
-    let (proxy, _dir) = idle_manager_with_state_dir();
+    let (proxy, _dir) = idle_manager();
     let weak = Arc::downgrade(&proxy);
     block_on(tear_down_service(
         &progress,
@@ -834,7 +834,7 @@ fn service_teardown_without_an_etw_consumer_does_not_enter_close_etw() {
     // The ETW consumer can fail to start; CloseEtw names work that then does not exist.
     let log = Log::default();
     let progress = Arc::new(log.progress());
-    let (proxy, _dir) = idle_manager_with_state_dir();
+    let (proxy, _dir) = idle_manager();
     block_on(tear_down_service(
         &progress,
         proxy,
@@ -860,7 +860,7 @@ fn service_teardown_names_a_proxy_handle_that_outlives_it() {
     let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
     let log = Log::default();
     let progress = Arc::new(log.progress());
-    let (proxy, _dir) = idle_manager_with_state_dir();
+    let (proxy, _dir) = idle_manager();
     let straggler = Arc::clone(&proxy);
     block_on(tear_down_service(
         &progress,

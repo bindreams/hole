@@ -63,24 +63,10 @@
 //!
 //! # Disclosed residuals
 //!
-//! - **A host cleaned up by `Cover::drop` keeps reporting.** The Windows guard's
-//!   `Drop` (`failclosed/windows.rs`, the `Lockdown` arm) deletes the whole
-//!   `swept_lockdown_keys` list — twins included — and is the ONE twin-removing
-//!   path that does not run through `super::sweep_with_witness`, because the
-//!   guard carries no `state_dir` to write to. It fires when an engage COMMITS
-//!   (so the record is already `Armed`) and a later fatal phase of the same
-//!   start fails, unwinding `ProxyManager`'s locally-owned guard; an ordinary
-//!   disconnect is unaffected, since that releases through
-//!   `Routing::release_all_covers` first and drops an already-swept cover. The
-//!   twins were genuinely watched going, so this is an OVER-report: the record
-//!   stays `Armed`, the sibling is gone, and every later `release-covers` on
-//!   that `state_dir` names the two twin keys. Safe direction, and the same
-//!   one this file has always failed in — but not the same claim as "only a
-//!   non-sweep cause leaves a stale record", which is why it is spelled out.
-//! - Other causes with the same shape and no fix here at all: an external FWPM
-//!   delete, a firewall reset, an image restore. No sweep ever held the
-//!   evidence, so nothing could have copied it — which is the case
-//!   `record_armed`-at-engage exists for in the first place.
+//! - **A host whose twins went without a sweep watching keeps reporting.** Causes
+//!   with no fix here at all: an external FWPM delete, a firewall reset, an image
+//!   restore. No sweep ever held the evidence, so nothing could have copied it —
+//!   which is the case `record_armed`-at-engage exists for in the first place.
 //! - A `record` write that FAILS (an unwritable `state_dir`) loses the witness
 //!   with nothing left to re-derive it from. The sweep that failed to write
 //!   still reports — it holds the sibling evidence itself — but a later one
@@ -96,7 +82,7 @@
 //!   writes its `Disarm` only to its OWN dir, so a peer's `Armed` — one a
 //!   user-profile bridge wrote — survives a SYSTEM sweep that watched those
 //!   very twins go, and keeps reporting. Over-report, the same direction as
-//!   `Cover::drop` above.
+//!   the residual above.
 
 use std::path::Path;
 
@@ -105,7 +91,7 @@ use util::versioned_file::{
     Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, VersionedFile, VersionedState,
 };
 
-use super::ArmingWitness;
+use super::{ArmingWitness, CoverLock};
 
 /// Filename under `state_dir`.
 pub const STATE_FILE_NAME: &str = "bridge-boottime.json";
@@ -146,7 +132,12 @@ fn file(state_dir: &Path) -> VersionedFile<BootTimeState> {
 /// `Unreadable` — which REPORTS — rather than discarded as absence: losing the
 /// record is not evidence that nothing was armed.
 pub fn load(state_dir: &Path) -> ArmingWitness {
-    match file(state_dir).observe().loaded {
+    arming_of(&file(state_dir).observe().loaded)
+}
+
+/// The one reading of a record: `load` and `apply`'s decision both classify through it.
+fn arming_of(loaded: &Loaded<BootTimeState>) -> ArmingWitness {
+    match loaded {
         Loaded::Absent => ArmingWitness::Unset,
         Loaded::Current { value, .. } if value.armed => ArmingWitness::Armed,
         Loaded::Current { .. } => ArmingWitness::Disarmed,
@@ -187,8 +178,8 @@ fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> Result<(), 
 /// reason `readback` gives: the rule it encodes is platform-free and a rule
 /// proved only where the hazard lives is proved nowhere else.
 #[cfg(any(target_os = "windows", test, feature = "test-utils"))]
-pub(crate) fn record_armed(state_dir: &Path, owner: Option<(u32, u32)>) {
-    write_or_warn(state_dir, true, owner);
+pub(crate) fn record_armed(lock: &CoverLock, owner: Option<(u32, u32)>) {
+    write_or_warn(lock.state_dir(), true, owner);
 }
 
 /// Arm the record from a test in a DOWNSTREAM crate, which cannot reach
@@ -199,10 +190,11 @@ pub(crate) fn record_armed(state_dir: &Path, owner: Option<(u32, u32)>) {
 /// bridge armed a twin under a different `state_dir`. Reproducing it needs a
 /// peer dir with an armed record and no other evidence at all — which is
 /// exactly the state a Windows `engage_lockdown` leaves and nothing else does.
+/// `owner` is passed through to the write, so a writer-table row can supply one.
 /// Behind `test-utils`, so no production build can reach it.
 #[cfg(feature = "test-utils")]
-pub fn record_armed_for_test(state_dir: &Path) {
-    record_armed(state_dir, None);
+pub fn record_armed_for_test(lock: &CoverLock, owner: Option<(u32, u32)>) {
+    record_armed(lock, owner);
 }
 
 /// What a sweep's own observations say the record should now hold.
@@ -234,12 +226,10 @@ pub(crate) enum WitnessUpdate {
 
 /// The record's next value, or `None` when nothing needs writing.
 ///
-/// Pure, and a table rather than a condition spread over the write site,
-/// because the two rules that matter are both about which CURRENT values a
-/// write may land on: an `Arm` never rewrites an existing `Armed` (pointless
-/// I/O that can only fail), and a `Disarm` never writes `false` over `Unset`
-/// or `Disarmed` — the first would litter every host that never armed a twin
-/// with a file saying so, on every `release-covers` it ever runs.
+/// Pure, and a table rather than a condition spread over the write site. An `Arm` never rewrites an existing
+/// `Armed` (pointless I/O that can only fail), and a `Disarm` never writes `false` over `Unset` or `Disarmed` (the
+/// first would litter every host that never armed a twin with a file saying so, on every `release-covers` it ever
+/// runs).
 fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
     match update {
         WitnessUpdate::Leave => None,
@@ -253,24 +243,45 @@ fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
     }
 }
 
-/// Apply a sweep's [`WitnessUpdate`] to the record it was folded against.
-pub(crate) fn apply(state_dir: &Path, current: ArmingWitness, update: WitnessUpdate, owner: Option<(u32, u32)>) {
-    if let Some(armed) = next_record(current, update) {
-        write_or_warn(state_dir, armed, owner);
+/// Apply a sweep's [`WitnessUpdate`], decided against the record as it is NOW; the read and the write are one
+/// `update`. Takes no owner: a sweep writes only on a boot-time sighting, which exists only on Windows, where
+/// placement ignores unix ids.
+pub(crate) fn apply(lock: &CoverLock, update: WitnessUpdate) {
+    // `Leave` writes nothing for any record, so it must not even open the directory.
+    if update == WitnessUpdate::Leave {
+        return;
+    }
+    let mut decided = None;
+    let written = file(lock.state_dir()).update(&DefaultPlacement::default(), |now| {
+        match next_record(arming_of(&now.loaded), update) {
+            Some(armed) => {
+                decided = Some(armed);
+                (Change::Store(BootTimeState { armed }), ())
+            }
+            None => (Change::Keep, ()),
+        }
+    });
+    if let Err(e) = written {
+        warn_unwritten(&e, decided);
     }
 }
 
 /// Warn, never propagate — see the module doc's residuals.
 fn write_or_warn(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) {
     if let Err(e) = save(state_dir, armed, owner) {
-        tracing::warn!(
-            error = &e as &dyn std::error::Error,
-            armed,
-            file = STATE_FILE_NAME,
-            "the boot-time witness could not be written; a later sweep that can no longer see a \
-             standing cover's PERSISTENT sibling will have nothing to fall back on"
-        );
+        warn_unwritten(&e, Some(armed));
     }
+}
+
+/// `armed` is the value that was to be written; `None` when the write failed before one was chosen.
+fn warn_unwritten(e: &StoreError, armed: Option<bool>) {
+    tracing::warn!(
+        error = e as &dyn std::error::Error,
+        armed = ?armed,
+        file = STATE_FILE_NAME,
+        "the boot-time witness could not be written; a later sweep that can no longer see a \
+         standing cover's PERSISTENT sibling will have nothing to fall back on"
+    );
 }
 
 // Deliberately NOT platform-gated, for the reason `clearance_tests` gives: the

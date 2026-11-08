@@ -440,7 +440,8 @@ fn supersede_twice_archives_the_newer_file_instead_of_clobbering_the_older_one()
     assert_eq!(
         std::fs::read(&superseded_path).unwrap(),
         b"first",
-        "the older, already-superseded file must survive untouched — it is the evidence closer to          the user's true original DNS"
+        "the older, already-superseded file must survive untouched — it is the evidence closer to \
+         the user's true original DNS"
     );
     let archive_path = dir.path().join("bridge-dns.superseded.2.json");
     assert_eq!(

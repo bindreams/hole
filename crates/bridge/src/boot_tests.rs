@@ -62,13 +62,13 @@ fn the_boot_reap_spares_the_plugin_of_the_boot_auto_connect() {
             plugin_state::append_record(&record_dir, record.clone(), None).unwrap();
         });
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let pm = ProxyManager::new(mock, routing).with_state_dir(dir.path().to_path_buf());
+        let pm = ProxyManager::new(mock, routing);
         let proxy = Arc::new(Mutex::new(pm));
         #[allow(clippy::disallowed_methods)]
         // Test-side root token; production roots live at the three entry points.
         let cancel = CancellationToken::new();
 
-        recover_then_reconcile(dir.path(), None, &proxy, &cancel).await;
+        recover_then_reconcile(&proxy, &cancel).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -106,13 +106,13 @@ fn the_boot_reconcile_sees_the_cover_route_recovery_adopted() {
         let routing = MockRouting::new(dir.path().to_path_buf());
         let routing_state = routing.state();
         *routing_state.cover_presence.lock().unwrap() = CoverPresence::Live;
-        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing);
         let proxy = Arc::new(Mutex::new(pm));
         #[allow(clippy::disallowed_methods)]
         // Test-side root token; production roots live at the three entry points.
         let cancel = CancellationToken::new();
 
-        recover_then_reconcile_with(dir.path(), None, &proxy, &cancel, |_, _| Recovery {
+        recover_then_reconcile_with(&proxy, &cancel, |_, _| Recovery {
             action: CoverRecovery::Adopt,
             record_intent_on: false,
             presence: CoverPresence::Live,

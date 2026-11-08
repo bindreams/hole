@@ -166,36 +166,163 @@ fn wire_form_pins_the_token_as_a_decimal_string() {
 }
 
 #[skuld::test]
-fn clear_removes_file() {
+fn a_reap_that_accounts_for_every_record_removes_the_file() {
     let dir = tempfile::tempdir().unwrap();
+    let record = synthetic(1, 1);
     seed(
         dir.path(),
         PluginState {
-            plugins: vec![synthetic(1, 1)],
+            plugins: vec![record.clone()],
         },
     );
     assert!(state_path(dir.path()).exists());
-    assert_eq!(clear(dir.path()).unwrap(), UpdateOutcome::Removed);
+    assert_eq!(remove_accounted(dir.path(), &[record]).unwrap(), UpdateOutcome::Removed);
     assert!(!state_path(dir.path()).exists());
 }
 
 #[skuld::test]
-fn clear_tolerates_missing_file() {
+fn remove_accounted_over_an_absent_file_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(clear(dir.path()).unwrap(), UpdateOutcome::Absent);
+    assert_eq!(
+        remove_accounted(dir.path(), &[synthetic(1, 1)]).unwrap(),
+        UpdateOutcome::Unchanged
+    );
+    assert!(!state_path(dir.path()).exists());
 }
 
 #[skuld::test]
-fn clear_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
+fn remove_accounted_refuses_a_state_dir_that_is_a_users_link_to_a_system_folder() {
     let tmp = tempfile::tempdir().unwrap();
     let state = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
 
-    let err = clear(&state).unwrap_err();
+    let err = remove_accounted(&state, &[synthetic(1, 1)]).unwrap_err();
 
     let StoreError::Io(err) = err else {
         panic!("expected an I/O refusal, got {err:?}");
     };
     assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
+}
+
+// The reap and the appends ============================================================================================
+
+fn plugins_in(dir: &Path) -> Vec<ProcessIdRecord> {
+    plugins_of(load(dir))
+}
+
+#[skuld::test]
+fn a_reap_removes_only_the_records_it_accounted_for() {
+    // The reap loaded the file, then an append landed; the removal takes what the reap settled and nothing else.
+    let dir = tempfile::tempdir().unwrap();
+    let (reaped, late) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir.path(), reaped.clone(), None).unwrap();
+    let seen = plugins_in(dir.path());
+    append_record(dir.path(), late.clone(), None).unwrap();
+
+    remove_accounted(dir.path(), &seen).unwrap();
+
+    assert_eq!(plugins_in(dir.path()), vec![late]);
+}
+
+#[skuld::test]
+fn an_append_then_a_removal_keeps_the_appended_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir.path(), r1.clone(), None).unwrap();
+    append_record(dir.path(), r2.clone(), None).unwrap();
+    remove_accounted(dir.path(), &[r1]).unwrap();
+    assert_eq!(plugins_in(dir.path()), vec![r2]);
+}
+
+#[skuld::test]
+fn a_removal_then_an_append_does_not_resurrect_the_removed_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir.path(), r1.clone(), None).unwrap();
+    remove_accounted(dir.path(), &[r1]).unwrap();
+    assert!(!state_path(dir.path()).exists(), "the file goes when no record remains");
+    append_record(dir.path(), r2.clone(), None).unwrap();
+    assert_eq!(plugins_in(dir.path()), vec![r2]);
+}
+
+#[skuld::test]
+fn remove_accounted_drops_exactly_the_accounted_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2, r3) = (synthetic(1, 1), synthetic(2, 2), synthetic(3, 3));
+    for r in [&r1, &r2, &r3] {
+        append_record(dir.path(), r.clone(), None).unwrap();
+    }
+    remove_accounted(dir.path(), &[r1, r3.clone()]).unwrap();
+    assert_eq!(plugins_in(dir.path()), vec![r2.clone()]);
+
+    // A record the file does not hold is not an error and removes nothing.
+    remove_accounted(dir.path(), &[r3]).unwrap();
+    assert_eq!(plugins_in(dir.path()), vec![r2]);
+}
+
+#[skuld::test]
+fn an_append_racing_the_reap_is_not_lost() {
+    // The reaper and every appender are released together; whatever the order, the reaped record is gone and every
+    // appended one is there.
+    const APPENDERS: u32 = 8;
+    let dir = tempfile::tempdir().unwrap();
+    let reaped = synthetic(1000, 1000);
+    append_record(dir.path(), reaped.clone(), None).unwrap();
+    let barrier = std::sync::Barrier::new(APPENDERS as usize + 1);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            barrier.wait();
+            remove_accounted(dir.path(), std::slice::from_ref(&reaped)).unwrap();
+        });
+        for n in 0..APPENDERS {
+            let (barrier, dir) = (&barrier, dir.path());
+            scope.spawn(move || {
+                barrier.wait();
+                append_record(dir, synthetic(n, u64::from(n)), None).unwrap();
+            });
+        }
+    });
+
+    let mut pids: Vec<u32> = plugins_in(dir.path()).iter().map(|r| r.pid).collect();
+    pids.sort_unstable();
+    assert_eq!(pids, (0..APPENDERS).collect::<Vec<_>>());
+}
+
+/// The owner of `path` itself.
+#[cfg(unix)]
+fn owner_ids(path: &Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    (meta.uid(), meta.gid())
+}
+
+/// Discriminates on a root lane, where `own` gives the file to another user; unprivileged the file and the writer
+/// share an owner, so the test is vacuous there.
+#[cfg(unix)]
+#[skuld::test]
+fn a_reap_rewrite_keeps_the_files_owner_and_leaves_the_directory_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r1, r2) = (synthetic(1, 1), synthetic(2, 2));
+    append_record(dir.path(), r1.clone(), None).unwrap();
+    append_record(dir.path(), r2.clone(), None).unwrap();
+    util::dir::testing::own(&state_path(dir.path()));
+    let (file_before, dir_before) = (owner_ids(&state_path(dir.path())), owner_ids(dir.path()));
+
+    remove_accounted(dir.path(), &[r1]).unwrap();
+
+    assert_eq!(plugins_in(dir.path()), vec![r2]);
+    assert_eq!(owner_ids(&state_path(dir.path())), file_before);
+    assert_eq!(owner_ids(dir.path()), dir_before);
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn an_append_leaves_the_file_owned_by_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    append_record(dir.path(), synthetic(1, 1), None).unwrap();
+    // SAFETY: geteuid and getegid take no arguments and cannot fail.
+    let writer = unsafe { (libc::geteuid(), libc::getegid()) };
+    assert_eq!(owner_ids(&state_path(dir.path())), writer);
 }
 
 // A record this release cannot read ===================================================================================
@@ -289,14 +416,75 @@ fn append_over_absent_and_obsolete_starts_a_fresh_record() {
 }
 
 #[skuld::test]
-fn clear_keeps_a_record_it_cannot_read() {
-    for Unreadable { what, plant, .. } in UNREADABLE {
+fn a_reap_keeps_a_record_it_cannot_read() {
+    for Unreadable { what, plant, bytes } in UNREADABLE {
         let dir = tempfile::tempdir().unwrap();
         plant(dir.path());
 
-        assert_eq!(clear(dir.path()).unwrap(), UpdateOutcome::Kept, "{what}");
-        assert!(state_path(dir.path()).exists(), "{what}");
+        assert_eq!(
+            remove_accounted(dir.path(), &[synthetic(1, 1)]).unwrap(),
+            UpdateOutcome::Unchanged,
+            "{what}"
+        );
+        match bytes {
+            Some(bytes) => assert_eq!(std::fs::read(state_path(dir.path())).unwrap(), bytes, "{what}"),
+            None => assert!(
+                state_path(dir.path()).is_dir(),
+                "{what}: the planted directory was replaced"
+            ),
+        }
     }
+}
+
+#[skuld::test]
+fn remove_accounted_leaves_a_file_it_cannot_read_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    plant_unreadable(dir.path());
+    assert_eq!(
+        remove_accounted(dir.path(), &[synthetic(1, 1)]).unwrap(),
+        UpdateOutcome::Unchanged
+    );
+    assert!(state_path(dir.path()).exists());
+}
+
+#[skuld::test]
+fn a_reap_that_has_nothing_to_edit_does_not_move_the_generation() {
+    // An absent file and each unreadable one: the reap has no record to remove, so it writes nothing and a reader
+    // that compares generations sees no write.
+    let mut cases = vec![("absent", tempfile::tempdir().unwrap())];
+    for u in &UNREADABLE {
+        let dir = tempfile::tempdir().unwrap();
+        (u.plant)(dir.path());
+        cases.push((u.what, dir));
+    }
+    for (what, dir) in cases {
+        let dir = dir.path();
+        let before = file(dir).observe().generation;
+
+        remove_accounted(dir, &[synthetic(1, 1)]).unwrap();
+
+        assert_eq!(file(dir).observe().generation, before, "{what}");
+    }
+}
+
+#[skuld::test]
+fn clear_obsolete_removes_only_an_obsolete_record() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        state_path(dir.path()),
+        br#"{"version":1,"plugins":[{"pid":1234,"start_time_unix_ms":1700000000000}]}"#,
+    )
+    .unwrap();
+    assert_eq!(clear_obsolete(dir.path()).unwrap(), UpdateOutcome::Removed);
+    assert!(!state_path(dir.path()).exists());
+
+    // A file that has become current since the caller looked is not obsolete.
+    append_record(dir.path(), synthetic(1, 1), None).unwrap();
+    assert_eq!(clear_obsolete(dir.path()).unwrap(), UpdateOutcome::Unchanged);
+    assert_eq!(plugins_in(dir.path()), vec![synthetic(1, 1)]);
+
+    let absent = tempfile::tempdir().unwrap();
+    assert_eq!(clear_obsolete(absent.path()).unwrap(), UpdateOutcome::Unchanged);
 }
 
 #[skuld::test]
@@ -315,4 +503,86 @@ fn append_refuses_a_link_to_a_folder_the_system_owns_and_writes_nothing_there() 
         before,
         "a state file was written in the system's folder"
     );
+}
+
+// Swallowed outcomes are logged =======================================================================================
+
+/// Capture this crate's log at `DEBUG` and above while `body` runs.
+fn captured(body: impl FnOnce()) -> String {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = crate::test_support::log_capture::VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        body();
+    }
+    writer.snapshot_string()
+}
+
+#[skuld::test]
+fn clear_obsolete_reports_a_file_it_could_not_read_and_keeps_it() {
+    // A directory where the file belongs: the read fails with something other than "not found", so the file is
+    // neither classified nor discarded.
+    let dir = tempfile::tempdir().unwrap();
+    plant_unreadable(dir.path());
+
+    let log = captured(|| {
+        clear_obsolete(dir.path()).unwrap();
+    });
+
+    assert!(state_path(dir.path()).exists(), "an unreadable file is kept");
+    assert!(
+        log.contains("WARN") && log.contains("could not be read"),
+        "the read failure must not vanish: {log}"
+    );
+}
+
+#[skuld::test]
+fn remove_accounted_logs_the_error_of_a_failed_read() {
+    let dir = tempfile::tempdir().unwrap();
+    plant_unreadable(dir.path());
+
+    let log = captured(|| {
+        remove_accounted(dir.path(), &[synthetic(1, 1)]).unwrap();
+    });
+
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WARN") && l.contains("nothing to remove") && l.contains("error=")),
+        "the I/O error must reach the log, not just the fact of a failed read: {log}"
+    );
+}
+
+#[skuld::test]
+fn remove_accounted_says_why_it_removed_nothing_from_a_file_that_is_gone_or_unusable() {
+    let absent = tempfile::tempdir().unwrap();
+    let log = captured(|| {
+        remove_accounted(absent.path(), &[synthetic(1, 1)]).unwrap();
+    });
+    assert!(log.contains("DEBUG") && log.contains("no plugin state file"), "{log}");
+
+    // Each unusable file gets its own warning, worded by what is wrong with it.
+    for (what, expected) in [
+        ("newer", "newer"),
+        ("corrupt", "corrupt"),
+        ("a failed read", "unreadable"),
+    ] {
+        let unusable = tempfile::tempdir().unwrap();
+        let case = UNREADABLE.iter().find(|u| u.what == what).unwrap();
+        (case.plant)(unusable.path());
+        let log = captured(|| {
+            remove_accounted(unusable.path(), &[synthetic(1, 1)]).unwrap();
+        });
+        assert!(
+            log.lines()
+                .any(|l| l.contains("WARN") && l.contains("nothing to remove") && l.contains(expected)),
+            "{what}: {log}"
+        );
+    }
 }

@@ -5,12 +5,13 @@
 
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
+use crate::target::Target;
 use crate::test_support::target_records;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tun_engine::gateway::{GatewayInfo, NextHop};
-use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::failclosed::{lockdown_state, CoverKind, CoverLock, InstallStamp};
 use tun_engine::routing::{self, state as route_state, RouteId, RoutedFamilies, RoutesInstalled, Routing};
 use tun_engine::{RoutingError, TunIdentity};
 
@@ -178,6 +179,9 @@ impl Drop for MockRunning {
 
 // MockRouting =========================================================================================================
 
+/// What a test runs when a cover install begins.
+type InstallHook = Box<dyn FnOnce() + Send>;
+
 pub(crate) struct MockRoutingState {
     install_calls: AtomicU32,
     teardown_calls: AtomicU32,
@@ -194,17 +198,11 @@ pub(crate) struct MockRoutingState {
     pub(crate) release_all_calls: AtomicU32,
     /// `release_all_covers` returns `RoutingError::RouteSetup` when set.
     pub(crate) fail_release: AtomicBool,
-    /// The guard's own `Drop` (the second, unconfirmable release attempt
-    /// `apply_cover_step` makes after `release_all_covers`, mirroring the real
-    /// `Cover::drop` calling `lockdown_disengage`) leaves the measured
-    /// presence untouched instead of clearing it when set — lets a test
-    /// simulate BOTH real release attempts failing to confirm, the only
-    /// scenario in which the OS cover can genuinely remain engaged.
+    /// The guard's own `Drop` (mirroring the real `Cover::drop` calling `lockdown_disengage`) leaves the measured
+    /// presence untouched instead of clearing it when set. The Drop is a second release attempt only after a FAILED
+    /// sweep (after a successful one the guard is stale and deletes nothing), so this simulates BOTH real attempts
+    /// failing to confirm, the only scenario in which the OS cover can genuinely remain engaged.
     pub(crate) fail_lockdown_disengage_on_drop: AtomicBool,
-    /// Ordered record of teardown events ("routes" / "lockdown") so a test can
-    /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
-    /// both `MockRoutes` and `MockCover` clone.
-    teardown_order: std::sync::Mutex<Vec<&'static str>>,
     /// Last `server_ip` passed to `install`, so a test can assert the bypass
     /// route received the DoH-resolved IP (not a system-resolved one).
     last_install_server_ip: std::sync::Mutex<Option<IpAddr>>,
@@ -229,6 +227,16 @@ pub(crate) struct MockRoutingState {
     /// (a set containing both values) for the double-failure fail-open path.
     /// `fail_cover` (always-fail) is unaffected and takes priority.
     fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
+    /// `install_failclosed_cover` calls, counted at ENTRY, before any failure
+    /// the mock injects: tells "never tried" from "tried and refused", which
+    /// `cover_engage_calls` (counted only on success) cannot.
+    pub(crate) cover_engage_attempts: AtomicU32,
+    /// Runs once, at the entry of the next `install_failclosed_cover` or `install_lockdown`, under the cover lock
+    /// the caller holds: a test parks the install here to put another party's release behind it.
+    on_install: std::sync::Mutex<Option<(u32, InstallHook)>>,
+    /// What happened, in order: an install's "engage begins" (the park hook) and "engage ends", a sweep's "release"
+    /// (or "release failed"), a route teardown's "routes", and a standing guard's drop that deleted, "lockdown".
+    events: std::sync::Mutex<Vec<&'static str>>,
     /// `install` excludes any [`RouteId`] in this set from the persisted
     /// `installed` list — simulates a route whose `add` failed (e.g. another
     /// VPN already holds that prefix), analogous to `fail_cover_for_resolvers`.
@@ -260,17 +268,56 @@ impl Default for MockRoutingState {
             release_all_calls: AtomicU32::new(0),
             fail_release: AtomicBool::new(false),
             fail_lockdown_disengage_on_drop: AtomicBool::new(false),
-            teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
             last_install_tun_alias: std::sync::Mutex::new(None),
             last_lockdown_tun_alias: std::sync::Mutex::new(None),
             last_cover_server_ip: std::sync::Mutex::new(None),
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            cover_engage_attempts: AtomicU32::new(0),
+            on_install: std::sync::Mutex::new(None),
+            events: std::sync::Mutex::new(Vec::new()),
             fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_teardown_installed: std::sync::Mutex::new(None),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
         }
+    }
+}
+
+impl MockRoutingState {
+    fn run_on_install(&self) {
+        let hook = {
+            let mut armed = self.on_install.lock().unwrap();
+            match armed.as_mut() {
+                Some((skip, _)) if *skip > 0 => {
+                    *skip -= 1;
+                    None
+                }
+                Some(_) => armed.take().map(|(_, hook)| hook),
+                None => None,
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Park the install after `skip` more installs have gone through: the install reports "engage begins", signals
+    /// the returned receiver, and waits for the returned sender before it completes. A test holds another party
+    /// (the tray's Unblock) behind the cover lock the install is under, then lets the install go.
+    fn park_install(self: &Arc<Self>, skip: u32) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let state = Arc::clone(self);
+        *self.on_install.lock().unwrap() = Some((
+            skip,
+            Box::new(move || {
+                state.events.lock().unwrap().push("engage begins");
+                entered_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            }),
+        ));
+        (entered_rx, go_tx)
     }
 }
 
@@ -448,9 +495,12 @@ impl Routing for MockRouting {
 
     fn install_failclosed_cover(
         &self,
+        lock: &CoverLock,
         server_ip: IpAddr,
         resolver_ip: Option<IpAddr>,
     ) -> Result<MockCover, RoutingError> {
+        self.state.cover_engage_attempts.fetch_add(1, Ordering::SeqCst);
+        self.state.run_on_install();
         if self.state.fail_cover.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock cover failure".into()));
         }
@@ -466,39 +516,62 @@ impl Routing for MockRouting {
         *self.state.last_cover_server_ip.lock().unwrap() = Some(server_ip);
         *self.state.last_cover_resolver_ip.lock().unwrap() = resolver_ip;
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
+        self.state.events.lock().unwrap().push("engage ends");
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: false,
+            stamp: lock.stamp_install(CoverKind::Transient),
         })
     }
 
     fn install_lockdown(
         &self,
+        lock: &CoverLock,
         _server_ip: IpAddr,
         tun: &TunIdentity,
         _app_ids: &[std::path::PathBuf],
     ) -> Result<MockCover, RoutingError> {
+        self.state.run_on_install();
         if self.state.fail_lockdown.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock lockdown failure".into()));
         }
         *self.state.last_lockdown_tun_alias.lock().unwrap() = Some(tun.alias().to_owned());
         self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
+        self.state.events.lock().unwrap().push("engage ends");
         // Mirrors the real OS: a successful engage is what a subsequent
         // `lockdown_cover_presence` probe would find.
         *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Live;
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: true,
+            stamp: lock.stamp_install(CoverKind::Lockdown),
         })
     }
 
-    fn release_all_covers(&self) -> Result<(), RoutingError> {
+    fn lock_covers(&self) -> CoverLock {
+        CoverLock::acquire(self.state_dir())
+    }
+
+    fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    fn owner(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    fn release_all_covers(&self, lock: &CoverLock) -> Result<(), RoutingError> {
         self.state.release_all_calls.fetch_add(1, Ordering::SeqCst);
         if self.state.fail_release.load(Ordering::SeqCst) {
+            self.state.events.lock().unwrap().push("release failed");
             return Err(RoutingError::RouteSetup("mock release_all_covers failure".into()));
         }
-        // Unconditional clear, mirroring `failclosed::release_all`.
+        // All or nothing: the mock answers with the table's stated outcome and never models a sweep that
+        // releases one kind and fails the other. A success outdates every guard; a failure outdates none.
+        self.state.events.lock().unwrap().push("release");
         *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
+        lock.outdate_stamps(CoverKind::Transient);
+        lock.outdate_stamps(CoverKind::Lockdown);
         Ok(())
     }
 
@@ -517,7 +590,7 @@ pub(crate) struct MockRoutes {
 impl Drop for MockRoutes {
     fn drop(&mut self) {
         self.state.teardown_calls.fetch_add(1, Ordering::SeqCst);
-        self.state.teardown_order.lock().unwrap().push("routes");
+        self.state.events.lock().unwrap().push("routes");
         *self.state.last_teardown_installed.lock().unwrap() = Some(self.installed.clone());
         let _ = route_state::remove(&route_state::file(&self.state_dir));
     }
@@ -543,33 +616,57 @@ pub(crate) struct MockCover {
     /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
     /// the kind-aware `failclosed::Cover`.
     lockdown: bool,
+    /// Which install this guard came from, as the real guards carry it: a guard a later install or a completed
+    /// sweep outdated disengages nothing.
+    stamp: InstallStamp,
 }
 
-impl Drop for MockCover {
-    fn drop(&mut self) {
-        if self.lockdown {
-            self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
-            self.state.teardown_order.lock().unwrap().push("lockdown");
-            // Mirrors the real OS: an actual disengage (not `disarm`, which
-            // `mem::forget`s this guard and never runs `Drop`) is what a
+impl MockCover {
+    /// What a disengage does, as the real guard's does: counted and, for the standing cover, the presence probe
+    /// stops finding it.
+    fn disengage(state: &MockRoutingState, lockdown: bool) {
+        if lockdown {
+            state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
+            state.events.lock().unwrap().push("lockdown");
+            // Mirrors the real OS: an actual disengage (not `disarm`, after which
+            // the real guard's `Drop` disengages nothing) is what a
             // subsequent `lockdown_cover_presence` probe would no longer find
             // — UNLESS this Drop's own disengage attempt is simulated as
             // failing to confirm too (`fail_lockdown_disengage_on_drop`).
-            if !self.state.fail_lockdown_disengage_on_drop.load(Ordering::SeqCst) {
-                *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
+            if !state.fail_lockdown_disengage_on_drop.load(Ordering::SeqCst) {
+                *state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
             }
         } else {
-            self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
+            state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
 
+impl Drop for MockCover {
+    fn drop(&mut self) {
+        self.stamp
+            .release_on_drop(|_| Self::disengage(&self.state, self.lockdown));
+    }
+}
+
 impl tun_engine::routing::CoverGuard for MockCover {
-    /// Mirror `failclosed::Cover::disarm`: consume the guard without running
-    /// `Drop`, so the disengage counter does NOT move — the cutover persists the
-    /// cover instead of disengaging it.
+    /// Mirror `failclosed::Cover::disarm`: consume the guard so it disengages
+    /// nothing and the disengage counter does NOT move — the cutover persists the
+    /// cover instead of disengaging it. The mock holds nothing to empty, so it
+    /// skips its `Drop` outright.
     fn disarm(self) {
         std::mem::forget(self);
+    }
+
+    /// Under the held lock a drop IS the explicit release, so this is one, after the lock-dir check the real guards
+    /// make.
+    fn release(self, lock: &CoverLock) {
+        self.stamp.assert_held_under(lock);
+        drop(self);
+    }
+
+    fn is_current(&self) -> bool {
+        self.stamp.is_current()
     }
 }
 
@@ -587,6 +684,7 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
 
     let cover = routing
         .install_lockdown(
+            &routing.lock_covers(),
             IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
             &TunIdentity::synthetic(0xFEED, "hole-tun"),
             &[],
@@ -603,12 +701,98 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
 }
 
 #[skuld::test]
+fn a_stale_guard_release_after_a_completed_sweep_deletes_nothing() {
+    // The stamp rule the real guards follow: a completed sweep took what the guard held, so its later drop (or
+    // release) must not disengage a second time.
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let transient = routing
+        .install_failclosed_cover(&routing.lock_covers(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None)
+        .unwrap();
+    let standing = routing
+        .install_lockdown(
+            &routing.lock_covers(),
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            &TunIdentity::synthetic(0xFEED, "hole-tun"),
+            &[],
+        )
+        .unwrap();
+    assert!(transient.is_current() && standing.is_current());
+
+    routing.release_all_covers(&routing.lock_covers()).unwrap();
+    assert!(!transient.is_current() && !standing.is_current());
+    drop(transient);
+    drop(standing);
+
+    assert_eq!(state.cover_disengage_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+}
+
+/// A disposition log says a cover was released only when this call released a cover still in force: a cover an
+/// Unblock already took is dropped silently.
+#[skuld::test]
+fn releasing_a_held_cover_reports_it_only_when_it_was_still_in_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let held = |routing: &MockRouting| {
+        Posture::<MockProxy, MockRouting, SystemDns>::PendingStart(BlockedStart {
+            cover: routing
+                .install_failclosed_cover(&routing.lock_covers(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None)
+                .unwrap(),
+            host: "proxy.example".into(),
+            server_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            pin: crate::dns::ech::PinSource::NoQueryNeeded,
+            resolver_permit: None,
+        })
+    };
+
+    let state = routing.state();
+    let disengaged = || state.cover_disengage_calls.load(Ordering::SeqCst);
+
+    let mut current = held(&routing);
+    assert!(current.release_pending(&routing.lock_covers()));
+    assert!(matches!(current, Posture::Idle));
+    assert_eq!(disengaged(), 1, "the cover in force is disengaged once");
+
+    let mut taken = held(&routing);
+    let lock = routing.lock_covers();
+    routing.release_all_covers(&lock).unwrap();
+    assert!(!taken.release_pending(&lock));
+    drop(lock);
+    assert!(matches!(taken, Posture::Idle));
+    assert_eq!(disengaged(), 1, "a guard an Unblock outdated disengages nothing itself");
+
+    let lock = routing.lock_covers();
+    assert!(!Posture::<MockProxy, MockRouting, SystemDns>::Idle.release_pending(&lock));
+    assert_eq!(disengaged(), 1, "no held cover, nothing to disengage");
+}
+
+#[skuld::test]
+fn a_failed_release_leaves_a_guard_current_so_its_drop_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let transient = routing
+        .install_failclosed_cover(&routing.lock_covers(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None)
+        .unwrap();
+    state.fail_release.store(true, Ordering::SeqCst);
+
+    assert!(routing.release_all_covers(&routing.lock_covers()).is_err());
+    assert!(transient.is_current());
+    drop(transient);
+
+    assert_eq!(state.cover_disengage_calls.load(Ordering::SeqCst), 1);
+}
+
+#[skuld::test]
 fn mock_failing_lockdown_returns_err_without_recording() {
     let dir = tempfile::tempdir().unwrap();
     let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
     let state = routing.state();
 
     let result = routing.install_lockdown(
+        &routing.lock_covers(),
         IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
         &TunIdentity::synthetic(0xFEED, "hole-tun"),
         &[],
@@ -621,6 +805,23 @@ fn mock_failing_lockdown_returns_err_without_recording() {
 
 pub(crate) fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
+}
+
+/// A covered start's coverage with the Unblock count read now, as the IPC handler reads it when the start begins.
+pub(crate) fn covered_now<P: Proxy, R: Routing, D: Dns>(pm: &ProxyManager<P, R, D>) -> Coverage {
+    Coverage::Covered {
+        unblock_snapshot: pm.unblock_generation_handle().load(Ordering::SeqCst),
+    }
+}
+
+/// A DoH bootstrap querier that fails every query at once, so a resolve fails with no network.
+struct UnreachableQuerier;
+
+#[async_trait::async_trait]
+impl crate::dns::bootstrap::DohQuerier for UnreachableQuerier {
+    async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, crate::dns::forwarder::UpstreamCause> {
+        Err(crate::dns::forwarder::UpstreamCause::Unreachable)
+    }
 }
 
 /// Current-thread, unlike `rt()`: `tokio::time::pause()` panics on a
@@ -673,18 +874,16 @@ fn new_manager_with_routing(
     (pm, dir)
 }
 
-/// Build a manager whose routing + manager share `dir` as state_dir, with the
-/// lockdown intent seeded to `enabled`. The shared state_dir is how the manager
-/// reads `bridge-lockdown.json` in `start_inner`.
+/// Build a manager over `routing` with the lockdown intent seeded to `enabled` in
+/// the routing's state directory, which is where `start_inner` reads
+/// `bridge-lockdown.json`. The caller keeps the `TempDir` alive.
 fn new_manager_with_lockdown(
     proxy: MockProxy,
     routing: MockRouting,
-    dir: tempfile::TempDir,
     enabled: bool,
-) -> (ProxyManager<MockProxy, MockRouting>, tempfile::TempDir) {
-    lockdown_state::set_enabled(dir.path(), enabled, None).unwrap();
-    let pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
-    (pm, dir)
+) -> ProxyManager<MockProxy, MockRouting> {
+    lockdown_state::set_enabled(&routing.lock_covers(), enabled, None).unwrap();
+    ProxyManager::new(proxy, routing)
 }
 
 /// `new_manager_with_routing` variant that also substitutes `MockDns` for
@@ -804,11 +1003,10 @@ fn install_and_lockdown_name_the_device_dns_was_given() {
         let dns_state = dns.state_handle();
 
         let dir = tempfile::tempdir().unwrap();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let routing_state = routing.state();
-        let (pm, dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
-        let mut pm = pm.with_state_dir(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
         assert!(
             pm.standing_cover_expected(),
             "HARNESS: the lockdown intent set above must make install_lockdown reachable"
@@ -1025,7 +1223,7 @@ fn an_unexpected_death_moves_the_target_off() {
         let proxy_state = proxy.state_handle();
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(proxy, routing);
         pm.start(&test_config()).await.unwrap();
         target_records::save(
             dir.path(),
@@ -1051,7 +1249,7 @@ fn an_unexpected_death_moves_the_target_off() {
 #[skuld::test]
 fn an_unexpected_death_releases_the_cover_after_the_session() {
     // Same teardown-ordering guarantee as a user stop
-    // (`user_stop_tears_down_routes_before_disengaging_the_lockdown_cover`),
+    // (`user_stop_tears_down_routes_before_releasing_the_lockdown_cover`),
     // but driven by `check_health`'s GaveUp: the standing cover's persistent
     // filters must still outlive the routes they cover on a crash, not just
     // a clean stop.
@@ -1061,17 +1259,17 @@ fn an_unexpected_death_releases_the_cover_after_the_session() {
         let st = routing.state();
         let proxy = MockProxy::new();
         let proxy_state = proxy.state_handle();
-        let (mut pm, _dir) = new_manager_with_lockdown(proxy, routing, dir, true);
+        let mut pm = new_manager_with_lockdown(proxy, routing, true);
         pm.start(&test_config()).await.unwrap();
 
+        st.events.lock().unwrap().clear();
         proxy_state.crashed.store(true, Ordering::SeqCst);
         let event = pm.check_health().expect("crashed task must report GaveUp");
         pm.stop_with(event).await.unwrap();
 
-        let order = st.teardown_order.lock().unwrap().clone();
         assert_eq!(
-            order,
-            vec!["routes", "lockdown"],
+            *st.events.lock().unwrap(),
+            ["routes", "release"],
             "the standing cover's persistent filters must outlive the routes they cover, even on a crash"
         );
     });
@@ -1323,7 +1521,7 @@ fn a_plugin_chain_death_moves_the_target_off() {
     current_thread_rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.start(&test_config()).await.unwrap();
         target_records::save(
             dir.path(),
@@ -1527,7 +1725,7 @@ fn mock_cover_engage_disengage_never_spawns() {
     let st = routing.state();
     for _ in 0..10 {
         let cover = routing
-            .install_failclosed_cover("1.2.3.4".parse().unwrap(), None)
+            .install_failclosed_cover(&routing.lock_covers(), "1.2.3.4".parse().unwrap(), None)
             .unwrap();
         drop(cover);
     }
@@ -1545,13 +1743,13 @@ fn mock_install_failclosed_cover_records_the_resolver_argument() {
     let resolver: IpAddr = "9.9.9.9".parse().unwrap();
 
     let cover = routing
-        .install_failclosed_cover("1.2.3.4".parse().unwrap(), Some(resolver))
+        .install_failclosed_cover(&routing.lock_covers(), "1.2.3.4".parse().unwrap(), Some(resolver))
         .unwrap();
     assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver));
     drop(cover);
 
     let cover = routing
-        .install_failclosed_cover("1.2.3.4".parse().unwrap(), None)
+        .install_failclosed_cover(&routing.lock_covers(), "1.2.3.4".parse().unwrap(), None)
         .unwrap();
     assert_eq!(
         *st.last_cover_resolver_ip.lock().unwrap(),
@@ -1575,7 +1773,7 @@ fn lockdown_off_does_not_engage_cover() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
 
         pm.start(&test_config()).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
@@ -1596,12 +1794,12 @@ fn lockdown_off_does_not_engage_cover() {
 }
 
 #[skuld::test]
-fn lockdown_on_engages_after_install_and_disengages_on_stop() {
+fn lockdown_on_engages_after_install_and_is_released_on_stop() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
 
         pm.start(&test_config()).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
@@ -1623,15 +1821,16 @@ fn lockdown_on_engages_after_install_and_disengages_on_stop() {
         );
 
         pm.stop().await.unwrap();
+        assert_eq!(pm.cover_presence(), CoverPresence::Absent, "cover released after stop");
         assert_eq!(
-            pm.cover_presence(),
-            CoverPresence::Absent,
-            "cover disengaged after stop"
+            st.release_all_calls.load(Ordering::SeqCst),
+            1,
+            "the sweep released the cover"
         );
         assert_eq!(
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
-            "disengaged on stop"
+            0,
+            "not a guard's drop: a stale guard deletes nothing after the sweep"
         );
     });
 }
@@ -1645,7 +1844,7 @@ fn lockdown_engage_failure_is_fatal_and_tears_down() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
         let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
 
         let err = pm.start(&test_config()).await.unwrap_err();
         assert!(
@@ -1668,6 +1867,95 @@ fn lockdown_engage_failure_is_fatal_and_tears_down() {
     });
 }
 
+// The tray's Unblock against a standing install -----------------------------------------------------------------------
+//
+// `install_standing_cover` is the one section a start installs its standing cover in, so these drive it directly:
+// the start path around it cannot run here (no wintun).
+
+fn standing_install_inputs() -> (IpAddr, TunIdentity) {
+    (
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        TunIdentity::synthetic(0xFEED, "hole-tun"),
+    )
+}
+
+/// Order A: an Unblock that holds the cover lock when the start arrives records its `Off` before the start reads
+/// anything, so the start installs nothing. A start that read the intent before the lock would see the `On`.
+#[skuld::test]
+fn a_standing_start_that_arrives_during_an_unblock_installs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+    let routing = Arc::new(MockRouting::new(dir.path().to_path_buf()));
+    let st = routing.state();
+    let (ip, tun) = standing_install_inputs();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+
+    let installed = std::thread::scope(|scope| {
+        let unblock = scope.spawn({
+            let routing = Arc::clone(&routing);
+            move || {
+                let lock = routing.lock_covers();
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                routing.release_all_covers(&lock).unwrap();
+                lockdown_state::set_enabled(&lock, false, None).unwrap();
+            }
+        });
+        held_rx.recv().unwrap();
+        let start = scope.spawn(|| {
+            arrived_tx.send(()).unwrap();
+            install_standing_cover(&*routing, ip, &tun, &[])
+        });
+        arrived_rx.recv().unwrap();
+        go_tx.send(()).unwrap();
+        unblock.join().unwrap();
+        start.join().unwrap().expect("the section does not fail")
+    });
+
+    assert!(installed.is_none(), "the start read the Off the Unblock recorded");
+    assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Order B: the Unblock begins while the standing install is inside its OS step and releases wholly after it; the
+/// start's guard is then stale and its drop disengages nothing more.
+#[skuld::test]
+fn an_unblock_waits_for_a_standing_install_in_flight_and_then_releases_it() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+    let routing = Arc::new(MockRouting::new(dir.path().to_path_buf()));
+    let st = routing.state();
+    let (ip, tun) = standing_install_inputs();
+    let (entered, go) = st.park_install(0);
+
+    let installed = std::thread::scope(|scope| {
+        let start = scope.spawn(|| install_standing_cover(&*routing, ip, &tun, &[]));
+        entered.recv().unwrap();
+        let unblock = scope.spawn(|| {
+            let lock = routing.lock_covers();
+            routing.release_all_covers(&lock).unwrap();
+        });
+        go.send(()).unwrap();
+        unblock.join().unwrap();
+        start.join().unwrap().expect("the section does not fail")
+    });
+
+    assert_eq!(
+        *st.events.lock().unwrap(),
+        ["engage begins", "engage ends", "release"],
+        "the release ran wholly after the install"
+    );
+    let cover = installed.expect("the install ran first");
+    assert!(
+        !tun_engine::routing::CoverGuard::is_current(&cover),
+        "the release took the cover the start installed"
+    );
+    drop(cover);
+    assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+}
+
 #[skuld::test]
 fn lockdown_engage_failure_tears_down_routes_only() {
     // Fail-FATAL engage: routes were installed (engage runs after install) then the
@@ -1675,21 +1963,20 @@ fn lockdown_engage_failure_tears_down_routes_only() {
     // cover is never constructed (the `?` fires before the `lockdown` binding
     // completes), so the ordered recorder must show exactly one teardown — "routes" —
     // and the cover disengage counter must stay at zero. (On a clean stop the order
-    // is the reverse — routes then lockdown — by design; see ProxyManager::stop.)
+    // is the reverse — routes then release — by design; see ProxyManager::stop.)
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
         let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
 
         let err = pm.start(&test_config()).await.unwrap_err();
         assert!(err.to_string().contains("mock lockdown failure"));
         assert_eq!(pm.state(), ProxyState::Stopped);
 
-        let order = st.teardown_order.lock().unwrap().clone();
         assert_eq!(
-            order,
-            vec!["routes"],
+            *st.events.lock().unwrap(),
+            ["routes"],
             "engage failure tears down routes only; no cover was created"
         );
         assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
@@ -1697,23 +1984,22 @@ fn lockdown_engage_failure_tears_down_routes_only() {
 }
 
 #[skuld::test]
-fn user_stop_tears_down_routes_before_disengaging_the_lockdown_cover() {
-    // Characterization test, pinned against unmodified code: the clean-stop
-    // path tears down routes before disengaging the standing cover. The
-    // standing cover's persistent filters must outlive the routes they cover.
+fn user_stop_tears_down_routes_before_releasing_the_lockdown_cover() {
+    // The clean-stop path tears down routes before the sweep releases the standing cover. The standing cover's
+    // persistent filters must outlive the routes they cover.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
         pm.start(&test_config()).await.unwrap();
 
+        st.events.lock().unwrap().clear();
         pm.stop_with(SessionEvent::UserStopped).await.unwrap();
 
-        let order = st.teardown_order.lock().unwrap().clone();
         assert_eq!(
-            order,
-            vec!["routes", "lockdown"],
+            *st.events.lock().unwrap(),
+            ["routes", "release"],
             "the standing cover's persistent filters must outlive the routes they cover"
         );
     });
@@ -1759,7 +2045,7 @@ fn a_full_session_stop_enters_each_phase_before_the_work_it_names() {
         let routing_state = routing.state();
         let proxy = MockProxy::new();
         let proxy_state = proxy.state_handle();
-        let mut pm = ProxyManager::new_with_dns(proxy, routing, dns).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new_with_dns(proxy, routing, dns);
         let mut config = test_config();
         config.local_port = upstream.port();
         config.dns.enabled = true;
@@ -1785,48 +2071,11 @@ fn a_full_session_stop_enters_each_phase_before_the_work_it_names() {
 }
 
 #[skuld::test]
-fn a_socks_only_stop_without_a_state_dir_enters_only_the_phases_with_work() {
+fn stopping_an_idle_manager_enters_only_the_target_persist() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let routing_state = routing.state();
-        let proxy = MockProxy::new();
-        let proxy_state = proxy.state_handle();
-        let mut pm = ProxyManager::new(proxy, routing);
-        let mut config = test_config();
-        config.tunnel_mode = TunnelMode::SocksOnly;
-        pm.start(&config).await.unwrap();
-
-        let seen = stop_recording_phases(&mut pm, || false, &proxy_state, &routing_state).await;
-
-        assert_eq!(
-            seen,
-            vec![
-                (StopPhase::StopProxy, false, 0, 0),
-                (StopPhase::SettleCover, false, 1, 0)
-            ]
-        );
-    });
-}
-
-#[skuld::test]
-fn stopping_an_idle_manager_without_a_state_dir_enters_no_phase() {
-    rt().block_on(async {
-        let (mut pm, _dir) = new_manager(MockProxy::new());
-        let mut seen = Vec::new();
-        pm.stop_with_progress(SessionEvent::UserStopped, |phase| seen.push(phase))
-            .await
-            .unwrap();
-        assert_eq!(seen, vec![]);
-    });
-}
-
-#[skuld::test]
-fn stopping_an_idle_manager_with_a_state_dir_enters_only_the_target_persist() {
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         let mut seen = Vec::new();
         pm.stop_with_progress(SessionEvent::UserStopped, |phase| seen.push(phase))
             .await
@@ -1838,19 +2087,21 @@ fn stopping_an_idle_manager_with_a_state_dir_enters_only_the_target_persist() {
 #[skuld::test]
 fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
     rt().block_on(async {
-        // UserStop: the cover Drop disengages (opens the host).
+        // UserStop: the release opens the host.
         {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
             pm.start(&test_config()).await.unwrap();
 
             pm.stop_with(SessionEvent::UserStopped).await.unwrap();
+            assert_eq!(pm.cover_presence(), CoverPresence::Absent, "user stop opens the host");
+            assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1, "the sweep released");
             assert_eq!(
                 st.lockdown_disengage_calls.load(Ordering::SeqCst),
-                1,
-                "user stop disengages the cover"
+                0,
+                "not a guard's drop"
             );
         }
         // Cutover: the cover is disarmed (persist-without-disengage) so the
@@ -1872,15 +2123,15 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
                 None,
             )
             .unwrap();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
             pm.start(&test_config()).await.unwrap();
             assert_eq!(st.teardown_calls.load(Ordering::SeqCst), 0);
 
             pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
             assert_eq!(
-                st.lockdown_disengage_calls.load(Ordering::SeqCst),
-                0,
-                "cutover does NOT disengage the cover (it is disarmed so the filters persist)"
+                pm.cover_presence(),
+                CoverPresence::Live,
+                "cutover keeps the cover in force (disarmed, not released)"
             );
             assert_eq!(
                 st.teardown_calls.load(Ordering::SeqCst),
@@ -1957,21 +2208,12 @@ fn build_config_failure_sets_last_error() {
 
 #[skuld::test]
 fn doh_bootstrap_failure_sets_last_error() {
-    use crate::dns::bootstrap::DohQuerier;
-    use crate::dns::forwarder::UpstreamCause;
-    struct NeverQuerier;
-    #[async_trait::async_trait]
-    impl DohQuerier for NeverQuerier {
-        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            Err(UpstreamCause::Unreachable)
-        }
-    }
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
-        pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+        pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
         let mut config = test_config();
         // RFC 2606 reserves .invalid for guaranteed-non-resolution; the stub
-        // querier never answers, so resolve is fail-closed without any network.
+        // querier fails every query at once, so resolve fails without any network.
         config.server.server = "test.invalid".into();
 
         let err = pm.start(&config).await.unwrap_err();
@@ -1981,6 +2223,60 @@ fn doh_bootstrap_failure_sets_last_error() {
         // last_error is the PII-free DohBootstrap Display — host is in the log, not here.
         assert!(!pm.last_error().unwrap().contains("test.invalid"));
     });
+}
+
+/// A start that cannot resolve the server logs the failure with the measured cover presence, whatever the start's
+/// coverage and whatever the probe answered. The line states what the start did, not whether the host is blocked.
+#[skuld::test]
+fn a_start_that_cannot_resolve_logs_the_measured_cover_presence() {
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    use tun_engine::routing::CoverPresence;
+
+    for presence in [
+        CoverPresence::Live,
+        CoverPresence::Recorded,
+        CoverPresence::Absent,
+        CoverPresence::Indeterminate,
+        CoverPresence::Unreachable,
+    ] {
+        for covered in [true, false] {
+            current_thread_rt().block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                *routing.state.cover_presence.lock().unwrap() = presence;
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
+                pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
+                let mut config = test_config();
+                // RFC 2606 reserves .invalid for guaranteed non-resolution.
+                config.server.server = "test.invalid".into();
+                let coverage = if covered { covered_now(&pm) } else { Coverage::Uncovered };
+
+                let err = pm
+                    .start_cancellable(&config, coverage, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, ProxyError::DohBootstrap(_)), "{err:?}");
+
+                let output = writer.snapshot_string();
+                let want = format!("cover_presence={presence:?}");
+                assert!(
+                    output.contains("could not resolve the server") && output.contains(&want),
+                    "covered={covered}: the resolve failure must log `{want}`; got:\n{output}"
+                );
+            });
+        }
+    }
 }
 
 #[skuld::test]
@@ -2019,10 +2315,10 @@ fn a_covered_start_that_fails_over_a_third_party_upstream_reports_blocked() {
         let proxy = MockProxy::new();
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::failing_gateway(dir.path().to_path_buf());
-        let (mut pm, _dir) = new_manager_with_lockdown(proxy, routing, dir, false);
+        let mut pm = new_manager_with_lockdown(proxy, routing, false);
 
         let err = pm
-            .start_cancellable(&test_config(), true, CancellationToken::new())
+            .start_cancellable(&test_config(), covered_now(&pm), CancellationToken::new())
             .await
             .unwrap_err();
 
@@ -2155,7 +2451,9 @@ fn start_cancellable_succeeds_when_not_cancelled() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         let token = CancellationToken::new();
-        pm.start_cancellable(&test_config(), false, token).await.unwrap();
+        pm.start_cancellable(&test_config(), Coverage::Uncovered, token)
+            .await
+            .unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
         pm.stop().await.unwrap();
     });
@@ -2183,7 +2481,10 @@ fn start_cancellable_cancelled_during_ss_start_rolls_back() {
             cancel_clone.cancel();
         });
 
-        let err = pm.start_cancellable(&test_config(), false, token).await.unwrap_err();
+        let err = pm
+            .start_cancellable(&test_config(), Coverage::Uncovered, token)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(
@@ -2212,7 +2513,10 @@ fn start_cancellable_cancel_before_start_returns_immediately() {
         let token = CancellationToken::new();
         token.cancel(); // already cancelled before start is even called
 
-        let err = pm.start_cancellable(&test_config(), false, token).await.unwrap_err();
+        let err = pm
+            .start_cancellable(&test_config(), Coverage::Uncovered, token)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled));
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().is_none());
@@ -2227,7 +2531,7 @@ fn start_cancellable_late_cancel_on_finished_token_is_noop() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         let token = CancellationToken::new();
-        pm.start_cancellable(&test_config(), false, token.clone())
+        pm.start_cancellable(&test_config(), Coverage::Uncovered, token.clone())
             .await
             .unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
@@ -2264,7 +2568,7 @@ fn start_cancellable_dropped_future_runs_guards() {
         // surrounding scope drops `f`, running the drop-safety guards.
         {
             let cfg = test_config();
-            let f = pm.start_cancellable(&cfg, false, token);
+            let f = pm.start_cancellable(&cfg, Coverage::Uncovered, token);
             tokio::pin!(f);
             tokio::select! {
                 _ = &mut f => panic!("start should not complete while gate is unfired"),
@@ -2342,7 +2646,10 @@ fn pure_vpn_start_cancellable_during_proxy_start() {
             cancel_clone.cancel();
         });
 
-        let err = pm.start_cancellable(&config, false, token).await.unwrap_err();
+        let err = pm
+            .start_cancellable(&config, Coverage::Uncovered, token)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
         assert_eq!(pm.state(), ProxyState::Stopped);
         // No gate release needed: the cancel drops the parked
@@ -2896,19 +3203,11 @@ fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
 
 #[skuld::test]
 fn full_start_fails_closed_when_doh_cannot_resolve() {
-    // A stub that never answers → Unreachable → DohBootstrap, hermetic (no
+    // A stub that fails at once → Unreachable → DohBootstrap, hermetic (no
     // system DNS or network).
-    use crate::dns::forwarder::UpstreamCause;
-    struct NeverQuerier;
-    #[async_trait::async_trait]
-    impl DohQuerier for NeverQuerier {
-        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            Err(UpstreamCause::Unreachable)
-        }
-    }
     rt().block_on(async {
         let (mut pm, rstate, _dir) = new_manager_capturing(MockProxy::new());
-        pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+        pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
         let mut config = doh_config_with_server_host("proxy.example", TunnelMode::Full);
         config.server.plugin = None;
         let err = pm.start(&config).await.unwrap_err();
@@ -2977,7 +3276,7 @@ mod self_test {
                 // reading (see `self_test_error_for`'s precedence).
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
                 let mut cfg = test_config();
                 // A real listener HELD open for the whole test, not a
                 // free_port()-allocated number: `free_port` only proves the
@@ -3082,7 +3381,7 @@ mod self_test {
 
             tokio::time::pause();
             let err = pm
-                .start_cancellable(&cfg, false, CancellationToken::new())
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
 
@@ -3138,7 +3437,7 @@ mod self_test {
 
             tokio::time::pause();
             let err = pm
-                .start_cancellable(&cfg, false, CancellationToken::new())
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(
@@ -3161,7 +3460,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, _dir) = new_manager(MockProxy::new());
             // test_config() already has dns.enabled = false.
-            pm.start_cancellable(&test_config(), false, CancellationToken::new())
+            pm.start_cancellable(&test_config(), Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap();
             assert_eq!(pm.state(), ProxyState::Running);
@@ -3190,7 +3489,7 @@ mod self_test {
 
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
+        let pm = new_manager_with_lockdown(MockProxy::new(), routing, lockdown);
 
         let mut cfg = test_config();
         cfg.server.server = closed.ip().to_string().into();
@@ -3215,7 +3514,7 @@ mod self_test {
             let (mut pm, cfg, _dir) = gate_failure_setup(true);
             tokio::time::pause();
             let err = pm
-                .start_cancellable(&cfg, false, CancellationToken::new())
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             // Either reading is admissible: a closed loopback port is REFUSED on
@@ -3261,7 +3560,7 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let (mut pm, cfg, _dir) = gate_failure_setup(false);
-                pm.start_cancellable(&cfg, false, CancellationToken::new())
+                pm.start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                     .await
                     .expect_err("both the probe and the gate must fail");
             });
@@ -3282,7 +3581,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, cfg, _dir) = gate_failure_setup(false);
             let err = pm
-                .start_cancellable(&cfg, false, CancellationToken::new())
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             match err {
@@ -3321,7 +3620,7 @@ mod self_test {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
+        let pm = new_manager_with_lockdown(MockProxy::new(), routing, lockdown);
         let mut cfg = test_config();
         cfg.server.server = closed.ip().to_string().into();
         cfg.server.server_port = closed.port();
@@ -3335,7 +3634,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3363,7 +3662,7 @@ mod self_test {
             // restart gap — never disengage; a user Disconnect disengages (opens the
             // host). Mirrors stop_with_cutover_disarms_lockdown for the standing cover.
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -3381,7 +3680,7 @@ mod self_test {
 
             // User-stop branch, fresh manager: a Disconnect disengages (opens host).
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             pm.stop_with(SessionEvent::UserStopped).await.unwrap();
@@ -3399,7 +3698,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
-                .start_cancellable(&cfg, false, CancellationToken::new())
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3418,7 +3717,7 @@ mod self_test {
             // lockdown cover holds the line), so we must NOT engage it.
             let (mut pm, cfg, st, _dir) = covered_gate_setup(true);
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3438,7 +3737,7 @@ mod self_test {
     fn a_pending_start_stop_enters_a_phase_before_the_transient_cover_is_released() {
         rt().block_on(async {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(pm.blocked_until_connected());
@@ -3465,7 +3764,7 @@ mod self_test {
     fn a_pending_start_cutover_stop_enters_the_same_phase_before_disarming() {
         rt().block_on(async {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             let mut seen = Vec::new();
@@ -3481,7 +3780,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(pm.blocked_until_connected());
@@ -3507,12 +3806,12 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             // Retry to the SAME server+resolvers while blocked: reuse the guard.
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3539,12 +3838,12 @@ mod self_test {
             // is proven separately by `different_hostname_retry_re_resolves_uncovered…`.
             let (mut pm, mut cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             cfg.server.server = "127.0.0.2".into();
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3574,8 +3873,8 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_routing(MockProxy::new(), routing, dir);
-            pm.start_cancellable(&test_config(), true, CancellationToken::new())
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
+            pm.start_cancellable(&test_config(), covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap();
             assert_eq!(pm.state(), ProxyState::Running);
@@ -3601,14 +3900,17 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
+            let mut pm = new_manager_with_lockdown(proxy, routing, false);
             let token = CancellationToken::new();
             let cancel_clone = token.clone();
             tokio::spawn(async move {
                 entered_rx.await.expect("MockProxy::start never entered");
                 cancel_clone.cancel();
             });
-            let err = pm.start_cancellable(&test_config(), true, token).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&test_config(), covered_now(&pm), token)
+                .await
+                .unwrap_err();
             assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
             assert_eq!(
                 st.cover_engage_calls.load(Ordering::SeqCst),
@@ -3638,7 +3940,7 @@ mod self_test {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             st.fail_cover.store(true, Ordering::SeqCst);
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3650,6 +3952,307 @@ mod self_test {
                 !pm.blocked_until_connected(),
                 "a failed engage retains no cover — host is not reported blocked"
             );
+        });
+    }
+
+    // The tray's Unblock against a start ------------------------------------------------------------------------------
+    //
+    // The cover lock orders them: an engage in flight holds it through its OS step, so an Unblock that arrives
+    // waits for the engage and then releases what it installed (order B); one that held it first has released and
+    // recorded before a start reads anything (order A, the standing path's `install_standing_cover` tests).
+
+    /// Order B: the Unblock begins while the engage is inside its OS step, and its release runs wholly after the
+    /// install. The start's cover is then the release's to have taken: a held cover a release took is not
+    /// reported blocked, and its guard's drop deletes nothing more.
+    #[skuld::test]
+    fn an_unblock_waits_for_an_engage_in_flight_and_then_releases_it() {
+        let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+        let routing = pm.routing_handle();
+        let (entered, go) = st.park_install(0);
+        let runtime = rt();
+
+        std::thread::scope(|scope| {
+            let start = scope.spawn(|| {
+                runtime
+                    .block_on(pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new()))
+                    .unwrap_err()
+            });
+            entered.recv().unwrap();
+            let unblock = scope.spawn(|| {
+                let lock = routing.lock_covers();
+                routing.release_all_covers(&lock).unwrap();
+            });
+            go.send(()).unwrap();
+            start.join().unwrap();
+            unblock.join().unwrap();
+        });
+
+        assert_eq!(
+            *st.events.lock().unwrap(),
+            ["engage begins", "engage ends", "release"],
+            "the release ran wholly after the install"
+        );
+        assert!(!pm.blocked_until_connected(), "the release took the held cover");
+        drop(pm);
+        assert_eq!(
+            st.cover_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "the cover is gone once: the stale guard deletes nothing more"
+        );
+    }
+
+    /// Order B for a repair's restore engage: the corrected engage fails, the old permit is restored, and the
+    /// Unblock begins during THAT install. The repair released the held cover itself; the restored one is the
+    /// Unblock's.
+    #[skuld::test]
+    fn an_unblock_waits_for_a_repairs_restore_install_and_then_releases_it() {
+        let runtime = rt();
+        let (mut pm, cfg, st, resolver, _dir) = runtime.block_on(repair_setup());
+        st.fail_cover_for_resolvers.lock().unwrap().insert(Some(resolver));
+        let routing = pm.routing_handle();
+        let (entered, go) = st.park_install(1);
+        st.events.lock().unwrap().clear();
+        let disengaged = st.cover_disengage_calls.load(Ordering::SeqCst);
+
+        std::thread::scope(|scope| {
+            let start = scope.spawn(|| {
+                runtime
+                    .block_on(pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new()))
+                    .unwrap_err()
+            });
+            entered.recv().unwrap();
+            let unblock = scope.spawn(|| {
+                let lock = routing.lock_covers();
+                routing.release_all_covers(&lock).unwrap();
+            });
+            go.send(()).unwrap();
+            start.join().unwrap();
+            unblock.join().unwrap();
+        });
+
+        assert_eq!(
+            *st.events.lock().unwrap(),
+            ["engage begins", "engage ends", "release"],
+            "the restore install finished before the release ran"
+        );
+        assert!(!pm.blocked_until_connected(), "the release took the restored cover");
+        drop(pm);
+        assert_eq!(
+            st.cover_disengage_calls.load(Ordering::SeqCst) - disengaged,
+            1,
+            "only the held cover the repair released: the restored one is the release's, and its guard is stale"
+        );
+    }
+
+    /// A release the start did not overlap has nothing to do with it: a start that begins after an Unblock ended
+    /// installs its cover.
+    #[skuld::test]
+    fn an_unblock_that_ended_before_the_start_began_does_not_cancel_it() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let routing = pm.routing_handle();
+            routing.release_all_covers(&routing.lock_covers()).unwrap();
+            pm.unblock_generation_handle().fetch_add(1, Ordering::SeqCst);
+
+            let err = pm
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(
+                !matches!(err, ProxyError::Cancelled),
+                "an Unblock that finished before this start began is not an input: the start is a fresh decision: {err:?}"
+            );
+            assert!(pm.blocked_until_connected(), "the covered start holds its cover");
+            assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// A querier that runs a hook once, at its first query, then answers as `inner` does: lets a test land an
+    /// Unblock in the window between a start's entry and its cover section (the resolve is the one `.await`).
+    struct HookQuerier {
+        inner: CountingQuerier,
+        hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DohQuerier for HookQuerier {
+        async fn query(&self, server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            if let Some(hook) = self.hook.lock().unwrap().take() {
+                hook();
+            }
+            self.inner.query(server, wire).await
+        }
+    }
+
+    /// An Unblock that begins after the start took its snapshot and ends before the start reaches its cover
+    /// section is not an input the section can ignore: intent `Off` reads the same before and after it, so the
+    /// section would engage a block-until-connected cover the user had just released. The start installs no
+    /// transient cover and proceeds uncovered, as an uncovered start does.
+    #[skuld::test]
+    fn a_covered_start_with_an_unblock_between_its_entry_and_the_lock_installs_nothing() {
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
+            let generation = pm.unblock_generation_handle();
+            let routing = pm.routing_handle();
+            pm.set_bootstrap_querier_for_test(Arc::new(HookQuerier {
+                inner: CountingQuerier {
+                    host: "proxy.example".into(),
+                    ip: closed.ip(),
+                    queries: AtomicU32::new(0),
+                },
+                hook: std::sync::Mutex::new(Some(Box::new(move || {
+                    // The Unblock, as `handle_unblock` runs it: release under the lock, then announce.
+                    routing.release_all_covers(&routing.lock_covers()).unwrap();
+                    generation.fetch_add(1, Ordering::SeqCst);
+                }))),
+            }));
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = None;
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
+
+            let result = pm
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
+                .await;
+
+            assert_eq!(
+                st.release_all_calls.load(Ordering::SeqCst),
+                1,
+                "guard: the Unblock ran during the resolve"
+            );
+            assert!(
+                !matches!(result, Err(ProxyError::Cancelled)),
+                "the start proceeds uncovered: {result:?}"
+            );
+            assert_eq!(
+                st.cover_engage_attempts.load(Ordering::SeqCst),
+                0,
+                "no transient cover is installed after an Unblock that ran since the start began"
+            );
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    /// A start begins when its handler is entered, before it waits for `state.proxy`. An Unblock that commits
+    /// during that wait is concurrent with the start, so the cover section must see it: the handler's snapshot,
+    /// not one the start takes later, decides.
+    #[skuld::test]
+    fn a_covered_start_whose_unblock_committed_while_it_waited_for_the_proxy_installs_nothing() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let generation = pm.unblock_generation_handle();
+            let routing = pm.routing_handle();
+
+            // The handler's snapshot, then the Unblock `handle_unblock` runs while the start waits.
+            let snapshot = generation.load(Ordering::SeqCst);
+            routing.release_all_covers(&routing.lock_covers()).unwrap();
+            generation.fetch_add(1, Ordering::SeqCst);
+
+            let result = pm
+                .start_cancellable(
+                    &cfg,
+                    Coverage::Covered {
+                        unblock_snapshot: snapshot,
+                    },
+                    CancellationToken::new(),
+                )
+                .await;
+
+            assert_eq!(
+                snapshot + 1,
+                generation.load(Ordering::SeqCst),
+                "guard: the Unblock committed"
+            );
+            assert!(
+                !matches!(result, Err(ProxyError::Cancelled)),
+                "the start proceeds uncovered: {result:?}"
+            );
+            assert_eq!(
+                st.cover_engage_attempts.load(Ordering::SeqCst),
+                0,
+                "no transient cover is installed after an Unblock that committed since the start began"
+            );
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    /// A start that installs no cover never takes the cover lock, so an Unblock holding it cannot make a plain
+    /// start wait: this start returns while another thread holds the lock (a start that waited would never
+    /// return).
+    #[skuld::test]
+    fn an_uncovered_start_proceeds_while_an_unblock_holds_the_cover_lock() {
+        let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+        let routing = pm.routing_handle();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::scope(|scope| {
+            let unblock = scope.spawn(move || {
+                let _lock = routing.lock_covers();
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            held_rx.recv().unwrap();
+
+            let err = rt()
+                .block_on(pm.start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new()))
+                .unwrap_err();
+
+            assert!(!matches!(err, ProxyError::Cancelled), "{err:?}");
+            assert_eq!(st.cover_engage_attempts.load(Ordering::SeqCst), 0);
+            release_tx.send(()).unwrap();
+            unblock.join().unwrap();
+        });
+    }
+
+    /// As [`an_uncovered_start_proceeds_while_an_unblock_holds_the_cover_lock`], for a reload.
+    #[skuld::test]
+    fn a_reload_proceeds_while_an_unblock_holds_the_cover_lock() {
+        let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+        let routing = pm.routing_handle();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::scope(|scope| {
+            let unblock = scope.spawn(move || {
+                let _lock = routing.lock_covers();
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            held_rx.recv().unwrap();
+
+            let err = rt().block_on(pm.reload(&cfg)).unwrap_err();
+
+            assert!(!matches!(err, ProxyError::Cancelled), "{err:?}");
+            release_tx.send(()).unwrap();
+            unblock.join().unwrap();
+        });
+    }
+
+    /// The status read consults the held cover's stamp: a held cover a release has taken is not reported blocked,
+    /// even before any start reaps it.
+    #[skuld::test]
+    fn a_held_cover_a_release_took_is_not_reported_blocked() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected());
+
+            let routing = pm.routing_handle();
+            routing.release_all_covers(&routing.lock_covers()).unwrap();
+
+            assert!(!pm.blocked_until_connected());
         });
     }
 
@@ -3669,14 +4272,14 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3772,7 +4375,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -3785,7 +4388,7 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec![failing_resolver, answering_resolver];
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -3818,7 +4421,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -3827,7 +4430,7 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec![answering_resolver];
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -3859,7 +4462,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -3868,7 +4471,9 @@ mod self_test {
             // Outcome (Ok/Err) is irrelevant here: `install_failclosed_cover` is
             // called BEFORE `start_inner` runs, so the assertions below hold
             // either way — no need to force a failure.
-            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+            let _ = pm
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
+                .await;
             assert_eq!(
                 st.cover_engage_calls.load(Ordering::SeqCst),
                 1,
@@ -3893,7 +4498,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             let mut cfg = test_config();
             cfg.server.server = "203.0.113.9".into();
             cfg.server.plugin = Some("ex-ray".into());
@@ -3903,7 +4508,7 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec![permitted_resolver];
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -3923,8 +4528,8 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
-            pm.set_bootstrap_querier_for_test(Arc::new(DeadQuerier));
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
+            pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
             let mut cfg = test_config();
             // Resolvable on every CI host without network.
             cfg.server.server = "localhost".into();
@@ -3936,7 +4541,7 @@ mod self_test {
             cfg.dns.allow_insecure_bootstrap = true;
             cfg.dns.servers = vec![permitted_resolver];
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -3961,7 +4566,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -3970,13 +4575,13 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec![answering_resolver];
 
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
             assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(answering_resolver));
 
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4008,7 +4613,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -4017,14 +4622,14 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec![answering_resolver];
 
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
             assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(answering_resolver));
 
             cfg.server.plugin = None; // attempt 2: plugin removed, nothing to permit now
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4077,7 +4682,7 @@ mod self_test {
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
                 let st = routing.state();
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
                 pm.set_bootstrap_querier_for_test(querier);
                 let mut cfg = test_config();
                 cfg.server.server = "proxy.example".into();
@@ -4086,7 +4691,7 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec![answering_resolver];
 
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
                 assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(answering_resolver));
@@ -4096,7 +4701,7 @@ mod self_test {
                 // Some(answering_resolver).
                 st.fail_cover_for_resolvers.lock().unwrap().insert(None);
                 cfg.server.plugin = None;
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
                 assert_eq!(
@@ -4155,7 +4760,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -4165,7 +4770,7 @@ mod self_test {
             cfg.dns.servers = vec![answering_resolver];
 
             let err1 = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(
@@ -4186,7 +4791,7 @@ mod self_test {
 
             cfg.server.plugin = Some("ex-ray".into()); // attempt 2: plugin added
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4230,7 +4835,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -4239,7 +4844,7 @@ mod self_test {
             cfg.dns.enabled = true; // forces attempt 1 to fail via the self-test gate
             cfg.dns.servers = vec![answering_resolver];
 
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -4254,7 +4859,7 @@ mod self_test {
 
             cfg.server.plugin = Some("ex-ray".into()); // attempt 2: plugin added
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
 
@@ -4272,7 +4877,58 @@ mod self_test {
                 None,
                 "the restored cover permits the OLD value, not the corrected one that failed to engage"
             );
+            // The whole repair is one section under the cover lock: the held cover is released inside it, the
+            // corrected engage fails, and the restore engages, without the section waiting on the lock it holds.
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "the held cover the repair released; the restored one is still held"
+            );
+            assert_eq!(
+                st.cover_engage_attempts.load(Ordering::SeqCst),
+                3,
+                "first engage, corrected, restore"
+            );
         });
+    }
+
+    /// Attempt 1 (no plugin, permit `None`) engages and fails at the self-test;
+    /// attempt 2 adds an ECH-capable plugin, so its corrected permit is
+    /// `Some(answering_resolver)`. Returns the manager parked between them.
+    async fn repair_setup() -> (
+        ProxyManager<MockProxy, MockRouting>,
+        ProxyConfig,
+        Arc<MockRoutingState>,
+        IpAddr,
+        tempfile::TempDir,
+    ) {
+        let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = probe_l.local_addr().unwrap();
+        drop(probe_l);
+        let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+        let querier = Arc::new(CountingQuerier {
+            host: "proxy.example".into(),
+            ip: closed.ip(),
+            queries: AtomicU32::new(0),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
+        pm.set_bootstrap_querier_for_test(querier);
+        let mut cfg = test_config();
+        cfg.server.server = "proxy.example".into();
+        cfg.server.server_port = closed.port();
+        cfg.server.plugin = None;
+        cfg.dns.enabled = true;
+        cfg.dns.servers = vec![answering_resolver];
+        pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+        cfg.server.plugin = Some("ex-ray".into());
+        cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+        (pm, cfg, st, answering_resolver, dir)
     }
 
     #[skuld::test]
@@ -4310,7 +4966,7 @@ mod self_test {
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
                 let st = routing.state();
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
                 pm.set_bootstrap_querier_for_test(querier);
                 let mut cfg = test_config();
                 cfg.server.server = "proxy.example".into();
@@ -4319,7 +4975,7 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec![answering_resolver];
 
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
                 st.fail_cover_for_resolvers
@@ -4328,7 +4984,7 @@ mod self_test {
                     .insert(Some(answering_resolver));
                 cfg.server.plugin = Some("ex-ray".into());
                 cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
 
@@ -4377,7 +5033,7 @@ mod self_test {
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
                 let st = routing.state();
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
                 pm.set_bootstrap_querier_for_test(querier);
                 let mut cfg = test_config();
                 cfg.server.server = "proxy.example".into();
@@ -4386,7 +5042,7 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec![answering_resolver];
 
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
                 st.fail_cover_for_resolvers
@@ -4395,7 +5051,7 @@ mod self_test {
                     .insert(Some(answering_resolver));
                 cfg.server.plugin = Some("ex-ray".into());
                 cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
 
@@ -4428,7 +5084,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -4438,7 +5094,7 @@ mod self_test {
             cfg.dns.servers = vec![answering_resolver];
 
             // Attempt 1: engages with permit None.
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -4451,7 +5107,7 @@ mod self_test {
                 .insert(Some(answering_resolver));
             cfg.server.plugin = Some("ex-ray".into());
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4464,7 +5120,7 @@ mod self_test {
             // Some(answering_resolver) the previous attempt already proved
             // unreachable. Must re-attempt the correction (fails again,
             // uncounted) and restore again (counted) — not skip.
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4481,7 +5137,7 @@ mod self_test {
             // Attempt 4: STILL the same desired value, but now able to engage
             // (the transient failure has passed) — the repair lands.
             st.fail_cover_for_resolvers.lock().unwrap().clear();
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4518,7 +5174,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -4528,7 +5184,7 @@ mod self_test {
             cfg.dns.servers = vec![answering_resolver];
 
             // Attempt 1: engages with permit None.
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -4541,7 +5197,7 @@ mod self_test {
             st.fail_cover_for_resolvers.lock().unwrap().insert(None);
             cfg.server.plugin = Some("ex-ray".into());
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
 
@@ -4572,7 +5228,7 @@ mod self_test {
             // Attempt 3: unchanged config. With the cover gone, this is an
             // ordinary fresh engage attempt (not a repair) — no wedge.
             st.fail_cover_for_resolvers.lock().unwrap().clear();
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4616,7 +5272,7 @@ mod self_test {
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
                 let st = routing.state();
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
                 pm.set_bootstrap_querier_for_test(querier);
                 let mut cfg = test_config();
                 cfg.server.server = "proxy.example".into();
@@ -4625,7 +5281,7 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec![answering_resolver];
 
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
                 st.fail_cover_for_resolvers
@@ -4635,7 +5291,7 @@ mod self_test {
                 st.fail_cover_for_resolvers.lock().unwrap().insert(None);
                 cfg.server.plugin = Some("ex-ray".into());
                 cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
 
@@ -4672,7 +5328,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -4683,7 +5339,7 @@ mod self_test {
             cfg.dns.servers = vec![resolver_a];
 
             // Attempt 1: pin = Answered(A), engages Some(A).
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -4694,7 +5350,7 @@ mod self_test {
             // back to A.
             st.fail_cover_for_resolvers.lock().unwrap().insert(Some(resolver_b));
             cfg.dns.servers = vec![resolver_b];
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4711,7 +5367,7 @@ mod self_test {
             // Attempt 3: `dns.servers` -> [C] — a different value from either
             // A or B. Must repair normally.
             cfg.dns.servers = vec![resolver_c];
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4768,7 +5424,7 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier);
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
@@ -4779,7 +5435,7 @@ mod self_test {
             cfg.dns.servers = vec![resolver_a];
 
             // Attempt 1: fresh resolve, A answers -> pin = Answered(A).
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_a));
@@ -4791,7 +5447,7 @@ mod self_test {
             // bug's site: the new BlockedStart must still remember A was
             // ONCE verified-answering, not just that B currently isn't.
             cfg.dns.servers = vec![resolver_b];
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_b));
@@ -4807,7 +5463,7 @@ mod self_test {
             // reappear, because `revalidate` is being applied to the
             // ORIGINAL Answered(A), not to attempt 2's ResolverDeselected.
             cfg.dns.servers = vec![resolver_a];
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_a));
@@ -4846,7 +5502,7 @@ mod self_test {
 
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
                 let mut cfg = test_config();
                 // Literal-IP server: Hole's own candidate is unpinned
                 // (NoQueryNeeded), so it never outranks an IP-literal operator
@@ -4857,7 +5513,7 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
                 let _ = pm
-                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
 
@@ -4897,7 +5553,7 @@ mod self_test {
 
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
                 let mut cfg = test_config();
                 cfg.server.server = "203.0.113.9".into();
                 cfg.server.plugin = Some("ex-ray".into());
@@ -4905,7 +5561,7 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
                 let _ = pm
-                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
 
@@ -4948,7 +5604,7 @@ mod self_test {
 
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
                 let mut cfg = test_config();
                 cfg.server.server = "203.0.113.9".into();
                 cfg.server.plugin = Some("ex-ray".into());
@@ -4956,7 +5612,7 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
                 let _ = pm
-                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
 
@@ -5001,7 +5657,7 @@ mod self_test {
                 });
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
                 pm.set_bootstrap_querier_for_test(querier);
                 let mut cfg = test_config();
                 cfg.server.server = "proxy.example".into();
@@ -5012,7 +5668,7 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec![answering_resolver];
                 let _ = pm
-                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
 
@@ -5059,7 +5715,7 @@ mod self_test {
                 });
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
                 pm.set_bootstrap_querier_for_test(querier);
                 let mut cfg = test_config();
                 cfg.server.server = "proxy.example".into();
@@ -5068,12 +5724,12 @@ mod self_test {
                 cfg.dns.enabled = true;
                 cfg.dns.servers = vec![answering_resolver];
 
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
                 cfg.server.plugin = Some("ex-ray".into());
                 cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                     .await
                     .unwrap_err();
 
@@ -5100,21 +5756,21 @@ mod self_test {
             });
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier.clone());
             let mut cfg = test_config();
             cfg.server.server = "proxy.example".into();
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
 
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             let after_first = querier.queries.load(Ordering::SeqCst);
             assert!(after_first >= 1, "the first covered start resolves via DoH");
             assert!(pm.blocked_until_connected(), "the failed covered start holds the cover");
 
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -5144,7 +5800,7 @@ mod self_test {
         });
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
         pm.set_bootstrap_querier_for_test(querier);
         let mut cfg = test_config();
         cfg.server.server = "proxy.example".into();
@@ -5162,7 +5818,7 @@ mod self_test {
         // entry is the one that answers.
         cfg.dns.servers = vec!["2606:4700:4700::1111".parse().unwrap(), "1.0.0.1".parse().unwrap()];
 
-        pm.start_cancellable(&cfg, true, CancellationToken::new())
+        pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
             .await
             .unwrap_err();
         assert!(pm.blocked_until_connected(), "the failed covered start holds the cover");
@@ -5184,7 +5840,7 @@ mod self_test {
     fn a_covered_retry_keeps_the_pin_when_the_resolvers_are_unchanged() {
         rt().block_on(async {
             let (mut pm, cfg, _dir, _st) = covered_start_holding_the_cover(tempfile::tempdir().unwrap()).await;
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(pm.last_ech_doh(), Some("https://[2606:4700:4700::1111]/dns-query"));
@@ -5198,10 +5854,12 @@ mod self_test {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             let cfg = test_config();
             assert!(cfg.server.plugin.is_none(), "the default test config has no plugin");
-            let _ = pm.start_cancellable(&cfg, false, CancellationToken::new()).await;
+            let _ = pm
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
+                .await;
             assert_eq!(pm.last_ech_doh(), None);
         });
     }
@@ -5213,24 +5871,16 @@ mod self_test {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             let mut cfg = test_config();
             cfg.server.server = "203.0.113.9".into();
             cfg.server.plugin = Some("hole-694-absent-plugin".into());
             cfg.dns.servers = vec!["2606:4700:4700::1111".parse().unwrap(), "1.0.0.1".parse().unwrap()];
-            let _ = pm.start_cancellable(&cfg, false, CancellationToken::new()).await;
+            let _ = pm
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
+                .await;
             assert_eq!(pm.last_ech_doh(), Some("https://1.0.0.1/dns-query"));
         });
-    }
-
-    /// A querier that answers nothing, so every configured resolver fails.
-    struct DeadQuerier;
-
-    #[async_trait::async_trait]
-    impl DohQuerier for DeadQuerier {
-        async fn query(&self, _server: IpAddr, _wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            Err(UpstreamCause::Unreachable)
-        }
     }
 
     // Every resolver failed and the OS resolver supplied the address, so no
@@ -5241,15 +5891,17 @@ mod self_test {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
-            pm.set_bootstrap_querier_for_test(Arc::new(DeadQuerier));
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
+            pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
             let mut cfg = test_config();
             // Resolvable on every CI host without network.
             cfg.server.server = "localhost".into();
             cfg.server.plugin = Some("hole-694-absent-plugin".into());
             cfg.dns.allow_insecure_bootstrap = true;
             cfg.dns.servers = vec!["2606:4700:4700::1111".parse().unwrap(), "1.0.0.1".parse().unwrap()];
-            let _ = pm.start_cancellable(&cfg, false, CancellationToken::new()).await;
+            let _ = pm
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
+                .await;
             assert_eq!(pm.last_ech_doh(), Some("https://1.0.0.1/dns-query"));
         });
     }
@@ -5274,7 +5926,7 @@ mod self_test {
                 "sanity: the initial engage pinned the answering IPv6 resolver"
             );
             cfg.dns.servers = vec!["8.8.8.8".parse().unwrap()];
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -5346,14 +5998,14 @@ mod self_test {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(querier.clone());
             let mut cfg = test_config();
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
 
             cfg.server.server = "proxy-a.example".into();
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
@@ -5361,7 +6013,7 @@ mod self_test {
             let queries_after_a = querier.queries.load(Ordering::SeqCst);
 
             cfg.server.server = "proxy-b.example".into();
-            pm.start_cancellable(&cfg, true, CancellationToken::new())
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(
@@ -5401,7 +6053,7 @@ mod self_test {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
             tokio::time::pause();
             let err = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             // Same platform split as `lockdown_on_skips_probe_keeps_original_reason`:
@@ -5438,7 +6090,7 @@ mod self_test {
 
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
                 host: "probe-leak.example".into(),
                 ip: closed.ip(),
@@ -5453,7 +6105,7 @@ mod self_test {
             cfg.dns.allow_insecure_bootstrap = false;
 
             let err = pm
-                .start_cancellable(&cfg, false, CancellationToken::new())
+                .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
                 .await
                 .unwrap_err();
             match err {
@@ -5499,7 +6151,7 @@ mod self_test {
             // Lockdown-on: Absent -> Live -> Absent.
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
 
             assert_eq!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
@@ -5515,7 +6167,7 @@ mod self_test {
             // Intent off: no lockdown engage, so the probe never leaves Absent.
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             pm.start(&test_config()).await.unwrap();
             assert_eq!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
@@ -5531,7 +6183,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
 
@@ -5624,7 +6276,7 @@ mod self_test {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
             pm.start(&test_config()).await.unwrap();
 
             assert!(pm.posture.take_pending().is_none());
@@ -5647,19 +6299,23 @@ mod self_test {
     /// a hand-rolled fixture whose cost exceeds what the assert is worth.
     #[skuld::test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "hold_pending: posture must be Idle")]
+    #[should_panic(expected = "hold_pending: posture must hold no session and no standing cover")]
     fn posture_hold_pending_rejects_a_running_session() {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
-            let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             let cfg = test_config();
             pm.start(&cfg).await.unwrap();
             assert_eq!(pm.state(), ProxyState::Running, "setup must leave a live session");
 
             let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
-            let second_routing = MockRouting::new(dir.path().to_path_buf());
-            let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
+            // Another directory's routing, so installing a second cover does not outdate the one `pm` holds.
+            let other_dir = tempfile::tempdir().unwrap();
+            let second_routing = MockRouting::new(other_dir.path().to_path_buf());
+            let cover = second_routing
+                .install_failclosed_cover(&second_routing.lock_covers(), server_ip, None)
+                .unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
                 host: cfg.server.server.expose().to_string(),
@@ -5674,19 +6330,23 @@ mod self_test {
     /// `PendingStart`. See the comment above.
     #[skuld::test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "hold_pending: posture must be Idle")]
+    #[should_panic(expected = "hold_pending: posture must hold no session and no standing cover")]
     fn posture_hold_pending_rejects_a_posture_that_already_holds_one() {
         rt().block_on(async {
-            let (mut pm, cfg, _st, dir) = covered_gate_setup(false);
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
             let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
+                .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
                 .await
                 .unwrap_err();
             assert!(pm.blocked_until_connected(), "setup must leave a pending start held");
 
             let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
-            let second_routing = MockRouting::new(dir.path().to_path_buf());
-            let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
+            // Another directory's routing, so installing a second cover does not outdate the one `pm` holds.
+            let other_dir = tempfile::tempdir().unwrap();
+            let second_routing = MockRouting::new(other_dir.path().to_path_buf());
+            let cover = second_routing
+                .install_failclosed_cover(&second_routing.lock_covers(), server_ip, None)
+                .unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
                 host: cfg.server.server.expose().to_string(),
@@ -5709,7 +6369,7 @@ fn lockdown_enabled_reports_armed_when_the_intent_file_is_unreadable() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), b"{corrupt").unwrap();
     let routing = MockRouting::new(dir.path().to_path_buf());
-    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    let pm = ProxyManager::new(MockProxy::new(), routing);
 
     assert!(pm.lockdown_enabled(), "a corrupt intent must read as ARMED");
     assert!(
@@ -5731,14 +6391,14 @@ fn a_corrupt_intent_file_still_engages_the_transient_cover() {
         std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), b"{corrupt").unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         let mut cfg = test_config();
         cfg.server.server = closed.ip().to_string().into();
         cfg.server.server_port = closed.port();
         cfg.dns.enabled = true;
         cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
-        pm.start_cancellable(&cfg, true, CancellationToken::new())
+        pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
             .await
             .unwrap_err();
 
@@ -5767,7 +6427,7 @@ fn an_adopted_cover_makes_the_connect_path_expect_a_standing_cover() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
 
         assert!(
             !pm.standing_cover_expected(),
@@ -5793,15 +6453,21 @@ fn a_user_stop_that_dropped_a_standing_cover_clears_only_the_live_half() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
 
         pm.stop_with(SessionEvent::UserStopped).await.unwrap();
         assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
+            pm.cover_presence(),
+            CoverPresence::Absent,
             "the user stop opened the host"
+        );
+        assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1, "the sweep released");
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "not a guard's drop"
         );
         assert!(
             !pm.standing_cover_adopted(),
@@ -5824,8 +6490,7 @@ fn a_cutover_stop_keeps_the_claim() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
         // `cover_step`'s `Off` arm ignores intent outright, so reaching the
@@ -5843,9 +6508,9 @@ fn a_cutover_stop_keeps_the_claim() {
 
         pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
         assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            0,
-            "a cutover disarms rather than disengages"
+            pm.cover_presence(),
+            CoverPresence::Live,
+            "a cutover disarms rather than releases"
         );
         assert!(
             pm.lockdown_enabled(),
@@ -5865,7 +6530,7 @@ fn a_cutover_leaves_the_persisted_target_connected() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.start(&test_config()).await.unwrap();
         let connected = Target::Connected {
             config: Box::new(test_config()),
@@ -5892,7 +6557,7 @@ fn an_adopted_kill_switch_survives_a_stop_and_start() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
 
         pm.start(&test_config()).await.unwrap();
@@ -5922,7 +6587,7 @@ fn a_config_edit_does_not_disarm_an_adopted_kill_switch() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
 
@@ -5953,7 +6618,7 @@ fn an_unexpected_session_death_retires_the_claim_too() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(proxy, routing);
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
         target_records::save(
@@ -5965,6 +6630,7 @@ fn an_unexpected_session_death_retires_the_claim_too() {
         )
         .unwrap();
 
+        st.events.lock().unwrap().clear();
         proxy_state.crashed.store(true, Ordering::SeqCst);
         let event = pm.check_health().expect("crashed task must report GaveUp");
         pm.stop_with(event).await.unwrap();
@@ -5975,8 +6641,8 @@ fn an_unexpected_session_death_retires_the_claim_too() {
             "an unexpected death must move the target off"
         );
         assert_eq!(
-            st.teardown_order.lock().unwrap().clone(),
-            vec!["routes", "lockdown"],
+            *st.events.lock().unwrap(),
+            ["routes", "release"],
             "the standing cover must be released after the session it covered, not before"
         );
     });
@@ -5995,7 +6661,7 @@ fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
 
@@ -6030,7 +6696,7 @@ fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(proxy, routing);
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
 
@@ -6064,7 +6730,7 @@ fn turning_lockdown_off_mid_session_clears_a_stale_adopted_claim() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
 
@@ -6091,10 +6757,10 @@ fn lockdown_reads_honor_an_out_of_process_off_over_a_stale_claim() {
     // any ProxyManager setter.
     let dir = tempfile::tempdir().unwrap();
     let routing = MockRouting::new(dir.path().to_path_buf());
-    let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    let mut pm = ProxyManager::new(MockProxy::new(), routing);
     pm.set_standing_cover_adopted(true);
 
-    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
 
     assert!(
         !pm.lockdown_enabled(),
@@ -6115,10 +6781,10 @@ fn an_out_of_process_unlock_prevents_the_next_start_from_re_engaging_the_cover()
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
 
-        lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
 
         pm.start(&test_config()).await.unwrap();
         assert_eq!(
@@ -6138,14 +6804,38 @@ fn promote_adopted_claim_does_not_clobber_a_recorded_off() {
     // `lockdown_state::set_enabled` call `cutover::unlock_with` makes on the
     // running bridge's state_dir, bypassing every in-process setter.
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
 
-    promote_adopted_claim(Some(dir.path()), None);
+    promote_adopted_claim(&CoverLock::acquire(dir.path()), None);
 
     assert_eq!(
         lockdown_state::load_intent(dir.path()),
         lockdown_state::Intent::Off,
         "a cover this start just installed must not overwrite an explicitly recorded off"
+    );
+}
+
+#[skuld::test]
+fn promote_adopted_claim_arms_an_unset_intent() {
+    let unset = tempfile::tempdir().unwrap();
+    promote_adopted_claim(&CoverLock::acquire(unset.path()), None);
+    assert_eq!(lockdown_state::load_intent(unset.path()), lockdown_state::Intent::On);
+}
+
+#[skuld::test]
+fn promote_adopted_claim_leaves_an_unreadable_intent_as_it_is() {
+    // A newer schema may hold the user's `Off`; the promotion must not turn it into `On`.
+    let unreadable = tempfile::tempdir().unwrap();
+    let path = unreadable.path().join(lockdown_state::STATE_FILE_NAME);
+    let bytes: &[u8] = br#"{"version":2,"enabled":false}"#;
+    std::fs::write(&path, bytes).unwrap();
+
+    promote_adopted_claim(&CoverLock::acquire(unreadable.path()), None);
+
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        lockdown_state::load_intent(unreadable.path()),
+        lockdown_state::Intent::Unreadable
     );
 }
 
@@ -6201,8 +6891,7 @@ fn the_installed_routed_families_reach_dns_apply() {
         let dir = tempfile::tempdir().unwrap();
         let routing =
             MockRouting::failing_routes(dir.path().to_path_buf(), [RouteId::SplitV6Low, RouteId::SplitV6High]);
-        let (pm, dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
-        let mut pm = pm.with_state_dir(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
 
         let mut config = test_config();
         config.local_port = upstream.port();
@@ -6222,39 +6911,6 @@ fn the_installed_routed_families_reach_dns_apply() {
     });
 }
 
-// No-state-dir seed ===================================================================================================
-
-/// `persist_session_event` cannot consult the target file when the manager has
-/// no state dir, so it seeds `target_after` with a stand-in. Seeding `Off`
-/// makes a transient blip indistinguishable from a user disconnect —
-/// `cover_step`'s `Off` arm ignores intent and releases a live cover — which
-/// would tear the kill switch down mid-reconnect. `Unreadable` is the honest
-/// stand-in: it authorises neither connecting nor disarming, so the cover
-/// holds. The two explicit-end events are unaffected either way, since
-/// `target_after` collapses them to `Off` from any prior value.
-#[skuld::test]
-fn a_blip_with_no_state_dir_does_not_release_a_standing_cover() {
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        *st.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Live;
-        // `new_manager_with_routing` deliberately does NOT call
-        // `with_state_dir`, so `state_dir` is `None` — the branch under test.
-        let (mut pm, _dir) = new_manager_with_routing(MockProxy::new(), routing, dir);
-        pm.start(&test_config()).await.unwrap();
-
-        pm.stop_with(SessionEvent::Blipped).await.unwrap();
-
-        assert_eq!(
-            st.release_all_calls.load(Ordering::SeqCst),
-            0,
-            "a blip with no state dir released the cover: the seed collapsed \
-             'we cannot read the target' into 'the user asked to disconnect'"
-        );
-    });
-}
-
 // Explicit disarm =====================================================================================================
 
 /// `cover_step` holds on every unknown, which is right for a steady-state
@@ -6268,7 +6924,7 @@ fn a_user_disconnect_with_an_unreachable_probe_releases_the_cover() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, true);
         pm.start(&test_config()).await.unwrap();
         *st.cover_presence.lock().unwrap() = CoverPresence::Unreachable;
 

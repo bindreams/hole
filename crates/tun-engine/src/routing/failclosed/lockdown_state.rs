@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use super::CoverLock;
 use serde::{Deserialize, Serialize};
 use util::versioned_file::{
     Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, VersionedFile, VersionedState,
@@ -39,9 +40,9 @@ impl VersionedState for LockdownState {
 util::assert_contiguous!(LockdownState);
 
 /// The intent file. Every read and write of it goes through this type.
-pub type LockdownFile = VersionedFile<LockdownState>;
+type LockdownFile = VersionedFile<LockdownState>;
 
-pub fn file(state_dir: &Path) -> LockdownFile {
+fn file(state_dir: &Path) -> LockdownFile {
     VersionedFile::new(state_dir)
 }
 
@@ -58,7 +59,8 @@ pub enum Intent {
     /// No file at all (`ErrorKind::NotFound`): a fresh install, a wiped or
     /// recreated state dir, or a second bridge's own `--state-dir`.
     Unset,
-    /// A file exists but the read, the JSON parse, or the version check failed.
+    /// A file exists but the read, the JSON parse, or the version check failed. It may hold the user's `Off`
+    /// (a newer or obsolete schema, a garbled write), so nothing but the user's own setter writes over it.
     Unreadable,
 }
 
@@ -85,36 +87,45 @@ impl Intent {
     pub fn installs_standing_cover(self) -> bool {
         matches!(self, Intent::On)
     }
-}
 
-/// The one reading of the intent file. `Ok` is a file that parsed at the current schema; `Err` carries the [`Intent`]
-/// its failure classifies to, so [`load`] and [`load_intent`] share a single reader (and a single set of `warn!`
-/// lines) instead of drifting apart.
-fn read_state(state_dir: &Path) -> Result<LockdownState, Intent> {
-    match file(state_dir).observe().loaded {
-        Loaded::Current { value, .. } => Ok(value),
-        Loaded::Absent => Err(Intent::Unset),
-        Loaded::Obsolete { .. } => Err(Intent::Unreadable),
-        Loaded::Newer { .. } => Err(Intent::Unreadable),
-        Loaded::Corrupt { .. } => Err(Intent::Unreadable),
-        Loaded::Unreadable { .. } => Err(Intent::Unreadable),
+    /// "May a start that just honoured an adopted cover record the kill switch as armed?" — `Unset` only.
+    /// `On` needs no write, `Off` is the user's explicit choice, and an adopted claim is never proof it still stands.
+    /// `Unreadable` already reads armed, and a write over it could turn a user's `Off` into `On`.
+    pub fn admits_adoption_promotion(self) -> bool {
+        match self {
+            Intent::Unset => true,
+            Intent::Unreadable | Intent::On | Intent::Off => false,
+        }
+    }
+
+    /// The one classification of a read of the intent file: a recorded value, nothing there, or a failure that is
+    /// never collapsed into either.
+    pub fn of(loaded: &Loaded<LockdownState>) -> Intent {
+        match loaded {
+            Loaded::Current { value, .. } if value.enabled => Intent::On,
+            Loaded::Current { .. } => Intent::Off,
+            Loaded::Absent => Intent::Unset,
+            Loaded::Obsolete { .. } => Intent::Unreadable,
+            Loaded::Newer { .. } => Intent::Unreadable,
+            Loaded::Corrupt { .. } => Intent::Unreadable,
+            Loaded::Unreadable { .. } => Intent::Unreadable,
+        }
     }
 }
 
 /// Load the intent, or `None` on absent/corrupt/newer/obsolete (the read logs at `warn`). Use [`load_intent`] where
 /// the *reason* for a `None` matters.
 pub fn load(state_dir: &Path) -> Option<LockdownState> {
-    read_state(state_dir).ok()
+    match file(state_dir).observe().loaded {
+        Loaded::Current { value, .. } => Some(value),
+        _ => None,
+    }
 }
 
 /// Classify the intent file. Never collapses a failure into a recorded value —
 /// see [`Intent`] and its two folds.
 pub fn load_intent(state_dir: &Path) -> Intent {
-    match read_state(state_dir) {
-        Ok(s) if s.enabled => Intent::On,
-        Ok(_) => Intent::Off,
-        Err(i) => i,
-    }
+    Intent::of(&file(state_dir).observe().loaded)
 }
 
 /// Convenience: [`Intent::reads_armed`] over [`load_intent`]. An absent file is
@@ -124,14 +135,39 @@ pub fn load_enabled(state_dir: &Path) -> bool {
     load_intent(state_dir).reads_armed()
 }
 
-/// Last-writer-wins absolute set, atomic, creating `state_dir`. A file this release cannot read is backed up beside
-/// it first.
-pub fn set_enabled(state_dir: &Path, enabled: bool, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
-    file(state_dir)
+/// Last-writer-wins absolute set, atomic, creating `lock`'s state dir. A file this release cannot read is backed up
+/// beside it first. Takes the cover lock because every cover decision reads this record: a write outside it could
+/// land between a decision's read and its act.
+pub fn set_enabled(lock: &CoverLock, enabled: bool, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
+    file(lock.state_dir())
         .update(&DefaultPlacement { owner }, |_| {
             (Change::Store(LockdownState { enabled }), ())
         })
         .map(|_| ())
+}
+
+/// How one [`promote_unrecorded`] went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromoteOutcome {
+    /// Nothing was recorded: the kill switch is now recorded as armed.
+    Wrote,
+    /// The record was left as it is.
+    Declined,
+}
+
+/// Record the kill switch as armed iff nothing is recorded ([`Intent::admits_adoption_promotion`]); the read and the
+/// write are one update, so a concurrent [`set_enabled`] is never overwritten.
+pub fn promote_unrecorded(lock: &CoverLock, owner: Option<(u32, u32)>) -> Result<PromoteOutcome, StoreError> {
+    file(lock.state_dir())
+        .update(&DefaultPlacement { owner }, |now| {
+            let intent = Intent::of(&now.loaded);
+            if intent.admits_adoption_promotion() {
+                (Change::Store(LockdownState { enabled: true }), PromoteOutcome::Wrote)
+            } else {
+                (Change::Keep, PromoteOutcome::Declined)
+            }
+        })
+        .map(|(outcome, _)| outcome)
 }
 
 #[cfg(test)]

@@ -61,6 +61,13 @@ pub trait Placement {
         None
     }
 
+    /// The owner the staged file is given when it will replace the file at `name` (unix; Windows has no such pair).
+    /// By default [`owner`](Self::owner); a placement that keeps a file's owner answers the replaced file's, `None`
+    /// when `name` is absent. An error here fails the write before anything is staged.
+    fn file_owner(&self, _dir: &Dir, _name: &OsStr) -> io::Result<Option<(u32, u32)>> {
+        Ok(self.owner())
+    }
+
     /// Before anything is written: the directory exists (the type created it)
     /// and is as it should be. By default it is handed to [`owner`](Self::owner).
     fn prepare_dir(&self, dir: &Dir) -> io::Result<()> {
@@ -144,6 +151,24 @@ pub struct DefaultPlacement {
 impl Placement for DefaultPlacement {
     fn owner(&self) -> Option<(u32, u32)> {
         self.owner
+    }
+}
+
+/// [`Placement`] that leaves a replaced file with its owner, and never chowns the directory. For a file a user's
+/// account may own, where the writer rewrites it without changing whose it is. On unix the staged file takes the owner
+/// of the file it replaces (a new file: the writer's), and a file that is not a regular file with one name (a symlink,
+/// a hard link a user planted) fails the write, since it would otherwise choose the owner. Windows has no uid/gid
+/// pair: the staged file gets the writer's default owner.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeepOwner;
+
+impl Placement for KeepOwner {
+    fn file_owner(&self, dir: &Dir, name: &OsStr) -> io::Result<Option<(u32, u32)>> {
+        dir.owner_of(name)
+    }
+
+    fn prepare_dir(&self, _dir: &Dir) -> io::Result<()> {
+        Ok(())
     }
 }
 

@@ -214,7 +214,8 @@ before editing; the sections linked below are the authoritative source.
   escape (`Routing::release_all_covers`) is unconditional, has a
   structurally-guarded set of sanctioned callers, and clears the in-process
   adopted-cover claim only on a confirmed release, never on a guard's silent
-  `Drop`. →
+  `Drop`. Mutators take `&CoverLock` (one lock per state dir), readers take a
+  path ([the cover lock](CONTRIBUTING.md#the-cover-lock)). →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
 - **Server-address redaction.** The configured address — hostname, resolved IP,
   every textual form — is replaced by a `<server:XXXXXXXX>` token before it
@@ -271,7 +272,7 @@ before editing; the sections linked below are the authoritative source.
 - **Per-variant policy lives on the type, never at a call site** — a decision
   keyed to an enum variant belongs in ONE exhaustive match on that type
   (`SessionEvent::preserves_death_reason`, `CoverPresence::is_present`,
-  `StaleKeyPolicy::refuses_a_stale_key`), and
+  `StaleKeyPolicy::refuses_a_stale_key`, `Coverage::plan`), and
   two variants are never grouped because they happen to share a consequence.
   Grouping by consequence is what let `ProcessExiting` inherit an answer chosen
   for a cutover; re-deriving the rule at each site is what let `== Live` drop
@@ -280,7 +281,8 @@ before editing; the sections linked below are the authoritative source.
   violated at a call site far away — so it is test-enforced
   (`session_event_policy_lives_on_the_type_not_at_call_sites`,
   `cover_presence_is_never_compared_against_a_variant`,
-  `stale_key_policy_lives_on_the_type_not_at_call_sites`). Prefer removing the
+  `stale_key_policy_lives_on_the_type_not_at_call_sites`,
+  `coverage_policy_lives_on_the_type_not_at_call_sites`). Prefer removing the
   hazard outright over guarding it: `CoverGuard::disarm` had a "call only
   before process exit" precondition that no test could enforce, and closing the
   handle it leaked deleted the rule instead of policing it.

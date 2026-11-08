@@ -255,7 +255,7 @@ pub(crate) enum FatalPhase {
     /// macOS pf cover engage. Runs through [`run_capturing`], not a route-command
     /// runner (Windows engages via FWPM FFI — no subprocess phase); gated so it is
     /// not dead code on a non-test Windows lib build under `-D warnings`.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     CoverEngage,
 }
 
@@ -274,7 +274,7 @@ pub(crate) enum BestEffortPhase {
     RecoverSplit,
     RecoverBypass,
     /// macOS-only, for the same reason as [`FatalPhase::CoverEngage`].
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     RecoverCover,
 }
 
@@ -285,7 +285,7 @@ impl Phase for FatalPhase {
     fn name(self) -> &'static str {
         match self {
             Self::Setup => "setup",
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", test))]
             Self::CoverEngage => "cover-engage",
         }
     }
@@ -300,7 +300,7 @@ impl Phase for BestEffortPhase {
             Self::Teardown => "teardown",
             Self::RecoverSplit => "recover-split",
             Self::RecoverBypass => "recover-bypass",
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", test))]
             Self::RecoverCover => "recover-cover",
         }
     }
@@ -1091,8 +1091,7 @@ pub(crate) fn run_capturing<P: Phase>(
 /// "a standing cover is live this run" — the claim that keeps the escape
 /// visible when the intent file cannot be read or repaired.
 ///
-/// `owner` is the uid/gid every other bridge write into `state_dir` threads
-/// (`SystemRouting::new`, `ProxyManager::set_lockdown_intent`). Recovery's
+/// `owner` is [`Routing::owner`], the uid/gid every bridge write into `state_dir` carries. Recovery's
 /// intent repair may CREATE both the directory and `bridge-lockdown.json` — a
 /// wiped state dir is exactly the condition that produces the `Unset` intent —
 /// so without it a user-scoped macOS bridge drops root-owned files into
@@ -1109,16 +1108,15 @@ pub(crate) fn run_capturing<P: Phase>(
 /// [`recover_routes_with`]'s doc for why the file alone cannot be the only
 /// source.
 pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>, tun_name: Option<&str>) -> Recovery {
-    let intent = failclosed::lockdown_state::load_intent(state_dir);
     recover_routes_with(
         state_dir,
         owner,
         tun_name,
         exec_one::<BestEffortPhase>,
         failclosed::recover_cover,
-        intent,
+        || failclosed::lockdown_state::load_intent(state_dir),
         || failclosed::lockdown_cover_presence(state_dir),
-        |decision, tun_name| failclosed::recover_lockdown(decision, state_dir, tun_name),
+        failclosed::recover_lockdown,
     )
 }
 
@@ -1157,9 +1155,9 @@ pub enum CoverRecovery {
     Adopt,
     /// [`Intent::Off`](failclosed::lockdown_state::Intent::Off) with an
     /// actionable presence: fully disengage the leftover cover (Windows: delete
-    /// all lockdown GUIDs; macOS: restore the pre-lockdown snapshot + drop the
-    /// pf token). The only action that removes protection, and the only one
-    /// that mutates the OS at all.
+    /// all lockdown GUIDs; macOS: restore the pre-lockdown snapshot, else `/etc/pf.conf`, then clear the record and,
+    /// only if that clear took it, drop the pf token; a record that cannot be read stays). The only action that
+    /// removes protection, and the only one that mutates the OS at all.
     Sweep,
     /// Nothing to do.
     Noop,
@@ -1232,8 +1230,9 @@ impl CoverPresence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recovery {
     pub action: CoverRecovery,
-    /// Repair the intent file to `enabled: true` before acting. Grounded in a
-    /// positive OS measurement only — see rule 4.
+    /// Repair an unset intent file to `enabled: true` before acting. Grounded
+    /// in a positive OS measurement only, and never over an unreadable record
+    /// — see rule 4.
     pub record_intent_on: bool,
     /// Echoes the `presence` this decision was made from. `action == Adopt`
     /// alone is not evidence the OS confirmed a live cover — it also covers
@@ -1252,7 +1251,7 @@ pub struct Recovery {
 /// 1. [`CoverPresence::Absent`] and [`CoverPresence::Unreachable`] always yield `Noop` with `record_intent_on = false`.
 /// 2. `Sweep` requires [`Intent::Off`](failclosed::lockdown_state::Intent::Off) and an actionable presence (`Live | Recorded | Indeterminate`). It is the only action that removes protection, and the only one that mutates the OS at all.
 /// 3. `Adopt` requires an actionable presence and an intent of `On`, `Unreadable`, or `Unset` — with `Unset` additionally requiring positive evidence (`Live | Recorded`), because an unknown intent plus an unusable OS answer is no evidence in any direction.
-/// 4. `record_intent_on` requires `Presence::Live` and an intent of `Unset` or `Unreadable`. The write is grounded in a positive OS measurement, never inferred.
+/// 4. `record_intent_on` requires `Presence::Live` and an intent of `Unset`. The write is grounded in a positive OS measurement, never inferred, and never over an `Unreadable` record: it already reads armed, and it may hold the user's `Off`, which a write would turn into `On`.
 ///
 /// The match is exhaustive on both axes with no wildcard, so a new variant of
 /// either is a compile error rather than a silently inherited answer.
@@ -1281,7 +1280,7 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
         (I::Unset, P::Absent) => (Noop, false),
         (I::Unset, P::Unreachable) => (Noop, false),
 
-        (I::Unreadable, P::Live) => (Adopt, true),
+        (I::Unreadable, P::Live) => (Adopt, false),
         (I::Unreadable, P::Recorded) => (Adopt, false),
         (I::Unreadable, P::Indeterminate) => (Adopt, false),
         (I::Unreadable, P::Absent) => (Noop, false),
@@ -1299,8 +1298,12 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
 /// reconciliation inputs (intent + presence probe + recover action) so unit
 /// tests can assert behavior without shelling out to `netsh`/`route` or
 /// touching the host firewall. Production passes [`exec_one::<BestEffortPhase>`],
-/// [`failclosed::recover_cover`], the classified lockdown intent,
+/// [`failclosed::recover_cover`], a read of the classified lockdown intent,
 /// [`failclosed::lockdown_cover_presence`], and [`failclosed::recover_lockdown`].
+///
+/// Route recovery runs unlocked: it depends on neither the intent nor the cover. Everything after it, the intent
+/// read, the presence probe, the decision, the repair and both cover steps, is one section under the cover lock, so
+/// the decision is made from a fresh read and no Unblock or engage can land between it and the act.
 /// `owner` is passed straight through to the intent repair — see
 /// [`recover_routes`].
 ///
@@ -1317,21 +1320,22 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
 /// caller has no compile-time fallback to offer (macOS) — the hint then
 /// degrades to whatever the recovered file itself names, or nothing at all.
 #[allow(clippy::too_many_arguments)] // private test seam — bundling into a struct adds more noise than the warning.
-pub(crate) fn recover_routes_with<R, S, P, L>(
+pub(crate) fn recover_routes_with<R, S, I, P, L>(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
     tun_name: Option<&str>,
     runner: R,
     sweep_cover: S,
-    lockdown_intent: failclosed::lockdown_state::Intent,
+    lockdown_intent: I,
     lockdown_present: P,
     lockdown_recover: L,
 ) -> Recovery
 where
     R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
-    S: FnOnce(&Path, bool),
+    S: FnOnce(&failclosed::CoverLock, bool),
+    I: FnOnce() -> failclosed::lockdown_state::Intent,
     P: FnOnce() -> CoverPresence,
-    L: FnOnce(CoverRecovery, Option<&str>),
+    L: FnOnce(&failclosed::CoverLock, CoverRecovery, Option<&str>),
 {
     info!(state_dir = %state_dir.display(), "starting route recovery");
 
@@ -1480,27 +1484,36 @@ where
         .map(|st| st.tun_name)
         .or_else(|| tun_name.map(|s| s.to_owned()));
 
-    // Reconcile the standing lockdown cover FIRST. The presence is the
+    // Reconcile the standing lockdown cover FIRST, under the cover lock, so the intent read below is the one this
+    // decision acts on. The presence is the
     // lockdown cover's OWN evidence (injected probe), NOT the route-state file,
     // whose lifetime is independent of the cover. Deciding/adopting before the
     // transient sweep means the subsequent sweep can be told a standing cover is
     // held and must not clobber it. The recover action keeps the host fail-closed
     // (Adopt) or disengages (Sweep).
+    let lock = failclosed::CoverLock::acquire(state_dir);
     let presence = lockdown_present();
-    let decision = decide_cover_recovery(lockdown_intent, presence);
+    let decision = decide_cover_recovery(lockdown_intent(), presence);
     // Repair BEFORE acting, so a crash in between leaves an intent that reads
-    // armed rather than one the next start would sweep on. A failed write costs
+    // armed. Only an unset intent is repaired, and an unreadable one already reads armed and may hold the
+    // user's `Off`: `promote_unrecorded` decides over the file inside the write. A failed write costs
     // the persisted preference, never the action or the escape: this run's
     // adopted-cover claim carries the escape, and the bridge retries the write
     // the moment it honours that claim with a real cover install (see
     // `promote_adopted_claim`). Re-deriving it on a LATER start is not a
     // fallback — once the cover is torn down the measurement reads `Absent`.
     if decision.record_intent_on {
-        if let Err(e) = failclosed::lockdown_state::set_enabled(state_dir, true, owner) {
-            warn!(
+        match failclosed::lockdown_state::promote_unrecorded(&lock, owner) {
+            Ok(failclosed::lockdown_state::PromoteOutcome::Wrote) => {}
+            // The promotion reads the file again, and that read can fail where the decision's did not: the record
+            // is then left as it is.
+            Ok(failclosed::lockdown_state::PromoteOutcome::Declined) => warn!(
+                "the lockdown intent file declined the promotion the decision asked for; the record is left as it is"
+            ),
+            Err(e) => warn!(
                 error = &e as &dyn std::error::Error,
                 "could not repair the lockdown intent over a measured live cover"
-            );
+            ),
         }
     }
     let adopt = matches!(decision.action, CoverRecovery::Adopt);
@@ -1517,9 +1530,11 @@ where
     // the reclaim's server-IP counterpart is scoped by the per-install
     // identity gap CONTRIBUTING.md discloses, and this reclaim never
     // touches that permit.
-    lockdown_recover(decision.action, tun_name_hint.as_deref());
+    lockdown_recover(&lock, decision.action, tun_name_hint.as_deref());
 
-    // Sweep any transient fail-closed cover left by a crashed update cutover.
+    // Sweep any transient fail-closed cover left by a bridge that crashed holding one. Only a bridge up to
+    // 0.6.0 engages one (no current start does, and the update cutover never has), so this is for the leftovers
+    // of an older bridge.
     // Runs UNCONDITIONALLY (outside the route-state guard above): a crash can
     // leave a cover engaged with the routes already torn down, so there is no
     // bridge-routes.json, yet the cover persists. The cover is keyed
@@ -1530,7 +1545,7 @@ where
     // it) — passed as `adopt`. Note this is `adopt`, NOT the raw presence: on a
     // Sweep (intent off, cover present) the standing ruleset is being torn down,
     // so the transient restore SHOULD run.
-    sweep_cover(state_dir, adopt);
+    sweep_cover(&lock, adopt);
 
     decision
 }
@@ -1544,8 +1559,8 @@ where
 /// `Routing::Cover` associated type, and an inherent method is not callable
 /// through that type parameter.
 pub trait CoverGuard {
-    /// Persist the underlying filters without disengaging: consume the guard so
-    /// its `Drop` (the disengage) never runs.
+    /// Persist the underlying filters without disengaging: consume the guard and
+    /// empty what it holds, so its `Drop` disengages nothing.
     ///
     /// Persists the filters and releases this process's claim on them. Safe
     /// for a LONG-LIVED caller: the implementation closes whatever the guard
@@ -1555,6 +1570,19 @@ pub trait CoverGuard {
     /// macOS deliberately leaves pf enabled: its guard holds no process-local
     /// resource, and the enable refcount is the thing being persisted.
     fn disarm(self);
+
+    /// Disengage the cover under `lock`, the proof that no other cover mutation runs. Asserts `lock` is this
+    /// guard's directory's, then drops the guard: its `Drop` is the only code that deletes. Deletes only while
+    /// this guard's install is current ([`CoverGuard::is_current`]); a stale guard releases nothing, so it can
+    /// never delete a newer cover's filters or drop a pf token a sweep already dropped. A panic in the assert
+    /// unwinds with the guard intact and its `Drop` releases; a panic in the delete propagates once from that
+    /// `Drop` and is not retried.
+    fn release(self, lock: &failclosed::CoverLock);
+
+    /// Whether this guard still owns the cover: no later install of its kind, and no sweep that released it, has
+    /// happened since it was installed. A lock-free read, so a report (status) may call it; a decision must read
+    /// it inside the section that acts on it, under the lock.
+    fn is_current(&self) -> bool;
 }
 
 /// OS routing: install split-tunnel routes and query routing state.
@@ -1678,6 +1706,7 @@ pub trait Routing: Send + Sync {
     /// tunnel comes up.
     fn install_failclosed_cover(
         &self,
+        lock: &failclosed::CoverLock,
         server_ip: IpAddr,
         resolver_ip: Option<IpAddr>,
     ) -> Result<Self::Cover, RoutingError>;
@@ -1696,6 +1725,7 @@ pub trait Routing: Send + Sync {
     /// Fail-FATAL: the bridge aborts the start on Err.
     fn install_lockdown(
         &self,
+        lock: &failclosed::CoverLock,
         server_ip: IpAddr,
         tun: &crate::device::TunIdentity,
         app_ids: &[PathBuf],
@@ -1727,7 +1757,30 @@ pub trait Routing: Send + Sync {
     /// persists that evidence (`failclosed::boottime_witness`) before
     /// returning, which is what makes the discard here cost a message and not
     /// the finding.
-    fn release_all_covers(&self) -> Result<(), RoutingError>;
+    ///
+    /// Takes the cover lock as proof that no other cover mutation runs: a release decides and acts as one section
+    /// (see [`failclosed::CoverLock`]), and a guard held from before it releases nothing afterwards, because a
+    /// sweep outdates the stamps of each cover kind it released. An implementation calls `outdate_stamps` for the
+    /// kinds whose release completed, as [`failclosed::release_all`] does, even when the other kind's release
+    /// failed; a kind whose release failed keeps its stamps, so a held guard's drop retries.
+    fn release_all_covers(&self, lock: &failclosed::CoverLock) -> Result<(), RoutingError>;
+
+    /// Take the cover lock for this provider's own state directory: the one every cover method above takes as its
+    /// proof. A trait method, not the free [`failclosed::CoverLock::acquire`], because the provider owns the
+    /// directory its covers record into, so a lock for any other directory cannot reach it.
+    ///
+    /// Blocks while another mutation holds it. Never call it while this thread already holds the lock (it
+    /// panics); never hold the result across an `.await` (it is `!Send`).
+    fn lock_covers(&self) -> failclosed::CoverLock;
+
+    /// The directory this provider's covers record into: the one [`Routing::lock_covers`] locks. The single source
+    /// of the state directory: callers read it here rather than holding a copy.
+    fn state_dir(&self) -> &Path;
+
+    /// The uid/gid this provider chowns what it records into [`Routing::state_dir`] to; `None` leaves the creating
+    /// process's ownership (the `--service` daemon, whose dirs are root-owned by design). The single source of the
+    /// owner: every bridge write into the state directory reads it here rather than holding a copy.
+    fn owner(&self) -> Option<(u32, u32)>;
 
     /// Measure whether a standing lockdown cover is present on the host right
     /// now — an OS probe, not a recollection of what this process engaged.
@@ -1889,23 +1942,40 @@ impl Routing for SystemRouting {
 
     fn install_failclosed_cover(
         &self,
+        lock: &failclosed::CoverLock,
         server_ip: IpAddr,
         resolver_ip: Option<IpAddr>,
     ) -> Result<Self::Cover, RoutingError> {
-        failclosed::engage(server_ip, resolver_ip, &self.state_dir, self.owner)
+        self.assert_own_lock(lock);
+        failclosed::engage(lock, server_ip, resolver_ip, self.owner)
     }
 
     fn install_lockdown(
         &self,
+        lock: &failclosed::CoverLock,
         server_ip: IpAddr,
         tun: &crate::device::TunIdentity,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError> {
+        self.assert_own_lock(lock);
         let resolver = failclosed::SystemLuidResolver;
-        failclosed::engage_lockdown(server_ip, tun.alias(), &resolver, app_ids, &self.state_dir, self.owner)
+        failclosed::engage_lockdown(lock, server_ip, tun.alias(), &resolver, app_ids, self.owner)
     }
 
-    fn release_all_covers(&self) -> Result<(), RoutingError> {
+    fn lock_covers(&self) -> failclosed::CoverLock {
+        failclosed::CoverLock::acquire(self.state_dir())
+    }
+
+    fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    fn owner(&self) -> Option<(u32, u32)> {
+        self.owner
+    }
+
+    fn release_all_covers(&self, lock: &failclosed::CoverLock) -> Result<(), RoutingError> {
+        self.assert_own_lock(lock);
         // Named discard, not `?;` — see the trait method's doc for why the
         // in-process escape is the one caller the clearance does not bind.
         //
@@ -1918,7 +1988,7 @@ impl Routing for SystemRouting {
         // persisted copy, every later sweep (including the uninstall gate's)
         // would read the empty sibling set as "no cover was ever here" and go
         // silent for good.
-        failclosed::release_all(&self.state_dir).map(|_clearance_binds_only_the_uninstall_gate| ())
+        failclosed::release_all(lock).map(|_clearance_binds_only_the_uninstall_gate| ())
     }
 
     fn lockdown_cover_presence(&self) -> CoverPresence {
@@ -1927,6 +1997,15 @@ impl Routing for SystemRouting {
 }
 
 impl SystemRouting {
+    /// A lock for another directory cannot make this provider's covers exclusive with anything that matters.
+    fn assert_own_lock(&self, lock: &failclosed::CoverLock) {
+        assert_eq!(
+            lock.state_dir(),
+            self.state_dir,
+            "a cover is mutated under the lock of the provider's own state dir"
+        );
+    }
+
     /// Test seam for [`Routing::install`]: injectable per-command setup/
     /// teardown runners (the same shape [`exec_one`] has) so unit tests can
     /// drive the failure/rollback path without issuing real route commands

@@ -152,8 +152,9 @@
 //!   on any boot where no object is live the key answers empty whether or not
 //!   a record survives behind it — on a host that armed the switch years ago
 //!   and on one that never armed it. That asymmetry is the whole reason
-//!   [`release_all`] AND [`disengage_lockdown`] both return a [`Clearance`]
-//!   rather than a bare `Ok`: the ordinary uninstall sees exactly that answer.
+//!   [`release_all`] AND [`disengage_lockdown`] both carry a [`Clearance`] in
+//!   their [`SweepOutcome`] (the facade's `Ok` holds it) rather than a bare
+//!   `Ok`: the ordinary uninstall sees exactly that answer.
 //! - **That a record could exist on this host AT ALL** — the twins'
 //!   `Persistent` sibling, the other half of the same rule
 //!   ([`KeyRole::BootTimeSibling`]). BFE re-adds it from its own store at every
@@ -171,9 +172,8 @@
 //!
 //! Deletion needs no new path. A boot-time filter is removed by the same
 //! `FwpmFilterDeleteByKey0` call a persistent one is — no lifetime-specific
-//! delete API exists — so every fixed-GUID sweep here (`Cover::drop`'s
-//! Lockdown arm, [`disengage_lockdown`], [`release_all`],
-//! [`swept_lockdown_keys`]) covers the twins once their GUIDs are in the array.
+//! delete API exists — so every fixed-GUID sweep here ([`disengage_lockdown`],
+//! [`release_all`], [`swept_lockdown_keys`]) covers the twins once their GUIDs are in the array.
 //!
 //! ## What no test here can reach
 //!
@@ -239,7 +239,10 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::RESOLVER_PERMIT_PORT;
-use super::{ArmingWitness, Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, SweepOutcome};
+use super::{
+    ArmingWitness, Clearance, CoverKind, CoverLock, InstallStamp, KeyLifetime, KeyObservation, KeyOutcome, KeyRole,
+    SweepOutcome,
+};
 use crate::error::RoutingError;
 
 // Fixed Hole identifiers. Compiled in so recovery can delete by key with no
@@ -1301,21 +1304,16 @@ fn first_delete_failure(codes: &[(&'static str, u32)]) -> Option<RoutingError> {
     })
 }
 
-/// Which cover a [`Cover`] guard owns — selects the GUID set its Drop deletes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CoverKind {
-    Transient,
-    Lockdown,
-}
-
-/// WFP-backed cover guard. Drop deletes the filters it installed by GUID.
+/// WFP-backed cover guard. Drop deletes the filters it installed by GUID, while its install is the latest
+/// ([`InstallStamp`]); the stamp's [`CoverKind`] selects the GUID set.
 pub struct Cover {
-    engine: HANDLE,
-    kind: CoverKind,
+    /// `None` once `detach` has taken and closed the engine, which makes `Drop` a no-op.
+    engine: Option<HANDLE>,
+    stamp: InstallStamp,
 }
 
 // SAFETY: the FWPM engine handle is owned exclusively by this guard and only
-// touched in `engage` and `Drop`. Sending it between threads is sound; FWPM
+// touched in `engage`, `detach` and `Drop`. Sending it between threads is sound; FWPM
 // engine handles are not thread-affine.
 unsafe impl Send for Cover {}
 
@@ -1412,9 +1410,9 @@ fn pre_delete_verdict(policy: StaleKeyPolicy, codes: &[(&'static str, u32)]) -> 
 
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
 pub fn engage(
+    lock: &CoverLock,
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
-    _state_dir: &Path,
     _owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     let spec = build_cover_spec(server_ip, resolver_ip);
@@ -1431,7 +1429,7 @@ pub fn engage(
 
         // Wrap the mutating steps so any failure aborts the transaction and
         // closes the engine before returning.
-        let result = (|| -> Result<(), RoutingError> {
+        let result = (|| -> Result<InstallStamp, RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             // Refresh the runtime-valued permits (server IP, resolver IP) in
             // this same transaction — see `transient_pre_delete_guids` and
@@ -1443,27 +1441,29 @@ pub fn engage(
                 add_filter(engine, spec.provider, spec.sublayer, f, spec.stale_key)?;
             }
             wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
-            Ok(())
+            Ok(lock.stamp_install(CoverKind::Transient))
         })();
 
-        if let Err(e) = result {
-            let _ = FwpmTransactionAbort0(engine);
-            let _ = FwpmEngineClose0(engine);
-            return Err(e);
+        match result {
+            Ok(stamp) => Ok(Cover {
+                engine: Some(engine),
+                stamp,
+            }),
+            Err(e) => {
+                let _ = FwpmTransactionAbort0(engine);
+                let _ = FwpmEngineClose0(engine);
+                Err(e)
+            }
         }
-        Ok(Cover {
-            engine,
-            kind: CoverKind::Transient,
-        })
     }
 }
 
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
 pub fn engage_lockdown(
+    lock: &CoverLock,
     server_ip: IpAddr,
     tun_luid: u64,
     app_ids: &[std::path::PathBuf],
-    state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     let spec = build_lockdown_spec(server_ip, tun_luid, app_ids);
@@ -1473,7 +1473,7 @@ pub fn engage_lockdown(
             FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
             "FwpmEngineOpen0",
         )?;
-        let result = (|| -> Result<(), RoutingError> {
+        let result = (|| -> Result<InstallStamp, RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             // Refresh every runtime-valued permit AND re-arm the boot-time
             // twins: delete their fixed keys before the adds, in this same
@@ -1535,7 +1535,7 @@ pub fn engage_lockdown(
             for f in &spec.filters {
                 add_filter(engine, spec.provider, spec.sublayer, f, spec.stale_key)?;
             }
-            commit_and_record(engine, state_dir, owner)?;
+            let stamp = commit_and_record(engine, lock, owner)?;
             // A commit code is not evidence about a boot-time key: it says the
             // transaction reached the FWPM object store, not that the next
             // boot's pre-BFE window is covered. Read the twins back out of the
@@ -1545,17 +1545,19 @@ pub fn engage_lockdown(
             // The record is already written by then, deliberately: see
             // `commit_and_record`.
             verify_boottime_twins(engine)?;
-            Ok(())
+            Ok(stamp)
         })();
-        if let Err(e) = result {
-            let _ = FwpmTransactionAbort0(engine);
-            let _ = FwpmEngineClose0(engine);
-            return Err(e);
+        match result {
+            Ok(stamp) => Ok(Cover {
+                engine: Some(engine),
+                stamp,
+            }),
+            Err(e) => {
+                let _ = FwpmTransactionAbort0(engine);
+                let _ = FwpmEngineClose0(engine);
+                Err(e)
+            }
         }
-        Ok(Cover {
-            engine,
-            kind: CoverKind::Lockdown,
-        })
     }
 }
 
@@ -1577,13 +1579,21 @@ pub fn engage_lockdown(
 /// this is the Windows file: retiring the twins must retire the record with
 /// them, not leave an engage writing a witness for a key class that no longer
 /// exists.
+///
+/// The install is stamped at the commit too, not when the guard is returned: the read-back after it can fail over
+/// a cover that stands, and a guard held from an earlier install must not then delete it.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-unsafe fn commit_and_record(engine: HANDLE, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<(), RoutingError> {
+unsafe fn commit_and_record(
+    engine: HANDLE,
+    lock: &CoverLock,
+    owner: Option<(u32, u32)>,
+) -> Result<InstallStamp, RoutingError> {
     wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
+    let stamp = lock.stamp_install(CoverKind::Lockdown);
     if STANDING_COVER_ARMS_BOOT_TIME {
-        super::boottime_witness::record_armed(state_dir, owner);
+        super::boottime_witness::record_armed(lock, owner);
     }
-    Ok(())
+    Ok(stamp)
 }
 
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -1931,8 +1941,8 @@ unsafe fn add_filter(
 
 impl Cover {
     /// Release this process's claim on the cover without disengaging it:
-    /// close the FWPM engine handle, then skip `Drop` so its filter deletes
-    /// never run.
+    /// close the FWPM engine handle and empty the guard, so `Drop` deletes no
+    /// filter.
     ///
     /// Safe because no object this cover installs is owned by the engine
     /// session, and that turns on the SESSION, not on any filter's flags:
@@ -1955,54 +1965,70 @@ impl Cover {
     /// That is what lets a LONG-LIVED caller keep the host covered without
     /// leaking a handle per call: `std::mem::forget` alone, which this
     /// replaces, leaked one on every armed reload for the life of the process.
-    pub(crate) fn detach(self) {
-        // SAFETY: `self.engine` is a live FWPM engine handle owned solely by
-        // this guard, and `self` is consumed here, so it cannot be closed twice.
+    pub(crate) fn detach(mut self) {
+        let engine = self.engine.take().expect("a live cover holds its engine");
+        // SAFETY: `engine` is a live FWPM engine handle owned solely by this
+        // guard, and taking it from `self` leaves `Drop` nothing to close, so
+        // it cannot be closed twice.
         unsafe {
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let rc = FwpmEngineClose0(self.engine);
+            let rc = FwpmEngineClose0(engine);
             if rc != ERROR_SUCCESS.0 {
                 tracing::warn!("FwpmEngineClose0 failed while detaching a cover: 0x{rc:08x}");
             }
         }
-        std::mem::forget(self);
     }
 }
 
-impl Drop for Cover {
-    fn drop(&mut self) {
-        unsafe {
-            match self.kind {
-                // Transient: today's full sweep (filters + sublayer + provider).
-                CoverKind::Transient => delete_all(self.engine),
-                // Lockdown: delete only the lockdown + App-ID filters; the
-                // shared sublayer/provider are owned by the transient sweep.
-                // A user stop RELIES on this Drop to open the host, and Drop
-                // cannot return an error, so a code that is neither success nor
-                // not-found is warned: silence there is indistinguishable from
-                // a clean release.
-                #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-                CoverKind::Lockdown => {
-                    let codes: Vec<(&'static str, u32)> = swept_lockdown_keys()
-                        .into_iter()
-                        .map(|k| (k.label, FwpmFilterDeleteByKey0(self.engine, &k.guid)))
-                        .collect();
-                    if let Some(e) = first_delete_failure(&codes) {
-                        tracing::warn!(
-                            error = &e as &dyn std::error::Error,
-                            "lockdown cover release left a filter installed; egress may still be blocked"
-                        );
-                    }
+impl Cover {
+    /// Delete the filters of this guard's kind.
+    fn delete_filters(lock: &CoverLock, engine: HANDLE, kind: CoverKind) {
+        match kind {
+            // Transient: today's full sweep (filters + sublayer + provider).
+            CoverKind::Transient => {
+                let _ = unsafe { delete_all(engine) };
+            }
+            // Lockdown: the same witnessed sweep as `bridge unlock`, so the boot-time record is written. The
+            // shared sublayer/provider are owned by the transient sweep. A user stop RELIES on this Drop to open
+            // the host, and Drop cannot return an error, so a failure is warned: silence there is
+            // indistinguishable from a clean release.
+            CoverKind::Lockdown => {
+                if let Err(e) = super::disengage_lockdown(lock) {
+                    tracing::warn!(
+                        error = &e as &dyn std::error::Error,
+                        "lockdown cover release failed; egress may still be blocked"
+                    );
                 }
             }
+        }
+    }
+
+    fn close_engine(engine: HANDLE) {
+        unsafe {
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let rc = FwpmEngineClose0(self.engine);
+            let rc = FwpmEngineClose0(engine);
             if rc != ERROR_SUCCESS.0 {
                 // Leaks the handle for the life of the process; the deletes
                 // above already committed, so the host's posture is unaffected.
                 tracing::warn!("FwpmEngineClose0 failed: 0x{rc:08x}");
             }
         }
+    }
+
+    pub(crate) fn stamp(&self) -> &InstallStamp {
+        &self.stamp
+    }
+}
+
+impl Drop for Cover {
+    fn drop(&mut self) {
+        let Some(engine) = self.engine.take() else {
+            return;
+        };
+        let kind = self.stamp.kind();
+        self.stamp
+            .release_on_drop(|lock| Self::delete_filters(lock, engine, kind));
+        Self::close_engine(engine);
     }
 }
 
@@ -2021,10 +2047,10 @@ pub(crate) fn should_reclaim_tun_permit(resolved: bool) -> bool {
 /// not an error, but a code that is neither success nor not-found means a
 /// filter is STILL installed — the exact staleness this reclaim exists to
 /// close — so it is folded through [`first_delete_failure`] and warned, same
-/// as `Cover::drop`'s Lockdown arm and [`delete_all`]: a DACL-denied delete
+/// as [`disengage_lockdown`] and [`delete_all`]: a DACL-denied delete
 /// must not read as a successful reclaim.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &str) {
+pub fn reclaim_stale_tun_permit(_lock: &CoverLock, resolver: &dyn super::LuidResolver, tun_name: &str) {
     if !should_reclaim_tun_permit(resolver.resolve(tun_name).is_ok()) {
         // A live `hole-tun` exists — some bridge may be relying on this
         // permit. Never delete it out from under a running bridge.
@@ -2174,48 +2200,38 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
     }
 }
 
-/// Fail-loud disengage for the `bridge unlock` escape hatch. Deletes all
-/// lockdown + App-ID filters by their fixed GUIDs (idempotent — a "not found"
-/// delete is a no-op, so a clean host returns `Ok`). The failure that means
-/// "cannot disengage" is the ENGINE OPEN: the Base Filtering Engine could not
-/// be reached, so nothing could have been issued → `Err`. That is NOT "not
-/// elevated" — FWPM opens without elevation (`release_all`'s doc records the
-/// same measurement); a failed open means BFE is not running or RPC failed.
-/// There is no persisted Windows state to key absence on (delete-by-GUID is
-/// idempotent), so a successful open always reports `Ok`.
+/// Fail-loud disengage for the `bridge unlock` escape hatch and the standing guard's `Drop`. Deletes all
+/// lockdown + App-ID filters by their fixed GUIDs (idempotent: a "not found" delete is a no-op, so a clean host
+/// reports no failure). The outcome carries a failure in two cases: the ENGINE OPEN failed, so nothing was
+/// issued (the Base Filtering Engine is not running or RPC failed, which is NOT "not elevated": FWPM opens
+/// without elevation, as `release_all`'s doc records), or a delete was refused (a code neither success nor
+/// not-found, per [`first_delete_failure`], e.g. the unelevated run, which opens the engine but cannot write).
+/// There is no persisted Windows state to key absence on, so a clean open with no refused delete is the only
+/// no-failure outcome.
 ///
-/// Its `Ok` is a [`Clearance`], not a bare unit, for the same reason
-/// [`release_all`]'s is: a `FWPM_FILTER_FLAG_BOOTTIME` key answers
+/// Returns a [`SweepOutcome`], not the facade's `Result`: the facade
+/// (`failclosed::disengage_lockdown`) turns it into `Ok(Clearance)` or `Err`.
+/// The [`Clearance`] is not a bare unit, for the same reason [`release_all`]'s
+/// is: a `FWPM_FILTER_FLAG_BOOTTIME` key answers
 /// `FWP_E_FILTER_NOT_FOUND` on any boot where its runtime object is not live,
 /// so turning the kill switch off in a boot where the bridge never engaged
 /// deletes nothing it can see and learns nothing about what may sit behind
 /// those two keys.
 ///
-/// **That qualification used to be dropped here, defended by an argument that
-/// is false on this exact path.** The claim was that nothing is unrecoverable
-/// because `hole.exe` is still on disk and "the next engage re-arms the key,
-/// pre-deleting it first". [`crate::routing::failclosed::disengage_lockdown`]'s
-/// caller is `hole bridge unlock`, which exists precisely so that there is no
-/// next engage: `cutover::unlock_with` writes the kill-switch intent OFF in
-/// the statement after this one, and the pre-delete that would clean the key
-/// up runs only from [`engage_lockdown`], which an off intent prevents. So the
-/// one path where the recovery argument was needed is the one where it does
-/// not hold, and the verdict travels to the caller instead of being collapsed
-/// here.
+/// A next engage does not clean those keys up on `hole bridge unlock`'s path: `cutover::unlock_with` records
+/// the target `Off` before this sweep and the lockdown intent off after it, and the pre-delete that would clear
+/// a key runs only from [`engage_lockdown`], which an off intent prevents. So the verdict travels to the caller
+/// instead of being collapsed here.
 ///
-/// It still does not FAIL the disengage — see [`Clearance`] for why a bounded
+/// It still does not FAIL the disengage over an unproven twin — see [`Clearance`] for why a bounded
 /// boot-window block must not block the escape hatch from a hard-blocked host.
 /// The caller surfaces it, and `Clearance::leftover_keys` is what decides
 /// whether an operator hears about it at all.
 ///
-/// What it IS gated on is every delete's return code. `Ok` here means the host
-/// is genuinely open: `hole bridge unlock` flips the persisted intent off only
-/// on this function's success (`cutover::unlock_with`), so an `Ok` returned
-/// over deletes that were refused — the unelevated run, which reaches the
-/// engine open but not the write — would leave the kill switch engaged while
-/// the intent reads "off", with nothing left to reconcile it. The macOS arm
-/// has always propagated its `pfctl` failures; this is the same rule.
-pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
+/// A refused delete does fail it: `unlock_with` flips the persisted lockdown intent off only after the facade's
+/// `Ok`, so an `Ok` over refused deletes would tell the operator the host is open while the kill switch is still
+/// engaged. The macOS arm has always propagated its `pfctl` failures; this is the same rule.
+pub(super) fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
     let swept = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -2274,15 +2290,15 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witne
     // fail?" and "what did the empty answers prove?" cannot disagree about
     // which key answered what. The clearance is built EITHER WAY — every
     // delete above was issued before any code was read, so a failure verdict
-    // does not make the observations beside it any less real (#1010 F1).
+    // does not make the observations beside it any less real.
     let clearance = Clearance::from_observations(&observations(swept), witness);
-    match first_delete_failure(&codes) {
-        Some(e) => SweepOutcome::failed(clearance, e),
-        None => SweepOutcome::completed(clearance),
-    }
+    SweepOutcome::per_kind(clearance, [(CoverKind::Lockdown, first_delete_failure(&codes))])
 }
 
-pub fn recover_cover(_state_dir: &Path, adopting: bool) {
+/// Sweep the transient cover's fixed filter set; the body of [`super::recover_cover`], called once at bridge start.
+/// `Ok` when every transient filter is gone. The engine not opening is an error too: nothing was swept, so a guard
+/// that still holds the cover must keep its stamp. Both failures are warned here, the caller has no log of its own.
+pub fn recover_cover(_lock: &CoverLock, adopting: bool) -> Result<(), RoutingError> {
     // Windows is structurally safe regardless: the transient cover and the
     // standing lockdown use disjoint WFP filter GUIDs, so deleting the transient
     // filters cannot touch the lockdown ones (the shared sublayer/provider
@@ -2293,13 +2309,24 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
         // FwpmEngineOpen0 returns u32 — compare to ERROR_SUCCESS.0, NOT `.is_ok()`.
         // A failed open means the Base Filtering Engine could not be reached
         // (not "not elevated" — FWPM opens without elevation), so nothing could
-        // have been swept anyway; skipping is a benign no-op.
+        // have been swept anyway.
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        if FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine) == ERROR_SUCCESS.0 {
-            delete_all(engine);
-            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let _ = FwpmEngineClose0(engine);
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            let e = RoutingError::RouteSetup(format!(
+                "FwpmEngineOpen0 failed (0x{rc:08x}): the transient cover could not be swept"
+            ));
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "transient cover sweep could not open the firewall engine, so it did not run; a crashed run's transient \
+                 cover may still block egress"
+            );
+            return Err(e);
         }
+        let swept = delete_all(engine);
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmEngineClose0(engine);
+        swept
     }
 }
 
@@ -2307,24 +2334,30 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
 /// provider. Order matters: a sublayer/provider delete fails while filters
 /// still reference it. Each delete is idempotent — a "not found" return is
 /// ignored (recovery runs even when no cover is present) — but a code that is
-/// neither success nor not-found is a filter still blocking egress, and the
-/// callers (`Cover::drop`, `recover_cover`) can return nothing, so it is
-/// warned here. The sublayer/provider deletes stay best-effort: an orphaned
-/// empty sublayer holds no traffic.
+/// neither success nor not-found is a filter still blocking egress: it is
+/// warned here and returned as the first failure. `Cover::drop` discards the
+/// result (it can return nothing); `recover_cover` returns it. The
+/// sublayer/provider deletes stay best-effort: an orphaned empty sublayer holds
+/// no traffic.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-unsafe fn delete_all(engine: HANDLE) {
+unsafe fn delete_all(engine: HANDLE) -> Result<(), RoutingError> {
     let codes: Vec<(&'static str, u32)> = swept_transient_keys()
         .into_iter()
         .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
         .collect();
-    if let Some(e) = first_delete_failure(&codes) {
-        tracing::warn!(
-            error = &e as &dyn std::error::Error,
-            "transient cover sweep left a filter installed; egress may still be blocked"
-        );
-    }
+    let swept = match first_delete_failure(&codes) {
+        Some(e) => {
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "transient cover sweep left a filter installed; egress may still be blocked"
+            );
+            Err(e)
+        }
+        None => Ok(()),
+    };
     let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
     let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
+    swept
 }
 
 /// Clear every fail-closed cover Windows can install — both the lockdown
@@ -2349,55 +2382,77 @@ unsafe fn delete_all(engine: HANDLE) {
 /// that this call can see — but it is only *proof of absence* for a
 /// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
 /// two lets the MSI delete `hole.exe` over a key it never observed.
-pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
-    unsafe {
+pub(super) fn release_all(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
+    let (lockdown, transient) = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return SweepOutcome::failed(
-                // The empty fold: nothing was issued, so nothing was observed.
-                Clearance::from_observations(&[], witness),
-                RoutingError::RouteSetup(format!(
-                    "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so nothing could have been deleted"
-                )),
-            );
+            return release_all_verdict(Some(rc), &[], &[], witness);
         }
 
         // One pass, both folds: each key carries its lifetime out of the
         // sweep list, so the failure verdict and the clearance are derived
         // from the SAME observation rather than from two walks that could
-        // disagree about which key answered what.
-        let mut swept: Vec<(SweptKey, u32)> = Vec::new();
+        // disagree about which key answered what. Every delete is issued
+        // before any code is read.
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for k in swept_lockdown_keys() {
-            let code = FwpmFilterDeleteByKey0(engine, &k.guid);
-            swept.push((k, code));
-        }
+        let lockdown: Vec<(SweptKey, u32)> = swept_lockdown_keys()
+            .into_iter()
+            .map(|k| {
+                let code = FwpmFilterDeleteByKey0(engine, &k.guid);
+                (k, code)
+            })
+            .collect();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for k in swept_transient_keys() {
-            let code = FwpmFilterDeleteByKey0(engine, &k.guid);
-            swept.push((k, code));
-        }
+        let transient: Vec<(SweptKey, u32)> = swept_transient_keys()
+            .into_iter()
+            .map(|k| {
+                let code = FwpmFilterDeleteByKey0(engine, &k.guid);
+                (k, code)
+            })
+            .collect();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
+        (lockdown, transient)
+    };
+    release_all_verdict(None, &lockdown, &transient, witness)
+}
 
-        let codes: Vec<(&'static str, u32)> = swept.iter().map(|(k, code)| (k.label, *code)).collect();
-        // Folded before the failure verdict is consulted, for the reason
-        // `disengage_verdict` gives: every delete above was ISSUED before any
-        // code was read, so a sweep that ends in `Err` is still holding a
-        // complete observation set — including the sibling it just removed
-        // (#1010 F1).
-        let clearance = Clearance::from_observations(&observations(&swept), witness);
-        match first_delete_failure(&codes) {
-            Some(e) => SweepOutcome::failed(clearance, e),
-            None => SweepOutcome::completed(clearance),
-        }
+/// `release_all`'s verdict, pure and separated from the FFI as [`disengage_verdict`] is. The failure is the first
+/// refused delete (lockdown keys first); the clearance is folded from every key either way (see
+/// [`disengage_verdict`]).
+fn release_all_verdict(
+    open_failure: Option<u32>,
+    lockdown: &[(SweptKey, u32)],
+    transient: &[(SweptKey, u32)],
+    witness: ArmingWitness,
+) -> SweepOutcome {
+    if let Some(rc) = open_failure {
+        return SweepOutcome::failed(
+            // The empty fold: nothing was issued, so nothing was observed.
+            Clearance::from_observations(&[], witness),
+            RoutingError::RouteSetup(format!(
+                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so nothing could have been deleted"
+            )),
+        );
     }
+    let labelled = |swept: &[(SweptKey, u32)]| -> Vec<(&'static str, u32)> {
+        swept.iter().map(|(k, code)| (k.label, *code)).collect()
+    };
+    let mut observed = observations(lockdown);
+    observed.extend(observations(transient));
+    SweepOutcome::per_kind(
+        Clearance::from_observations(&observed, witness),
+        [
+            (CoverKind::Lockdown, first_delete_failure(&labelled(lockdown))),
+            (CoverKind::Transient, first_delete_failure(&labelled(transient))),
+        ],
+    )
 }
 
 // Boot-time read-back =================================================================================================
@@ -2630,7 +2685,7 @@ fn classify_twin_readback(views: &[Result<Vec<FilterRecord>, u32>], key: GUID) -
 /// Those filters are NOT orphaned: nothing treats the `Err` as "no cover
 /// installed", the next start probes the OS via [`lockdown_cover_presence`],
 /// reads `Live` off the fixed GUIDs, and `decide_cover_recovery` yields
-/// `Adopt`, with `record_intent_on` repairing `bridge-lockdown.json`.
+/// `Adopt` (over an intent nobody recorded it also repairs `bridge-lockdown.json`, through `record_intent_on`).
 ///
 /// **What it is NOT is what an aborted `install_lockdown` does.** That claim
 /// held only where a cover ALREADY existed. Over a clean host on a FIRST

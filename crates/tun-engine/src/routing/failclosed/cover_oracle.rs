@@ -51,7 +51,7 @@ fn transient_held(_state_dir: &Path) -> Option<String> {
 fn transient_held(state_dir: &Path) -> Option<String> {
     let mut sources = Vec::new();
     if !matches!(
-        super::failclosed_state::load_presence(state_dir),
+        super::pf_record::read::<super::failclosed_state::FailClosedState>(state_dir),
         super::StateFile::Absent
     ) {
         sources.push("its state record exists");

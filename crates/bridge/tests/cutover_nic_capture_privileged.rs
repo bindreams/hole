@@ -92,7 +92,9 @@ use tun_engine::test_utils::{capture_contains_nonce, nonce, pktmon, send_marker,
 fn cutover_global_net_state_nic_capture_no_udp_leak() {
     use tun_engine::gateway::get_default_gateway_info;
     use tun_engine::helpers::bypass::create_bypass_udp;
-    use tun_engine::routing::failclosed::{disengage_lockdown, engage_lockdown, lockdown_state, SystemLuidResolver};
+    use tun_engine::routing::failclosed::{
+        disengage_lockdown, engage_lockdown, lockdown_state, CoverLock, SystemLuidResolver,
+    };
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime for the bound UDP socket");
     let dir = tempfile::tempdir().unwrap();
@@ -208,13 +210,13 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
         &[],
         &held,
         || {
-            lockdown_state::set_enabled(dir.path(), true, None).expect("persist lockdown intent");
+            lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).expect("persist lockdown intent");
             let cover = engage_lockdown(
+                &CoverLock::acquire(dir.path()),
                 server_ip,
                 "Loopback Pseudo-Interface 1", // always-present LUID source; the block governs the probed egress
                 &SystemLuidResolver,
                 &[],
-                dir.path(),
                 None,
             )
             .expect("engage the real standing lockdown cover");
@@ -271,9 +273,10 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
             // Tear the cover down BEFORE the asserts so a failure never leaves the box
             // severed. The capture verdicts are already in hand.
             drop(cover);
-            lockdown_state::set_enabled(dir.path(), false, None).expect("clear the lockdown intent");
-            let _clearance_has_no_reader_in_cleanup =
-                disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
+            lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None)
+                .expect("clear the lockdown intent");
+            let _clearance_has_no_reader_in_cleanup = disengage_lockdown(&CoverLock::acquire(dir.path()))
+                .expect("disengage the persisted cover to restore egress");
 
             // The invariant: no UDP leaked to the non-permitted destination. A marker on the wire is a leak
             // whatever the network was doing.

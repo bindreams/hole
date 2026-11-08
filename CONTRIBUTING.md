@@ -1311,10 +1311,14 @@ fails, and releasing it on success, cancel, or a user stop. When the standing
 lockdown intent is ON, a covered start does NOT engage this cover at all — that
 cohort's cover is installed once at `routing.install` instead
 ([Lockdown mode](#lockdown-mode)) — and a HELD transient cover from a prior
-start is released outright, a brief, disclosed open window until the lockdown
-cover takes over. It does *not* cover an indefinite outage (a bridge that
-stays down) — without lockdown, default-off Hole fails *open* there; lockdown
-closes that broader gap.
+start is released outright. Unless an adopted standing cover already holds the
+host (the release then opens nothing), the host is uncovered from that release
+until the standing cover engages after the plugin chain and `routing.install`.
+A start that fails before then never engages it and holds no cover for the
+retry, so the window lasts as long as the starts keep failing
+([#1206](https://github.com/bindreams/hole/issues/1206)). It does *not* cover an
+indefinite outage (a bridge that stays down) — without lockdown, default-off Hole
+fails *open* there; lockdown closes that broader gap.
 
 `resolver_ip` optionally permits ONE more address, scoped to **TCP port 443**
 (not the server permit's unrestricted shape — `doh_url_for_ip` in
@@ -1399,7 +1403,11 @@ the repair's own `warn!` lines, not silent, but not eliminated either: Windows'
 engage is delete-then-add, not an atomic in-place update, and on macOS the gap is
 the release itself (the drop reloads `/etc/pf.conf`), although the macOS engage
 is now atomic over a live cover. The same release-first gap applies when lockdown
-is newly enabled on a covered retry. Tracked separately:
+is newly enabled on a covered retry, but there the window lasts until the
+standing cover engages, which a failing start never reaches, and it opens
+nothing when an adopted standing cover already holds the host
+([#1206](https://github.com/bindreams/hole/issues/1206)).
+The repair's own gap is tracked in
 [#758](https://github.com/bindreams/hole/issues/758). If BOTH the corrected
 engage AND the compensating restore fail — two independent OS-level
 failures back to back — the attempt proceeds fully uncovered: the same
@@ -1475,7 +1483,8 @@ milliseconds.
   `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin
   (`pfctl -f -`, spawned as `SystemTool::Pfctl`, so by absolute path — see
   [System tools](#system-tools-absolute-paths)).
-  Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`);
+  Disengage restores `/etc/pf.conf`, clears the record and drops the refcount
+  (`pfctl -X <token>`);
   the token is persisted to `bridge-failclosed.json` *before* the blocking
   ruleset loads (persist-before-mutate), and a failed persist unwinds the `-E`
   before propagating, mirroring `engage_lockdown`'s `FreshEnable`/`Reenable`
@@ -1788,8 +1797,9 @@ warning into a failed engage.
 that is a behaviour change.** The transaction has already committed when
 `verify_boottime_twins` runs, so `engage_lockdown` returns `Err` with the
 filters installed and no guard over them. They are not orphaned — the next start
-reads `Live` off the fixed GUIDs, `decide_cover_recovery` yields `Adopt`, and
-`record_intent_on` repairs `bridge-lockdown.json`. But over a **clean host on a
+reads `Live` off the fixed GUIDs, and `decide_cover_recovery` yields `Adopt`
+(over an intent nobody recorded it also repairs `bridge-lockdown.json`, through
+`record_intent_on`). But over a **clean host on a
 first engage** a pre-commit abort used to leave the host untouched, and this
 path instead leaves a full block-all in force while the start fails: the permits
 alongside it are loopback, the server IP, the TUN and Hole's own App-IDs, so
@@ -1876,19 +1886,15 @@ observation set and the record keeps what it held.
 Disclosed residuals. **A host whose twins went without a sweep watching keeps
 reporting**: the record stays `Armed`, the sibling is gone, and every later
 `bridge release-covers` on that `state_dir` names the two twin keys for the life
-of the dir. Two causes. One is outside Hole entirely — an external FWPM delete,
-a firewall reset, an image restore — and is the case `record_armed`-at-engage
-exists for, since no sweep ever held the evidence to copy. The other is Hole's
-own: the Windows guard's `Drop` (`Cover`'s `Lockdown` arm) deletes the whole
-`swept_lockdown_keys` list, twins included, and is the one twin-removing path
-that does not run through `sweep_with_witness` — it carries no `state_dir`. It
-fires when an engage commits and a *later* fatal phase of the same start fails,
-unwinding `ProxyManager`'s locally-owned guard; an ordinary disconnect releases
-through `Routing::release_all_covers` first and then drops an already-swept
-cover, so it is unaffected. Both are over-reports — an over-report costs an
-operator a paragraph, where the silence it replaces costs #1003's unrecoverable
-host — and both are bounded to hosts that ever armed a twin; one that never did
-has no record and no live sibling and stays silent. The record is
+of the dir. The cause outside Hole is an external FWPM delete, a firewall reset,
+an image restore: the case `record_armed`-at-engage exists for, since no sweep
+ever held the evidence to copy. Two Hole-side causes leave the same state and are
+described below: a witness write that fails, and a peer dir's `Armed` that a
+SYSTEM sweep of its own dir does not retract. Every Hole path that removes the
+twins, the Windows guard's `Drop` included, runs through `sweep_with_witness`. An
+over-report costs an operator a paragraph, where the silence it replaces costs
+#1003's unrecoverable host, and it is bounded to hosts that ever armed a twin;
+one that never did has no record and no live sibling and stays silent. The record is
 per-`state_dir` while the WFP filters it
 describes are machine-wide, so the uninstall gate folds in every peer dir it
 already locks against a live bridge (`cutover::release_covers_with`); a bridge
@@ -2015,7 +2021,9 @@ three axes:
   **fail-FATAL** — it aborts the start and tears everything down; the transient
   cover fails *open* on its own engage error so a half-loaded ruleset never
   strands the host. Lockdown is **last-writer-wins**: an absolute set via
-  `POST /v1/lockdown`, system-wide.
+  `POST /v1/lockdown`, system-wide. On macOS a failed re-engage over a live
+  cover removes it (the engage's back-out releases the cover, not only the
+  token and record it took; bindreams/hole#1203).
 
 Intent persists to `bridge-lockdown.json`; macOS additionally records the
 pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
@@ -2063,6 +2071,24 @@ examined), never reports success over a host it left closed, and never erases
 a cover's state file after a restore that did not confirm — a corrupt or
 version-skewed file is treated as a cover to clear, not as absence.
 
+A macOS restore that fails leaves the block, its record and its token in place, and the release returns the
+restore's own error. The transient cover's restore is one `/etc/pf.conf` reload with no fallback, so one failed reload
+leaves the block. The standing cover restores its captured snapshot; a record with no captured baseline reloads
+`/etc/pf.conf`, and a snapshot that will not load falls back to it, so only a failing `/etc/pf.conf` reload as well
+(or with no snapshot to try) leaves the block, and the error is then the reload's (the snapshot's is logged). The ways out: fix `/etc/pf.conf` and unblock
+again (the restore is retried); `sudo pfctl -d` turns pf off, and the record stays until a later restore succeeds; a
+reboot resets pf, and with the target already off nothing re-arms it.
+
+A macOS release restores the host, then clears the cover's record, then drops the `pfctl -E` token, and drops it only if
+that clear took the record that named it. A record names only a token Hole holds: pf can hand a freed token's value to
+the next `pfctl -E` of any app, so `pfctl -X` never runs while a record names the token it drops. Hence a clear that
+cannot write is the cover's error and drops nothing (the retry still has its token), a clear that finds another token's
+record or none drops nothing (the engage that displaced the record dropped its token, `drop_displaced`), and a token
+that will not drop is logged only: with the host's rules restored it blocks nothing. A cover record that could not be
+read is never absent and never removed: a release over one restores the host, leaves the record in place and answers an
+error, never success. Every record is written under the [cover lock](#the-cover-lock); nothing out of process writes
+them while a bridge runs.
+
 Inside a live bridge, `Routing::release_all_covers` — the same primitive —
 has four sanctioned callers, guarded by a structural test
 (`cover_release_has_the_known_sanctioned_caller_set`,
@@ -2073,7 +2099,7 @@ Lockdown-off toggle, which reads no session posture — it decides via
 already `Off` is released too, not just an idle bridge; session teardown's
 own `apply_cover_disposition`, ordered after routes so the release never precedes
 the tunnel it covered; and the tray's Unblock action (`handle_unblock`,
-below), which deliberately bypasses `ProxyManager` (and the lock a wedged
+below), which deliberately bypasses `ProxyManager` (and the proxy lock a wedged
 teardown may hold) rather than routing through one of the other three.
 Turning the kill switch off, from either surface, now releases immediately
 rather than waiting for the next bridge start.
@@ -2910,9 +2936,14 @@ Disclosed residuals:
    this window — it derives from the running session, not an OS probe of the
    cover.
 
-1. On macOS a state file that cannot be read costs the host its captured
-   pre-cover pf rules (the release falls back to the default ruleset) and
-   leaks a pf enable refcount until reboot.
+1. On macOS a state file that is unusable (corrupt, or at a version this
+   release does not read) costs the host its captured pre-cover pf rules (the
+   release falls back to the default ruleset) and, when no token can be read
+   out of it, leaks a pf enable refcount until reboot. One that cannot be read
+   at all is left in place, and the release answers an error after its
+   restore. Every later release answers that error until the file reads
+   again, and the pf enable refcount stays held meanwhile; once the restore
+   held, a held refcount blocks nothing.
 
 1. An unreadable `bridge-lockdown.json` is read through two named folds of
    `lockdown_state::Intent`, not one bool, because the consumers want
@@ -2926,7 +2957,10 @@ Disclosed residuals:
    that only arrives after `routing.install`, and `consent_gate` still asks
    for informed consent because no standing cover holds the update gap. The
    tray can therefore read `Lockdown: On (warning: not engaged)` there, which
-   is the honest rendering.
+   is the honest rendering. The start's adoption promotion
+   (`promote_unrecorded`, `Intent::admits_adoption_promotion`) writes only over
+   `Unset`: an unreadable record already reads armed, and a write over it could
+   turn a user's `Off` (a newer or obsolete schema, a garbled write) into `On`.
 
 1. Startup reconciliation is a **20-cell table** over two measured axes, not
    two bools — `decide_cover_recovery(Intent, CoverPresence)` in
@@ -2940,8 +2974,10 @@ Disclosed residuals:
    `Intent::Off` **and** an actionable presence; `Adopt` requires an
    actionable presence with an intent of `On`/`Unreadable`/`Unset`, and
    `Unset` additionally requires positive evidence; the intent file is
-   repaired to `enabled: true` only on `Presence::Live` with an `Unset` or
-   `Unreadable` intent, never inferred.
+   repaired to `enabled: true` only on `Presence::Live` with an `Unset`
+   intent, never inferred. An `Unreadable` record is adopted over and left as it
+   is: it already reads armed and may hold the user's `Off`, which a write would
+   turn into `On`.
 
    `Live` means **any residue**, not the whole cover: the Windows sweeps loop
    delete-by-key with every return code discarded, over the persistent filters
@@ -3126,6 +3162,59 @@ Disclosed residuals:
    claim is that it is never touched at startup without an explicit recorded
    "off".
 
+#### The cover lock
+
+Every mutation of a fail-closed cover inside the bridge process runs under one lock per state directory,
+`failclosed::CoverLock` ([`cover_lock.rs`](crates/tun-engine/src/routing/failclosed/cover_lock.rs)).
+
+- **What it excludes.** An engage, a guard's release or drop, a sweep (`release_all`, `disengage_lockdown`,
+  `recover_cover`) and crash recovery. A decision that reads cover state (the kill-switch intent, the target, the
+  measured presence) is made from a fresh read taken inside the section that acts on it, so nothing changes between the
+  read and the act. Mutators take `&CoverLock`, readers take a path, so a mutation without the lock does not compile.
+  The mutators are the facade's engage, release, sweep and TUN-permit reclaim (`reclaim_stale_tun_permit`) functions,
+  the platform functions beneath them, the pf records' `swap` and `clear_if_token`, and the record writers
+  (`lockdown_state::{set_enabled, promote_unrecorded}`, the boot-time witness's writes). Every function that only reads
+  cover records or OS state takes a path (`lockdown_cover_presence`, `pf_record::read`, `boottime_witness::load` and the
+  intent loads are some): a read outside the lock races a locked writer as the old or the new state, and a read that
+  decides a write is taken again under the lock.
+  The platform `release_all` and `disengage_lockdown` are called only through the facade's `sweep_with_witness`, on
+  every platform: through the facade's `disengage_lockdown` and `release_all` (the Windows guard's `Drop` calls
+  `disengage_lockdown`), while the macOS guard's `Drop` and failed-engage back-out call `sweep_with_witness`
+  directly, so a `pf_on_any_host` build reaches macOS's `pfctl` rather than another host's sweep. The
+  sweep calls `outdate_stamps` for every kind it confirmed released, and adds the boot-time witness where a platform
+  arms boot-time keys (Windows, `STANDING_COVER_ARMS_BOOT_TIME`).
+- **One directory and one owner, from the routing provider.** The bridge's state directory is read from one place,
+  `Routing::state_dir()`, the directory `Routing::lock_covers` locks; the uid/gid its records are chowned to is read
+  from `Routing::owner()`. `ProxyManager`, `IpcState` and the boot functions hold no copy of either, so a handler's
+  records and its cover lock cannot name different directories or owners, and no function takes both a manager or
+  routing and a state directory or an owner. Functions that act on a directory alone take a path. Liveness and route
+  recovery also take the owner to give the files they write. DNS recovery and plugin reap take none and never choose
+  one: they remove a record, rename it aside, or (plugin reap) rewrite it with `KeepOwner`. Outside `Routing`'s
+  methods, a function that holds a routing takes the cover lock from it; nothing public takes a `CoverLock` beside a
+  manager or a routing.
+- **Order.** `state.proxy` (X), then the cover lock, then the record files' own locks and the witness lock. A section
+  is a synchronous function or a `spawn_blocking` closure: `CoverLock` is `!Send` and `!Sync` (`a_cover_lock_is_neither_send_nor_sync`), so a
+  future cannot hold it across an `.await` and a `&CoverLock` stays on the acquiring thread. `Routing::lock_covers` takes the lock for the provider's own directory;
+  `CoverLock::acquire` is for code with no provider (the cutover, crash recovery, a test's escape). The tray's Unblock
+  takes no X.
+- **Stamps.** A guard keeps the `InstallStamp` of its install: `stamp_install(kind)` runs after the OS step succeeded,
+  and `outdate_stamps(kind)` after a completed sweep released that kind (a kind whose release failed keeps its stamp, so
+  a held guard's drop retries). A release or drop deletes only while its stamp is current, so a guard that outlived its
+  cover deletes nothing: Windows keys are fixed and a macOS cover owns one pf token. `CoverGuard::is_current` is the
+  lock-free read, for a report; a decision reads it inside the section.
+- **Drop rule.** A guard's `Drop` is the only code that deletes. On a thread that already holds the lock for that
+  directory it deletes under it, through a non-owning view of the held lock that `InstallStamp::release_on_drop` hands
+  to the delete, so a cover dropped by an early return or an unwind inside a section neither deadlocks nor panics while
+  unwinding; on any other thread `release_on_drop` acquires. `CoverGuard::release(self, &CoverLock)` is the explicit form: it asserts the lock is the guard's directory's, then drops. `CoverLock::acquire` on
+  a directory this thread already holds panics, where a std mutex would hang.
+- **In-process only.** `hole bridge unlock`, the uninstall and the cutover run with no live bridge (`BridgeLiveness`),
+  so nothing out of process writes a cover record while a bridge runs, and the lock does not try to exclude it.
+- **Cost, disclosed.** An Unblock waits for an engage in flight, and a start's persist waits for an Unblock's release.
+  A start that begins during an Unblock waits, then decides from the persisted state: it reads `Off`, installs no cover
+  and proceeds uncovered. A covered start whose Unblock committed between its handler
+  and the lock installs no transient cover: `unblock_generation` is read by the handler before the proxy lock and
+  compared under the cover lock.
+
 #### Cover ownership
 
 "Who holds a fail-closed cover" is no longer answered from in-process state at
@@ -3176,7 +3265,8 @@ holds the gap, so consent is moot.
 
 Leak-correctness rides the **standing lockdown cover**, not a transient one. The
 bridge's marker-conditional shutdown sees the marker and `disarm`s the cover
-(persist-without-disengage via `std::mem::forget`) instead of dropping it, so the
+(persist-without-disengage: the guard is consumed and emptied, so its `Drop`
+disengages nothing) instead of dropping it, so the
 WFP/pf filters survive the restart and the new bridge re-adopts them
 (`decide_cover_recovery == Adopt`). The `cutover::os::CutoverOs` effects trait
 exposes no cover-mutating method, so a cutover structurally cannot engage a

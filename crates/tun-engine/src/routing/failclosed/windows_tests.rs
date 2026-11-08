@@ -1007,6 +1007,70 @@ fn a_clean_or_already_swept_host_disengages_successfully() {
     assert!(disengage_verdict(None, &[], ArmingWitness::Unset).into_result().is_ok());
 }
 
+// `release_all`'s per-kind release ------------------------------------------------------------------------------------
+//
+// A held guard stops deleting once a sweep released its kind (its keys are gone, and a delete would hit whatever a
+// later engage put there), and keeps retrying while a sweep did not. One kind's refused delete must not decide
+// the other's.
+
+const ACCESS_DENIED: u32 = 5;
+
+/// `release_all`'s verdict over one lockdown key and one transient key answering the given codes.
+fn release_verdict_over(lockdown_code: u32, transient_code: u32) -> SweepOutcome {
+    release_all_verdict(
+        None,
+        &[swept("lockdown filter", lockdown_code)],
+        &[swept("transient filter", transient_code)],
+        ArmingWitness::Unset,
+    )
+}
+
+// The `a_release_all_*` tests below are pure verdict tests, labelled because nextest's `global_net_state` filter
+// sweeps in their `release_all_` name.
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn a_release_all_whose_lockdown_deletes_failed_still_releases_the_transient_kind() {
+    let outcome = release_verdict_over(ACCESS_DENIED, ERROR_SUCCESS.0);
+    assert_eq!(outcome.released(), [CoverKind::Transient]);
+    assert!(outcome.into_result().is_err(), "the failure still travels");
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn a_release_all_whose_transient_deletes_failed_still_releases_the_lockdown_kind() {
+    let outcome = release_verdict_over(ERROR_SUCCESS.0, ACCESS_DENIED);
+    assert_eq!(outcome.released(), [CoverKind::Lockdown]);
+    assert!(outcome.into_result().is_err(), "the failure still travels");
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn a_release_all_whose_deletes_failed_for_both_kinds_releases_neither() {
+    assert_eq!(release_verdict_over(ACCESS_DENIED, ACCESS_DENIED).released(), []);
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn a_release_all_that_found_nothing_to_delete_releases_both_kinds() {
+    let outcome = release_verdict_over(FWP_E_FILTER_NOT_FOUND_DWORD, FWP_E_FILTER_NOT_FOUND_DWORD);
+    assert_eq!(outcome.released(), [CoverKind::Lockdown, CoverKind::Transient]);
+    assert!(outcome.into_result().is_ok());
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn a_release_all_that_could_not_reach_the_firewall_releases_neither_kind() {
+    let outcome = release_all_verdict(Some(0x8032_0001), &[], &[], ArmingWitness::Unset);
+    assert_eq!(outcome.released(), []);
+}
+
+#[skuld::test]
+fn a_disengage_releases_the_lockdown_kind_only_when_every_delete_held() {
+    assert_eq!(
+        disengage_verdict(None, &[swept("k", ERROR_SUCCESS.0)], ArmingWitness::Unset).released(),
+        [CoverKind::Lockdown]
+    );
+    assert_eq!(
+        disengage_verdict(None, &[swept("k", ACCESS_DENIED)], ArmingWitness::Unset).released(),
+        []
+    );
+}
+
 // What `bridge unlock` hands back -------------------------------------------------------------------------------------
 //
 // #1010: `disengage_lockdown` used to return a bare `Ok`, defended by "the
@@ -1867,7 +1931,8 @@ fn reclaim_stale_tun_permit_resolves_the_given_name() {
         result: std::sync::Mutex::new(Some(Ok(0x1234))),
         called_with: std::sync::Mutex::new(None),
     };
-    reclaim_stale_tun_permit(&resolver, "some-other-tun");
+    let dir = tempfile::tempdir().unwrap();
+    reclaim_stale_tun_permit(&CoverLock::acquire(dir.path()), &resolver, "some-other-tun");
     assert_eq!(
         resolver.called_with.into_inner().unwrap().as_deref(),
         Some("some-other-tun"),
@@ -2080,7 +2145,7 @@ fn reclaim_stale_tun_permit_does_not_discard_delete_codes() {
     // `let _ = FwpmFilterDeleteByKey0(...)`, silently discarding the exact
     // return code that means a filter is STILL blocking egress. Assert the
     // source routes the TUN-permit deletes through the same
-    // `first_delete_failure` fold `Cover::drop`'s Lockdown arm and
+    // `first_delete_failure` fold `disengage_lockdown` and
     // `delete_all` use, rather than re-running the real FWPM call under an
     // access-denied DACL to observe it (this file has no such fixture).
     let src = include_str!("windows.rs");

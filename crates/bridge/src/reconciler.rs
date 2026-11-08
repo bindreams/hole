@@ -6,7 +6,6 @@
 //! performs I/O: every function is a table lookup from measured/decided
 //! inputs to a step, and the actual driving of those steps lives elsewhere.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -14,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tun_engine::routing::failclosed::lockdown_state::Intent;
 use tun_engine::routing::{CoverPresence, Routing};
 
+use crate::coverage::Coverage;
 use crate::dns::system::Dns;
 use crate::proxy::Proxy;
 use crate::proxy_manager::{ProxyManager, ProxyState};
@@ -278,7 +278,7 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// that macOS pf rules do not survive a reboot, so an armed user egresses in
 /// the clear until a connect re-engages the cover; reconciling at boot makes
 /// that connect happen sooner, but a boot connect that FAILS engages nothing
-/// at all (it is deliberately uncovered — see `start_cancellable`'s `covered`
+/// at all (it is deliberately uncovered — see `start_cancellable`'s `Coverage`
 /// argument below). Closing #617 needs a cover that survives reboot on its
 /// own; see #1000.
 ///
@@ -300,7 +300,7 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// So `Phase::Cover(Engage)` is a no-op in this driver — the standing cover's
 /// actual engage happens inside `start_cancellable`'s own
 /// `standing_cover_expected()` gate, once the TUN device and routes it needs
-/// exist. `start_cancellable` is called with `covered = false`, so no
+/// exist. `start_cancellable` is called with `Coverage::Uncovered`, so no
 /// transient cover holds the connect window when the lockdown intent is off —
 /// a boot auto-connect that fails leaves the host reachable rather than
 /// blocked.
@@ -314,20 +314,24 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// `Off` so a later status read (or a session-event write, should one ever
 /// race this early) sees the same target this pass reconciles toward, not
 /// the stale one it overrode.
-pub async fn reconcile_once<P, R, D>(
-    state_dir: &Path,
-    owner: Option<(u32, u32)>,
-    proxy: &Arc<Mutex<ProxyManager<P, R, D>>>,
-    cancel: &CancellationToken,
-) where
+pub async fn reconcile_once<P, R, D>(proxy: &Arc<Mutex<ProxyManager<P, R, D>>>, cancel: &CancellationToken)
+where
     P: Proxy,
-    R: Routing,
+    R: Routing + 'static,
     D: Dns,
 {
-    let pref = target::load_startup_preference(state_dir);
-    let state_dir_owned = state_dir.to_path_buf();
+    // X first, then the cover lock (the order is `state.proxy` -> cover lock). The startup preference is read under
+    // the lock, in the same section that applies it: an Unblock that landed between a read and the apply would
+    // otherwise have its `Off` overwritten from the candidate it cleared, and the boot would reconnect to the
+    // server the user just escaped.
+    let mut pm = proxy.lock().await;
+    let routing = pm.routing_handle();
+    let state_dir = routing.state_dir().to_path_buf();
+    let owner = routing.owner();
     let target = match tokio::task::spawn_blocking(move || {
-        target::apply(&state_dir_owned, owner, move |current| {
+        let lock = routing.lock_covers();
+        let pref = target::load_startup_preference(lock.state_dir());
+        target::apply(lock.state_dir(), owner, move |current| {
             target::resolve_startup_target(current, pref.on_startup, pref.candidate)
         })
     })
@@ -339,7 +343,7 @@ pub async fn reconcile_once<P, R, D>(
                 error = &error as &dyn std::error::Error,
                 "reconcile_once: failed to persist the startup-resolved target; reading current disk state instead of guessing"
             );
-            target::load(state_dir)
+            target::load(&state_dir)
         }
         Err(error) => {
             tracing::error!(
@@ -350,7 +354,6 @@ pub async fn reconcile_once<P, R, D>(
         }
     };
 
-    let mut pm = proxy.lock().await;
     let intent = pm.effective_lockdown_intent();
     let presence = pm.cover_presence();
     let session_live = pm.state() == ProxyState::Running;
@@ -364,15 +367,33 @@ pub async fn reconcile_once<P, R, D>(
             // `Routing::release_all_covers` for why that costs the operator
             // message and not the evidence (the sweep persists the boot-time
             // witness before returning).
-            Phase::Cover(CoverStep::Release) => match pm.routing_handle().release_all_covers() {
-                Ok(()) => pm.set_standing_cover_adopted(false),
-                Err(error) => {
-                    tracing::warn!(
-                        error = &error as &dyn std::error::Error,
-                        "reconcile_once: failed to release a stray standing cover"
-                    );
+            Phase::Cover(CoverStep::Release) => {
+                // A sync section: the cover lock is never held across an `.await`. The tunnel phase may have run
+                // since the decision above (`step_order` puts a release after it), and an Unblock may have landed,
+                // so the intent, presence and target are read again under the lock and the release happens only if
+                // it is still due.
+                let released = {
+                    let routing = pm.routing_handle();
+                    let lock = routing.lock_covers();
+                    let intent = pm.effective_lockdown_intent();
+                    let presence = routing.lockdown_cover_presence();
+                    let target = target::load(lock.state_dir());
+                    match cover_step(intent, presence, &target) {
+                        CoverStep::Release => Some(routing.release_all_covers(&lock)),
+                        CoverStep::Hold | CoverStep::Engage => None,
+                    }
+                };
+                match released {
+                    None => tracing::debug!("reconcile_once: the stray standing cover is no longer due for release"),
+                    Some(Ok(())) => pm.set_standing_cover_adopted(false),
+                    Some(Err(error)) => {
+                        tracing::warn!(
+                            error = &error as &dyn std::error::Error,
+                            "reconcile_once: failed to release a stray standing cover"
+                        );
+                    }
                 }
-            },
+            }
             // Engaging happens inside `start_cancellable` below, not here —
             // see the fn doc.
             Phase::Cover(CoverStep::Engage) | Phase::Cover(CoverStep::Hold) => {}
@@ -385,7 +406,7 @@ pub async fn reconcile_once<P, R, D>(
                 // SCM Stop arriving mid-boot abandons the auto-connect instead
                 // of racing it. A token minted here would be one
                 // nothing else holds: uncancellable by construction.
-                // `covered = false`: a boot auto-connect that fails leaves the
+                // `Coverage::Uncovered`: a boot auto-connect that fails leaves the
                 // host REACHABLE. The transient block-until-connected cover
                 // would block all egress on a path the user never opted into,
                 // so any bug in the connect sequence strands them with no
@@ -393,7 +414,10 @@ pub async fn reconcile_once<P, R, D>(
                 // it prevents. Users who want the strict trade turn the kill
                 // switch on, which engages the STANDING cover instead; that
                 // path is untouched and still holds on failure.
-                if let Err(error) = pm.start_cancellable(config, false, cancel.child_token()).await {
+                if let Err(error) = pm
+                    .start_cancellable(config, Coverage::Uncovered, cancel.child_token())
+                    .await
+                {
                     tracing::warn!(
                         error = &error as &dyn std::error::Error,
                         "reconcile_once: failed to start the persisted target"

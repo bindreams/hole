@@ -11,9 +11,8 @@
 // "Bridge cancellation contract" carve-out).
 #![allow(clippy::disallowed_methods)]
 
-use super::proxy_manager_tests::{rt, test_config, MockProxy, MockRouting, MockRoutingState};
+use super::proxy_manager_tests::{covered_now, rt, test_config, MockProxy, MockRouting, MockRoutingState};
 use super::*;
-use crate::proxy::ProxyError;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tun_engine::routing::failclosed::lockdown_state;
@@ -32,15 +31,15 @@ async fn covered_start_holding_the_cover(
 
     let routing = MockRouting::new(dir.path().to_path_buf());
     let st = routing.state();
-    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
-    let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
+    let mut pm = ProxyManager::new(MockProxy::new(), routing);
     let mut cfg = test_config();
     cfg.server.server = closed.ip().to_string().into();
     cfg.server.server_port = closed.port();
     cfg.dns.enabled = true;
     cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
-    pm.start_cancellable(&cfg, true, tokio_util::sync::CancellationToken::new())
+    pm.start_cancellable(&cfg, covered_now(&pm), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap_err();
     assert!(
@@ -62,8 +61,8 @@ fn turn_lockdown_off_releases_a_stranded_cover_even_while_a_session_runs() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.start(&test_config()).await.unwrap();
 
         pm.turn_lockdown_off().expect("a running session must not error");
@@ -87,9 +86,10 @@ fn turn_lockdown_off_reports_an_unsaved_intent_while_a_session_runs() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        // No `.with_state_dir(..)`: the persist fails. `standing_cover_expected`
-        // also reads no state_dir here, so this covered start engages no
-        // standing cover — presence stays `Absent` and `cover_step` holds.
+        // A directory where the intent file belongs: the persist fails with a real OS error. The intent then reads
+        // `Unreadable`, which does not authorise a standing cover, so this covered start engages none: presence
+        // stays `Absent` and `cover_step` holds.
+        std::fs::create_dir(dir.path().join(lockdown_state::STATE_FILE_NAME)).unwrap();
         let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.start(&test_config()).await.unwrap();
 
@@ -97,9 +97,8 @@ fn turn_lockdown_off_reports_an_unsaved_intent_while_a_session_runs() {
             .turn_lockdown_off()
             .expect_err("an unpersistable intent must still be reported");
         assert!(
-            matches!(err, ProxyError::LockdownIntentNotPersisted { .. }),
-            "must be the SAME distinguishable error a failed release uses, not an opaque \
-             ProxyError::Runtime the IPC layer's generic 500 path can't tell apart from it: {err:?}"
+            matches!(err, LockdownOffError::IntentNotSaved(_)),
+            "must be distinguishable from a failed release: {err:?}"
         );
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
@@ -118,17 +117,30 @@ fn turn_lockdown_off_clears_a_stranded_standing_cover() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         // Simulate an OS probe finding a standing cover from a prior run —
         // the realistic shape of the escape's stranded-cover case.
         *st.cover_presence.lock().unwrap() = CoverPresence::Live;
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
 
         pm.turn_lockdown_off()
             .expect("a stranded cover must clear without error");
         assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1);
         assert!(!lockdown_state::load_enabled(dir.path()));
     });
+}
+
+/// Turning the switch on can fail only by its persist, so it reports the store's own error.
+#[skuld::test]
+fn turn_lockdown_on_reports_an_unsaved_intent_as_the_store_error() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory where the intent file belongs: the persist fails with a real OS error.
+    std::fs::create_dir(dir.path().join(lockdown_state::STATE_FILE_NAME)).unwrap();
+    let pm = ProxyManager::new(MockProxy::new(), MockRouting::new(dir.path().to_path_buf()));
+
+    let _: util::versioned_file::StoreError = pm
+        .turn_lockdown_on()
+        .expect_err("an unpersistable intent must be reported");
 }
 
 #[skuld::test]
@@ -142,8 +154,8 @@ fn turn_lockdown_off_releases_even_when_presence_reads_absent() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
 
         pm.turn_lockdown_off().expect("a clean manager must not error");
         assert_eq!(
@@ -164,11 +176,11 @@ fn turn_lockdown_off_failure_leaves_the_intent_on() {
         let st = routing.state();
         st.fail_release.store(true, Ordering::SeqCst);
         *st.cover_presence.lock().unwrap() = CoverPresence::Live;
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
 
         let err = pm.turn_lockdown_off().expect_err("a failed release must be reported");
-        assert!(!matches!(err, ProxyError::LockdownIntentNotPersisted { .. }));
+        assert!(matches!(err, LockdownOffError::Release(_)), "{err:?}");
         assert!(
             lockdown_state::load_enabled(dir.path()),
             "the intent must stay ON: flipping it off over a still-held cover would hide the tray escape"
@@ -183,20 +195,21 @@ fn turn_lockdown_off_reports_an_unsaved_intent_distinctly_from_a_failed_release(
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
         *st.cover_presence.lock().unwrap() = CoverPresence::Live;
-        // No `.with_state_dir(..)`: `set_lockdown_intent` hits its existing
-        // no-state_dir error path even though the release itself succeeds.
+        // A directory where the intent file belongs: the persist fails with a real OS error even though the release
+        // itself succeeds.
+        std::fs::create_dir(dir.path().join(lockdown_state::STATE_FILE_NAME)).unwrap();
         let mut pm = ProxyManager::new(MockProxy::new(), routing);
 
         let err = pm
             .turn_lockdown_off()
             .expect_err("an unpersistable intent must still be reported");
         assert!(
-            matches!(err, ProxyError::LockdownIntentNotPersisted { .. }),
+            matches!(err, LockdownOffError::IntentNotSaved(_)),
             "must be distinguishable from a failed release: {err:?}"
         );
         assert!(
-            util::error::chain(&err).any(|link| link.to_string().contains("no state_dir")),
-            "the persist failure behind the fixed sentence must stay in the chain: {err:?}"
+            util::error::chain(&err).any(|link| link.is::<util::versioned_file::StoreError>()),
+            "the persist failure behind the fixed sentence must stay in the chain as its own type: {err:?}"
         );
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
@@ -221,8 +234,8 @@ fn turn_lockdown_off_releases_when_the_target_is_unreadable() {
         // `cover_step` alone would (correctly) hold on. Only the unreadable
         // target should force the release here.
         std::fs::write(dir.path().join(target::STATE_FILE_NAME), b"not json").unwrap();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
 
         pm.turn_lockdown_off()
             .expect("an unreadable target must not block the explicit disarm");
@@ -246,8 +259,8 @@ fn turn_lockdown_off_releases_when_presence_is_unreachable() {
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
         *st.cover_presence.lock().unwrap() = CoverPresence::Unreachable;
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
 
         pm.turn_lockdown_off()
             .expect("an unreachable probe must not block the explicit disarm");
@@ -292,11 +305,11 @@ fn an_externally_released_cover_is_not_silently_reused() {
     // 18c09cd9 (transient half): a lock-free `handle_unblock` releasing every
     // OS-level cover while this manager isn't holding the lock leaves any
     // `PendingStart` a zombie — the OS objects it claims to hold are already
-    // gone. Without consuming `cover_invalidated`, a same-host retry would
-    // trust the zombie (`pending().is_none()` reads false) and skip
-    // re-engaging, believing an already-gone cover still protects it. The
-    // signal must force the zombie's own `Drop` (idempotent against an
-    // already-cleared cover either way) and a fresh, real re-engage.
+    // gone. Without noticing that a release took the cover since it was held, a
+    // same-host retry would trust the zombie (`pending().is_none()` reads
+    // false) and skip re-engaging, believing an already-gone cover still
+    // protects it. The stale stamp makes the retry drop the zombie (which
+    // deletes nothing) and engage a fresh, real cover.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let (mut pm, st) = covered_start_holding_the_cover(&dir).await;
@@ -309,7 +322,8 @@ fn an_externally_released_cover_is_not_silently_reused() {
 
         // Simulate `handle_unblock` releasing out-of-band, lock-free, while
         // this manager wasn't holding its lock.
-        pm.cover_invalidation_handle().store(true, Ordering::SeqCst);
+        let routing = pm.routing_handle();
+        routing.release_all_covers(&routing.lock_covers()).unwrap();
 
         // `test_config()`'s default server host is the same `127.0.0.1` as
         // `covered_start_holding_the_cover`'s closed probe, so this retry
@@ -318,14 +332,15 @@ fn an_externally_released_cover_is_not_silently_reused() {
         // attempt succeeds all the way through instead of failing again.
         let cfg = test_config();
 
-        pm.start_cancellable(&cfg, true, tokio_util::sync::CancellationToken::new())
+        pm.start_cancellable(&cfg, covered_now(&pm), tokio_util::sync::CancellationToken::new())
             .await
-            .expect("the invalidated zombie must not block a fresh, successful retry");
+            .expect("the superseded zombie must not block a fresh, successful retry");
 
         assert_eq!(
             st.cover_disengage_calls.load(Ordering::SeqCst),
-            2,
-            "one disengage for the dropped zombie, one for the retry's own successful-connect release"
+            1,
+            "the dropped zombie's stamp is stale, so its drop deletes nothing; only the retry's own \
+             successful-connect release disengages"
         );
         assert_eq!(
             st.cover_engage_calls.load(Ordering::SeqCst),
@@ -351,7 +366,7 @@ fn unblock_clears_the_adopted_cover_claim() {
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
         *st.cover_presence.lock().unwrap() = CoverPresence::Live;
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
         assert!(pm.lockdown_enabled());
 
@@ -373,7 +388,7 @@ fn a_failed_release_keeps_the_adopted_cover_claim() {
         let st = routing.state();
         st.fail_release.store(true, Ordering::SeqCst);
         *st.cover_presence.lock().unwrap() = CoverPresence::Live;
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
 
         pm.turn_lockdown_off().expect_err("a failed release must be reported");
@@ -398,7 +413,7 @@ fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
         assert_eq!(
