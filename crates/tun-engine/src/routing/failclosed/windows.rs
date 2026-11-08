@@ -2295,8 +2295,9 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witne
     SweepOutcome::per_kind(clearance, [(CoverKind::Lockdown, first_delete_failure(&codes))])
 }
 
+/// Sweep the transient cover's fixed filter set; the body of [`super::recover_cover`], called once at bridge start.
 /// `Ok` when every transient filter is gone. The engine not opening is an error too: nothing was swept, so a guard
-/// that still holds the cover must keep its stamp.
+/// that still holds the cover must keep its stamp. Both failures are warned here, the caller has no log of its own.
 pub fn recover_cover(_lock: &CoverLock, adopting: bool) -> Result<(), RoutingError> {
     // Windows is structurally safe regardless: the transient cover and the
     // standing lockdown use disjoint WFP filter GUIDs, so deleting the transient
@@ -2312,9 +2313,14 @@ pub fn recover_cover(_lock: &CoverLock, adopting: bool) -> Result<(), RoutingErr
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return Err(RoutingError::RouteSetup(format!(
+            let e = RoutingError::RouteSetup(format!(
                 "FwpmEngineOpen0 failed (0x{rc:08x}): the transient cover could not be swept"
-            )));
+            ));
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "transient cover sweep could not open the firewall engine; a cover left by a crashed run stays"
+            );
+            return Err(e);
         }
         let swept = delete_all(engine);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -2327,10 +2333,11 @@ pub fn recover_cover(_lock: &CoverLock, adopting: bool) -> Result<(), RoutingErr
 /// provider. Order matters: a sublayer/provider delete fails while filters
 /// still reference it. Each delete is idempotent — a "not found" return is
 /// ignored (recovery runs even when no cover is present) — but a code that is
-/// neither success nor not-found is a filter still blocking egress, and the
-/// callers (`Cover::drop`, `recover_cover`) can return nothing, so it is
-/// warned here. The sublayer/provider deletes stay best-effort: an orphaned
-/// empty sublayer holds no traffic.
+/// neither success nor not-found is a filter still blocking egress: it is
+/// warned here and returned as the first failure. `Cover::drop` discards the
+/// result (it can return nothing); `recover_cover` returns it. The
+/// sublayer/provider deletes stay best-effort: an orphaned empty sublayer holds
+/// no traffic.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn delete_all(engine: HANDLE) -> Result<(), RoutingError> {
     let codes: Vec<(&'static str, u32)> = swept_transient_keys()

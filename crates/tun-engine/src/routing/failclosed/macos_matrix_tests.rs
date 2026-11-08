@@ -142,7 +142,7 @@ impl EngageOps for Host<'_> {
     }
 
     fn transient_restore(&mut self, token: &str) {
-        disengage_with(Ok(Some(token)), false, self);
+        let _ = release_transient(Ok(Some(token)), false, self);
     }
 }
 

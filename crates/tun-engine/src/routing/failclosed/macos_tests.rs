@@ -856,7 +856,7 @@ fn recover_cover_with_an_unusable_record_naming_no_token_still_restores_the_host
 /// Version skew — the reachable vector — reaches `Unusable` only AFTER
 /// `serde_json` produced a complete record whose token is intact; the version
 /// check is the last thing to reject it. Dropping the record there discards the
-/// only copy of the `pfctl -E` ticket that exists, and `disengage_with(Ok(None), ..)`
+/// only copy of the `pfctl -E` ticket that exists, and `release_transient(Ok(None), ..)`
 /// then skips `pfctl -X` and, on a confirmed restore, CLEARS the file — so
 /// pf stays enabled until reboot with nothing left to release it.
 #[skuld::test]

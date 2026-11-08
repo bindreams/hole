@@ -766,13 +766,9 @@ fn drop_or_warn(token: &str, context: &str, drop: impl FnOnce(&str) -> Result<()
 /// (the live main ruleset) before Adopt.
 ///
 /// A failed restore keeps the token and the record, so the next sweep still sees a cover rather than a clean host over
-/// a block ([`release`]). Shared by `Drop`, `recover_cover` and the transient engage's back-out.
-fn disengage_with(token: Result<Option<&str>, RoutingError>, adopting: bool, ops: &mut dyn PfOps) {
-    let _ = release_transient(token, adopting, ops);
-}
-
-/// [`disengage_with`]'s release, with the outcome kept for a caller that must know whether the cover is gone.
-/// A failure is logged here.
+/// a block ([`release`]). `Ok` when the cover is gone; a failure is logged here and returned. Called by `Drop`
+/// and the transient engage's back-out (through [`disengage`], which discard it: neither can act on it) and by
+/// [`recover_cover_with`], whose caller outdates stamps only on `Ok`.
 fn release_transient(
     token: Result<Option<&str>, RoutingError>,
     adopting: bool,
@@ -794,9 +790,10 @@ fn release_transient(
     released
 }
 
-/// [`disengage_with`] over the real `pfctl` and record, for the cover whose token is `token`.
+/// [`release_transient`] over the real `pfctl` and record, for the cover whose token is `token`. The failure is
+/// already logged, and a `Drop` has nowhere to send it.
 fn disengage(token: &str, lock: &CoverLock) {
-    disengage_with(Ok(Some(token)), false, &mut RealPfOps { lock });
+    let _ = release_transient(Ok(Some(token)), false, &mut RealPfOps { lock });
 }
 
 pub fn recover_cover(lock: &CoverLock, adopting: bool) -> Result<(), RoutingError> {

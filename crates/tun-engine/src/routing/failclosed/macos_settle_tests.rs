@@ -89,7 +89,7 @@ fn a_clear_that_found_another_record_drops_nothing() {
         ..Default::default()
     };
 
-    disengage_with(Ok(Some("111")), false, &mut ops);
+    let _ = release_transient(Ok(Some("111")), false, &mut ops);
 
     assert_eq!(ops.log, vec!["reload_default", "clear_transient"]);
 }
@@ -405,13 +405,13 @@ fn a_release_over_records_that_could_not_be_read_restores_the_host_and_reports_t
     assert_eq!(ops.log, vec!["reload_default", "reload_default"]);
 }
 
-// disengage_with ======================================================================================================
+// release_transient ===================================================================================================
 
 #[skuld::test]
 fn a_disengage_restores_then_clears_then_drops() {
     let mut ops = RecordingPfOps::default();
 
-    disengage_with(Ok(Some("111")), false, &mut ops);
+    let _ = release_transient(Ok(Some("111")), false, &mut ops);
 
     assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
     assert_eq!(ops.cleared, vec![Some("111".to_owned())]);
@@ -425,7 +425,7 @@ fn a_disengage_whose_restore_fails_drops_nothing_and_clears_nothing() {
         ..Default::default()
     };
 
-    disengage_with(Ok(Some("111")), false, &mut ops);
+    let _ = release_transient(Ok(Some("111")), false, &mut ops);
 
     assert_eq!(
         ops.log,
@@ -438,16 +438,16 @@ fn a_disengage_whose_restore_fails_drops_nothing_and_clears_nothing() {
 fn an_adopting_disengage_skips_the_restore_but_still_clears_and_drops() {
     let mut ops = RecordingPfOps::default();
 
-    disengage_with(Ok(Some("111")), true, &mut ops);
+    let _ = release_transient(Ok(Some("111")), true, &mut ops);
 
     assert_eq!(ops.log, vec!["clear_transient", "drop_token"]);
 }
 
 #[skuld::test]
-fn a_disengage_with_no_token_on_record_drops_nothing() {
+fn a_release_with_no_token_on_record_drops_nothing() {
     let mut ops = RecordingPfOps::default();
 
-    disengage_with(Ok(None), false, &mut ops);
+    let _ = release_transient(Ok(None), false, &mut ops);
 
     assert_eq!(ops.log, vec!["reload_default", "clear_transient"]);
     assert_eq!(ops.cleared, vec![None]);
@@ -460,7 +460,7 @@ fn a_disengage_whose_token_will_not_drop_still_clears_its_record() {
         ..Default::default()
     };
 
-    disengage_with(Ok(Some("111")), false, &mut ops);
+    let _ = release_transient(Ok(Some("111")), false, &mut ops);
 
     assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
 }
@@ -603,7 +603,7 @@ fn a_release_never_drops_a_token_a_record_still_names() {
             name: "transient guard",
             standing: false,
             run: |_, ops| {
-                disengage_with(Ok(Some("111")), false, ops);
+                let _ = release_transient(Ok(Some("111")), false, ops);
                 None
             },
         },
@@ -869,7 +869,7 @@ fn a_guard_whose_record_a_later_engage_replaced_drops_nothing_and_leaves_the_new
     pf_record::swap(&lock, &recorded_cover("222"), None).unwrap();
     let mut ops = RecordingPfOps::over_records(&lock);
 
-    disengage_with(Ok(Some("111")), false, &mut ops);
+    let _ = release_transient(Ok(Some("111")), false, &mut ops);
 
     assert_eq!(ops.log, vec!["reload_default", "clear_transient"]);
     assert_eq!(
