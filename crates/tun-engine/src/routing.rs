@@ -1506,13 +1506,11 @@ where
     if decision.record_intent_on {
         match failclosed::lockdown_state::promote_unrecorded(&lock, owner) {
             Ok(failclosed::lockdown_state::PromoteOutcome::Wrote) => {}
-            // The decision and the promotion read the same file under the same lock.
-            Ok(failclosed::lockdown_state::PromoteOutcome::Declined) => {
-                debug_assert!(
-                    false,
-                    "the lockdown intent file declined the promotion the decision asked for"
-                )
-            }
+            // The promotion reads the file again, and that read can fail where the decision's did not: the record
+            // is then left as it is.
+            Ok(failclosed::lockdown_state::PromoteOutcome::Declined) => warn!(
+                "the lockdown intent file declined the promotion the decision asked for; the record is left as it is"
+            ),
             Err(e) => warn!(
                 error = &e as &dyn std::error::Error,
                 "could not repair the lockdown intent over a measured live cover"

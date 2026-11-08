@@ -1863,25 +1863,47 @@ fn recovery_does_not_adopt_over_an_off_that_lands_during_route_recovery() {
     );
 }
 
-/// Under the cover lock the decision's `Unset` is the file's: a promotion the file declines means the two disagree,
-/// which is a contract violation and not a state to carry on from.
-#[cfg(debug_assertions)]
-#[skuld::test(should_panic = "declined the promotion")]
-fn a_promotion_the_file_declines_is_a_contract_violation() {
+/// The decision's `Unset` and the file can still disagree under the lock (the second read can fail), so a promotion
+/// the file declines is warned and skipped: the record stays as it is and recovery carries on.
+#[skuld::test]
+fn a_promotion_the_file_declines_is_warned_and_skipped() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
     let dir = tempfile::tempdir().unwrap();
     {
         let lock = failclosed::CoverLock::acquire(dir.path());
         failclosed::lockdown_state::set_enabled(&lock, false, None).unwrap();
     }
-    recover_routes_with(
-        dir.path(),
-        None,
-        Some("hole-tun"),
-        |_, _c, _p| Ok(()),
-        |_lock, _adopting| {},
-        || Intent::Unset,
-        || Live,
-        |_lock, _action, _tun_name| {},
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        recover_routes_with(
+            dir.path(),
+            None,
+            Some("hole-tun"),
+            |_, _c, _p| Ok(()),
+            |_lock, _adopting| {},
+            || Intent::Unset,
+            || Live,
+            |_lock, _action, _tun_name| {},
+        );
+    }
+
+    let log = writer.snapshot();
+    assert!(
+        log.contains("declined the promotion"),
+        "the decline must be warned: {log}"
+    );
+    assert_eq!(
+        failclosed::lockdown_state::load_intent(dir.path()),
+        Intent::Off,
+        "the record is left as it was"
     );
 }
 
