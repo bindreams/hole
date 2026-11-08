@@ -745,15 +745,18 @@ fn releasing_a_held_cover_reports_it_only_when_it_was_still_in_force() {
     };
 
     let mut current = held(&routing);
-    assert!(current.release_pending());
+    assert!(current.release_pending(&routing.lock_covers()));
     assert!(matches!(current, Posture::Idle));
 
     let mut taken = held(&routing);
-    routing.release_all_covers(&routing.lock_covers()).unwrap();
-    assert!(!taken.release_pending());
+    let lock = routing.lock_covers();
+    routing.release_all_covers(&lock).unwrap();
+    assert!(!taken.release_pending(&lock));
+    drop(lock);
     assert!(matches!(taken, Posture::Idle));
 
-    assert!(!Posture::<MockProxy, MockRouting, SystemDns>::Idle.release_pending());
+    let lock = routing.lock_covers();
+    assert!(!Posture::<MockProxy, MockRouting, SystemDns>::Idle.release_pending(&lock));
 }
 
 #[skuld::test]

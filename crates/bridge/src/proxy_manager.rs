@@ -362,11 +362,16 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
         }
     }
 
-    /// Drop the held cover whatever its state, and report whether it was still the OS's when this call began: the
-    /// answer for a log that says a cover was released. A cover an Unblock already took is dropped silently.
-    fn release_pending(&mut self) -> bool {
-        let in_force = self.pending().is_some();
-        drop(self.take_pending());
+    /// Release the held cover under `lock` whatever its state, and report whether it was still the OS's: the
+    /// answer for a log that says a cover was released. The currency is read under the lock, where an Unblock
+    /// cannot change it, so a cover an Unblock already took is dropped silently and reports `false`.
+    #[must_use]
+    fn release_pending(&mut self, lock: &CoverLock) -> bool {
+        let Some(held) = self.take_pending() else {
+            return false;
+        };
+        let in_force = held.cover.is_current();
+        held.cover.release(lock);
         in_force
     }
 
@@ -899,8 +904,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .is_some_and(|b| b.host != config.server.server.expose());
         if stale {
             debug_assert!(self.posture.pending().is_some(), "stale implies a held cover");
-            self.posture.release_pending();
-            warn!("start for a different server while blocked: releasing the held cover before re-resolving");
+            if self.release_held_cover() {
+                warn!("start for a different server while blocked: releasing the held cover before re-resolving");
+            }
         }
 
         // Resolve the server IP over private DoH. A same-server retry under the
@@ -1010,8 +1016,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             CoverPlan::HandToLockdown => {
                 // Covered retry after the user enabled lockdown mid-blocked-state:
                 // release the held cover. This opens egress until the standing lockdown
-                // cover engages at routing.install — a brief, disclosed open window.
-                if self.posture.release_pending() {
+                // cover engages at routing.install — a brief, disclosed open window (open: bindreams/hole#758).
+                if self.release_held_cover() {
                     warn!(
                         "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
                          uncovered until the standing lockdown cover engages at connect"
@@ -1022,7 +1028,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // Manual (uncovered) connect or reload-while-blocked: fail-open by
                 // design. Releasing the held cover opens egress — logged so the fail-open
                 // has a visible disposition, never a silent drop.
-                if self.posture.release_pending() {
+                if self.release_held_cover() {
                     warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
                 }
             }
@@ -1192,7 +1198,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .filter(|b| b.host == host && b.resolver_permit != ech_resolver_permit)
             .map(|b| (b.resolver_permit, b.pin));
         if repair_fallback.is_some() {
-            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below.
+            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below
+            // (re-engaging over the live cover instead: open, bindreams/hole#758).
             if let Some(held) = self.posture.take_pending() {
                 held.cover.release(&lock);
             }
@@ -1273,6 +1280,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 }
             }
         }
+    }
+
+    /// [`Posture::release_pending`] under a cover lock taken here. The section has no `.await`: the lock is `!Send`.
+    /// A start with no held cover never takes the lock, so an Unblock holding it cannot make that start wait.
+    #[must_use]
+    fn release_held_cover(&mut self) -> bool {
+        if !matches!(self.posture, Posture::PendingStart(_)) {
+            return false;
+        }
+        let routing = Arc::clone(&self.routing);
+        let lock = routing.lock_covers();
+        self.posture.release_pending(&lock)
     }
 
     /// The one exit of a cancelled start, early or late: the user, or the start's own token, cancelled it, so the
