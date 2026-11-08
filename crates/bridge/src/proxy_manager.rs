@@ -902,11 +902,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .posture
             .pending()
             .is_some_and(|b| b.host != config.server.server.expose());
-        if stale {
-            debug_assert!(self.posture.pending().is_some(), "stale implies a held cover");
-            if self.release_held_cover() {
-                warn!("start for a different server while blocked: releasing the held cover before re-resolving");
-            }
+        if stale && self.release_held_cover() {
+            warn!("start for a different server while blocked: releasing the held cover before re-resolving");
         }
 
         // Resolve the server IP over private DoH. A same-server retry under the
@@ -1015,12 +1012,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             }
             CoverPlan::HandToLockdown => {
                 // Covered retry after the user enabled lockdown mid-blocked-state:
-                // release the held cover. This opens egress until the standing lockdown
-                // cover engages at routing.install — a brief, disclosed open window (open: bindreams/hole#758).
+                // release the held cover. The host is uncovered from here until the standing
+                // lockdown cover engages after the plugin chain and `routing.install` (open: bindreams/hole#1206).
                 if self.release_held_cover() {
                     warn!(
-                        "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
-                         uncovered until the standing lockdown cover engages at connect"
+                        "covered retry with lockdown newly enabled: releasing the held cover; the host is uncovered \
+                         until the standing lockdown cover engages at connect"
                     );
                 }
             }
@@ -1037,7 +1034,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // release/reuse decisions above — read once here so `start_inner`
         // (which can never observe `Posture::Session`, only `Idle`/
         // `PendingStart`) gets an explicit bool instead of recomputing it
-        // from session state.
+        // from session state. A lock-free read: a stale `true` (an Unblock took
+        // the cover meanwhile) only skips the reachability probe.
         let transient_pending = self.posture.pending().is_some();
 
         // Disclosed residual (see CONTRIBUTING.md's "Transient cutover
@@ -1289,8 +1287,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if !matches!(self.posture, Posture::PendingStart(_)) {
             return false;
         }
-        let routing = Arc::clone(&self.routing);
-        let lock = routing.lock_covers();
+        let lock = self.routing.lock_covers();
         self.posture.release_pending(&lock)
     }
 

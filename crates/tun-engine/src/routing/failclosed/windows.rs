@@ -2318,7 +2318,7 @@ pub fn recover_cover(_lock: &CoverLock, adopting: bool) -> Result<(), RoutingErr
             ));
             tracing::warn!(
                 error = &e as &dyn std::error::Error,
-                "transient cover sweep could not open the firewall engine; a cover left by a crashed run stays"
+                "transient cover sweep could not open the firewall engine, so it did not run"
             );
             return Err(e);
         }
