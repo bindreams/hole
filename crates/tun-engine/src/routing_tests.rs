@@ -1881,6 +1881,7 @@ fn a_promotion_the_file_declines_is_warned_and_skipped() {
             .with_ansi(false)
             .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
     );
+    let steps = std::cell::RefCell::new(Vec::new());
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
         recover_routes_with(
@@ -1888,12 +1889,17 @@ fn a_promotion_the_file_declines_is_warned_and_skipped() {
             None,
             Some("hole-tun"),
             |_, _c, _p| Ok(()),
-            |_lock, _adopting| {},
+            |_lock, adopting| steps.borrow_mut().push(format!("sweep(adopting={adopting})")),
             || Intent::Unset,
             || Live,
-            |_lock, _action, _tun_name| {},
+            |_lock, action, tun_name| steps.borrow_mut().push(format!("recover({action:?}, {tun_name:?})")),
         );
     }
+    assert_eq!(
+        steps.into_inner(),
+        ["recover(Adopt, Some(\"hole-tun\"))", "sweep(adopting=true)"],
+        "the decline must not stop the Adopt or the sweep"
+    );
 
     let log = writer.snapshot();
     assert!(
