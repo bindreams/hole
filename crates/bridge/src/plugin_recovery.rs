@@ -54,7 +54,7 @@ pub(crate) fn reap_loaded_with(
         Loaded::Absent => return,
         Loaded::Unreadable { error, .. } => {
             tracing::error!(
-                error = %util::error_chain::error_chain(&error),
+                error = &error as &dyn std::error::Error,
                 file = plugin_state::STATE_FILE_NAME,
                 "plugin state file could not be read; keeping it so the next start retries"
             );
@@ -98,7 +98,7 @@ pub(crate) fn reap_loaded_with(
                 // for it would litter forever.
                 tracing::error!(
                     pid = record.pid,
-                    error = %util::error_chain::error_chain(&e),
+                    error = &e as &dyn std::error::Error,
                     "recorded plugin identity cannot be restored on this host; nothing here can name it"
                 );
                 continue;
@@ -110,7 +110,7 @@ pub(crate) fn reap_loaded_with(
                 all_accounted = false;
                 tracing::warn!(
                     pid = record.pid,
-                    error = %util::error_chain::error_chain(&e),
+                    error = &e as &dyn std::error::Error,
                     "recorded plugin identity could not be checked on this host; keeping the file so the next start retries"
                 );
                 continue;
@@ -139,7 +139,7 @@ pub(crate) fn reap_loaded_with(
                     pid = record.pid,
                     token = record.token,
                     observation,
-                    error = %util::error_chain::error_chain(&e),
+                    error = &e as &dyn std::error::Error,
                     "failed to kill recorded plugin"
                 );
             }
@@ -192,7 +192,10 @@ fn clear_or_log(state_dir: &Path) {
             tracing::warn!("plugin state file could not be read at the clear, so it was kept")
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %util::error_chain::error_chain(&e), "failed to clear plugin state file"),
+        Err(e) => tracing::warn!(
+            error = &e as &dyn std::error::Error,
+            "failed to clear plugin state file"
+        ),
     }
 }
 

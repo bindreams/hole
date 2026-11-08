@@ -336,13 +336,16 @@ pub async fn reconcile_once<P, R, D>(
         Ok(Ok(target)) => target,
         Ok(Err(error)) => {
             tracing::error!(
-                error = %util::error_chain::error_chain(&error),
+                error = &error as &dyn std::error::Error,
                 "reconcile_once: failed to persist the startup-resolved target; reading current disk state instead of guessing"
             );
             target::load(state_dir)
         }
         Err(error) => {
-            tracing::error!(%error, "reconcile_once: startup-target resolution task panicked; treating target as unreadable");
+            tracing::error!(
+                error = &error as &dyn std::error::Error,
+                "reconcile_once: startup-target resolution task panicked; treating target as unreadable"
+            );
             Target::Unreadable
         }
     };
@@ -364,7 +367,10 @@ pub async fn reconcile_once<P, R, D>(
             Phase::Cover(CoverStep::Release) => match pm.routing_handle().release_all_covers() {
                 Ok(()) => pm.set_standing_cover_adopted(false),
                 Err(error) => {
-                    tracing::warn!(error = %util::error_chain::error_chain(&error), "reconcile_once: failed to release a stray standing cover");
+                    tracing::warn!(
+                        error = &error as &dyn std::error::Error,
+                        "reconcile_once: failed to release a stray standing cover"
+                    );
                 }
             },
             // Engaging happens inside `start_cancellable` below, not here —
@@ -388,7 +394,10 @@ pub async fn reconcile_once<P, R, D>(
                 // switch on, which engages the STANDING cover instead; that
                 // path is untouched and still holds on failure.
                 if let Err(error) = pm.start_cancellable(config, false, cancel.child_token()).await {
-                    tracing::warn!(error = %util::error_chain::error_chain(&error), "reconcile_once: failed to start the persisted target");
+                    tracing::warn!(
+                        error = &error as &dyn std::error::Error,
+                        "reconcile_once: failed to start the persisted target"
+                    );
                 }
             }
             Phase::Tunnel(TunnelStep::Hold) => {}

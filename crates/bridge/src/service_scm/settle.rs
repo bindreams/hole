@@ -356,7 +356,11 @@ impl<A: StopActor> Settle<'_, A> {
             Ok(()) => Ok(true),
             Err(error) => match service_gone(&error) {
                 Some(gone) if gone.answers_through_an_open_handle() => {
-                    warn!(%error, ?gone, "the SCM refused an arm; waiting on the service's processes instead");
+                    warn!(
+                        error = &error as &dyn std::error::Error,
+                        ?gone,
+                        "the SCM refused an arm; waiting on the service's processes instead"
+                    );
                     self.refused = true;
                     Ok(false)
                 }
@@ -379,7 +383,11 @@ impl<A: StopActor> Settle<'_, A> {
             if again.settle_step().is_a_stop_the_service_takes() {
                 return Err(SettleError::Stop(refused));
             }
-            info!(?again, error = %refused, "stop wait: the Stop was refused, but the service is no longer running");
+            info!(
+                ?again,
+                error = &refused as &dyn std::error::Error,
+                "stop wait: the Stop was refused, but the service is no longer running"
+            );
             return Ok(Next::Look(again));
         }
         match wait {

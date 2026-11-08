@@ -129,9 +129,9 @@ impl fmt::Display for Refusal {
 /// [`Refused::from_error`].
 ///
 /// The path is a filesystem path, so it can name an account (the lock sits in a
-/// user's profile). Neither `Display` nor `Debug` carries it: logging the error
-/// with `%e` or `?e` cannot leak it. [`Refused::path`] is the one way out, for
-/// a caller whose sink may hold a path.
+/// user's profile). Neither `Display` nor `Debug` carries it, and `Refused` has
+/// no `source()`. [`Refused::path`] is the one way out, for a caller whose sink
+/// may hold a path.
 pub struct Refused {
     path: PathBuf,
     why: Refusal,

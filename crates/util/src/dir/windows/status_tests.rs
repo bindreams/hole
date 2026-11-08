@@ -60,7 +60,7 @@ fn read_of_a_file_held_without_sharing_names_the_ntstatus_of_the_open() {
 }
 
 /// The outer error carries no OS code of its own: the code is the source's. Every reader of a code sees through
-/// the wrapper (`raw_os_error` of `error_chain`), `is_file_contention` among them.
+/// the wrapper (`util::error::raw_os_error`), `is_file_contention` among them.
 #[skuld::test]
 fn the_os_code_of_a_status_error_is_in_its_source_and_readers_see_through_the_wrapper() {
     let dir = tempfile::tempdir().unwrap();
@@ -71,7 +71,7 @@ fn the_os_code_of_a_status_error_is_in_its_source_and_readers_see_through_the_wr
 
     assert_eq!(err.raw_os_error(), None, "{err:?}");
     assert_eq!(original_code(&err), Some(32), "ERROR_SHARING_VIOLATION: {err:?}");
-    assert_eq!(crate::error_chain::raw_os_error(&err), Some(32), "{err:?}");
+    assert_eq!(crate::error::raw_os_error(&err), Some(32), "{err:?}");
     assert!(is_file_contention(&err), "{err:?}");
 }
 

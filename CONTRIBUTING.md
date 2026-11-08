@@ -641,10 +641,14 @@ fields"): the version is the only compatibility signal. For the lockdown intent,
 
 `Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
 lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
-the path, and logging the error with `%e` or `?e` cannot put a username in
-`bridge.log` (which the support bundle collects). `Refused::path()` is the one way
-out; a caller that wants it chooses a sink that may hold a path (`gui.log`), never
-the bridge log or the bundle.
+the path. `Refused` has no `source()`, and the `InvalidData` `io::Error` that holds it
+delegates to it, so logging that error as `error = &e as &dyn std::error::Error`
+([Logging an error](#logging-an-error)) renders one link, `refusing to lock: <reason>`.
+The reason is a fixed sentence or a uid, never a name or a path: the directory's
+refusal is folded into that `Display`, not a link of its own. That cannot put a username in
+`bridge.log` (which the support bundle collects), also when a caller's error holds it as
+a `#[source]`. `Refused::path()` is the one way out; a caller that wants it chooses a sink
+that may hold a path (`gui.log`), never the bridge log or the bundle.
 
 ### Privileged code in folders a user may own
 
@@ -4265,6 +4269,34 @@ rewriting files in a user-writable directory is an attack surface. The support
 bundle is scrubbed on collection instead, and its `REDACTION.txt` states the
 three residuals plainly.
 
+### Logging an error
+
+An error reaches a log as a value, in one form:
+
+```rust
+tracing::warn!(error = &e as &dyn std::error::Error, "what failed");
+```
+
+- **Boxed and borrowed.** A boxed error (`Box<dyn Error>`, with or without `+ Send + Sync`) and an `anyhow::Error` pass
+  as `error = &*b`, and a reference to one as `error = &**b`. When `e` is a reference to a concrete error, cast it
+  without the extra `&` (`error = e as &dyn std::error::Error`): `&&T` is not `'static`.
+- **The message never interpolates the error** (`{e}`, `%e`, `?e`): the field carries it, and the message would print
+  its first link a second time. The message names what failed.
+- **The renderer.** `YamlFormat` renders an error field as a YAML list of its `source()` chain, outermost first, each
+  link's `Display` as one item (a multi-line `Display` stays one item). The stock formatter that `galoshes` and
+  `garter-bin` install prints the same field as `error=<Display> error.sources=[..]`, so the call site is the same there.
+- **The type rule.** A variant's `Display` names what this layer failed to do and never formats its `source()`; a cause
+  is `#[source]` or `#[from]`. A `Display` that includes its cause prints it twice. A wrapper variant exposes its
+  inner error as its `source()` and is never `#[error(transparent)]`, which forwards `source()` past the inner value so
+  `find` and `raw_os_error` cannot reach it. A new wrapper is `#[error("<what failed>")] V(#[source] Inner)` (or
+  `#[from]`); the existing `#[error("{0}")]` wrappers are the transitional exception, and a logged chain shows their
+  inner text twice until they get text of their own.
+- **Reading a chain in code.** Use [`util::error`](crates/util/src/error.rs) (`chain`, `links`, `find`, `raw_os_error`);
+  do not write a `source()` loop by hand. What the walks reach is stated in the module doc.
+- **A value that is not an error stays as it is.** Third-party types with no `std::error::Error` impl and a `String`
+  made from an error are logged as they are; text a user reads (a dialog, a toast) is written from `user_message()` or
+  the type's `Display`, never from the log field.
+
 ### Logging directives (HOLE_BRIDGE_LOG)
 
 `HOLE_BRIDGE_LOG` takes a comma-separated list of `tracing` directives (default
@@ -4360,9 +4392,8 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   `gh release create` (`hole=true`, others `false`); without it GitHub's legacy
   semver+date heuristic can promote the wrong track (#308).
 - **garter publish is idempotent** — it queries crates.io and skips `cargo publish` if the version exists; a `dry_run` input runs `--dry-run` only.
-- **garter publish is blocked** — garter takes `cosca` as a git rev with no
-  version key, which `cargo package` refuses. It unblocks when the workspace pin
-  names a registry version, the final gate of #816.
+- **garter publishes against crates.io's `cosca`** — the workspace pins a registry
+  version, so `cargo package` accepts the dependency.
 - **Versions** live in each crate's `[package.metadata.hole-release].group`
   (ex-ray in `crates/ex-ray/version.toml`); validate with `cargo xtask version [--check --group <name> [--exact]]` (release CI uses `--exact`). The legacy
   `v0.1.0` tag predates the scheme and is ignored.

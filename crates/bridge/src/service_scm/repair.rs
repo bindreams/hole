@@ -63,7 +63,10 @@ pub fn display<S: StartRead>(session: &mut S) -> DisabledState {
             None => RecordState::Absent,
         };
         if let Err(error) = &start {
-            warn!(%error, "could not read the service's start type, so it is taken as not disabled");
+            warn!(
+                error = error as &dyn std::error::Error,
+                "could not read the service's start type, so it is taken as not disabled"
+            );
         }
         let disabled_by = start.ok().and_then(|start| RepairStep::of(record, start).disabled_by());
         return DisabledState::of(before.holder(), changer, disabled_by);
@@ -78,7 +81,10 @@ fn stamp<S: StartConfig>(session: &mut S) -> bool {
     match session.write_record() {
         Ok(()) => true,
         Err(error) => {
-            warn!(%error, "could not stamp the record with this process; a status read may call this change interrupted");
+            warn!(
+                error = &error as &dyn std::error::Error,
+                "could not stamp the record with this process; a status read may call this change interrupted"
+            );
             false
         }
     }

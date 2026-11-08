@@ -168,14 +168,20 @@ fn finish(state_dir: &Path, fully_settled: bool) {
                 false
             }
             Err(e) => {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "dns_recovery: failed to clear bridge-dns.json after full restore");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "dns_recovery: failed to clear bridge-dns.json after full restore"
+                );
                 false
             }
         };
         if !cleared {
             tracing::warn!("dns_recovery: superseding bridge-dns.json instead");
             if let Err(e) = dns_state::supersede(state_dir) {
-                tracing::warn!(error = %util::error_chain::error_chain(&e), "dns_recovery: failed to rename bridge-dns.json to the superseded name");
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "dns_recovery: failed to rename bridge-dns.json to the superseded name"
+                );
             }
         }
     } else {
@@ -184,7 +190,10 @@ fn finish(state_dir: &Path, fully_settled: bool) {
              preserving the file as bridge-dns.superseded.json. Run scripts/network-reset.py if DNS looks wrong."
         );
         if let Err(e) = dns_state::supersede(state_dir) {
-            tracing::warn!(error = %util::error_chain::error_chain(&e), "dns_recovery: failed to rename bridge-dns.json to the superseded name");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "dns_recovery: failed to rename bridge-dns.json to the superseded name"
+            );
         }
     }
 }

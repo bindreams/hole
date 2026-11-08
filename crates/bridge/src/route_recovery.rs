@@ -91,7 +91,7 @@ pub(crate) async fn record_recovery_outcome<P, R, D>(
             // always a no-op — but the guarantee this doc promises ("leaves
             // the claim false") should not rest on that call-ordering
             // invariant holding forever.
-            tracing::warn!(error = %e, "recover_routes task panicked");
+            tracing::warn!(error = &e as &dyn std::error::Error, "recover_routes task panicked");
             proxy.lock().await.set_standing_cover_adopted(false);
         }
     }

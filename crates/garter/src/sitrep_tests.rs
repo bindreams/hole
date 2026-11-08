@@ -225,3 +225,17 @@ fn any_other_bind_error_is_fatal_and_keeps_its_errno() {
         }
     }
 }
+
+#[skuld::test]
+fn a_start_error_is_an_error_that_displays_its_text() {
+    let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+    let conflict = StartError::BindConflict { errno: 98, addr };
+    let fatal = StartError::Fatal {
+        detail: "upstream refused".into(),
+        errno: None,
+    };
+    let as_error: [&dyn std::error::Error; 2] = [&conflict, &fatal];
+    let texts: Vec<String> = as_error.iter().map(|e| e.to_string()).collect();
+    assert_eq!(texts, ["bind conflict on 127.0.0.1:80 (errno 98)", "upstream refused"]);
+    assert!(as_error.iter().all(|e| e.source().is_none()));
+}

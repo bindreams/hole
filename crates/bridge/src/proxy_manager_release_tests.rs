@@ -194,10 +194,9 @@ fn turn_lockdown_off_reports_an_unsaved_intent_distinctly_from_a_failed_release(
             matches!(err, ProxyError::LockdownIntentNotPersisted { .. }),
             "must be distinguishable from a failed release: {err:?}"
         );
-        let chain = util::error_chain::error_chain(&err).to_string();
         assert!(
-            chain.contains("no state_dir"),
-            "the persist failure behind the fixed sentence must stay in the chain: {chain}"
+            util::error::chain(&err).any(|link| link.to_string().contains("no state_dir")),
+            "the persist failure behind the fixed sentence must stay in the chain: {err:?}"
         );
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),

@@ -27,7 +27,11 @@ pub fn log_snapshot(phase: &'static str) {
     let output = match run_netsh() {
         Ok(o) => o,
         Err(e) => {
-            warn!(phase, error = %util::error_chain::error_chain(&e), "wfp snapshot: netsh invocation failed");
+            warn!(
+                phase,
+                error = &e as &dyn std::error::Error,
+                "wfp snapshot: netsh invocation failed"
+            );
             return;
         }
     };

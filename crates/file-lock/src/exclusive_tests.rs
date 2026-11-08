@@ -277,6 +277,13 @@ fn assert_refused(path: &Path, owner: Option<(u32, u32)>) {
             !format!("{err:?}").contains(&*shown),
             "{entry}: Debug must not carry the path, got: {err:?}"
         );
+        // The logged form (`error = &err as &dyn Error`) renders every `source()` link's `Display`.
+        for link in util::error::chain(&err) {
+            assert!(
+                !link.to_string().contains(&*shown),
+                "{entry}: a source link must not carry the path, got: {link}"
+            );
+        }
     }
 }
 

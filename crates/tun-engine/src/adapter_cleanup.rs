@@ -91,7 +91,7 @@ pub fn remove_adapter(tun_name: &str) {
         Err(e) => {
             warn!(
                 tun = tun_name,
-                error = %util::error_chain::error_chain(&e),
+                error = &e as &dyn std::error::Error,
                 "failed to spawn Remove-NetAdapter; adapter may be leaked"
             );
         }

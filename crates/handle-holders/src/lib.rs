@@ -76,7 +76,7 @@ pub fn log_holders(path: &Path) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
-                error = %e,
+                error = &e as &dyn std::error::Error,
                 path = %path.display(),
                 "could not canonicalize path; skipping holder enumeration",
             );
@@ -88,7 +88,7 @@ pub fn log_holders(path: &Path) {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(
-                error = %e,
+                error = &e as &dyn std::error::Error,
                 path = %canonical.display(),
                 "failed to enumerate file-lock holders",
             );

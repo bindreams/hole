@@ -236,7 +236,7 @@ fn foreground_run_accepts_ipc_and_shuts_down() {
             tokio::select! {
                 result = server.run() => {
                     if let Err(e) = result {
-                        tracing::error!(error = %e, "IPC server error");
+                        tracing::error!(error = &e as &dyn std::error::Error, "IPC server error");
                     }
                 }
                 _ = shutdown_rx => {
