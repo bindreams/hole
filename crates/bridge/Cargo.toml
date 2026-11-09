@@ -129,6 +129,8 @@ tar = "0.4"
 # `NotifyChangeEventLog`, for the restart probe's wait on the SCM's log entry;
 # tests only, so the production `windows` feature set stays as it is.
 windows = { version = "0.62", features = ["Win32_System_EventLog"] }
+# The SCM log entries the restart probe reads, as `wevtutil /f:xml` renders them.
+roxmltree = "0.21"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 payload-archive = { path = "../payload-archive" }

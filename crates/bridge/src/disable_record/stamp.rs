@@ -98,6 +98,11 @@ impl Stamp {
         }
     }
 
+    /// The creation `FILETIME`, 100 ns ticks since 1601.
+    pub fn created(&self) -> u64 {
+        self.created
+    }
+
     /// `"<pid>:<created>"`, both decimal.
     pub fn encode(&self) -> String {
         format!("{}:{}", self.pid, self.created)
