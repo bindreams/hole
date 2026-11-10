@@ -760,7 +760,8 @@ symlink or a FIFO planted at a name it acts on changes nothing it leads to, and 
 (or removes it) or refuses it with a typed refusal, and a second run in the same layout, with or without a user's link
 on the path, succeeds. A source file that opens a `Dir`, calls `make_dir_and_free_name` or `append_own_file`, or
 writes a `VersionedFile`, and has no row in its table fails
-`every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. The readers have the same kind
+`every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them (galoshes' extraction folder,
+`embedded/sealed_dir.rs`, is one: `hole-bridge` dev-depends on `galoshes` for its row). The readers have the same kind
 of table (`no_reader_reads_through_a_symlink_planted_at_its_name`, `no_reader_waits_on_a_fifo_planted_at_its_name`,
 and `state_symlink_tests.rs` in `tun-engine`): each writes a valid file, plants the name, and the reader must not
 report the file the name leads to. A hard link is the file's own inode, so only `read_vouched`'s ownership and link-count rule tells it from the
@@ -3415,6 +3416,29 @@ to run on mismatch. At startup galoshes extracts ex-ray to
 (`$XDG_RUNTIME_DIR/galoshes` else the platform cache dir; bails if neither is
 set) and probes it for `noexec` (statvfs/statfs) — the Linux `/tmp` fallback was
 removed because tmpfs is commonly `noexec` (#401).
+
+galoshes can run as root with that directory in a user's profile, so what it execs is what it hashed: the directory
+is walked through handles (`util::dir::Dir`), the file is opened first through that handle
+(`OpenFile::ReadPinned`: never following a link, regular files only, and on unix only one the running user owns that
+group and other cannot write and the owner can execute), hashed through it, and the handle is kept through the spawn.
+Linux execs `/proc/self/fd/N`. Windows opens with `FILE_SHARE_READ` only, which pins the file's real path, the one
+that is run: nobody can write, delete or rename the file or a folder above it (measured), so the path is read off the
+handle (`GetFinalPathNameByHandleW`) and a junction on the name it was given cannot be retargeted to other bytes. macOS
+cannot exec a descriptor, so it execs the name and accepts the directory only if every component of the path the
+held handle resolves to (`F_GETPATH`) is the running user's or root's, not writable by group or other, and not on a
+volume mounted `MNT_IGNORE_OWNERSHIP` (`embedded/sealed_dir.rs`); an ACL on a component is its owner's own grant and
+is not inspected. Under root that is a root-owned path, so macOS takes the default directory from the account's home
+(`getpwuid_r`), not `$HOME`, which an elevated launch leaves at the invoking user's. A directory that exists is judged as
+it is, never repaired; one galoshes makes is made `0o700` in the `mkdirat` itself. A leftover directory the running user
+cannot use (root-owned from a `sudo` run, or on macOS a leaf group or other can write) is moved aside to
+`<name>.unusable.<n>`, as a stale binary is replaced, because the user owns what it is in (instances take turns at it
+through `<name>.replace.lock` beside the directory, so one never moves aside the directory another has just made); a
+directory on the way to it is not the user's to replace and is refused with the typed `SealedDirRefusal`. A file at the name that is missing, a
+link, not a regular file, unreadable to the user, or held open for writing by a foreign process is replaced; if the
+replace fails, the start fails with its cause. Instances starting together take turns through `<name>.lock` beside the
+binary (`file_lock::Exclusive`, held to the end of `prepare_in`): no replacement of the name can then meet a file
+another instance has just published and still holds open for writing, which fails the Windows pin and makes Linux
+`execve` fail with `ETXTBSY`.
 
 **Client TLS dial paths must fail closed on ECH.** Every client TLS dial path in
 the vendored `ex-ray/third_party/v2ray-core` must build its config via a factory:

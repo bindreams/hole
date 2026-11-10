@@ -64,6 +64,8 @@ pub(super) type FileId = (u64, u64);
 const SHARE_ALL: FILE_SHARE_MODE = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
 /// What a file the caller opens shares: everything but `DELETE`, so the name stays bound to the open file.
 const SHARE_NO_DELETE: FILE_SHARE_MODE = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0);
+/// What a pinned file shares: reads only, so nobody can write, delete or rename it.
+const SHARE_READ: FILE_SHARE_MODE = FILE_SHARE_READ;
 
 /// The error of a failed `NTSTATUS`, naming it.
 fn nt(status: NTSTATUS) -> io::Result<()> {
@@ -514,9 +516,18 @@ fn give_made_folder(parent: &File, name: &[u16], made: &File, sid: &[u8]) -> io:
     set_owner(&again, sid)
 }
 
-pub(super) fn open_dir(path: &Path, create: bool, _owner: Option<(u32, u32)>, _caller: Caller) -> io::Result<File> {
+pub(super) fn open_dir(
+    path: &Path,
+    create: bool,
+    _owner: Option<(u32, u32)>,
+    _caller: Caller,
+    _leaf_mode: u32,
+) -> io::Result<File> {
     open_dir_with(path, create, FILE_ACCESS_RIGHTS(0))
 }
+
+/// Windows has no mode: a made folder gets its parent's ACL.
+pub(super) const DIR_MODE: u32 = 0;
 
 /// [`open_dir`] with `extra` rights on the final directory.
 pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS) -> io::Result<File> {
@@ -619,12 +630,16 @@ fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::R
         FILE_OPEN_FOR_BACKUP_INTENT,
         FILE_OPEN_REPARSE_POINT,
     ];
+    let pinned_file = [FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT];
     // `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write lands at the end.
     let append = FILE_APPEND_DATA.0 | FILE_READ_ATTRIBUTES.0;
     let (rights, share, disposition, flags) = match how {
         OpenFile::CreateNew { .. } => (rights, SHARE_NO_DELETE, FILE_CREATE, options(&own_file)),
         OpenFile::Existing => (rights, SHARE_NO_DELETE, FILE_OPEN, options(OPEN_AS_ITSELF)),
         OpenFile::Read => (FILE_GENERIC_READ.0, SHARE_ALL, FILE_OPEN, options(&own_file)),
+        // No backup intent: the open is subject to the file's ACL, not the backup privilege's override. The pin
+        // itself is the share mode, which this flag is not known to affect.
+        OpenFile::ReadPinned => (FILE_GENERIC_READ.0, SHARE_READ, FILE_OPEN, options(&pinned_file)),
         OpenFile::Append => (append, SHARE_ALL, FILE_OPEN, options(&own_file)),
         OpenFile::CreateAppend { .. } => (append, SHARE_ALL, FILE_CREATE, options(&own_file)),
     };
@@ -637,7 +652,9 @@ fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::R
         flags,
     )?;
     // Opened as itself, a symlink is the link and not what it points at: it is not a file to read or append to.
-    if matches!(how, OpenFile::Read | OpenFile::Append) && kind_from(&file)? == EntryKind::Symlink {
+    if matches!(how, OpenFile::Read | OpenFile::ReadPinned | OpenFile::Append)
+        && kind_from(&file)? == EntryKind::Symlink
+    {
         return Err(Refusal::Symlink.into_io_error());
     }
     Ok(file)

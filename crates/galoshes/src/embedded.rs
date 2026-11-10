@@ -1,9 +1,16 @@
+use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
+use util::dir::{Dir, EntryKind, OpenFile, Refusal};
+use util::retry::is_file_contention;
+
+mod sealed_dir;
+use sealed_dir::SealedDir;
+pub use sealed_dir::SealedDirRefusal;
 
 pub struct EmbeddedBinary {
     pub name: &'static str,
@@ -11,13 +18,15 @@ pub struct EmbeddedBinary {
     pub sha256: [u8; 32],
 }
 
+/// An extracted binary whose bytes were hashed through `_file`, which stays open for as long as this does.
+///
+/// Linux execs `_file` itself, so what runs is what was hashed. Windows execs the file's real path, which the handle
+/// pins by denying write, delete and rename of the file and of the folders above it. Elsewhere the name is exec'd, and
+/// [`sealed_dir`] is what keeps anyone else from swapping it.
 pub struct VerifiedBinary {
     fs_path: PathBuf,
     exec_path: PathBuf,
-    #[cfg(unix)]
-    _fd: std::os::unix::io::OwnedFd,
-    #[cfg(windows)]
-    _handle: std::fs::File,
+    _file: fs::File,
 }
 
 impl VerifiedBinary {
@@ -38,46 +47,40 @@ impl EmbeddedBinary {
     }
 
     /// Extract to a specific directory (useful for testing).
+    ///
+    /// Instances starting together take turns through a lock file beside the binary, held until this returns, so none
+    /// meets a file another has just published and still holds open for writing (Windows: the pin fails; Linux:
+    /// `execve` fails with `ETXTBSY`).
     pub fn prepare_in(&self, dir: &Path) -> Result<VerifiedBinary> {
-        fs::create_dir_all(dir).with_context(|| format!("failed to create directory {}", dir.display()))?;
+        let dir = sealed_dir::prepare(dir)?;
 
-        #[cfg(unix)]
-        set_dir_permissions(dir)?;
+        check_dir_executable(&dir)?;
 
-        check_dir_executable(dir)?;
+        let _turn = file_lock::Exclusive::acquire(&dir.path().join(format!("{}.lock", self.name)), None)
+            .context("failed to lock the runtime directory")?;
 
-        let target = dir.join(self.name);
-
-        // Warm start: try to verify the existing file first.
-        if target.exists() {
-            match self.try_verify(&target) {
-                Ok(verified) => return Ok(verified),
-                Err(_) => {
-                    // Hash mismatch or other error — re-extract.
-                }
-            }
+        // Warm start: try to verify the existing file first. A missing file, a mismatch, or anything that is not a
+        // file we may use means re-extract; a failure of the OS is returned.
+        if let VerifyOutcome::Verified(verified) = self.try_verify(&dir)? {
+            return Ok(verified);
         }
 
         // Cold start (or re-extract after mismatch): extract and verify.
-        match self.extract(&target) {
-            Ok(()) => {}
-            Err(extract_err) => {
-                // Another process may have completed extraction concurrently.
-                // All concurrent galoshes instances embed identical binary data
-                // (same compile), so a file written by another process is valid.
-                // Retry warm start before giving up.
-                if let Ok(verified) = self.try_verify(&target) {
-                    return Ok(verified);
-                }
-                return Err(extract_err.context(format!("failed to extract {}", self.name)));
+        self.extract(dir.dir())
+            .with_context(|| format!("failed to extract {}", self.name))?;
+        match self
+            .try_verify(&dir)
+            .with_context(|| format!("verification failed after extraction of {}", self.name))?
+        {
+            VerifyOutcome::Verified(verified) => Ok(verified),
+            VerifyOutcome::Stale(why) => {
+                Err(why.context(format!("{} is not usable right after extraction", self.name)))
             }
         }
-        self.try_verify(&target)
-            .with_context(|| format!("verification failed after extraction of {}", self.name))
     }
 
-    /// Verify embedded hash, write via tempfile, set permissions, atomic rename.
-    fn extract(&self, target: &Path) -> Result<()> {
+    /// Verify the embedded hash, then stage the bytes in `dir` and rename them into place.
+    fn extract(&self, dir: &Dir) -> Result<()> {
         // Verify that our embedded data matches the expected hash.
         let actual_hash = sha256_bytes(self.data);
         if actual_hash != self.sha256 {
@@ -89,38 +92,74 @@ impl EmbeddedBinary {
             );
         }
 
-        let parent = target.parent().context("target path has no parent directory")?;
-
-        // Write to a temporary file in the same directory (for atomic rename).
-        let mut tmp = tempfile::NamedTempFile::new_in(parent).context("failed to create temporary file")?;
-        tmp.write_all(self.data).context("failed to write embedded data")?;
-        tmp.flush().context("failed to flush temporary file")?;
-
-        #[cfg(unix)]
-        set_file_permissions(tmp.path())?;
-
-        // Atomic rename into place.
-        tmp.persist(target)
-            .context("failed to atomically rename temporary file")?;
-
-        Ok(())
+        dir.stage(OsStr::new(self.name), self.data, None, make_executable)
+            .context("failed to stage the embedded binary")?
+            .publish()
+            .context("failed to atomically rename the staged binary")
     }
 
-    /// Read the file at `path`, check its SHA256, and open with deny-write.
-    fn try_verify(&self, path: &Path) -> Result<VerifiedBinary> {
-        let content = fs::read(path).context("failed to read file for verification")?;
-        let actual_hash = sha256_bytes(&content);
+    /// Open the binary in `dir`, check the SHA256 of what the handle reads, and keep the handle: the bytes hashed are
+    /// the inode that is held, whatever the name is made to mean afterwards. A file that is missing, not one we may
+    /// use, or not these bytes is [`VerifyOutcome::Stale`]; a failure of the OS is the error.
+    fn try_verify(&self, dir: &SealedDir) -> Result<VerifyOutcome> {
+        let name = OsStr::new(self.name);
+        let mut file = match dir.dir().open_file(name, OpenFile::ReadPinned) {
+            Ok(file) => file,
+            Err(err) if names_no_file_to_use(dir.dir(), name, &err) => {
+                return Ok(VerifyOutcome::Stale(
+                    anyhow::Error::from(err).context("failed to open file for verification"),
+                ));
+            }
+            Err(err) => return Err(anyhow::Error::from(err).context("failed to open file for verification")),
+        };
+        let path = dir.path().join(self.name);
+        // Windows has nothing to check: the pin is the guarantee. It fails while anything can still write the file, a
+        // writable mapped view of it included, so no one holds a way to change what runs.
+        #[cfg(unix)]
+        if let Runnability::Refused(why) = check_runnable(&file, &path)? {
+            return Ok(VerifyOutcome::Stale(anyhow::anyhow!(why)));
+        }
+        let actual_hash = sha256_reader(&mut file).context("failed to read file for verification")?;
         if actual_hash != self.sha256 {
-            bail!(
+            return Ok(VerifyOutcome::Stale(anyhow::anyhow!(
                 "hash mismatch for {}: expected {}, got {}",
                 self.name,
                 hex(&self.sha256),
                 hex(&actual_hash),
-            );
+            )));
         }
 
-        open_verified(path)
+        VerifiedBinary::new(path, file).map(VerifyOutcome::Verified)
     }
+}
+
+/// Whether the open of the binary's name failed because there is nothing there this process can use: no file, a link,
+/// something that is not a regular file, a file this user may not read (`sudo` left one behind; the user owns the
+/// folder and replaces it), or a file some other process holds (Windows: open for writing, which the replace of the
+/// name then waits out if the holder shares delete and fails with its cause if not). Anything else is the OS failing.
+fn names_no_file_to_use(dir: &Dir, name: &OsStr, err: &std::io::Error) -> bool {
+    // What a link at the name looks like differs by OS (`ELOOP`, `EMLINK`, `EFTYPE`; Windows a `Refusal`), so the name is
+    // asked what it is rather than the error.
+    let link = || matches!(dir.kind_of(name), Ok(Some(EntryKind::Symlink)));
+    err.kind() == std::io::ErrorKind::NotFound
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+        || is_file_contention(err)
+        || Refusal::from_error(err).is_some()
+        || link()
+}
+
+/// What [`EmbeddedBinary::try_verify`] found in the runtime directory.
+enum VerifyOutcome {
+    Verified(VerifiedBinary),
+    /// Not a file to run, and the reason: extract again.
+    Stale(anyhow::Error),
+}
+
+/// Whether a file in the runtime directory is one galoshes may run.
+#[cfg(unix)]
+enum Runnability {
+    Runnable,
+    Refused(String),
 }
 
 // Helpers =============================================================================================================
@@ -131,6 +170,19 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn sha256_reader(reader: &mut impl Read) -> std::io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(hasher.finalize().into()),
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -138,28 +190,67 @@ fn hex(bytes: &[u8; 32]) -> String {
 // Platform: runtime_dir ===============================================================================================
 
 pub fn runtime_dir() -> Result<PathBuf> {
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-    let default_root = platform_default_env().ok();
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let default_root = platform_default_root();
     resolve(xdg.as_deref(), default_root.as_deref())
 }
 
-#[cfg(unix)]
-fn platform_default_env() -> Result<String, std::env::VarError> {
-    std::env::var("HOME")
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_default_root() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// macOS execs the extracted binary by name, so the directory must be one only the running user can change. The
+/// account's own home is that user's; `$HOME` is whoever launched the process (an administrator-privileges prompt and
+/// `sudo` both leave it at the invoking user's home), which a root process would then be refused in.
+#[cfg(target_os = "macos")]
+fn platform_default_root() -> Option<PathBuf> {
+    home_of_effective_user()
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn home_of_effective_user() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: an all-zero `passwd` is a valid out-parameter for getpwuid_r.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: geteuid cannot fail; `pwd`, `buf` and `result` outlive the call.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                &mut pwd,
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` is a valid C string for a non-null result, and `buf` is alive.
+        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+        return Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())));
+    }
 }
 
 #[cfg(target_os = "windows")]
-fn platform_default_env() -> Result<String, std::env::VarError> {
-    std::env::var("LOCALAPPDATA")
+fn platform_default_root() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn resolve(xdg: Option<&str>, default_root: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn resolve(xdg: Option<&Path>, default_root: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = xdg {
-        return Ok(PathBuf::from(dir).join("galoshes"));
+        return Ok(dir.join("galoshes"));
     }
     if let Some(home) = default_root {
-        return Ok(PathBuf::from(home).join(".cache").join("galoshes"));
+        return Ok(home.join(".cache").join("galoshes"));
     }
     bail!(
         "cannot resolve galoshes runtime directory: neither XDG_RUNTIME_DIR nor HOME is set. \
@@ -168,26 +259,26 @@ pub(crate) fn resolve(xdg: Option<&str>, default_root: Option<&str>) -> Result<P
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn resolve(xdg: Option<&str>, default_root: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn resolve(xdg: Option<&Path>, default_root: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = xdg {
-        return Ok(PathBuf::from(dir).join("galoshes"));
+        return Ok(dir.join("galoshes"));
     }
     if let Some(home) = default_root {
-        return Ok(PathBuf::from(home).join("Library").join("Caches").join("galoshes"));
+        return Ok(home.join("Library").join("Caches").join("galoshes"));
     }
     bail!(
-        "cannot resolve galoshes runtime directory: neither XDG_RUNTIME_DIR nor HOME is set. \
+        "cannot resolve galoshes runtime directory: XDG_RUNTIME_DIR is not set and the running user has no home directory. \
          Set XDG_RUNTIME_DIR to a directory on an exec-capable mount."
     );
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn resolve(xdg: Option<&str>, default_root: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn resolve(xdg: Option<&Path>, default_root: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = xdg {
-        return Ok(PathBuf::from(dir).join("galoshes"));
+        return Ok(dir.join("galoshes"));
     }
     if let Some(local) = default_root {
-        return Ok(PathBuf::from(local).join("galoshes"));
+        return Ok(local.join("galoshes"));
     }
     bail!(
         "cannot resolve galoshes runtime directory: neither XDG_RUNTIME_DIR nor LOCALAPPDATA is set. \
@@ -196,53 +287,52 @@ pub(crate) fn resolve(xdg: Option<&str>, default_root: Option<&str>) -> Result<P
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(crate) fn resolve(xdg: Option<&str>, _default_root: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn resolve(xdg: Option<&Path>, _default_root: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = xdg {
-        return Ok(PathBuf::from(dir).join("galoshes"));
+        return Ok(dir.join("galoshes"));
     }
     bail!("cannot resolve galoshes runtime directory: XDG_RUNTIME_DIR is not set");
 }
 
 // Platform: permissions ===============================================================================================
 
+/// Gives the staged file the mode the binary is run with: the owner may read and execute it, and no one can write it.
 #[cfg(unix)]
-fn set_dir_permissions(path: &Path) -> Result<()> {
+fn make_executable(file: &fs::File) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to set permissions on {}", path.display()))
+    file.set_permissions(fs::Permissions::from_mode(0o500))
 }
 
-#[cfg(unix)]
-fn set_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o500))
-        .with_context(|| format!("failed to set permissions on {}", path.display()))
+/// No ACL: [`OpenFile::ReadPinned`] fails while anything can still write the file, so what is pinned cannot change.
+#[cfg(windows)]
+fn make_executable(_file: &fs::File) -> std::io::Result<()> {
+    Ok(())
 }
 
 // Platform: check_dir_executable ======================================================================================
 
-fn check_dir_executable(dir: &Path) -> Result<()> {
-    if is_noexec_mount(dir)? {
+fn check_dir_executable(dir: &SealedDir) -> Result<()> {
+    if is_noexec_mount(dir.dir())? {
         bail!(
             "runtime directory {} is mounted noexec; galoshes cannot exec the embedded \
              ex-ray plugin from this location. Set XDG_RUNTIME_DIR to a directory on an \
              exec-capable mount, or remount this filesystem with the exec option.",
-            dir.display(),
+            dir.path().display(),
         );
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn is_noexec_mount(dir: &Path) -> Result<bool> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
-        .with_context(|| format!("path {} contains a NUL byte", dir.display()))?;
+fn is_noexec_mount(dir: &Dir) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: an all-zero `statvfs` is a valid out-parameter.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    // SAFETY: the descriptor is open and `stat` outlives the call.
+    let rc = unsafe { libc::fstatvfs(dir.file().as_raw_fd(), &mut stat) };
     if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(anyhow::Error::from(err)).with_context(|| format!("statvfs({}) failed", dir.display()));
+        return Err(anyhow::Error::from(std::io::Error::last_os_error()))
+            .context("fstatvfs of the runtime directory failed");
     }
     Ok(check_noexec_linux(stat.f_flag))
 }
@@ -253,15 +343,15 @@ pub(crate) fn check_noexec_linux(flag: libc::c_ulong) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn is_noexec_mount(dir: &Path) -> Result<bool> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
-        .with_context(|| format!("path {} contains a NUL byte", dir.display()))?;
+fn is_noexec_mount(dir: &Dir) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: an all-zero `statfs` is a valid out-parameter.
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+    // SAFETY: the descriptor is open and `stat` outlives the call.
+    let rc = unsafe { libc::fstatfs(dir.file().as_raw_fd(), &mut stat) };
     if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(anyhow::Error::from(err)).with_context(|| format!("statfs({}) failed", dir.display()));
+        return Err(anyhow::Error::from(std::io::Error::last_os_error()))
+            .context("fstatfs of the runtime directory failed");
     }
     Ok(check_noexec_macos(stat.f_flags))
 }
@@ -278,56 +368,92 @@ pub(crate) fn check_noexec_macos(flags: u32) -> bool {
 // OpenBSD, …) fall through to the same noop; their MNT_NOEXEC semantics differ
 // per kernel and galoshes is not currently shipped there.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn is_noexec_mount(_dir: &Path) -> Result<bool> {
+fn is_noexec_mount(_dir: &Dir) -> Result<bool> {
     Ok(false)
 }
 
-// Platform: open_verified =============================================================================================
+// Platform: the file that is run ======================================================================================
 
-#[cfg(unix)]
-fn open_verified(path: &Path) -> Result<VerifiedBinary> {
-    use std::os::unix::io::{AsRawFd, OwnedFd};
-
-    let file = fs::File::open(path).context("failed to open file for verification")?;
-    let raw_fd = file.as_raw_fd();
-    let fd: OwnedFd = file.into();
-
-    // Linux: /proc/self/fd/N is a kernel-resolved symlink — works even after
-    // CLOEXEC closes the fd in the child process.
-    // Non-Linux Unix (macOS, FreeBSD, etc.): /dev/fd/N is a device node that
-    // requires the fd to be live in the process's fd table. Rust's Command
-    // sets CLOEXEC on all fds, so the fd is closed before execve and
-    // /dev/fd/N becomes invalid. Fall back to the filesystem path.
-    let exec_path = if cfg!(target_os = "linux") {
-        PathBuf::from(format!("/proc/self/fd/{raw_fd}"))
-    } else {
-        path.to_path_buf()
-    };
-
-    Ok(VerifiedBinary {
-        fs_path: path.to_path_buf(),
-        exec_path,
-        _fd: fd,
-    })
+impl VerifiedBinary {
+    fn new(path: PathBuf, file: fs::File) -> Result<Self> {
+        Ok(Self {
+            exec_path: exec_path_of(&path, &file)?,
+            fs_path: path,
+            _file: file,
+        })
+    }
 }
 
+/// Refuses a file that is not one galoshes may run: one whose bytes another principal can still change (such a writer
+/// can alter what the held handle runs after the hash), or one that cannot be executed (a warm start that took it
+/// would fail to spawn on every start after). The caller replaces it. The handle is an [`OpenFile::ReadPinned`] one,
+/// so it is already a regular file the name did not lead through a link to.
+#[cfg(unix)]
+fn check_runnable(file: &fs::File, path: &Path) -> Result<Runnability> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = file.metadata().context("failed to stat the opened file")?;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid || meta.mode() & 0o022 != 0 || meta.mode() & 0o100 == 0 {
+        return Ok(Runnability::Refused(format!(
+            "{} is owned by uid {} with mode {:o}; refusing a file others can write or the owner cannot execute",
+            path.display(),
+            meta.uid(),
+            meta.mode() & 0o7777,
+        )));
+    }
+    Ok(Runnability::Runnable)
+}
+
+/// Linux execs the descriptor itself: `/proc/self/fd/N` is a kernel-resolved symlink to the held inode, so it works
+/// even after CLOEXEC closes the fd in the child. Elsewhere on unix `/dev/fd/N` needs the fd live in the child, which
+/// `Command`'s CLOEXEC prevents, so the name is exec'd and the directory holding it is what is trusted
+/// ([`sealed_dir::EXEC_BY_PATH`]).
+#[cfg(unix)]
+fn exec_path_of(path: &Path, file: &fs::File) -> Result<PathBuf> {
+    use std::os::unix::io::AsRawFd;
+
+    if sealed_dir::EXEC_BY_PATH {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())))
+    }
+}
+
+/// The file's real path, read off the pinned handle: the handle denies write, delete and rename of the file and of
+/// every folder above it, so the path cannot come to mean another file while the handle is held. The name it was
+/// opened by may have gone through a junction or a link, which is not pinned. A volume with no drive letter has no
+/// such path and is an error.
 #[cfg(windows)]
-fn open_verified(path: &Path) -> Result<VerifiedBinary> {
-    use std::os::windows::fs::OpenOptionsExt;
+fn exec_path_of(_path: &Path, file: &fs::File) -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, GETFINALPATHNAMEBYHANDLE_FLAGS, VOLUME_NAME_DOS,
+    };
 
-    // FILE_SHARE_READ = 1 (deny write + delete)
-    let handle = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(1)
-        .open(path)
-        .context("failed to open file with deny-write sharing")?;
-
-    let fs_path = path.to_path_buf();
-    let exec_path = fs_path.clone();
-
-    Ok(VerifiedBinary {
-        fs_path,
-        exec_path,
-        _handle: handle,
-    })
+    let handle = HANDLE(file.as_raw_handle());
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: `handle` is open for as long as `file` is, and `buf` is a writable slice.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                &mut buf,
+                GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0),
+            )
+        } as usize;
+        if len == 0 {
+            return Err(anyhow::Error::from(std::io::Error::last_os_error()))
+                .context("failed to read the real path of the verified binary");
+        }
+        // A result that does not fit says how many units it needs, terminator included.
+        if len > buf.len() {
+            buf.resize(len, 0);
+            continue;
+        }
+        return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])));
+    }
 }

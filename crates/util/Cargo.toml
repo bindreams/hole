@@ -47,8 +47,8 @@ libc = { workspace = true }
 windows = { version = "0.62", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [target.'cfg(windows)'.dev-dependencies]
-# `system_tool_console_tests`: process enumeration.
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+# `system_tool_console_tests`: process enumeration; `Win32_System_Memory`: the writable view `dir_tests` maps.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_Threading"] }
 
 [dev-dependencies]
 skuld = { workspace = true }

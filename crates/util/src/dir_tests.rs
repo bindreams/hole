@@ -64,6 +64,41 @@ fn missing_components_are_created_when_asked() {
     assert!(deep.is_dir());
 }
 
+/// The last component is made with the mode asked for in the `mkdirat` itself, so no other process can see it with the
+/// umask's mode first; a component above it keeps the usual `0o777` before the umask.
+#[cfg(unix)]
+#[skuld::test]
+fn the_leaf_is_made_with_the_mode_asked_for() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let leaf = tmp.path().join("above").join("leaf");
+
+    Dir::open_with_leaf_mode(&leaf, 0o700).unwrap();
+
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&leaf), 0o700);
+    assert_ne!(
+        mode(leaf.parent().unwrap()),
+        0o700,
+        "only the leaf is asked for the mode"
+    );
+}
+
+/// A leaf that exists is opened as it is: its mode is not the walk's to change.
+#[cfg(unix)]
+#[skuld::test]
+fn an_existing_leaf_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir(&leaf).unwrap();
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+    Dir::open_with_leaf_mode(&leaf, 0o700).unwrap();
+
+    assert_eq!(std::fs::metadata(&leaf).unwrap().permissions().mode() & 0o7777, 0o750);
+}
+
 #[skuld::test]
 fn a_directory_that_exists_is_opened_not_recreated_when_asked_to_create() {
     let tmp = tempfile::tempdir().unwrap();
@@ -637,6 +672,142 @@ fn an_appended_file_can_be_renamed_by_anyone_who_shares_delete() {
     std::fs::rename(tmp.path().join(LOG), tmp.path().join("log.1")).unwrap();
 
     assert_eq!(std::fs::read(tmp.path().join("log.1")).unwrap(), b"x");
+}
+
+// open_file: ReadPinned -----------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn read_pinned_reads_what_is_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("bin"), b"bytes").unwrap();
+
+    let mut file = dir.open_file(&name("bin"), OpenFile::ReadPinned).unwrap();
+
+    let mut read = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut read).unwrap();
+    assert_eq!(read, b"bytes");
+}
+
+#[skuld::test]
+fn read_pinned_does_not_follow_a_symlink_at_the_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let target = tmp.path().join("secret");
+    std::fs::write(&target, b"theirs").unwrap();
+    plant_file_symlink(&target, &tmp.path().join("bin"));
+
+    assert!(dir.open_file(&name("bin"), OpenFile::ReadPinned).is_err());
+}
+
+#[skuld::test]
+fn read_pinned_refuses_a_missing_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    assert_eq!(
+        kind(dir.open_file(&name("bin"), OpenFile::ReadPinned)),
+        Some(io::ErrorKind::NotFound)
+    );
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn read_pinned_refuses_a_fifo_and_does_not_wait_for_a_writer() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let fifo = std::ffi::CString::new(tmp.path().join("bin").as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let err = dir.open_file(&name("bin"), OpenFile::ReadPinned).err().unwrap();
+
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular));
+}
+
+/// While the handle is held nobody can write the file, delete it, replace it or rename it.
+#[cfg(windows)]
+#[skuld::test]
+fn read_pinned_holds_the_file_against_a_write_a_delete_and_a_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let path = tmp.path().join("bin");
+    std::fs::write(&path, b"bytes").unwrap();
+    let other = tmp.path().join("other");
+    std::fs::write(&other, b"replacement").unwrap();
+
+    let _pinned = dir.open_file(&name("bin"), OpenFile::ReadPinned).unwrap();
+
+    assert!(std::fs::write(&path, b"x").is_err(), "write");
+    assert!(std::fs::remove_file(&path).is_err(), "delete");
+    assert!(std::fs::rename(&other, &path).is_err(), "replace");
+    assert!(std::fs::rename(&path, tmp.path().join("moved")).is_err(), "rename");
+    assert!(dir.rename(&name("other"), &name("bin")).is_err(), "replace by name");
+    assert_eq!(std::fs::read(&path).unwrap(), b"bytes");
+}
+
+/// A file somebody already has open for writing cannot be pinned: the pin would not stop that writer.
+#[cfg(windows)]
+#[skuld::test]
+fn read_pinned_fails_while_a_writer_has_the_file_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let path = tmp.path().join("bin");
+    std::fs::write(&path, b"bytes").unwrap();
+    let _writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+    assert!(dir.open_file(&name("bin"), OpenFile::ReadPinned).is_err());
+}
+
+/// A holder that denies sharing refuses the pin. Unelevated, the open fails for the sharing violation alone, so this
+/// run does not tell whether the pin asks for backup intent; an elevated run would, if the privilege passes a share
+/// mode for a backup-intent open (as `testing::as_unprivileged_thread` records for reads).
+#[cfg(windows)]
+#[skuld::test]
+fn read_pinned_fails_while_a_holder_denies_sharing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let path = tmp.path().join("bin");
+    std::fs::write(&path, b"bytes").unwrap();
+    let _held = super::testing::held_without_sharing(&path);
+
+    assert!(dir.open_file(&name("bin"), OpenFile::ReadPinned).is_err());
+}
+
+/// A writable view mapped from the file still counts as a writer after every handle it was made through is closed, so
+/// the pin cannot be taken over a file whose bytes someone can still change through memory.
+#[cfg(windows)]
+#[skuld::test]
+fn read_pinned_fails_while_a_writable_view_of_the_file_exists() {
+    use ::windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use ::windows::Win32::System::Memory::{
+        CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE, PAGE_READWRITE,
+    };
+    use std::os::windows::io::AsRawHandle;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let path = tmp.path().join("bin");
+    std::fs::write(&path, b"bytes").unwrap();
+    let writer = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    // SAFETY: `writer` is open for the call; the mapping and the view are released below.
+    let (mapping, view) = unsafe {
+        let mapping = CreateFileMappingW(HANDLE(writer.as_raw_handle()), None, PAGE_READWRITE, 0, 0, None).unwrap();
+        (mapping, MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0))
+    };
+    assert!(!view.Value.is_null(), "map a writable view");
+    drop(writer);
+    // SAFETY: `mapping` is open and owned here; the view keeps the section alive.
+    unsafe { CloseHandle(mapping) }.unwrap();
+
+    let pinned = dir.open_file(&name("bin"), OpenFile::ReadPinned);
+
+    // SAFETY: `view` came from `MapViewOfFile` above.
+    unsafe { UnmapViewOfFile(view) }.unwrap();
+    assert!(pinned.is_err(), "pinned a file that still has a writable view");
+    dir.open_file(&name("bin"), OpenFile::ReadPinned)
+        .expect("pins once the view is gone");
 }
 
 // append_own_file =====================================================================================================

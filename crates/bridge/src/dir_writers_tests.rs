@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use hole_common::logging::dir_rotate::DirRotate;
 use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE};
+use sha2::Digest;
 use tun_engine::routing::state as route_state;
 use util::dir::testing::{plant_link, user_dir};
 use util::dir::{Dir, Refusal};
@@ -97,7 +98,8 @@ impl std::fmt::Display for LeftAsItIs {
 impl std::error::Error for LeftAsItIs {}
 
 /// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's, a
-/// versioned file's decision to leave a file it cannot read as it is, or the update marker's refusal to stamp one.
+/// versioned file's decision to leave a file it cannot read as it is, the update marker's refusal to stamp one, or
+/// galoshes' refusal of an extraction folder someone else can change.
 fn is_a_refusal(err: &io::Error) -> bool {
     util::error::links(err).any(|link| {
         let versioned_file_left_it = matches!(
@@ -108,6 +110,7 @@ fn is_a_refusal(err: &io::Error) -> bool {
             || link.downcast_ref::<file_lock::Refused>().is_some()
             || link.downcast_ref::<LeftAsItIs>().is_some()
             || link.downcast_ref::<update_marker::NoMarkerToStamp>().is_some()
+            || link.downcast_ref::<galoshes::embedded::SealedDirRefusal>().is_some()
             || versioned_file_left_it
     })
 }
@@ -144,6 +147,10 @@ const LOG_FALLBACK_NAME: &str = "bridge.log.1.fallback";
 const SOCKET_NAME: &str = "hole-bridge.sock";
 const CRASH_PID: u32 = 4242;
 const CRASH_MARKER_NAME: &str = "crash-bridge-4242.marker";
+const EMBEDDED_BINARY_NAME: &str = "embedded-plugin";
+const EMBEDDED_BINARY_DATA: &[u8] = b"#!/bin/sh
+echo hello
+";
 
 fn marker_info() -> MarkerInfo {
     MarkerInfo {
@@ -453,6 +460,27 @@ fn writers() -> Vec<Writer> {
             },
         },
         Writer {
+            name: "the embedded plugin, extracted",
+            sources: &["crates/galoshes/src/embedded/sealed_dir.rs"],
+            names: &[EMBEDDED_BINARY_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, _| {
+                galoshes::embedded::EmbeddedBinary {
+                    name: EMBEDDED_BINARY_NAME,
+                    data: EMBEDDED_BINARY_DATA,
+                    sha256: sha2::Sha256::digest(EMBEDDED_BINARY_DATA).into(),
+                }
+                .prepare_in(dir)
+                .map(drop)
+                // `io::Error::other(anyhow)` boxes anyhow's wrapper, which hides the refusal from `links`.
+                .map_err(|err| match err.downcast::<galoshes::embedded::SealedDirRefusal>() {
+                    Ok(refusal) => io::Error::other(refusal),
+                    Err(err) => io::Error::other(err),
+                })
+            },
+        },
+        Writer {
             name: "the log, rotated",
             sources: &[
                 "crates/common/src/logging.rs",
@@ -636,9 +664,11 @@ fn a_store_writer_below_a_state_directory_that_is_a_link_is_refused_with_a_refus
 fn run_twice(writer: &Writer, dir: &Path, layout: &str) {
     for run in ["first", "second"] {
         let result = (writer.run)(dir, owner());
-        // A claim that is lost is the right second answer of a single-occupancy write.
+        // A claim that is lost is the right second answer of a single-occupancy write. So is galoshes' refusal of a
+        // folder someone else can change (as root, a user's profile is one).
         let result = match (writer.at_a_planted_name, result) {
             (AtAPlantedName::ClaimedElsewhere, Err(err)) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            (_, Err(err)) if util::error::find::<galoshes::embedded::SealedDirRefusal>(&err).is_some() => Ok(()),
             (_, result) => result,
         };
         result.unwrap_or_else(|err| panic!("{}: the {run} run {layout}: {err}", writer.name));
@@ -1075,8 +1105,10 @@ const READS_BY_PATH: &[&str] = &[
 ];
 
 /// The crates whose code runs privileged on state or log directories. `hole` is one: `hole bridge run` is the bridge.
+/// `galoshes` is one: as the bridge's plugin it runs as root and extracts into a runtime directory under a user's profile.
 const PRIVILEGED_CRATES: &[&str] = &[
     "bridge",
+    "galoshes",
     "tun-engine",
     "util",
     "file-lock",
@@ -1397,6 +1429,11 @@ const RESOLVING_ALLOWED: &[(&str, &str, &str)] = &[
         "crates/hole/src/setup.rs",
         "canonicalize(&exe)",
         "the process's own executable, to register as the bridge",
+    ),
+    (
+        "crates/galoshes/src/embedded/sealed_dir.rs",
+        "canonicalize(given)",
+        "a unix other than Linux or macOS (not shipped): the path is resolved after the handle walk, then judged component by component",
     ),
 ];
 

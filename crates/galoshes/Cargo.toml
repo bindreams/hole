@@ -36,8 +36,11 @@ futures = "0.3"
 yamux = "0.14"
 socket2 = "0.6"
 sha2 = "0.11"
-tempfile = "3"
 tombstone = { path = "../tombstone" }
+# `dir::Dir`: the runtime dir is walked and made through handles, since it can sit in a user's profile.
+util = { path = "../util" }
+# `file_lock::Exclusive`: instances starting together take turns extracting into the one runtime dir.
+file-lock = { path = "../file-lock" }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -45,10 +48,12 @@ libc = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 # WSAIoctl(SIO_UDP_CONNRESET) — see `bind_udp` in yamux.rs (#415).
 # Win32_System_IO supplies WSAOVERLAPPED, referenced by WSAIoctl's signature.
-windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
+tempfile = "3"
+util = { path = "../util", features = ["test-support"] }
 hole-test-observability = { path = "../test-observability" }
 # Enable garter's `test_utils::WaitableWriter` for the E2E relay tests
 # (the module is gated behind garter's `test-utils` feature).
