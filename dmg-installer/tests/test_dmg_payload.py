@@ -7,14 +7,20 @@ backtraces resolve at runtime — parity with the Windows hole.pdb).
 
 import plistlib
 import re
+import shutil
 import subprocess
 from pathlib import Path
+
 
 from conftest import REPO_ROOT, canonical_darwin_bindir
 
 # Canonical Mach-O UUID shape (8-4-4-4-12 hex), matching
 # msi-installer/tests/test_hole_wxs.py. Unanchored for use with finditer.
 _UUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+
+# Failure bound for a child that prints one line and exits: a hang means a broken
+# binary, surfaced to the human instead of stalling the job.
+_HOLE_VERSION_TIMEOUT_SECS = 60
 
 
 def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
@@ -109,29 +115,15 @@ def test_dsym_uuid_matches_binary(installed_app: Path) -> None:
     )
 
 
-def _embeds_version(data: bytes, version: bytes) -> bool:
-    """Whether `data` embeds `version` as a string of its own.
+def test_shipped_version_is_exact(installed_app: Path, tmp_path: Path) -> None:
+    """The shipped binary reports exactly the version `cargo xtask version` gives this tree, without `.dirty` (#1066).
 
-    A bare tag version (`0.7.0`) also occurs in dependency paths such as
-    `.../foo-0.7.0/src/lib.rs`, so a match inside a longer version or after `-`
-    and before `/` is not the embedded string.
-    """
-    pattern = rb"(?<![0-9.])" + re.escape(version) + rb"(?![0-9]|\.[0-9])"
-    return any(
-        not (data[m.start() - 1 : m.start()] == b"-" and data[m.end() : m.end() + 1] == b"/")
-        for m in re.finditer(pattern, data)
-    )
-
-
-def test_shipped_version_is_not_dirty(installed_app: Path) -> None:
-    """The shipped binary must embed a clean version, never `<version>.dirty` (#1066).
-
-    `xtask-lib::display_version` appends `.dirty` when tracked files differ from
-    HEAD at build time. The binary is read, not run: Gatekeeper kills the
-    quarantined copy on exec. The clean version is `cargo xtask version --group
-    hole` minus `.dirty`; it must be embedded as a string of its own, so a
-    dependency path containing the same bare version does not satisfy the check.
-    Requires a clean checkout.
+    Both sides come from the same version logic, so this checks the stamp, not
+    which version a tree should carry. The binary is run (`hole version`, the
+    lib constant, printed before any GUI or logging) rather than scanned: the
+    version is a bare string a dependency's own version can match byte for
+    byte. It runs from a copy outside the quarantined Hole.app. Requires a
+    clean checkout.
     """
     result = subprocess.run(
         ["cargo", "xtask", "version", "--group", "hole"],
@@ -140,12 +132,20 @@ def test_shipped_version_is_not_dirty(installed_app: Path) -> None:
         text=True,
     )
     assert result.returncode == 0, f"`cargo xtask version` failed:\n{result.stderr}"
-    clean = result.stdout.strip().removesuffix(".dirty").encode()
-    data = (installed_app / "Contents" / "MacOS" / "hole").read_bytes()
-    assert _embeds_version(data, clean), f"the hole binary does not embed its version {clean.decode()!r}"
-    assert clean + b".dirty" not in data, (
-        f"the hole binary embeds {clean.decode()}.dirty: the build dirtied tracked files "
-        f"before `hole` was compiled. See test_build_leaves_tracked_files_unmodified for which."
+    clean = result.stdout.strip().removesuffix(".dirty")
+    assert not clean.startswith("0.0.0"), (
+        f"`cargo xtask version` printed {clean!r}, its fallback when git or the workspace cannot be read; "
+        f"the binary would report the same and this check would prove nothing."
+    )
+
+    binary = Path(shutil.copy(installed_app / "Contents" / "MacOS" / "hole", tmp_path / "hole"))
+    command = [str(binary), "version"]
+    run = subprocess.run(command, capture_output=True, text=True, check=False, timeout=_HOLE_VERSION_TIMEOUT_SECS)
+    killed = f" (killed by signal {-run.returncode})" if run.returncode < 0 else ""
+    assert run.returncode == 0, f"`hole version` exited {run.returncode}{killed}:\n{run.stderr}"
+    assert run.stdout.strip() == f"hole {clean}", (
+        f"`hole version` printed {run.stdout.strip()!r}, expected 'hole {clean}'. A `.dirty` suffix means "
+        f"the build script stamped a dirty tree."
     )
 
 
