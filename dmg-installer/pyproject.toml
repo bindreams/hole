@@ -16,6 +16,9 @@ packages = ["src/dmg_installer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `install_e2e` tests install a root daemon on the host: opt in with `-m install_e2e`.
+addopts = "-m 'not install_e2e'"
+markers = ["install_e2e: installs the built app's bridge as root and connects through it (CI runners only)"]
 
 [dependency-groups]
 dev = ["pytest"]

@@ -695,7 +695,13 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
     g.insert("doc-hole", HOLE_LEGS.to_vec());
     g.insert("clippy-ex-galoshes", NON_HOLE_LEGS.to_vec());
     g.insert("doc-ex-galoshes", NON_HOLE_LEGS.to_vec());
-    for id in ["dmg-start", "dmg"] {
+    for id in [
+        "dmg-start",
+        "dmg",
+        "dmg-install-server",
+        "dmg-install-e2e",
+        "dmg-install-cleanup",
+    ] {
         g.insert(id, DARWIN.to_vec());
     }
     for id in [

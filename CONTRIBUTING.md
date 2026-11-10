@@ -3746,6 +3746,12 @@ The `hole-dmg-tests` pytest derives its expected payload from
 `cargo xtask bindir-names --os darwin --bundle`, so the Tauri config can't silently drift, and checks that the
 plugins are absent from the app and present, byte for byte, inside `hole`.
 
+`cargo xtask run hole-dmg-install-e2e` installs the built app's bridge as root
+(`sudo -n`), connects through each bundled plugin with `hole proxy start`, and
+uninstalls. It is CI-only by design: it needs passwordless sudo, refuses to run
+over an existing install, and expects `hole-dmg-tests` to have built the app and
+`cargo build -p plugin-e2e --example ss_plugin_server` the test's server first.
+
 ## Development
 
 ### Running in dev mode

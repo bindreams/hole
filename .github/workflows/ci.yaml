@@ -73,8 +73,8 @@ jobs:
           # type check.
           - { os: windows, arch: amd64, runner: windows-latest,   timeout: 175, cache-saver: true, hole: true, installer: true, ex-ray-unit: true }
           - { os: windows, arch: arm64, runner: windows-11-arm,   timeout: 90 }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel,   timeout: 305, hole: true, dmg: true }
-          - { os: darwin,  arch: arm64, runner: macos-latest,     timeout: 155, cache-saver: true, hole: true, dmg: true, ex-ray-unit: true }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel,   timeout: 355, hole: true, dmg: true }
+          - { os: darwin,  arch: arm64, runner: macos-latest,     timeout: 205, cache-saver: true, hole: true, dmg: true, ex-ray-unit: true }
           - { os: linux,   arch: amd64, runner: ubuntu-latest,    timeout: 60,  cache-saver: true, portable-lint: true, ech: true, frontend: true }
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm, timeout: 60 }
     steps:
@@ -481,13 +481,82 @@ jobs:
           cargo xtask run hole-dmg-tests
           df -h .
 
+      # The install test's shadowsocks server, built here so the next step's
+      # budget bounds only the wait on the installed bridge. The three install
+      # steps are unmeasured: their budgets are guesses and both darwin walls
+      # carry their sum (50m); replace them with 1.25 x the measured worst
+      # after the first runs.
+      - id: dmg-install-server
+        name: Build the install test's server
+        if: ${{ !cancelled() && steps.dmg.outcome == 'success' }}
+        timeout-minutes: 25
+        shell: bash
+        run: cargo build -p plugin-e2e --example ss_plugin_server
+
+      # The bound on the wait for the installed bridge to answer: a bridge that
+      # stays up but never answers ends here, and the cleanup step prints its log.
+      - id: dmg-install-e2e
+        name: Install the bridge and connect through the bundled plugins
+        if: ${{ !cancelled() && steps.dmg-install-server.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: bash
+        run: cargo xtask run hole-dmg-install-e2e
+
+      # The test uninstalls on its own teardown, which a step timeout skips; the
+      # root launchd job and what the install wrote must not outlive the step into
+      # the hole lanes. The step fails if the uninstall failed or anything remains.
+      - id: dmg-install-cleanup
+        name: Print the installed bridge's log and uninstall it
+        if: ${{ !cancelled() && steps.dmg-install-e2e.outcome != 'skipped' }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          label=system/com.hole.bridge
+          helper=/Library/PrivilegedHelperTools/com.hole.bridge
+          plist=/Library/LaunchDaemons/com.hole.bridge.plist
+          socket=/var/run/hole-bridge.sock
+          status=0
+
+          sudo -n sh -c 'for f in /var/log/hole/*; do echo "=== $f"; cat "$f"; done' || true
+
+          if [[ -e "$helper" ]]; then
+            if ! sudo -n "$helper" bridge uninstall; then
+              echo "::error::hole bridge uninstall failed"
+              status=1
+            fi
+          fi
+
+          # The uninstall may have failed or never run (no helper), so the job and every file are removed here.
+          if sudo -n launchctl print "$label" > /dev/null 2>&1; then
+            echo "::warning::$label is still loaded after the uninstall; booting it out"
+            sudo -n launchctl bootout "$label" || true
+          fi
+          if ! sudo -n rm -rf "$helper" "$plist" "$socket" /var/log/hole /var/db/hole; then
+            status=1
+          fi
+
+          # Paced re-check (CONTRIBUTING "No sleeps for synchronization", class 3): launchd unloads the job after
+          # `bootout` returns and announces nothing. Every pass re-reads the job; the step's timeout is the bound.
+          while sudo -n launchctl print "$label" > /dev/null 2>&1; do
+            sleep 1
+          done
+
+          for leftover in "$helper" "$plist" "$socket"; do
+            if sudo -n test -e "$leftover"; then
+              echo "::error::$leftover is still there"
+              status=1
+            fi
+          done
+          exit "$status"
+
       # hdiutil DMG creation/mounting is a non-deterministic macOS
       # DiskArbitration race; capture system state when the DMG step fails (build
-      # or the pytest mount) to diagnose the next occurrence (#446). A step
-      # timeout is a failure of the step, so this fires on it too.
+      # or the pytest mount, which the install test repeats) to diagnose the next
+      # occurrence (#446). A step timeout is a failure of the step, so this fires
+      # on it too.
       - id: dmg-diagnostics
         name: Capture DiskArbitration/hdiutil state on failure
-        if: ${{ !cancelled() && steps.dmg.outcome == 'failure' }}
+        if: ${{ !cancelled() && (steps.dmg.outcome == 'failure' || steps.dmg-install-e2e.outcome == 'failure') }}
         timeout-minutes: 5
         shell: bash
         run: |
@@ -504,7 +573,7 @@ jobs:
 
       - id: dmg-upload-diagnostics
         name: Upload DMG flake diagnostics
-        if: ${{ !cancelled() && steps.dmg.outcome == 'failure' }}
+        if: ${{ !cancelled() && (steps.dmg.outcome == 'failure' || steps.dmg-install-e2e.outcome == 'failure') }}
         timeout-minutes: 5
         uses: ./.github/actions/upload-diagnostics
         with:

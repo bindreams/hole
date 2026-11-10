@@ -28,6 +28,7 @@ base64 = "0.22"
 hex = "0.4"
 
 [dev-dependencies]
+serde_json = { workspace = true }
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
 
