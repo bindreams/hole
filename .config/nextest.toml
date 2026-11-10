@@ -139,6 +139,9 @@ nextest-version = "0.9.130"
 #     crates/tun-engine/tests/macos_session_key_lifetime_probe.rs
 #     crates/bridge/src/dns/system/macos_tests.rs (the real steerer's
 #     engage/withdraw round trip through the trait objects)
+#   - `reset_probe_global_net_state_` prefix (#1112 measurements: a real wintun adapter or utun with
+#     TEST-NET routes added and removed, and on macOS a real pf cover whose record is deleted):
+#     crates/tun-engine/src/routing/split_route_privileged_tests.rs
 #   - `dispatcher_opens_tun_` prefix (the production
 #     `Dispatcher::new` opens a real TUN device, and on macOS it is a
 #     kernel-assigned `utun` adapter with no fixed name):
@@ -173,7 +176,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/macos_lockdown_failed_engage_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/failclosed_cover_transition_/) + test(/failclosed_cover_state_purge_/) + test(/failclosed_cover_engage_does_not_sever_/) + test(/failclosed_cover_load_/) + test(/macos_recover_cover_/) + test(/release_all_/) + test(/boottime_global_net_state_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/macos_lockdown_failed_engage_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/failclosed_cover_transition_/) + test(/failclosed_cover_state_purge_/) + test(/failclosed_cover_engage_does_not_sever_/) + test(/failclosed_cover_load_/) + test(/macos_recover_cover_/) + test(/release_all_/) + test(/boottime_global_net_state_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/) + test(/reset_probe_global_net_state_/)'
 test-group = 'global_net_state'
 
 # `macos_failclosed_cover_transition_never_admits_blocked_flow` prints the
@@ -190,12 +193,26 @@ test-group = 'global_net_state'
 # kind of test: it prints which controls the SCM delivered after a Stop, and that
 # line is the measurement.
 #
+# `reset_probe_global_net_state_*` print what the OS does with a split route once its adapter is gone and with a
+# pf cover whose record is gone; those `MEASURE[1112]` lines are the result (#1112).
+#
 # `immediate-final` for both, not `final`: `final` prints only when the whole run
 # ends, so a job killed by its time budget drops the measurement.
 # `immediate-final` prints it as the test finishes and again in the summary.
 [[profile.default.overrides]]
 filter = 'test(/failclosed_cover_transition_/)'
 success-output = 'immediate-final'
+
+[[profile.default.overrides]]
+filter = 'test(/reset_probe_global_net_state_/)'
+success-output = 'immediate-final'
+
+# The macOS route probe waits, uncapped, for the real event "the utun left the kernel's name table"; a
+# premise that never holds would hang the lane, so `terminate-after` turns it into a failure naming the test.
+# The Windows probe runs six adapter lifecycles of PowerShell reads, so the period is generous.
+[[profile.default.overrides]]
+filter = 'test(/reset_probe_global_net_state_/)'
+slow-timeout = { period = "120s", terminate-after = 5 }
 
 [[profile.default.overrides]]
 filter = 'test(/cutover_global_net_state_service_controls_after_stop_/)'

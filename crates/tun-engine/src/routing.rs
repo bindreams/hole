@@ -2727,3 +2727,7 @@ mod routing_tests;
 #[cfg(test)]
 #[path = "routing_unreadable_tests.rs"]
 mod routing_unreadable_tests;
+
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[path = "routing/split_route_privileged_tests.rs"]
+mod split_route_privileged_tests;
