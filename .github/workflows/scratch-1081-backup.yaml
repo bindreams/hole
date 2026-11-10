@@ -13,7 +13,10 @@
 # Not for merging.
 name: scratch-1081-backup
 
-on: workflow_dispatch
+# `workflow_dispatch` needs the file on the default branch, so a push to this branch starts it.
+on:
+  push:
+    branches: [azhukova/1081-measure-backup]
 
 jobs:
   measure:
