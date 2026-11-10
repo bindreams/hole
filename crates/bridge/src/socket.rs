@@ -262,8 +262,9 @@ pub(crate) fn remove_name(dir: &Path, name: &std::ffi::OsStr) -> io::Result<()> 
     }
 }
 
-/// Makes the folder of `path` if it is missing and frees the name: a stale socket is removed. A name that cannot be
-/// removed is the bind's error, not a warning before the bind's own.
+/// Makes the folder of `path` if it is missing and frees the name: whatever is there is removed, a live bridge's
+/// socket as much as a stale one, so a second bridge takes the name over. A name that cannot be removed is the
+/// bind's error, not a warning before the bind's own.
 fn make_room(path: &Path) -> io::Result<()> {
     let (parent, name) = split(path)?;
     util::dir::make_dir_and_free_name(parent, name)

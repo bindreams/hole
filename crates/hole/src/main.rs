@@ -62,9 +62,9 @@ fn main() {
                 eprintln!("error: dashboard flags cannot be combined with a subcommand");
                 std::process::exit(2);
             }
-            cli::dispatch(cmd);
+            cli::dispatch(cmd, cli.log_dir);
         }
-        None => launch_gui(show_dashboard),
+        None => launch_gui(show_dashboard, cli.log_dir),
     }
 }
 
@@ -79,7 +79,7 @@ fn main() {
     skuld::run_all();
 }
 
-fn launch_gui(show_dashboard: bool) {
+fn launch_gui(show_dashboard: bool, log_dir: Option<std::path::PathBuf>) {
     // BEFORE logging redirects stdout into the (lossy) log relay: if we were
     // relaunched to take over a stale predecessor (version self-heal, or
     // post-update), signal READY over the inherited stdout pipe and wait for
@@ -96,9 +96,14 @@ fn launch_gui(show_dashboard: bool) {
     // Determine paths
     let config_dir = dirs::config_dir().expect("no config directory found").join("hole");
     let config_path = config_dir.join("config.json");
-    let log_dir = hole_common::logging::resolve_log_dir(None);
+    // A GUI is never the installed service: with no person behind it, it logs to its own profile.
+    let resolved = hole::principal::Principal::resolve(false);
+    let log_dir = hole_common::logging::resolve_log_dir_from(log_dir, hole_common::logging::hole_log_dir_env(), || {
+        resolved.principal.own_log_dir()
+    });
 
-    let _log_guard = logging::init(&log_dir);
+    let _log_guard = logging::init(&log_dir, resolved.principal.owner());
+    resolved.log_warning();
 
     // Native-crash observability (bindreams/hole#438): report any crash
     // marker a previously-crashed GUI/foreground-bridge left in this dir.
@@ -180,6 +185,7 @@ fn launch_gui(show_dashboard: bool) {
             // events from commands like `test_server`.
             let (config_store, config, recovery) =
                 hole_common::config_store::ConfigStore::load(config_path.clone(), time::OffsetDateTime::now_utc());
+            app.manage(log_collector::GuiLogDir(log_dir.clone()));
             app.manage(AppState::new(config_store, config, app.handle().clone()));
             if let Some(recovery) = recovery {
                 // Non-blocking: `blocking_show` must not run on the main

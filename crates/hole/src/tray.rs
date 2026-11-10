@@ -1251,7 +1251,8 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
 pub(crate) async fn handle_collect_logs(app: AppHandle) {
     use tauri_plugin_dialog::DialogExt;
 
-    let zip_result = tokio::task::spawn_blocking(crate::log_collector::collect_logs_to_zip).await;
+    let gui_log_dir = app.state::<crate::log_collector::GuiLogDir>().0.clone();
+    let zip_result = tokio::task::spawn_blocking(move || crate::log_collector::collect_logs_to_zip(&gui_log_dir)).await;
 
     let zip_path = match zip_result {
         Ok(Ok(path)) => path,

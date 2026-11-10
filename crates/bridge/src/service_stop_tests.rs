@@ -201,24 +201,13 @@ fn teardown_enters_the_proxy_phases_through_the_progress_it_hands_the_stop_work(
 }
 
 #[skuld::test]
-fn stopped_is_reported_only_after_the_runtime_is_dropped() {
+fn the_runtime_is_dropped_after_shutdown_runtime_is_reported() {
     let log = Log::default();
     let progress = log.progress();
-    finish_stop(
-        &progress,
-        || log.step("drop_runtime"),
-        || {
-            log.step("stopped");
-            Ok(())
-        },
-    );
+    shutdown_runtime(&progress, || log.step("drop_runtime"));
     assert_eq!(
         log.events(),
-        vec![
-            Event::Reported(StopPhase::ShutdownRuntime),
-            Event::Step("drop_runtime"),
-            Event::Step("stopped"),
-        ]
+        vec![Event::Reported(StopPhase::ShutdownRuntime), Event::Step("drop_runtime")]
     );
 }
 
@@ -719,12 +708,49 @@ fn the_stop_control_reports_before_it_signals_the_main_task_and_signals_once() {
 fn a_failed_stopped_report_is_logged_as_a_warning() {
     let writer = VecWriter::new();
     let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
-    let progress = StopProgress::new(|_| Ok(()));
-    finish_stop(&progress, || {}, || Err(std::io::Error::other("SCM refused")));
+    run_then_report_stopped(|| Ok(()), |_| Err(std::io::Error::other("SCM refused")));
     let out = writer.snapshot_string();
     assert!(
         out.contains("WARN") && out.contains("failed to report Stopped"),
-        "failed Stopped report not logged:\n{out}"
+        "failed Stopped report not logged:
+{out}"
+    );
+}
+
+#[skuld::test]
+fn a_run_that_succeeds_reports_stopped_zero_once() {
+    let reported = Mutex::new(Vec::new());
+    run_then_report_stopped(
+        || Ok(()),
+        |code| {
+            reported.lock().unwrap().push(code);
+            Ok(())
+        },
+    );
+    assert_eq!(*reported.lock().unwrap(), vec![0]);
+}
+
+#[skuld::test]
+fn a_run_that_fails_is_logged_once_and_reports_stopped_nonzero_once() {
+    let writer = VecWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    let reported = Mutex::new(Vec::new());
+    run_then_report_stopped(
+        || Err("the runtime could not be built".into()),
+        |code| {
+            reported.lock().unwrap().push(code);
+            Ok(())
+        },
+    );
+    let reported = reported.into_inner().unwrap();
+    assert_eq!(reported.len(), 1, "Stopped is reported exactly once: {reported:?}");
+    assert_ne!(reported[0], 0);
+    let out = writer.snapshot_string();
+    assert_eq!(
+        out.matches("the runtime could not be built").count(),
+        1,
+        "the failure is logged exactly once:
+{out}"
     );
 }
 

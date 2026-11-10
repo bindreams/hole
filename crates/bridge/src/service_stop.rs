@@ -480,18 +480,37 @@ pub fn drop_last_handle<T>(handle: Arc<T>) {
     }
 }
 
-/// Last teardown step: `Stopped` is reported only once the runtime is gone,
-/// because dropping it joins blocking tasks that can still hang. A failed
-/// `Stopped` report is logged: the SCM stays on the last checkpoint, which
-/// otherwise reads as a hang in [`StopPhase::ShutdownRuntime`].
-pub fn finish_stop<F: Fn(StopPhase) -> std::io::Result<()>>(
+/// Last teardown step: report [`StopPhase::ShutdownRuntime`], then drop the
+/// runtime, which joins blocking tasks that can still hang. The caller reports
+/// `Stopped` only after this returns ([`run_then_report_stopped`]).
+pub fn shutdown_runtime<F: Fn(StopPhase) -> std::io::Result<()>>(
     progress: &StopProgress<F>,
     drop_runtime: impl FnOnce(),
-    report_stopped: impl FnOnce() -> std::io::Result<()>,
 ) {
     progress.enter(StopPhase::ShutdownRuntime);
     drop_runtime();
-    if let Err(e) = report_stopped() {
+}
+
+/// Run the service, then report `Stopped` to the SCM exactly once, with exit
+/// code 0 when `run` succeeded and 1 when it failed. A failure is logged here,
+/// once, and nowhere else; it is not a requested stop, so it reports no
+/// [`StopPhase`]. The dispatcher returns only once the service is `Stopped`,
+/// so a failed start that skipped the report would leave the service in
+/// `StartPending` (error 1053) with no failure action run. A failed `Stopped`
+/// report is logged: the SCM stays on the last checkpoint, which otherwise
+/// reads as a hang in [`StopPhase::ShutdownRuntime`].
+pub fn run_then_report_stopped(
+    run: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    report_stopped: impl FnOnce(u32) -> std::io::Result<()>,
+) {
+    let exit_code = match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!(error = &*e, "service failed");
+            1
+        }
+    };
+    if let Err(e) = report_stopped(exit_code) {
         tracing::warn!(
             error = &e as &dyn std::error::Error,
             "failed to report Stopped to the SCM"

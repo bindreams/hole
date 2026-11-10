@@ -27,6 +27,18 @@ pub fn default_state_dir() -> PathBuf {
     default_user_subdir("state")
 }
 
+/// Hole's directory inside a named user's home, rather than inside that of whoever the process's effective user
+/// happens to be: macOS's layout, a pure join compiled everywhere. Every per-user directory below except
+/// [`windows_profile_state_dir`] (Windows' layout, under `AppData\Local`) is a child of it.
+pub fn user_data_dir(home: &std::path::Path) -> PathBuf {
+    home.join("Library/Application Support/hole")
+}
+
+/// Log directory for a named user's home. The same arrangement as [`user_state_dir`].
+pub fn user_log_dir(home: &std::path::Path) -> PathBuf {
+    user_data_dir(home).join("logs")
+}
+
 /// State directory for a named user's home, rather than for whoever the
 /// process's effective user happens to be.
 ///
@@ -40,7 +52,7 @@ pub fn default_state_dir() -> PathBuf {
 /// pure path join and is compiled everywhere so its unit test does not need a
 /// platform of its own.
 pub fn user_state_dir(home: &std::path::Path) -> PathBuf {
-    home.join("Library/Application Support/hole/state")
+    user_data_dir(home).join("state")
 }
 
 /// State directory inside a named Windows user profile, rather than the

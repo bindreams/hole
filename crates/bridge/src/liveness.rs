@@ -6,11 +6,14 @@
 //! OS-level exclusive lock the running bridge holds for its entire
 //! lifetime. `unlock`'s refusal check and its target-write → disengage →
 //! intent-flip sequence both go through [`BridgeLiveness::try_acquire`] on
-//! the SAME lock file, so a bridge that starts mid-unlock contends on the
-//! lock instead of interleaving with it: either it observes the lock held
-//! and is not the thing racing (single-instance is separately enforced by
-//! the IPC socket bind, which fails first), or `unlock` observes the lock
-//! held and refuses outright, with no window where neither is true.
+//! the SAME lock file, so a bridge on that state directory that starts
+//! mid-unlock waits on the lock instead of interleaving with it, or `unlock`
+//! observes the lock held and refuses outright, with no window where neither
+//! is true. The lock is per state directory: `unlock` probes the installed
+//! service's, so it does not see a bridge on another one (a foreground run's
+//! default, or `--state-dir`). The socket bind takes its name over, so nothing
+//! here keeps two bridges apart: one bridge per host is the user's to keep
+//! (CONTRIBUTING.md, "One bridge per host").
 //!
 //! Unlike the in-process lock of a `VersionedFile` (a leaf), this lock is
 //! meant to be held for a whole process's lifetime, across other locks
@@ -31,9 +34,8 @@ pub struct BridgeLiveness(#[allow(dead_code)] Exclusive);
 
 impl BridgeLiveness {
     /// Acquire for the running bridge's own lifetime: call once, early in
-    /// boot, and hold the returned value until process exit. Blocks, but a
-    /// second real bridge instance never reaches this call — the IPC socket
-    /// bind already refuses it first.
+    /// boot, and hold the returned value until process exit. Blocks: a second
+    /// bridge on the same state directory waits here until the first exits.
     pub fn acquire(state_dir: &Path, owner: Option<(u32, u32)>) -> io::Result<Self> {
         Ok(Self(Exclusive::acquire(&state_dir.join(LOCK_FILE_NAME), owner)?))
     }

@@ -2660,7 +2660,7 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
   service Disabled again and does not start it; it still exits 0 (the MSI's
   `BridgeInstall` is `Return="check"`) and logs why the service is not running. A
   start type it cannot read fails the install before anything changes, since
-  guessing "not disabled" would re-enable it. Only `hole bridge enable [--log-dir DIR]` (elevated; set Automatic, clear the record, start; an already running
+  guessing "not disabled" would re-enable it. Only `hole bridge enable` (elevated; set Automatic, clear the record, start; an already running
   service is success; `Unsupported` on macOS, whose service has no start type)
   and the GUI's Enable action, which runs it, override it.
 - **The in-app update over an administrator's Disable succeeds.** The cutover
@@ -3606,6 +3606,8 @@ Ctrl+C and re-run.
   `bridge run`. Vite and the GUI run as you, reading your real `~/Library`. On
   Windows everything inherits the already-elevated UAC token (token-based; no
   identity change).
+- dev-console starts a bridge of its own: stop the installed service first (see
+  [One bridge per host](#one-bridge-per-host)).
 - dev-console runs `hole bridge grant-access` (creates the `hole` group, adds
   your user) so the bridge exercises the production DACL/group path on every
   run. The group is **not** removed on exit (same as production). The GUI needs
@@ -3630,8 +3632,11 @@ Ctrl+C and re-run.
 
 ### Manual workflow
 
-Separate terminals, more control. **Terminal 1 — bridge:** build and stage as
-your normal user; only `bridge grant-access` + `bridge run` need elevation.
+Separate terminals, more control. Stop the installed service first: the bridge below is a second one beside it (see
+[One bridge per host](#one-bridge-per-host)).
+
+**Terminal 1 — bridge:** build and stage as your normal user; only `bridge grant-access` + `bridge run` need
+elevation.
 
 ```powershell
 # Windows (elevated PowerShell — UAC token-based, everything inherits it)
@@ -3679,11 +3684,39 @@ checked against it by conformance tests (`cargo xtask bindir-names`).
 - `hole bridge run` — foreground, logs to stderr + file. **Needs elevation.**
 - `--service` — register with Windows SCM / macOS launchd (the service installer
   passes this).
-- `--log-dir` / `--state-dir` / `--socket-path` — override defaults.
+- `--log-dir` (top-level, every command; see [Where a command's log goes](#where-a-commands-log-goes)) /
+  `--state-dir` / `--socket-path` — override defaults.
   A `--socket-path`'s folder gets the same link walk as the default one (a link is followed only under the
   ownership-transition rule) and nothing more: Hole does not require the bridge to own it, and the caller vouches for it. The safety work is on the
   default path of a production install.
+- A foreground `bridge run` without `--socket-path` binds the installed service's socket name, as the service does
+  (see [One bridge per host](#one-bridge-per-host)).
 - `HOLE_BRIDGE_SOCKET` env var — tells the GUI to connect to a dev bridge socket.
+
+### One bridge per host
+
+Run one bridge per host. Nothing in code keeps a second one out: the bind of the IPC socket unlinks whatever is at the
+name, a live bridge's socket as much as a stale one, and the liveness lock is per state directory. A foreground
+`bridge run` binds the installed service's socket name by default, so every client finds the host's one bridge at the
+path it already dials. A second bridge (foreground, dev-console, the manual workflow) beside the installed service is
+not supported: both act on the same host-wide state (the TUN, WFP filters and routes on Windows; the route splits, pf
+anchors and DNS steering key on macOS), and the newer one takes the socket.
+
+To run a bridge of your own, stop the service first and start it again after yours has exited:
+
+- Windows (elevated PowerShell): `Stop-Service HoleBridge`, then `Start-Service HoleBridge`.
+- macOS: `sudo launchctl bootout system/com.hole.bridge`, then
+  `sudo launchctl bootstrap system /Library/LaunchDaemons/com.hole.bridge.plist`.
+
+If a second bridge ran while the service was still running, restart the service once that bridge has exited:
+`Restart-Service HoleBridge` or `sudo launchctl kickstart -k system/com.hole.bridge`. (After the `bootout` above the
+service is not loaded, so `kickstart -k` fails: `bootstrap` it as shown.) Restart it only once the second bridge is
+gone. This holds for a second bridge on a non-default socket too, since it acts on the same host-wide state; one that
+ran on the default socket also left the service unreachable until it restarts.
+
+The CLI's own requests (`hole proxy`, `hole bridge ipc-send`, `hole bridge grant-access --then-send`) dial the default
+path. Only the GUI reads `HOLE_BRIDGE_SOCKET`, which with `--socket-path` is how dev-console points it at its own
+bridge.
 
 ### Notes
 
@@ -4076,6 +4109,37 @@ the file (the active file itself is held without delete sharing, or both names a
 file keeps being appended past the limit while the holder keeps it, and the next rotation that succeeds restores the
 limit. Only a file that cannot be opened loses lines, and says so once on the real stderr.
 
+#### Where a command's log goes
+
+**A command's default log directory follows the principal: the person who ran it.** One rule for every command
+(`gui.log`, `bridge.log`, `gui-cli.log`), resolved once by [`Principal`](crates/hole/src/principal.rs):
+
+- **A person running as themselves, elevated or not:** their own directory (the first bullet above). On Windows an
+  elevated administrator keeps their SID, so this needs no work.
+- **A person behind `sudo` (macOS root):** the real user's. `SUDO_USER`, else the owner of
+  `/dev/console`, else `logname` names them; uid, gid and home come from the passwd entry, not `$HOME`. Files created are
+  handed to that user. If none of them names a person, the process is treated as having none, and logs why once its
+  log exists. Likewise a Windows process whose own account cannot be read is treated as a person, and logs why.
+- **An over-the-shoulder elevation on Windows** (a standard user enters an administrator's credentials at the UAC
+  prompt): the process's token is the administrator's, so the log goes to the folder of the account whose credentials
+  were entered.
+- **No person:** the system's, `C:\ProgramData\hole\logs` or `/var/log/hole`. That is LocalSystem, LocalService,
+  NetworkService, a per-service virtual account (`S-1-5-80-*`), the launchd daemon (`bridge run --service`), and root
+  with no person behind it. A service account's own profile (`systemprofile`) is never a destination, except for a
+  process that is not the installed service (below).
+
+The GUI and a foreground `bridge run` (no `--service`) are not the installed service, and none of their files may land
+in the installed service's folders: with no person behind it, such a process's log goes to its own profile, as a
+foreground bridge's state already does. (The installed service's state dir is passed to it with `--state-dir`.) The
+socket is not among those files: it is the host's address of its one bridge ([One bridge per host](#one-bridge-per-host)).
+The GUI resolves its `gui.log` through `Principal` like every other command, and the support bundle collects from that
+same resolved directory.
+
+`--log-dir DIR` is one top-level flag, accepted by every command before or after its subcommand. Precedence: the flag,
+then `HOLE_LOG_DIR`, then the list above. The MSI's custom actions run as LocalSystem and so land in the system dir without
+passing it. `hole bridge log` reads the installed bridge's log, so its fallback is the system dir whoever asks. A new
+command takes the rule for free by logging through `dispatch`; it does not add a flag or its own default.
+
 ### WebView2 and Chromium logs
 
 Windows WebView2 writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
@@ -4340,11 +4404,12 @@ The out-of-process plugin (`ex-ray`, `galoshes`) is otherwise invisible:
 User-facing commands are in [README.md](README.md#commands). The rest:
 
 ```
-hole bridge run [--socket-path P] [--log-dir DIR] [--state-dir DIR]   run bridge (foreground, needs elevation)
-hole bridge run --service [--log-dir DIR] [--state-dir DIR]           run as service (invoked by SCM/launchd)
-hole bridge install | uninstall [--log-dir DIR] | status             register/start | stop/remove | status (elevation)
-hole bridge enable [--log-dir DIR]                                     enable + start a disabled service (elevation)
-hole bridge log [path | watch [--tail N]] [--log-dir DIR]            print | locate | stream the bridge log
+hole [--log-dir DIR] <command>                                         any command; the log dir for it (see Logging)
+hole bridge run [--socket-path P] [--state-dir DIR]                    run bridge (foreground, needs elevation)
+hole bridge run --service [--state-dir DIR]                            run as service (invoked by SCM/launchd)
+hole bridge install | uninstall | status                               register/start | stop/remove | status (elevation)
+hole bridge enable                                                     enable + start a disabled service (elevation)
+hole bridge log [path | watch [--tail N]]                              print | locate | stream the bridge log
 hole bridge grant-access [--then-send B64 | --then-send-file PATH]    create hole group, add user, write SID file
 hole bridge ipc-send (--base64 B64 | --request-file PATH)            proxy a single IPC command (elevation)
 hole proxy start --config-file PATH [--local-port PORT] [--local-port-http PORT] [--no-socks5] [--http] [--tunnel-mode MODE]

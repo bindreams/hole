@@ -1,28 +1,30 @@
 use super::*;
 use clap::Parser;
+#[cfg(unix)]
+use skuld::env;
 use skuld::temp_dir;
 use std::path::Path;
 
 // Elevated-run owner resolution (#572) ================================================================================
 
 #[skuld::test]
-fn user_dirs_derive_from_home_not_env() {
-    use std::path::Path;
+fn user_state_dir_derives_from_home_not_env() {
     assert_eq!(
-        super::user_log_dir(Path::new("/Users/alice")),
-        Path::new("/Users/alice/Library/Application Support/hole/logs")
-    );
-    assert_eq!(
-        super::user_state_dir(Path::new("/Users/alice")),
+        hole_common::paths::user_state_dir(Path::new("/Users/alice")),
         Path::new("/Users/alice/Library/Application Support/hole/state")
     );
 }
 
 #[skuld::test]
-fn service_never_gets_an_owner() {
-    assert!(
-        super::resolved_owner(true).is_none(),
-        "--service must never resolve an owner"
+fn a_users_dirs_all_live_in_their_data_dir() {
+    let home = Path::new("/Users/alice");
+    assert_eq!(
+        hole_common::paths::user_data_dir(home),
+        Path::new("/Users/alice/Library/Application Support/hole")
+    );
+    assert_eq!(
+        hole_common::paths::user_log_dir(home),
+        Path::new("/Users/alice/Library/Application Support/hole/logs")
     );
 }
 
@@ -182,7 +184,6 @@ fn dispatch_exempts_bridge_run_from_cli_log_guard() {
         action: BridgeAction::Run {
             socket_path: None,
             service: false,
-            log_dir: None,
             state_dir: None,
             ready_notify: None,
         },
@@ -193,22 +194,17 @@ fn dispatch_exempts_bridge_run_from_cli_log_guard() {
 #[skuld::test]
 fn dispatch_exempts_bridge_log_from_cli_log_guard() {
     let cmd = Command::Bridge {
-        action: BridgeAction::Log {
-            log_dir: None,
-            action: None,
-        },
+        action: BridgeAction::Log { action: None },
     };
     assert!(!should_install_cli_log_guard(&cmd));
     let cmd = Command::Bridge {
         action: BridgeAction::Log {
-            log_dir: None,
             action: Some(LogAction::Path),
         },
     };
     assert!(!should_install_cli_log_guard(&cmd));
     let cmd = Command::Bridge {
         action: BridgeAction::Log {
-            log_dir: None,
             action: Some(LogAction::Watch { tail: 0 }),
         },
     };
@@ -220,15 +216,11 @@ fn dispatch_installs_cli_log_guard_for_write_actions() {
     assert!(should_install_cli_log_guard(&Command::Upgrade { yes: false }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
         action: BridgeAction::Install {
-            log_dir: None,
             repair_user_data_dir: None,
         },
     }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
-        action: BridgeAction::Uninstall {
-            keep_covers: false,
-            log_dir: None,
-        },
+        action: BridgeAction::Uninstall { keep_covers: false },
     }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
         action: BridgeAction::Status,
@@ -568,29 +560,12 @@ fn decode_b64_request_round_trips_a_well_formed_payload() {
 fn bridge_install_parses_with_no_flags() {
     let cli = Cli::try_parse_from(["hole", "bridge", "install"]).expect("parse bridge install");
     let Some(Command::Bridge {
-        action: BridgeAction::Install {
-            log_dir,
-            repair_user_data_dir,
-        },
+        action: BridgeAction::Install { repair_user_data_dir },
     }) = cli.command
     else {
         panic!("expected Command::Bridge::Install");
     };
-    assert!(log_dir.is_none(), "default log_dir is None");
     assert!(repair_user_data_dir.is_none(), "default repair_user_data_dir is None");
-}
-
-#[skuld::test]
-fn bridge_install_parses_log_dir_flag() {
-    let cli = Cli::try_parse_from(["hole", "bridge", "install", "--log-dir", "/tmp/hole-install-XXXX"])
-        .expect("parse bridge install --log-dir");
-    let Some(Command::Bridge {
-        action: BridgeAction::Install { log_dir, .. },
-    }) = cli.command
-    else {
-        panic!("expected Command::Bridge::Install");
-    };
-    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/hole-install-XXXX")));
 }
 
 #[skuld::test]
@@ -629,174 +604,296 @@ fn bridge_install_parses_both_flags() {
         "/tmp/R",
     ])
     .expect("parse bridge install with both flags");
+    assert_eq!(cli.log_dir, Some(std::path::PathBuf::from("/tmp/L")));
     let Some(Command::Bridge {
-        action: BridgeAction::Install {
-            log_dir,
-            repair_user_data_dir,
-        },
+        action: BridgeAction::Install { repair_user_data_dir },
     }) = cli.command
     else {
         panic!("expected Command::Bridge::Install");
     };
-    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/L")));
     assert_eq!(repair_user_data_dir, Some(std::path::PathBuf::from("/tmp/R")));
 }
 
-// `bridge log --log-dir` position-independence ========================================================================
+// Top-level `--log-dir` ===============================================================================================
 //
-// --log-dir applies to `bridge log` regardless of position relative to the
-// nested watch/path subcommand.
+// One flag, accepted by every command before or after its subcommand, in place of the per-subcommand flags it
+// replaced.
 
-#[skuld::test]
-fn bridge_log_dir_flag_accepted_after_watch_subcommand() {
-    let cli = Cli::try_parse_from([
-        "hole",
-        "bridge",
-        "log",
-        "watch",
-        "--tail",
-        "50",
-        "--log-dir",
-        "/tmp/svc",
-    ])
-    .expect("--log-dir should be accepted after the watch subcommand");
-    let Some(Command::Bridge {
-        action: BridgeAction::Log { log_dir, action },
-    }) = cli.command
-    else {
-        panic!("expected Bridge::Log");
-    };
-    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/svc")));
-    assert!(matches!(action, Some(LogAction::Watch { tail: 50 })));
+/// Every command line the CLI accepts, each as the arguments after `hole`.
+fn every_command_line() -> Vec<Vec<&'static str>> {
+    vec![
+        vec!["version"],
+        vec!["upgrade", "--yes"],
+        vec!["path", "add"],
+        vec!["path", "remove"],
+        vec!["proxy", "stop"],
+        vec!["proxy", "start", "--config-file", "c.json"],
+        vec!["proxy", "test-server", "--config-file", "c.json"],
+        vec!["bridge", "run"],
+        vec!["bridge", "run", "--service"],
+        vec!["bridge", "install"],
+        vec!["bridge", "enable"],
+        vec!["bridge", "uninstall", "--keep-covers"],
+        vec!["bridge", "status"],
+        vec!["bridge", "log"],
+        vec!["bridge", "log", "path"],
+        vec!["bridge", "log", "watch", "--tail", "50"],
+        vec!["bridge", "grant-access"],
+        vec!["bridge", "ipc-send", "--base64", "e30="],
+        vec!["bridge", "cutover", "--payload", "p", "--target-version", "1.0.0"],
+        vec!["bridge", "unlock"],
+        vec!["bridge", "release-covers"],
+    ]
 }
 
 #[skuld::test]
-fn bridge_log_dir_flag_accepted_after_path_subcommand() {
-    let cli = Cli::try_parse_from(["hole", "bridge", "log", "path", "--log-dir", "/tmp/svc"])
-        .expect("--log-dir should be accepted after the path subcommand");
-    let Some(Command::Bridge {
-        action: BridgeAction::Log { log_dir, action },
-    }) = cli.command
-    else {
-        panic!("expected Bridge::Log");
-    };
-    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/svc")));
-    assert!(matches!(action, Some(LogAction::Path)));
+fn log_dir_is_accepted_by_every_command_before_or_after_its_subcommand() {
+    for args in every_command_line() {
+        let mut before = vec!["hole", "--log-dir", "/tmp/L"];
+        before.extend(&args);
+        let cli = Cli::try_parse_from(&before).unwrap_or_else(|e| panic!("{before:?}: {e}"));
+        assert_eq!(cli.log_dir, Some(std::path::PathBuf::from("/tmp/L")), "{before:?}");
+
+        let mut after = vec!["hole"];
+        after.extend(&args);
+        after.extend(["--log-dir", "/tmp/L"]);
+        let cli = Cli::try_parse_from(&after).unwrap_or_else(|e| panic!("{after:?}: {e}"));
+        assert_eq!(cli.log_dir, Some(std::path::PathBuf::from("/tmp/L")), "{after:?}");
+    }
 }
 
 #[skuld::test]
-fn bridge_log_dir_flag_still_accepted_before_subcommand() {
-    let cli = Cli::try_parse_from([
-        "hole",
-        "bridge",
-        "log",
-        "--log-dir",
-        "/tmp/svc",
-        "watch",
-        "--tail",
-        "50",
-    ])
-    .expect("--log-dir before the subcommand must still parse");
-    let Some(Command::Bridge {
-        action: BridgeAction::Log { log_dir, action },
-    }) = cli.command
-    else {
-        panic!("expected Bridge::Log");
-    };
-    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/svc")));
-    assert!(matches!(action, Some(LogAction::Watch { tail: 50 })));
+fn log_dir_is_none_unless_given() {
+    for args in every_command_line() {
+        let mut argv = vec!["hole"];
+        argv.extend(&args);
+        let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        assert_eq!(cli.log_dir, None, "{argv:?}");
+    }
 }
 
-// `hole bridge log` reader default ====================================================================================
+#[skuld::test]
+fn log_dir_is_accepted_by_a_gui_launch() {
+    let cli = Cli::try_parse_from(["hole", "--log-dir", "/tmp/L"]).expect("parse a launch with --log-dir");
+    assert!(cli.command.is_none());
+    assert_eq!(cli.log_dir, Some(std::path::PathBuf::from("/tmp/L")));
+}
+
+// Default log directory ===============================================================================================
 //
-// Falls back to the installed service's log dir, not the per-user default.
+// With no flag and no HOLE_LOG_DIR, a command's own log follows the principal; `bridge log` reads the installed
+// bridge's, which is the system's.
+
+fn alice() -> Principal {
+    Principal::Elevated(hole_bridge::group::RealUser {
+        name: "alice".into(),
+        uid: 501,
+        gid: 20,
+        home: std::path::PathBuf::from("/Users/alice"),
+    })
+}
+
+fn alices_logs() -> &'static Path {
+    Path::new("/Users/alice/Library/Application Support/hole/logs")
+}
+
+fn parse(args: &[&str]) -> Command {
+    let mut argv = vec!["hole"];
+    argv.extend(args);
+    Cli::try_parse_from(argv).expect("parse").command.expect("a command")
+}
+
+fn is_bridge_log(args: &[&str]) -> bool {
+    args.len() >= 2 && args[..2] == ["bridge", "log"]
+}
+
+fn is_foreground_bridge(args: &[&str]) -> bool {
+    args == ["bridge", "run"]
+}
 
 #[skuld::test]
-fn resolve_bridge_log_dir_falls_back_to_service_dir() {
-    // Pins the load-bearing wiring: the baked fallback is the service dir, not
-    // the per-user default. A revert to default_log_dir would fail this.
-    assert_eq!(
-        super::resolve_bridge_log_dir_from(None, None),
-        hole_common::update_marker::service_log_dir()
+fn a_commands_default_log_dir_follows_the_principal() {
+    let own = hole_common::logging::default_log_dir();
+    let system = hole_common::update_marker::service_log_dir();
+    for (principal, expected) in [
+        (Principal::Person, own),
+        (alice(), alices_logs().to_path_buf()),
+        (Principal::Service, system),
+    ] {
+        for args in every_command_line() {
+            if is_bridge_log(&args) || is_foreground_bridge(&args) {
+                continue;
+            }
+            assert_eq!(
+                parse(&args).standing().default_log_dir(&principal),
+                expected,
+                "{args:?} for {principal:?}"
+            );
+        }
+    }
+}
+
+// A foreground `bridge run` is a second bridge: for no person it logs to its own profile, never the installed
+// service's directory (whose update marker and crash marker it would sweep).
+#[skuld::test]
+fn a_foreground_bridge_run_never_defaults_to_the_installed_services_dir() {
+    let own = hole_common::logging::default_log_dir();
+    for (principal, expected) in [
+        (Principal::Person, own.clone()),
+        (alice(), alices_logs().to_path_buf()),
+        (Principal::Service, own),
+    ] {
+        let dir = parse(&["bridge", "run"]).standing().default_log_dir(&principal);
+        assert_eq!(dir, expected, "{principal:?}");
+        assert_ne!(dir, hole_common::update_marker::service_log_dir(), "{principal:?}");
+    }
+}
+
+#[skuld::test]
+fn bridge_log_defaults_to_the_installed_bridges_dir_whoever_asks() {
+    for principal in [Principal::Person, alice(), Principal::Service] {
+        for args in every_command_line().into_iter().filter(|a| is_bridge_log(a)) {
+            assert_eq!(
+                parse(&args).standing().default_log_dir(&principal),
+                hole_common::update_marker::service_log_dir(),
+                "{args:?}"
+            );
+        }
+    }
+}
+
+// What every `bridge run` hands the bridge: the one socket name the GUI and the CLI dial unless `--socket-path` says
+// otherwise, and a state dir that follows the principal unless `--state-dir` says otherwise. The cases drive
+// `bridge_run_paths`, the function the Run arm takes both paths from. Each platform lists the principals a foreground run
+// can have there, with literal expected paths: Linux has only `Person` (nothing there makes an account a service
+// account, and it never sets up a person behind an elevation); Windows adds `Service` (a service account; elevation
+// keeps the person's own profile, so an elevated administrator is a `Person`); macOS has all three. The service entry
+// point (`--service`) is a `Service` on every platform. Unix pins the environment its default state dir is read from;
+// Windows' is the profile's Local AppData known folder, which the test cannot set and reads from the shell directly.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_bridge_run_hands_the_bridge_the_default_socket_and_the_principals_state_dir() {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+
+    // SAFETY: the returned string is read once and freed with `CoTaskMemFree`, as the call requires.
+    let local_app_data = unsafe {
+        let raw =
+            SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None).expect("the Local AppData folder");
+        let path = raw.to_string().expect("a UTF-16 path");
+        CoTaskMemFree(Some(raw.0.cast()));
+        std::path::PathBuf::from(path)
+    };
+    assert_bridge_run_paths(local_app_data.join("hole").join("state"));
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn a_bridge_run_hands_the_bridge_the_default_socket_and_the_principals_state_dir(
+    #[fixture] env: &skuld::EnvGuard,
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    let home = dir.join("own-home");
+    env.set("HOME", home.to_str().expect("a UTF-8 temp dir"));
+    assert_bridge_run_paths(
+        home.join("Library")
+            .join("Application Support")
+            .join("hole")
+            .join("state"),
     );
-    assert_ne!(
-        super::resolve_bridge_log_dir_from(None, None),
-        hole_common::logging::default_log_dir()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[skuld::test]
+fn a_bridge_run_hands_the_bridge_the_default_socket_and_the_principals_state_dir(
+    #[fixture] env: &skuld::EnvGuard,
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    let xdg_state = dir.join("xdg-state");
+    env.set("XDG_STATE_HOME", xdg_state.to_str().expect("a UTF-8 temp dir"));
+    assert_bridge_run_paths(xdg_state.join("hole").join("state"));
+}
+
+/// `own_state` is the process's own default state dir: what a `Person` gets, and a `Service` too when no
+/// `--state-dir` is passed (the installed service always passes one).
+fn assert_bridge_run_paths(own_state: std::path::PathBuf) {
+    // Derived here, not through the code under test.
+    #[cfg(not(target_os = "windows"))]
+    let default_socket = std::path::PathBuf::from("/var/run/hole-bridge.sock");
+    #[cfg(target_os = "windows")]
+    let default_socket =
+        std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
+            .join("hole")
+            .join("hole-bridge.sock");
+
+    #[cfg(target_os = "macos")]
+    let elevated = {
+        let alices_home = std::env::temp_dir().join("alice");
+        let alice = Principal::Elevated(hole_bridge::group::RealUser {
+            name: "alice".into(),
+            uid: 501,
+            gid: 20,
+            home: alices_home.clone(),
+        });
+        let alices_state = alices_home
+            .join("Library")
+            .join("Application Support")
+            .join("hole")
+            .join("state");
+        vec![(alice, alices_state)]
+    };
+    #[cfg(not(target_os = "macos"))]
+    let elevated = Vec::new();
+    let given_state = std::env::temp_dir().join("given-state");
+    let given_socket = std::path::PathBuf::from("/tmp/dev.sock");
+    let given = given_state.to_str().expect("a UTF-8 temp dir");
+
+    // A foreground run has the principals its platform can produce; the service entry point is the `Service` one.
+    let mut cases: Vec<(&[&str], Principal, std::path::PathBuf)> =
+        vec![(&["bridge", "run"], Principal::Person, own_state.clone())];
+    #[cfg(any(windows, target_os = "macos"))]
+    cases.push((&["bridge", "run"], Principal::Service, own_state.clone()));
+    cases.extend(
+        elevated
+            .into_iter()
+            .map(|(principal, state)| (&["bridge", "run"][..], principal, state)),
     );
+    cases.push((&["bridge", "run", "--service"], Principal::Service, own_state));
+
+    for (bare, principal, state) in cases {
+        let mut explicit = bare.to_vec();
+        explicit.extend(["--socket-path", "/tmp/dev.sock", "--state-dir", given]);
+        for (args, socket, state) in [
+            (bare.to_vec(), default_socket.clone(), state),
+            (explicit, given_socket.clone(), given_state.clone()),
+        ] {
+            let Command::Bridge {
+                action: BridgeAction::Run {
+                    socket_path, state_dir, ..
+                },
+            } = parse(&args)
+            else {
+                panic!("{args:?} is not a bridge run");
+            };
+            let paths = bridge_run_paths(socket_path, state_dir, &principal).expect("paths");
+            assert_eq!(
+                (paths.socket_path, paths.state_dir),
+                (socket, state),
+                "{args:?} for {principal:?}"
+            );
+        }
+    }
 }
 
 #[skuld::test]
-fn resolve_bridge_log_dir_prefers_explicit_override() {
-    let custom = std::path::PathBuf::from("/tmp/custom-logs");
-    assert_eq!(super::resolve_bridge_log_dir_from(Some(custom.clone()), None), custom);
-}
-
-#[skuld::test]
-fn resolve_bridge_log_dir_uses_env_when_no_override() {
-    let env = std::path::PathBuf::from("/tmp/env-logs");
-    assert_eq!(super::resolve_bridge_log_dir_from(None, Some(env.clone())), env);
-}
-
-#[skuld::test]
-fn resolve_cli_log_dir_honors_install_log_dir_override() {
-    let custom = std::path::PathBuf::from("/tmp/hole-install-XYZ");
-    let cmd = Command::Bridge {
-        action: BridgeAction::Install {
-            log_dir: Some(custom.clone()),
-            repair_user_data_dir: None,
-        },
-    };
-    let resolved = resolve_cli_log_dir(&cmd);
-    assert_eq!(resolved, Some(custom));
-}
-
-#[skuld::test]
-fn resolve_cli_log_dir_falls_back_to_default_without_override() {
-    let cmd = Command::Bridge {
-        action: BridgeAction::Install {
-            log_dir: None,
-            repair_user_data_dir: None,
-        },
-    };
-    let resolved = resolve_cli_log_dir(&cmd);
-    assert_eq!(resolved, Some(hole_common::logging::default_log_dir()));
-}
-
-/// The MSI's custom actions pass `--log-dir`, so the installer's own
-/// `gui-cli.log` lands in a directory every principal can find rather than in
-/// whichever profile the elevated process resolved.
-#[skuld::test]
-fn resolve_cli_log_dir_honors_the_uninstall_and_release_covers_log_dir() {
-    let custom = std::path::PathBuf::from("/tmp/hole msi logs");
-    let uninstall = Command::Bridge {
-        action: BridgeAction::Uninstall {
-            keep_covers: true,
-            log_dir: Some(custom.clone()),
-        },
-    };
-    assert_eq!(resolve_cli_log_dir(&uninstall), Some(custom.clone()));
-    let release = Command::Bridge {
-        action: BridgeAction::ReleaseCovers {
-            log_dir: Some(custom.clone()),
-        },
-    };
-    assert_eq!(resolve_cli_log_dir(&release), Some(custom));
-}
-
-#[skuld::test]
-fn resolve_cli_log_dir_falls_back_to_default_for_uninstall_and_release_covers_without_override() {
-    let default = Some(hole_common::logging::default_log_dir());
-    let uninstall = Command::Bridge {
-        action: BridgeAction::Uninstall {
-            keep_covers: false,
-            log_dir: None,
-        },
-    };
-    assert_eq!(resolve_cli_log_dir(&uninstall), default);
-    let release = Command::Bridge {
-        action: BridgeAction::ReleaseCovers { log_dir: None },
-    };
-    assert_eq!(resolve_cli_log_dir(&release), default);
+fn only_bridge_run_service_is_the_daemon() {
+    for args in every_command_line() {
+        assert_eq!(
+            parse(&args).standing().runs_as_daemon(),
+            args == ["bridge", "run", "--service"],
+            "{args:?}"
+        );
+    }
 }
 
 // `bridge cutover` / `bridge unlock` parsing ==========================================================================
@@ -853,25 +950,14 @@ fn bridge_unlock_takes_no_args() {
 // installer's uninstall custom actions (bindreams/hole#1003).
 
 #[skuld::test]
-fn bridge_release_covers_takes_only_a_log_dir() {
+fn bridge_release_covers_parses() {
     let cli = Cli::try_parse_from(["hole", "bridge", "release-covers"]).expect("parse bridge release-covers");
     assert!(matches!(
         cli.command,
         Some(Command::Bridge {
-            action: BridgeAction::ReleaseCovers { log_dir: None }
+            action: BridgeAction::ReleaseCovers
         })
     ));
-
-    let dir = r"C:\ProgramData\hole\logs";
-    let cli = Cli::try_parse_from(["hole", "bridge", "release-covers", "--log-dir", dir])
-        .expect("parse bridge release-covers --log-dir");
-    let Some(Command::Bridge {
-        action: BridgeAction::ReleaseCovers { log_dir },
-    }) = cli.command
-    else {
-        panic!("not release-covers");
-    };
-    assert_eq!(log_dir, Some(std::path::PathBuf::from(dir)));
 }
 
 #[skuld::test]
@@ -880,10 +966,7 @@ fn bridge_uninstall_keeps_covers_only_when_asked() {
     assert!(matches!(
         bare.command,
         Some(Command::Bridge {
-            action: BridgeAction::Uninstall {
-                keep_covers: false,
-                log_dir: None
-            }
+            action: BridgeAction::Uninstall { keep_covers: false }
         })
     ));
 
@@ -892,42 +975,9 @@ fn bridge_uninstall_keeps_covers_only_when_asked() {
     assert!(matches!(
         kept.command,
         Some(Command::Bridge {
-            action: BridgeAction::Uninstall {
-                keep_covers: true,
-                log_dir: None
-            }
+            action: BridgeAction::Uninstall { keep_covers: true }
         })
     ));
-}
-
-#[skuld::test]
-fn bridge_uninstall_takes_a_log_dir_next_to_keep_covers() {
-    let dir = r"C:\ProgramData\hole\logs";
-    let cli = Cli::try_parse_from(["hole", "bridge", "uninstall", "--keep-covers", "--log-dir", dir])
-        .expect("parse bridge uninstall --keep-covers --log-dir");
-    let Some(Command::Bridge {
-        action: BridgeAction::Uninstall { keep_covers, log_dir },
-    }) = cli.command
-    else {
-        panic!("not uninstall");
-    };
-    assert!(keep_covers);
-    assert_eq!(log_dir, Some(std::path::PathBuf::from(dir)));
-}
-
-#[skuld::test]
-fn resolve_cli_log_dir_returns_none_for_exempt_commands() {
-    assert!(resolve_cli_log_dir(&Command::Version).is_none());
-    assert!(resolve_cli_log_dir(&Command::Bridge {
-        action: BridgeAction::Run {
-            socket_path: None,
-            service: false,
-            log_dir: None,
-            state_dir: None,
-            ready_notify: None,
-        },
-    })
-    .is_none());
 }
 
 // --result-file flag (elevated outcome sink) ==========================================================================
@@ -1241,35 +1291,23 @@ fn redaction_is_armed_only_by_the_wire_funnel() {
 // `bridge enable` and `bridge status` =================================================================================
 
 #[skuld::test]
-fn bridge_enable_parses_with_and_without_a_log_dir() {
+fn bridge_enable_parses() {
     let cli = Cli::try_parse_from(["hole", "bridge", "enable"]).expect("parse bridge enable");
-    let Some(Command::Bridge {
-        action: BridgeAction::Enable { log_dir },
-    }) = cli.command
-    else {
-        panic!("expected Command::Bridge::Enable");
-    };
-    assert!(log_dir.is_none());
-
-    let cli = Cli::try_parse_from(["hole", "bridge", "enable", "--log-dir", "/tmp/L"]).expect("parse with --log-dir");
-    let Some(Command::Bridge {
-        action: BridgeAction::Enable { log_dir },
-    }) = cli.command
-    else {
-        panic!("expected Command::Bridge::Enable");
-    };
-    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/L")));
+    assert!(matches!(
+        cli.command,
+        Some(Command::Bridge {
+            action: BridgeAction::Enable
+        })
+    ));
 }
 
 #[skuld::test]
-fn bridge_enable_writes_its_gui_cli_log_where_the_gui_reads_it_back() {
-    let cli = Cli::try_parse_from(["hole", "bridge", "enable", "--log-dir", "/tmp/L"]).unwrap();
-    let command = cli.command.expect("a command");
+fn bridge_enable_has_a_gui_cli_log() {
+    let command = parse(&["bridge", "enable"]);
     assert!(
         should_install_cli_log_guard(&command),
         "enable is a write action with an audit trail"
     );
-    assert_eq!(resolve_cli_log_dir(&command), Some(std::path::PathBuf::from("/tmp/L")));
 }
 
 #[skuld::test]

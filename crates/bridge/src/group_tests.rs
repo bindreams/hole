@@ -60,6 +60,59 @@ mod macos {
         assert!(!crate::group::group_exists("foo\0bar"));
     }
 
+    // first_person: the fallback order of `installing_username` -------------------------------------------------------
+
+    use crate::group::first_person;
+    use std::io;
+
+    fn says(user: &'static str) -> impl Fn() -> io::Result<Option<String>> {
+        move || Ok(Some(user.to_string()))
+    }
+
+    fn nothing() -> io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn fails() -> io::Result<Option<String>> {
+        Err(io::Error::other("the tool could not run"))
+    }
+
+    #[skuld::test]
+    fn the_first_source_that_names_a_person_wins() {
+        let (sudo, console, logname) = (says("alice"), says("bob"), says("carol"));
+        assert_eq!(first_person(&[&sudo, &console, &logname]).unwrap(), "alice");
+    }
+
+    #[skuld::test]
+    fn without_sudo_user_the_console_owner_is_next() {
+        let (console, logname) = (says("bob"), says("carol"));
+        assert_eq!(first_person(&[&nothing, &console, &logname]).unwrap(), "bob");
+    }
+
+    #[skuld::test]
+    fn without_either_logname_is_last() {
+        let logname = says("carol");
+        assert_eq!(first_person(&[&nothing, &nothing, &logname]).unwrap(), "carol");
+    }
+
+    #[skuld::test]
+    fn root_and_blank_hand_over_to_the_next_source() {
+        let (root, blank, logname) = (says("root"), says(""), says("carol"));
+        assert_eq!(first_person(&[&root, &blank, &logname]).unwrap(), "carol");
+    }
+
+    #[skuld::test]
+    fn no_source_naming_a_person_is_an_error() {
+        let root = says("root");
+        assert!(first_person(&[&nothing, &root, &nothing]).is_err());
+    }
+
+    #[skuld::test]
+    fn a_source_that_fails_ends_the_search() {
+        let logname = says("carol");
+        assert!(first_person(&[&nothing, &fails, &logname]).is_err());
+    }
+
     #[skuld::test]
     fn resolve_real_user_returns_an_absolute_home() {
         let ru = crate::group::resolve_real_user().expect("resolve current user");

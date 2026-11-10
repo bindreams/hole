@@ -289,3 +289,43 @@ fn every_step_of_a_change_opens_under_the_hold_of_its_own_thread_without_waiting
     drop(hold);
     assert!(!lock.is_held_for_another_thread(), "released with the hold");
 }
+
+// Failed start --------------------------------------------------------------------------------------------------------
+
+fn service_args() -> &'static ServiceArgs {
+    Box::leak(Box::new(ServiceArgs {
+        socket_path: PathBuf::from("socket"),
+        state_dir: PathBuf::from("state"),
+        log_dir: PathBuf::from("log"),
+        version: "test".to_owned(),
+    }))
+}
+
+#[skuld::test]
+fn a_start_without_service_args_is_an_error_not_a_panic() {
+    // `service_main` is an SCM callback; a panic there aborts the process.
+    let start_pending_reported = std::cell::Cell::new(false);
+    let out = super::prepare_start(None, || {
+        start_pending_reported.set(true);
+        Ok(())
+    });
+    assert!(out.is_err());
+    assert!(
+        !start_pending_reported.get(),
+        "nothing is reported for a start that cannot begin"
+    );
+}
+
+#[skuld::test]
+fn a_refused_start_pending_report_fails_the_start() {
+    let out = super::prepare_start(Some(service_args()), || Err(std::io::Error::other("SCM refused")));
+    assert!(out.is_err());
+}
+
+#[skuld::test]
+fn a_prepared_start_hands_back_the_args_and_a_runtime() {
+    let args = service_args();
+    let (got, rt) = super::prepare_start(Some(args), || Ok(())).unwrap();
+    assert!(std::ptr::eq(got, args));
+    assert_eq!(rt.block_on(async { 7 }), 7);
+}

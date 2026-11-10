@@ -56,11 +56,26 @@ pub fn installing_username() -> io::Result<String> {
     os::installing_username()
 }
 
+/// The first of `sources` that names somebody other than root. A source that errors ends the search with that
+/// error; one that has nothing to say (`None`, blank, `root`) hands over to the next.
+#[cfg(target_os = "macos")]
+pub(crate) fn first_person(sources: &[&dyn Fn() -> io::Result<Option<String>>]) -> io::Result<String> {
+    for source in sources {
+        if let Some(user) = source()? {
+            if !user.is_empty() && user != "root" {
+                return Ok(user);
+            }
+        }
+    }
+    Err(io::Error::other("could not determine the installing user"))
+}
+
 /// The real interactive user's identity, resolved from the passwd database.
 ///
-/// Built from [`installing_username`] plus a `getpwnam_r(3)` lookup. Used by
-/// elevated non-`--service` bridge processes to write user-owned files.
-#[cfg(target_os = "macos")]
+/// Built from [`installing_username`] plus a `getpwnam_r(3)` lookup. The person behind a root process on macOS,
+/// whose home and ids decide where any command's files go and who owns them (`hole::principal`). The type is
+/// compiled everywhere so a platform-independent caller can hold one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealUser {
     pub name: String,
     pub uid: u32,
@@ -96,7 +111,7 @@ mod os {
     use std::io;
     use util::system_tool::SystemTool;
 
-    use super::{group_exists, RealUser, GROUP_NAME};
+    use super::{first_person, group_exists, RealUser, GROUP_NAME};
 
     pub fn create_group() -> io::Result<()> {
         // EAFP: just try to create. On macOS `dseditgroup -o create` is
@@ -163,35 +178,23 @@ mod os {
     }
 
     pub fn installing_username() -> io::Result<String> {
-        // 1. Check SUDO_USER (set by sudo and osascript elevation)
-        if let Ok(user) = std::env::var("SUDO_USER") {
-            if !user.is_empty() && user != "root" {
-                return Ok(user);
-            }
-        }
+        first_person(&[
+            // 1. SUDO_USER (set by sudo)
+            &|| Ok(std::env::var("SUDO_USER").ok()),
+            // 2. the owner of /dev/console, the GUI login user
+            &|| command_output(SystemTool::Stat.command()?.args(["-f", "%Su", "/dev/console"])),
+            // 3. logname as last resort
+            &|| command_output(&mut SystemTool::Logname.command()?),
+        ])
+    }
 
-        // 2. stat /dev/console to find the GUI login user
-        let output = SystemTool::Stat
-            .command()?
-            .args(["-f", "%Su", "/dev/console"])
-            .output()?;
-        if output.status.success() {
-            let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !user.is_empty() && user != "root" {
-                return Ok(user);
-            }
-        }
-
-        // 3. logname as last resort
-        let output = SystemTool::Logname.command()?.output()?;
-        if output.status.success() {
-            let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !user.is_empty() && user != "root" {
-                return Ok(user);
-            }
-        }
-
-        Err(io::Error::other("could not determine the installing user"))
+    /// Trimmed stdout of a command that succeeded, `None` for one that did not.
+    fn command_output(command: &mut std::process::Command) -> io::Result<Option<String>> {
+        let output = command.output()?;
+        Ok(output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
     }
 
     pub fn resolve_real_user() -> io::Result<RealUser> {

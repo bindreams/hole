@@ -217,13 +217,18 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// engaged — egress still blocked — while the intent reads "off", misleading the
 /// user.
 ///
-/// Refuses outright against a live bridge instance (#840): a running bridge
-/// already reconciles the target itself, and racing it from an unrelated CLI
-/// invocation is exactly the two-writer hazard `BridgeLiveness` exists to
-/// prevent: the state files' own locks are in-process only. The in-app
-/// "Unblock Network" action is the live-bridge equivalent, so refusal names it
-/// as the alternative. The exclusion is structural, not a point-in-time probe:
-/// see [`unlock_with`].
+/// Refuses outright against a live bridge on the installed service's state
+/// directory (#840): a running bridge already reconciles the target itself,
+/// and racing it from an unrelated CLI invocation is exactly the two-writer
+/// hazard `BridgeLiveness` exists to prevent: the state files' own locks are
+/// in-process only. The in-app "Unblock Network" action is the live-bridge
+/// equivalent, so refusal names it as the alternative. The exclusion is
+/// structural, not a point-in-time probe: see [`unlock_with`].
+///
+/// The liveness lock is per state directory and this probes the service's
+/// only. A bridge on another one (a foreground run's default, or an explicit
+/// `--state-dir`) holds its lock elsewhere, and `unlock` does not see it.
+///
 /// **`Ok` is qualified, and the caller must surface it.** The returned
 /// [`Clearance`] is what the disengage could not prove — on Windows, the two
 /// boot-time twins on any boot where no bridge engaged. This is the ONE
@@ -251,10 +256,9 @@ pub fn unlock() -> std::io::Result<Clearance> {
 /// probe (the old `is_running`) can go stale before the first mutation runs,
 /// letting a bridge that starts mid-unlock have its live cover restored away
 /// and its intent flipped off underneath it. Holding the lock instead means
-/// a bridge trying to start during this sequence contends on the same lock
-/// (single-instance is separately enforced by the IPC socket bind, so no
-/// second real bridge is racing this token itself) rather than interleaving
-/// with it.
+/// a bridge trying to start on this state directory during this sequence
+/// contends on the same lock rather than interleaving with it. A bridge on
+/// another state directory contends on a different lock and is not excluded.
 fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<Clearance>) -> std::io::Result<Clearance> {
     let Some(_liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
         return Err(std::io::Error::other(

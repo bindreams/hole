@@ -4,6 +4,8 @@
 // (visible here via `#[macro_use]` in `main.rs` and `lib.rs`).
 
 use clap::{Parser, Subcommand};
+use hole::principal::{Principal, Resolved};
+use std::cell::LazyCell;
 
 // CLI structure =======================================================================================================
 
@@ -17,6 +19,11 @@ pub(crate) struct Cli {
     /// Start in the tray without opening the dashboard
     #[arg(long, overrides_with = "show_dashboard")]
     no_show_dashboard: bool,
+
+    /// Override the log directory, for any command. Precedence: this flag, then `HOLE_LOG_DIR`, then the
+    /// directory of the account the command runs for
+    #[arg(long, global = true)]
+    pub(crate) log_dir: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
@@ -140,9 +147,6 @@ pub(crate) enum BridgeAction {
         /// Run as a system service (invoked by SCM/launchd)
         #[arg(long)]
         service: bool,
-        /// Override the log directory
-        #[arg(long)]
-        log_dir: Option<std::path::PathBuf>,
         /// Override the directory where the bridge writes its crash-recovery
         /// state files (`bridge-routes.json`, `bridge-dns.json`,
         /// `bridge-plugins.json`). Default: platform-specific user state dir.
@@ -157,12 +161,6 @@ pub(crate) enum BridgeAction {
     },
     /// Install and start the bridge service
     Install {
-        /// Override the log directory. The GUI's elevated-install path
-        /// passes a per-invocation temp dir here so it can read this CLI's
-        /// `gui-cli.log` back after the elevation completes (and surface it
-        /// in the failure dialog).
-        #[arg(long)]
-        log_dir: Option<std::path::PathBuf>,
         /// Repair ownership of a user data directory tree that an earlier
         /// elevated install left root-owned (macOS only — a no-op
         /// elsewhere). The walk is bounded to this exact path; symlinks
@@ -172,12 +170,7 @@ pub(crate) enum BridgeAction {
         repair_user_data_dir: Option<std::path::PathBuf>,
     },
     /// Set the bridge service to start automatically and start it (requires elevation)
-    Enable {
-        /// Override the log directory. The GUI's elevated path passes a
-        /// per-invocation temp dir here, as `install` does.
-        #[arg(long)]
-        log_dir: Option<std::path::PathBuf>,
-    },
+    Enable,
     /// Stop and remove the bridge service
     Uninstall {
         /// Internal (the MSI's major-upgrade path): tear the service down but
@@ -187,19 +180,11 @@ pub(crate) enum BridgeAction {
         /// Hidden: hand-running it reproduces #1003 exactly.
         #[arg(long, hide = true)]
         keep_covers: bool,
-        /// Override the log directory (the MSI passes the one directory every
-        /// principal can read).
-        #[arg(long)]
-        log_dir: Option<std::path::PathBuf>,
     },
     /// Print bridge install/running status
     Status,
     /// View bridge logs
     Log {
-        /// Override the log directory. Global so it parses before or after the
-        /// nested `watch`/`path` subcommand.
-        #[arg(long, global = true)]
-        log_dir: Option<std::path::PathBuf>,
         #[command(subcommand)]
         action: Option<LogAction>,
     },
@@ -252,12 +237,7 @@ pub(crate) enum BridgeAction {
     /// Hidden because `unlock` is the user-facing hatch; like `unlock`, this
     /// refuses against a live bridge.
     #[command(hide = true)]
-    ReleaseCovers {
-        /// Override the log directory (the MSI passes the one directory every
-        /// principal can read).
-        #[arg(long)]
-        log_dir: Option<std::path::PathBuf>,
-    },
+    ReleaseCovers,
 }
 
 #[derive(Subcommand)]
@@ -378,76 +358,77 @@ pub(crate) fn status_report(status: crate::setup::BridgeInstallStatus) -> (&'sta
     }
 }
 
-/// Resolve the directory where `dispatch` should install the `gui-cli.log`
-/// guard for `command`. `None` means "don't install a guard" — see
-/// [`should_install_cli_log_guard`]. A `Some` result means "install in this
-/// directory".
-///
-/// `Bridge::Install { log_dir: Some(d), .. }` overrides the default — the
-/// GUI's elevated-install path uses this to redirect the subscriber into a
-/// per-invocation temp dir it can read back after the elevation completes
-/// (so the failure dialog can include the underlying error text). The MSI's
-/// `bridge install`, `bridge uninstall` and `bridge release-covers` custom
-/// actions pass one too, so their log lands where every principal can find it.
-pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBuf> {
-    if !should_install_cli_log_guard(command) {
-        return None;
-    }
-    match command {
-        Command::Bridge {
-            action:
-                BridgeAction::Install { log_dir: Some(d), .. }
-                | BridgeAction::Enable { log_dir: Some(d) }
-                | BridgeAction::Uninstall { log_dir: Some(d), .. }
-                | BridgeAction::ReleaseCovers { log_dir: Some(d) },
-        } => Some(d.clone()),
-        _ => Some(hole_common::logging::resolve_log_dir(None)),
-    }
-}
-
-// Elevated-run owner resolution (#572) ================================================================================
-
-/// Resolve the real interactive user for an elevated, non-`--service` bridge
-/// run. `Some` only when this process is privileged AND not the launchd/SCM
-/// daemon; the daemon (`--service`) and the unprivileged GUI both get `None`,
-/// keeping their logs/state root-owned (the daemon) or self-owned (the GUI).
-///
-/// A resolve failure is non-fatal: log a warning and fall back to `None`, so
-/// the run proceeds with root-owned files rather than aborting.
-#[cfg(target_os = "macos")]
-fn resolved_owner(service: bool) -> Option<hole_bridge::group::RealUser> {
-    if service || !stepstool::is_privileged() {
-        return None;
-    }
-    match hole_bridge::group::resolve_real_user() {
-        Ok(u) => Some(u),
-        Err(e) => {
-            cli_log!(
-                warn,
-                "could not resolve the real user for an elevated run; logs/state stay root-owned: {e}"
-            );
-            None
+impl Command {
+    /// What this command is to the installed service: the one answer behind its principal and its default log
+    /// directory.
+    pub(crate) fn standing(&self) -> Standing {
+        match self {
+            Command::Bridge { action } => action.standing(),
+            Command::Version | Command::Upgrade { .. } | Command::Proxy { .. } | Command::Path { .. } => {
+                Standing::Ordinary
+            }
         }
     }
 }
 
-/// Non-macOS twin: the elevated-run owner concept is macOS-only (the
-/// osascript-admin elevation is what leaves user-home files root-owned), so
-/// every other platform always gets `None`. Returns `Option<()>` and is only
-/// referenced inside `#[cfg(target_os = "macos")]` blocks.
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)] // exercised by the cross-platform `service_never_gets_an_owner` test; its only lib call sites are macOS-gated
-fn resolved_owner(_service: bool) -> Option<()> {
-    None
+impl BridgeAction {
+    fn standing(&self) -> Standing {
+        match self {
+            BridgeAction::Run { service: true, .. } => Standing::InstalledService,
+            BridgeAction::Run { service: false, .. } => Standing::ForegroundBridge,
+            BridgeAction::Log { .. } => Standing::ServiceLogReader,
+            BridgeAction::Install { .. }
+            | BridgeAction::Enable
+            | BridgeAction::Uninstall { .. }
+            | BridgeAction::Status
+            | BridgeAction::GrantAccess { .. }
+            | BridgeAction::IpcSend { .. }
+            | BridgeAction::Cutover { .. }
+            | BridgeAction::Unlock
+            | BridgeAction::ReleaseCovers => Standing::Ordinary,
+        }
+    }
 }
 
-/// Extract `(uid, gid)` from a resolved [`hole_bridge::group::RealUser`]. Named `to_ids` (not
-/// `to_uid_gid`/a method) to avoid shadowing the local `owner_ids` binding at
-/// the call site.
-#[cfg(target_os = "macos")]
-fn to_ids(u: &hole_bridge::group::RealUser) -> (u32, u32) {
-    (u.uid, u.gid)
+/// What a command is to the installed service. Every per-command answer that depends on it is one exhaustive match
+/// here, never a test of the command's flags at the place that needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// `bridge run --service`, the service itself.
+    InstalledService,
+    /// `bridge run`, another bridge: not the service, so it keeps its logs out of the service's directory.
+    ForegroundBridge,
+    /// `bridge log`, which reads the installed service's log.
+    ServiceLogReader,
+    /// Any other command acts for whoever runs it.
+    Ordinary,
 }
+
+impl Standing {
+    /// Whether no account can make this command a person: it is the service entry point.
+    pub(crate) fn runs_as_daemon(self) -> bool {
+        match self {
+            Self::InstalledService => true,
+            Self::ForegroundBridge => false,
+            Self::ServiceLogReader => false,
+            Self::Ordinary => false,
+        }
+    }
+
+    /// Where this command logs when neither `--log-dir` nor `HOLE_LOG_DIR` says.
+    pub(crate) fn default_log_dir(self, principal: &Principal) -> std::path::PathBuf {
+        match self {
+            Self::InstalledService => principal.log_dir(),
+            Self::ForegroundBridge => principal.own_log_dir(),
+            Self::ServiceLogReader => hole_common::update_marker::service_log_dir(),
+            Self::Ordinary => principal.log_dir(),
+        }
+    }
+}
+
+/// A value computed on first use: the account behind a command, and the log directory that follows from it, are
+/// read only by a command that needs them.
+type Deferred<'a, T> = LazyCell<T, Box<dyn FnOnce() -> T + 'a>>;
 
 /// `state_dir` as an absolute path, so a service whose cwd is `C:\Windows\System32` or `/` does not read it relative
 /// to that. Links are not resolved: the walk of `util::dir` judges every one in the path, and a path resolved here
@@ -457,21 +438,32 @@ fn absolute_state_dir(state_dir: std::path::PathBuf) -> std::io::Result<std::pat
     std::path::absolute(&state_dir)
 }
 
-/// Per-user log directory under the resolved user's home, derived from `home`
-/// (never `$HOME`/`dirs`, which under osascript-admin still point at the
-/// invoking user but are easy to get wrong for an elevated process).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // non-test lib callers are macOS-gated; the path test uses it on all platforms
-fn user_log_dir(home: &std::path::Path) -> std::path::PathBuf {
-    home.join("Library/Application Support/hole/logs")
+/// What a `bridge run` hands the bridge to bind and keep state in.
+struct BridgeRunPaths {
+    socket_path: std::path::PathBuf,
+    state_dir: std::path::PathBuf,
 }
 
-/// Per-user state directory under the resolved user's home. See
-/// [`user_log_dir`]. Delegates so `cutover::peer_state_dirs`, which has to find
-/// this bridge's liveness lock afterwards, resolves the same path from the same
-/// source.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn user_state_dir(home: &std::path::Path) -> std::path::PathBuf {
-    hole_common::paths::user_state_dir(home)
+/// The paths a `bridge run` hands the bridge. The socket is `--socket-path`, else the host's one bridge socket, for
+/// every principal and for the service and a foreground run alike (CONTRIBUTING.md, "One bridge per host"). The state
+/// dir is `--state-dir`, else a person behind an elevation's own, else the process's default, which is never the
+/// installed service's (that one is passed `--state-dir`).
+fn bridge_run_paths(
+    socket_path: Option<std::path::PathBuf>,
+    state_dir: Option<std::path::PathBuf>,
+    principal: &Principal,
+) -> std::io::Result<BridgeRunPaths> {
+    let state_dir = state_dir
+        .or_else(|| {
+            principal
+                .elevated()
+                .map(|user| hole_common::paths::user_state_dir(&user.home))
+        })
+        .unwrap_or_else(hole_common::paths::default_state_dir);
+    Ok(BridgeRunPaths {
+        socket_path: socket_path.unwrap_or_else(hole_common::protocol::default_bridge_socket_path),
+        state_dir: absolute_state_dir(state_dir)?,
+    })
 }
 
 /// The remedy to append to a failed privileged bridge command, or `""` when
@@ -505,29 +497,35 @@ fn elevation_hint() -> &'static str {
 /// For write-action subcommands, install a CLI log guard so that
 /// `cli_log!(...)` calls are recorded in `gui-cli.log` in addition to the
 /// user-facing terminal output. See [`should_install_cli_log_guard`] for
-/// exactly which subcommands are exempted and [`resolve_cli_log_dir`] for
-/// how the directory is chosen.
-pub(crate) fn dispatch(command: Command) -> ! {
-    // Owner for the gui-cli.log guard: only for guard-eligible commands
-    // (`should_install_cli_log_guard` excludes `Bridge::Run`, so the daemon
-    // is never touched) and only when this process is privileged.
-    #[cfg(target_os = "macos")]
-    let cli_owner: Option<(u32, u32)> = if should_install_cli_log_guard(&command) && stepstool::is_privileged() {
-        hole_bridge::group::resolve_real_user().ok().map(|u| (u.uid, u.gid))
-    } else {
-        None
-    };
-    #[cfg(not(target_os = "macos"))]
-    let cli_owner: Option<(u32, u32)> = None;
-    let _cli_log_guard = resolve_cli_log_dir(&command)
-        .map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info", cli_owner));
+/// exactly which subcommands are exempted. The directory is `log_dir` (the
+/// top-level `--log-dir`), else `HOLE_LOG_DIR`, else the default of
+/// [`Standing::default_log_dir`].
+pub(crate) fn dispatch(command: Command, log_dir: Option<std::path::PathBuf>) -> ! {
+    let standing = command.standing();
+    let principal: Deferred<Resolved> = LazyCell::new(Box::new(move || Principal::resolve(standing.runs_as_daemon())));
+    let log_dir: Deferred<std::path::PathBuf> = LazyCell::new(Box::new(|| {
+        hole_common::logging::resolve_log_dir_from(log_dir, hole_common::logging::hole_log_dir_env(), || {
+            standing.default_log_dir(&principal.principal)
+        })
+    }));
+    let _cli_log_guard = should_install_cli_log_guard(&command).then(|| {
+        let guard = hole_common::logging::init(
+            &log_dir,
+            "gui-cli",
+            "gui-cli.log",
+            "hole=info",
+            principal.principal.owner(),
+        );
+        principal.log_warning();
+        guard
+    });
     let code = match command {
         Command::Version => {
             println!("hole {}", hole::version::VERSION);
             0
         }
         Command::Upgrade { yes } => handle_upgrade(yes),
-        Command::Bridge { action } => handle_bridge(action),
+        Command::Bridge { action } => handle_bridge(action, &log_dir, &principal),
         Command::Proxy { action } => handle_proxy(action),
         Command::Path { action } => handle_path(action),
     };
@@ -680,45 +678,30 @@ fn handle_upgrade(yes: bool) -> i32 {
     }
 }
 
-fn handle_bridge(action: BridgeAction) -> i32 {
+fn handle_bridge(action: BridgeAction, log_dir: &Deferred<std::path::PathBuf>, principal: &Deferred<Resolved>) -> i32 {
     match action {
         BridgeAction::Run {
             socket_path,
             service,
-            log_dir,
             state_dir,
             ready_notify,
         } => {
-            // Resolve the elevated-run owner once: `Some` only for a
-            // privileged, non-`--service` run (the daemon and the
-            // unprivileged GUI both get `None`). The owner picks the
-            // user-home log/state dirs and chowns the files we write.
-            #[cfg(target_os = "macos")]
-            let owner = resolved_owner(service);
-            #[cfg(target_os = "macos")]
-            let owner_ids: Option<(u32, u32)> = owner.as_ref().map(to_ids);
-            #[cfg(not(target_os = "macos"))]
-            let owner_ids: Option<(u32, u32)> = None;
-
-            // Precedence: explicit `--log-dir` or the resolved-user home (for an
-            // elevated user-scoped run) → `HOLE_LOG_DIR` env → default. The chown
-            // happens regardless of which dir wins, since `init_dual` chowns
-            // `log_dir` with `owner_ids`.
-            #[cfg(target_os = "macos")]
-            let log_dir = hole_common::logging::resolve_log_dir(
-                log_dir.or_else(|| owner.as_ref().map(|u| user_log_dir(&u.home))),
-            );
-            #[cfg(not(target_os = "macos"))]
-            let log_dir = hole_common::logging::resolve_log_dir(log_dir);
-            let _guard = hole_bridge::logging::init(&log_dir, owner_ids);
+            // The principal picks the log dir and the ownership of every file written for a person behind an
+            // elevation.
+            let log_dir: &std::path::Path = log_dir;
+            let resolved: &Resolved = principal;
+            let principal = &resolved.principal;
+            let owner_ids = principal.owner();
+            let _guard = hole_bridge::logging::init(log_dir, owner_ids);
+            resolved.log_warning();
             tracing::info!("hole bridge starting");
 
             // Reclaim ownership of an already-existing user data tree that an
             // earlier elevated run left root-owned. Best-effort; the walk is
             // hardened (lchown, refuse symlink top, skip nlink>1).
             #[cfg(target_os = "macos")]
-            if let (Some(u), Some((uid, gid))) = (owner.as_ref(), owner_ids) {
-                crate::setup::repair_user_data_tree(&u.home.join("Library/Application Support/hole"), uid, gid);
+            if let Some(user) = principal.elevated() {
+                crate::setup::repair_user_data_tree(&hole_common::paths::user_data_dir(&user.home), user.uid, user.gid);
             }
 
             if service && ready_notify.is_some() {
@@ -726,33 +709,29 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 return 2;
             }
 
-            #[cfg(target_os = "macos")]
-            let state_dir = state_dir.or_else(|| owner.as_ref().map(|u| user_state_dir(&u.home)));
-            let state_dir = match absolute_state_dir(state_dir.unwrap_or_else(hole_common::paths::default_state_dir)) {
-                Ok(state_dir) => state_dir,
+            let BridgeRunPaths { socket_path, state_dir } = match bridge_run_paths(socket_path, state_dir, principal) {
+                Ok(paths) => paths,
                 Err(e) => {
                     cli_log!(error, "bridge error: cannot resolve the state directory: {e}");
                     return 1;
                 }
             };
 
-            let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
-
             let result: Result<(), Box<dyn std::error::Error>> = if service {
                 #[cfg(target_os = "macos")]
                 {
-                    hole_bridge::platform::os::run(&socket_path, &state_dir, &log_dir, hole::version::VERSION)
+                    hole_bridge::platform::os::run(&socket_path, &state_dir, log_dir, hole::version::VERSION)
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    hole_bridge::platform::os::run(&socket_path, &state_dir, &log_dir, hole::version::VERSION)
+                    hole_bridge::platform::os::run(&socket_path, &state_dir, log_dir, hole::version::VERSION)
                         .map_err(|e| Box::new(e) as _)
                 }
             } else {
                 hole_bridge::foreground::run(
                     &socket_path,
                     &state_dir,
-                    &log_dir,
+                    log_dir,
                     ready_notify.as_deref(),
                     hole::version::VERSION,
                     owner_ids,
@@ -768,10 +747,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             }
             0
         }
-        BridgeAction::Install {
-            log_dir: _, // consumed by `resolve_cli_log_dir` already
-            repair_user_data_dir,
-        } => {
+        BridgeAction::Install { repair_user_data_dir } => {
             // Header line — guarantees the gui-cli.log identifies the build
             // and host even if the rest of the install fails immediately.
             cli_log!(
@@ -787,19 +763,14 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             }
             0
         }
-        BridgeAction::Uninstall {
-            keep_covers,
-            log_dir: _, // consumed by `resolve_cli_log_dir` already
-        } => {
+        BridgeAction::Uninstall { keep_covers } => {
             if let Err(e) = crate::setup::uninstall_bridge(keep_covers) {
                 cli_log!(error, "bridge uninstall failed: {e}{}", elevation_hint());
                 return 1;
             }
             0
         }
-        BridgeAction::Enable {
-            log_dir: _, // consumed by `resolve_cli_log_dir` already
-        } => {
+        BridgeAction::Enable => {
             if let Err(e) = crate::setup::enable_bridge() {
                 cli_log!(error, "bridge enable failed: {e}{}", elevation_hint());
                 return 1;
@@ -811,7 +782,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             println!("{line}");
             code
         }
-        BridgeAction::Log { log_dir, action } => handle_bridge_log(log_dir, action),
+        BridgeAction::Log { action } => handle_bridge_log(log_dir, action),
         BridgeAction::GrantAccess {
             then_send,
             then_send_file,
@@ -846,9 +817,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 }
             }
         }
-        BridgeAction::ReleaseCovers {
-            log_dir: _, // consumed by `resolve_cli_log_dir` already
-        } => match hole_bridge::cutover::release_covers() {
+        BridgeAction::ReleaseCovers => match hole_bridge::cutover::release_covers() {
             Ok(clearance) => {
                 if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
                     cli_log!(warn, "{report}");
@@ -878,24 +847,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
     }
 }
 
-/// Resolve where `hole bridge log` reads: explicit `--log-dir`, else
-/// `HOLE_LOG_DIR`, else the installed service's log dir. The service is where
-/// the bridge writes in production; the per-user default never matches it.
-fn resolve_bridge_log_dir(log_dir: Option<std::path::PathBuf>) -> std::path::PathBuf {
-    resolve_bridge_log_dir_from(log_dir, hole_common::logging::hole_log_dir_env())
-}
-
-/// Pure seam for [`resolve_bridge_log_dir`]: the service log dir is baked in as
-/// the fallback so tests can pin it without reading the process environment.
-fn resolve_bridge_log_dir_from(
-    log_dir: Option<std::path::PathBuf>,
-    env_dir: Option<std::path::PathBuf>,
-) -> std::path::PathBuf {
-    hole_common::logging::resolve_log_dir_from(log_dir, env_dir, hole_common::update_marker::service_log_dir)
-}
-
-fn handle_bridge_log(log_dir: Option<std::path::PathBuf>, action: Option<LogAction>) -> i32 {
-    let log_dir = resolve_bridge_log_dir(log_dir);
+fn handle_bridge_log(log_dir: &std::path::Path, action: Option<LogAction>) -> i32 {
     let log_path = log_dir.join("bridge.log");
 
     match action {

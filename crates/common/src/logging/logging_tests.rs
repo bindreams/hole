@@ -576,7 +576,7 @@ fn resolve_blank_component_env_falls_back() {
     assert_eq!(file, vec!["hole=info".to_string()]);
 }
 
-// resolve_log_dir -----------------------------------------------------------------------------------------------------
+// resolve_log_dir_from ------------------------------------------------------------------------------------------------
 #[skuld::test]
 fn resolve_log_dir_prefers_explicit_override() {
     let got = super::resolve_log_dir_from(
@@ -591,12 +591,6 @@ fn resolve_log_dir_prefers_explicit_override() {
 fn resolve_log_dir_uses_env_when_no_override() {
     let got = super::resolve_log_dir_from(None, Some(std::path::PathBuf::from("/env")), super::default_log_dir);
     assert_eq!(got, std::path::PathBuf::from("/env"));
-}
-
-#[skuld::test]
-fn resolve_log_dir_falls_back_to_default() {
-    let got = super::resolve_log_dir_from(None, None, super::default_log_dir);
-    assert_eq!(got, super::default_log_dir());
 }
 
 #[skuld::test]

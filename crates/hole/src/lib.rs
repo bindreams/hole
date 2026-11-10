@@ -17,6 +17,7 @@ pub mod elevation;
 pub mod launch;
 pub mod logging;
 pub mod path_management;
+pub mod principal;
 pub mod relaunch;
 pub mod selfheal;
 pub mod setup;

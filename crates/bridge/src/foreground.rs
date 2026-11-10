@@ -163,12 +163,11 @@ async fn run_inner(
     ));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-    // Bind BEFORE the liveness acquire and BEFORE recovery. If a second
-    // bridge instance tries to run, the bind() fails and we exit without
-    // touching any routing state or contending on the liveness lock —
-    // matching crate::liveness's documented invariant (BridgeLiveness::acquire's
-    // doc: "a second real bridge instance never reaches this call — the IPC
-    // socket bind already refuses it first").
+    // Bind BEFORE the liveness acquire and BEFORE recovery: a bind that fails
+    // (an unusable path or folder) exits without touching any routing state or
+    // contending on the liveness lock. The bind does not keep a second bridge
+    // out; it takes the socket name over, and one bridge per host is the
+    // user's to keep (CONTRIBUTING.md, "One bridge per host").
     let server = crate::ipc::IpcServer::bind_with_dirs(
         socket_path,
         proxy,

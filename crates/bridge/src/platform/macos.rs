@@ -395,12 +395,13 @@ pub fn run(
         ));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-        // Bind BEFORE the liveness acquire and BEFORE recovery — a second
-        // instance's bind() fails before it can touch routing state or
-        // contend on the liveness lock, matching crate::liveness's documented
-        // invariant. Route recovery is offloaded via spawn_blocking so a hung
-        // netsh/route command cannot wedge the runtime while the IPC socket
-        // is bound but not yet serving.
+        // Bind BEFORE the liveness acquire and BEFORE recovery: a bind that fails
+        // exits before it can touch routing state or contend on the liveness
+        // lock. The bind does not keep a second bridge out (it takes the socket
+        // name over); one bridge per host is the user's to keep.
+        // Route recovery is offloaded via spawn_blocking so a hung route
+        // command cannot wedge the runtime while the IPC socket is bound but
+        // not yet serving.
         let server = crate::ipc::IpcServer::bind_with_dirs(
             socket_path,
             proxy,

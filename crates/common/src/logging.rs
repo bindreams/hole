@@ -155,15 +155,7 @@ fn nonblank_dir(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     raw.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
-/// Resolve the log directory: explicit `override_dir`, else `HOLE_LOG_DIR`,
-/// else [`default_log_dir`].
-pub fn resolve_log_dir(override_dir: Option<PathBuf>) -> PathBuf {
-    resolve_log_dir_from(override_dir, hole_log_dir_env(), default_log_dir)
-}
-
-/// Pure resolution core: `override_dir`, else `env_dir`, else `fallback()`.
-/// `fallback` is a closure so callers can supply something other than
-/// [`default_log_dir`].
+/// Resolve the log directory: `override_dir`, else `env_dir`, else `fallback()`.
 pub fn resolve_log_dir_from(
     override_dir: Option<PathBuf>,
     env_dir: Option<PathBuf>,

@@ -4,22 +4,27 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// The directory this GUI logs to, as resolved at launch (`--log-dir`, `HOLE_LOG_DIR`, else its principal's), so the
+/// bundle collects from the one place `gui.log` is written.
+pub struct GuiLogDir(pub PathBuf);
+
 /// Locate all log directories to include in the archive.
 ///
-/// The user-local log dir holds both GUI and foreground-bridge logs.
-/// Service-mode bridge logs live in system paths and are included when present.
-fn log_dirs() -> Vec<(&'static str, PathBuf)> {
+/// The GUI's log dir holds the GUI's logs, and those of a foreground bridge that resolved to the same directory (the
+/// default for the same person; not one given a different `--log-dir` or `HOLE_LOG_DIR`). Service-mode bridge logs
+/// live in system paths and are included when present.
+fn log_dirs(gui_log_dir: &Path) -> Vec<(&'static str, PathBuf)> {
     vec![
-        ("user", hole_common::logging::default_log_dir()),
+        ("user", gui_log_dir.to_path_buf()),
         ("service", hole_common::update_marker::service_log_dir()),
     ]
 }
 
 /// Create a zip archive containing all log files. Returns the path to the temp zip.
-pub fn collect_logs_to_zip() -> Result<PathBuf, String> {
+pub fn collect_logs_to_zip(gui_log_dir: &Path) -> Result<PathBuf, String> {
     let zip_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp directory: {e}"))?;
     let zip_path = zip_dir.keep().join("hole-logs.zip");
-    collect_logs_into(&log_dirs(), &zip_path)?;
+    collect_logs_into(&log_dirs(gui_log_dir), &zip_path)?;
     Ok(zip_path)
 }
 

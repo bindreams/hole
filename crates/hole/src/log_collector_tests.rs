@@ -74,3 +74,17 @@ fn redaction_manifest_names_every_residual(#[fixture(temp_dir)] dir: &Path) {
         "must state that the service log dir is scrubbed with the hostname-only registry: {manifest}"
     );
 }
+
+// The bundle's user entry comes from the directory the GUI logs to, whatever resolved it (`--log-dir`,
+// `HOLE_LOG_DIR`, its principal), not from the default.
+#[skuld::test]
+fn the_user_entry_is_the_directory_the_gui_logs_to(#[fixture(temp_dir)] dir: &Path) {
+    let gui_dir = dir.join("elsewhere");
+    assert_eq!(
+        log_dirs(&gui_dir),
+        vec![
+            ("user", gui_dir),
+            ("service", hole_common::update_marker::service_log_dir()),
+        ]
+    );
+}

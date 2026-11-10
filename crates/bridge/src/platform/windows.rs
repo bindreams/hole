@@ -54,28 +54,30 @@ pub const SERVICE_DESCRIPTION: &str = "Transparent proxy bridge for the Hole app
 
 // Service entry =======================================================================================================
 
-/// Socket path override set by the CLI before service dispatch.
-static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-/// State directory override set by the CLI before service dispatch.
-static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-/// Log directory override set by the CLI before service dispatch.
-/// Used by diagnostic artefacts to land alongside `bridge.log` in the
-/// same directory.
-static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-/// GUI build version override set by the CLI before service dispatch. The
-/// `bind` runs inside `service_main` (a SCM callback with no access to
-/// `run`'s args), so the version is threaded through this static.
-static VERSION_OVERRIDE: OnceLock<String> = OnceLock::new();
+/// What `run` was given. `service_main` is an SCM callback with no access to `run`'s arguments, so they reach it
+/// through [`SERVICE_ARGS`].
+struct ServiceArgs {
+    socket_path: PathBuf,
+    state_dir: PathBuf,
+    /// Where diagnostic artefacts land beside `bridge.log`.
+    log_dir: PathBuf,
+    /// The GUI build version the IPC server reports.
+    version: String,
+}
+
+/// Set by [`run`] before the service dispatcher starts, read by [`run_service`].
+static SERVICE_ARGS: OnceLock<ServiceArgs> = OnceLock::new();
 
 /// Run as a Windows Service (called by the service control manager).
 pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) -> std::io::Result<()> {
-    let default = hole_common::protocol::default_bridge_socket_path();
-    if socket_path != default {
-        SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();
-    }
-    STATE_DIR_OVERRIDE.set(state_dir.to_owned()).ok();
-    LOG_DIR_OVERRIDE.set(log_dir.to_owned()).ok();
-    VERSION_OVERRIDE.set(version.to_owned()).ok();
+    SERVICE_ARGS
+        .set(ServiceArgs {
+            socket_path: socket_path.to_owned(),
+            state_dir: state_dir.to_owned(),
+            log_dir: log_dir.to_owned(),
+            version: version.to_owned(),
+        })
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "the service was already run"))?;
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
         .map_err(|e| scm_failure(ScmCall::StartServiceCtrlDispatcher, e))
 }
@@ -94,9 +96,26 @@ fn scm_failure(call: ScmCall, error: windows_service::Error) -> std::io::Error {
 windows_service::define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_arguments: Vec<OsString>) {
-    if let Err(e) = run_service() {
-        error!(error = &*e, "service failed");
-    }
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let RegisteredStop {
+        status_handle,
+        progress: stop,
+    } = match register_stop_handler(std::sync::Mutex::new(Some(shutdown_tx)), report_stop_pending, |_| {}) {
+        Ok(registered) => registered,
+        Err(e) => {
+            // No status handle exists to report with. A non-zero exit before
+            // `Stopped` reads to the SCM as a crash, which runs the failure actions.
+            error!(
+                error = &e as &dyn std::error::Error,
+                "service control handler registration failed"
+            );
+            std::process::exit(1);
+        }
+    };
+    service_stop::run_then_report_stopped(
+        || run_service(&stop, &status_handle, shutdown_rx),
+        |code| status_handle.set_service_status(&stopped_status(code)),
+    );
 }
 
 /// What [`register_stop_handler`] registered.
@@ -155,43 +174,62 @@ pub fn report_stop_pending(handle: &StatusHandle, phase: StopPhase) -> std::io::
     handle.set_service_status(&stop_pending_status(phase))
 }
 
-fn run_service() -> Result<(), Box<dyn std::error::Error>> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let shutdown_tx = std::sync::Mutex::new(Some(shutdown_tx));
+/// The start-up that can fail once the SCM has a status handle: everything up to
+/// the runtime existing. `report_start_pending` is the `StartPending` report.
+/// Returns the args from the static they live in, so the runtime's tasks may
+/// borrow them.
+fn prepare_start(
+    args: Option<&'static ServiceArgs>,
+    report_start_pending: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(&'static ServiceArgs, tokio::runtime::Runtime), Box<dyn std::error::Error>> {
+    let args = args.ok_or("contract: `run` sets SERVICE_ARGS before it starts the dispatcher")?;
+    report_start_pending()?;
+    info!("Windows service starting");
+    Ok((args, tokio::runtime::Runtime::new()?))
+}
 
-    let RegisteredStop {
-        status_handle,
-        progress: stop,
-    } = register_stop_handler(shutdown_tx, report_stop_pending, |_| {})?;
-
+/// Everything between the control handler existing and `Stopped`. Reports no
+/// `Stopped` and logs no failure itself: [`service_stop::run_then_report_stopped`]
+/// does both, once, for every way out of here.
+fn run_service<F>(
+    stop: &std::sync::Arc<StopProgress<F>>,
+    status_handle: &StatusHandle,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Fn(StopPhase) -> std::io::Result<()> + Send + Sync + 'static,
+{
     // Report StartPending, NOT Running: the cutover child exits on the SCM
     // `Running` edge, so `Running` is deferred until after the socket binds AND
     // the marker is swept (`sweep_marker_then_ready`) — so a healthy update never
     // presents "marker present + dead driver". No controls accepted while starting.
-    status_handle.set_service_status(&ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::StartPending,
-        controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::from_secs(30),
-        process_id: None,
+    let (
+        ServiceArgs {
+            socket_path,
+            state_dir,
+            log_dir,
+            version,
+        },
+        rt,
+    ) = prepare_start(SERVICE_ARGS.get(), || {
+        status_handle.set_service_status(&ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::StartPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::from_secs(30),
+            process_id: None,
+        })
     })?;
 
-    info!("Windows service starting");
-
-    // Build and run the tokio runtime
-    let rt = tokio::runtime::Runtime::new()?;
     // `StatusHandle` is Copy (a raw SCM handle wrapper); capture it for the
     // deferred `Running` report inside the async block.
-    let status_handle_ready = status_handle;
-    let stop_progress = std::sync::Arc::clone(&stop);
+    let status_handle_ready = *status_handle;
+    let stop_progress = std::sync::Arc::clone(stop);
     let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async move {
-        let state_dir = STATE_DIR_OVERRIDE
-            .get()
-            .cloned()
-            .unwrap_or_else(hole_common::paths::default_state_dir);
-        let log_dir = LOG_DIR_OVERRIDE.get().cloned().unwrap_or_else(service_log_dir);
+        let state_dir = state_dir.clone();
+        let log_dir = log_dir.clone();
 
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::proxy_manager::ProxyManager::new(
@@ -202,26 +240,20 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         ));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-        let socket_path = SOCKET_PATH_OVERRIDE
-            .get()
-            .cloned()
-            .unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
-        // Bind BEFORE the liveness acquire and BEFORE recovery — a second
-        // instance's bind() fails before it can touch routing state or contend
-        // on the liveness lock, matching crate::liveness's documented invariant
-        // (BridgeLiveness::acquire's doc: "a second real bridge instance never
-        // reaches this call — the IPC socket bind already refuses it first").
+        // Bind BEFORE the liveness acquire and BEFORE recovery: a bind that fails
+        // exits before it can touch routing state or contend on the liveness
+        // lock. The bind does not keep a second bridge out (it takes the socket
+        // name over); one bridge per host is the user's to keep.
         // Route recovery is offloaded via spawn_blocking so a hung netsh/route
         // command cannot wedge the runtime while the IPC socket is bound but
         // not yet serving.
-        let version = VERSION_OVERRIDE.get().cloned().unwrap_or_else(|| "unknown".to_string());
         // The `--service` daemon runs as SYSTEM and its dirs are SYSTEM-owned by
         // design; no real user to chown writes back to. (chown is a macOS no-op
         // anyway, but pass `None` to keep the daemon contract explicit.)
         let server = crate::ipc::IpcServer::bind_with_dirs(
-            &socket_path,
+            socket_path,
             proxy,
-            &version,
+            version,
             log_dir.clone(),
             state_dir.clone(),
             None,
@@ -312,18 +344,14 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     });
 
-    if let Err(e) = &run_result {
-        error!(error = &**e, "bridge runtime error");
+    // Dropping the runtime joins blocking tasks, so `Stopped` follows it. Only
+    // a requested stop reports its teardown phases; a start that failed
+    // (everything that fails here is before `Running`) never reaches the
+    // `StopPending` states.
+    match &run_result {
+        Ok(()) => service_stop::shutdown_runtime(stop, || drop(rt)),
+        Err(_) => drop(rt),
     }
-
-    // Dropping the runtime joins blocking tasks, so `Stopped` follows it. Report
-    // stopped even on error; non-zero exit code if the runtime failed.
-    let exit_code = if run_result.is_err() { 1 } else { 0 };
-    service_stop::finish_stop(
-        &stop,
-        || drop(rt),
-        || status_handle.set_service_status(&stopped_status(exit_code)),
-    );
 
     run_result
 }

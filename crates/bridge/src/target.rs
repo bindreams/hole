@@ -209,7 +209,7 @@ impl Placement for TargetPlacement {
 /// access the unix arm preserves via `fchown` and which a bare
 /// SYSTEM+Administrators DACL would otherwise revoke on their own state dir.
 #[cfg(windows)]
-pub(crate) fn current_user_sid() -> std::io::Result<String> {
+pub fn current_user_sid() -> std::io::Result<String> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
