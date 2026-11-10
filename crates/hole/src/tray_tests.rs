@@ -8,7 +8,7 @@
 use super::*;
 use crate::bridge_client::ClientError;
 use hole_common::config_store::ConfigStore;
-use hole_common::protocol::{BridgeResponse, StartError, NETWORK_BLOCKED_MESSAGE};
+use hole_common::protocol::{BridgeResponse, Refusal, StartError, NETWORK_BLOCKED_MESSAGE};
 use skuld::temp_dir;
 use std::path::Path;
 use std::sync::Mutex;
@@ -80,8 +80,11 @@ fn start_response_outcomes() {
         sf(StartError::AlreadyRunning),
         Outcome(ToggleOutcome::Running)
     ));
-    assert!(matches!(sf(StartError::NetworkBlocked), Fail(_)));
-    assert!(matches!(sf(StartError::Failed { message: "boom".into() }), Fail(_)));
+    assert!(matches!(sf(StartError::Refused(Refusal::NetworkBlocked)), Fail(_)));
+    assert!(matches!(
+        sf(StartError::Refused(Refusal::Failed { message: "boom".into() })),
+        Fail(_)
+    ));
     assert!(matches!(
         outcome_for_start_response(&Err(ClientError::PermissionDenied)),
         NeedsElevation
@@ -91,8 +94,33 @@ fn start_response_outcomes() {
         Fail(_)
     ));
     assert!(matches!(outcome_for_start_response(&Err(transport_err())), Fail(_)));
-    // An unexpected variant on the Start path fails gracefully (no panic).
-    assert!(matches!(outcome_for_start_response(&Ok(status_resp(true))), Fail(_)));
+}
+
+/// `BridgeClient::send` answers a start with Ack or StartFailed (or an error), so any other response is a same-build
+/// contract breach: asserted, never a soft failure.
+#[skuld::test]
+#[should_panic(expected = "BridgeClient answers a start with Ack or StartFailed")]
+fn an_unexpected_response_on_the_start_path_breaks_the_contract() {
+    let _ = outcome_for_start_response(&Ok(status_resp(true)));
+}
+
+/// A `StateBlocked` start error renders a clean toast that names the files and the GUI's remedy, and is not wrapped in
+/// `Bridge error:`.
+#[skuld::test]
+fn state_blocked_renders_the_files_and_the_gui_remedy() {
+    use StartDecision::*;
+    let files = vec!["bridge-routes.json".to_string(), "bridge-plugins.json".to_string()];
+    let error = StartError::Refused(Refusal::StateBlocked { files: files.clone() });
+    let Fail(toast) = outcome_for_start_response(&Ok(BridgeResponse::StartFailed(error))) else {
+        panic!("expected StartDecision::Fail");
+    };
+    assert_eq!(toast, start_error_toast(&Refusal::StateBlocked { files }));
+    assert!(toast.contains("bridge-routes.json, bridge-plugins.json"), "{toast}");
+    assert!(toast.contains("Help > Reset Network…"), "{toast}");
+    assert!(
+        !toast.contains("Bridge error:") && !toast.contains("hole network reset"),
+        "{toast}"
+    );
 }
 
 /// A `NetworkBlocked` start error renders a CLEAN toast — the host-free censorship
@@ -100,7 +128,9 @@ fn start_response_outcomes() {
 #[skuld::test]
 fn network_blocked_renders_clean_toast() {
     use StartDecision::*;
-    let Fail(toast) = outcome_for_start_response(&Ok(BridgeResponse::StartFailed(StartError::NetworkBlocked))) else {
+    let Fail(toast) = outcome_for_start_response(&Ok(BridgeResponse::StartFailed(StartError::Refused(
+        Refusal::NetworkBlocked,
+    )))) else {
         panic!("expected StartDecision::Fail with the clean message");
     };
     assert_eq!(
@@ -110,18 +140,14 @@ fn network_blocked_renders_clean_toast() {
     assert!(!toast.contains("Bridge error:"), "no Bridge error: prefix: {toast}");
     assert!(toast.contains("firewall or censorship"), "{toast}");
 
-    // The shared kind→toast producer (also used by the elevated path) renders
-    // NetworkBlocked clean and Failed wrapped; a non-failure kind degrades safely.
-    assert_eq!(start_error_toast(&StartError::NetworkBlocked), NETWORK_BLOCKED_MESSAGE);
+    // The shared refusal→toast producer (also used by the elevated path) renders
+    // NetworkBlocked clean and Failed wrapped.
+    assert_eq!(start_error_toast(&Refusal::NetworkBlocked), NETWORK_BLOCKED_MESSAGE);
     assert_eq!(
-        start_error_toast(&StartError::Failed {
+        start_error_toast(&Refusal::Failed {
             message: "plugin failed".into()
         }),
         "Bridge error: plugin failed"
-    );
-    assert_eq!(
-        start_error_toast(&StartError::Cancelled),
-        "Bridge error: unexpected start outcome"
     );
 }
 

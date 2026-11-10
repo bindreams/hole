@@ -638,8 +638,11 @@ impl BridgeIpcClient {
                 let resp = self.http_post(ROUTE_RELOAD, body, &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
+                } else if resp.status().is_server_error() {
+                    let body = read_body(resp).await?;
+                    Ok(BridgeResponse::StartFailed(serde_json::from_slice(&body)?))
                 } else {
-                    parse_bridge_error(resp).await
+                    Err(HarnessError(format!("unexpected HTTP status: {}", resp.status())))
                 }
             }
             BridgeRequest::Metrics => {

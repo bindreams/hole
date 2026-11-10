@@ -1,6 +1,6 @@
 //! What a file that cannot be read means, per kind of file.
 
-use super::loaded::{CannotRead, WhyUnreadable};
+use super::loaded::CannotRead;
 
 /// What a file is for, and so what it means when this release cannot read it.
 ///
@@ -13,7 +13,8 @@ use super::loaded::{CannotRead, WhyUnreadable};
 pub enum Role {
     /// The user's latest decision, with a safe default to fall back on.
     Decision,
-    /// What this bridge did to the OS, needed for cleanup.
+    /// What this bridge did to the OS, needed for cleanup. A type of this role must be added to the bridge's connect
+    /// gate (`state_gate::check`).
     OsRecord,
     /// An OS record a past release wrote and no release writes any more:
     /// kept, never overwritten, and it never blocks a connect.
@@ -26,7 +27,8 @@ pub enum Role {
     Claim,
     /// What this bridge did to the OS where an unreadable record must still be
     /// cleaned up after (a macOS pf record): moved aside, never destroyed
-    /// unread, and it blocks a connect.
+    /// unread, and it blocks a connect. A type of this role must be added to the bridge's connect gate
+    /// (`state_gate::check`).
     Cover,
 }
 
@@ -114,19 +116,10 @@ impl Role {
         }
     }
 
-    /// Whether a file of this role, unreadable for `why`, stops the bridge from
-    /// connecting.
-    pub fn blocks_connect(self, why: WhyUnreadable) -> bool {
-        match why {
-            WhyUnreadable::CannotRead(why) => self.unreadable_blocks_connect(why),
-            WhyUnreadable::ReadFailed(_) => self.io_failure_blocks_connect(),
-        }
-    }
-
-    /// Whether a file of this role whose read failed with an I/O error stops the
-    /// bridge from connecting. The bytes were never seen, so the file may name
-    /// what an OS record exists to clean up.
-    pub fn io_failure_blocks_connect(self) -> bool {
+    /// Whether a file of this role that this release cannot act on stops the bridge from connecting. One answer for
+    /// every way a file is unreadable (newer, corrupt, a failed read): an OS record may name what a connect would
+    /// strand, however it came to be unreadable.
+    pub fn blocks_connect(self) -> bool {
         match self {
             Role::Decision => false,
             Role::OsRecord => true,
@@ -134,25 +127,6 @@ impl Role {
             Role::Config => false,
             Role::Claim => false,
             Role::Cover => true,
-        }
-    }
-
-    /// Whether a file of this role that cannot be read stops the bridge from
-    /// connecting.
-    pub fn unreadable_blocks_connect(self, why: CannotRead) -> bool {
-        match (self, why) {
-            (Role::Decision, CannotRead::Newer) => false,
-            (Role::Decision, CannotRead::Corrupt) => false,
-            (Role::OsRecord, CannotRead::Newer) => true,
-            (Role::OsRecord, CannotRead::Corrupt) => true,
-            (Role::LegacyRecord, CannotRead::Newer) => false,
-            (Role::LegacyRecord, CannotRead::Corrupt) => false,
-            (Role::Config, CannotRead::Newer) => false,
-            (Role::Config, CannotRead::Corrupt) => false,
-            (Role::Claim, CannotRead::Newer) => false,
-            (Role::Claim, CannotRead::Corrupt) => false,
-            (Role::Cover, CannotRead::Newer) => true,
-            (Role::Cover, CannotRead::Corrupt) => true,
         }
     }
 }

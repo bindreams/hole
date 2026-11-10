@@ -451,7 +451,7 @@ fn send_reload_receives_ack() {
 
 /// Spawn a mock bridge that returns a 500 typed `StartError` for POST /start.
 async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
-    use hole_common::protocol::StartError;
+    use hole_common::protocol::{Refusal, StartError};
 
     let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
 
@@ -477,9 +477,9 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
             axum::routing::post(|| async {
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(StartError::Failed {
+                    Json(StartError::Refused(Refusal::Failed {
                         message: "mock start failure".to_string(),
-                    }),
+                    })),
                 )
             }),
         )
@@ -549,7 +549,9 @@ fn start_500_maps_to_typed_start_failed() {
             .await
             .unwrap();
         match resp {
-            BridgeResponse::StartFailed(hole_common::protocol::StartError::Failed { message }) => {
+            BridgeResponse::StartFailed(hole_common::protocol::StartError::Refused(
+                hole_common::protocol::Refusal::Failed { message },
+            )) => {
                 assert!(
                     message.contains("mock start failure"),
                     "expected error message, got: {message}"
@@ -876,11 +878,17 @@ fn bad_request_maps_to_invalid_update_destination() {
 }
 
 #[skuld::test]
-fn update_other_4xx_maps_to_protocol() {
+fn update_other_4xx_maps_to_unexpected_status() {
     rt().block_on(async {
         let result =
             update_against_status(&test_socket_path("err404"), axum::http::StatusCode::NOT_FOUND, "nope").await;
-        assert!(matches!(result, Err(ClientError::Protocol(_))), "got {result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::UnexpectedStatus(axum::http::StatusCode::NOT_FOUND))
+            ),
+            "got {result:?}"
+        );
     });
 }
 
@@ -902,11 +910,17 @@ fn generic_route_5xx_maps_to_error() {
 }
 
 #[skuld::test]
-fn generic_route_4xx_maps_to_protocol() {
+fn generic_route_4xx_maps_to_unexpected_status() {
     rt().block_on(async {
         // A non-Start, non-update route must NOT inherit the update 4xx mappings.
         let result = stop_against_status(&test_socket_path("stop409"), axum::http::StatusCode::CONFLICT, "nope").await;
-        assert!(matches!(result, Err(ClientError::Protocol(_))), "got {result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::UnexpectedStatus(axum::http::StatusCode::CONFLICT))
+            ),
+            "got {result:?}"
+        );
     });
 }
 
@@ -919,7 +933,7 @@ fn unblock_200_maps_to_ack() {
 }
 
 #[skuld::test]
-fn unblock_409_maps_to_protocol() {
+fn unblock_409_maps_to_unexpected_status() {
     rt().block_on(async {
         // The handler reads no session posture (Task 8b), so the bridge
         // never answers Unblock with a 409 in the first place; but if it
@@ -930,7 +944,13 @@ fn unblock_409_maps_to_protocol() {
             "nope",
         )
         .await;
-        assert!(matches!(result, Err(ClientError::Protocol(_))), "got {result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::UnexpectedStatus(axum::http::StatusCode::CONFLICT))
+            ),
+            "got {result:?}"
+        );
     });
 }
 
@@ -995,6 +1015,40 @@ fn start_409_maps_to_concurrent_start() {
     });
 }
 
+/// A reload's 500 carries the same typed `StartError` a start's does.
+#[skuld::test]
+fn reload_500_typed_body_parses() {
+    rt().block_on(async {
+        let path = test_socket_path("r500t");
+        let listener = hole_bridge::socket::LocalListener::bind(&path).unwrap();
+        let router = stamp_version(axum::Router::new().route(
+            hole_common::protocol::ROUTE_RELOAD,
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"kind":"state_blocked","files":["bridge-routes.json"]}"#,
+                )
+            }),
+        ));
+        let _m = serve_one(listener, router);
+        let mut c = BridgeClient::connect(&path).await.unwrap();
+        let r = c
+            .send(BridgeRequest::Reload {
+                config: hole_common::protocol::ProxyConfig::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            BridgeResponse::StartFailed(hole_common::protocol::StartError::Refused(
+                hole_common::protocol::Refusal::StateBlocked {
+                    files: vec!["bridge-routes.json".into()]
+                }
+            ))
+        );
+    });
+}
+
 #[skuld::test]
 fn start_500_typed_body_parses() {
     rt().block_on(async {
@@ -1007,7 +1061,9 @@ fn start_500_typed_body_parses() {
         .unwrap();
         assert_eq!(
             r,
-            BridgeResponse::StartFailed(hole_common::protocol::StartError::NetworkBlocked)
+            BridgeResponse::StartFailed(hole_common::protocol::StartError::Refused(
+                hole_common::protocol::Refusal::NetworkBlocked
+            ))
         );
     });
 }
@@ -1024,9 +1080,11 @@ fn start_500_unparseable_body_falls_back() {
         .unwrap();
         assert_eq!(
             r,
-            BridgeResponse::StartFailed(hole_common::protocol::StartError::Failed {
-                message: "unknown error".into()
-            })
+            BridgeResponse::StartFailed(hole_common::protocol::StartError::Refused(
+                hole_common::protocol::Refusal::Failed {
+                    message: "unknown error".into()
+                }
+            ))
         );
     });
 }
@@ -1043,15 +1101,17 @@ fn start_500_oversized_body_is_read_failure() {
         .unwrap();
         assert_eq!(
             r,
-            BridgeResponse::StartFailed(hole_common::protocol::StartError::Failed {
-                message: "failed to read error response".into()
-            })
+            BridgeResponse::StartFailed(hole_common::protocol::StartError::Refused(
+                hole_common::protocol::Refusal::Failed {
+                    message: "failed to read error response".into()
+                }
+            ))
         );
     });
 }
 
 #[skuld::test]
-fn start_unexpected_status_is_protocol_error() {
+fn start_unexpected_status_is_unexpected_status() {
     rt().block_on(async {
         // A framework status (e.g. a body-limit 413) is NOT a typed StartError.
         let r = start_raw(
@@ -1060,7 +1120,41 @@ fn start_unexpected_status_is_protocol_error() {
             "length limit exceeded",
         )
         .await;
-        assert!(matches!(r, Err(ClientError::Protocol(_))), "got {r:?}");
+        assert!(
+            matches!(
+                r,
+                Err(ClientError::UnexpectedStatus(axum::http::StatusCode::PAYLOAD_TOO_LARGE))
+            ),
+            "got {r:?}"
+        );
+    });
+}
+
+/// The bridge caps a request body at 1 MiB, so a reload of a very large config is answered 413 by the framework before
+/// the handler runs: nothing was applied, and it is not a typed `StartError`.
+#[skuld::test]
+fn reload_unexpected_status_is_unexpected_status() {
+    rt().block_on(async {
+        let path = test_socket_path("r413");
+        let listener = hole_bridge::socket::LocalListener::bind(&path).unwrap();
+        let router = stamp_version(axum::Router::new().route(
+            hole_common::protocol::ROUTE_RELOAD,
+            axum::routing::post(|| async { (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "length limit exceeded") }),
+        ));
+        let _m = serve_one(listener, router);
+        let mut c = BridgeClient::connect(&path).await.unwrap();
+        let r = c
+            .send(BridgeRequest::Reload {
+                config: hole_common::protocol::ProxyConfig::default(),
+            })
+            .await;
+        assert!(
+            matches!(
+                r,
+                Err(ClientError::UnexpectedStatus(axum::http::StatusCode::PAYLOAD_TOO_LARGE))
+            ),
+            "got {r:?}"
+        );
     });
 }
 

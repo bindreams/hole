@@ -1147,15 +1147,81 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
     send_bridge_request(request, None)
 }
 
-/// CLI disposition for a typed start failure: process exit code + an optional error
-/// line. Cancelled/AlreadyRunning are success-equivalent (0); a block and any other
-/// failure are errors (1). Shared by both CLI start paths so exit codes never diverge.
-pub(crate) fn start_error_cli(e: &hole_common::protocol::StartError) -> (i32, Option<String>) {
-    use hole_common::protocol::StartError;
-    match e {
-        StartError::Cancelled | StartError::AlreadyRunning => (0, None),
-        StartError::NetworkBlocked => (1, Some(hole_common::protocol::NETWORK_BLOCKED_MESSAGE.to_string())),
-        StartError::Failed { message } => (1, Some(format!("bridge rejected start: {message}"))),
+/// What the CLI tells the user to do about a start refused over unreadable state files.
+const STATE_BLOCKED_REMEDY: &str = "Run `hole network reset` from an elevated shell to clear them.";
+
+/// The request a typed start failure answers: only a start or a reload is answered with one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartOperation {
+    Start,
+    Reload,
+}
+
+impl StartOperation {
+    /// The operation `request` asks for, if the bridge answers it with a typed start failure.
+    fn of(request: &hole_common::protocol::BridgeRequest) -> Option<Self> {
+        use hole_common::protocol::BridgeRequest;
+        match request {
+            BridgeRequest::Start { .. } => Some(StartOperation::Start),
+            BridgeRequest::Reload { .. } => Some(StartOperation::Reload),
+            BridgeRequest::Stop
+            | BridgeRequest::Cancel { .. }
+            | BridgeRequest::Status
+            | BridgeRequest::Metrics
+            | BridgeRequest::Diagnostics
+            | BridgeRequest::SetLockdown { .. }
+            | BridgeRequest::Unblock
+            | BridgeRequest::ApplyUpdate { .. }
+            | BridgeRequest::TestServer { .. } => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            StartOperation::Start => "start",
+            StartOperation::Reload => "reload",
+        }
+    }
+}
+
+/// How a typed start failure ends a CLI start or reload. Cancelled and already running are success-equivalent; a
+/// refusal is an error with its line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartReport {
+    AlreadyRunning,
+    Cancelled,
+    Refused(String),
+}
+
+impl StartReport {
+    /// The process exit code, shared by every CLI path that can see a typed start failure so they never diverge.
+    pub(crate) fn exit_code(&self) -> i32 {
+        match self {
+            StartReport::AlreadyRunning => 0,
+            StartReport::Cancelled => 0,
+            StartReport::Refused(_) => 1,
+        }
+    }
+}
+
+/// The report for the typed start failure `e` that answered `operation`.
+///
+/// # Panics
+/// If `operation` is a reload and `e` is a cancel or an already-running answer (see [`StartError::reload_refusal`]).
+pub(crate) fn start_report(operation: StartOperation, e: &hole_common::protocol::StartError) -> StartReport {
+    use hole_common::protocol::{Refusal, StartError};
+    let refusal_line = |refusal: &Refusal| match refusal {
+        Refusal::NetworkBlocked => hole_common::protocol::NETWORK_BLOCKED_MESSAGE.to_string(),
+        Refusal::StateBlocked { files } => hole_common::protocol::state_blocked_message(files, STATE_BLOCKED_REMEDY),
+        Refusal::Failed { message } => format!("bridge rejected {}: {message}", operation.name()),
+    };
+    match operation {
+        StartOperation::Start => match e {
+            StartError::Cancelled => StartReport::Cancelled,
+            StartError::AlreadyRunning => StartReport::AlreadyRunning,
+            StartError::Refused(refusal) => StartReport::Refused(refusal_line(refusal)),
+        },
+        StartOperation::Reload => StartReport::Refused(refusal_line(e.reload_refusal())),
     }
 }
 
@@ -1167,7 +1233,16 @@ pub(crate) fn start_error_cli(e: &hole_common::protocol::StartError) -> (i32, Op
 fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_file: Option<&std::path::Path>) -> i32 {
     use hole_common::protocol::BridgeResponse;
 
+    let operation = StartOperation::of(&request);
     let inner = send_bridge_request_inner(request);
+    // Before the result file mirrors it: a contract breach is asserted, never reported as an outcome.
+    let report = match &inner {
+        Ok(BridgeResponse::StartFailed(e)) => {
+            let operation = operation.expect("only a start or a reload is answered with a typed start failure");
+            Some(start_report(operation, e))
+        }
+        _ => None,
+    };
 
     if let Some(path) = result_file {
         let outcome = crate::elevation::classify_elevated_send(&inner);
@@ -1186,12 +1261,12 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
             cli_log!(error, "bridge error: {message}");
             1
         }
-        Ok(BridgeResponse::StartFailed(e)) => {
-            let (code, log) = start_error_cli(&e);
-            if let Some(line) = log {
+        Ok(BridgeResponse::StartFailed(_)) => {
+            let report = report.expect("built above for a typed start failure");
+            if let StartReport::Refused(line) = &report {
                 cli_log!(error, "{line}");
             }
-            code
+            report.exit_code()
         }
         Err(msg) => {
             cli_log!(error, "{msg}");
@@ -1329,17 +1404,13 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     0
                 }
                 Ok(BridgeResponse::StartFailed(e)) => {
-                    use hole_common::protocol::StartError;
-                    match &e {
-                        StartError::AlreadyRunning => println!("proxy already running on local_port {local_port}"),
-                        StartError::Cancelled => println!("proxy start cancelled"),
-                        _ => {}
+                    let report = start_report(StartOperation::Start, &e);
+                    match &report {
+                        StartReport::AlreadyRunning => println!("proxy already running on local_port {local_port}"),
+                        StartReport::Cancelled => println!("proxy start cancelled"),
+                        StartReport::Refused(line) => cli_log!(error, "{line}"),
                     }
-                    let (code, log) = start_error_cli(&e);
-                    if let Some(line) = log {
-                        cli_log!(error, "{line}");
-                    }
-                    code
+                    report.exit_code()
                 }
                 Ok(other) => {
                     cli_log!(error, "unexpected response: {other:?}");

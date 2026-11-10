@@ -336,7 +336,7 @@ fn doh_bootstrap_display_is_pii_free_and_clear() {
 
 #[skuld::test]
 fn proxy_error_converts_to_start_error() {
-    use hole_common::protocol::StartError;
+    use hole_common::protocol::{Refusal, StartError};
     assert_eq!(StartError::from(&ProxyError::Cancelled), StartError::Cancelled);
     assert_eq!(
         StartError::from(&ProxyError::AlreadyRunning),
@@ -344,10 +344,10 @@ fn proxy_error_converts_to_start_error() {
     );
     assert_eq!(
         StartError::from(&ProxyError::NetworkBlocked),
-        StartError::NetworkBlocked
+        StartError::Refused(Refusal::NetworkBlocked)
     );
     match StartError::from(&ProxyError::RouteSetup("nope".into())) {
-        StartError::Failed { message } => assert!(message.contains("nope")),
+        StartError::Refused(Refusal::Failed { message }) => assert!(message.contains("nope")),
         other => panic!("expected Failed, got {other:?}"),
     }
 }
@@ -408,22 +408,35 @@ fn io_dispatcher_start_error_converts_to_runtime() {
 // RoutingError conversion ---------------------------------------------------------------------------------------------
 
 /// The path of a route record names the user's profile directory, and this
-/// error's `StartError` is a toast: it names the file only. The path stays in
-/// the log.
+/// error's `StartError` is a toast: it carries the file name only. A route
+/// install that finds the record unreadable is the same refusal as the connect
+/// gate's, so the toast has the one remedy.
 #[skuld::test]
-fn an_unreadable_route_record_reaches_the_toast_as_its_file_name_only() {
+fn an_unreadable_route_record_at_install_is_the_same_refusal_as_the_connect_gate() {
     let path = std::path::PathBuf::from("somebody-private").join("bridge-routes.json");
     let err = ProxyError::from(tun_engine::RoutingError::StateUnreadable { path });
 
-    assert!(matches!(err, ProxyError::RouteSetup(_)), "{err:?}");
-    match hole_common::protocol::StartError::from(&err) {
-        hole_common::protocol::StartError::Failed { message } => assert_eq!(
-            message,
-            "route setup failed: the route record bridge-routes.json cannot be read; \
-             it is left as it is, and no route is installed over it"
-        ),
-        other => panic!("expected StartError::Failed, got {other:?}"),
-    }
+    assert!(matches!(err, ProxyError::StateBlocked(_)), "{err:?}");
+    assert_eq!(
+        hole_common::protocol::StartError::from(&err),
+        hole_common::protocol::StartError::Refused(hole_common::protocol::Refusal::StateBlocked {
+            files: vec!["bridge-routes.json".into()]
+        })
+    );
+}
+
+/// The refusal's `Display` names the files and no directory, and is the whole message: it has no `source()`, so the
+/// log chain prints the files once.
+#[skuld::test]
+fn the_state_blocked_error_names_its_files_once_and_no_directory() {
+    use std::error::Error;
+    let err = ProxyError::from(crate::state_gate::StateBlocked::new(vec![std::path::PathBuf::from(
+        "somebody-private/bridge-routes.json",
+    )]));
+
+    assert!(err.to_string().contains("bridge-routes.json"), "{err}");
+    assert!(!err.to_string().contains("somebody-private"), "{err}");
+    assert!(err.source().is_none(), "the files are printed once, in the message");
 }
 
 // Key-material classification -----------------------------------------------------------------------------------------
@@ -488,8 +501,10 @@ fn a_key_decode_failure_leaks_no_decode_detail() {
 
     // And the toast, which is the `StartError` this maps to.
     match hole_common::protocol::StartError::from(&err) {
-        hole_common::protocol::StartError::Failed { message } => assert_eq!(message, EXPECTED),
-        other => panic!("expected StartError::Failed, got {other:?}"),
+        hole_common::protocol::StartError::Refused(hole_common::protocol::Refusal::Failed { message }) => {
+            assert_eq!(message, EXPECTED)
+        }
+        other => panic!("expected a Failed refusal, got {other:?}"),
     }
 }
 
@@ -554,4 +569,23 @@ fn an_unknown_cipher_name_is_still_a_method_fault() {
         ProxyError::InvalidMethod(m) => assert_eq!(m, "not-a-cipher"),
         other => panic!("expected InvalidMethod, got {other:?}"),
     }
+}
+
+// StateBlocked --------------------------------------------------------------------------------------------------------
+
+/// The refusal crosses the wire as the typed `StateBlocked` with file names only: the bridge writes no user text and no
+/// path.
+#[skuld::test]
+fn a_refused_connect_reaches_the_wire_as_typed_file_names() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bridge-plugins.json"), b"not json").unwrap();
+    let err = ProxyError::StateBlocked(crate::state_gate::check(dir.path()).unwrap_err());
+
+    assert_eq!(
+        hole_common::protocol::StartError::from(&err),
+        hole_common::protocol::StartError::Refused(hole_common::protocol::Refusal::StateBlocked {
+            files: vec!["bridge-plugins.json".to_owned()]
+        })
+    );
+    assert!(!err.to_string().contains(&dir.path().display().to_string()), "{err}");
 }

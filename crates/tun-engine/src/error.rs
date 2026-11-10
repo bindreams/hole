@@ -18,29 +18,9 @@ pub enum RoutingError {
     /// The route record is newer than this release, corrupt, or its read fails.
     /// It may name routes an earlier run left behind, so nothing is installed
     /// over it and it is left as it is. `Display` names the path: it is for
-    /// the log, not a toast; use [`RoutingError::redacted`] for a toast.
-    #[error("{}", state_unreadable(&path.display()))]
+    /// the log, not a toast; the bridge's toast names the file only.
+    #[error("the route record {} cannot be read; it is left as it is, and no route is installed over it", path.display())]
     StateUnreadable { path: PathBuf },
-}
-
-fn state_unreadable(record: &dyn std::fmt::Display) -> String {
-    format!("the route record {record} cannot be read; it is left as it is, and no route is installed over it")
-}
-
-impl RoutingError {
-    /// The text for a toast: `Display`, with the record named by its file name
-    /// instead of its path. One exhaustive match, so a new variant must choose.
-    ///
-    /// `RouteSetup` and `Gateway` text is built path-free at its sources: a
-    /// write failure names the `io::ErrorKind` only (`state_op_failed`), and
-    /// the full error is logged.
-    pub fn redacted(&self) -> String {
-        match self {
-            RoutingError::Gateway(_) => self.to_string(),
-            RoutingError::RouteSetup(_) => self.to_string(),
-            RoutingError::StateUnreadable { .. } => state_unreadable(&crate::routing::state::STATE_FILE_NAME),
-        }
-    }
 }
 
 /// What was asked of a state file when it failed: the user is told which, so a clear is not "written".
@@ -125,7 +105,7 @@ impl From<SetupFailure> for RoutingError {
 ///
 /// `Display` is PII-free by construction — program name (`netsh` / `route`),
 /// position within the phase, exit code. A [`RoutingError::RouteSetup`] built
-/// from this reaches a GUI toast verbatim (`StartError::Failed`), so the argv
+/// from this reaches a GUI toast verbatim (`Refusal::Failed`), so the argv
 /// (which carries the server IP and the upstream interface name) and the
 /// child's stdout/stderr are logged at `warn` by the runner instead.
 #[derive(Debug, Error)]

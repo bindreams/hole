@@ -388,3 +388,74 @@ fn a_placement_asking_for_acl_gets_a_directory_that_can_be_protected() {
         CreateOutcome::Created
     );
 }
+
+// connect_blocker =====================================================================================================
+
+/// What a file of `S`'s role holding `bytes` (`None`: no file) says to a connect.
+fn blocker<S: crate::versioned_file::VersionedState>(
+    bytes: Option<&[u8]>,
+) -> (tempfile::TempDir, Option<std::path::PathBuf>, std::path::PathBuf) {
+    let dir = dir();
+    let path = dir.path().join(S::FILE_NAME);
+    if let Some(bytes) = bytes {
+        std::fs::write(&path, bytes).unwrap();
+    }
+    let found = VersionedFile::<S>::new(dir.path()).connect_blocker();
+    (dir, found, path)
+}
+
+#[skuld::test]
+fn an_os_record_this_release_cannot_read_blocks_a_connect_whatever_the_cause() {
+    use crate::versioned_file::fixtures::OsRecordFile;
+    for (what, bytes) in [
+        ("newer", &br#"{"version": 2, "value": "x"}"#[..]),
+        ("corrupt", b"not json {"),
+        ("empty", b""),
+    ] {
+        let (_dir, found, path) = blocker::<OsRecordFile>(Some(bytes));
+        assert_eq!(found, Some(path), "{what}");
+    }
+
+    let dir = dir();
+    let path = dir.path().join("os-record.json");
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(
+        VersionedFile::<OsRecordFile>::new(dir.path()).connect_blocker(),
+        Some(path),
+        "a read that fails"
+    );
+}
+
+#[skuld::test]
+fn an_os_record_this_release_reads_or_that_is_absent_does_not_block_a_connect() {
+    use crate::versioned_file::fixtures::OsRecordFile;
+    assert_eq!(blocker::<OsRecordFile>(None).1, None, "absent");
+    assert_eq!(
+        blocker::<OsRecordFile>(Some(br#"{"version": 1, "value": "x"}"#)).1,
+        None,
+        "current"
+    );
+}
+
+#[skuld::test]
+fn a_cover_blocks_a_connect_and_a_decision_claim_legacy_record_or_config_does_not() {
+    use crate::versioned_file::fixtures::{ClaimFile, ConfigFile, CoverFile, LegacyRecordFile};
+    let newer = Some(&br#"{"version": 2, "value": "x"}"#[..]);
+    let corrupt = Some(&b"not json {"[..]);
+    for bytes in [newer, corrupt] {
+        let (_dir, found, path) = blocker::<CoverFile>(bytes);
+        assert_eq!(found, Some(path), "cover");
+        assert_eq!(blocker::<DecisionFile>(bytes).1, None, "decision");
+        assert_eq!(blocker::<ClaimFile>(bytes).1, None, "claim");
+        assert_eq!(blocker::<LegacyRecordFile>(bytes).1, None, "legacy record");
+        assert_eq!(blocker::<ConfigFile>(bytes).1, None, "config");
+    }
+}
+
+/// A failed read blocks exactly where the role blocks.
+#[skuld::test]
+fn a_decision_whose_read_fails_does_not_block_a_connect() {
+    let dir = dir();
+    std::fs::create_dir(dir.path().join("decision.json")).unwrap();
+    assert_eq!(VersionedFile::<DecisionFile>::new(dir.path()).connect_blocker(), None);
+}

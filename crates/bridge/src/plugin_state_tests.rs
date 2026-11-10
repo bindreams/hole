@@ -370,6 +370,37 @@ const UNREADABLE: [Unreadable; 3] = [
     },
 ];
 
+/// Every record this release cannot read blocks a connect, and names the file it blocks on.
+#[skuld::test]
+fn a_record_this_release_cannot_read_blocks_a_connect() {
+    for Unreadable { what, plant, .. } in UNREADABLE {
+        let dir = tempfile::tempdir().unwrap();
+        plant(dir.path());
+        assert_eq!(blocking(dir.path()), Some(state_path(dir.path())), "{what}");
+    }
+}
+
+#[skuld::test]
+fn a_record_this_release_reads_or_drops_or_lacks_does_not_block_a_connect() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(blocking(dir.path()), None, "no record");
+
+    seed(
+        dir.path(),
+        PluginState {
+            plugins: vec![synthetic(1, 1)],
+        },
+    );
+    assert_eq!(blocking(dir.path()), None, "a current record");
+
+    std::fs::write(
+        state_path(dir.path()),
+        br#"{"version":1,"plugins":[{"pid":1,"start_time_unix_ms":1}]}"#,
+    )
+    .unwrap();
+    assert_eq!(blocking(dir.path()), None, "an obsolete record is dropped on purpose");
+}
+
 #[skuld::test]
 fn append_over_an_unreadable_record_is_refused() {
     // Rewriting with a single record would drop the plugins the file tracks. Each case keeps what it held.

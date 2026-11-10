@@ -234,14 +234,14 @@ fn result_target() -> tempfile::TempPath {
 }
 
 fn outcome_samples() -> Vec<ElevatedOutcome> {
-    use hole_common::protocol::StartError;
+    use hole_common::protocol::Refusal;
     vec![
         ElevatedOutcome::Success,
         ElevatedOutcome::StartFailed {
-            error: StartError::NetworkBlocked,
+            error: Refusal::NetworkBlocked,
         },
         ElevatedOutcome::StartFailed {
-            error: StartError::Failed { message: "boom".into() },
+            error: Refusal::Failed { message: "boom".into() },
         },
         ElevatedOutcome::ConcurrentStart,
         ElevatedOutcome::BridgeError {
@@ -305,7 +305,7 @@ fn read_result_file_garbage_is_err() {
 
 use super::classify_elevated_send;
 use crate::bridge_client::ClientError;
-use hole_common::protocol::{BridgeResponse, CoverPresence, StartError};
+use hole_common::protocol::{BridgeResponse, CoverPresence, Refusal, StartError};
 
 #[skuld::test]
 fn classify_ack_is_success() {
@@ -335,13 +335,32 @@ fn classify_unexpected_ok_is_success() {
 
 #[skuld::test]
 fn classify_start_failed_network_blocked_is_typed() {
-    let r = Ok(BridgeResponse::StartFailed(StartError::NetworkBlocked));
+    let r = Ok(BridgeResponse::StartFailed(StartError::Refused(
+        Refusal::NetworkBlocked,
+    )));
     assert_eq!(
         classify_elevated_send(&r),
         ElevatedOutcome::StartFailed {
-            error: StartError::NetworkBlocked
+            error: Refusal::NetworkBlocked
         }
     );
+}
+
+#[skuld::test]
+fn classify_start_failed_state_blocked_is_typed_and_survives_the_result_file() {
+    let files = vec!["bridge-routes.json".to_string()];
+    let error = StartError::Refused(Refusal::StateBlocked { files: files.clone() });
+    let outcome = classify_elevated_send(&Ok(BridgeResponse::StartFailed(error)));
+    assert_eq!(
+        outcome,
+        ElevatedOutcome::StartFailed {
+            error: Refusal::StateBlocked { files }
+        }
+    );
+
+    let file = tempfile::NamedTempFile::new().unwrap();
+    write_result_file(file.path(), &outcome).unwrap();
+    assert_eq!(read_result_file(file.path()).unwrap(), outcome);
 }
 
 #[skuld::test]

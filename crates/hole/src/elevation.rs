@@ -132,9 +132,9 @@ pub enum ElevatedOutcome {
     /// Bridge accepted the request (Ack/Status/...) or a bridge-side
     /// cancelled/already-running Start: the confirming Status drives the tray.
     Success,
-    /// A typed start failure (NetworkBlocked / Failed); the parent renders it via
-    /// `tray::start_error_toast`.
-    StartFailed { error: hole_common::protocol::StartError },
+    /// A refused start (NetworkBlocked / StateBlocked / Failed); the parent renders it via
+    /// `toast::start_error_toast`.
+    StartFailed { error: hole_common::protocol::Refusal },
     /// A concurrent-start rejection (409): the bridge was reached and refused.
     ConcurrentStart,
     /// Bridge was reached but rejected the request (a generic/Stop error). Raw,
@@ -171,8 +171,9 @@ pub fn classify_elevated_send(
     use hole_common::protocol::{BridgeResponse, StartError};
     match result {
         Ok(BridgeResponse::StartFailed(e)) => match e {
-            StartError::Cancelled | StartError::AlreadyRunning => ElevatedOutcome::Success,
-            StartError::NetworkBlocked | StartError::Failed { .. } => ElevatedOutcome::StartFailed { error: e.clone() },
+            StartError::Cancelled => ElevatedOutcome::Success,
+            StartError::AlreadyRunning => ElevatedOutcome::Success,
+            StartError::Refused(error) => ElevatedOutcome::StartFailed { error: error.clone() },
         },
         Ok(BridgeResponse::Error { message }) => ElevatedOutcome::BridgeError {
             message: message.clone(),
@@ -192,7 +193,7 @@ pub fn classify_elevated_send(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElevationResult {
     Success,
-    StartFailed(hole_common::protocol::StartError),
+    StartFailed(hole_common::protocol::Refusal),
     ConcurrentStart,
     BridgeError(String),
     Transport(String),

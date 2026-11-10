@@ -152,6 +152,14 @@ impl<S: VersionedState> VersionedFile<S> {
         }
     }
 
+    /// The file's path iff the connect gate must refuse to start over it: the file exists, this release cannot act
+    /// on it (newer, corrupt, or its read fails), and its [`Role`](super::Role) blocks a connect. `None` for a file
+    /// this release reads, one the chain's floor drops, and no file.
+    pub fn connect_blocker(&self) -> Option<PathBuf> {
+        self.observe().loaded.into_actionable().err()?;
+        S::ROLE.blocks_connect().then(|| self.path().to_path_buf())
+    }
+
     /// One read through `dir`. When it fails, the one look at the name says whether it holds a regular file, nothing
     /// (the file is [`Loaded::Absent`]), or could not be examined.
     fn read_through(&self, dir: &ReadDir) -> Loaded<S> {

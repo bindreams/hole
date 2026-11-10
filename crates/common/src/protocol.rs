@@ -179,9 +179,11 @@ pub const NETWORK_BLOCKED_MESSAGE: &str = "The network is blocking the connectio
      reset or got no response. This usually means a firewall or censorship; \
      try a different server.";
 
-/// Typed outcome of a failed `POST /v1/start` (the 500 body). The concurrent-start
-/// rejection is a `ClientError::ConcurrentStart`, not a variant here, so `Failed`
-/// is always a genuine `ProxyError`.
+/// Typed outcome of a failed `POST /v1/start` or `POST /v1/reload` (the 500 body; a reload's slow path restarts). The
+/// concurrent-start rejection is a `ClientError::ConcurrentStart`, not a variant here, so a `Failed` refusal is always a
+/// genuine `ProxyError`.
+///
+/// A [`Refusal`] is flattened into it: its `kind` is the tag, so the wire holds one `kind` per answer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StartError {
@@ -189,10 +191,68 @@ pub enum StartError {
     Cancelled,
     /// The proxy was already running — idempotent success GUI-side.
     AlreadyRunning,
+    /// The start was refused or failed, and the user is told why.
+    #[serde(untagged)]
+    Refused(Refusal),
+}
+
+/// A [`StartError`] the user is told about: every answer that is neither a cancel nor an already-running one. A
+/// display site that takes a `Refusal` cannot be handed a cancel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Refusal {
     /// The network reset/dropped the server handshake (DPI / censorship).
     NetworkBlocked,
+    /// The start was refused because these state files (file names only) cannot be read. The reader composes the
+    /// text and its remedy with [`state_blocked_message`].
+    StateBlocked { files: Vec<String> },
     /// Any other `ProxyError`. `message` is the system-authored, PII-free reason.
     Failed { message: String },
+}
+
+impl From<Refusal> for StartError {
+    fn from(refusal: Refusal) -> Self {
+        StartError::Refused(refusal)
+    }
+}
+
+impl StartError {
+    /// Whether a session is up once the bridge answered a start (or a reload's restart) this way. A failed start is
+    /// rolled back bridge-side, and a reload's slow path stops the session before it restarts.
+    pub fn leaves_session_up(&self) -> bool {
+        match self {
+            StartError::Cancelled => false,
+            StartError::AlreadyRunning => true,
+            StartError::Refused(_) => false,
+        }
+    }
+
+    /// The refusal a reload was answered with. A reload restarts only after stopping the session, and with a token
+    /// nobody signals, so the bridge answers it with a refusal or not at all.
+    ///
+    /// # Panics
+    /// If `self` is a cancel or an already-running answer, which the bridge cannot produce for a reload.
+    pub fn reload_refusal(&self) -> &Refusal {
+        match self {
+            StartError::Refused(refusal) => refusal,
+            StartError::Cancelled => {
+                unreachable!("a reload cannot be cancelled: its restart token is never signalled")
+            }
+            StartError::AlreadyRunning => {
+                unreachable!("a reload cannot find a session running: its slow path stops the session first")
+            }
+        }
+    }
+}
+
+/// The user-facing text of [`Refusal::StateBlocked`]: the files and `remedy`, a sentence the display site writes
+/// for where its user is (the GUI's menu, or the CLI).
+pub fn state_blocked_message(files: &[String], remedy: &str) -> String {
+    format!(
+        "Cannot connect: these state files cannot be read (newer than this release, damaged, or unreadable) and are \
+         left as they are: {}. {remedy}",
+        files.join(", ")
+    )
 }
 
 /// Client-side response enum. Used by the GUI client API and elevation flow.

@@ -334,21 +334,61 @@ fn file_was_rotated_reports_false_when_path_missing(#[fixture(temp_dir)] dir: &P
     );
 }
 
-// start_error_cli disposition =========================================================================================
+// start_report disposition ============================================================================================
 
 #[skuld::test]
-fn start_error_cli_disposition() {
-    use hole_common::protocol::StartError;
-    assert_eq!(start_error_cli(&StartError::Cancelled), (0, None));
-    assert_eq!(start_error_cli(&StartError::AlreadyRunning), (0, None));
-    let (code, log) = start_error_cli(&StartError::NetworkBlocked);
+fn start_report_disposition() {
+    use hole_common::protocol::{Refusal, StartError};
+    let start = |e: StartError| start_report(StartOperation::Start, &e);
+    assert_eq!(start(StartError::Cancelled), StartReport::Cancelled);
+    assert_eq!(start(StartError::AlreadyRunning), StartReport::AlreadyRunning);
     assert_eq!(
-        (code, log.as_deref()),
-        (1, Some(hole_common::protocol::NETWORK_BLOCKED_MESSAGE))
+        start(Refusal::NetworkBlocked.into()),
+        StartReport::Refused(hole_common::protocol::NETWORK_BLOCKED_MESSAGE.to_string())
     );
+    let StartReport::Refused(line) = start(
+        Refusal::StateBlocked {
+            files: vec!["bridge-routes.json".into(), "bridge-plugins.json".into()],
+        }
+        .into(),
+    ) else {
+        panic!("a state-blocked start is refused");
+    };
+    assert!(line.contains("bridge-routes.json, bridge-plugins.json"), "{line}");
+    assert!(line.contains("`hole network reset`"), "{line}");
+    assert!(!line.contains("Help >"), "{line}");
     assert_eq!(
-        start_error_cli(&StartError::Failed { message: "x".into() }),
-        (1, Some("bridge rejected start: x".to_string()))
+        start(Refusal::Failed { message: "x".into() }.into()),
+        StartReport::Refused("bridge rejected start: x".to_string())
+    );
+    // The line names the operation that failed.
+    assert_eq!(
+        start_report(StartOperation::Reload, &Refusal::Failed { message: "x".into() }.into()),
+        StartReport::Refused("bridge rejected reload: x".to_string())
+    );
+}
+
+/// A cancelled or already-running start is success-equivalent; a refusal is an error.
+#[skuld::test]
+fn start_report_exit_codes() {
+    assert_eq!(StartReport::Cancelled.exit_code(), 0);
+    assert_eq!(StartReport::AlreadyRunning.exit_code(), 0);
+    assert_eq!(StartReport::Refused("x".into()).exit_code(), 1);
+}
+
+/// A reload is never answered cancelled or already running, here as in the GUI: asserted.
+#[skuld::test]
+#[should_panic(expected = "a reload cannot be cancelled")]
+fn a_cancelled_reload_breaks_the_contract() {
+    let _ = start_report(StartOperation::Reload, &hole_common::protocol::StartError::Cancelled);
+}
+
+#[skuld::test]
+#[should_panic(expected = "a reload cannot find a session running")]
+fn an_already_running_reload_breaks_the_contract() {
+    let _ = start_report(
+        StartOperation::Reload,
+        &hole_common::protocol::StartError::AlreadyRunning,
     );
 }
 

@@ -182,10 +182,14 @@ impl Drop for MockRunning {
 /// What a test runs when a cover install begins.
 type InstallHook = Box<dyn FnOnce() + Send>;
 
+/// Builds the error a failing `install` returns from the state directory.
+type InstallFailure = fn(&Path) -> RoutingError;
+
 pub(crate) struct MockRoutingState {
     install_calls: AtomicU32,
     teardown_calls: AtomicU32,
-    fail_install: AtomicBool,
+    /// Makes `install` fail with the error this builds from the state directory.
+    fail_install: std::sync::Mutex<Option<InstallFailure>>,
     fail_gateway: AtomicBool,
     pub(crate) cover_engage_calls: AtomicU32,
     pub(crate) cover_disengage_calls: AtomicU32,
@@ -257,7 +261,7 @@ impl Default for MockRoutingState {
         Self {
             install_calls: AtomicU32::new(0),
             teardown_calls: AtomicU32::new(0),
-            fail_install: AtomicBool::new(false),
+            fail_install: std::sync::Mutex::new(None),
             fail_gateway: AtomicBool::new(false),
             cover_engage_calls: AtomicU32::new(0),
             cover_disengage_calls: AtomicU32::new(0),
@@ -353,7 +357,20 @@ impl MockRouting {
 
     fn failing_install(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
-        m.state.fail_install.store(true, Ordering::SeqCst);
+        *m.state.fail_install.lock().unwrap() = Some(|_| RoutingError::RouteSetup("mock install failure".into()));
+        m
+    }
+
+    /// `install` finds the route record unreadable after setup began, and leaves it as found, as
+    /// `SystemRouting::install` does.
+    fn failing_install_unreadable(state_dir: PathBuf) -> Self {
+        let m = Self::new(state_dir);
+        *m.state.fail_install.lock().unwrap() = Some(|dir| {
+            make_unreadable(dir, route_state::STATE_FILE_NAME, Unreadable::Corrupt);
+            RoutingError::StateUnreadable {
+                path: dir.join(route_state::STATE_FILE_NAME),
+            }
+        });
         m
     }
 
@@ -425,11 +442,11 @@ impl Routing for MockRouting {
         route_state::write(&route_state::file(&self.state_dir), &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
 
-        if self.state.fail_install.load(Ordering::SeqCst) {
+        if let Some(error) = *self.state.fail_install.lock().unwrap() {
             // Defensive: match `SystemRouting::install`'s error path —
             // clear the stale file we just wrote.
             let _ = route_state::remove(&route_state::file(&self.state_dir));
-            return Err(RoutingError::RouteSetup("mock install failure".into()));
+            return Err(error(&self.state_dir));
         }
 
         // Mirror `SystemRouting::install`'s ACTUAL fatality, which is
@@ -1187,6 +1204,48 @@ fn route_failure_rolls_back_proxy() {
         // `MockRoutes` was never returned, so the teardown counter stayed at 0.
         assert_eq!(routing_state.teardown_calls.load(Ordering::SeqCst), 0);
         assert!(pm.last_error().is_some());
+    });
+}
+
+/// A route install that finds its record unreadable is refused after the proxy started: it fails like any route
+/// install (the session is not left running), and names the file the same way the gate's refusal does.
+#[skuld::test]
+fn an_unreadable_route_record_found_at_install_rolls_the_start_back() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_install_unreadable(dir.path().to_path_buf());
+        let routing_state = routing.state();
+
+        let (mut pm, dir) = new_manager_with_routing(proxy, routing, dir);
+        let err = pm.start(&test_config()).await.unwrap_err();
+
+        assert!(matches!(err, ProxyError::StateBlocked(_)), "{err:?}");
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        // The rollback leaves the unreadable record as found: it is the user's to reset, not this start's to erase.
+        assert_untouched(
+            dir.path(),
+            route_state::STATE_FILE_NAME,
+            Some(CORRUPT_RECORD),
+            "the unreadable route record",
+        );
+        assert_eq!(
+            proxy_state.start_calls.load(Ordering::SeqCst),
+            1,
+            "the start went past the gate"
+        );
+        assert_eq!(routing_state.install_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(routing_state.teardown_calls.load(Ordering::SeqCst), 0);
+
+        // The gate refuses the same record with the same text.
+        let (mut gated, gated_dir) = new_manager(MockProxy::new());
+        make_unreadable(gated_dir.path(), route_state::STATE_FILE_NAME, Unreadable::Corrupt);
+        gated.start(&test_config()).await.unwrap_err();
+        assert_eq!(pm.last_error(), gated.last_error());
+        assert!(pm
+            .last_error()
+            .is_some_and(|e| e.contains(route_state::STATE_FILE_NAME)));
     });
 }
 
@@ -6936,5 +6995,150 @@ fn a_user_disconnect_with_an_unreachable_probe_releases_the_cover() {
             "a user disconnect whose probe could not reach the firewall must still release: \
              disarming there strands the filters with no owner"
         );
+    });
+}
+
+// The connect gate ====================================================================================================
+
+/// How a state file came to be unreadable.
+#[derive(Debug, Clone, Copy)]
+enum Unreadable {
+    Newer,
+    Corrupt,
+    /// A directory where the file should be: the read fails.
+    ReadFails,
+}
+
+/// What `Unreadable::Corrupt` writes.
+const CORRUPT_RECORD: &[u8] = b"not json {";
+
+const ALL_UNREADABLE: [Unreadable; 3] = [Unreadable::Newer, Unreadable::Corrupt, Unreadable::ReadFails];
+
+/// Leaves `name` in `dir` unreadable, and returns what it holds (`None` for the directory).
+fn make_unreadable(dir: &Path, name: &str, how: Unreadable) -> Option<&'static [u8]> {
+    let path = dir.join(name);
+    let bytes: &'static [u8] = match how {
+        Unreadable::Newer => br#"{"version": 99}"#,
+        Unreadable::Corrupt => CORRUPT_RECORD,
+        Unreadable::ReadFails => {
+            std::fs::create_dir(&path).unwrap();
+            return None;
+        }
+    };
+    std::fs::write(&path, bytes).unwrap();
+    Some(bytes)
+}
+
+fn assert_untouched(dir: &Path, name: &str, held: Option<&[u8]>, what: &str) {
+    match held {
+        Some(bytes) => assert_eq!(
+            std::fs::read(dir.join(name)).unwrap(),
+            bytes,
+            "{what}: the file was rewritten"
+        ),
+        None => assert!(dir.join(name).is_dir(), "{what}: the planted directory was replaced"),
+    }
+}
+
+/// The gate refuses before anything is mutated, over each OS record this release cannot read: no tunnel, no route
+/// command, no plugin chain, and the file stays as it was.
+#[skuld::test]
+fn connect_is_refused_over_every_unreadable_os_record() {
+    rt().block_on(async {
+        for name in [route_state::STATE_FILE_NAME, crate::plugin_state::STATE_FILE_NAME] {
+            for how in ALL_UNREADABLE {
+                let what = format!("{name} {how:?}");
+                let dir = tempfile::tempdir().unwrap();
+                let held = make_unreadable(dir.path(), name, how);
+                let proxy = MockProxy::new();
+                let proxy_state = proxy.state_handle();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let routing_state = routing.state();
+                let mut pm = ProxyManager::new(proxy, routing);
+
+                let err = pm.start(&test_config()).await.expect_err(&what);
+
+                match &err {
+                    ProxyError::StateBlocked(blocked) => {
+                        assert_eq!(blocked.paths(), [dir.path().join(name)], "{what}")
+                    }
+                    other => panic!("{what}: expected StateBlocked, got {other:?}"),
+                }
+                assert_eq!(pm.state(), ProxyState::Stopped, "{what}");
+                assert_eq!(
+                    proxy_state.start_calls.load(Ordering::SeqCst),
+                    0,
+                    "{what}: the proxy started"
+                );
+                assert_eq!(
+                    routing_state.install_calls.load(Ordering::SeqCst),
+                    0,
+                    "{what}: routes were installed"
+                );
+                assert!(
+                    pm.last_error().is_some_and(|e| e.contains(name)),
+                    "{what}: {:?}",
+                    pm.last_error()
+                );
+                assert_untouched(dir.path(), name, held, &what);
+            }
+        }
+    });
+}
+
+/// The refusal is of this record, not a state: once it is moved away the next connect goes through.
+#[skuld::test]
+fn a_connect_goes_through_once_the_unreadable_record_is_gone() {
+    rt().block_on(async {
+        let (mut pm, dir) = new_manager(MockProxy::new());
+        make_unreadable(dir.path(), crate::plugin_state::STATE_FILE_NAME, Unreadable::Corrupt);
+        pm.start(&test_config()).await.expect_err("refused");
+
+        std::fs::remove_file(dir.path().join(crate::plugin_state::STATE_FILE_NAME)).unwrap();
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+        assert_eq!(pm.last_error(), None);
+    });
+}
+
+/// A decision file this release cannot read is backed up and replaced by its writer; the connect proceeds.
+#[skuld::test]
+fn connect_is_not_refused_over_an_unreadable_decision_file() {
+    rt().block_on(async {
+        for name in [
+            crate::target::STATE_FILE_NAME,
+            crate::target::STARTUP_PREFERENCE_FILE_NAME,
+        ] {
+            for how in ALL_UNREADABLE {
+                let (mut pm, dir) = new_manager(MockProxy::new());
+                make_unreadable(dir.path(), name, how);
+
+                pm.start(&test_config())
+                    .await
+                    .unwrap_or_else(|e| panic!("{name} {how:?}: {e}"));
+                assert_eq!(pm.state(), ProxyState::Running, "{name} {how:?}");
+            }
+        }
+    });
+}
+
+/// A refused attempt is still a (re)start: it supersedes a prior out-of-band death like any other failed start.
+#[skuld::test]
+fn a_refused_connect_clears_a_prior_death_reason() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+        state.crashed.store(true, Ordering::SeqCst);
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
+        assert_eq!(pm.death_reason(), Some(DEATH_REASON));
+
+        make_unreadable(dir.path(), crate::plugin_state::STATE_FILE_NAME, Unreadable::Newer);
+        pm.start(&test_config()).await.expect_err("refused");
+
+        assert_eq!(pm.death_reason(), None);
     });
 }

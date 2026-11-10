@@ -558,7 +558,7 @@ fn a_checkpoint_that_could_not_be_written_reaches_the_toast_without_a_path() {
         .err();
     });
 
-    let toast = RoutingError::from(SetupFailure::Checkpoint(failure.unwrap())).redacted();
+    let toast = RoutingError::from(SetupFailure::Checkpoint(failure.unwrap())).to_string();
     assert_eq!(
         toast,
         format!("route setup failed: the route record could not be written ({kind})")
@@ -794,30 +794,6 @@ fn recovery_is_silent_about_a_record_that_vanished_under_it() {
 }
 
 // What the install reports ============================================================================================
-
-/// The `Display` of `StateUnreadable` is for the log and names the path; the
-/// toast text names the file.
-#[skuld::test]
-fn a_toast_for_an_unreadable_record_names_the_file_and_not_the_path() {
-    let path = PathBuf::from("somebody-private").join(STATE_FILE_NAME);
-    let err = RoutingError::StateUnreadable { path: path.clone() };
-
-    assert!(err.to_string().contains(&path.display().to_string()), "{err}");
-    assert_eq!(
-        err.redacted(),
-        "the route record bridge-routes.json cannot be read; it is left as it is, and no route is installed over it"
-    );
-}
-
-#[skuld::test]
-fn a_toast_for_any_other_routing_error_is_its_text() {
-    for err in [
-        RoutingError::Gateway(crate::gateway::GatewayError::NoDefaultRoute),
-        RoutingError::RouteSetup("`route` (command 1 of 5) exited with code 1".into()),
-    ] {
-        assert_eq!(err.redacted(), err.to_string());
-    }
-}
 
 /// A checkpoint that could not be written says nothing about the route command
 /// that was about to run: no command is named.

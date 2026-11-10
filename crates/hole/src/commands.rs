@@ -639,7 +639,12 @@ pub async fn reload_proxy_filters(state: State<'_, AppState>) -> Result<(), Stri
         return Ok(()); // No server selected.
     };
 
-    state.link.reload_if_running(proxy_config).await.map(|_| ())
+    state
+        .link
+        .reload_if_running(proxy_config)
+        .await
+        .map(|_| ())
+        .map_err(hole::toast::reload_error_toast)
 }
 
 // Filter Test box =====================================================================================================

@@ -425,6 +425,27 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
     platform::lockdown_cover_presence(state_dir)
 }
 
+/// The cover records the connect gate must refuse to start over: each one this release cannot read (newer, corrupt, or
+/// its read fails). Only macOS keeps cover records (the two pf records); every other platform's covers are OS objects
+/// with no file of ours to leave unread, so it has none.
+pub fn blocking_state(state_dir: &Path) -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        [
+            pf_record::blocking::<failclosed_state::FailClosedState>(state_dir),
+            pf_record::blocking::<lockdown_pf_state::LockdownPfState>(state_dir),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state_dir;
+        Vec::new()
+    }
+}
+
 /// Clear every fail-closed cover this platform can install — both the
 /// transient block-until-connected cover and the standing lockdown cover —
 /// without ever asking whether either is present. This is the escape from a

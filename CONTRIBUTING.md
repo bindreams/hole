@@ -639,6 +639,25 @@ fields"): the version is the only compatibility signal. For the lockdown intent,
 `deny_unknown_fields`: `{"version":1,"enabled":false,"stray":1}` now reads as the intent Off, where it was
 `Unreadable` (which keeps a standing cover at boot).
 
+**Connect gate.** A connect is refused, before anything is resolved, covered or mutated, while a file whose role
+blocks a connect (`Role::blocks_connect`: the route and plugin records, and on macOS the two pf cover records) is
+newer than this release, corrupt, or cannot be read. `ProxyManager::start_cancellable` calls `state_gate::check`, which
+reads every such record type directly (a new `OsRecord` or `Cover` type is added there). The refusal is
+`ProxyError::StateBlocked`, and crosses the wire as the typed `Refusal::StateBlocked { files }` (a `StartError::Refused`):
+the bridge's log and
+`last_error` carry the same text (file names only), and the GUI (and the CLI) compose the text and the remedy at the display site,
+"Help > Reset Network…" (the elevated `hole network reset` where there is no GUI). A decision file never refuses a
+connect (its writer backs it up and replaces it), and no escape (unlock, Unblock, uninstall) goes through the gate. The
+gate engages no transient cover, as for a server that cannot be resolved. A route install that finds
+its record unreadable is the same error with the same text, but raised after setup began (the gate had passed), so it
+rolls back like any failed route install; the gate alone leaves nothing to undo. On a covered start that rollback
+comes after the transient cover was engaged, and a failed covered start keeps its cover (`PendingStart`); the gate then
+refuses every retry before any release, so the cover stays until the records are readable again, the user unblocks
+or disconnects, or the bridge exits (an update cutover or a blip keeps it, and the next start sweeps it). A reload's
+slow path (`stop()` then
+`start`) reaches the gate too, so a reload's 500 carries the typed `StartError` like a start's, and a refused reload
+leaves the session stopped.
+
 `Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
 lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
 the path. `Refused` has no `source()`, and the `InvalidData` `io::Error` that holds it
@@ -865,7 +884,7 @@ failure surfaces the stranded route instead of routing around it.
 
 `RouteCommandError`'s `Display` is PII-free by construction (program name,
 position in the phase, exit code): it reaches a GUI toast verbatim through
-`StartError::Failed`. The argv and the child's stdout/stderr go to `bridge.log`.
+`Refusal::Failed`. The argv and the child's stdout/stderr go to `bridge.log`.
 
 A failed install's rollback does exactly four things — see
 `SystemRouting::install_with`'s doc comment, which is the source of truth.

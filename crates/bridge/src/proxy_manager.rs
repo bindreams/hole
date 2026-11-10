@@ -860,6 +860,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // reason regardless of this attempt's outcome.
         self.death_reason = None;
 
+        // Before anything is resolved, covered or mutated: a refusal leaves nothing to undo. No cover is engaged
+        // either, as for a server that cannot be resolved: an engage over an unreadable pf record would move the
+        // record aside, erasing what this check reads.
+        if let Err(blocked) = crate::state_gate::check(self.routing.state_dir()) {
+            self.last_error = Some(blocked.to_string());
+            return Err(blocked.into());
+        }
+
         #[cfg(test)]
         let bootstrap_querier = self.bootstrap_querier.clone();
         #[cfg(not(test))]

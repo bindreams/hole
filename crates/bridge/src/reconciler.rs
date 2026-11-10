@@ -418,7 +418,7 @@ where
                     .start_cancellable(config, Coverage::Uncovered, cancel.child_token())
                     .await
                 {
-                    tracing::warn!(
+                    tracing::error!(
                         error = &error as &dyn std::error::Error,
                         "reconcile_once: failed to start the persisted target"
                     );

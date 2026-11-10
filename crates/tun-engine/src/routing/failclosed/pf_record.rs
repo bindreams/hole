@@ -16,7 +16,7 @@
 //! undropped: a displaced token was dropped by the engage that displaced it, and a failed write leaves the record
 //! naming a token still held. A release whose restore failed touches neither record nor token.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use util::versioned_file::{Change, DefaultPlacement, Role, StoreError, UpdateOutcome, VersionedFile, VersionedState};
 
@@ -145,6 +145,11 @@ fn record<R: PfRecord>(state_dir: &Path) -> VersionedFile<R> {
 /// missing file, never for one that cannot be read.
 pub fn read<R: PfRecord>(state_dir: &Path) -> StateFile<R> {
     StateFile::view(&record::<R>(state_dir).observe().loaded)
+}
+
+/// The record's path, iff the connect gate must refuse to start over it: newer, corrupt, or its read fails.
+pub fn blocking<R: PfRecord>(state_dir: &Path) -> Option<PathBuf> {
+    record::<R>(state_dir).connect_blocker()
 }
 
 /// Persist `new`, creating `state_dir`; a file this release cannot read is backed up beside it first. Returns the

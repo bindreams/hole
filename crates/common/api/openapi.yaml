@@ -290,7 +290,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/StartError"
 
   /v1/metrics:
     get:
@@ -407,7 +407,8 @@ components:
       type: object
       description: |
         Not code-generated; see protocol.rs::StartError. Tagged union with a `kind`
-        discriminator: cancelled, already_running, network_blocked, failed {message}.
+        discriminator: cancelled, already_running, network_blocked, state_blocked {files},
+        failed {message}.
         Concurrent-start is surfaced client-side as ClientError::ConcurrentStart (a
         generic ErrorResponse on the 409).
       required:
@@ -417,6 +418,11 @@ components:
           type: string
         message:
           type: string
+        files:
+          type: array
+          description: The state files (file names only) a `state_blocked` start was refused over.
+          items:
+            type: string
 
     VersionResponse:
       type: object

@@ -91,6 +91,12 @@ pub enum ProxyError {
     RouteSetup(String),
     #[error("proxy already running")]
     AlreadyRunning,
+    /// A record of what this bridge did to the OS cannot be read, so the start did not go ahead. The connect gate
+    /// raises it before anything is mutated; a route install that finds its record unreadable raises it after setup
+    /// began, and the start then rolls back like any failed route install. `Display` names the files (no directory);
+    /// the user-facing text is composed at the display site.
+    #[error(transparent)]
+    StateBlocked(#[from] crate::state_gate::StateBlocked),
     /// The start was cancelled via `CancellationToken` before it could complete.
     /// Not recorded as `last_error` — the user asked for the cancel, so it is not
     /// a diagnostic failure.
@@ -232,11 +238,12 @@ pub enum ProxyError {
 
 impl From<&ProxyError> for hole_common::protocol::StartError {
     fn from(e: &ProxyError) -> Self {
-        use hole_common::protocol::StartError;
+        use hole_common::protocol::{Refusal, StartError};
         match e {
             ProxyError::Cancelled => StartError::Cancelled,
             ProxyError::AlreadyRunning => StartError::AlreadyRunning,
-            ProxyError::NetworkBlocked => StartError::NetworkBlocked,
+            ProxyError::NetworkBlocked => Refusal::NetworkBlocked.into(),
+            ProxyError::StateBlocked(blocked) => Refusal::StateBlocked { files: blocked.files() }.into(),
             // Every other start failure is generic; its `Display` is the reason.
             // Listed exhaustively (no `_`) so a new `ProxyError` variant forces a
             // deliberate classification choice here.
@@ -261,7 +268,7 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::TunnelSetupIncomplete { .. }
             | ProxyError::NoTunnelConnection { .. }
             | ProxyError::ForeignAdapter { .. }
-            | ProxyError::DnsConfinementFailed { .. } => StartError::Failed { message: e.to_string() },
+            | ProxyError::DnsConfinementFailed { .. } => Refusal::Failed { message: e.to_string() }.into(),
         }
     }
 }
@@ -280,7 +287,9 @@ impl From<tun_engine::RoutingError> for ProxyError {
             tun_engine::RoutingError::Gateway(s) => ProxyError::Gateway(s),
             tun_engine::RoutingError::RouteSetup(s) => ProxyError::RouteSetup(s),
             // The path is in the bridge log (tun-engine logged it); the toast names the file only.
-            tun_engine::RoutingError::StateUnreadable { .. } => ProxyError::RouteSetup(e.redacted()),
+            tun_engine::RoutingError::StateUnreadable { path } => {
+                ProxyError::StateBlocked(crate::state_gate::StateBlocked::new(vec![path]))
+            }
         }
     }
 }

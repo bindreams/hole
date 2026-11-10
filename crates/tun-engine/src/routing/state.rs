@@ -331,17 +331,7 @@ pub fn load(state_dir: &Path) -> Loaded<RouteState> {
 /// is newer, corrupt, or its read fails. `None` for a readable record and no
 /// record.
 pub fn blocking(state_dir: &Path) -> Option<PathBuf> {
-    match read(&file(state_dir)) {
-        Found::Unreadable { path, cause } => {
-            assert!(
-                RouteState::ROLE.blocks_connect(cause),
-                "the route record is an OS record: every unreadable one blocks a connect ({cause})"
-            );
-            Some(path)
-        }
-        Found::Records(_) => None,
-        Found::Nothing => None,
-    }
+    file(state_dir).connect_blocker()
 }
 
 /// Writes `state` atomically (same-directory temp file, `sync_all`, rename),

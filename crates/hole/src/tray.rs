@@ -3,6 +3,7 @@
 use crate::commands::build_proxy_config;
 use crate::setup::{InstallGate, CHANGE_IN_PROGRESS_ERROR};
 use crate::state::AppState;
+use hole::toast::{bridge_error_toast, start_error_toast, CONCURRENT_START_MESSAGE};
 use hole::tray_icons;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, CoverPresence};
 use serde::Serialize;
@@ -75,38 +76,6 @@ pub(crate) enum StartDecision {
     Fail(String),
 }
 
-/// Single producer of the user-facing bridge-error string, shared by the elevated
-/// and non-elevated paths so they read identically. The bridge message is shown
-/// raw: it is authored by the bridge running as a system account (LocalSystem /
-/// root) with system-scoped paths, and `ProxyConfig` carries no path field, so it
-/// cannot contain user PII (#475). A future change that threads a user path into a
-/// bridge request and echoes it here must revisit this.
-pub(crate) fn bridge_error_toast(message: &str) -> String {
-    format!("Bridge error: {message}")
-}
-
-/// Toast shown for a concurrent-start rejection (409). Shared by the live-Connect
-/// (`outcome_for_start_response`) and elevated (`elevate_and_confirm`) paths so the
-/// two surfaces read identically.
-pub(crate) const CONCURRENT_START_MESSAGE: &str = "Another start is already in progress.";
-
-/// Final toast for a typed start failure, shared by the live-Connect and elevated
-/// paths so they read identically. `NetworkBlocked` is host-free and self-contained
-/// (shown raw); every other genuine failure is wrapped by [`bridge_error_toast`].
-/// Cancelled/AlreadyRunning are routed to outcomes by callers and don't reach here;
-/// if one does, log it and render a safe generic string rather than panic.
-pub(crate) fn start_error_toast(kind: &hole_common::protocol::StartError) -> String {
-    use hole_common::protocol::StartError;
-    match kind {
-        StartError::NetworkBlocked => hole_common::protocol::NETWORK_BLOCKED_MESSAGE.to_string(),
-        StartError::Failed { message } => bridge_error_toast(message),
-        StartError::Cancelled | StartError::AlreadyRunning => {
-            warn!(?kind, "start_error_toast reached with a non-failure variant");
-            bridge_error_toast("unexpected start outcome")
-        }
-    }
-}
-
 /// Toast for a transport failure observed AFTER a successful elevation — the
 /// bridge is unreachable, which is not an elevation denial.
 pub(crate) fn transport_after_elevation_toast(detail: &str) -> String {
@@ -169,14 +138,11 @@ pub(crate) fn outcome_for_start_response(
         Ok(BridgeResponse::StartFailed(e)) => match e {
             StartError::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
             StartError::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
-            StartError::NetworkBlocked | StartError::Failed { .. } => StartDecision::Fail(start_error_toast(e)),
+            StartError::Refused(refusal) => StartDecision::Fail(start_error_toast(refusal)),
         },
-        // An unexpected variant on the Start path is a same-build contract breach —
-        // warn and fail gracefully (no panic), never silently treat it as success.
-        Ok(other) => {
-            warn!(?other, "unexpected bridge response on the start path");
-            StartDecision::Fail("Unexpected response from bridge".into())
-        }
+        // `BridgeClient::send` maps a start to Ack or StartFailed (or an error): anything else is a same-build contract
+        // breach, asserted like a reload's.
+        Ok(other) => unreachable!("BridgeClient answers a start with Ack or StartFailed, got {other:?}"),
         Err(ClientError::PermissionDenied) => StartDecision::NeedsElevation,
         Err(ClientError::ConcurrentStart) => StartDecision::Fail(CONCURRENT_START_MESSAGE.into()),
         Err(e) => StartDecision::Fail(format!("Failed to connect to bridge: {e}")),

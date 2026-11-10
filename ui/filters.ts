@@ -130,7 +130,8 @@ function persistFilters(): Promise<void> {
       await invoke("reload_proxy_filters");
     } catch (err) {
       console.error("reload_proxy_filters failed:", err);
-      showToast(`Filters saved, but not applied to the running proxy: ${err}`, "error");
+      // `err` is the Rust-side sentence and states what happened to the reload; the prefix claims only the save.
+      showToast(`Filters saved. ${err}`, "error");
     }
   });
   return persistChain;

@@ -100,6 +100,7 @@ over_both_records!(
     a_truncated_pf_record_is_unusable_with_no_token,
     a_pf_record_with_an_unknown_field_is_still_present,
     a_pf_record_whose_read_fails_is_unreadable,
+    a_pf_record_this_release_cannot_read_blocks_a_connect,
     swap_says_which_token_it_displaced,
     swap_over_a_corrupt_pf_record_keeps_a_backup,
     swap_over_a_newer_pf_record_keeps_a_backup,
@@ -179,6 +180,30 @@ mod both {
         make_unreadable::<R>(tmp.path());
 
         assert_eq!(read::<R>(tmp.path()), StateFile::Unreadable);
+    }
+
+    /// A cover record is an OS record that outlives its writer: newer, corrupt and unread all refuse a connect, and
+    /// a readable or absent one does not.
+    pub fn a_pf_record_this_release_cannot_read_blocks_a_connect<R: Case>() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(blocking::<R>(tmp.path()), None, "no record");
+
+        let lock = CoverLock::acquire(tmp.path());
+        swap(&lock, &R::sample("7"), None).unwrap();
+        assert_eq!(blocking::<R>(tmp.path()), None, "a current record");
+
+        for (what, bytes) in [("newer", R::json(2, "7")), ("corrupt", "{ not json".to_owned())] {
+            write_raw::<R>(tmp.path(), bytes.as_bytes());
+            assert_eq!(blocking::<R>(tmp.path()), Some(tmp.path().join(R::FILE)), "{what}");
+        }
+
+        let unread = tempfile::tempdir().unwrap();
+        make_unreadable::<R>(unread.path());
+        assert_eq!(
+            blocking::<R>(unread.path()),
+            Some(unread.path().join(R::FILE)),
+            "a failed read"
+        );
     }
 
     /// A release whose restore failed leaves its record; the engage that then overwrites it must drop that token.
@@ -553,4 +578,34 @@ fn kept_is_a_refusal_that_names_no_path() {
     let kept = Cleared::Kept.refusal().expect("a refusal").to_string();
     assert!(kept.contains("could not be read"), "{kept}");
     assert!(!kept.contains("bridge-"), "no file name reaches a toast: {kept}");
+}
+
+// The facade ==========================================================================================================
+
+/// macOS reports each pf record it cannot read; run in CI only.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn blocking_state_names_every_pf_record_this_release_cannot_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(super::super::blocking_state(tmp.path()).is_empty(), "no records");
+
+    write_raw::<FailClosedState>(tmp.path(), b"{ not json");
+    write_raw::<LockdownPfState>(tmp.path(), LockdownPfState::json(2, "1").as_bytes());
+    let mut found = super::super::blocking_state(tmp.path());
+    found.sort();
+    let mut want = vec![
+        tmp.path().join(FailClosedState::FILE),
+        tmp.path().join(LockdownPfState::FILE),
+    ];
+    want.sort();
+    assert_eq!(found, want);
+}
+
+/// Other platforms keep no cover record, so a file at a pf record's name is none of the gate's business.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn blocking_state_is_empty_where_no_cover_record_is_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_raw::<FailClosedState>(tmp.path(), b"{ not json");
+    assert!(super::super::blocking_state(tmp.path()).is_empty());
 }

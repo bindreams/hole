@@ -88,6 +88,12 @@ pub fn load(state_dir: &Path) -> Loaded<PluginState> {
     file(state_dir).observe().loaded
 }
 
+/// The record's path, iff the connect gate must refuse to start over it: newer, corrupt, or its read fails. The
+/// record may name plugins a connect would orphan by writing over it.
+pub fn blocking(state_dir: &Path) -> Option<std::path::PathBuf> {
+    file(state_dir).connect_blocker()
+}
+
 /// Removes exactly the `accounted` records, and the file when none remain.
 ///
 /// The caller loaded the file earlier and settled those records (killed, gone, or unrestorable here); the file may

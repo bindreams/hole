@@ -23,7 +23,7 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, socks5_request};
 use hole_common::config::ServerEntry;
-use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, StartError, TunnelMode};
+use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, Refusal, StartError, TunnelMode};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -86,7 +86,7 @@ async fn start_expect_error(harness: &mut DistHarness, config: ProxyConfig) -> S
         .await
         .expect("send Start");
     match resp {
-        BridgeResponse::StartFailed(StartError::Failed { message }) => message,
+        BridgeResponse::StartFailed(StartError::Refused(Refusal::Failed { message })) => message,
         other => panic!("expected StartFailed(Failed), got {other:?}"),
     }
 }

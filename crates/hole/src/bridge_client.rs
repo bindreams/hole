@@ -51,6 +51,10 @@ pub enum ClientError {
     /// The bridge rejected a start because another is already in flight (409).
     #[error("a start is already in progress")]
     ConcurrentStart,
+    /// The bridge answered with a status the route has no meaning for (a framework rejection such as the 1 MiB body
+    /// limit's 413): it refused the request without acting on it.
+    #[error("unexpected HTTP status: {0}")]
+    UnexpectedStatus(http::StatusCode),
 }
 
 // Client ==============================================================================================================
@@ -155,10 +159,7 @@ impl BridgeClient {
                 } else if resp.status().is_server_error() {
                     Ok(BridgeResponse::StartFailed(parse_start_error(resp).await))
                 } else {
-                    Err(ClientError::Protocol(format!(
-                        "unexpected HTTP status: {}",
-                        resp.status()
-                    )))
+                    Err(ClientError::UnexpectedStatus(resp.status()))
                 }
             }
             BridgeRequest::Stop => {
@@ -184,8 +185,10 @@ impl BridgeClient {
                 let resp = self.http_post(ROUTE_RELOAD, body, &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
+                } else if resp.status().is_server_error() {
+                    Ok(BridgeResponse::StartFailed(parse_start_error(resp).await))
                 } else {
-                    parse_generic_error(resp).await
+                    Err(ClientError::UnexpectedStatus(resp.status()))
                 }
             }
             BridgeRequest::Metrics => {
@@ -430,7 +433,7 @@ async fn parse_generic_error(resp: http::Response<hyper::body::Incoming>) -> Res
             message: error_message(resp).await,
         })
     } else {
-        Err(ClientError::Protocol(format!("unexpected HTTP status: {status}")))
+        Err(ClientError::UnexpectedStatus(status))
     }
 }
 
@@ -438,23 +441,25 @@ async fn parse_generic_error(resp: http::Response<hyper::body::Incoming>) -> Res
 /// read failure vs an unparseable body (an unparseable body is a same-build contract
 /// breach — logged, never panics).
 async fn parse_start_error(resp: http::Response<hyper::body::Incoming>) -> hole_common::protocol::StartError {
-    use hole_common::protocol::StartError;
+    use hole_common::protocol::{Refusal, StartError};
     match read_body(resp).await {
         Ok(body) => match serde_json::from_slice::<StartError>(&body) {
             Ok(e) => e,
             Err(e) => {
                 let preview = String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned();
                 warn!(error = &e as &dyn std::error::Error, body = %preview, "unparseable StartError body (same-build contract breach)");
-                StartError::Failed {
+                Refusal::Failed {
                     message: "unknown error".to_string(),
                 }
+                .into()
             }
         },
         Err(e) => {
             warn!(error = &e as &dyn std::error::Error, "failed to read start-error body");
-            StartError::Failed {
+            Refusal::Failed {
                 message: "failed to read error response".to_string(),
             }
+            .into()
         }
     }
 }

@@ -797,7 +797,7 @@ fn a_non_fatal_failure_does_not_mask_a_later_fatal_one() {
     assert!(err.to_string().contains("exited with code 7"), "got {err}");
 }
 
-/// The message reaches a GUI toast verbatim (`StartError::Failed`), so it must
+/// The message reaches a GUI toast verbatim (`Refusal::Failed`), so it must
 /// not carry the argv — the server IP and the upstream interface name live
 /// there. They stay in the `warn` log instead.
 #[skuld::test]

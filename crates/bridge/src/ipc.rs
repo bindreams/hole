@@ -14,10 +14,10 @@ use axum::http::StatusCode;
 use axum::Json;
 use hole_common::config::StartupBehavior;
 use hole_common::protocol::{
-    DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StartError,
-    StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, ROUTE_CANCEL,
-    ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
-    ROUTE_TEST_SERVER, ROUTE_UNBLOCK, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
+    DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, Refusal,
+    StartError, StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse,
+    ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS,
+    ROUTE_STOP, ROUTE_TEST_SERVER, ROUTE_UNBLOCK, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -377,8 +377,9 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
             // Death reason only (path-free, #470) — NOT `last_error`, which can
             // carry a filesystem path/hostname from a failed start and must never
             // reach the GUI toast. The rich detail stays in `last_error` for
-            // diagnostics (bridge="error") and the click-path start-error surface.
-            // Redacted at the boundary alongside `StartError::Failed`, so "no
+            // diagnostics (bridge="error") and the click-path start-error surface: a boot refusal (`StateBlocked`)
+            // reaches the GUI only as the typed error of its next start, never through this response.
+            // Redacted at the boundary alongside `Refusal::Failed`, so "no
             // outgoing error string carries the server address" holds for the
             // whole response surface rather than for one variant.
             error: pm.death_reason().map(|s| util::redact::redact_str(s).into_owned()),
@@ -434,7 +435,7 @@ fn wire_cover_presence(p: tun_engine::routing::CoverPresence) -> hole_common::pr
     }
 }
 
-/// Enforce [`StartError::Failed`]'s "PII-free message" claim at the response
+/// Enforce [`Refusal::Failed`]'s "PII-free message" claim at the response
 /// boundary, where it is one call rather than an audit of every producer.
 ///
 /// The address can arrive from outside Hole: garter formats a chain's
@@ -444,14 +445,14 @@ fn wire_cover_presence(p: tun_engine::routing::CoverPresence) -> hole_common::pr
 /// `<server:8f2a1c04>` is what the user sees instead.
 fn redact_outgoing(error: StartError) -> StartError {
     match error {
-        StartError::Failed { message } => StartError::Failed {
+        StartError::Refused(Refusal::Failed { message }) => StartError::Refused(Refusal::Failed {
             message: util::redact::redact_str(&message).into_owned(),
-        },
+        }),
         other => other,
     }
 }
 
-/// Error side of `handle_start`: a control-plane 409 carries a generic
+/// Error side of `handle_start` and `handle_reload`: a control-plane 409 carries a generic
 /// `ErrorResponse`; an actual start failure (500) carries the typed `StartError`.
 #[derive(Debug)]
 enum StartHandlerError {
@@ -1190,7 +1191,7 @@ async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(
 async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(config): Json<ProxyConfig>,
-) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<EmptyResponse>, StartHandlerError> {
     // Same reason as `handle_start`'s: `reload`'s slow path (`structural_same`
     // false) is `stop()` + `start(config)`, and `start_inner` arms only the
     // resolved IP — never the configured host. A reload to a host this
@@ -1221,15 +1222,7 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
             // address can still arrive from outside Hole (e.g. garter's
             // `remote_host` in a plugin error) — `redact_outgoing` tokenises
             // it the same way `handle_start`'s response boundary does.
-            let message = match redact_outgoing((&e).into()) {
-                StartError::Failed { message } => message,
-                // `Cancelled`/`AlreadyRunning`/`NetworkBlocked` carry no
-                // arbitrary text — `redact_outgoing` is a no-op for them, so
-                // falling back to `e`'s own fixed, PII-free `Display` is
-                // exactly what `redact_outgoing` would have produced.
-                _ => e.to_string(),
-            };
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { message })))
+            Err(StartHandlerError::Failed(redact_outgoing((&e).into())))
         }
     }
 }

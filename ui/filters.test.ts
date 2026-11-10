@@ -302,6 +302,17 @@ describe("reload_proxy_filters on mutation", () => {
     expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("bridge gone"), "error");
   });
 
+  it("a reload failure's toast claims the save only, never an outcome of the reload", async () => {
+    invokeMock.mockRejectedValueOnce("The Hole bridge did not answer, so the change may not have been applied.");
+    await setup();
+    document.querySelectorAll<HTMLElement>(".filter-del")[0]!.click();
+    await flushPersist();
+    expect(showToastMock).toHaveBeenCalledWith(
+      "Filters saved. The Hole bridge did not answer, so the change may not have been applied.",
+      "error",
+    );
+  });
+
   it("two rapid mutations serialize: save,reload,save,reload in order", async () => {
     await setup();
     const order: string[] = [];

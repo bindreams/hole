@@ -169,32 +169,101 @@ fn bridge_response_error_json_roundtrip() {
     assert_eq!(decoded, resp);
 }
 
+/// The text a user reads: the files and the remedy, in one sentence each, with no run of spaces from a line
+/// continuation.
+#[skuld::test]
+fn state_blocked_message_reads_as_two_clean_sentences() {
+    let text = state_blocked_message(&["a.json".into(), "b.json".into()], "Do the thing.");
+    assert_eq!(
+        text,
+        "Cannot connect: these state files cannot be read (newer than this release, damaged, or unreadable) and are left as they are: a.json, b.json. Do the thing."
+    );
+}
+
+/// Only an already-running answer leaves a session up: a cancelled or refused start was rolled back, and a reload's
+/// slow path stopped the session before it restarted.
+#[skuld::test]
+fn only_an_already_running_answer_leaves_the_session_up() {
+    assert!(!StartError::Cancelled.leaves_session_up());
+    assert!(StartError::AlreadyRunning.leaves_session_up());
+    assert!(!StartError::Refused(Refusal::NetworkBlocked).leaves_session_up());
+}
+
+/// A reload restarts only after stopping the session, with a token nobody signals: the bridge answers it with a
+/// refusal or not at all.
+#[skuld::test]
+fn a_refused_answer_is_a_reload_refusal() {
+    let refusal = Refusal::Failed { message: "x".into() };
+    assert_eq!(StartError::Refused(refusal.clone()).reload_refusal(), &refusal);
+}
+
+#[skuld::test]
+#[should_panic(expected = "a reload cannot be cancelled")]
+fn a_cancelled_reload_breaks_the_contract() {
+    let _ = StartError::Cancelled.reload_refusal();
+}
+
+#[skuld::test]
+#[should_panic(expected = "a reload cannot find a session running")]
+fn an_already_running_reload_breaks_the_contract() {
+    let _ = StartError::AlreadyRunning.reload_refusal();
+}
+
 // StartError wire compatibility =======================================================================================
+
+/// The wire shape of every variant, spelled out: a `Refusal` held by a `StartError` is flat, with the one `kind` tag.
+fn start_error_wire() -> Vec<(&'static str, StartError)> {
+    vec![
+        (r#"{"kind":"cancelled"}"#, StartError::Cancelled),
+        (r#"{"kind":"already_running"}"#, StartError::AlreadyRunning),
+        (
+            r#"{"kind":"network_blocked"}"#,
+            StartError::Refused(Refusal::NetworkBlocked),
+        ),
+        (
+            r#"{"kind":"state_blocked","files":["bridge-routes.json","bridge-plugins.json"]}"#,
+            StartError::Refused(Refusal::StateBlocked {
+                files: vec!["bridge-routes.json".into(), "bridge-plugins.json".into()],
+            }),
+        ),
+        (
+            r#"{"kind":"failed","message":"boom"}"#,
+            StartError::Refused(Refusal::Failed { message: "boom".into() }),
+        ),
+    ]
+}
 
 #[skuld::test]
 fn start_error_round_trips() {
-    for (e, json) in [
-        (StartError::Cancelled, r#"{"kind":"cancelled"}"#),
-        (StartError::AlreadyRunning, r#"{"kind":"already_running"}"#),
-        (StartError::NetworkBlocked, r#"{"kind":"network_blocked"}"#),
-    ] {
-        assert_eq!(serde_json::to_string(&e).unwrap(), json);
-        assert_eq!(serde_json::from_str::<StartError>(json).unwrap(), e);
+    for (json, error) in start_error_wire() {
+        assert_eq!(serde_json::to_string(&error).unwrap(), json, "{error:?}");
+        assert_eq!(serde_json::from_str::<StartError>(json).unwrap(), error, "{json}");
     }
-    let failed = StartError::Failed { message: "boom".into() };
-    assert_eq!(
-        serde_json::to_string(&failed).unwrap(),
-        r#"{"kind":"failed","message":"boom"}"#
-    );
-    assert_eq!(
-        serde_json::from_str::<StartError>(r#"{"kind":"failed","message":"boom"}"#).unwrap(),
-        failed
-    );
+}
+
+/// A refusal has the wire shape of the `StartError` that holds it, so a result file written with either reads back as
+/// the other.
+#[skuld::test]
+fn a_refusal_has_the_wire_shape_of_the_start_error_that_holds_it() {
+    for (json, error) in start_error_wire() {
+        let StartError::Refused(refusal) = error else {
+            continue;
+        };
+        assert_eq!(serde_json::to_string(&refusal).unwrap(), json, "{refusal:?}");
+        assert_eq!(serde_json::from_str::<Refusal>(json).unwrap(), refusal, "{json}");
+    }
+}
+
+/// A `kind` neither a `StartError` nor a `Refusal` names is a parse failure, not a refusal.
+#[skuld::test]
+fn an_unknown_start_error_kind_does_not_parse() {
+    assert!(serde_json::from_str::<StartError>(r#"{"kind":"unheard_of"}"#).is_err());
+    assert!(serde_json::from_str::<StartError>(r#"{"kind":"failed"}"#).is_err());
 }
 
 #[skuld::test]
 fn bridge_response_start_failed_round_trips() {
-    let resp = BridgeResponse::StartFailed(StartError::NetworkBlocked);
+    let resp = BridgeResponse::StartFailed(StartError::Refused(Refusal::NetworkBlocked));
     assert_eq!(
         serde_json::from_slice::<BridgeResponse>(&serde_json::to_vec(&resp).unwrap()).unwrap(),
         resp

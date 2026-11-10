@@ -1,6 +1,6 @@
 use super::*;
 use crate::bridge_client::ClientError;
-use hole_common::protocol::{BridgeResponse, StartError};
+use hole_common::protocol::{BridgeResponse, Refusal, StartError};
 use hole_common::update_marker::{Marker, MarkerInfo};
 
 fn sample_marker() -> MarkerInfo {
@@ -348,17 +348,53 @@ fn observed_running_rules() {
         ),
         (
             Start,
-            Ok(BridgeResponse::StartFailed(StartError::NetworkBlocked)),
+            Ok(BridgeResponse::StartFailed(StartError::Refused(
+                Refusal::NetworkBlocked,
+            ))),
             Some(false),
         ),
         (
             Start,
-            Ok(BridgeResponse::StartFailed(StartError::Failed {
+            Ok(BridgeResponse::StartFailed(StartError::Refused(Refusal::Failed {
                 message: "plugin failed".into(),
-            })),
+            }))),
             Some(false),
         ),
         (Start, Err(ClientError::ConcurrentStart), None),
+        // A refused reload's slow path stopped the session first, so the refusal is a disconnect like a refused start.
+        (Reload, Ok(BridgeResponse::Ack), Some(true)),
+        (
+            Reload,
+            Ok(BridgeResponse::StartFailed(StartError::Refused(
+                Refusal::StateBlocked {
+                    files: vec!["bridge-routes.json".into()],
+                },
+            ))),
+            Some(false),
+        ),
+        (
+            Reload,
+            Ok(BridgeResponse::StartFailed(StartError::Refused(
+                Refusal::NetworkBlocked,
+            ))),
+            Some(false),
+        ),
+        (
+            Reload,
+            Ok(BridgeResponse::StartFailed(StartError::Refused(Refusal::Failed {
+                message: "plugin failed".into(),
+            }))),
+            Some(false),
+        ),
+        // A reload's exchange can break after the bridge acted on it, so an error proves nothing; the next Status decides.
+        (Reload, Err(transport_err()), None),
+        (
+            Reload,
+            Err(ClientError::UnexpectedStatus(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            )),
+            None,
+        ),
         (Stop, Ok(BridgeResponse::Ack), Some(false)),
         (Stop, Ok(err_resp("teardown failed")), None),
         (Start, Err(ClientError::PermissionDenied), None),
@@ -1143,6 +1179,91 @@ async fn reload_if_running_reloads_when_running() {
             blocked_until_connected: false
         }
     );
+}
+
+/// A reload refused over unreadable state files reaches the caller typed, as a start's does.
+#[skuld::test]
+async fn reload_if_running_surfaces_a_state_blocked_refusal_with_the_remedy() {
+    let path = test_socket_path("reload-blocked");
+    let router = axum::Router::new()
+        .route(ROUTE_STATUS, get(|| async { Json(status_response(true)) }))
+        .route(
+            ROUTE_RELOAD,
+            post(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(hole_common::protocol::StartError::Refused(
+                        hole_common::protocol::Refusal::StateBlocked {
+                            files: vec!["bridge-routes.json".into()],
+                        },
+                    )),
+                )
+            }),
+        );
+    let _mock = serve_router(&path, router).await;
+
+    let link = test_link(path, noop_hook());
+    let err = link.reload_if_running(test_proxy_config()).await.unwrap_err();
+
+    assert_eq!(
+        err,
+        hole::toast::ReloadError::Refused(hole_common::protocol::Refusal::StateBlocked {
+            files: vec!["bridge-routes.json".into()]
+        })
+    );
+    // The refused reload's slow path stopped the session: the tray and the filters UI must stop saying running.
+    assert_eq!(
+        link.cell().snapshot(),
+        ProxySnapshot {
+            seq: 2,
+            running: false,
+            error: None,
+            lockdown_enabled: false,
+            cover_presence: CoverPresence::Absent,
+            blocked_until_connected: false
+        }
+    );
+}
+
+/// A reload the bridge rejects before it acts (a 422 Json rejection, a 413 over the body limit) was not applied and
+/// says nothing about the session: the snapshot keeps the running state the Status leg committed, and the next Status
+/// decides.
+#[skuld::test]
+async fn a_rejected_reload_leaves_the_snapshot_running() {
+    let path = test_socket_path("reload-rejected");
+    let router = axum::Router::new()
+        .route(ROUTE_STATUS, get(|| async { Json(status_response(true)) }))
+        .route(
+            ROUTE_RELOAD,
+            post(|| async { axum::http::StatusCode::UNPROCESSABLE_ENTITY }),
+        );
+    let _mock = serve_router(&path, router).await;
+
+    let link = test_link(path, noop_hook());
+    let err = link.reload_if_running(test_proxy_config()).await.unwrap_err();
+
+    assert_eq!(err, hole::toast::ReloadError::Rejected);
+    let snapshot = link.cell().snapshot();
+    assert!(snapshot.running, "{snapshot:?}");
+    assert_eq!(snapshot.seq, 1, "{snapshot:?}");
+}
+
+/// The exchange of a reload failing says the bridge refused the request only when it answered with a status the route
+/// has no meaning for; every other failure leaves it unknown whether the reload applied.
+#[skuld::test]
+fn a_reload_exchange_failure_is_rejected_only_for_an_unexpected_status() {
+    use hole::toast::ReloadError;
+    assert_eq!(
+        reload_error_for_exchange(&ClientError::UnexpectedStatus(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        )),
+        ReloadError::Rejected
+    );
+    assert_eq!(
+        reload_error_for_exchange(&ClientError::Protocol("boom".into())),
+        ReloadError::Transport
+    );
+    assert_eq!(reload_error_for_exchange(&transport_err()), ReloadError::Transport);
 }
 
 // resolve_bridge_socket ===============================================================================================

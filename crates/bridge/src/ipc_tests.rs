@@ -1564,11 +1564,11 @@ fn start_failure_returns_error() {
         let resp = post_start(&mut client, &sample_config(), "t").await;
 
         match start_error_body(resp).await {
-            StartError::Failed { message } => assert!(
+            StartError::Refused(Refusal::Failed { message }) => assert!(
                 message.contains("mock failure"),
                 "expected mock failure message, got: {message}"
             ),
-            other => panic!("expected StartError::Failed, got {other:?}"),
+            other => panic!("expected a Failed refusal, got {other:?}"),
         }
 
         drop(client);
@@ -2372,7 +2372,7 @@ async fn a_failed_start_logs_the_cause_the_toast_points_at() {
         .await
     };
 
-    let Err(super::StartHandlerError::Failed(StartError::Failed { message })) = result else {
+    let Err(super::StartHandlerError::Failed(StartError::Refused(Refusal::Failed { message }))) = result else {
         panic!("expected a generic start failure");
     };
     assert_eq!(
@@ -2456,11 +2456,11 @@ async fn a_failed_reload_logs_the_cause() {
         .await
     };
 
-    let Err((_, Json(body))) = result else {
-        panic!("a failed reload must be reported");
+    let Err(StartHandlerError::Failed(StartError::Refused(Refusal::Failed { message }))) = result else {
+        panic!("a failed reload must be reported as a typed failure: {result:?}");
     };
     assert_eq!(
-        body.message, "gateway detection failed: Could not read the system routing table. See bridge.log for details.",
+        message, "gateway detection failed: Could not read the system routing table. See bridge.log for details.",
         "the toast text must stay the fixed sentence"
     );
     let log = writer.snapshot();
@@ -3466,7 +3466,7 @@ async fn test_server_request_arms_redaction_before_it_logs() {
 
 #[skuld::test]
 async fn an_outgoing_error_carrying_the_address_is_redacted() {
-    // Asserts on the **response**, not the log: `StartError::Failed`'s doc
+    // Asserts on the **response**, not the log: `Refusal::Failed`'s doc
     // claims a PII-free message and nothing enforced it. The bridge's
     // registry is armed by the same handler, so the claim becomes a property.
     let token = hole_common::logging::redact_arm::token_for(REDACT_ENTRY_ID);
@@ -3517,7 +3517,7 @@ async fn reload_to_a_different_server_that_fails_is_redacted_in_log_and_response
     // path — the one `MockProxy::failing_from_second_start` is built to fail.
     let reloaded = redaction_config();
 
-    let (status, body) = {
+    let message = {
         let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
         let _ = handle_start(
             axum::extract::State(state.clone()),
@@ -3530,27 +3530,48 @@ async fn reload_to_a_different_server_that_fails_is_redacted_in_log_and_response
         let result = handle_reload(axum::extract::State(state.clone()), Json(reloaded)).await;
         emit_third_party_line();
 
-        let Err((status, Json(body))) = result else {
-            panic!("expected the stop+start reload to fail");
+        let Err(StartHandlerError::Failed(StartError::Refused(Refusal::Failed { message }))) = result else {
+            panic!("expected the stop+start reload to fail: {result:?}");
         };
-        (status, body)
+        message
     };
 
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
-        !body.message.contains(REDACT_ADDR),
-        "the response body carried the address: {}",
-        body.message
+        !message.contains(REDACT_ADDR),
+        "the response body carried the address: {message}"
     );
-    assert!(
-        body.message.contains(&token),
-        "the response body lost its token: {}",
-        body.message
-    );
+    assert!(message.contains(&token), "the response body lost its token: {message}");
 
     let log = writer.snapshot();
     assert!(!log.contains(REDACT_ADDR), "the address reached the log: {log}");
     assert!(log.contains(&token), "the token is missing from the log: {log}");
+}
+
+/// A reload's stop+start slow path runs the connect gate like a start does, so the typed refusal reaches the GUI.
+#[skuld::test]
+async fn a_reload_over_an_unreadable_state_file_is_refused_as_state_blocked() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let state = ipc_state_with_dir_and_proxy(dir.clone(), MockProxy::new());
+    let _ = handle_start(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(sample_config()),
+    )
+    .await
+    .expect("initial start must succeed");
+    std::fs::write(dir.join(crate::plugin_state::STATE_FILE_NAME), b"not json").unwrap();
+
+    let result = handle_reload(axum::extract::State(state.clone()), Json(redaction_config())).await;
+
+    let Err(StartHandlerError::Failed(error)) = result else {
+        panic!("expected a typed refusal: {result:?}");
+    };
+    assert_eq!(
+        error,
+        StartError::Refused(Refusal::StateBlocked {
+            files: vec![crate::plugin_state::STATE_FILE_NAME.to_owned()]
+        })
+    );
 }
 
 // Unblock vs post-start persist =======================================================================================

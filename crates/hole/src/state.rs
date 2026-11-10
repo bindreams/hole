@@ -3,7 +3,7 @@
 use crate::bridge_client::{BridgeClient, ClientError};
 use hole_common::config::AppConfig;
 use hole_common::config_store::ConfigStore;
-use hole_common::protocol::{BridgeRequest, BridgeResponse, CoverPresence, StartError};
+use hole_common::protocol::{BridgeRequest, BridgeResponse, CoverPresence};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -343,7 +343,10 @@ impl BridgeLink {
     ///
     /// Returns Ok(false) when skipped (not running), Ok(true) on a
     /// successful reload.
-    pub async fn reload_if_running(&self, config: hole_common::protocol::ProxyConfig) -> Result<bool, String> {
+    pub async fn reload_if_running(
+        &self,
+        config: hole_common::protocol::ProxyConfig,
+    ) -> Result<bool, hole::toast::ReloadError> {
         let mut guard = self.client.lock().await;
         let (marker, driver) = self.cutover_state();
         let decision = cutover_decision(&marker, driver);
@@ -357,12 +360,36 @@ impl BridgeLink {
         }
         let reload = Self::send_locked(&mut guard, &self.socket_path, BridgeRequest::Reload { config }).await;
         self.note_mismatch(&reload);
+        if let Some(running) = observed_running(ReqKind::Reload, &reload, matches!(decision, CutoverDecision::Mask)) {
+            self.commit_observation(decision, running, &reload);
+        }
         match reload {
             Ok(BridgeResponse::Ack) => Ok(true),
-            Ok(BridgeResponse::Error { message }) => Err(message),
-            Ok(_) => Err("unexpected response from bridge".into()),
-            Err(e) => Err(e.to_string()),
+            Ok(BridgeResponse::StartFailed(e)) => Err(hole::toast::ReloadError::Refused(e.reload_refusal().clone())),
+            // `BridgeClient::send` maps a reload to exactly these three; the exchange's error is logged by `send_locked`.
+            Ok(other) => unreachable!("BridgeClient answers a reload with Ack or StartFailed, got {other:?}"),
+            Err(e) => Err(reload_error_for_exchange(&e)),
         }
+    }
+}
+
+/// The error for a reload whose exchange failed with `error`: the bridge refused the request without acting on it only
+/// when it answered with a status the route has no meaning for; any other failure leaves it unknown whether the reload
+/// applied.
+pub(crate) fn reload_error_for_exchange(error: &ClientError) -> hole::toast::ReloadError {
+    use hole::toast::ReloadError;
+    match error {
+        ClientError::UnexpectedStatus(_) => ReloadError::Rejected,
+        ClientError::PermissionDenied
+        | ClientError::Connection(_)
+        | ClientError::Io(_)
+        | ClientError::Protocol(_)
+        | ClientError::VersionMismatch { .. }
+        | ClientError::ConsentRequired { .. }
+        | ClientError::CutoverInProgress { .. }
+        | ClientError::PayloadVerificationFailed { .. }
+        | ClientError::InvalidUpdateDestination { .. }
+        | ClientError::ConcurrentStart => ReloadError::Transport,
     }
 }
 
@@ -586,6 +613,7 @@ pub(crate) enum ReqKind {
     Status,
     Start,
     Stop,
+    Reload,
     Other,
 }
 
@@ -595,6 +623,7 @@ impl ReqKind {
             BridgeRequest::Status => Self::Status,
             BridgeRequest::Start { .. } => Self::Start,
             BridgeRequest::Stop => Self::Stop,
+            BridgeRequest::Reload { .. } => Self::Reload,
             _ => Self::Other,
         }
     }
@@ -609,6 +638,8 @@ impl ReqKind {
 ///   says nothing about the tunnel.
 /// - Transport errors on tracked kinds commit false: an unreachable
 ///   bridge tunnels nothing (the mapping `get_proxy_status` always used).
+///   A reload's error commits nothing: the bridge may have acted before the
+///   exchange broke, so only a refusal it reports proves the session stopped.
 /// - While the cutover mask is active (a marker present with a live/unassessed
 ///   driver) both a transport error AND a reachable running:false commit
 ///   nothing: the bridge is mid-restart, so the gap is expected, not a
@@ -634,6 +665,9 @@ pub(crate) fn observed_running(
         // VersionMismatch arm: keying on VersionMismatch alone is too late, as
         // it arrives only after the new bridge answers.
         (_, Err(_)) if update_in_progress => None,
+        // A reload's exchange can break after the bridge acted on it (the fast path's hot-swap leaves the session up),
+        // and a Json rejection says nothing about the session either: the next Status decides.
+        (Reload, Err(_)) => None,
         (_, Err(_)) => Some(false),
         // A reachable running:false DURING a cutover is held (no surprise
         // Disconnected — e.g. the proxy self-dies via `check_health` while the old
@@ -642,11 +676,9 @@ pub(crate) fn observed_running(
         (Status, Ok(BridgeResponse::Status { running: false, .. })) if update_in_progress => None,
         (Status, Ok(BridgeResponse::Status { running, .. })) => Some(*running),
         (Start, Ok(BridgeResponse::Ack)) => Some(true),
-        (Start, Ok(BridgeResponse::StartFailed(e))) => match e {
-            // A failed start is rolled back bridge-side.
-            StartError::Cancelled | StartError::NetworkBlocked | StartError::Failed { .. } => Some(false),
-            StartError::AlreadyRunning => Some(true),
-        },
+        (Reload, Ok(BridgeResponse::Ack)) => Some(true),
+        // A reload's slow path stops the session before it restarts, so a refused restart leaves it stopped.
+        (Start | Reload, Ok(BridgeResponse::StartFailed(e))) => Some(e.leaves_session_up()),
         (Stop, Ok(BridgeResponse::Ack)) => Some(false),
         (Stop, Ok(BridgeResponse::Error { .. })) => None,
         (_, Ok(_)) => None,

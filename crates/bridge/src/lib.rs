@@ -32,6 +32,7 @@ pub mod service_scm;
 pub mod service_start;
 pub mod service_stop;
 pub mod socket;
+pub mod state_gate;
 pub mod target;
 
 // Cross-cutting test helpers. Deviates from the sibling `foo_tests.rs`
