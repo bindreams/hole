@@ -713,6 +713,8 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
         "installer-kill",
         "installer-uninstall",
         "installer-verify-uninstall",
+        "installer-measure-upgrade-rollback",
+        "installer-verify-measure-cleanup",
         "installer-upload-msi-logs",
         "hole-test-tun",
         "hole-verify-executed",

@@ -249,16 +249,68 @@
          Uses FileRef (Type 18) to reference hole.exe by its File ID,
          not Directory (Type 34) which fails to launch the exe.
 
-         The three `bridge` actions pass a log directory so their gui-cli.log lands
+         The `bridge` actions pass a log directory so their gui-cli.log lands
          in the directory every principal can find (the bridge's own), not in
          the profile of whichever account the action runs as. The path is
          quoted: ExeCommand is appended to the quoted hole.exe path as one
          command line, and CommonAppDataFolder can hold a space. It carries no
          trailing backslash, which a quoted argument would escape. -->
+    <!-- Registers the service and does not start it. A bridge started inside
+         the transaction runs its recovery and reconcile and can write state in
+         the new format; if anything after it rolls the transaction back (a
+         cancelled progress dialog, PathAdd), the old product comes back over
+         files its bridge cannot read. BridgeStart below starts it once the
+         install can no longer roll back. -->
     <CustomAction
       Id="BridgeInstall"
       FileRef="hole.exe"
-      ExeCommand="bridge install --log-dir &quot;[CommonAppDataFolder]hole\logs&quot;"
+      ExeCommand="bridge install --no-start --log-dir &quot;[CommonAppDataFolder]hole\logs&quot;"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <!-- Undoes BridgeInstall if the transaction rolls back: without it a
+         rolled-back fresh install leaves an Automatic service that names a
+         deleted hole.exe. Runs `bridge uninstall` with the keep-covers flag (as
+         BridgeUninstall does), so a rolled-back upgrade leaves the old
+         product's standing cover to the old bridge. It removes only what
+         BridgeInstall registered: the old product's BridgeUninstall already
+         deregistered the old service. What brings the old service back is the
+         old product's own rollback, BridgeUninstallRollback, run by the old
+         hole.exe once its files are restored. Releases without that action
+         (0.5.0, 0.6.0) end with the old files and no service, until the old
+         GUI's install prompt on Connect registers and starts it.
+         Sequenced Before="BridgeInstall" because a rollback action is written
+         into the script ahead of the deferred action it undoes. -->
+    <CustomAction
+      Id="BridgeInstallRollback"
+      FileRef="hole.exe"
+      ExeCommand="bridge uninstall --keep-covers --log-dir &quot;[CommonAppDataFolder]hole\logs&quot;"
+      Execute="rollback"
+      Impersonate="no"
+      Return="ignore" />
+
+    <!-- Starts the registered service when the transaction commits. A commit
+         action runs on the server, elevated, and only on success; an immediate
+         action after InstallFinalize (LaunchApp) runs as the installing user,
+         who cannot start a service. Return="check": a failed start rolls the
+         whole upgrade back; safe because StartService fails only before the
+         new bridge's service main runs, and this is the only commit action.
+         A commit action does not run when rollback is disabled
+         (DISABLEROLLBACK, the DisableRollback policy), so that case runs the
+         in-script copy below; the two conditions are exclusive. -->
+    <CustomAction
+      Id="BridgeStart"
+      FileRef="hole.exe"
+      ExeCommand="bridge start --log-dir &quot;[CommonAppDataFolder]hole\logs&quot;"
+      Execute="commit"
+      Impersonate="no"
+      Return="check" />
+
+    <CustomAction
+      Id="BridgeStartNoRollback"
+      FileRef="hole.exe"
+      ExeCommand="bridge start --log-dir &quot;[CommonAppDataFolder]hole\logs&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
@@ -333,8 +385,9 @@
          Return="check", so the action immediately after BridgeUninstall can
          abort the whole transaction; without this, the product is still
          installed but its service is stopped and deregistered, and nothing
-         puts it back. Re-runs exactly what BridgeInstall runs, so the product
-         comes back as a fresh install would, Automatic and started: the
+         puts it back. Runs `bridge install` (registers and starts, unlike
+         BridgeInstall's no-start flag), so the product comes back as a fresh
+         install would, Automatic and started: the
          deleted service has no start type to read, so one an administrator
          set is not carried.
 
@@ -365,11 +418,18 @@
       Return="asyncNoWait" />
 
     <InstallExecuteSequence>
-      <!-- Post-install: bridge install then PATH add -->
+      <!-- Post-install: bridge install, PATH add, then the bridge start (at
+           commit, or in the script when rollback is disabled) -->
+      <Custom Action="BridgeInstallRollback" Before="BridgeInstall"
+        Condition="NOT Installed AND NOT REMOVE" />
       <Custom Action="BridgeInstall" After="InstallFiles"
         Condition="NOT Installed AND NOT REMOVE" />
       <Custom Action="PathAdd" After="BridgeInstall"
         Condition="NOT Installed AND NOT REMOVE" />
+      <Custom Action="BridgeStart" After="PathAdd"
+        Condition="NOT Installed AND NOT REMOVE AND NOT RollbackDisabled" />
+      <Custom Action="BridgeStartNoRollback" After="PathAdd"
+        Condition="RollbackDisabled AND NOT Installed AND NOT REMOVE" />
 
       <!-- Pre-uninstall: deregister the service, release the covers, then
            strip PATH. Each uninstall CA must be transitively anchored Before

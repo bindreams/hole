@@ -44,7 +44,7 @@ use tracing_subscriber::registry::LookupSpan;
 use yaml_serde::{Mapping, Value};
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct YamlFormat;
+pub struct YamlFormat;
 
 // Visitor =============================================================================================================
 

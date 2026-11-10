@@ -25,6 +25,10 @@ param(
     [Parameter(Mandatory)]
     [string]$LogPath,
 
+    # Public properties for msiexec's command line (`NAME=value`), after the
+    # package. Ignored when -ExeArgs replaces the command line.
+    [string[]]$Properties = @(),
+
     # No direct cold-run measurement exists for this job -- CI here runs
     # often enough that sccache has never been observed to go fully cold --
     # so this is derived, not measured: the sibling `dmg` step
@@ -82,7 +86,7 @@ param(
 )
 
 if (-not $ExeArgs) {
-    $ExeArgs = @($Verb, $MsiPath, "/quiet", "/norestart", "/l*vx", $LogPath)
+    $ExeArgs = @($Verb, $MsiPath) + $Properties + @("/quiet", "/norestart", "/l*vx", $LogPath)
 }
 
 # The wedge branch's helpers: the process-tree walk and the native thread-stack

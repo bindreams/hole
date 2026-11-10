@@ -33,7 +33,7 @@ mod start_type_lock;
 pub use start_type_lock::{Held, StartTypeLock, BOUNDARY_NAME, MUTEX_LEAF, REQUIRED_SID};
 #[path = "windows/repair_session.rs"]
 mod repair_session;
-use repair_session::{RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
+use repair_session::{RepairSession, READ_ACCESS, REPAIR_ACCESS};
 #[path = "windows/status_session.rs"]
 mod status_session;
 use status_session::StatusSession;
@@ -820,33 +820,30 @@ pub fn disabled_state() -> DisabledState {
 
 /// Sets the service's start type to automatic, clears the record, and starts
 /// it: the administrator's explicit request to undo a disable, whoever made
-/// it. A service already running is success. Holds the start-type lock from
-/// the first write to the start.
+/// it. A service already running or starting is success; one stopping, or
+/// stopped with its process not yet exited, fails with
+/// `StartFailure::NotServing`, and the start does not wait. Holds the
+/// start-type lock from the first write to the start.
 pub fn enable() -> std::io::Result<()> {
-    let Some(mut session) = RepairSession::open(ENABLE_ACCESS)? else {
+    let Some(mut session) = RepairSession::open(REPAIR_ACCESS)? else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "the Hole service is not installed",
         ));
     };
     repair::enable(&mut session).map_err(std::io::Error::other)?;
-    session.start()?;
+    repair_session::start_service()?;
     info!("Windows service enabled and started");
     Ok(())
 }
 
 // Start/stop ==========================================================================================================
 
-/// Start the Windows Service via SCM.
+/// Start the Windows Service via SCM. A service already running or starting is
+/// success. One stopping, or stopped with its process not yet exited, fails with
+/// `StartFailure::NotServing`; the start does not wait.
 pub fn start() -> std::io::Result<()> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
-    let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::START)
-        .map_err(|e| scm_failure(ScmCall::OpenService, e))?;
-    service
-        .start::<&str>(&[])
-        .map_err(|e| scm_failure(ScmCall::StartService, e))?;
+    repair_session::start_service()?;
     info!("Windows service started");
     Ok(())
 }

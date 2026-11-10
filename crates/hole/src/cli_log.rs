@@ -21,4 +21,4 @@ macro_rules! cli_log {
 
 #[cfg(test)]
 #[path = "cli_log_tests.rs"]
-mod cli_log_tests;
+pub(crate) mod cli_log_tests;

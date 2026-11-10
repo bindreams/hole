@@ -29,12 +29,11 @@ fn an_unprivileged_read_asks_for_the_query_right_alone() {
     // anything more would fail there.
     assert_eq!(READ_ACCESS, ServiceAccess::QUERY_CONFIG);
     assert!(REPAIR_ACCESS.contains(READ_ACCESS));
-    assert!(ENABLE_ACCESS.contains(ServiceAccess::START | ServiceAccess::CHANGE_CONFIG));
 }
 
 #[skuld::test]
-fn opening_for_a_repair_or_an_enable_waits_for_the_start_type_lock() {
-    for access in [REPAIR_ACCESS, ENABLE_ACCESS, READ_ACCESS] {
+fn opening_for_a_repair_waits_for_the_start_type_lock() {
+    for access in [REPAIR_ACCESS, READ_ACCESS] {
         let lock = StartTypeLock::scratch("repair-open");
         let opened = lock.while_another_waits(|on_busy| RepairSession::open_noting(&lock, access, on_busy).is_ok());
         assert!(opened, "{access:?}");
@@ -55,4 +54,47 @@ fn a_repair_session_holds_the_start_type_lock_for_as_long_as_it_is_open() {
     assert!(lock.is_held_for_another_thread(), "held while the session is open");
     drop(session);
     assert!(!lock.is_held_for_another_thread(), "let go with the session");
+}
+
+// What a start makes of a service the SCM called "already running" ====================================================
+
+#[skuld::test]
+fn only_a_service_up_or_coming_up_is_what_the_start_was_after() {
+    for (state, success) in [
+        (ServiceState::Running, true),
+        (ServiceState::StartPending, true),
+        (ServiceState::StopPending, false),
+        (ServiceState::Stopped, false),
+        (ServiceState::Paused, false),
+        (ServiceState::PausePending, false),
+        (ServiceState::ContinuePending, false),
+    ] {
+        assert_eq!(is_up_or_coming_up(state), success, "{state:?}");
+    }
+}
+
+#[skuld::test]
+fn an_unreadable_status_chains_its_cause_as_the_source() {
+    let failure = StartFailure::Status(io::Error::from_raw_os_error(5));
+    let cause = std::error::Error::source(&failure).expect("the cause is the source");
+    assert_eq!(cause.to_string(), io::Error::from_raw_os_error(5).to_string());
+}
+
+#[skuld::test]
+fn a_service_that_is_not_serving_is_named_by_its_state_and_no_cause_is_asserted() {
+    for state in [
+        ServiceState::StopPending,
+        ServiceState::Stopped,
+        ServiceState::Paused,
+        ServiceState::PausePending,
+        ServiceState::ContinuePending,
+    ] {
+        assert!(
+            !is_up_or_coming_up(state),
+            "{state:?} is not a state the start succeeds in"
+        );
+        let text = StartFailure::NotServing(state).to_string();
+        assert!(text.contains(&format!("{state:?}")), "{text}");
+        assert!(!text.contains("on its way down"), "{text}");
+    }
 }

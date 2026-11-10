@@ -864,7 +864,8 @@ pub mod dir_rotate;
 pub mod redact_arm;
 use dir_rotate::DirRotate;
 
-pub(crate) mod yaml_format;
+/// The event formatter of every Hole log file: fields as a YAML block, an error as its source chain.
+pub mod yaml_format;
 
 #[cfg(test)]
 pub(crate) mod logging_tests;

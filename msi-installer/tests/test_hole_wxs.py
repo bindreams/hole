@@ -183,11 +183,13 @@ def test_install_cas_sequenced_after_install_files(package: ET.Element) -> None:
         if after:
             after_map[action] = after
 
+    cas = _ca_map(package)
     install_cas = [c for c in customs if _is_install_condition(c.get("Condition", ""))]
 
     for custom in install_cas:
         action = custom.get("Action", "")
-        if action in _LAUNCH_CAS:
+        # A rollback CA is scripted Before the action it undoes, not After InstallFiles.
+        if action in _LAUNCH_CAS or cas[action].get("Execute") == "rollback":
             continue
         # Walk the After chain to verify it reaches InstallFiles
         visited: set[str] = set()
@@ -394,9 +396,9 @@ def test_launch_condition_requires_build_19041(package: ET.Element) -> None:
 
 def test_deferred_cas_not_impersonated(package: ET.Element) -> None:
     for ca in package.iter(f"{{{NS['wix']}}}CustomAction"):
-        if ca.get("Execute") == "deferred":
+        if ca.get("Execute") in ("deferred", "commit"):
             assert ca.get("Impersonate") == "no", (
-                f"Deferred CA '{ca.get('Id')}' must have Impersonate='no' to run with elevated privileges"
+                f"{ca.get('Execute')} CA '{ca.get('Id')}' must have Impersonate='no' to run with elevated privileges"
             )
 
 
@@ -410,10 +412,11 @@ def test_install_cas_return_check(package: ET.Element) -> None:
     for custom in _get_custom_entries(package):
         if _is_install_condition(custom.get("Condition", "")):
             action = custom.get("Action", "")
-            if action in _LAUNCH_CAS:
-                continue
             ca = cas.get(action)
             assert ca is not None, f"Custom references undefined CA '{action}'"
+            # MSI ignores a rollback action's return value (see test_bridge_install_has_a_rollback_partner).
+            if action in _LAUNCH_CAS or ca.get("Execute") == "rollback":
+                continue
             assert ca.get("Return") == "check", (
                 f"Install CA '{action}' should have Return='check' to fail the install on error"
             )
@@ -524,6 +527,72 @@ def test_major_upgrade_removes_the_old_product_before_the_new_files_land(package
     )
 
 
+# The new bridge starts only after the install can no longer roll back =================================================
+#
+# A bridge started inside the transaction runs its recovery and reconcile and may write state in the new
+# format; a later failure (a cancelled progress dialog, PathAdd) then reinstalls the old product over files
+# its bridge cannot read. So BridgeInstall only registers, and the start is a commit action: the installer
+# runs it on the server, elevated, once the script has run to its end. A commit action does not run when
+# rollback is disabled (DISABLEROLLBACK, the DisableRollback policy), so that case has an in-script start.
+# The built MSI's CustomAction types, conditions and ordering are pinned in test_hole_msi.py.
+
+
+def test_bridge_install_registers_without_starting(package: ET.Element) -> None:
+    command = _ca_map(package)["BridgeInstall"].get("ExeCommand", "")
+    assert command.startswith("bridge install --no-start "), (
+        "BridgeInstall runs inside the transaction; a bridge it starts has run before the install can no longer "
+        f"roll back. Got {command!r}"
+    )
+
+
+def test_bridge_start_runs_only_at_commit(package: ET.Element) -> None:
+    """The start is a commit CA: server-side, elevated, and only on success.
+
+    An immediate action after InstallFinalize (like LaunchApp) runs in the client process, as the
+    installing user when the installer was elevated by UAC, which cannot start the service. Return='check':
+    a failed start rolls the whole upgrade back, so the host is never left with no bridge; safe because
+    StartService fails only before the new bridge's service main runs.
+    """
+    ca = _ca_map(package).get("BridgeStart")
+    assert ca is not None, "BridgeStart CA must exist so the registered service gets started"
+    assert ca.get("FileRef") == "hole.exe"
+    assert ca.get("Execute") == "commit", f"got Execute='{ca.get('Execute')}'"
+    assert ca.get("Impersonate") == "no", "starting a service needs the elevated server context"
+    assert ca.get("Return") == "check", "a failed start must roll the install back, not leave the host with no bridge"
+    assert ca.get("ExeCommand", "").startswith("bridge start "), ca.get("ExeCommand")
+
+
+def test_bridge_start_without_rollback_is_an_in_script_start(package: ET.Element) -> None:
+    """With rollback disabled the commit action never runs, so a deferred `bridge start` stands in for it."""
+    cas = _ca_map(package)
+    ca = cas.get("BridgeStartNoRollback")
+    assert ca is not None, "BridgeStartNoRollback CA must exist: a commit CA does not run when rollback is disabled"
+    assert ca.get("FileRef") == "hole.exe"
+    assert ca.get("Execute") == "deferred", f"got Execute='{ca.get('Execute')}'"
+    assert ca.get("Impersonate") == "no"
+    assert ca.get("Return") == "check", "with nothing to roll back, a failed start must still fail the install"
+    assert ca.get("ExeCommand") == cas["BridgeStart"].get("ExeCommand"), "the two starts run the same command"
+
+
+def test_bridge_install_has_a_rollback_partner(package: ET.Element) -> None:
+    """A rolled-back install must not leave the service registered over deleted files.
+
+    BridgeInstall registers an Automatic service that names hole.exe; if the transaction rolls back,
+    the files go and the registration would stay. The partner deregisters it, keeping the covers
+    (`--keep-covers`, as BridgeUninstall does): a rolled-back upgrade must leave the old product's
+    standing cover to the old bridge.
+    """
+    cas = _ca_map(package)
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    assert "BridgeInstallRollback" in entries, "BridgeInstallRollback must be sequenced"
+    ca = cas.get("BridgeInstallRollback")
+    assert ca is not None, "BridgeInstallRollback CA must be defined"
+    assert ca.get("Execute") == "rollback"
+    assert ca.get("Impersonate") == "no", "deregistering a service needs the elevated server context"
+    assert ca.get("Return") == "ignore", "MSI ignores a rollback action's return value"
+    assert ca.get("ExeCommand", "").startswith("bridge uninstall --keep-covers "), ca.get("ExeCommand")
+
+
 # Fail-closed cover release (bindreams/hole#1003) ======================================================================
 
 
@@ -617,14 +686,17 @@ def test_bridge_uninstall_has_a_rollback_partner(package: ET.Element) -> None:
     assert ca is not None, "BridgeUninstallRollback CA must be defined"
     assert ca.get("Execute") == "rollback", f"must run in the rollback script, got Execute='{ca.get('Execute')}'"
     assert ca.get("Impersonate") == "no", "re-registering a service needs the elevated server context"
-    assert ca.get("ExeCommand") == _ca_map(package)["BridgeInstall"].get("ExeCommand"), (
-        "the rollback must re-run exactly what the install CA runs, or the restored state "
+    # The install CA only registers; the rollback runs `bridge install` without
+    # --no-start, because the uninstall it undoes found a running service.
+    registers_only = _ca_map(package)["BridgeInstall"].get("ExeCommand", "")
+    assert ca.get("ExeCommand") == registers_only.replace(" --no-start", ""), (
+        "the rollback must re-run what the install CA runs, started, or the restored state "
         "is not the state the uninstall found"
     )
 
 
 def test_bridge_cas_pass_the_shared_log_dir(package: ET.Element) -> None:
-    """Every `bridge install|release-covers|uninstall` action logs to one place.
+    """Every `bridge install|start|release-covers|uninstall` action logs to one place.
 
     Without --log-dir the CLI's gui-cli.log lands in the profile of whichever
     account the action runs as, which nobody looking at a failed install knows
@@ -637,11 +709,17 @@ def test_bridge_cas_pass_the_shared_log_dir(package: ET.Element) -> None:
         ca_id: ca
         for ca_id, ca in _ca_map(package).items()
         if ca.get("ExeCommand", "").split()[:2]
-        in (["bridge", "install"], ["bridge", "release-covers"], ["bridge", "uninstall"])
+        in (["bridge", "install"], ["bridge", "start"], ["bridge", "release-covers"], ["bridge", "uninstall"])
     }
-    assert set(bridge_cas) == {"BridgeInstall", "BridgeRelease", "BridgeUninstall", "BridgeUninstallRollback"}, (
-        f"unexpected set of bridge CAs: {sorted(bridge_cas)}"
-    )
+    assert set(bridge_cas) == {
+        "BridgeInstall",
+        "BridgeInstallRollback",
+        "BridgeStart",
+        "BridgeStartNoRollback",
+        "BridgeRelease",
+        "BridgeUninstall",
+        "BridgeUninstallRollback",
+    }, f"unexpected set of bridge CAs: {sorted(bridge_cas)}"
     for ca_id, ca in bridge_cas.items():
         command = ca.get("ExeCommand", "")
         assert command.endswith(wanted), f"{ca_id} must end with{wanted!r}, got {command!r}"

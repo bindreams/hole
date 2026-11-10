@@ -748,6 +748,7 @@ struct InstallScript {
     repair: std::io::Result<RepairStep>,
     register: Result<(), &'static str>,
     start: Result<(), &'static str>,
+    timing: StartTiming,
 }
 
 impl Default for InstallScript {
@@ -762,6 +763,7 @@ impl Default for InstallScript {
             repair: Ok(RepairStep::Nothing),
             register: Ok(()),
             start: Ok(()),
+            timing: StartTiming::Now,
         }
     }
 }
@@ -781,6 +783,7 @@ fn install_probe_raw(script: InstallScript) -> (Result<(), Box<dyn std::error::E
     let steps: StepLog = std::cell::RefCell::new(Vec::new());
     let note = |step: &str| steps.borrow_mut().push(step.to_string());
     let result = install_bridge_with(
+        script.timing,
         || {
             note("hold");
             script.hold.map(|()| Unhold(&steps))
@@ -894,6 +897,130 @@ fn a_service_an_interrupted_uninstall_disabled_is_registered_automatic_and_start
     assert!(result.is_ok());
     assert!(steps.contains(&"register(Automatic)".to_string()), "{steps:?}");
     assert_eq!(steps.last().map(String::as_str), Some("start"));
+}
+
+// The repair belongs to the start decision, which `bridge start` makes; a deferred install repairing as well would
+// decide it twice.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_deferred_install_only_registers() {
+    let (result, steps) = install_probe(InstallScript {
+        timing: StartTiming::Deferred,
+        ..InstallScript::default()
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        steps,
+        ["disabled_by", "is_installed", "register(Automatic)"],
+        "the MSI's BridgeInstall registers inside the transaction; the repair and the start wait for its commit"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_deferred_reinstall_still_stops_the_old_service_before_registering() {
+    let (result, steps) = install_probe(InstallScript {
+        installed: true,
+        timing: StartTiming::Deferred,
+        ..InstallScript::default()
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        steps,
+        [
+            "disabled_by",
+            "is_installed",
+            "stop",
+            "deregister",
+            "register(Automatic)"
+        ]
+    );
+}
+
+// `bridge start` orchestration ========================================================================================
+
+/// The scripted outcome of each injected effect of `start_bridge_with`.
+struct StartScript {
+    hold: std::io::Result<()>,
+    repair: std::io::Result<RepairStep>,
+    start: Result<(), &'static str>,
+}
+
+impl Default for StartScript {
+    fn default() -> Self {
+        Self {
+            hold: Ok(()),
+            repair: Ok(RepairStep::Nothing),
+            start: Ok(()),
+        }
+    }
+}
+
+fn start_probe(script: StartScript) -> (Result<(), Box<dyn std::error::Error>>, Vec<String>) {
+    let steps: StepLog = std::cell::RefCell::new(Vec::new());
+    let note = |step: &str| steps.borrow_mut().push(step.to_string());
+    let result = start_bridge_with(
+        || {
+            note("hold");
+            script.hold.map(|()| Unhold(&steps))
+        },
+        || {
+            note("repair");
+            script.repair
+        },
+        || {
+            note("start");
+            script.start.map_err(Into::into)
+        },
+    );
+    (result, steps.into_inner())
+}
+
+#[skuld::test]
+fn a_start_holds_the_start_type_repairs_then_starts_and_lets_go() {
+    let (result, steps) = start_probe(StartScript::default());
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(steps, ["hold", "repair", "start", "unhold"]);
+}
+
+#[skuld::test]
+fn a_start_leaves_a_service_an_administrator_disabled_stopped_and_succeeds() {
+    let (result, steps) = start_probe(StartScript {
+        repair: Ok(RepairStep::LeaveDisabled),
+        ..StartScript::default()
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(steps, ["hold", "repair", "unhold"]);
+}
+
+#[skuld::test]
+fn a_start_that_cannot_take_the_lock_starts_nothing_and_fails() {
+    let (result, steps) = start_probe(StartScript {
+        hold: Err(std::io::Error::other("busy")),
+        ..StartScript::default()
+    });
+    assert!(result.is_err());
+    assert_eq!(steps, ["hold"]);
+}
+
+#[skuld::test]
+fn a_start_that_cannot_repair_the_start_type_does_not_start_and_fails() {
+    let (result, steps) = start_probe(StartScript {
+        repair: Err(std::io::Error::other("unreadable")),
+        ..StartScript::default()
+    });
+    assert!(result.is_err());
+    assert_eq!(steps, ["hold", "repair", "unhold"]);
+}
+
+#[skuld::test]
+fn a_failed_start_is_the_commands_failure() {
+    let (result, steps) = start_probe(StartScript {
+        start: Err("SCM said no"),
+        ..StartScript::default()
+    });
+    assert!(result.unwrap_err().to_string().contains("SCM said no"));
+    assert_eq!(steps, ["hold", "repair", "start", "unhold"]);
 }
 
 #[skuld::test]
@@ -1124,16 +1251,20 @@ fn the_cover_release_is_wired_to_both_of_its_entry_points() {
     );
 }
 
-/// `install_bridge_with` and `uninstall_bridge_with` take their hold from the
+/// `install_bridge_with`, `start_bridge_with` and `uninstall_bridge_with` take their hold from the
 /// closure they are given, so every test of them stays green if the real lock
 /// is replaced by `|| Ok(())`. Pin who passes it.
 #[skuld::test]
-fn the_start_type_hold_is_wired_to_both_elevated_changes() {
+fn the_start_type_hold_is_wired_to_every_elevated_change() {
     let pattern = regex::Regex::new(r"\bhold_start_type\b").expect("regex must compile");
 
     assert_eq!(
         production_call_sites(&pattern),
-        expected_sites(&[("setup.rs", "install_bridge"), ("setup.rs", "uninstall_bridge"),]),
+        expected_sites(&[
+            ("setup.rs", "install_bridge"),
+            ("setup.rs", "start_bridge"),
+            ("setup.rs", "uninstall_bridge"),
+        ]),
         "a change that spans several start-type steps must hold the lock across them"
     );
 }
@@ -1158,4 +1289,16 @@ fn the_bridge_stop_is_wired_ahead_of_every_deregistration() {
         ]),
         "`platform::os::ensure_stopped` is what makes the stop independent of `is_installed`"
     );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_deferred_install_still_keeps_a_start_type_an_administrator_disabled() {
+    let (result, steps) = install_probe(InstallScript {
+        disabled_by: Ok(Some(DisabledBy::Elsewhere)),
+        timing: StartTiming::Deferred,
+        ..InstallScript::default()
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(steps, ["disabled_by", "is_installed", "register(LeaveDisabled)"]);
 }

@@ -4,7 +4,7 @@
 use std::io;
 
 use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
-use windows_service::service::{Service, ServiceAccess};
+use windows_service::service::{Service, ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::retire_session::{read_start_type, write_start_type};
@@ -22,8 +22,9 @@ pub(super) const READ_ACCESS: ServiceAccess = ServiceAccess::QUERY_CONFIG;
 /// The rights a repair needs: the start type read and written.
 pub(super) const REPAIR_ACCESS: ServiceAccess = ServiceAccess::QUERY_CONFIG.union(ServiceAccess::CHANGE_CONFIG);
 
-/// The rights an enable needs: a repair's, and the start.
-pub(super) const ENABLE_ACCESS: ServiceAccess = REPAIR_ACCESS.union(ServiceAccess::START);
+/// The rights a start needs: the start, and the status read that tells a service
+/// already up from one on its way down.
+const START_ACCESS: ServiceAccess = ServiceAccess::START.union(ServiceAccess::QUERY_STATUS);
 
 /// An open `HoleBridge` service and the key its record lives in.
 pub(super) struct RepairSession {
@@ -71,15 +72,65 @@ impl RepairSession {
             Err(e) => Err(scm_failure(ScmCall::OpenService, e)),
         }
     }
+}
 
-    /// Starts the service. A service that is already running is the state the
-    /// start was after, so it is success.
-    pub(super) fn start(&self) -> io::Result<()> {
-        match self.service.start::<&str>(&[]) {
-            Ok(()) => Ok(()),
-            Err(e) if already_running(&e) => Ok(()),
-            Err(e) => Err(scm_failure(ScmCall::StartService, e)),
-        }
+/// Starts the service on a handle of its own, opened with the rights a start
+/// needs. One already running, or starting, is success. Does not wait: one on
+/// its way down, or stopped with its process not yet exited, is
+/// [`StartFailure::NotServing`].
+pub(super) fn start_service() -> io::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| scm_failure(ScmCall::OpenScManager, e))?;
+    let service = manager
+        .open_service(SERVICE_NAME, START_ACCESS)
+        .map_err(|e| scm_failure(ScmCall::OpenService, e))?;
+    let Err(e) = service.start::<&str>(&[]) else {
+        return Ok(());
+    };
+    if !already_running(&e) {
+        return Err(scm_failure(ScmCall::StartService, e));
+    }
+    // "Already running" does not say which state the service is in.
+    let state = service
+        .query_status()
+        .map(|status| status.current_state)
+        .map_err(|e| io::Error::other(StartFailure::Status(scm_failure(ScmCall::QueryServiceStatusEx, e))))?;
+    if is_up_or_coming_up(state) {
+        Ok(())
+    } else {
+        Err(io::Error::other(StartFailure::NotServing(state)))
+    }
+}
+
+/// Why a start that the SCM answered with "already running" failed. The CLI
+/// logs the error with its sources (`gui-cli.log`, and the terminal through the
+/// stderr layer); an MSI type-18 action captures no output, so the MSI log
+/// holds only the exit code. The messages say what went wrong and carry no path
+/// or address.
+#[derive(Debug, thiserror::Error)]
+enum StartFailure {
+    #[error(
+        "the SCM answered the start with \"already running\", but the service is {0:?}, not running or starting, and this start does not wait for it to change"
+    )]
+    NotServing(ServiceState),
+    #[error("the SCM answered the start with \"already running\", and the service's status could not be read")]
+    Status(#[source] io::Error),
+}
+
+/// Whether a service in `state` is the one the start was after: up, or on its
+/// way up. The one place that decides it, because `ServiceState` is foreign.
+fn is_up_or_coming_up(state: ServiceState) -> bool {
+    match state {
+        ServiceState::Running => true,
+        ServiceState::StartPending => true,
+        // On its way down; a start does not wait for the stop.
+        ServiceState::StopPending => false,
+        // The SCM's "already running" answer can precede the process's exit.
+        ServiceState::Stopped => false,
+        // Hole's service accepts neither pause nor continue.
+        ServiceState::Paused => false,
+        ServiceState::PausePending => false,
+        ServiceState::ContinuePending => false,
     }
 }
 

@@ -476,13 +476,39 @@ fn applescript_quote(s: &str) -> String {
 
 // Install/uninstall orchestration =====================================================================================
 
+/// When `bridge install` starts the service it registered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartTiming {
+    /// Right after registering.
+    Now,
+    /// Not at all: a later `bridge start` repairs the start type and starts it.
+    /// The MSI registers inside its transaction and starts at its commit, so a
+    /// rollback never meets files a started bridge wrote. Windows only: launchd
+    /// loads and runs the macOS job in one step.
+    #[cfg(target_os = "windows")]
+    Deferred,
+}
+
+impl StartTiming {
+    fn starts_now(self) -> bool {
+        match self {
+            Self::Now => true,
+            #[cfg(target_os = "windows")]
+            Self::Deferred => false,
+        }
+    }
+}
+
 /// Run `bridge install` — idempotent, handles upgrades.
 ///
 /// `repair_user_data_dir` is the path to a (possibly root-owned-by-mistake)
 /// user data directory that the GUI wants the elevated install to reclaim
 /// for the invoking user before doing anything else. Best-effort on macOS;
 /// no-op everywhere else.
-pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn install_bridge(
+    repair_user_data_dir: Option<&Path>,
+    timing: StartTiming,
+) -> Result<(), Box<dyn std::error::Error>> {
     let binary_path = bridge_binary_path()?;
 
     // Reclaim ownership of an existing user data dir if the GUI asked us to.
@@ -508,6 +534,7 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
     hole_bridge::ipc::prepare_ipc_access()?;
 
     install_bridge_with(
+        timing,
         hole_bridge::platform::os::hold_start_type,
         hole_bridge::platform::os::disabled_by,
         hole_bridge::platform::os::is_installed,
@@ -540,6 +567,57 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
     )
 }
 
+/// Run `bridge start`: start the registered service, as `bridge install` does after
+/// registering it. A service an administrator disabled stays stopped and the start
+/// succeeds; a service already running or starting is success. On Windows, one in any
+/// other state (stopping, paused, or stopped with its process not yet exited) is an
+/// error: the start does not wait.
+pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    start_bridge_with(
+        hole_bridge::platform::os::hold_start_type,
+        hole_bridge::platform::os::repair_interrupted_change,
+        || {
+            hole_bridge::platform::os::start()?;
+            Ok(())
+        },
+    )
+}
+
+/// `start_bridge`'s ordering, with the effects injected so tests can drive it
+/// without touching SCM/launchd: the start-type lock is held from the repair to
+/// the start, and the service is started only if the repair says it may be.
+fn start_bridge_with<Hold>(
+    hold: impl FnOnce() -> std::io::Result<Hold>,
+    repair: impl FnOnce() -> std::io::Result<RepairStep>,
+    start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _hold = hold().map_err(|e| {
+        format!("could not take the lock over the service's start type, so the service was not started: {e}")
+    })?;
+    repair_then_start(repair, start)
+}
+
+/// The one decision to start the service: repair its start type, then start it
+/// unless the repair says an administrator disabled it. `bridge install` and
+/// `bridge start` both end here, and both hold the start-type lock around it.
+fn repair_then_start(
+    repair: impl FnOnce() -> std::io::Result<RepairStep>,
+    start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repaired = repair().map_err(|e| format!("could not repair the service's start type: {e}"))?;
+    if !repaired.starts_service() {
+        cli_log!(
+            warn,
+            "the service is disabled on this computer and was left disabled, so it is not running. Run `hole bridge enable` to enable and start it"
+        );
+        return Ok(());
+    }
+    start()?;
+
+    cli_log!(info, "bridge started");
+    Ok(())
+}
+
 /// `install_bridge`'s ordering, with the effects injected so tests can drive it
 /// without touching SCM/launchd.
 ///
@@ -558,12 +636,17 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
 /// themselves; the thread running them already owns it, so they proceed. A lock
 /// that cannot be taken fails the install before anything changes.
 ///
+/// **`timing`** says whether this install starts the service. A deferred one
+/// stops after the registration: the repair and the start are `bridge start`'s,
+/// so the decision is made once ([`repair_then_start`]).
+///
 /// **The repair follows the registration.** A record an interrupted uninstall
 /// left is cleared by the stop's restore, or, if the stop fails, dies with the
 /// old service's key at the deregistration; the repair reads the new key and
 /// says whether the service may be started.
 #[allow(clippy::too_many_arguments)] // private seam: one injected closure per step, bundling them adds more noise than the warning.
 fn install_bridge_with<Hold>(
+    timing: StartTiming,
     hold: impl FnOnce() -> std::io::Result<Hold>,
     disabled_by: impl FnOnce() -> std::io::Result<Option<DisabledBy>>,
     is_installed: impl FnOnce() -> bool,
@@ -603,18 +686,11 @@ fn install_bridge_with<Hold>(
     }
 
     register(start_type)?;
-    let repaired = repair().map_err(|e| format!("could not repair the service's start type: {e}"))?;
-    if !repaired.starts_service() {
-        cli_log!(
-            warn,
-            "bridge installed; the service is disabled on this computer and was left disabled, so it is not running. Run `hole bridge enable` to enable and start it"
-        );
+    cli_log!(info, "bridge installed");
+    if !timing.starts_now() {
         return Ok(());
     }
-    start()?;
-
-    cli_log!(info, "bridge installed and started");
-    Ok(())
+    repair_then_start(repair, start)
 }
 
 /// Removes the bridge's socket. It is in a folder a standard user can add names to and this runs elevated, so it is

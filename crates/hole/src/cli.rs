@@ -170,6 +170,26 @@ pub(crate) enum BridgeAction {
         /// failures are logged but do not abort the install.
         #[arg(long)]
         repair_user_data_dir: Option<std::path::PathBuf>,
+        /// Internal (the MSI): register the service without starting it. The
+        /// installer starts it with `bridge start` once its transaction can no
+        /// longer roll back.
+        ///
+        /// Hidden: a service registered this way stays stopped until started.
+        /// Windows only: launchd loads and runs the macOS job in one step.
+        #[cfg(target_os = "windows")]
+        #[arg(long, hide = true)]
+        no_start: bool,
+    },
+    /// Start the registered bridge service
+    ///
+    /// Internal (the MSI's commit): starts what `bridge install --no-start`
+    /// registered. A service an administrator disabled is left stopped.
+    #[command(hide = true)]
+    Start {
+        /// Override the log directory (the MSI passes the one directory every
+        /// principal can read).
+        #[arg(long)]
+        log_dir: Option<std::path::PathBuf>,
     },
     /// Set the bridge service to start automatically and start it (requires elevation)
     Enable {
@@ -387,8 +407,8 @@ pub(crate) fn status_report(status: crate::setup::BridgeInstallStatus) -> (&'sta
 /// GUI's elevated-install path uses this to redirect the subscriber into a
 /// per-invocation temp dir it can read back after the elevation completes
 /// (so the failure dialog can include the underlying error text). The MSI's
-/// `bridge install`, `bridge uninstall` and `bridge release-covers` custom
-/// actions pass one too, so their log lands where every principal can find it.
+/// `bridge install`, `bridge start`, `bridge uninstall` and `bridge release-covers`
+/// custom actions pass one too, so their log lands where every principal can find it.
 pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBuf> {
     if !should_install_cli_log_guard(command) {
         return None;
@@ -398,6 +418,7 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
             action:
                 BridgeAction::Install { log_dir: Some(d), .. }
                 | BridgeAction::Enable { log_dir: Some(d) }
+                | BridgeAction::Start { log_dir: Some(d) }
                 | BridgeAction::Uninstall { log_dir: Some(d), .. }
                 | BridgeAction::ReleaseCovers { log_dir: Some(d) },
         } => Some(d.clone()),
@@ -500,14 +521,32 @@ fn elevation_hint() -> &'static str {
     }
 }
 
+/// Reports a failed `bridge` command: `eprintln` prints the error's own text and
+/// `hint`; the tracing event carries the error itself, so its causes (a typed
+/// failure keeps the SCM's answer in its `source()`) reach `gui-cli.log` and,
+/// through the stderr layer, the terminal, both rendered by `YamlFormat`.
+fn report_bridge_failure(command: &str, error: &(dyn std::error::Error + 'static), hint: &str) {
+    eprintln!("{command} failed: {error}{hint}");
+    tracing::error!(error, "{command} failed{hint}");
+}
+
 /// Dispatch a parsed subcommand to its handler. Exits the process when done.
+///
+/// The exit is out here, past [`run`], because `process::exit` runs no
+/// destructors: the log guard drains its non-blocking writers when it drops, so
+/// it lives in `run` and is gone before the process leaves.
+pub(crate) fn dispatch(command: Command) -> ! {
+    std::process::exit(run(command))
+}
+
+/// Runs `command` and returns its exit code.
 ///
 /// For write-action subcommands, install a CLI log guard so that
 /// `cli_log!(...)` calls are recorded in `gui-cli.log` in addition to the
 /// user-facing terminal output. See [`should_install_cli_log_guard`] for
 /// exactly which subcommands are exempted and [`resolve_cli_log_dir`] for
 /// how the directory is chosen.
-pub(crate) fn dispatch(command: Command) -> ! {
+fn run(command: Command) -> i32 {
     // Owner for the gui-cli.log guard: only for guard-eligible commands
     // (`should_install_cli_log_guard` excludes `Bridge::Run`, so the daemon
     // is never touched) and only when this process is privileged.
@@ -521,7 +560,7 @@ pub(crate) fn dispatch(command: Command) -> ! {
     let cli_owner: Option<(u32, u32)> = None;
     let _cli_log_guard = resolve_cli_log_dir(&command)
         .map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info", cli_owner));
-    let code = match command {
+    match command {
         Command::Version => {
             println!("hole {}", hole::version::VERSION);
             0
@@ -530,9 +569,7 @@ pub(crate) fn dispatch(command: Command) -> ! {
         Command::Bridge { action } => handle_bridge(action),
         Command::Proxy { action } => handle_proxy(action),
         Command::Path { action } => handle_path(action),
-    };
-
-    std::process::exit(code)
+    }
 }
 
 fn handle_upgrade(yes: bool) -> i32 {
@@ -771,6 +808,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
         BridgeAction::Install {
             log_dir: _, // consumed by `resolve_cli_log_dir` already
             repair_user_data_dir,
+            #[cfg(target_os = "windows")]
+            no_start,
         } => {
             // Header line — guarantees the gui-cli.log identifies the build
             // and host even if the rest of the install fails immediately.
@@ -781,8 +820,25 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 std::env::consts::OS,
                 std::env::consts::ARCH,
             );
-            if let Err(e) = crate::setup::install_bridge(repair_user_data_dir.as_deref()) {
-                cli_log!(error, "bridge install failed: {e}");
+            #[cfg(target_os = "windows")]
+            let timing = if no_start {
+                crate::setup::StartTiming::Deferred
+            } else {
+                crate::setup::StartTiming::Now
+            };
+            #[cfg(not(target_os = "windows"))]
+            let timing = crate::setup::StartTiming::Now;
+            if let Err(e) = crate::setup::install_bridge(repair_user_data_dir.as_deref(), timing) {
+                report_bridge_failure("bridge install", &*e, "");
+                return 1;
+            }
+            0
+        }
+        BridgeAction::Start {
+            log_dir: _, // consumed by `resolve_cli_log_dir` already
+        } => {
+            if let Err(e) = crate::setup::start_bridge() {
+                report_bridge_failure("bridge start", &*e, elevation_hint());
                 return 1;
             }
             0
@@ -801,7 +857,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             log_dir: _, // consumed by `resolve_cli_log_dir` already
         } => {
             if let Err(e) = crate::setup::enable_bridge() {
-                cli_log!(error, "bridge enable failed: {e}{}", elevation_hint());
+                report_bridge_failure("bridge enable", &*e, elevation_hint());
                 return 1;
             }
             0

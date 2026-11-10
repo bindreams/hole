@@ -697,6 +697,11 @@ jobs:
           }
           $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
           if (!$svc) { throw "HoleBridge service not registered" }
+          # The MSI registers the service inside its transaction and starts it from a commit action (BridgeStart).
+          $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds(60))
+          # A start of a service that is already running is success (the bridge's start repairs, then starts).
+          $start = Start-Process -FilePath "$binDir\hole.exe" -ArgumentList 'bridge', 'start' -Wait -PassThru -NoNewWindow
+          if ($start.ExitCode -ne 0) { throw "hole bridge start on a running service exited $($start.ExitCode)" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -notmatch [regex]::Escape($binDir)) { throw "$binDir not in PATH" }
 
@@ -797,6 +802,32 @@ jobs:
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
 
+      # The two premises the MSI's bridge start rests on (#1109), measured on the real Windows Installer: a
+      # failing commit start rolls a major upgrade back to a running old product (M1, asserted), and which
+      # start runs when rollback is disabled (M2a asserted; M2b, recorded in the step summary, only in a
+      # workflow_dispatch run). Runs after the uninstall so it starts from nothing, and uninstalls everything
+      # it installs.
+      - id: installer-measure-upgrade-rollback
+        name: Measure MSI upgrade rollback and the start with rollback disabled (M1, M2)
+        if: ${{ !cancelled() && matrix.installer == true && steps.installer-verify-uninstall.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          & .github/scripts/measure-msi-upgrade-rollback.ps1 -MsiPath target\release\hole.msi -WorkDir "$env:RUNNER_TEMP\msi-variants" -RecordM2b:('${{ github.event_name }}' -eq 'workflow_dispatch')
+
+      - id: installer-verify-measure-cleanup
+        name: Verify nothing is left installed after the measurements
+        if: ${{ !cancelled() && matrix.installer == true && steps.installer-verify-uninstall.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $binDir = "C:\Program Files\hole\bin"
+          if (Test-Path $binDir) { throw "$binDir still exists" }
+          $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
+          if ($svc) { throw "HoleBridge service still registered" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
+
       # What the uninstall's own processes did. The MSI's custom actions run
       # `hole bridge uninstall` / `release-covers` as SYSTEM with no console, so
       # their only record is the CLI log in `%ProgramData%\hole\logs`; the SCM
@@ -829,6 +860,7 @@ jobs:
           path: |
             ${{ runner.temp }}/msi-install.log
             ${{ runner.temp }}/msi-uninstall.log
+            ${{ runner.temp }}/msi-measure-*.log
             ${{ runner.temp }}/*-stack-*.txt
             ${{ runner.temp }}/*-cdbout-*.log
           if-no-files-found: ignore
@@ -858,7 +890,7 @@ jobs:
       # Quoted: an unquoted ` #` opens a YAML comment and truncates the name.
       - id: hole-test-tun
         name: "Test (TUN, last test lane for #200)"
-        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'windows' && matrix.arch == 'amd64' && (steps.installer-install.outcome == 'skipped' || steps.installer-verify-uninstall.outcome == 'success') }}
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'windows' && matrix.arch == 'amd64' && (steps.installer-install.outcome == 'skipped' || (steps.installer-verify-uninstall.outcome == 'success' && steps.installer-verify-measure-cleanup.outcome == 'success')) }}
         timeout-minutes: 25
         shell: bash
         env:

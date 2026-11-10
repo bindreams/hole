@@ -393,28 +393,68 @@ fn service_log_dir_matches_log_collector_constants() {
 /// The MSI's bridge actions pass `--log-dir` to the CLI so its log lands where
 /// the service writes its own: the directory the wxs names must be
 /// `service_log_dir()`, or a failed install's log is somewhere nobody looks.
+/// Every `bridge` action carries one, so a new action cannot skip it, and every
+/// `--log-dir` in an `ExeCommand` belongs to one, so an action the test did not
+/// recognise as a `bridge` one (a renamed subcommand) is caught too. A comment
+/// that mentions the flag counts for nothing.
 /// `[CommonAppDataFolder]` is `%ProgramData%` with a trailing backslash.
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn the_msi_bridge_actions_log_to_the_service_log_dir() {
     const WXS: &str = include_str!("../../../msi-installer/src/msi_installer/hole.wxs");
-    const OPEN: &str = "--log-dir &quot;";
+    const OPEN: &str = "--log-dir \"";
     let program_data = std::env::var("ProgramData").expect("ProgramData is set on every Windows host");
 
-    let mut found = 0;
-    for (at, _) in WXS.match_indices(OPEN) {
-        let rest = &WXS[at + OPEN.len()..];
-        let literal = &rest[..rest.find("&quot;").expect("the quoted --log-dir closes")];
+    let mut bridge_actions = 0;
+    let mut log_dir_flags = 0;
+    for element in WXS.split("<CustomAction").skip(1) {
+        let element = &element[..element.find("/>").expect("a CustomAction element closes")];
+        let name = element_attribute(element, "Id").unwrap_or("?");
+        let Some(command) = element_attribute(element, "ExeCommand") else {
+            continue;
+        };
+        let command = command.replace("&quot;", "\"");
+        log_dir_flags += command.matches("--log-dir").count();
+        if first_argument(&command) != "bridge" {
+            continue;
+        }
+        bridge_actions += 1;
+        assert_eq!(command.matches(OPEN).count(), 1, "{name}: one --log-dir in {command:?}");
+        let rest = &command[command.find(OPEN).unwrap() + OPEN.len()..];
+        let literal = &rest[..rest.find('"').expect("the quoted --log-dir closes")];
         let dir = literal.replace("[CommonAppDataFolder]", &format!("{program_data}\\"));
         assert_eq!(
             std::path::Path::new(&dir),
             service_log_dir(),
-            "the wxs names {literal:?}"
+            "{name}: the wxs names {literal:?}"
         );
-        found += 1;
     }
-    // install, release-covers, uninstall, and the rollback's install.
-    assert_eq!(found, 4, "the bridge actions that carry --log-dir");
+    assert_ne!(bridge_actions, 0, "the wxs has bridge actions");
+    assert_eq!(
+        log_dir_flags, bridge_actions,
+        "every --log-dir in an ExeCommand is on a `bridge` action's command"
+    );
+}
+
+/// The first argument of a command line, unquoted: what the program is handed
+/// as `argv[1]` after the executable path.
+#[cfg(target_os = "windows")]
+fn first_argument(command: &str) -> &str {
+    let command = command.trim_start();
+    match command.strip_prefix('"') {
+        Some(quoted) => &quoted[..quoted.find('"').unwrap_or(quoted.len())],
+        None => command.split_whitespace().next().unwrap_or(""),
+    }
+}
+
+/// The value of `name` in one wxs element's text, in either quote style.
+#[cfg(target_os = "windows")]
+fn element_attribute<'a>(element: &'a str, name: &str) -> Option<&'a str> {
+    let at = element.find(&format!("{name}="))? + name.len() + 1;
+    let quote = element[at..].chars().next()?;
+    assert!(quote == '"' || quote == '\'', "{name} is quoted in {element:?}");
+    let rest = &element[at + 1..];
+    Some(&rest[..rest.find(quote)?])
 }
 
 // The log directory is the user's to swap =============================================================================

@@ -2715,7 +2715,7 @@ value is the stamp of the process that wrote it, `<pid>:<creation FILETIME>`
 
 ##### What the MSI must guarantee for the keep-covers path to be safe
 
-Two `hole.wxs` properties, both of which the release depends on and neither of
+Three `hole.wxs` properties, all of which the release depends on and none of
 which is visible from the Rust side.
 
 - **`MajorUpgrade Schedule="afterInstallInitialize"`.** The upgrade path
@@ -2737,10 +2737,96 @@ which is visible from the Rust side.
   `test_major_upgrade_removes_the_old_product_before_the_new_files_land`).
 - **`BridgeUninstallRollback`.** `BridgeRelease` is `Return="check"` and runs
   immediately after `BridgeUninstall`, so a failed release rolls back an
-  uninstall whose service teardown already happened. The rollback action
-  re-runs exactly what `BridgeInstall` runs, so the product is left as the
-  uninstall found it rather than installed-but-deregistered. MSI ignores a
-  rollback action's return value, so it can only add recovery.
+  uninstall whose service teardown already happened. The rollback action runs
+  `bridge install` (registers and starts, unlike `BridgeInstall`'s
+  `--no-start`), so the product is left as the uninstall found it rather than
+  installed-but-deregistered. MSI ignores a rollback action's return value, so
+  it can only add recovery.
+- **`BridgeInstall` registers; `BridgeStart` starts, at commit.** A bridge
+  started inside the transaction runs its recovery and reconcile and can write
+  state in the new format, and a later failure (a cancelled progress dialog,
+  `PathAdd`) rolls back to the old product over files its bridge cannot read.
+  `BridgeInstall` runs `bridge install --no-start` (hidden; Windows only), and
+  `BridgeStart` runs `bridge start` (hidden) as a `commit` custom action: it
+  runs on the server, elevated, only when the script has run to its end. An
+  immediate action after `InstallFinalize`, like `LaunchApp`, would run as the
+  installing user, who cannot start a service. The start decision lives once
+  (`setup::repair_then_start`): `bridge install` and `bridge start` both repair
+  the start type first, so a service an administrator disabled stays stopped,
+  and a service already running or starting is success. A service that is
+  stopping fails the start and rolls the install back. No install step stops the
+  service it starts (`BridgeInstall` registered it unstarted after settling any
+  older instance), so a stop at commit is someone else's act; a wait would hold
+  the MSI and every retirement on the start-type lock for as long as that stop
+  takes.
+  - **A failed start rolls the whole upgrade back** (`Return="check"`): the
+    host is never left with no bridge and a success exit.
+    `BridgeStart` is the **only** commit action: a failing commit action
+    rolls back whatever is still in the script, so a second one could undo a
+    start that already ran.
+    - A `StartService` that fails outright fails before the new bridge's
+      service main runs, so the rollback meets nothing the new bridge wrote.
+    - **Residual: a start answered "already running" by a service that is not
+      up** (`StartFailure::NotServing`: stopping, paused, or stopped with its
+      process not yet exited). That instance was started by someone else after
+      `BridgeInstall` registered the service, so it is the new bridge and its
+      service main has run: it may have written state, and the rollback then
+      restores the old product over that state. The start fails the upgrade
+      rather than report a bridge that is going away, but it cannot undo what
+      that instance did. Disclosed, not closed: nothing in the install stops
+      the instance, and a wait for it would hold the start-type lock.
+  - **A commit action does not run when rollback is disabled**
+    (`DISABLEROLLBACK=1`, the `DisableRollback` policy, "continue without
+    rollback" on low disk). `BridgeStartNoRollback`, a deferred copy of the
+    same command conditioned on `RollbackDisabled`, starts the bridge then;
+    `BridgeStart` carries `NOT RollbackDisabled`, so exactly one runs.
+  - **`BridgeInstallRollback`** runs `bridge uninstall --keep-covers` when the
+    transaction rolls back, so a rolled-back fresh install does not leave an
+    Automatic service naming a deleted `hole.exe`. It undoes only what
+    `BridgeInstall` registered; each product's rollback restores its own state.
+    On an upgrade the old product's `BridgeUninstall` has already deregistered
+    the old service, and the old product's own `BridgeUninstallRollback` (run
+    by the old `hole.exe` once its files are back) registers and starts it,
+    which re-adopts a standing cover. `--keep-covers` leaves that cover to the
+    old bridge. Releases without `BridgeUninstallRollback` (0.5.0, 0.6.0) end a
+    rolled-back upgrade with the old files and no service; the way back is the
+    old GUI's install prompt on Connect (0.6.0: `tray.rs`, `setup.rs`). That
+    case is read from those releases' code at their tags, not measured: M1
+    below upgrades from a byte-identical copy of the same tree. A fresh
+    install leaves any cover as it found it: this transaction started no
+    bridge, so no cover on the host is its own.
+  - **The kill-switch-off window is longer.** With the kill switch off there
+    is no cover, and the host has no bridge from the old bridge's
+    `BridgeUninstall` (inside `RemoveExistingProducts`, scheduled
+    `afterInstallInitialize`) until the commit, the rest of the install,
+    where it used to end at `InstallFiles`. With the kill switch on, the
+    standing cover holds the whole window.
+  - Pinned against the built MSI's `CustomAction` types by
+    `test_bridge_start_is_the_only_commit_action_and_it_fails_the_install_in_place`,
+    `test_bridge_start_without_rollback_is_in_script_and_fails_the_install_in_place`,
+    `test_the_two_starts_have_exclusive_conditions` and
+    `test_bridge_install_rollback_partner_is_a_rollback_action`, and against
+    the source by the `test_bridge_*` tests in `test_hole_wxs.py`. That the
+    commit action starts the service on a real install is checked by CI's
+    "Verify install" step (which also runs `bridge start` on the running
+    service). The rollback behaviour is measured on the real installer by CI's
+    `installer-measure-upgrade-rollback` step (`.github/scripts/measure-msi-upgrade-rollback.ps1`,
+    results in the step summary): **M1** a failing `BridgeStart` makes a
+    major upgrade exit 1603 with the old product installed again, the new
+    product's registry marker gone and the bridge running (asserted). The
+    marker's absence shows the new product's registry write was rolled back;
+    it does not show that the restored `hole.exe` is the old file, which M1
+    cannot tell apart (the variants' `hole.exe` is byte-identical to the
+    original's, so file identity cannot change behaviour here). **M2a**
+    the shipped MSI with `DISABLEROLLBACK=1` lays the new product (the marker)
+    and leaves the bridge running (asserted); **M2b** whether a commit action
+    runs with rollback disabled, read from a `gui-cli.log` in a log folder only the
+    variant's `BridgeStart` writes to (`--log-dir`; no other action does) and
+    recorded (if it does, the in-script row is redundant and goes), runs only
+    in a `workflow_dispatch` run. The upgrade targets are byte-identical copies
+    of the built MSI with a bumped version, so `hole.exe` cannot tell the old
+    product from the new; the marker (a registry value in the `HoleExe`
+    component) is what tells the new product's presence.
 
 ##### What the gate can prove, and what it only attempted
 

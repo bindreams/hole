@@ -4,6 +4,7 @@ Builds an MSI with dummy binaries, then validates it via ICE checks and
 table inspection. Windows-only, requires WiX toolchain.
 """
 
+import ctypes
 import platform
 import shutil
 import struct
@@ -183,14 +184,21 @@ def _get_decompiled_sequence_map(tree: ET.ElementTree) -> dict[str, dict]:
 
 
 def test_sequence_install_order(decompiled_tree: ET.ElementTree) -> None:
-    """Install CAs must be ordered: InstallFiles < BridgeInstall < PathAdd."""
+    """Install CAs must be ordered: InstallFiles < BridgeInstallRollback < BridgeInstall < PathAdd.
+
+    The rollback partner is scripted immediately before the action it undoes, so the decompiler reports
+    BridgeInstall as following it. The starts' place is pinned by test_the_starts_run_after_the_last_registration_step.
+    """
     entries = _get_decompiled_sequence_map(decompiled_tree)
 
-    assert "BridgeInstall" in entries, "BridgeInstall not found in InstallExecuteSequence"
-    assert "PathAdd" in entries, "PathAdd not found in InstallExecuteSequence"
+    for action in ("BridgeInstallRollback", "BridgeInstall", "PathAdd"):
+        assert action in entries, f"{action} not found in InstallExecuteSequence"
 
-    assert entries["BridgeInstall"]["after"] == "InstallFiles", (
-        f"BridgeInstall should be After='InstallFiles', got After='{entries['BridgeInstall']['after']}'"
+    assert entries["BridgeInstallRollback"]["after"] == "InstallFiles", (
+        f"BridgeInstallRollback should be After='InstallFiles', got After='{entries['BridgeInstallRollback']['after']}'"
+    )
+    assert entries["BridgeInstall"]["after"] == "BridgeInstallRollback", (
+        f"BridgeInstall should be After='BridgeInstallRollback', got After='{entries['BridgeInstall']['after']}'"
     )
     assert entries["PathAdd"]["after"] == "BridgeInstall", (
         f"PathAdd should be After='BridgeInstall', got After='{entries['PathAdd']['after']}'"
@@ -511,3 +519,143 @@ def test_verifyreadydlg_back_override_wins(decompiled_tree: ET.ElementTree) -> N
         f"Last NewDialog row (Condition='NOT Installed') for (VerifyReadyDlg, Back) is "
         f"'{targets[-1]}', not 'ShortcutsDlg'. Full sequence: {targets}."
     )
+
+
+# CustomAction types of the built MSI ==================================================================================
+#
+# The decompiled XML decodes the Type column; the bits themselves are what the installer reads, so the commit
+# start's safety argument is pinned on them. Type bits: msidbCustomActionType{Continue=0x40, Async=0x80,
+# Rollback=0x100, Commit=0x200, InScript=0x400} (Windows Installer SDK, "Custom Action Return Processing Options" and
+# "Custom Action Execution Scheduling Options"). 0x200 alone, on an immediate action, is OncePerProcess;
+# it is a commit action only together with InScript (0x400). Continue (0x40) ignores the action's failure.
+# Async (0x80) without Continue (asyncWait) still fails the install, but the installer reads the outcome at the
+# end of the sequence, not where the action sits in the script; so an action whose failure must be met at its place
+# carries neither.
+
+_CA_CONTINUE = 0x40
+_CA_ASYNC = 0x80
+_CA_ROLLBACK = 0x100
+_CA_COMMIT = 0x200
+_CA_IN_SCRIPT = 0x400
+_CA_COMMIT_ACTION = _CA_COMMIT | _CA_IN_SCRIPT
+_CA_FAILURE_NOT_MET_AT_ITS_PLACE = _CA_CONTINUE | _CA_ASYNC
+
+
+def _is_commit_action(type_: int) -> bool:
+    return type_ & _CA_COMMIT_ACTION == _CA_COMMIT_ACTION
+
+
+def _msi_rows(msi: Path, query: str, columns: int) -> list[tuple]:
+    """Run a read-only SQL query over an MSI database (msi.dll), returning each row as a tuple of str|int|None."""
+    lib = ctypes.WinDLL("msi")
+    handle = ctypes.c_ulong
+    lib.MsiOpenDatabaseW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.POINTER(handle)]
+    lib.MsiDatabaseOpenViewW.argtypes = [handle, ctypes.c_wchar_p, ctypes.POINTER(handle)]
+    lib.MsiViewExecute.argtypes = [handle, handle]
+    lib.MsiViewFetch.argtypes = [handle, ctypes.POINTER(handle)]
+    lib.MsiRecordGetStringW.argtypes = [handle, ctypes.c_uint, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
+    lib.MsiRecordIsNull.argtypes = [handle, ctypes.c_uint]
+    lib.MsiRecordIsNull.restype = ctypes.c_int
+    lib.MsiCloseHandle.argtypes = [handle]
+
+    def check(rc: int, what: str) -> None:
+        assert rc == 0, f"{what} failed with Windows error {rc}"
+
+    db, view = handle(), handle()
+    # A null mode pointer is MSIDBOPEN_READONLY.
+    check(lib.MsiOpenDatabaseW(str(msi), None, ctypes.byref(db)), "MsiOpenDatabase")
+    try:
+        check(lib.MsiDatabaseOpenViewW(db, query, ctypes.byref(view)), f"MsiDatabaseOpenView({query!r})")
+        try:
+            check(lib.MsiViewExecute(view, 0), "MsiViewExecute")
+            rows = []
+            while True:
+                record = handle()
+                rc = lib.MsiViewFetch(view, ctypes.byref(record))
+                if rc == 259:  # ERROR_NO_MORE_ITEMS
+                    return rows
+                check(rc, "MsiViewFetch")
+                row = []
+                for column in range(1, columns + 1):
+                    if lib.MsiRecordIsNull(record, column):
+                        row.append(None)
+                        continue
+                    size = ctypes.c_ulong(0)
+                    lib.MsiRecordGetStringW(record, column, ctypes.create_unicode_buffer(1), ctypes.byref(size))
+                    buffer = ctypes.create_unicode_buffer(size.value + 1)
+                    size = ctypes.c_ulong(size.value + 1)
+                    check(lib.MsiRecordGetStringW(record, column, buffer, ctypes.byref(size)), "MsiRecordGetString")
+                    row.append(buffer.value)
+                lib.MsiCloseHandle(record)
+                rows.append(tuple(row))
+        finally:
+            lib.MsiCloseHandle(view)
+    finally:
+        lib.MsiCloseHandle(db)
+
+
+@pytest.fixture(scope="session")
+def custom_action_types(built_msi: Path) -> dict[str, int]:
+    return {
+        action: int(type_) for action, type_ in _msi_rows(built_msi, "SELECT `Action`, `Type` FROM `CustomAction`", 2)
+    }
+
+
+@pytest.fixture(scope="session")
+def execute_conditions(built_msi: Path) -> dict[str, str]:
+    rows = _msi_rows(built_msi, "SELECT `Action`, `Condition` FROM `InstallExecuteSequence`", 2)
+    return {action: condition or "" for action, condition in rows}
+
+
+def test_bridge_start_is_the_only_commit_action_and_it_fails_the_install_in_place(
+    custom_action_types: dict[str, int],
+) -> None:
+    """A failing commit action rolls back whatever is still in the script, so it is safe only as the last one.
+
+    A failed start rolls the whole upgrade back; safe because StartService fails only before the new
+    bridge's service main runs, and this is the only commit action. Any other commit action (an extension's
+    included) could be rolled back over a start that already ran.
+    """
+    commit_actions = sorted(a for a, t in custom_action_types.items() if _is_commit_action(t))
+    assert commit_actions == ["BridgeStart"], f"BridgeStart must be the only commit custom action, got {commit_actions}"
+
+    start = custom_action_types["BridgeStart"]
+    assert not start & _CA_ROLLBACK, f"BridgeStart must not be a rollback action: {start:#x}"
+    assert not start & _CA_FAILURE_NOT_MET_AT_ITS_PLACE, (
+        f"BridgeStart's failure must be met at its place in the script (neither continue nor async): {start:#x}"
+    )
+
+
+def test_bridge_start_without_rollback_is_in_script_and_fails_the_install_in_place(
+    custom_action_types: dict[str, int],
+) -> None:
+    """The start that runs when rollback is disabled is neither a commit nor a rollback action, and its failure is met in place."""
+    start = custom_action_types["BridgeStartNoRollback"]
+    assert start & _CA_IN_SCRIPT, f"must be a deferred (in-script) action: {start:#x}"
+    assert not start & (_CA_COMMIT | _CA_ROLLBACK | _CA_FAILURE_NOT_MET_AT_ITS_PLACE), (
+        f"must be neither commit, rollback, continue nor async: {start:#x}"
+    )
+
+
+def test_the_two_starts_have_exclusive_conditions(execute_conditions: dict[str, str]) -> None:
+    install = "NOT Installed AND NOT REMOVE"
+    assert execute_conditions["BridgeStart"] == f"{install} AND NOT RollbackDisabled"
+    assert execute_conditions["BridgeStartNoRollback"] == f"RollbackDisabled AND {install}"
+    assert execute_conditions["BridgeInstallRollback"] == execute_conditions["BridgeInstall"], (
+        "the rollback partner runs when, and only when, the action it undoes does"
+    )
+
+
+def test_the_starts_run_after_the_last_registration_step(built_msi: Path) -> None:
+    rows = _msi_rows(built_msi, "SELECT `Action`, `Sequence` FROM `InstallExecuteSequence`", 2)
+    sequence = {action: int(number) for action, number in rows}
+    for start in ("BridgeStart", "BridgeStartNoRollback"):
+        assert sequence[start] > sequence["PathAdd"] > sequence["BridgeInstall"], (
+            f"{start} must be scripted after PathAdd, itself after BridgeInstall: {sequence}"
+        )
+
+
+def test_bridge_install_rollback_partner_is_a_rollback_action(custom_action_types: dict[str, int]) -> None:
+    partner = custom_action_types["BridgeInstallRollback"]
+    assert partner & _CA_ROLLBACK and partner & _CA_IN_SCRIPT, f"{partner:#x}"
+    assert partner & _CA_CONTINUE, f"a rollback action's failure is ignored: {partner:#x}"

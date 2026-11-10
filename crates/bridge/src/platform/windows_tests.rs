@@ -270,11 +270,11 @@ fn a_change_that_spans_several_steps_waits_for_another_holder_before_its_first()
 
 #[skuld::test]
 fn every_step_of_a_change_opens_under_the_hold_of_its_own_thread_without_waiting() {
-    use repair_session::{ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
+    use repair_session::{READ_ACCESS, REPAIR_ACCESS};
 
     let lock = StartTypeLock::scratch("hold-steps");
     let hold = hold_start_type_noting(&lock, || panic!("nothing held it")).expect("hold");
-    for access in [READ_ACCESS, REPAIR_ACCESS, ENABLE_ACCESS] {
+    for access in [READ_ACCESS, REPAIR_ACCESS] {
         let step = RepairSession::open_noting(&lock, access, || panic!("this thread holds it: {access:?}"))
             .expect("open a repair or an enable");
         drop(step);

@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone)]
-struct VecWriter {
-    inner: Arc<Mutex<Vec<u8>>>,
+pub(crate) struct VecWriter {
+    pub(crate) inner: Arc<Mutex<Vec<u8>>>,
 }
 
 impl std::io::Write for VecWriter {

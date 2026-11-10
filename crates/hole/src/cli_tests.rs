@@ -222,6 +222,8 @@ fn dispatch_installs_cli_log_guard_for_write_actions() {
         action: BridgeAction::Install {
             log_dir: None,
             repair_user_data_dir: None,
+            #[cfg(target_os = "windows")]
+            no_start: false,
         },
     }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
@@ -571,6 +573,7 @@ fn bridge_install_parses_with_no_flags() {
         action: BridgeAction::Install {
             log_dir,
             repair_user_data_dir,
+            ..
         },
     }) = cli.command
     else {
@@ -633,6 +636,7 @@ fn bridge_install_parses_both_flags() {
         action: BridgeAction::Install {
             log_dir,
             repair_user_data_dir,
+            ..
         },
     }) = cli.command
     else {
@@ -640,6 +644,55 @@ fn bridge_install_parses_both_flags() {
     };
     assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/L")));
     assert_eq!(repair_user_data_dir, Some(std::path::PathBuf::from("/tmp/R")));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[skuld::test]
+fn bridge_install_has_no_no_start_flag_off_windows() {
+    assert!(Cli::try_parse_from(["hole", "bridge", "install", "--no-start"]).is_err());
+}
+
+// The MSI invokes `bridge install --no-start` inside its transaction and `bridge start` at its commit; a rename here
+// silently breaks the installer's ordering.
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn bridge_install_starts_the_service_unless_told_not_to() {
+    let parse = |args: &[&str]| {
+        let cli = Cli::try_parse_from(args).expect("parse bridge install");
+        let Some(Command::Bridge {
+            action: BridgeAction::Install { no_start, .. },
+        }) = cli.command
+        else {
+            panic!("expected Command::Bridge::Install");
+        };
+        no_start
+    };
+    assert!(!parse(&["hole", "bridge", "install"]));
+    assert!(parse(&["hole", "bridge", "install", "--no-start"]));
+}
+
+#[skuld::test]
+fn bridge_start_takes_only_a_log_dir() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "start"]).expect("parse bridge start");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Bridge {
+            action: BridgeAction::Start { log_dir: None }
+        })
+    ));
+
+    let dir = r"C:\ProgramData\hole\logs";
+    let cli = Cli::try_parse_from(["hole", "bridge", "start", "--log-dir", dir]).expect("parse bridge start --log-dir");
+    let cmd = cli.command.expect("a command");
+    let Command::Bridge {
+        action: BridgeAction::Start { log_dir },
+    } = &cmd
+    else {
+        panic!("not start");
+    };
+    assert_eq!(log_dir, &Some(std::path::PathBuf::from(dir)));
+    assert_eq!(resolve_cli_log_dir(&cmd), Some(std::path::PathBuf::from(dir)));
 }
 
 // `bridge log --log-dir` position-independence ========================================================================
@@ -744,6 +797,8 @@ fn resolve_cli_log_dir_honors_install_log_dir_override() {
         action: BridgeAction::Install {
             log_dir: Some(custom.clone()),
             repair_user_data_dir: None,
+            #[cfg(target_os = "windows")]
+            no_start: false,
         },
     };
     let resolved = resolve_cli_log_dir(&cmd);
@@ -756,6 +811,8 @@ fn resolve_cli_log_dir_falls_back_to_default_without_override() {
         action: BridgeAction::Install {
             log_dir: None,
             repair_user_data_dir: None,
+            #[cfg(target_os = "windows")]
+            no_start: false,
         },
     };
     let resolved = resolve_cli_log_dir(&cmd);
@@ -1314,4 +1371,49 @@ fn a_state_dir_with_no_absolute_form_is_an_error() {
     let err = super::absolute_state_dir(std::path::PathBuf::new()).unwrap_err();
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+// A failed bridge command reaches the log with its cause chain ========================================================
+
+/// A failure whose cause is only reachable through `source()`, the shape of
+/// the bridge's typed start failures.
+#[derive(Debug)]
+struct Outer(std::io::Error);
+
+impl std::fmt::Display for Outer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the status could not be read")
+    }
+}
+
+impl std::error::Error for Outer {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[skuld::test]
+fn a_failed_bridge_command_logs_its_error_with_every_cause() {
+    use crate::cli_log::cli_log_tests::VecWriter;
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(VecWriter { inner: buf.clone() })
+        .with_ansi(false)
+        .event_format(hole_common::logging::yaml_format::YamlFormat)
+        .finish();
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+    let cause = std::io::Error::from_raw_os_error(5);
+    let cause_text = cause.to_string();
+    let failure: Box<dyn std::error::Error> = Box::new(std::io::Error::other(Outer(cause)));
+    report_bridge_failure("bridge start", &*failure, "");
+
+    let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let top = logged
+        .find("the status could not be read")
+        .unwrap_or_else(|| panic!("the top of the chain is logged: {logged}"));
+    let below = logged
+        .find(&cause_text)
+        .unwrap_or_else(|| panic!("the cause is logged: {logged}"));
+    assert!(top < below, "outermost first: {logged}");
 }
