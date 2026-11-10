@@ -153,14 +153,10 @@ async fn run_inner(
     version: &str,
     owner: Option<(u32, u32)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
-        ProxyManager::new(
-            ShadowsocksProxy::new(),
-            SystemRouting::new(state_dir.to_path_buf(), owner),
-        )
-        .with_state_dir(state_dir.to_path_buf())
-        .with_state_owner(owner),
-    ));
+    let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(ProxyManager::new(
+        ShadowsocksProxy::new(),
+        SystemRouting::new(state_dir.to_path_buf(), owner),
+    )));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
     // Bind BEFORE the liveness acquire and BEFORE recovery. If a second
@@ -169,14 +165,7 @@ async fn run_inner(
     // matching crate::liveness's documented invariant (BridgeLiveness::acquire's
     // doc: "a second real bridge instance never reaches this call — the IPC
     // socket bind already refuses it first").
-    let server = crate::ipc::IpcServer::bind_with_dirs(
-        socket_path,
-        proxy,
-        version,
-        log_dir.to_path_buf(),
-        state_dir.to_path_buf(),
-        owner,
-    )?;
+    let server = crate::ipc::IpcServer::bind_with_log_dir(socket_path, proxy, version, log_dir.to_path_buf())?;
 
     // Held for this bridge's entire run, from just after the socket bind to
     // process exit — see crate::liveness's module doc. Blocks (in
@@ -237,7 +226,7 @@ async fn run_inner(
 
     // Reconcile the persisted target before any client can connect (narrows,
     // does not close, the boot->first-connect gap).
-    crate::boot::recover_then_reconcile(state_dir, owner, &proxy_shutdown, &shutdown).await;
+    crate::boot::recover_then_reconcile(&proxy_shutdown, &shutdown).await;
 
     // Capture WFP + NDIS state after recovery has had a chance to clean
     // up. Each probe emits a one-line INFO (always) + WARN on anomaly +

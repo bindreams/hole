@@ -165,14 +165,35 @@ impl Routing for StubRouting {
             ipv6_available: false,
         })
     }
-    fn install_failclosed_cover(&self, _: IpAddr, _: Option<IpAddr>) -> Result<StubCover, RoutingError> {
+    fn install_failclosed_cover(
+        &self,
+        _: &tun_engine::routing::failclosed::CoverLock,
+        _: IpAddr,
+        _: Option<IpAddr>,
+    ) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
     }
-    fn install_lockdown(&self, _: IpAddr, _: &TunIdentity, _: &[PathBuf]) -> Result<StubCover, RoutingError> {
+    fn install_lockdown(
+        &self,
+        _: &tun_engine::routing::failclosed::CoverLock,
+        _: IpAddr,
+        _: &TunIdentity,
+        _: &[PathBuf],
+    ) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
     }
-    fn release_all_covers(&self) -> Result<(), RoutingError> {
+    fn release_all_covers(&self, _: &tun_engine::routing::failclosed::CoverLock) -> Result<(), RoutingError> {
         Ok(())
+    }
+    fn lock_covers(&self) -> tun_engine::routing::failclosed::CoverLock {
+        tun_engine::routing::failclosed::CoverLock::acquire(self.state_dir())
+    }
+    fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
+    }
+
+    fn owner(&self) -> Option<(u32, u32)> {
+        None
     }
     fn lockdown_cover_presence(&self) -> tun_engine::routing::CoverPresence {
         tun_engine::routing::CoverPresence::Absent
@@ -202,6 +223,10 @@ impl Drop for StubCover {
 
 impl tun_engine::routing::CoverGuard for StubCover {
     fn disarm(self) {}
+    fn release(self, _: &tun_engine::routing::failclosed::CoverLock) {}
+    fn is_current(&self) -> bool {
+        true
+    }
 }
 
 fn test_socket_path(suffix: &str) -> PathBuf {

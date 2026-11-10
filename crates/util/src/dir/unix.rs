@@ -38,7 +38,10 @@ pub(super) struct Meta {
     pub dev: u64,
     pub ino: u64,
     pub uid: u32,
+    pub gid: u32,
     pub mode: u32,
+    /// The file's link count: how many names it has.
+    pub links: u64,
 }
 
 impl Meta {
@@ -111,7 +114,9 @@ fn meta_of(st: &libc::stat) -> Meta {
         dev: st.st_dev as u64,
         ino: st.st_ino as u64,
         uid: st.st_uid,
+        gid: st.st_gid,
         mode: u32::from(st.st_mode),
+        links: st.st_nlink as u64,
     }
 }
 
@@ -342,7 +347,7 @@ pub(super) fn is_vouched_for(dir: &File, file: &File) -> io::Result<bool> {
     })
 }
 
-/// What `fstat` says about a file opened to append to; the only input to [`trusted_appender`].
+/// What `fstat` says about a file: the only input to [`trusted_appender`] and [`ids_of`]'s refusals.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Facts {
     pub regular: bool,
@@ -351,11 +356,18 @@ pub(super) struct Facts {
     pub links: u64,
 }
 
+impl Facts {
+    /// A regular file with no other name. A second name is what a hard link a user planted adds, and a write
+    /// through one name changes the file at the other.
+    pub(super) fn is_a_regular_file_with_one_name(self) -> bool {
+        self.regular && self.links == 1
+    }
+}
+
 /// Whether a file found at a log's name is one a privileged writer may append to: a regular file with no other name
-/// (a second name is what a hard link a user planted adds) that `owner` owns. With no `owner`, no ownership is
-/// expected and any such file will do.
+/// that `owner` owns. With no `owner`, no ownership is expected and any such file will do.
 pub(super) fn trusted_appender(facts: Facts, owner: Option<(u32, u32)>) -> bool {
-    facts.regular && facts.links == 1 && owner.is_none_or(|(uid, _)| facts.uid == uid)
+    facts.is_a_regular_file_with_one_name() && owner.is_none_or(|(uid, _)| facts.uid == uid)
 }
 
 pub(super) fn is_own_file(file: &File, owner: Option<(u32, u32)>) -> io::Result<bool> {
@@ -378,6 +390,25 @@ pub(super) fn create_temp(dir: &File, name: &OsStr) -> io::Result<File> {
 pub(super) fn id_of(dir: &File, name: &OsStr) -> io::Result<Option<FileId>> {
     match fstatat_nofollow(dir.as_raw_fd(), &cstr(name)?) {
         Ok(meta) => Ok(Some((meta.dev, meta.ino))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+pub(super) fn ids_of(dir: &File, name: &OsStr) -> io::Result<Option<(u32, u32)>> {
+    match fstatat_nofollow(dir.as_raw_fd(), &cstr(name)?) {
+        Ok(meta) => {
+            let facts = Facts {
+                regular: meta.kind() == EntryKind::File,
+                uid: meta.uid,
+                links: meta.links,
+            };
+            match (facts.is_a_regular_file_with_one_name(), facts.regular) {
+                (true, _) => Ok(Some((meta.uid, meta.gid))),
+                (false, false) => Err(Refusal::NotRegular.into_io_error()),
+                (false, true) => Err(Refusal::ForeignFile.into_io_error()),
+            }
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
@@ -515,7 +546,14 @@ pub(super) fn secure_dir(dir: &File, owner: Option<(u32, u32)>, mode: Option<u32
 }
 
 pub(super) fn seal(file: &File, owner: Option<(u32, u32)>) -> io::Result<()> {
-    chown_best_effort(file, owner);
+    // A file already owned as asked is left alone: `fchown` to the owner it has is not needed.
+    let already = match owner {
+        Some((uid, gid)) => fstat(file.as_raw_fd()).is_ok_and(|meta| (meta.uid, meta.gid) == (uid, gid)),
+        None => false,
+    };
+    if !already {
+        chown_best_effort(file, owner);
+    }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 

@@ -13,7 +13,8 @@
 use std::path::Path;
 
 use super::super::{
-    ArmingWitness, Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, RoutingError, SweepOutcome,
+    ArmingWitness, Clearance, CoverKind, CoverLock, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, RoutingError,
+    SweepOutcome,
 };
 use super::{next_record, WitnessUpdate};
 
@@ -56,20 +57,45 @@ fn twin_removed() -> KeyObservation {
 /// Run one sweep against `state_dir`'s record, exactly as `release_all` and
 /// `disengage_lockdown` do — consult, fold, write back.
 fn sweep(state_dir: &Path, observations: &[KeyObservation]) -> Clearance {
-    super::super::sweep_with_witness(state_dir, None, |witness| {
-        SweepOutcome::completed(Clearance::from_observations(observations, witness))
+    sweep_under(&CoverLock::acquire(state_dir), observations)
+}
+
+/// [`sweep`] under a lock the caller already holds.
+fn sweep_under(lock: &CoverLock, observations: &[KeyObservation]) -> Clearance {
+    super::super::sweep_with_witness(lock, |witness| {
+        SweepOutcome::per_kind(Clearance::from_observations(observations, witness), [])
     })
     .expect("the sweep body cannot fail")
+}
+
+/// `sweep_with_witness` over a lock taken here for `state_dir`; `body` gets the lock for the writes a test makes
+/// from inside the sweep.
+fn sweep_with_lock(
+    state_dir: &Path,
+    body: impl FnOnce(&CoverLock, ArmingWitness) -> SweepOutcome,
+) -> Result<Clearance, RoutingError> {
+    let lock = CoverLock::acquire(state_dir);
+    super::super::sweep_with_witness(&lock, |witness| body(&lock, witness))
+}
+
+/// Arm `state_dir`'s record under its own lock, as an engage's commit does.
+fn arm(state_dir: &Path) {
+    super::record_armed(&CoverLock::acquire(state_dir), None);
 }
 
 /// A sweep that issued every delete, observed `observations`, and THEN found a
 /// failing code among them — the shape both Windows sweeps have, where no
 /// code is inspected until all of them are in.
 fn failing_sweep(state_dir: &Path, observations: &[KeyObservation]) -> RoutingError {
-    super::super::sweep_with_witness(state_dir, None, |witness| {
-        SweepOutcome::failed(
+    sweep_with_lock(state_dir, |_, witness| {
+        SweepOutcome::per_kind(
             Clearance::from_observations(observations, witness),
-            RoutingError::RouteSetup("the firewall refused one of the deletes".into()),
+            [(
+                CoverKind::Lockdown,
+                Some(RoutingError::RouteSetup(
+                    "the firewall refused one of the deletes".into(),
+                )),
+            )],
         )
     })
     .expect_err("the sweep body failed")
@@ -140,7 +166,7 @@ fn arming_then_unblocking_in_one_boot_clears_the_record_and_stays_clear() {
     // go quiet is an empty answer; that is
     // `an_empty_sibling_set_never_clears_a_recorded_twin`.
     let state = dir();
-    super::record_armed(state.path(), None);
+    arm(state.path());
 
     let off = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
     assert!(
@@ -175,7 +201,7 @@ fn an_uninstall_on_the_boot_that_armed_the_twin_watched_it_go() {
     // sweep took the record away with the object, and `RemoveFiles` deleting
     // the binary afterwards strands nothing.
     let state = dir();
-    super::record_armed(state.path(), None);
+    arm(state.path());
 
     let uninstall = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
     assert!(uninstall.is_proven(), "every key this sweep touched was watched going");
@@ -191,7 +217,7 @@ fn an_empty_sibling_set_never_clears_a_recorded_twin() {
     // the record off on it would consume the persisted witness exactly as the
     // live one was consumed, just one release later.
     let state = dir();
-    super::record_armed(state.path(), None);
+    arm(state.path());
 
     for round in 0..3 {
         let c = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
@@ -207,7 +233,7 @@ fn the_engage_records_the_twin_before_any_sweep_could_have_seen_it() {
     // held the evidence, so no sweep could have copied it; the engage is the
     // only site that knows the fact at the moment it becomes true.
     let state = dir();
-    super::record_armed(state.path(), None);
+    arm(state.path());
 
     let c = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
     assert_eq!(
@@ -278,7 +304,7 @@ fn a_sweep_that_never_reached_the_firewall_writes_nothing_down() {
     // would answer `Disarm` here and throw away what an earlier sweep learned,
     // on a failure that observed nothing at all.
     let armed = dir();
-    super::record_armed(armed.path(), None);
+    arm(armed.path());
     failing_sweep(armed.path(), &[]);
     assert_eq!(
         super::load(armed.path()),
@@ -319,7 +345,7 @@ fn a_record_at_another_schema_version_reports_rather_than_suppressing() {
 fn a_recorded_twin_survives_being_read_back() {
     let state = dir();
     assert_eq!(super::load(state.path()), ArmingWitness::Unset);
-    super::record_armed(state.path(), None);
+    arm(state.path());
     assert_eq!(super::load(state.path()), ArmingWitness::Armed);
 }
 
@@ -353,6 +379,67 @@ fn every_update_and_record_pair_has_one_write_answer() {
     for (current, update, want) in table {
         assert_eq!(next_record(current, update), want, "{current:?} + {update:?}");
     }
+}
+
+#[skuld::test]
+fn an_engage_after_a_disarming_sweep_arms_the_record() {
+    // The engage and the sweep cannot overlap (both hold the cover lock), so the order is one or the other: a sweep
+    // that watched its twins go disarms the record, and the next engage arms it again.
+    let state = dir();
+    arm(state.path());
+
+    let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
+    assert!(
+        c.leftover_keys().is_empty(),
+        "the sweep itself proved its own twins gone"
+    );
+    assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
+
+    arm(state.path());
+    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
+}
+#[skuld::test]
+fn a_disarming_sweep_over_an_armed_record_disarms_it() {
+    let state = dir();
+    arm(state.path());
+    let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
+    assert!(c.is_proven());
+    assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
+}
+#[skuld::test]
+fn a_sweep_that_leaves_the_record_does_no_i_o() {
+    // `Leave` says nothing about the record, so applying it must not open the directory: an open that fails would warn
+    // about a write nobody asked for.
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+
+    let root = dir();
+    let state = root.path().join("state");
+    std::fs::create_dir(&state).expect("state dir");
+    arm(&state);
+
+    let aside = root.path().join("aside");
+    std::fs::rename(&state, &aside).expect("move the state dir aside");
+    let link = util::dir::testing::state_dir_linked_to_a_system_folder(root.path());
+    assert_eq!(link, state, "guard: the link sits at the state dir's path");
+
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::apply(&CoverLock::acquire(&state), WitnessUpdate::Leave);
+    }
+    let logs = writer.snapshot();
+
+    std::fs::remove_dir_all(&link).expect("remove the link");
+    std::fs::rename(&aside, &state).expect("put the state dir back");
+
+    assert!(logs.is_empty(), "Leave warned about a write nobody asked for: {logs}");
 }
 
 #[skuld::test]
@@ -461,7 +548,7 @@ fn a_sweep_carrying_no_boot_time_key_at_all_leaves_the_record_alone() {
     // the twins left the sweep list — silently, and in the direction that
     // hurts.
     let state = dir();
-    super::record_armed(state.path(), None);
+    arm(state.path());
 
     let c = sweep(state.path(), &[sibling(KeyOutcome::Removed)]);
     assert!(c.is_proven(), "nothing in this sweep went unproven");
@@ -525,7 +612,7 @@ fn the_engage_arms_the_record_at_the_commit_and_nowhere_downstream_of_it() {
     // on passing over a body that had inlined the commit and kept only the
     // sentence about it.
     assert_eq!(
-        engage.matches("commit_and_record(engine, state_dir, owner)?").count(),
+        engage.matches("commit_and_record(engine, lock, owner)?").count(),
         1,
         "engage_lockdown must commit through commit_and_record, exactly once:\n{engage}"
     );

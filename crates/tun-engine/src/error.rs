@@ -32,7 +32,7 @@ impl RoutingError {
     /// instead of its path. One exhaustive match, so a new variant must choose.
     ///
     /// `RouteSetup` and `Gateway` text is built path-free at its sources: a
-    /// write failure names the `io::ErrorKind` only (`state_write_failed`), and
+    /// write failure names the `io::ErrorKind` only (`state_op_failed`), and
     /// the full error is logged.
     pub fn redacted(&self) -> String {
         match self {
@@ -43,23 +43,44 @@ impl RoutingError {
     }
 }
 
-#[cfg(target_os = "macos")]
+/// What was asked of a state file when it failed: the user is told which, so a clear is not "written".
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateOp {
+    /// A store or a rewrite.
+    Write,
+    /// A removal.
+    Clear,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl StateOp {
+    fn past_tense(self) -> &'static str {
+        match self {
+            StateOp::Write => "written",
+            StateOp::Clear => "cleared",
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 impl RoutingError {
-    /// A state file under `what` could not be written. The toast text names the
+    /// A state file under `what` could not be written or cleared (`op`). The toast text names the
     /// error's kind only (`tempfile`'s error text names the path); the full
     /// error goes to the log.
-    pub(crate) fn state_write_failed(what: &str, e: &util::versioned_file::StoreError) -> Self {
+    pub(crate) fn state_op_failed(op: StateOp, what: &str, e: &util::versioned_file::StoreError) -> Self {
         use util::versioned_file::StoreError;
-        tracing::error!(error = e as &dyn std::error::Error, "{what} could not be written");
+        let done = op.past_tense();
+        tracing::error!(error = e as &dyn std::error::Error, "{what} could not be {done}");
         let kind = match e {
             StoreError::Io(e) => e.kind(),
             StoreError::Encode(_) => std::io::ErrorKind::InvalidData,
-            // The pf records' role replaces what it cannot read, so no store of theirs is refused.
+            // The pf records' role replaces what it cannot read, so no store or removal of theirs is refused.
             StoreError::Unreadable { .. } | StoreError::ReadFailed { .. } => {
                 unreachable!("a pf record is never refused a store: {e}")
             }
         };
-        RoutingError::RouteSetup(format!("{what} could not be written ({kind})"))
+        RoutingError::RouteSetup(format!("{what} could not be {done} ({kind})"))
     }
 }
 

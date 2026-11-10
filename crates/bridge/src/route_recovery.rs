@@ -46,17 +46,17 @@ pub(crate) fn recover_bridge_routes(state_dir: &Path, owner: Option<(u32, u32)>)
 /// panicked task is logged and leaves the claim false — the conservative
 /// direction for the connect path, and the intent file still carries the tray's
 /// answer.
-pub async fn recover_and_record<P, R, D, F>(state_dir: &Path, proxy: &Arc<Mutex<ProxyManager<P, R, D>>>, recover: F)
+pub async fn recover_and_record<P, R, D, F>(proxy: &Arc<Mutex<ProxyManager<P, R, D>>>, recover: F)
 where
     P: Proxy,
     R: Routing,
     D: Dns,
     F: FnOnce(&Path, Option<(u32, u32)>) -> Recovery + Send + 'static,
 {
-    let dir = state_dir.to_path_buf();
-    // Taken from the manager rather than re-derived, so recovery's intent
-    // repair cannot chown to a different owner than the manager's own writes.
-    let owner = proxy.lock().await.state_owner();
+    let (dir, owner) = {
+        let routing = proxy.lock().await.routing_handle();
+        (routing.state_dir().to_path_buf(), routing.owner())
+    };
     let outcome = tokio::task::spawn_blocking(move || recover(&dir, owner)).await;
     record_recovery_outcome(outcome, proxy).await;
 }

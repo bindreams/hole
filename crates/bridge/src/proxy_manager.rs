@@ -45,11 +45,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
+use tun_engine::routing::failclosed::CoverLock;
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
 
+use crate::coverage::{CoverPlan, Coverage};
 use crate::reconciler::{teardown_cover_disposition, transient_cover_disposition, CoverDisposition};
 use crate::service_stop::{run_phase, StopPhase};
-use crate::target::{self, target_after, SessionEvent, Target};
+use crate::target::{self, target_after, SessionEvent};
 
 use crate::dns::self_test::{
     build_local_dns, implicates_plugin_transport, report_plugin_output, run_forwarder_self_test, self_test_error_for,
@@ -57,6 +59,8 @@ use crate::dns::self_test::{
 };
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
 use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals};
+use tun_engine::RoutingError;
+use util::versioned_file::StoreError;
 // `WINDOWS_TUN_ALIAS` only stands in for a real `TunIdentity` on the
 // `#[cfg(test)]` synthetic path below — the production path threads the
 // identity `Engine::build`/`Dispatcher::identity()` actually opened. Names no
@@ -65,6 +69,18 @@ use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, Shadowsocks
 // compiles for.
 #[cfg(test)]
 use crate::proxy::config::WINDOWS_TUN_ALIAS;
+
+/// Why [`ProxyManager::turn_lockdown_off`] did not complete, in the order its steps run. Both are for the log: the
+/// sentence the user sees is written by the IPC layer.
+#[derive(Debug, thiserror::Error)]
+pub enum LockdownOffError {
+    /// The release did not confirm; the intent is unchanged.
+    #[error("the covers could not be released")]
+    Release(#[source] RoutingError),
+    /// The release confirmed; only the setting did not save.
+    #[error("the kill-switch setting could not be saved")]
+    IntentNotSaved(#[source] StoreError),
+}
 
 /// Non-secret diagnostic view of a proxy-start event — suitable for
 /// YAML-shaped logging via `dump!`.
@@ -256,13 +272,6 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     udp_proxy_available: bool,
     /// Whether the upstream network has IPv6 connectivity.
     ipv6_bypass_available: bool,
-    /// State directory for plugin PID crash recovery. `None` in tests
-    /// that don't need crash recovery tracking.
-    state_dir: Option<std::path::PathBuf>,
-    /// uid/gid to chown persisted state files to. Set by an elevated
-    /// user-scoped run so the real user owns the files; `None` (the
-    /// default, and the `--service` daemon) leaves ownership as-is.
-    state_owner: Option<(u32, u32)>,
     /// "Startup recovery found a standing cover live this run" — see
     /// [`Self::set_standing_cover_adopted`] for the full contract.
     ///
@@ -271,14 +280,11 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// once a start honours this claim with a real `install_lockdown`. Holding
     /// both facts here is what let a plain disconnect disarm the switch.
     adopted_standing_cover: bool,
-    /// Set (lock-free) by `handle_unblock` via [`Self::cover_invalidation_handle`]
-    /// when it releases every OS-level cover from outside this manager's own
-    /// lock (R7: the escape must work even while a wedged teardown holds
-    /// `state.proxy.lock()`). `start_cancellable` consumes it — see the swap
-    /// at its top — the same way `turn_lockdown_off` drops a held transient
-    /// guard directly via `posture.take_pending()`, just reachable without
-    /// `&mut self`.
-    cover_invalidated: Arc<std::sync::atomic::AtomicBool>,
+    /// The count of Unblocks the tray has committed, shared with `IpcState::unblock_generation` (see
+    /// [`Self::unblock_generation_handle`]). The transient cover section compares it under the cover lock against
+    /// the snapshot in [`Coverage::Covered`]: an Unblock since then means the user released the cover the start is
+    /// about to engage.
+    unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only DoH querier override. Set by `set_bootstrap_querier_for_test`;
     /// when present, `start_cancellable` resolves via `resolve_via_doh_with`
     /// instead of the production `resolve_via_doh`.
@@ -344,11 +350,36 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
         }
     }
 
+    /// The held cover, if it is still the OS's: its install is current ([`CoverGuard::is_current`]), so no release
+    /// has taken it since. Every read of a held cover goes through this, so a cover a release took is never
+    /// reused, reported or trusted. A lock-free read: a section that decides over it reads it under the cover
+    /// lock, where the answer cannot change.
     fn pending(&self) -> Option<&BlockedStart<R::Cover>> {
         match self {
-            Posture::PendingStart(b) => Some(b),
-            _ => None,
+            Posture::PendingStart(b) if b.cover.is_current() => Some(b),
+            Posture::PendingStart(_) | Posture::Idle | Posture::Session(_) => None,
         }
+    }
+
+    /// Drop a held cover a release took, and keep one that is current.
+    fn reap_taken(&mut self) {
+        let taken = matches!(self, Posture::PendingStart(b) if !b.cover.is_current());
+        if taken {
+            self.take_pending();
+        }
+    }
+
+    /// Release the held cover under `lock` whatever its state, and report whether it was still the OS's: the
+    /// answer for a log that says a cover was released. The currency is read under the lock, where an Unblock
+    /// cannot change it, so a cover an Unblock already took is dropped silently and reports `false`.
+    #[must_use]
+    fn release_pending(&mut self, lock: &CoverLock) -> bool {
+        let Some(held) = self.take_pending() else {
+            return false;
+        };
+        let in_force = held.cover.is_current();
+        held.cover.release(lock);
+        in_force
     }
 
     /// Take the pending-start payload, leaving `Idle`. `None`, and the
@@ -364,15 +395,15 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
         }
     }
 
-    /// Contract: the posture is `Idle`. Provers: `start_cancellable`'s
+    /// Contract: no session, and no current held cover. Provers: `start_cancellable`'s
     /// `AlreadyRunning` guard rules out `Session`; the caller's own
     /// `self.posture.pending().is_none()` check, immediately before this
-    /// call, rules out an existing `PendingStart`.
+    /// call, rules out a current `PendingStart`. A held cover a release took is replaced, and its guard dropped.
     fn hold_pending(&mut self, held: BlockedStart<R::Cover>) {
         debug_assert!(
-            matches!(self, Posture::Idle),
-            "hold_pending: posture must be Idle — AlreadyRunning already ruled out a session, \
-             and the caller's own pending().is_none() check ruled out an existing pending start"
+            !matches!(self, Posture::Session(_)) && self.pending().is_none(),
+            "hold_pending: posture must hold no session and no standing cover — AlreadyRunning already ruled out a \
+             session, and the caller's own pending().is_none() check ruled out a standing pending start"
         );
         *self = Posture::PendingStart(held);
     }
@@ -414,10 +445,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             active_config: None,
             udp_proxy_available: true,
             ipv6_bypass_available: true,
-            state_dir: None,
-            state_owner: None,
             adopted_standing_cover: false,
-            cover_invalidated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             bootstrap_querier: None,
             #[cfg(test)]
@@ -433,41 +462,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         self.bootstrap_querier = Some(q);
     }
 
-    /// Clone of the shared routing handle. `bind_with_dirs`/`bind` derive
+    /// Clone of the shared routing handle. `IpcState::new` derives
     /// `IpcState::routing` from this — a `Mutex`-free clone taken once at
     /// bind time, uncontended since the `ProxyManager` is freshly
     /// constructed there — so the unblock escape can act on routing without
-    /// taking `state.proxy.lock()`.
+    /// taking `state.proxy.lock()`. The routing is also the one source of the
+    /// state directory (`Routing::state_dir`): the manager holds no copy.
     pub fn routing_handle(&self) -> Arc<R> {
         Arc::clone(&self.routing)
     }
 
-    /// Clone of the lock-free cover-invalidation signal. `bind_with_dirs`
-    /// derives `IpcState::cover_invalidated` from this, the same way it
-    /// derives `routing` from [`Self::routing_handle`] — taken once at bind
-    /// time, uncontended. `handle_unblock` sets it after releasing every
-    /// OS-level cover; [`Self::start_cancellable`] consumes it.
-    pub fn cover_invalidation_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        Arc::clone(&self.cover_invalidated)
-    }
-
-    /// Set the state directory for plugin PID crash recovery.
-    pub fn with_state_dir(mut self, dir: std::path::PathBuf) -> Self {
-        self.state_dir = Some(dir);
-        self
-    }
-
-    /// Set the owner (uid/gid) that persisted state files are chowned to.
-    pub fn with_state_owner(mut self, owner: Option<(u32, u32)>) -> Self {
-        self.state_owner = owner;
-        self
-    }
-
-    /// The owner every persisted-state write must carry. Read by
-    /// `crate::route_recovery` so crash recovery's intent repair chowns what it
-    /// creates the same way the manager's own writes do.
-    pub fn state_owner(&self) -> Option<(u32, u32)> {
-        self.state_owner
+    /// Clone of the Unblock counter. `IpcState::new` derives `IpcState::unblock_generation` from this, so the
+    /// handler that bumps it and the starts that read it share one counter.
+    pub fn unblock_generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.unblock_generation)
     }
 
     pub fn state(&self) -> ProxyState {
@@ -635,7 +643,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// about THIS attempt's own held cover) that the standing-cover probe
     /// does not measure at all.
     pub fn blocked_until_connected(&self) -> bool {
-        matches!(self.posture, Posture::PendingStart(_))
+        self.posture.pending().is_some()
     }
 
     #[cfg(test)]
@@ -687,9 +695,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// set. Without this, that unlock is invisible to the tray and the next
     /// connect re-engages the cover it just escaped.
     pub fn lockdown_enabled(&self) -> bool {
-        let Some(intent) = self.state_dir.as_deref().map(lockdown_state::load_intent) else {
-            return self.adopted_standing_cover;
-        };
+        let intent = lockdown_state::load_intent(self.routing.state_dir());
         !matches!(intent, lockdown_state::Intent::Off) && (self.adopted_standing_cover || intent.reads_armed())
     }
 
@@ -714,26 +720,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// after an out-of-process `hole bridge unlock` re-installs the cover the
     /// user just escaped.
     pub fn standing_cover_expected(&self) -> bool {
-        let Some(intent) = self.state_dir.as_deref().map(lockdown_state::load_intent) else {
-            return self.adopted_standing_cover;
-        };
+        let intent = lockdown_state::load_intent(self.routing.state_dir());
         !matches!(intent, lockdown_state::Intent::Off)
             && (self.adopted_standing_cover || intent.installs_standing_cover())
     }
 
-    /// Last-writer-wins absolute set of the lockdown intent. Persists to
-    /// `bridge-lockdown.json`. ERRORS when there is no state_dir: the bridge
-    /// cannot honor a kill switch it cannot persist (a silent `Ok(())` would be
-    /// a fail-open footgun — the GUI would believe lockdown is armed when
-    /// nothing was written).
-    pub fn set_lockdown_intent(&self, enabled: bool) -> Result<(), ProxyError> {
-        let dir = self.state_dir.as_deref().ok_or_else(|| {
-            ProxyError::Runtime(std::io::Error::other(
-                "cannot set lockdown intent: bridge has no state_dir to persist it",
-            ))
-        })?;
-        lockdown_state::set_enabled(dir, enabled, self.state_owner)
-            .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
+    /// Record the kill-switch intent as on in the routing's state directory, under the routing's cover lock.
+    /// Installs nothing: the next start engages the standing cover. ERRORS when the write fails: the bridge cannot
+    /// honor a kill switch it cannot persist (a silent `Ok(())` would be a fail-open footgun: the GUI would believe
+    /// lockdown is armed when nothing was written).
+    pub fn turn_lockdown_on(&self) -> Result<(), StoreError> {
+        let lock = self.routing.lock_covers();
+        lockdown_state::set_enabled(&lock, true, self.routing.owner())
     }
 
     /// Turn the kill-switch intent off, releasing the cover UNCONDITIONALLY.
@@ -766,18 +764,23 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// `hole bridge unlock` is still on disk. The uninstall gate
     /// (`cutover::release_covers`) is the one caller for which it is not, and
     /// it reads the `Clearance` this path drops.
-    pub fn turn_lockdown_off(&mut self) -> Result<(), ProxyError> {
+    pub fn turn_lockdown_off(&mut self) -> Result<(), LockdownOffError> {
+        let lock = self.routing.lock_covers();
         // Drop any held transient guard's in-process authority first. Not a
         // condition — a no-op when nothing is pending — it exists so no live
         // guard outlives the OS objects `release_all_covers` is about to
         // delete out from under it.
-        self.posture.take_pending();
+        if let Some(held) = self.posture.take_pending() {
+            held.cover.release(&lock);
+        }
 
         // Unconditional: `release_all_covers` is documented idempotent, so
         // gating it on a presence probe is a check-then-act guard on an
         // operation that needs none — and at an explicit disarm a stale
         // `Absent` is the one wrong answer that matters.
-        self.routing.release_all_covers()?;
+        self.routing
+            .release_all_covers(&lock)
+            .map_err(LockdownOffError::Release)?;
         // The clear confirmed, so the host is open: an adopted cover no
         // longer holds it. Dropping this claim is what stops the tray
         // from rendering `Lockdown: On` over an open host for the life
@@ -788,10 +791,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // the host is open, or `cover_step` said none needed releasing; a
         // persist failure here means only the SETTING did not save, which
         // the caller must be able to say distinctly from a failed release.
-        self.set_lockdown_intent(false)
-            .map_err(|source| ProxyError::LockdownIntentNotPersisted {
-                source: Box::new(source),
-            })
+        lockdown_state::set_enabled(&lock, false, self.routing.owner()).map_err(LockdownOffError::IntentNotSaved)
     }
 
     /// Non-cancellable convenience wrapper around
@@ -803,7 +803,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[allow(clippy::disallowed_methods)]
         // Non-cancellable shim: callers explicitly opt out of cancel semantics. See clippy.toml CancellationToken::new rule.
         let token = CancellationToken::new();
-        self.start_cancellable(config, false, token).await
+        self.start_cancellable(config, Coverage::Uncovered, token).await
     }
 
     /// Start the proxy with a caller-supplied `CancellationToken`.
@@ -832,10 +832,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    late cancel cannot race the commit. The started session is left
     ///    running, plugin chain included; the client sees `Ok(())`. A caller
     ///    that wanted to cancel that late can follow up with an explicit stop.
+    ///
     pub async fn start_cancellable(
         &mut self,
         config: &ProxyConfig,
-        covered: bool,
+        coverage: Coverage,
         cancel: CancellationToken,
     ) -> Result<(), ProxyError> {
         debug!(
@@ -850,20 +851,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if self.posture.session().is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
-
-        // A lock-free `handle_unblock` may have released every OS-level
-        // cover while this manager wasn't holding the lock. Any
-        // `PendingStart` we're still carrying is now a zombie: the OS
-        // objects it claims to hold are already gone. Drop it before the
-        // reuse checks below (`repair_fallback`, the `pending().is_none()`
-        // gate) can trust it — `take_pending()` is a no-op when nothing is
-        // pending, and the dropped guard's own Drop is idempotent against
-        // an already-cleared cover on both platforms, so this is safe
-        // whether or not anything was actually held. `swap` both reads and
-        // clears in one step, so this consumes the signal exactly once.
-        if self.cover_invalidated.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            self.posture.take_pending();
-        }
+        // `handle_unblock` takes no `state.proxy` lock, so it may have released every OS-level cover while this
+        // manager was not holding it. A `PendingStart` whose cover it took is a zombie: the OS objects it claims
+        // to hold are gone. Drop it before the reuse checks below can trust it (`pending()` filters it out too).
+        self.posture.reap_taken();
 
         // A (re)start supersedes any prior out-of-band death — clear the death
         // reason regardless of this attempt's outcome.
@@ -882,9 +873,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .posture
             .pending()
             .is_some_and(|b| b.host != config.server.server.expose());
-        if stale {
-            debug_assert!(self.posture.pending().is_some(), "stale implies a held cover");
-            self.posture.take_pending();
+        if stale && self.release_held_cover() {
             warn!("start for a different server while blocked: releasing the held cover before re-resolving");
         }
 
@@ -898,19 +887,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
                 Ok(b) => (b.server_ip, b.via),
+                Err(ProxyError::Cancelled) => return Err(self.cancelled_start()),
                 Err(e) => {
-                    if !matches!(e, ProxyError::Cancelled) {
-                        self.last_error = Some(e.to_string());
-                        // A covered start that can't resolve has no IP to permit, so no
-                        // cover can engage: the block-until-connected intent falls open
-                        // here — logged so the gap is visible, not silent.
-                        if covered {
-                            warn!(
-                                error = &e as &dyn std::error::Error,
-                                "covered start could not resolve the server; host NOT blocked (no IP to permit)"
-                            );
-                        }
-                    }
+                    self.last_error = Some(e.to_string());
+                    // No IP: this start engaged no cover. The presence is the probe's read at this moment, logged as
+                    // measured.
+                    warn!(
+                        error = &e as &dyn std::error::Error,
+                        ?coverage,
+                        cover_presence = ?self.cover_presence(),
+                        "could not resolve the server; this start engaged no cover"
+                    );
                     return Err(e);
                 }
             },
@@ -979,172 +966,50 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             "failclosed cover resolver permit"
         );
 
-        // Engage the block-until-connected cover for a covered start UNLESS a
-        // standing cover is expected: that cohort installs the lockdown cover
-        // at routing.install, and engaging the transient cover too would (on macOS)
-        // clobber the singular pf ruleset. A corrupt or absent lockdown-state
-        // file resolves to NOT STANDING — the fail-SAFE direction (we engage,
-        // blocking not leaking).
+        // A corrupt or absent lockdown-state file resolves to NOT STANDING — the
+        // fail-SAFE direction (we engage, blocking not leaking).
         let lockdown_on = self.standing_cover_expected();
 
-        // A held cover's resolver_permit is fixed at engage time; re-engage
-        // whenever this attempt's fresh derivation DIFFERS from what the
-        // held cover already has — a narrowing to `None` (e.g. the plugin
-        // was removed, or `effective_ech_doh` no longer resolves to
-        // `Holes`) drifts too: leaving a wider-than-needed permit live is a
-        // real widening of the kill switch (the resolver permit carries no
-        // App-ID/process scoping on either platform, so it is available to
-        // every process on the host, not just the plugin chain), not a
-        // correction with no benefit. `repair_fallback` captures what's
-        // being given up: `Some((old_permit, original_pin))` means a good
-        // cover existed a moment ago, so a failed fresh engage below
-        // restores it instead of leaving the host uncovered. `original_pin`
-        // is `pin` BEFORE this attempt's own `revalidate` — see the repair
-        // arms below for why it, not the local `pin` variable, is what gets
-        // stored back.
-        //
-        // A retry whose desired permit still matches a value a PRIOR repair
-        // already proved unreachable is not treated specially — it repairs
-        // again like any other drift. The corrected engage's own failure
-        // could be transient (a momentary OS-level condition), not a
-        // lasting property of the value, so there is no principled way to
-        // tell "will fail again" from "would now succeed" without trying;
-        // skipping on a heuristic (e.g. a fixed number of retries) would
-        // just delay a correction that could have landed this attempt. Each
-        // attempt's release-to-reengage window is bounded to this one
-        // (user-paced) retry either way — see the restore fallback below.
-        let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
-            self.posture
-                .pending()
-                .filter(|b| b.host == config.server.server.expose() && b.resolver_permit != ech_resolver_permit)
-                .map(|b| (b.resolver_permit, b.pin))
-        } else {
-            None
-        };
-        if repair_fallback.is_some() {
-            // On macOS the drop reloads `/etc/pf.conf`, so the host is open until the
-            // re-engage below; re-engaging over the live cover instead is bindreams/hole#758.
-            self.posture.take_pending();
-            warn!(
-                "covered retry: this attempt's resolver permit differs from the held cover's; \
-                 releasing it so a fresh engage can correct it — egress is briefly OPEN until \
-                 the corrected (or, on failure, the restored) cover re-engages below"
-            );
-        }
-
-        if covered && !lockdown_on {
-            // The transient cover is a global singleton — never construct a second
-            // over the same objects. An engage failure proceeds UNCOVERED (aborting
-            // would leave the user unconnected AND unprotected), surfaced via last_error
-            // — UNLESS this was a repair (`repair_fallback` is `Some`), in which case
-            // the host was ALREADY covered a moment ago and a compensating re-engage
-            // of the OLD permit is attempted first: correcting a permit now takes
-            // BOTH the corrected AND the restore engage failing to lose the cover
-            // (the `Err(e2)` arm below), not one — never impossible, just
-            // narrowed from the ordinary single-engage failure case. On that
-            // double failure this attempt proceeds open, same as the
-            // non-repair case; the NEXT retry finds the posture holds no
-            // pending start and re-engages fresh from scratch.
-            if self.posture.pending().is_none() {
-                // A repair's corrected engage still carries forward the
-                // ORIGINAL cover's `pin`, not this attempt's locally
-                // revalidated `pin`: `pin` (the struct field) records when
-                // the SERVER IP was resolved, a fact independent of which
-                // ECH resolver this attempt's permit needs — `revalidate`
-                // only ever downgrades (`Answered` -> `ResolverDeselected`),
-                // so persisting an already-downgraded value here would make
-                // that loss permanent, unrecoverable even once the original
-                // resolver returns to `dns.servers`. A fresh (non-repair)
-                // engage has no prior cover to preserve, so `pin` (fresh
-                // from resolve, or a first same-host reuse) is correct as-is.
-                let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
-                match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
-                    Ok(cover) => {
-                        self.posture.hold_pending(BlockedStart {
-                            cover,
-                            host: config.server.server.expose().to_string(),
-                            server_ip,
-                            pin: engaged_pin,
-                            resolver_permit: ech_resolver_permit,
-                        });
-                    }
-                    Err(e) => {
-                        if let Some((old_permit, original_pin)) = repair_fallback {
-                            match self.routing.install_failclosed_cover(server_ip, old_permit) {
-                                Ok(cover) => {
-                                    self.posture.hold_pending(BlockedStart {
-                                        cover,
-                                        host: config.server.server.expose().to_string(),
-                                        server_ip,
-                                        pin: original_pin,
-                                        resolver_permit: old_permit,
-                                    });
-                                    // The restored permit is stale either way, but which
-                                    // direction it's stale in depends on whether the fetch
-                                    // this attempt needs an ECH resolver at all: widening
-                                    // repairs (`Holes`) restore something narrower than
-                                    // needed, so the fetch may stall; narrowing repairs
-                                    // (`None`/`Operators`, no fetch this cover permits
-                                    // anyway) instead restore something WIDER than needed —
-                                    // a live kill-switch permit for an address nothing
-                                    // dials, not a stall risk.
-                                    if matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes) {
-                                        warn!(
-                                            error = &e as &dyn std::error::Error,
-                                            "failed to engage the corrected fail-closed cover; restored the \
-                                             PREVIOUS permit instead of leaving the host open — ex-ray's ECH \
-                                             fetch may still stall against the now-stale permit"
-                                        );
-                                    } else {
-                                        warn!(
-                                            error = &e as &dyn std::error::Error,
-                                            ?old_permit,
-                                            "failed to engage the corrected fail-closed cover; restored the \
-                                             PREVIOUS permit instead of leaving the host open — the fail-closed \
-                                             cover still permits a resolver address this attempt no longer needs"
-                                        );
-                                    }
-                                    self.last_error = Some(e.to_string());
-                                }
-                                Err(e2) => {
-                                    warn!(
-                                        error = &e as &dyn std::error::Error,
-                                        restore_error = &e2 as &dyn std::error::Error,
-                                        "failed to engage BOTH the corrected and the previous fail-closed \
-                                         cover; host NOT blocked, proceeding open"
-                                    );
-                                    self.last_error = Some(e.to_string());
-                                }
-                            }
-                        } else {
-                            warn!(error = &e as &dyn std::error::Error, "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open");
-                            self.last_error = Some(e.to_string());
-                        }
-                    }
-                }
-            }
-        } else if covered {
-            // Covered retry after the user enabled lockdown mid-blocked-state:
-            // release the held cover. This opens egress until the standing lockdown
-            // cover engages at routing.install — a brief, disclosed open window
-            // (bindreams/hole#758: not closed by the macOS pf work).
-            if self.posture.take_pending().is_some() {
-                warn!(
-                    "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
-                     uncovered until the standing lockdown cover engages at connect"
+        match coverage.plan(lockdown_on) {
+            CoverPlan::Engage { unblock_snapshot } => {
+                self.engage_transient_cover(
+                    config.server.server.expose(),
+                    server_ip,
+                    pin,
+                    ech_resolver_permit,
+                    &effective_ech_doh,
+                    unblock_snapshot,
                 );
             }
-        } else if self.posture.take_pending().is_some() {
-            // Manual (uncovered) connect or reload-while-blocked: fail-open by
-            // design. Releasing the held cover opens egress — logged so the fail-open
-            // has a visible disposition, never a silent drop.
-            warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
+            CoverPlan::HandToLockdown => {
+                // Covered retry after the user enabled lockdown mid-blocked-state:
+                // release the held cover. Unless an adopted standing cover already holds the host, it is uncovered
+                // from here until the standing cover engages after the plugin chain and `routing.install`; a start
+                // that fails first never engages it, so the window lasts as long as the starts fail (open:
+                // bindreams/hole#1206).
+                if self.release_held_cover() {
+                    warn!(
+                        "covered retry with lockdown newly enabled: releasing the held cover; unless an adopted standing \
+                         cover holds the host it is uncovered until the standing lockdown cover engages, which a \
+                         failing start never reaches"
+                    );
+                }
+            }
+            CoverPlan::FailOpen => {
+                // Manual (uncovered) connect or reload-while-blocked: fail-open by
+                // design. Releasing the held cover opens egress — logged so the fail-open
+                // has a visible disposition, never a silent drop.
+                if self.release_held_cover() {
+                    warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
+                }
+            }
         }
         // Whether THIS attempt still holds a transient cover after the
         // release/reuse decisions above — read once here so `start_inner`
         // (which can never observe `Posture::Session`, only `Idle`/
         // `PendingStart`) gets an explicit bool instead of recomputing it
-        // from session state.
+        // from session state. A lock-free read: a stale `true` (an Unblock took
+        // the cover meanwhile) only skips the reachability probe.
         let transient_pending = self.posture.pending().is_some();
 
         // Disclosed residual (see CONTRIBUTING.md's "Transient cutover
@@ -1203,8 +1068,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             ech_doh,
             transient_pending,
             lockdown_on,
-            self.state_dir.as_deref(),
-            self.state_owner,
             cancel,
         )
         .await;
@@ -1240,13 +1103,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 info!(started = %dump!(&diag), "proxy started");
                 Ok(())
             }
-            Err(ProxyError::Cancelled) => {
-                // User asked to cancel: release the cover (same trust as a user
-                // disconnect). Do NOT set last_error on cancel.
-                drop(self.posture.take_pending());
-                info!("proxy start cancelled");
-                Err(ProxyError::Cancelled)
-            }
+            Err(ProxyError::Cancelled) => Err(self.cancelled_start()),
             Err(e) => {
                 // Covered start failed: RETAIN the held cover (the posture keeps
                 // it as `PendingStart`, so its Drop does NOT run) — the host stays
@@ -1257,6 +1114,161 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Err(e)
             }
         }
+    }
+
+    /// Engage the transient block-until-connected cover for a covered start whose lockdown intent is off: one
+    /// section under the cover lock, so the held cover this decides over cannot be taken, and no Unblock can run,
+    /// between the read and the install. Never `.await`s.
+    ///
+    /// A held cover's `resolver_permit` is fixed at engage time; this re-engages whenever this attempt's fresh
+    /// derivation DIFFERS from what the held cover already has. A narrowing to `None` (the plugin was removed, or
+    /// `effective_ech_doh` no longer resolves to `Holes`) drifts too: a wider-than-needed permit is a real
+    /// widening of the kill switch (the resolver permit carries no App-ID/process scoping on either platform, so
+    /// every process on the host has it), not a correction with no benefit. `repair_fallback` captures what is
+    /// given up: `Some((old_permit, original_pin))` means a good cover existed a moment ago, so a failed fresh
+    /// engage restores it instead of leaving the host uncovered. `original_pin` is the held cover's `pin`, not
+    /// this attempt's locally revalidated one: `revalidate` only ever downgrades (`Answered` ->
+    /// `ResolverDeselected`), so persisting a downgraded value would make that loss permanent even once the
+    /// original resolver returns to `dns.servers`.
+    ///
+    /// A retry whose desired permit still matches a value a PRIOR repair proved unreachable repairs again like any
+    /// other drift: the corrected engage's failure could be transient, and there is no principled way to tell
+    /// "will fail again" from "would now succeed" without trying.
+    ///
+    /// The transient cover is a global singleton, so a second is never constructed over the same objects. An
+    /// engage failure proceeds UNCOVERED (aborting would leave the user unconnected AND unprotected), surfaced via
+    /// `last_error`, unless this was a repair: then the compensating engage of the OLD permit is attempted first,
+    /// and it takes BOTH engages failing to lose the cover. A held cover a release took (`is_current` false) is not
+    /// reused: the start engages fresh.
+    fn engage_transient_cover(
+        &mut self,
+        host: &str,
+        server_ip: IpAddr,
+        pin: crate::dns::ech::PinSource,
+        ech_resolver_permit: Option<IpAddr>,
+        effective_ech_doh: &crate::proxy::plugin::EffectiveEchDoh,
+        unblock_snapshot: u64,
+    ) {
+        let routing = Arc::clone(&self.routing);
+        let lock = routing.lock_covers();
+
+        // The tray's Unblock holds this lock through its release and bumps the counter before it lets go, so a
+        // count that moved since the snapshot is an Unblock that ran during this start. The lockdown intent reads
+        // the same before and after it (`Off` is "no standing cover", as is never armed), so only the counter can
+        // tell. The user released the cover this start was about to engage: it installs none and proceeds
+        // uncovered, as an uncovered start does. A repair's restore engage is in this same section.
+        if self.unblock_generation.load(std::sync::atomic::Ordering::SeqCst) != unblock_snapshot {
+            info!("an Unblock ran since this covered start began: no transient cover is engaged");
+            return;
+        }
+
+        let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = self
+            .posture
+            .pending()
+            .filter(|b| b.host == host && b.resolver_permit != ech_resolver_permit)
+            .map(|b| (b.resolver_permit, b.pin));
+        if repair_fallback.is_some() {
+            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below
+            // (re-engaging over the live cover instead: open, bindreams/hole#758).
+            if let Some(held) = self.posture.take_pending() {
+                held.cover.release(&lock);
+            }
+            warn!(
+                "covered retry: this attempt's resolver permit differs from the held cover's; \
+                 releasing it so a fresh engage can correct it — egress is briefly OPEN until \
+                 the corrected (or, on failure, the restored) cover re-engages below"
+            );
+        }
+        if self.posture.pending().is_some() {
+            return;
+        }
+
+        // A repair's corrected engage carries forward the ORIGINAL cover's `pin`; a fresh engage has no prior
+        // cover to preserve, so `pin` (fresh from resolve, or a first same-host reuse) is correct as-is.
+        let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
+        match routing.install_failclosed_cover(&lock, server_ip, ech_resolver_permit) {
+            Ok(cover) => {
+                self.posture.hold_pending(BlockedStart {
+                    cover,
+                    host: host.to_string(),
+                    server_ip,
+                    pin: engaged_pin,
+                    resolver_permit: ech_resolver_permit,
+                });
+            }
+            Err(e) => {
+                let Some((old_permit, original_pin)) = repair_fallback else {
+                    warn!(
+                        error = &e as &dyn std::error::Error,
+                        "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open"
+                    );
+                    self.last_error = Some(e.to_string());
+                    return;
+                };
+                match routing.install_failclosed_cover(&lock, server_ip, old_permit) {
+                    Ok(cover) => {
+                        self.posture.hold_pending(BlockedStart {
+                            cover,
+                            host: host.to_string(),
+                            server_ip,
+                            pin: original_pin,
+                            resolver_permit: old_permit,
+                        });
+                        // The restored permit is stale either way, but which direction it's stale in depends on
+                        // whether the fetch this attempt needs an ECH resolver at all: widening repairs
+                        // (`Holes`) restore something narrower than needed, so the fetch may stall; narrowing
+                        // repairs (`None`/`Operators`, no fetch this cover permits anyway) instead restore
+                        // something WIDER than needed — a live kill-switch permit for an address nothing dials,
+                        // not a stall risk.
+                        if matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes) {
+                            warn!(
+                                error = &e as &dyn std::error::Error,
+                                "failed to engage the corrected fail-closed cover; restored the \
+                                 PREVIOUS permit instead of leaving the host open — ex-ray's ECH \
+                                 fetch may still stall against the now-stale permit"
+                            );
+                        } else {
+                            warn!(
+                                error = &e as &dyn std::error::Error,
+                                ?old_permit,
+                                "failed to engage the corrected fail-closed cover; restored the \
+                                 PREVIOUS permit instead of leaving the host open — the fail-closed \
+                                 cover still permits a resolver address this attempt no longer needs"
+                            );
+                        }
+                        self.last_error = Some(e.to_string());
+                    }
+                    Err(e2) => {
+                        warn!(
+                            error = &e as &dyn std::error::Error,
+                            restore_error = &e2 as &dyn std::error::Error,
+                            "failed to engage BOTH the corrected and the previous fail-closed \
+                             cover; host NOT blocked, proceeding open"
+                        );
+                        self.last_error = Some(e.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Posture::release_pending`] under a cover lock taken here. The section has no `.await`: the lock is `!Send`.
+    /// A start with no held cover never takes the lock, so an Unblock holding it cannot make that start wait.
+    #[must_use]
+    fn release_held_cover(&mut self) -> bool {
+        if !matches!(self.posture, Posture::PendingStart(_)) {
+            return false;
+        }
+        let lock = self.routing.lock_covers();
+        self.posture.release_pending(&lock)
+    }
+
+    /// The one exit of a cancelled start, early or late: the user, or the start's own token, cancelled it, so the
+    /// held cover is dropped. A cancel records no `last_error`.
+    fn cancelled_start(&mut self) -> ProxyError {
+        drop(self.posture.take_pending());
+        info!("proxy start cancelled");
+        ProxyError::Cancelled
     }
 
     /// Resolve the proxy server's hostname to an IP over PRIVATE DoH using the
@@ -1306,6 +1318,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    before `R::Installed`; disengages the standing cover (only `Some`
     ///    when intent is on and engage already succeeded). On the fail-FATAL
     ///    engage `?` it is never constructed, so only `R::Installed` tears down.
+    ///    A failed start drops its standing cover, no exception.
     ///
     /// Per-phase cancellation strategy:
     /// - **Phase 1 (plugin chain)**: the bridge cancel is threaded into
@@ -1349,8 +1362,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// construction would otherwise leak routes with no on-disk record,
     /// defeating crash recovery on next startup. See
     /// [`tun_engine::routing::SystemRouting::install`] for the invariant.
-    // DI params (the proxy/routing/dns seams + config + cancel + the owner and
-    // test-querier seams); bundling into a struct adds more noise than the warning.
+    // DI params (the proxy/routing/dns seams + config + cancel + the
+    // test-querier seam); bundling into a struct adds more noise than the warning.
     #[allow(clippy::too_many_arguments)]
     async fn start_inner(
         proxy: &P,
@@ -1369,8 +1382,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // (which also used it to decide whether to engage the transient cover),
         // so this start cannot answer the question two ways.
         standing_cover_expected: bool,
-        state_dir: Option<&std::path::Path>,
-        owner: Option<(u32, u32)>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
@@ -1396,8 +1407,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 config.server.plugin_opts.as_deref(),
                 &server_host,
                 config.server.server_port,
-                state_dir,
-                owner,
+                Some(routing.state_dir()),
+                routing.owner(),
                 config.diagnostic_plugin_tap,
                 &cancel,
                 ech_doh.as_ref(),
@@ -1794,23 +1805,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // `lockdown_app_ids`'s doc.
         let app_ids = lockdown_app_ids(config);
 
-        // Re-read the intent fresh, right before the install it gates:
-        // `standing_cover_expected` was snapshotted by the caller before
-        // plugin-chain/DNS-bootstrap/TUN-device work that can take long
-        // enough for an explicit `hole bridge unlock`-equivalent (the tray's
-        // Unblock, `handle_unblock`) to land on a second, lock-free path in
-        // between. A fresh `Off` overrides the stale `true` so a start that
-        // began before an unblock cannot install a cover after it; any other
-        // fresh read (`On`, `Unreadable`, `Unset`) leaves the snapshot's own
-        // verdict (which already folded in `adopted_standing_cover`) alone.
-        // This narrows, never widens, the window a full lock would close —
-        // the remaining gap is the same class of race #878 tracks and this
-        // plan does not fix.
-        let standing_cover_expected = match state_dir.map(lockdown_state::load_intent) {
-            Some(Intent::Off) => false,
-            _ => standing_cover_expected,
-        };
-
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to
         // today. Engaged AFTER routing.install (TUN exists => LUID resolvable)
@@ -1820,16 +1814,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // unwind, tearing down — the opposite of the transient cover's
         // fail-open. Committed only on the Ok path (the field below).
         let lockdown = if standing_cover_expected {
-            match routing.install_lockdown(server_ip, &tun_identity, &app_ids) {
-                Ok(cover) => {
-                    promote_adopted_claim(state_dir, owner);
-                    Some(cover)
-                }
+            match install_standing_cover(routing, server_ip, &tun_identity, &app_ids) {
+                Ok(cover) => cover,
                 Err(e) => {
                     if let Some(mut d) = dispatcher.take() {
                         d.shutdown().await;
                     }
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         } else {
@@ -1911,7 +1902,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     /// Stop the proxy in response to `event`. The standing lockdown cover's
     /// fate is no longer read off `event` directly — it comes from
-    /// [`teardown_cover_disposition`], decided against the *persisted* [`Target`] `event`
+    /// [`teardown_cover_disposition`], decided against the *persisted* [`Target`](crate::target::Target) `event`
     /// moves it to (see [`persist_session_event`](Self::persist_session_event)).
     /// Routes/DNS/proxy/plugin tear down identically regardless of `event`.
     ///
@@ -1937,10 +1928,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         event: SessionEvent,
         mut on_phase: impl FnMut(StopPhase),
     ) -> Result<(), ProxyError> {
-        if self.state_dir.is_some() {
-            on_phase(StopPhase::PersistTarget);
-        }
-        let target = self.persist_session_event(event).await;
+        on_phase(StopPhase::PersistTarget);
+        self.persist_session_event(event).await;
 
         match std::mem::replace(&mut self.posture, Posture::Idle) {
             Posture::Idle => Ok(()),
@@ -1998,10 +1987,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     None => {}
                 }
 
-                // 2. Stop plugin chain: reap the tracked identities explicitly — the
-                // reap is the ONLY thing allowed to delete the state file, and only
-                // once it has accounted for every record — then drop, which just
-                // cancels the chain's token and aborts its task. Drop must not touch
+                // 2. Stop plugin chain: reap the tracked identities explicitly — only
+                // the reap removes records from the state file — then drop, which
+                // just cancels the chain's token and aborts its task. Drop must not touch
                 // the file: the abort cannot know whether teardown finished, so a
                 // clear there would forget still-live plugins.
                 run_phase(
@@ -2026,10 +2014,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // 5. Standing lockdown cover: decided by `cover_step` against
                 // the target `event` just moved us to, not by `event` itself.
                 on_phase(StopPhase::SettleCover);
-                let presence = self.routing.lockdown_cover_presence();
-                let intent = self.effective_lockdown_intent();
-                let disposition = teardown_cover_disposition(event, intent, presence, &target);
-                self.apply_cover_disposition(disposition, lockdown);
+                self.settle_standing_cover(event, lockdown);
 
                 // Snapshot WFP + NDIS post-teardown. Emits warn when wintun-
                 // related references remain in either layer. Cheap and
@@ -2068,11 +2053,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// read `Unset`/`Off` for an adopted-but-unpersisted cover and
     /// `cover_step` would incorrectly release it.
     pub(crate) fn effective_lockdown_intent(&self) -> Intent {
-        let intent = self
-            .state_dir
-            .as_deref()
-            .map(lockdown_state::load_intent)
-            .unwrap_or(Intent::Unset);
+        let intent = lockdown_state::load_intent(self.routing.state_dir());
         if !matches!(intent, Intent::Off) && self.adopted_standing_cover {
             Intent::On
         } else {
@@ -2080,17 +2061,29 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
-    /// Act on a `cover_step` decision against the standing cover guard
-    /// extracted from a torn-down `RunningState`.
+    /// Settle the standing cover guard extracted from a torn-down `RunningState`: one section under the cover lock
+    /// that reads the presence, the intent and the target, decides with `cover_step` and acts, so an Unblock cannot
+    /// land between the decision and the act. The target is read from the record, not carried from
+    /// `persist_session_event`: the teardown's phases awaited since it wrote it.
+    fn settle_standing_cover(&mut self, event: SessionEvent, cover: Option<R::Cover>) {
+        let routing = Arc::clone(&self.routing);
+        let lock = routing.lock_covers();
+        let presence = routing.lockdown_cover_presence();
+        let intent = self.effective_lockdown_intent();
+        let target = target::load(self.routing.state_dir());
+        let disposition = teardown_cover_disposition(event, intent, presence, &target);
+        self.apply_cover_disposition(&lock, disposition, cover);
+    }
+
+    /// Act on a `cover_step` decision against the standing cover guard, under the cover lock.
     ///
     /// `Engage` is unreachable here: by the time a session's teardown runs,
     /// the TUN/routes it would need (`server_ip`, `TunIdentity`, `app_ids`)
     /// are already gone — engaging a fresh cover happens at connect time or
     /// at boot-time reconcile, never mid-teardown (`ipc::handle_lockdown`
-    /// turning lockdown on mid-session only persists the intent; there is no
-    /// `turn_lockdown_on`). Treating it like `Hold` is the safe direction:
-    /// it never opens the host.
-    fn apply_cover_disposition(&mut self, disposition: CoverDisposition, cover: Option<R::Cover>) {
+    /// turning lockdown on mid-session only persists the intent: `turn_lockdown_on` installs nothing). Treating
+    /// it like `Hold` is the safe direction: it never opens the host.
+    fn apply_cover_disposition(&mut self, lock: &CoverLock, disposition: CoverDisposition, cover: Option<R::Cover>) {
         match disposition {
             CoverDisposition::ReleaseNow => {
                 // The guard's own Drop can only WARN on a genuine OS failure
@@ -2102,14 +2095,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // the claim only on a CONFIRMED open host: a false clear here
                 // is Rule #0 territory, the Unblock item disappearing exactly
                 // when it is still needed.
-                match self.routing.release_all_covers() {
+                match self.routing.release_all_covers(lock) {
                     Ok(()) => self.set_standing_cover_adopted(false),
                     Err(e) => tracing::warn!(
                         error = &e as &dyn std::error::Error,
                         "lockdown cover release could not be confirmed; keeping the escape visible"
                     ),
                 }
-                drop(cover);
+                // After a confirmed release this guard is stale and deletes nothing. After a failed one it may be
+                // either: a sweep that released only its kind has outdated it, one that released only the other kind
+                // leaves it current to retry its own deletes. Either way `Err` keeps the adopted claim set, so the
+                // escape stays visible while any kind is held.
+                if let Some(c) = cover {
+                    c.release(lock);
+                }
             }
             CoverDisposition::KeepEngaged => {
                 if let Some(c) = cover {
@@ -2119,45 +2118,27 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
-    /// Move the persisted [`Target`] according to `event` and return the new
-    /// value. Runs before any teardown so `cover_step` below always sees the
-    /// post-event target, never a stale pre-write one — `cover_step`'s
-    /// `Target::Off` arm ignores intent entirely while `Target::Connected`'s
-    /// arm is intent-dependent, so which arm applies must already reflect
-    /// `event`.
-    async fn persist_session_event(&mut self, event: SessionEvent) -> Target {
-        let Some(state_dir) = self.state_dir.clone() else {
-            // No file to consult, so `target_after` needs a stand-in. It must
-            // be `Unreadable`, not `Off`: `Off` is a DECIDED target that
-            // `cover_step` acts on (its `Off` arm ignores intent and releases
-            // a live cover), which would turn every blip on a state-dir-less
-            // manager into a kill-switch teardown. `Unreadable` authorises
-            // neither surface, so the cover holds. `UserStopped`/`GaveUp` are
-            // unaffected — `target_after` collapses both to `Off` from any
-            // prior value.
-            return target_after(Target::Unreadable, event);
-        };
-        let owner = self.state_owner;
+    /// Move the persisted [`Target`](crate::target::Target) according to `event`. Runs before any teardown so `cover_step` in
+    /// `settle_standing_cover` always reads the post-event target, never a stale pre-write one: `cover_step`'s
+    /// `Target::Off` arm ignores intent entirely while `Target::Connected`'s arm is intent-dependent, so which arm
+    /// applies must already reflect `event`. A failed write is logged; the settle reads the record as it stands.
+    async fn persist_session_event(&mut self, event: SessionEvent) {
+        let state_dir = self.routing.state_dir().to_path_buf();
+        let owner = self.routing.owner();
         let outcome = tokio::task::spawn_blocking(move || {
             target::apply(&state_dir, owner, move |current| target_after(current, event))
         })
         .await;
         match outcome {
-            Ok(Ok(new_target)) => new_target,
-            Ok(Err(e)) => {
-                tracing::error!(
-                    error = &e as &dyn std::error::Error,
-                    "failed to persist target after session event; reading current disk state instead of guessing"
-                );
-                self.state_dir.as_deref().map(target::load).unwrap_or(Target::Off)
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = &e as &dyn std::error::Error,
-                    "target-persistence task panicked; treating target as unreadable"
-                );
-                Target::Unreadable
-            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::error!(
+                error = &e as &dyn std::error::Error,
+                "failed to persist target after session event; reading current disk state instead of guessing"
+            ),
+            Err(e) => tracing::error!(
+                error = &e as &dyn std::error::Error,
+                "target-persistence task panicked; the settle re-reads the on-disk target"
+            ),
         }
     }
 
@@ -2282,31 +2263,48 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
     }
 }
 
+/// Install the standing cover, one section under the cover lock so the lock is never held across an `.await`.
+///
+/// The intent is re-read here, right before the install it gates: `standing_cover_expected` was snapshotted by the
+/// caller before plugin-chain, DNS-bootstrap and TUN-device work that can take long enough for the tray's Unblock
+/// (`handle_unblock`, which takes no `state.proxy` lock) to land in between. An `Off` recorded first overrides the
+/// stale `true`, so a start that began before an Unblock installs nothing after it; any other fresh read (`On`,
+/// `Unreadable`, `Unset`) leaves the snapshot's verdict (which already folded in `adopted_standing_cover`) alone.
+/// The Unblock holds the lock through its release and its `Off`, so the read and the install cannot straddle it.
+fn install_standing_cover<R: Routing>(
+    routing: &R,
+    server_ip: IpAddr,
+    tun: &tun_engine::TunIdentity,
+    app_ids: &[std::path::PathBuf],
+) -> Result<Option<R::Cover>, ProxyError> {
+    let lock = routing.lock_covers();
+    if matches!(lockdown_state::load_intent(lock.state_dir()), Intent::Off) {
+        return Ok(None);
+    }
+    let cover = routing.install_lockdown(&lock, server_ip, tun, app_ids)?;
+    promote_adopted_claim(&lock, routing.owner());
+    Ok(Some(cover))
+}
+
 /// Write the armed state to `bridge-lockdown.json` the moment an adopted claim
 /// is first honoured by a real `install_lockdown`. A cover this bridge just
 /// installed is first-hand evidence, stronger than the startup measurement
 /// `decide_cover_recovery` grounds its own repair write in.
 ///
-/// Promotes only over `Unset`/`Unreadable` — an intent already `On` needs no
-/// write, and an explicit recorded `Off` must never be clobbered: it can race
-/// this same start (an out-of-process `hole bridge unlock` writing `Off`
-/// between `standing_cover_expected`'s snapshot and this call), and a claim is
-/// never proof the intent is still unset.
+/// Promotes only over `Unset` ([`lockdown_state::Intent::admits_adoption_promotion`]); an unreadable record already
+/// reads armed and may hold the user's `Off`.
+/// An explicit recorded `Off` is never overwritten: a claim is never proof the intent is still unset, so
+/// [`lockdown_state::promote_unrecorded`] decides from the record it reads inside its own update.
+///
+/// `lock` is the caller's cover lock. It excludes every writer of that record in this process (the tray's Unblock, the
+/// lockdown handler, session teardown and the boot reconcile all take it), so none lands between the install and this
+/// write. It does not exclude another process: nothing writes the record while a bridge runs (`hole bridge unlock` and
+/// the cutover need `BridgeLiveness`), which is a premise of this function, not something it checks.
 ///
 /// Best-effort: the write only makes the preference durable, and failing the
 /// connect over a bookkeeping error would be the worse trade.
-fn promote_adopted_claim(state_dir: Option<&std::path::Path>, owner: Option<(u32, u32)>) {
-    let Some(dir) = state_dir else {
-        warn!("lockdown: standing cover installed with no state_dir; the kill switch cannot be persisted");
-        return;
-    };
-    if matches!(
-        lockdown_state::load_intent(dir),
-        lockdown_state::Intent::On | lockdown_state::Intent::Off
-    ) {
-        return;
-    }
-    if let Err(e) = lockdown_state::set_enabled(dir, true, owner) {
+fn promote_adopted_claim(lock: &CoverLock, owner: Option<(u32, u32)>) {
+    if let Err(e) = lockdown_state::promote_unrecorded(lock, owner) {
         warn!(
             error = &e as &dyn std::error::Error,
             "lockdown: could not persist the adopted kill switch; it will not survive this run"

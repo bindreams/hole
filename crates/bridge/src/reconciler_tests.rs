@@ -7,7 +7,7 @@ use crate::proxy_manager::proxy_manager_tests::{MockProxy, MockRouting};
 use crate::proxy_manager::ProxyState;
 use crate::test_support::rt;
 use crate::test_support::target_records;
-use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::failclosed::{lockdown_state, CoverLock};
 use tun_engine::routing::{CoverRecovery, Recovery};
 
 fn test_config() -> ProxyConfig {
@@ -271,15 +271,15 @@ fn connectable() -> Target {
 fn a_persisted_connected_target_reconciles_at_startup_with_no_gui() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
         let state = routing.state();
-        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing);
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
+        reconcile_once(&proxy, &never_cancelled()).await;
 
         // The tunnel started with no client ever having connected...
         assert_eq!(
@@ -308,10 +308,10 @@ fn a_persisted_off_target_starts_nothing() {
 
         let routing = MockRouting::new(dir.path().to_path_buf());
         let state = routing.state();
-        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing);
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
+        reconcile_once(&proxy, &never_cancelled()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -345,7 +345,7 @@ fn startup_recovery_runs_before_reconciliation() {
         let routing = MockRouting::new(dir.path().to_path_buf());
         let state = routing.state();
         *state.cover_presence.lock().unwrap() = CoverPresence::Recorded;
-        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing);
         let proxy = Arc::new(Mutex::new(pm));
 
         // The exact call `route_recovery::recover_and_record` makes on its
@@ -362,7 +362,7 @@ fn startup_recovery_runs_before_reconciliation() {
         )
         .await;
 
-        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
+        reconcile_once(&proxy, &never_cancelled()).await;
 
         assert_eq!(
             state.lockdown_engage_calls.load(Ordering::SeqCst),
@@ -391,10 +391,10 @@ fn reconcile_once_honours_a_do_not_connect_startup_preference() {
         .unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing);
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
+        reconcile_once(&proxy, &never_cancelled()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -428,10 +428,10 @@ fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate(
         .unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing);
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
+        reconcile_once(&proxy, &never_cancelled()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -489,20 +489,23 @@ pub(crate) fn fn_decl_re() -> regex::Regex {
 /// above a call site cannot change what the guard sees — the property
 /// `the_sanctioned_caller_guard_survives_line_shifts` pins.
 pub(crate) fn call_sites_by_function(text: &str, pattern: &regex::Regex) -> Vec<(String, String)> {
-    let decl = fn_decl_re();
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
-        if !pattern.is_match(line) {
-            continue;
+        if pattern.is_match(line) {
+            out.push((enclosing_fn(&lines, idx), line.trim().to_string()));
         }
-        let name = (0..=idx)
-            .rev()
-            .find_map(|i| decl.captures(lines[i]).map(|c| c[1].to_string()))
-            .unwrap_or_else(|| "<no enclosing fn>".to_string());
-        out.push((name, line.trim().to_string()));
     }
     out
+}
+
+/// The name of the function whose declaration is the nearest at or above `lines[idx]`.
+fn enclosing_fn(lines: &[&str], idx: usize) -> String {
+    let decl = fn_decl_re();
+    (0..=idx)
+        .rev()
+        .find_map(|i| decl.captures(lines[i]).map(|c| c[1].to_string()))
+        .unwrap_or_else(|| "<no enclosing fn>".to_string())
 }
 
 /// Every form the cover release is reachable through: the `Routing` trait
@@ -617,8 +620,8 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
 /// destroyed: shifting a call site's line must not change its identity.
 #[skuld::test]
 fn the_sanctioned_caller_guard_survives_line_shifts() {
-    let src = "fn alpha() {\n    something();\n}\n\nfn beta() {\n    routing.release_all_covers()?;\n}\n";
-    let shifted = "fn alpha() {\n    something();\n}\n\n// an unrelated comment\n\nfn beta() {\n    routing.release_all_covers()?;\n}\n";
+    let src = "fn alpha() {\n    something();\n}\n\nfn beta() {\n    routing.release_all_covers(&routing.lock_covers())?;\n}\n";
+    let shifted = "fn alpha() {\n    something();\n}\n\n// an unrelated comment\n\nfn beta() {\n    routing.release_all_covers(&routing.lock_covers())?;\n}\n";
 
     let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
     let before = call_sites_by_function(src, &pattern);
@@ -641,7 +644,7 @@ fn the_sanctioned_caller_guard_survives_line_shifts() {
 #[skuld::test]
 fn the_cover_release_pattern_catches_the_free_function_too() {
     let src = "fn stray() {\n    tun_engine::routing::failclosed::release_all(&state_dir)?;\n}\n\n\
-               fn viaz_trait() {\n    routing.release_all_covers()?;\n}\n";
+               fn viaz_trait() {\n    routing.release_all_covers(&routing.lock_covers())?;\n}\n";
     let sites = call_sites_by_function(src, &cover_release_pattern());
 
     let names: Vec<&str> = sites.iter().map(|(f, _)| f.as_str()).collect();
@@ -663,7 +666,7 @@ fn the_cover_release_pattern_ignores_the_release_internals() {
 /// walk must not stop early or attribute it to the previous function.
 #[skuld::test]
 fn a_call_inside_a_closure_belongs_to_its_enclosing_function() {
-    let src = "fn alpha() {\n    noop();\n}\n\nasync fn gamma() {\n    let f = || {\n        routing.release_all_covers()?;\n    };\n}\n";
+    let src = "fn alpha() {\n    noop();\n}\n\nasync fn gamma() {\n    let f = || {\n        routing.release_all_covers(&routing.lock_covers())?;\n    };\n}\n";
     let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
     let sites = call_sites_by_function(src, &pattern);
     assert_eq!(sites.len(), 1, "expected exactly one call site, got {sites:?}");
@@ -681,11 +684,11 @@ fn a_call_inside_a_closure_belongs_to_its_enclosing_function() {
 fn a_cancelled_boot_reconcile_abandons_the_start() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
         target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
-        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing);
         let proxy = Arc::new(Mutex::new(pm));
 
         // Shutdown arrived before reconciliation reached the start — the
@@ -695,7 +698,7 @@ fn a_cancelled_boot_reconcile_abandons_the_start() {
         let shutdown = CancellationToken::new();
         shutdown.cancel();
 
-        reconcile_once(dir.path(), None, &proxy, &shutdown).await;
+        reconcile_once(&proxy, &shutdown).await;
 
         assert_ne!(
             proxy.lock().await.state(),
@@ -839,13 +842,75 @@ fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// working. What this forbids is DECIDING from one (`=>`, `==`, `!=`).
 #[skuld::test]
 fn session_event_policy_lives_on_the_type_not_at_call_sites() {
-    let scan_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let src_root = scan_root.clone();
     // The two exhaustive deciders, by path relative to `src/`.
-    let sanctioned = ["target.rs", "reconciler.rs"];
+    let offenders = decisions_outside(&["target.rs", "reconciler.rs"], "SessionEvent::");
+    assert!(
+        offenders.is_empty(),
+        "per-variant SessionEvent policy decided outside `target.rs`/`reconciler.rs`:\n  {}\n\
+         Add a classifier method to `SessionEvent` (one exhaustive match, in one place) and ask \
+         it here instead. A sixth variant must be a compile error once, not silently inherit a \
+         group at every site that forgot it.",
+        offenders.join("\n  ")
+    );
+}
+
+/// The same rule for [`crate::coverage::Coverage`] and the [`crate::coverage::CoverPlan`] it yields: whether a
+/// start engages, hands over or releases the transient cover is decided once, by `Coverage::plan`, and a call
+/// site that matched a `Coverage` variant would make its own decision. `CoverPlan` has no methods; the one
+/// sanctioned `match` on it is the dispatch in `ProxyManager::start_cancellable`, each arm exactly once.
+#[skuld::test]
+fn coverage_policy_lives_on_the_type_not_at_call_sites() {
+    let offenders = decisions_outside(&["coverage.rs"], "Coverage::");
+    assert!(
+        offenders.is_empty(),
+        "per-variant Coverage policy decided outside `coverage.rs`:\n  {}\n\
+         Ask `Coverage::plan` instead.",
+        offenders.join("\n  ")
+    );
+
+    // `proxy_manager.rs` is scanned apart: its `CoverPlan` decisions must be exactly the dispatch arms, each once,
+    // inside `start_cancellable`. A moved or duplicated arm, or a decision elsewhere in the file, is an offender.
+    let offenders = decisions_outside(&["coverage.rs", "proxy_manager.rs"], "CoverPlan::");
+    assert!(
+        offenders.is_empty(),
+        "per-variant CoverPlan policy decided outside `coverage.rs` and the one dispatch match in \
+         `start_cancellable`:\n  {}\n\
+         Add a method to `CoverPlan` (one exhaustive match) and ask it instead.",
+        offenders.join("\n  ")
+    );
+
+    let text = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/proxy_manager.rs"))
+        .expect("failed to read proxy_manager.rs");
+    let lines: Vec<&str> = text.lines().collect();
+    let mut found: Vec<(String, String)> = code_lines(&text)
+        .filter(|(_, l)| l.contains("CoverPlan::") && line_decides(l))
+        .map(|(i, l)| (enclosing_fn(&lines, i), l.trim().to_string()))
+        .collect();
+    let mut want: Vec<(String, String)> = DISPATCH_ARMS
+        .iter()
+        .map(|arm| ("start_cancellable".to_string(), (*arm).to_string()))
+        .collect();
+    found.sort();
+    want.sort();
+    assert_eq!(
+        found, want,
+        "the `CoverPlan` decisions in `proxy_manager.rs` must be the dispatch arms, once each, in `start_cancellable`"
+    );
+}
+
+const DISPATCH_ARMS: [&str; 3] = [
+    "CoverPlan::Engage { unblock_snapshot } => {",
+    "CoverPlan::HandToLockdown => {",
+    "CoverPlan::FailOpen => {",
+];
+
+/// Every non-test line of `crates/bridge/src` that names `token` and decides from it ([`line_decides`]), outside
+/// the `sanctioned` files (paths relative to `src/`).
+fn decisions_outside(sanctioned: &[&str], token: &str) -> Vec<String> {
+    let scan_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders: Vec<String> = Vec::new();
 
-    for entry in walkdir::WalkDir::new(&src_root) {
+    for entry in walkdir::WalkDir::new(&scan_root) {
         let entry = entry.expect("failed to walk crates/bridge/src");
         let path = entry.path();
         if !entry.file_type().is_file() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
@@ -867,20 +932,12 @@ fn session_event_policy_lives_on_the_type_not_at_call_sites() {
         }
         let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
         for (idx, line) in code_lines(&text) {
-            if line.contains("SessionEvent::") && line_decides(line) {
+            if line.contains(token) && line_decides(line) {
                 offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
             }
         }
     }
-
-    assert!(
-        offenders.is_empty(),
-        "per-variant SessionEvent policy decided outside `target.rs`/`reconciler.rs`:\n  {}\n\
-         Add a classifier method to `SessionEvent` (one exhaustive match, in one place) and ask \
-         it here instead. A sixth variant must be a compile error once, not silently inherit a \
-         group at every site that forgot it.",
-        offenders.join("\n  ")
-    );
+    offenders
 }
 
 /// The same defect shape as [`session_event_policy_lives_on_the_type_not_at_call_sites`],
@@ -957,6 +1014,36 @@ fn cover_presence_is_never_compared_against_a_variant() {
     );
 }
 
+/// The boot reconcile reads the startup preference and applies it in one section under the cover lock: an Unblock
+/// that landed between a read and the apply would have its `Off` overwritten from the candidate it cleared (the
+/// boot would reconnect to the server the user just escaped). Asserted by source, not by interleaving: neither
+/// step has a point a test can park at.
+#[skuld::test]
+fn reconcile_once_reads_the_startup_preference_under_the_cover_lock() {
+    let src = include_str!("reconciler.rs");
+    let sites = regex::Regex::new(r"\block_covers\(|\bload_startup_preference\(|\btarget::apply\(").unwrap();
+    let in_function: Vec<String> = call_sites_by_function(src, &sites)
+        .into_iter()
+        .filter(|(name, line)| name == "reconcile_once" && !line.starts_with("//"))
+        .map(|(_, line)| line)
+        .collect();
+    let position = |needle: &str| {
+        in_function
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no site contains `{needle}`: {in_function:?}"))
+    };
+
+    assert!(
+        position("lock_covers(") < position("load_startup_preference("),
+        "the preference is read after the cover lock is taken: {in_function:?}"
+    );
+    assert!(
+        position("load_startup_preference(") < position("target::apply("),
+        "and applied after it is read, in the same section: {in_function:?}"
+    );
+}
+
 /// The guards are only worth having if they FAIL on the shapes that slipped
 /// past earlier versions. Asserted directly against the predicate rather than
 /// by mutating real sources, so a regression in `line_decides` cannot hide
@@ -1002,15 +1089,15 @@ fn a_failed_boot_connect_leaves_the_host_reachable() {
         let dir = tempfile::tempdir().unwrap();
         // Kill switch OFF — the only case where the transient cover decides
         // the outcome. With it on, the standing cover governs instead.
-        lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), false, None).unwrap();
         target_records::save(dir.path(), &connectable(), None).unwrap();
 
         let routing = MockRouting::new(dir.path().to_path_buf());
         let state = routing.state();
-        let pm = ProxyManager::new(MockProxy::failing_start(), routing).with_state_dir(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::failing_start(), routing);
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
+        reconcile_once(&proxy, &never_cancelled()).await;
 
         assert_eq!(
             state.cover_engage_calls.load(Ordering::SeqCst),
@@ -1032,7 +1119,7 @@ async fn a_failed_boot_connect_logs_the_cause_chain() {
     let dir = tempfile::tempdir().unwrap();
     target_records::save(dir.path(), &connectable(), None).unwrap();
     let routing = MockRouting::failing_gateway(dir.path().to_path_buf());
-    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    let pm = ProxyManager::new(MockProxy::new(), routing);
     let proxy = Arc::new(Mutex::new(pm));
 
     let writer = garter::test_utils::WaitableWriter::new();
@@ -1044,7 +1131,7 @@ async fn a_failed_boot_connect_logs_the_cause_chain() {
         .finish();
     {
         let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
-        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
+        reconcile_once(&proxy, &never_cancelled()).await;
     }
 
     let log = writer.snapshot();

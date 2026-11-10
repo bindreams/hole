@@ -15,7 +15,7 @@ mod windows_profiles;
 
 use std::path::{Path, PathBuf};
 
-use tun_engine::routing::failclosed::Clearance;
+use tun_engine::routing::failclosed::{Clearance, CoverLock};
 
 /// The privileged service's state dir (Windows: `C:\ProgramData\hole\state`),
 /// where the crash-recovery state and the lockdown intent + cover state live.
@@ -233,8 +233,8 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// [`release_clearance_report`] for exactly that reason.
 pub fn unlock() -> std::io::Result<Clearance> {
     let state_dir = service_state_dir();
-    unlock_with(&state_dir, || {
-        tun_engine::routing::failclosed::disengage_lockdown(&state_dir).map_err(std::io::Error::other)
+    unlock_with(&state_dir, |lock| {
+        tun_engine::routing::failclosed::disengage_lockdown(lock).map_err(std::io::Error::other)
     })
 }
 
@@ -255,22 +255,26 @@ pub fn unlock() -> std::io::Result<Clearance> {
 /// (single-instance is separately enforced by the IPC socket bind, so no
 /// second real bridge is racing this token itself) rather than interleaving
 /// with it.
-fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<Clearance>) -> std::io::Result<Clearance> {
+fn unlock_with(
+    state_dir: &Path,
+    disengage: impl FnOnce(&CoverLock) -> std::io::Result<Clearance>,
+) -> std::io::Result<Clearance> {
     let Some(_liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
         return Err(std::io::Error::other(
             "a bridge instance is running; use the in-app \"Unblock Network\" action instead of `hole bridge unlock`",
         ));
     };
+    let lock = CoverLock::acquire(state_dir);
     crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
         .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
-    let clearance = disengage()?;
+    let clearance = disengage(&lock)?;
     // Same reason `handle_unblock` clears it: `resolve_startup_target` feeds
     // the candidate to `AlwaysConnect` over an `Off` target, so leaving it
     // would let the next boot reconnect to the server this escape just freed
     // the host from.
     crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None)
         .map_err(|e| std::io::Error::other(format!("could not clear the auto-connect candidate: {e}")))?;
-    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
+    tun_engine::routing::failclosed::lockdown_state::set_enabled(&lock, false, None)
         .map_err(|e| std::io::Error::other(format!("could not record the lockdown intent off: {e}")))?;
     // Handed back, never dropped. The intent is now off, so nothing after this
     // will pre-delete a boot-time key or look at one again — see [`unlock`].
@@ -329,7 +333,7 @@ pub fn release_covers() -> std::io::Result<Clearance> {
         // bridge here, so no `Routing` handle to reach the trait method
         // through. `reconciler_tests.rs`'s sanctioned-caller guard matches both
         // forms so this site is visible to it.
-        || tun_engine::routing::failclosed::release_all(&state_dir).map_err(std::io::Error::other),
+        |lock| tun_engine::routing::failclosed::release_all(lock).map_err(std::io::Error::other),
     )
 }
 
@@ -364,7 +368,7 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// filter of it, and every key that reaches THIS message is nonetheless a
 /// boot-time twin. A `Persistent` key goes unproven under exactly one outcome,
 /// `failclosed::KeyOutcome::Failed`; that outcome is what `first_delete_failure`
-/// turns into a `SweepOutcome::failed`, so the clearance holding it reaches
+/// turns into the failure of a `SweepOutcome::per_kind`, so the clearance holding it reaches
 /// `unlock_with`/`release_covers_with` as `Err` and is dropped by their `?`
 /// before any of the three render sites runs. The message therefore states
 /// what its keys are instead of hedging
@@ -524,7 +528,7 @@ fn other_account_state_dirs() -> Vec<PathBuf> {
 fn release_covers_with(
     state_dir: &Path,
     peers: &[PathBuf],
-    release: impl FnOnce() -> std::io::Result<Clearance>,
+    release: impl FnOnce(&CoverLock) -> std::io::Result<Clearance>,
 ) -> std::io::Result<Clearance> {
     let Some(liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
         return Err(std::io::Error::other(
@@ -563,9 +567,10 @@ fn release_covers_with(
         }
     }
 
+    let lock = CoverLock::acquire(state_dir);
     crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
         .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
-    let mut clearance = release()?;
+    let mut clearance = release(&lock)?;
     // The boot-time record is per-state-dir; the WFP filters it describes are
     // machine-wide. An elevated non-`--service` bridge keeps its state in the
     // interactive user's profile, so a twin IT armed is recorded where this
@@ -584,7 +589,7 @@ fn release_covers_with(
             "covers released, but the auto-connect candidate could not be cleared"
         );
     }
-    if let Err(e) = tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None) {
+    if let Err(e) = tun_engine::routing::failclosed::lockdown_state::set_enabled(&lock, false, None) {
         tracing::warn!(
             error = &e as &dyn std::error::Error,
             "covers released, but the legacy lockdown intent could not be recorded off"

@@ -10,12 +10,12 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::{GatewayInfo, NextHop};
-use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::failclosed::{lockdown_state, CoverLock};
 use tun_engine::routing::{self as routing, state as route_state, RoutedFamilies, RoutesInstalled, Routing};
 use tun_engine::{RoutingError, TunIdentity};
 
@@ -213,6 +213,9 @@ struct MockRouting {
     /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
     /// probe. Defaults to `Absent`.
     cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
+    /// The state dir of the cover lock `release_all_covers` was handed: the Unblock releases under the lock of its
+    /// own state dir.
+    released_under: Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
 impl MockRouting {
@@ -224,6 +227,7 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
+            released_under: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -242,6 +246,7 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
+            released_under: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -253,6 +258,7 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
+            released_under: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -319,6 +325,7 @@ impl Routing for MockRouting {
 
     fn install_failclosed_cover(
         &self,
+        _lock: &tun_engine::routing::failclosed::CoverLock,
         _server_ip: IpAddr,
         _resolver_ip: Option<IpAddr>,
     ) -> Result<MockCover, RoutingError> {
@@ -327,6 +334,7 @@ impl Routing for MockRouting {
 
     fn install_lockdown(
         &self,
+        _lock: &tun_engine::routing::failclosed::CoverLock,
         _server_ip: IpAddr,
         _tun: &TunIdentity,
         _app_ids: &[PathBuf],
@@ -334,8 +342,21 @@ impl Routing for MockRouting {
         Ok(MockCover)
     }
 
-    fn release_all_covers(&self) -> Result<(), RoutingError> {
+    fn lock_covers(&self) -> tun_engine::routing::failclosed::CoverLock {
+        tun_engine::routing::failclosed::CoverLock::acquire(self.state_dir())
+    }
+
+    fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    fn owner(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    fn release_all_covers(&self, lock: &tun_engine::routing::failclosed::CoverLock) -> Result<(), RoutingError> {
         self.release_all_calls.fetch_add(1, Ordering::SeqCst);
+        *self.released_under.lock().unwrap() = Some(lock.state_dir().to_path_buf());
         if self.fail_release.load(Ordering::SeqCst) {
             return Err(crate::test_support::mock_gateway_failure());
         }
@@ -355,6 +376,10 @@ impl Drop for MockCover {
 
 impl tun_engine::routing::CoverGuard for MockCover {
     fn disarm(self) {}
+    fn release(self, _lock: &tun_engine::routing::failclosed::CoverLock) {}
+    fn is_current(&self) -> bool {
+        true
+    }
 }
 
 struct MockRoutes {
@@ -386,34 +411,30 @@ use crate::test_support::target_records;
 /// auto-cleanup Drop is suppressed — the directory lives until the
 /// process exits, which is fine for unit tests.
 fn mock_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
-    let state_dir = tempfile::tempdir().unwrap().keep();
-    let routing = MockRouting::new(state_dir);
-    Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing)))
+    mock_proxy_in(tempfile::tempdir().unwrap().keep())
 }
 
-/// `mock_proxy` variant whose manager has a persisted state_dir, so
-/// `set_lockdown_intent` can write `bridge-lockdown.json`. The TempDir is
-/// `.keep()`-ed (created, auto-cleanup suppressed) like the other helpers.
-fn mock_proxy_with_state_dir() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
-    let state_dir = tempfile::tempdir().unwrap().keep();
-    let routing = MockRouting::new(state_dir.clone());
-    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir);
-    Arc::new(Mutex::new(pm))
+/// `mock_proxy` over a state dir the test chooses: the routing owns it, and every handler reads it from there.
+fn mock_proxy_in(state_dir: PathBuf) -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
+    Arc::new(Mutex::new(ProxyManager::new(
+        MockProxy::new(),
+        MockRouting::new(state_dir),
+    )))
 }
 
-/// `mock_proxy_with_state_dir` variant whose mock routing reports
+/// `mock_proxy` variant whose mock routing reports
 /// `presence` from `lockdown_cover_presence` — a test's stand-in for the OS
 /// probe, independent of whether any session is running.
 fn mock_proxy_with_cover_presence(
     presence: tun_engine::routing::CoverPresence,
 ) -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
-    let routing = MockRouting::new(state_dir.clone()).with_cover_presence(presence);
-    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir);
+    let routing = MockRouting::new(state_dir).with_cover_presence(presence);
+    let pm = ProxyManager::new(MockProxy::new(), routing);
     Arc::new(Mutex::new(pm))
 }
 
-/// `mock_proxy_with_state_dir` variant that also hands back the mock
+/// `mock_proxy` variant that also hands back the mock
 /// routing's `release_all_calls` / `fail_release` handles (cloned out BEFORE
 /// `routing` moves into the manager, mirroring `mock_proxy_with_traffic`), so
 /// a test can assert the escape fired and drive a failure. Presence defaults
@@ -430,7 +451,7 @@ fn mock_proxy_with_release_state() -> (
     let routing = MockRouting::new(state_dir.clone()).with_cover_presence(tun_engine::routing::CoverPresence::Live);
     let release_all_calls = Arc::clone(&routing.release_all_calls);
     let fail_release = Arc::clone(&routing.fail_release);
-    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir.clone());
+    let pm = ProxyManager::new(MockProxy::new(), routing);
     (Arc::new(Mutex::new(pm)), release_all_calls, fail_release, state_dir)
 }
 
@@ -844,7 +865,7 @@ fn multiple_requests_on_same_connection() {
 fn lockdown_post_sets_intent_and_status_reflects_it() {
     rt().block_on(async {
         let path = test_socket_path("lockdown-post");
-        let server = IpcServer::bind(&path, mock_proxy_with_state_dir(), "test").unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -910,33 +931,6 @@ fn an_adopted_cover_with_no_session_reports_engaged() {
     });
 }
 
-#[skuld::test]
-fn lockdown_post_errors_without_state_dir() {
-    // A kill-switch request the bridge cannot persist must fail loudly, not
-    // silently 200: a silent Ok would make the GUI believe lockdown is armed
-    // when nothing was written. `mock_proxy()` has no `.with_state_dir(..)`.
-    rt().block_on(async {
-        let path = test_socket_path("lockdown-no-statedir");
-        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
-        let handle = tokio::spawn(async move {
-            server.run_once().await.unwrap();
-        });
-
-        let mut client = TestClient::connect(&path).await;
-        let resp = post_lockdown(&mut client, true).await;
-        assert_eq!(
-            resp.status(),
-            500,
-            "lockdown POST without a state_dir must error, not silently succeed"
-        );
-        let _ = resp.into_body().collect().await;
-
-        drop(client);
-        handle.abort();
-        let _ = handle.await;
-    });
-}
-
 // POST /v1/unblock ====================================================================================================
 
 async fn parse_error_body(resp: http::Response<hyper::body::Incoming>) -> hole_common::protocol::ErrorResponse {
@@ -979,11 +973,8 @@ fn a_wedged_teardown_with_an_off_target_releases_the_cover() {
         // bridge-lockdown.json already reads `false`, which would let that
         // assertion pass vacuously regardless of whether the handler wrote
         // anything.
-        lockdown_state::set_enabled(&dir, true, None).unwrap();
-        // `handle_unblock` persists through `IpcState::state_dir`, not the
-        // proxy manager's own — `bind_with_dirs` with the SAME `dir` mirrors
-        // production wiring (`foreground.rs` passes one `state_dir` to both).
-        let server = IpcServer::bind_with_dirs(&path, proxy, "test", dir.clone(), dir.clone(), None).unwrap();
+        lockdown_state::set_enabled(&CoverLock::acquire(&dir), true, None).unwrap();
+        let server = IpcServer::bind(&path, proxy, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1097,6 +1088,99 @@ fn lockdown_off_releases_covers_through_the_same_path() {
     });
 }
 
+/// The IPC state over `routing`: handlers read the state dir from it.
+fn ipc_state_over(routing: MockRouting) -> Arc<IpcState<MockProxy, MockRouting>> {
+    ipc_state(Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing))))
+}
+
+#[skuld::test]
+async fn an_unblock_holds_the_cover_lock_before_its_first_firewall_call() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(dir.clone());
+    let released_under = Arc::clone(&routing.released_under);
+    let state = ipc_state_over(routing);
+
+    let _ = super::handle_unblock(axum::extract::State(Arc::clone(&state)))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        released_under.lock().unwrap().as_deref(),
+        Some(dir.as_path()),
+        "the release ran under the cover lock of the Unblock's own state dir"
+    );
+    // And the lock ends with the Unblock: a later acquire returns instead of waiting for ever.
+    drop(state.routing.lock_covers());
+}
+#[skuld::test]
+async fn an_unblock_whose_release_fails_records_no_off_and_drops_the_lock() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    lockdown_state::set_enabled(&CoverLock::acquire(&dir), true, None).unwrap();
+    let routing = MockRouting::new(dir.clone());
+    routing.fail_release.store(true, Ordering::SeqCst);
+    let state = ipc_state_over(routing);
+
+    let result = super::handle_unblock(axum::extract::State(Arc::clone(&state))).await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        lockdown_state::load_intent(&dir),
+        lockdown_state::Intent::On,
+        "a release that failed records no `Off`: the user's retry, and the next start, still see the armed intent"
+    );
+    assert_eq!(
+        state.unblock_generation.load(Ordering::SeqCst),
+        0,
+        "and no unblock is announced"
+    );
+    drop(state.routing.lock_covers());
+}
+#[skuld::test]
+fn a_dropped_unblock_handler_future_still_runs_its_release_and_persist_to_the_end() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+    let routing = MockRouting::new(dir.path().to_owned());
+    let release_all_calls = Arc::clone(&routing.release_all_calls);
+    let state = ipc_state_over(routing);
+
+    // Declared first, dropped last: dropping it joins the persist, which waits on `holder`, which
+    // waits on `let_go_tx`. A failed assertion drops `let_go_tx` first and unblocks the chain.
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (let_go_tx, let_go_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn({
+        let dir = dir.path().to_owned();
+        move || {
+            target::apply(&dir, None, |current| {
+                entered_tx.send(()).unwrap();
+                let _ = let_go_rx.recv();
+                current
+            })
+        }
+    });
+    entered_rx.recv().unwrap();
+
+    runtime.block_on(async {
+        let mut handler = Box::pin(super::handle_unblock(axum::extract::State(state)));
+        let polled = handler.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(matches!(polled, Poll::Pending), "the persist is waiting on the lock");
+    });
+
+    // The handler future is gone; the section it spawned is not: it finishes once its record lock is free.
+    let_go_tx.send(()).unwrap();
+    holder.join().unwrap().unwrap();
+    drop(runtime);
+    assert_eq!(release_all_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        lockdown_state::load_intent(dir.path()),
+        lockdown_state::Intent::Off,
+        "the persist ran to its end after the future was dropped"
+    );
+}
+
 /// Seam guard with the sibling teardown item: `handle_unblock` must consume
 /// no session posture at all, so a stopping session's reported posture can
 /// never reach this decision — the escape reads only the reconciler's
@@ -1131,8 +1215,7 @@ fn update_apply_lockdown_off_without_consent_is_refused() {
     rt().block_on(async {
         let path = test_socket_path("update-apply-no-consent");
         let log_dir = tempfile::tempdir().unwrap().keep();
-        let server =
-            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
+        let server = IpcServer::bind_with_log_dir(&path, mock_proxy(), "test", log_dir.clone()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1170,8 +1253,7 @@ fn update_apply_with_existing_marker_is_409() {
             None,
         )
         .unwrap();
-        let server =
-            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
+        let server = IpcServer::bind_with_log_dir(&path, mock_proxy(), "test", log_dir.clone()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1229,8 +1311,7 @@ fn update_apply_unverifiable_payload_is_422_and_clears_the_marker() {
         #[cfg(not(target_os = "macos"))]
         let app_dest: Option<String> = None;
 
-        let server =
-            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
+        let server = IpcServer::bind_with_log_dir(&path, mock_proxy(), "test", log_dir.clone()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1284,8 +1365,7 @@ fn update_apply_staging_io_failure_clears_the_marker() {
         let app_dest_dir = tempfile::tempdir().unwrap();
         let app_dest = Some(make_valid_app_dest(app_dest_dir.path()).to_string_lossy().into_owned());
 
-        let server =
-            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
+        let server = IpcServer::bind_with_log_dir(&path, mock_proxy(), "test", log_dir.clone()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1339,7 +1419,7 @@ fn update_apply_spoofed_app_dest_is_400_no_marker() {
         )
         .unwrap();
 
-        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
+        let server = IpcServer::bind_with_log_dir(&path, mock_proxy(), "test", log_dir.clone()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1507,8 +1587,7 @@ fn setting_the_target_persists_the_startup_preference() {
     rt().block_on(async {
         let path = test_socket_path("on-startup-persist");
         let state_dir = tempfile::tempdir().unwrap().keep();
-        let server =
-            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", state_dir.clone(), state_dir.clone(), None).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy_in(state_dir.clone()), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1560,8 +1639,7 @@ fn a_start_with_no_startup_preference_leaves_the_persisted_one_alone() {
             None,
         )
         .unwrap();
-        let server =
-            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", state_dir.clone(), state_dir.clone(), None).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy_in(state_dir.clone()), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1599,11 +1677,9 @@ fn a_start_with_no_startup_preference_leaves_the_persisted_one_alone() {
 /// Build an `IpcState` directly (bypassing `IpcServer::bind*`, which cannot
 /// wire up the test-only persist gate) so `persist_after_start` can be
 /// parked exactly inside its write window — between `start_cancellable`
-/// returning and the
-/// target/startup-preference write landing. `proxy`'s own `state_dir` must
-/// be `dir`, same as `IpcState::state_dir`, for `handle_stop`'s write
-/// (via `ProxyManager::state_dir`) and `handle_start`'s (via this state's
-/// `state_dir`) to land in the same file.
+/// returning and the target/startup-preference write landing. The routing
+/// owns `dir`, so `handle_stop`'s and `handle_start`'s writes land in the
+/// same file.
 fn ipc_state_with_persist_gate(
     dir: PathBuf,
 ) -> (
@@ -1611,28 +1687,16 @@ fn ipc_state_with_persist_gate(
     Arc<tokio::sync::Notify>,
     oneshot::Receiver<()>,
 ) {
-    let routing = MockRouting::new(dir.clone());
-    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.clone());
-    let proxy = Arc::new(Mutex::new(pm));
-    let routing_handle = proxy.try_lock().unwrap().routing_handle();
-    let cover_invalidated = proxy.try_lock().unwrap().cover_invalidation_handle();
+    let proxy = Arc::new(Mutex::new(ProxyManager::new(
+        MockProxy::new(),
+        MockRouting::new(dir.clone()),
+    )));
     let gate = Arc::new(tokio::sync::Notify::new());
     let (entered_tx, entered_rx) = oneshot::channel();
-    let state = Arc::new(IpcState {
-        proxy,
-        routing: routing_handle,
-        cover_invalidated,
-        unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        intent_persist: Arc::new(std::sync::Mutex::new(())),
-        start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
-        version: "test".to_string(),
-        log_dir: dir.clone(),
-        state_dir: dir,
-        owner: None,
-        persist_gate: Some(gate.clone()),
-        persist_entered: std::sync::Mutex::new(Some(entered_tx)),
-    });
-    (state, gate, entered_rx)
+    let mut state = IpcState::new(proxy, "test", dir);
+    state.persist_gate = Some(gate.clone());
+    state.persist_entered = std::sync::Mutex::new(Some(entered_tx));
+    (Arc::new(state), gate, entered_rx)
 }
 
 #[skuld::test]
@@ -1722,12 +1786,9 @@ async fn a_second_start_cannot_begin_while_the_first_is_still_persisting() {
 
 #[skuld::test]
 fn ipc_start_never_engages_the_cover_even_on_failure() {
-    // #979: `handle_start` hardcodes `covered = false` unconditionally now —
-    // there is no wire signal left that can make an IPC-driven start covered
-    // (`X-Hole-Covered` was deleted; the only remaining source of a covered
-    // start is the bridge's own boot-time reconcile, which bypasses IPC
-    // entirely). A failed IPC start must therefore never leave the host
-    // fail-closed, regardless of any header a client sends.
+    // `handle_start` hardcodes `Coverage::Uncovered`: no wire signal can make an IPC-driven start covered; the only
+    // covered start is the bridge's own boot-time reconcile, which bypasses IPC. A failed IPC start therefore never
+    // leaves the host fail-closed, whatever header a client sends.
     rt().block_on(async {
         let path = test_socket_path("ipc-start-uncovered");
         let server = IpcServer::bind(&path, failing_proxy(), "test").unwrap();
@@ -1778,11 +1839,8 @@ fn reload_request_reloads_proxy() {
     });
 }
 
-/// Build an `IpcState` directly, backed by `dir` for both `state.state_dir`
-/// (what `handle_start`/`handle_reload` persist through) and the proxy's
-/// own `with_state_dir` (what `MockRouting` and `set_lockdown_intent` read),
-/// same pairing `ipc_state_with_persist_gate` uses — without that helper's
-/// persist-gate machinery, which these tests don't need.
+/// Build an `IpcState` directly, over a routing that owns `dir` (what `handle_start`/`handle_reload` persist
+/// through), without the persist-gate machinery `ipc_state_with_persist_gate` adds.
 fn ipc_state_with_dir(dir: PathBuf) -> Arc<IpcState<MockProxy, MockRouting>> {
     ipc_state_with_dir_and_proxy(dir, MockProxy::new())
 }
@@ -1791,27 +1849,7 @@ fn ipc_state_with_dir(dir: PathBuf) -> Arc<IpcState<MockProxy, MockRouting>> {
 /// test that needs its `start` calls to behave differently across a
 /// start/reload sequence (e.g. succeed then fail).
 fn ipc_state_with_dir_and_proxy(dir: PathBuf, proxy: MockProxy) -> Arc<IpcState<MockProxy, MockRouting>> {
-    let routing = MockRouting::new(dir.clone());
-    let pm = ProxyManager::new(proxy, routing).with_state_dir(dir.clone());
-    let proxy = Arc::new(Mutex::new(pm));
-    let (routing_handle, cover_invalidated) = {
-        let guard = proxy.try_lock().unwrap();
-        (guard.routing_handle(), guard.cover_invalidation_handle())
-    };
-    Arc::new(IpcState {
-        proxy,
-        routing: routing_handle,
-        cover_invalidated,
-        unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        intent_persist: Arc::new(std::sync::Mutex::new(())),
-        start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
-        version: "test".to_string(),
-        log_dir: dir.clone(),
-        state_dir: dir,
-        owner: None,
-        persist_gate: None,
-        persist_entered: std::sync::Mutex::new(None),
-    })
+    ipc_state(Arc::new(Mutex::new(ProxyManager::new(proxy, MockRouting::new(dir)))))
 }
 
 #[skuld::test]
@@ -2470,18 +2508,53 @@ async fn a_failed_teardown_after_a_dead_session_logs_the_cause_on_metrics() {
     );
 }
 
-/// With no state dir the intent cannot be saved. The message says only that the
+/// A manager whose routing's intent file cannot be written: a directory occupies the file's name, a real OS failure
+/// of the write alone.
+fn proxy_whose_intent_cannot_be_saved() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    std::fs::create_dir(state_dir.join(lockdown_state::STATE_FILE_NAME)).unwrap();
+    mock_proxy_in(state_dir)
+}
+
+/// A kill switch the bridge cannot persist fails loudly over the socket: a silent 200 would make the GUI believe
+/// lockdown is armed when nothing was written.
+#[skuld::test]
+fn lockdown_post_that_cannot_save_answers_500() {
+    rt().block_on(async {
+        let path = test_socket_path("lockdown-unsaved");
+        let server = IpcServer::bind(&path, proxy_whose_intent_cannot_be_saved(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_lockdown(&mut client, true).await;
+        assert_eq!(
+            resp.status(),
+            500,
+            "a lockdown POST whose intent cannot be saved must error, not silently succeed"
+        );
+        let body = parse_error_body(resp).await;
+        assert_eq!(
+            body.message, "the kill-switch setting could not be saved",
+            "the body is a written sentence, not the internal error's text"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// A directory where the intent file belongs: the intent cannot be saved. The message says only that the
 /// setting was not saved; why is in bridge.log.
 #[skuld::test]
 async fn a_kill_switch_off_that_cannot_save_logs_why() {
     let (subscriber, writer) = redacting_capture();
+    let state = ipc_state(proxy_whose_intent_cannot_be_saved());
     let result = {
         let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
-        super::handle_lockdown(
-            axum::extract::State(ipc_state(mock_proxy())),
-            Json(LockdownRequest { enabled: false }),
-        )
-        .await
+        super::handle_lockdown(axum::extract::State(state), Json(LockdownRequest { enabled: false })).await
     };
 
     let Err((_, Json(body))) = result else {
@@ -2492,43 +2565,54 @@ async fn a_kill_switch_off_that_cannot_save_logs_why() {
         "the network was unblocked, but the kill-switch setting could not be saved"
     );
     let log = writer.snapshot();
+    let cause = unsaved_intent_cause();
     assert!(
-        log.contains("bridge has no state_dir to persist it"),
+        log.contains(&format!("error.sources=[{cause}")),
         "bridge.log must name the cause: {log}"
     );
 }
 
-/// `ProxyError::Runtime` embeds its io cause in `Display` and returns it from
-/// `source()`, so the cause appears twice in the logged chain.
+/// The kill switch turned on logs the `StoreError`: it is the only thing that can fail the toggle.
 #[skuld::test]
-async fn a_failed_kill_switch_on_logs_the_chain() {
+async fn a_failed_kill_switch_on_logs_the_store_error() {
     let (subscriber, writer) = redacting_capture();
+    let state = ipc_state(proxy_whose_intent_cannot_be_saved());
     let result = {
         let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
-        super::handle_lockdown(
-            axum::extract::State(ipc_state(mock_proxy())),
-            Json(LockdownRequest { enabled: true }),
-        )
-        .await
+        super::handle_lockdown(axum::extract::State(state), Json(LockdownRequest { enabled: true })).await
     };
 
-    assert!(result.is_err(), "an unsaved intent must be reported");
+    let Err((_, Json(body))) = result else {
+        panic!("an unsaved intent must be reported");
+    };
+    assert_eq!(body.message, "the kill-switch setting could not be saved");
     let log = writer.snapshot();
-    let cause = "cannot set lockdown intent: bridge has no state_dir to persist it";
+    let cause = unsaved_intent_cause();
     assert!(
-        log.contains(&format!("error=proxy runtime error: {cause} error.sources=[{cause}]")),
-        "bridge.log must carry the chain: {log}"
+        log.contains(&format!("error={cause}")),
+        "bridge.log must carry the cause: {log}"
     );
+}
+
+/// The text of the failure `proxy_whose_intent_cannot_be_saved` produces, taken from the store itself.
+fn unsaved_intent_cause() -> String {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(lockdown_state::STATE_FILE_NAME)).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None)
+        .unwrap_err()
+        .to_string()
 }
 
 #[skuld::test]
 async fn a_failed_unblock_release_logs_the_cause() {
-    let (proxy, _calls, fail_release, _dir) = mock_proxy_with_release_state();
-    fail_release.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(dir.clone());
+    routing.fail_release.store(true, Ordering::SeqCst);
+    let state = ipc_state_over(routing);
     let (subscriber, writer) = redacting_capture();
     let result = {
         let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
-        super::handle_unblock(axum::extract::State(ipc_state(proxy))).await
+        super::handle_unblock(axum::extract::State(state)).await
     };
 
     let Err((_, Json(body))) = result else {
@@ -3304,27 +3388,8 @@ fn redacting_capture() -> (
 }
 
 fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<IpcState<MockProxy, MockRouting>> {
-    let dir = tempfile::tempdir().unwrap().keep();
-    let (routing, cover_invalidated) = {
-        let guard = proxy
-            .try_lock()
-            .expect("proxy mutex must be uncontended at construction time");
-        (guard.routing_handle(), guard.cover_invalidation_handle())
-    };
-    Arc::new(IpcState {
-        proxy,
-        routing,
-        cover_invalidated,
-        unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        intent_persist: Arc::new(std::sync::Mutex::new(())),
-        start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
-        version: "test".to_string(),
-        log_dir: dir.clone(),
-        state_dir: dir,
-        owner: None,
-        persist_gate: None,
-        persist_entered: std::sync::Mutex::new(None),
-    })
+    let log_dir = tempfile::tempdir().unwrap().keep();
+    Arc::new(IpcState::new(proxy, "test", log_dir))
 }
 
 fn redaction_config() -> ProxyConfig {
@@ -3543,8 +3608,7 @@ async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
 async fn an_unblock_whose_target_save_fails_leaves_the_generation_alone() {
     // A state directory below a regular file cannot be opened.
     let blocker = tempfile::NamedTempFile::new().unwrap();
-    let mut state = ipc_state(mock_proxy());
-    Arc::get_mut(&mut state).expect("the state is not shared yet").state_dir = blocker.path().join("state");
+    let state = ipc_state(mock_proxy_in(blocker.path().join("state")));
 
     let result = handle_unblock(axum::extract::State(state.clone())).await;
 
@@ -3556,23 +3620,15 @@ async fn an_unblock_whose_target_save_fails_leaves_the_generation_alone() {
     );
 }
 
-/// The start's target and candidate writes, and the unblock's Off, `set_enabled`
-/// and candidate clear, are each several critical sections, so an unblock
-/// committing between a start's two writes (or a start's pair landing between the
-/// unblock's) leaves `Off` beside a candidate, or `Connected` with its candidate
-/// erased. Both sequences run under `intent_persist`, and so does every access of
-/// `unblock_generation` inside them: the start reads it once before its writes, the
-/// unblock bumps it after the `Off` write succeeded.
-///
-/// Asserted by source, not by interleaving: neither sequence has a point a test
-/// can park at, and an unbounded wait for "the other side has blocked on the
-/// mutex" has no condition to re-check. In each function the guard must be bound
-/// (`let _ =` drops it at once) and taken before the first write.
 #[skuld::test]
-fn the_unblock_and_the_start_persist_run_under_the_intent_persist_mutex() {
+fn the_unblock_and_the_start_persist_run_under_the_cover_lock() {
     let src = include_str!("ipc.rs");
+    assert!(
+        !src.contains("intent_persist"),
+        "the cover lock is the one ordering of these writers: no second mutex beside it"
+    );
     let ordering_sites = regex::Regex::new(
-        r"\bintent_persist\.lock\(|\btarget::apply\(|\bwrite_start_records\(|\bapply_startup_preference\(|\bset_enabled\(|\bgeneration\.load\(|\bgeneration\.fetch_add\(",
+        r"\block_covers\(|\btarget::apply\(|\bwrite_start_records\(|\bapply_startup_preference\(|\bset_enabled\(|\bgeneration\.load\(|\bgeneration\.fetch_add\(",
     )
     .unwrap();
     let sites = crate::reconciler::reconciler_tests::call_sites_by_function(src, &ordering_sites);
@@ -3596,25 +3652,24 @@ fn the_unblock_and_the_start_persist_run_under_the_intent_persist_mutex() {
             "{function} must hold the lock and write under it: {in_function:?}"
         );
         assert!(
-            in_function[0].starts_with("let _ordered = intent_persist.lock("),
-            "{function} must bind the `intent_persist` guard before its first write: {in_function:?}"
+            in_function[0].contains("lock_covers("),
+            "{function} must take the cover lock before its first write or read of `unblock_generation`: {in_function:?}"
         );
     }
 
-    // The start reads the counter under the guard, before its first write.
+    // The start reads the counter under the lock, before its first write.
     let start = sites_of("persist_after_start");
     assert!(
         position(&start, "generation.load(") < position(&start, "write_start_records("),
         "the start must read `unblock_generation` before its writes: {start:?}"
     );
-    // The unblock bumps under the guard, and only after the `Off` write that `?` has confirmed.
+    // The unblock bumps under the lock, and only after the `Off` write that `?` has confirmed.
     let unblock = sites_of("handle_unblock");
     assert!(
         position(&unblock, "target::apply(") < position(&unblock, "generation.fetch_add("),
         "the unblock must bump `unblock_generation` after its target write: {unblock:?}"
     );
 }
-
 // Status probe placement ==============================================================================================
 
 /// `handle_status` used to reach cover presence through `pm.cover_presence()`

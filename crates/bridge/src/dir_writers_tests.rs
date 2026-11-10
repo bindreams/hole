@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use hole_common::logging::dir_rotate::DirRotate;
 use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE};
+use tun_engine::routing::failclosed::CoverLock;
 use tun_engine::routing::state as route_state;
 use util::dir::testing::{plant_link, user_dir};
 use util::dir::{Dir, Refusal};
@@ -95,6 +96,21 @@ impl std::fmt::Display for LeftAsItIs {
 }
 
 impl std::error::Error for LeftAsItIs {}
+
+/// A writer that removes or keeps what it finds reports a file it left in place as [`LeftAsItIs`]; no file there is
+/// nothing left.
+fn left_as_it_is_unless_nothing_was_there(outcome: util::versioned_file::UpdateOutcome, dir: &Path) -> io::Result<()> {
+    use util::versioned_file::UpdateOutcome;
+    match outcome {
+        UpdateOutcome::Removed | UpdateOutcome::Stored | UpdateOutcome::Absent | UpdateOutcome::MovedAside(_) => Ok(()),
+        UpdateOutcome::Kept | UpdateOutcome::Unchanged => {
+            match dir.join(crate::plugin_state::STATE_FILE_NAME).symlink_metadata() {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                _ => Err(io::Error::other(LeftAsItIs)),
+            }
+        }
+    }
+}
 
 /// Whether `err` is, or wraps, a refusal that names what it refused: the walk's (`util::dir::Refusal`), the lock's, a
 /// versioned file's decision to leave a file it cannot read as it is, or the update marker's refusal to stamp one.
@@ -184,11 +200,14 @@ fn route_record() -> route_state::RouteState {
 /// The macOS rows. Another platform lists their sources and runs none of them.
 #[cfg(target_os = "macos")]
 fn macos_writers() -> Vec<Writer> {
-    use tun_engine::routing::failclosed::{failclosed_state, lockdown_pf_state};
+    use tun_engine::routing::failclosed::{
+        failclosed_state, lockdown_pf_state,
+        pf_record::{self, Cleared},
+    };
     vec![
         Writer {
-            name: "the pf cover state, saved",
-            sources: &["crates/tun-engine/src/routing/failclosed/failclosed_state.rs"],
+            name: "the pf cover state, swapped",
+            sources: &["crates/tun-engine/src/routing/failclosed/pf_record.rs"],
             names: &[failclosed_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
@@ -197,7 +216,9 @@ fn macos_writers() -> Vec<Writer> {
                     pf_token: "0".to_owned(),
                     pf_was_enabled: false,
                 };
-                failclosed_state::save(dir, &state, owner).map_err(io::Error::other)
+                pf_record::swap(&CoverLock::acquire(dir), &state, owner)
+                    .map(|_| ())
+                    .map_err(io::Error::other)
             },
         },
         Writer {
@@ -206,14 +227,19 @@ fn macos_writers() -> Vec<Writer> {
             names: &[failclosed_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match failclosed_state::clear(dir).map_err(io::Error::other)? {
-                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+            run: |dir, _| match pf_record::clear_if_token::<failclosed_state::FailClosedState>(
+                &CoverLock::acquire(dir),
+                None,
+            )
+            .map_err(io::Error::other)?
+            {
+                Cleared::Kept => Err(io::Error::other(LeftAsItIs)),
                 _ => Ok(()),
             },
         },
         Writer {
-            name: "the pf lockdown state, saved",
-            sources: &["crates/tun-engine/src/routing/failclosed/lockdown_pf_state.rs"],
+            name: "the pf lockdown state, swapped",
+            sources: &[],
             names: &[lockdown_pf_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
@@ -224,7 +250,9 @@ fn macos_writers() -> Vec<Writer> {
                     nat_snapshot: String::new(),
                     main_snapshot_captured: true,
                 };
-                lockdown_pf_state::save(dir, &state, owner).map_err(io::Error::other)
+                pf_record::swap(&CoverLock::acquire(dir), &state, owner)
+                    .map(|_| ())
+                    .map_err(io::Error::other)
             },
         },
         Writer {
@@ -233,8 +261,13 @@ fn macos_writers() -> Vec<Writer> {
             names: &[lockdown_pf_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match lockdown_pf_state::clear(dir).map_err(io::Error::other)? {
-                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
+            run: |dir, _| match pf_record::clear_if_token::<lockdown_pf_state::LockdownPfState>(
+                &CoverLock::acquire(dir),
+                None,
+            )
+            .map_err(io::Error::other)?
+            {
+                Cleared::Kept => Err(io::Error::other(LeftAsItIs)),
                 _ => Ok(()),
             },
         },
@@ -245,10 +278,7 @@ fn macos_writers() -> Vec<Writer> {
 fn macos_writers() -> Vec<Writer> {
     vec![Writer {
         name: "the pf states (macOS)",
-        sources: &[
-            "crates/tun-engine/src/routing/failclosed/failclosed_state.rs",
-            "crates/tun-engine/src/routing/failclosed/lockdown_pf_state.rs",
-        ],
+        sources: &["crates/tun-engine/src/routing/failclosed/pf_record.rs"],
         names: &[],
         at_a_planted_name: AtAPlantedName::Replaces,
         runs_here: false,
@@ -368,14 +398,26 @@ fn writers() -> Vec<Writer> {
             run: |dir, owner| crate::plugin_state::append_record(dir, plugin_record(), owner).map_err(io::Error::other),
         },
         Writer {
-            name: "the plugin state, cleared",
+            name: "the plugin state, reaped",
             sources: &[],
             names: &[crate::plugin_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| match crate::plugin_state::clear(dir).map_err(io::Error::other)? {
-                util::versioned_file::UpdateOutcome::Kept => Err(io::Error::other(LeftAsItIs)),
-                _ => Ok(()),
+            run: |dir, _| {
+                let outcome =
+                    crate::plugin_state::remove_accounted(dir, &[plugin_record()]).map_err(io::Error::other)?;
+                left_as_it_is_unless_nothing_was_there(outcome, dir)
+            },
+        },
+        Writer {
+            name: "the plugin state, cleared when obsolete",
+            sources: &[],
+            names: &[crate::plugin_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, _| {
+                let outcome = crate::plugin_state::clear_obsolete(dir).map_err(io::Error::other)?;
+                left_as_it_is_unless_nothing_was_there(outcome, dir)
             },
         },
         Writer {
@@ -404,7 +446,28 @@ fn writers() -> Vec<Writer> {
             names: &[lockdown_state::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, owner| lockdown_state::set_enabled(dir, true, owner).map_err(io::Error::other),
+            run: |dir, owner| {
+                lockdown_state::set_enabled(&CoverLock::acquire(dir), true, owner).map_err(io::Error::other)
+            },
+        },
+        Writer {
+            name: "the lockdown state, promoted",
+            sources: &["crates/tun-engine/src/routing/failclosed/lockdown_state.rs"],
+            names: &[lockdown_state::STATE_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| {
+                // It writes only where nothing is recorded, and leaves what it cannot read as it found it.
+                match lockdown_state::promote_unrecorded(&CoverLock::acquire(dir), owner).map_err(io::Error::other)? {
+                    lockdown_state::PromoteOutcome::Wrote => Ok(()),
+                    lockdown_state::PromoteOutcome::Declined => match lockdown_state::load_intent(dir) {
+                        lockdown_state::Intent::Unreadable => Err(io::Error::other(LeftAsItIs)),
+                        lockdown_state::Intent::On | lockdown_state::Intent::Off | lockdown_state::Intent::Unset => {
+                            Ok(())
+                        }
+                    },
+                }
+            },
         },
         Writer {
             name: "the boot-time witness, recorded",
@@ -412,8 +475,8 @@ fn writers() -> Vec<Writer> {
             names: &[boottime_witness::STATE_FILE_NAME],
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
-            run: |dir, _| {
-                boottime_witness::record_armed_for_test(dir);
+            run: |dir, owner| {
+                boottime_witness::record_armed_for_test(&CoverLock::acquire(dir), owner);
                 Ok(())
             },
         },
@@ -1486,6 +1549,7 @@ const STATE_MODULES: &[&str] = &[
     "crates/tun-engine/src/routing/failclosed/failclosed_state.rs",
     "crates/tun-engine/src/routing/failclosed/lockdown_pf_state.rs",
     "crates/tun-engine/src/routing/failclosed/lockdown_state.rs",
+    "crates/tun-engine/src/routing/failclosed/pf_record.rs",
 ];
 
 #[skuld::test]

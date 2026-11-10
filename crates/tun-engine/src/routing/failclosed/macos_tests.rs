@@ -1,6 +1,8 @@
 use super::*;
 use std::net::IpAddr;
 
+use pf_record::PfRecord;
+
 use crate::GLOBAL_NET_STATE;
 
 fn v4() -> IpAddr {
@@ -16,12 +18,16 @@ fn resolver_v6() -> IpAddr {
     "2001:db8::abcd".parse().unwrap()
 }
 
-/// [`StateFile::Unusable`] with nothing salvaged — the shape an UNREADABLE file
-/// produces, since there are no bytes to read a `pf_token` out of. The
+/// [`StateFile::Unusable`] with nothing salvaged — bytes that held no `pf_token`. The
 /// version-skew vector, which is the reachable one in production, carries
 /// `Some(token)` instead (see `StateFile::unusable`).
 fn unusable<T>() -> StateFile<T> {
     StateFile::Unusable { pf_token: None }
+}
+
+/// A record whose read failed: no bytes were seen, so there is nothing to salvage and nothing may remove it.
+fn unreadable<T>() -> StateFile<T> {
+    StateFile::Unreadable
 }
 
 #[skuld::test]
@@ -178,6 +184,7 @@ fn ruleset_resolver_pass_is_scoped_to_tcp_443_not_unrestricted() {
 ///
 /// Fails loudly on a missing or failing `pfctl`, never skips: a cover ruleset
 /// this host's own `pfctl` will not parse is a bug on its own terms.
+#[cfg(target_os = "macos")]
 fn pfctl_normalized(ruleset: &str) -> Vec<String> {
     use std::io::Write;
     use std::process::Stdio;
@@ -215,6 +222,7 @@ fn pfctl_normalized(ruleset: &str) -> Vec<String> {
 /// `ruleset` with the `no state` qualifier stripped from every permit that is
 /// not a loopback pass — the pre-fix shape of both cover rulesets, and the
 /// positive control for the assertion below.
+#[cfg(target_os = "macos")]
 fn without_permit_no_state(ruleset: &str) -> String {
     ruleset
         .lines()
@@ -249,6 +257,7 @@ fn without_permit_no_state(ruleset: &str) -> String {
 /// from it, so on the very regression this exists to catch — a permit that
 /// never carried `no state` — the strip is a no-op and a control-first order
 /// would report "the control proves nothing" over the real, named defect.
+#[cfg(target_os = "macos")]
 fn assert_no_permit_is_syn_only(ruleset: &str, what: &str) {
     let is_pass = |l: &&String| l.trim_start().starts_with("pass");
 
@@ -296,6 +305,7 @@ fn assert_no_permit_is_syn_only(ruleset: &str, what: &str) {
 /// caller's own `ech-doh` URL, typically a well-known public DoH address a
 /// browser on the same host already holds a TLS connection to, and the engage
 /// purges that connection's state host-wide.
+#[cfg(target_os = "macos")]
 #[skuld::test]
 fn transient_cover_permits_are_never_syn_only() {
     assert_no_permit_is_syn_only(&build_pf_ruleset(v4(), Some(resolver())), "the transient cover");
@@ -306,6 +316,7 @@ fn transient_cover_permits_are_never_syn_only() {
 /// already carrying traffic when the ruleset commits; on a stock macOS whose pf
 /// this engage's own `pfctl -E` enabled, those flows hold no state entry for
 /// [`purges_state`]'s non-purge to preserve.
+#[cfg(target_os = "macos")]
 #[skuld::test]
 fn lockdown_permits_are_never_syn_only() {
     assert_no_permit_is_syn_only(&build_lockdown_main_ruleset(TUN_IF, v4(), ""), "the standing lockdown");
@@ -385,12 +396,12 @@ fn an_indeterminate_presence_reports_doing_nothing() {
 /// The manual escape hatch's half of the rule `release_all_with` already
 /// obeys: an UNUSABLE record still names the `pf_token` it must release.
 ///
-/// Driven from persisted bytes through the REAL [`lockdown_state::load_presence`],
+/// Driven from persisted bytes through the REAL [`pf_record::read`],
 /// so the `Unusable` arm is pinned to a payload a rolled-back bridge really
 /// produces rather than hand-constructed at the seam. The production cause is
 /// a version skew: `serde_json` produced a complete record, token intact, and
 /// only the version check rejected it. `disengage_lockdown` used to read this
-/// through `lockdown_state::load`, which collapses `Unusable` to `None`, so
+/// through an older release's `lockdown_state::load`, which collapses `Unusable` to `None`, so
 /// `bridge unlock` skipped `pfctl -X` entirely and `clear_standing` then
 /// deleted the only copy of the ticket — pf enabled under an unreferenced
 /// refcount until reboot.
@@ -400,7 +411,7 @@ fn disengage_lockdown_drops_the_token_salvaged_from_an_unusable_record() {
     let skewed = r#"{"version":2,"pf_token":"9","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":true}"#;
     std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), skewed).unwrap();
 
-    let file = lockdown_state::load_presence(dir.path());
+    let file = pf_record::read::<lockdown_state::LockdownPfState>(dir.path());
     assert!(
         matches!(file, StateFile::Unusable { pf_token: Some(ref t) } if t == "9"),
         "this test's premise: a record one schema version ahead must read as `Unusable` WITH its \
@@ -418,8 +429,8 @@ fn disengage_lockdown_drops_the_token_salvaged_from_an_unusable_record() {
     assert_eq!(
         ops.dropped,
         vec!["9".to_owned()],
-        "the escape hatch must release the refcount its unusable record still names, before \
-         `clear_standing` destroys the only record of it: {:?}",
+        "the escape hatch must release the refcount its unusable record still names, once \
+         `clear_standing` took that record: {:?}",
         ops.log
     );
 }
@@ -446,7 +457,7 @@ fn a_live_presence_with_a_captured_snapshot_restores_it_and_drops_the_token() {
     let mut ops = RecordingPfOps::default();
     let result = disengage_lockdown_with(CoverPresence::Live, StateFile::Present(standing_state()), &mut ops);
     assert!(result.is_ok(), "{result:?}");
-    assert_eq!(ops.log, vec!["load_ruleset", "drop_token", "clear_standing"]);
+    assert_eq!(ops.log, vec!["load_ruleset", "clear_standing", "drop_token"]);
 }
 
 // pfctl_stdout (non-zero exit must not read as an empty success) ======================================================
@@ -457,9 +468,8 @@ fn a_live_presence_with_a_captured_snapshot_restores_it_and_drops_the_token() {
 // single place every status-bearing read goes through.
 
 fn exit_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
-    use std::os::unix::process::ExitStatusExt;
     std::process::Output {
-        status: std::process::ExitStatus::from_raw(if code == 0 { 0 } else { code << 8 }),
+        status: exit_status(if code == 0 { 0 } else { code << 8 }),
         stdout: stdout.as_bytes().to_vec(),
         stderr: stderr.as_bytes().to_vec(),
     }
@@ -741,11 +751,20 @@ fn restore_empty_nat_has_no_blank_line() {
     assert!(!r.contains("\n\n"), "empty nat must not produce a blank line:\n{r}");
 }
 
-// restore_confirmed ===================================================================================================
+// exit statuses =======================================================================================================
 
-fn exit_status(code: i32) -> std::process::ExitStatus {
+/// A status from the host's raw encoding; only zero (success) and non-zero are read, so the two encodings need not
+/// agree on anything else.
+#[cfg(unix)]
+fn exit_status(raw: i32) -> std::process::ExitStatus {
     use std::os::unix::process::ExitStatusExt;
-    std::process::ExitStatus::from_raw(code)
+    std::process::ExitStatus::from_raw(raw)
+}
+
+#[cfg(windows)]
+fn exit_status(raw: i32) -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(raw as u32)
 }
 
 fn output_with_status(code: i32) -> Result<std::process::Output, RoutingError> {
@@ -756,40 +775,7 @@ fn output_with_status(code: i32) -> Result<std::process::Output, RoutingError> {
     })
 }
 
-#[skuld::test(labels = [GLOBAL_NET_STATE])]
-fn release_all_restore_confirmed_requires_a_successful_exit_status() {
-    // adopting=true short-circuits to true regardless of `out` — nothing was
-    // attempted, so nothing can have failed to confirm.
-    assert!(restore_confirmed(true, &output_with_status(0)));
-    assert!(restore_confirmed(true, &Err(RoutingError::RouteSetup("unused".into()))));
-
-    // adopting=false: only a successful spawn AND a zero exit status confirms.
-    assert!(restore_confirmed(false, &output_with_status(0)));
-    assert!(
-        !restore_confirmed(false, &output_with_status(1)),
-        "a non-zero pfctl exit must NOT be mistaken for confirmation"
-    );
-    assert!(!restore_confirmed(
-        false,
-        &Err(RoutingError::RouteSetup("spawn failed".into()))
-    ));
-}
-
 // recover_cover_with ==================================================================================================
-
-/// [`RecoverOps`] test double: records the token each `restore` was handed
-/// (`None` = "no token on record"), so what the sweep DOES is assertable, not
-/// merely that it did something.
-#[derive(Default)]
-struct RecordingRecoverOps {
-    restores: Vec<(Option<String>, bool)>,
-}
-
-impl RecoverOps for RecordingRecoverOps {
-    fn restore(&mut self, token: Option<&str>, adopting: bool) {
-        self.restores.push((token.map(str::to_owned), adopting));
-    }
-}
 
 /// A recorded transient cover holding `token`.
 fn recorded_cover(token: &str) -> state::FailClosedState {
@@ -801,23 +787,50 @@ fn recorded_cover(token: &str) -> state::FailClosedState {
 
 #[skuld::test]
 fn recover_cover_with_no_state_file_does_nothing() {
-    let mut ops = RecordingRecoverOps::default();
-    recover_cover_with(StateFile::Absent, false, &mut ops);
+    let mut ops = RecordingPfOps::default();
+    recover_cover_with(StateFile::Absent, false, &mut ops).unwrap();
     assert!(
-        ops.restores.is_empty(),
+        ops.log.is_empty(),
         "an absent file means no cover was ever engaged; a sweep must spawn nothing: {:?}",
-        ops.restores
+        ops.log
     );
 }
 
+/// A cover being adopted is the standing one's, so the sweep must not reload `/etc/pf.conf` over its ruleset; the
+/// transient token is dropped all the same.
 #[skuld::test]
-fn recover_cover_with_a_recorded_cover_restores_and_drops_its_token() {
-    let mut ops = RecordingRecoverOps::default();
-    recover_cover_with(StateFile::Present(recorded_cover("42")), true, &mut ops);
-    assert_eq!(ops.restores, vec![(Some("42".to_owned()), true)]);
+fn recover_cover_with_a_recorded_cover_drops_its_token_and_skips_the_reload_when_adopting() {
+    let mut ops = RecordingPfOps::default();
+    recover_cover_with(StateFile::Present(recorded_cover("42")), true, &mut ops).unwrap();
+    assert_eq!(ops.log, vec!["clear_transient", "drop_token"]);
+    assert_eq!(ops.dropped, vec!["42".to_owned()]);
 }
 
-/// An UNREADABLE record is a cover to clear, not an absence.
+#[skuld::test]
+fn recover_cover_with_a_recorded_cover_restores_then_drops_its_token() {
+    let mut ops = RecordingPfOps::default();
+    recover_cover_with(StateFile::Present(recorded_cover("42")), false, &mut ops).unwrap();
+    assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
+    assert_eq!(ops.dropped, vec!["42".to_owned()]);
+}
+
+/// The sweep reports whether it released the cover: a failed restore keeps the record and token, so a guard that
+/// still holds the cover must keep its stamp and retry.
+#[skuld::test]
+fn recover_cover_with_reports_a_failed_restore_and_a_clean_sweep() {
+    let mut failing = RecordingPfOps {
+        fail_reload_default: true,
+        ..Default::default()
+    };
+    assert!(recover_cover_with(StateFile::Present(recorded_cover("42")), false, &mut failing).is_err());
+
+    let mut clean = RecordingPfOps::default();
+    assert!(recover_cover_with(StateFile::Present(recorded_cover("42")), false, &mut clean).is_ok());
+    assert!(recover_cover_with(StateFile::Absent, false, &mut RecordingPfOps::default()).is_ok());
+}
+
+/// An UNUSABLE record that named no token is a cover to clear, not an absence. (A record whose read failed is the
+/// settle tests' `a_record_that_could_not_be_read_still_drives_a_restore_of_the_host`.)
 ///
 /// `Absent` and `Unusable` are opposite facts for a sweep: the first says no
 /// cover was ever engaged, the second is Hole's own unreconciled record that
@@ -826,15 +839,15 @@ fn recover_cover_with_a_recorded_cover_restores_and_drops_its_token() {
 /// not read it as "nothing to recover" while the crashed run's `block out all`
 /// still holds the host. Only the manual `bridge unlock` would escape it.
 #[skuld::test]
-fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
-    let mut ops = RecordingRecoverOps::default();
-    recover_cover_with(unusable(), false, &mut ops);
+fn recover_cover_with_an_unusable_record_naming_no_token_still_restores_the_host() {
+    let mut ops = RecordingPfOps::default();
+    let _ = recover_cover_with(unusable(), false, &mut ops);
     assert_eq!(
-        ops.restores,
-        vec![(None, false)],
-        "an unreadable failclosed-state file must still drive a restore — with no token to drop, \
-         but never as a no-op"
+        ops.log,
+        vec!["reload_default", "clear_transient"],
+        "an unusable record naming no token must still drive a restore, never a no-op"
     );
+    assert!(ops.dropped.is_empty(), "no token to drop: {:?}", ops.dropped);
 }
 
 /// An unusable record that STILL HOLDS a readable `pf_token` must hand it to
@@ -843,13 +856,13 @@ fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
 /// Version skew — the reachable vector — reaches `Unusable` only AFTER
 /// `serde_json` produced a complete record whose token is intact; the version
 /// check is the last thing to reject it. Dropping the record there discards the
-/// only copy of the `pfctl -E` ticket that exists, and `disengage(None, ..)`
+/// only copy of the `pfctl -E` ticket that exists, and `release_transient(Ok(None), ..)`
 /// then skips `pfctl -X` and, on a confirmed restore, CLEARS the file — so
 /// pf stays enabled until reboot with nothing left to release it.
 #[skuld::test]
 fn recover_cover_with_an_unusable_record_still_drops_the_token_it_could_read() {
-    let mut ops = RecordingRecoverOps::default();
-    recover_cover_with(
+    let mut ops = RecordingPfOps::default();
+    let _ = recover_cover_with(
         StateFile::Unusable {
             pf_token: Some("7".into()),
         },
@@ -857,11 +870,11 @@ fn recover_cover_with_an_unusable_record_still_drops_the_token_it_could_read() {
         &mut ops,
     );
     assert_eq!(
-        ops.restores,
-        vec![(Some("7".to_owned()), false)],
-        "a token salvaged from an unusable record is the only one there is — the restore must be \
-         handed it, or the pf enable refcount leaks permanently"
+        ops.dropped,
+        vec!["7".to_owned()],
+        "a salvaged token is the only one there is: the sweep must drop it or the refcount leaks"
     );
+    assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
 }
 
 /// [`StateFile::unusable`]'s two answers, driven from bytes.
@@ -889,7 +902,7 @@ fn a_pf_token_is_salvaged_from_unusable_bytes_only_when_one_is_really_there() {
 }
 
 /// A rolled-back bridge's sweep, driven from persisted bytes through the REAL
-/// [`state::load_presence`] into [`recover_cover_with`] — so `Unusable` is
+/// [`pf_record::read`] into [`recover_cover_with`] — so `Unusable` is
 /// pinned to a payload rather than hand-constructed at the seam. The payload is
 /// a record one schema version ahead, which this binary classifies as
 /// `Unusable`.
@@ -900,21 +913,21 @@ fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
     let newer = r#"{"version":2,"pf_token":"7","pf_was_enabled":false}"#;
     std::fs::write(&path, newer).unwrap();
 
-    let file = state::load_presence(dir.path());
+    let file = pf_record::read::<state::FailClosedState>(dir.path());
     assert!(
         matches!(file, StateFile::Unusable { .. }),
         "a record one schema version ahead must read as `Unusable` — on any other arm the \
          assertion below is exercising some other path: {newer} -> {file:?}"
     );
 
-    let mut ops = RecordingRecoverOps::default();
-    recover_cover_with(file, false, &mut ops);
+    let mut ops = RecordingPfOps::default();
+    let _ = recover_cover_with(file, false, &mut ops);
     assert_eq!(
-        ops.restores,
-        vec![(Some("7".to_owned()), false)],
-        "a record this binary cannot read must still drive a restore — AND with the `pf_token` \
-         that record plainly still contains, which is the only copy of the pf enable ticket left"
+        ops.dropped,
+        vec!["7".to_owned()],
+        "the token the newer record still holds"
     );
+    assert_eq!(ops.log, vec!["reload_default", "clear_transient", "drop_token"]);
 }
 
 // engage_with =========================================================================================================
@@ -935,6 +948,8 @@ struct RecordingEngageOps {
     /// Every state handed to `save_transient`, so what the engage RECORDS is
     /// assertable, not just that it recorded something.
     saved: Vec<state::FailClosedState>,
+    /// The token the record `save_transient` replaced named, if any.
+    displaced: Option<String>,
     fail_pf_enabled: bool,
     fail_enable_capture_token: bool,
     fail_save_transient: bool,
@@ -961,6 +976,16 @@ impl CoverRulesetOps for RecordingEngageOps {
             Ok(())
         }
     }
+
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.log.push("drop_token");
+        self.dropped.push(token.to_owned());
+        if self.fail_drop_token {
+            Err(RoutingError::RouteSetup("mock drop_token failure".into()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl EngageOps for RecordingEngageOps {
@@ -982,23 +1007,13 @@ impl EngageOps for RecordingEngageOps {
         }
     }
 
-    fn save_transient(&mut self, st: &state::FailClosedState) -> Result<(), RoutingError> {
+    fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError> {
         self.log.push("save_transient");
         self.saved.push(st.clone());
         if self.fail_save_transient {
             Err(RoutingError::RouteSetup("mock save_transient failure".into()))
         } else {
-            Ok(())
-        }
-    }
-
-    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        self.log.push("drop_token");
-        self.dropped.push(token.to_owned());
-        if self.fail_drop_token {
-            Err(RoutingError::RouteSetup("mock drop_token failure".into()))
-        } else {
-            Ok(())
+            Ok(self.displaced.clone())
         }
     }
 
@@ -1112,7 +1127,7 @@ fn a_failed_state_purge_does_not_fail_the_engage() {
 
 #[skuld::test]
 fn a_failed_persist_unwinds_the_pf_enable_refcount() {
-    // `enable_capture_token` has already taken a refcount. `state::save` fails
+    // `enable_capture_token` has already taken a refcount. `pf_record::swap` fails
     // on a real, enumerated set of causes — unwritable state dir, full disk;
     // NOT a failed chown, which `util::ownership::chown_if_some` logs and
     // swallows. Without this unwind pf stays ENABLED under an unreferenced
@@ -1278,7 +1293,7 @@ fn a_failed_pf_enabled_read_records_not_enabled_and_still_engages() {
 /// The previous release's `FailClosedState`, verbatim from `c66ceebf`: a `bool`
 /// `pf_was_enabled` under `deny_unknown_fields`. A binary rolled back to it
 /// reads whatever this one wrote, and a file it cannot parse is `Unusable` to it,
-/// which `state::load` collapses into "nothing to recover" — the crashed run's
+/// which an older release's `state::load` collapses into "nothing to recover" — the crashed run's
 /// `block out all` then stays on the host.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1291,7 +1306,7 @@ struct PreviousReleaseFailClosedState {
 
 /// What an engage persists must parse under [`PreviousReleaseFailClosedState`],
 /// whether or not the `pfctl -s info` read succeeded. Driven through
-/// `engage_with` and the real `state::save`, so it covers what the engage
+/// `engage_with` and the real `pf_record::swap`, so it covers what the engage
 /// writes, not a hand-built value.
 #[skuld::test]
 fn what_an_engage_persists_parses_under_the_previous_releases_schema() {
@@ -1307,7 +1322,8 @@ fn what_an_engage_persists_parses_under_the_previous_releases_schema() {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        state::save(dir.path(), saved, None).expect("persist");
+        let lock = CoverLock::acquire(dir.path());
+        pf_record::swap(&lock, saved, None).expect("persist");
         let bytes = std::fs::read(dir.path().join(state::STATE_FILE_NAME)).unwrap();
         let parsed = serde_json::from_slice::<PreviousReleaseFailClosedState>(&bytes);
         assert!(
@@ -1363,9 +1379,9 @@ fn a_failed_enable_capture_token_fails_the_engage_without_a_spurious_unwind() {
     );
 }
 
-// drop_refcount_or_warn (pfctl -X exit status must not be silently swallowed) =========================================
+// drop_or_warn (pfctl -X exit status must not be silently swallowed) ==================================================
 
-/// [`drop_refcount_or_warn`] routes `pfctl -X` through [`pfctl_status`] so a
+/// [`drop_or_warn`] over the real ops routes `pfctl -X` through [`pfctl_status`] so a
 /// non-zero EXIT is caught, not just a spawn failure: a spawn succeeds even
 /// when `pfctl` itself rejects the call (e.g. a token that is already gone),
 /// so reading the spawn `Result` alone leaks the refcount while the log claims
@@ -1382,8 +1398,9 @@ fn a_failed_enable_capture_token_fails_the_engage_without_a_spurious_unwind() {
 /// rely on. Since the parse precedes the open, the failure here is identical
 /// under root: the test cannot go vacuous if it is ever run elevated, and it
 /// needs no `TUN`/`GLOBAL_NET_STATE` label and no root.
+#[cfg(target_os = "macos")]
 #[skuld::test]
-fn drop_refcount_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
+fn drop_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
     let writer = garter::test_utils::WaitableWriter::new();
@@ -1399,15 +1416,13 @@ fn drop_refcount_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
         // it while parsing arguments, before `/dev/pf` is opened, so the
         // non-zero exit does not depend on this process being unprivileged
         // (see the doc comment above).
-        drop_refcount_or_warn(
-            "not-a-real-token",
-            BestEffortPhase::RecoverCover,
-            "test sentinel: drop_refcount_or_warn pin",
-        );
+        drop_or_warn("not-a-real-token", "test sentinel: drop_or_warn pin", |t| {
+            RealCoverRulesetOps.drop_token(t)
+        });
     }
     let log = writer.snapshot();
     assert!(
-        log.contains("test sentinel: drop_refcount_or_warn pin"),
+        log.contains("test sentinel: drop_or_warn pin"),
         "a `pfctl -X` with an invalid token exits non-zero (spawn succeeds, status fails) — that \
          must be logged via pfctl_status's exit-code check, not read as an `Ok` spawn result and \
          silently swallowed: {log}"
@@ -1421,22 +1436,63 @@ fn drop_refcount_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
 /// no-short-circuit property, and the clear-only-on-confirm rule are
 /// table-tested without shelling out to `pfctl`.
 #[derive(Default)]
-struct RecordingPfOps {
+struct RecordingPfOps<'a> {
     log: Vec<&'static str>,
     /// Every token handed to `drop_token`, so WHICH refcount was released is
     /// assertable and not merely that one was.
     dropped: Vec<String>,
     fail_reload_default: bool,
+    /// `reload_default` succeeds this many times, then fails: the transient block reloads first, so a test can
+    /// let it succeed and fail the standing block's fallback.
+    reload_default_ok_calls: Option<usize>,
     fail_load_ruleset: bool,
     fail_clear_transient: bool,
     fail_clear_standing: bool,
     fail_drop_token: bool,
+    /// Every token handed to `clear_transient` / `clear_standing`, so WHICH record a clear was keyed to is assertable.
+    cleared: Vec<Option<String>>,
+    /// What every clear reports finding; `Removed` when unset.
+    cleared_as: Option<Cleared>,
+    /// The state dir whose real records the clears act on, and `drop_token` reads: it fails the test when a
+    /// record still names the token being dropped, the one thing a call-order assertion cannot show (a crash between
+    /// the drop and the write leaves exactly that record).
+    records: Option<&'a CoverLock>,
 }
 
-impl PfOps for RecordingPfOps {
+impl<'a> RecordingPfOps<'a> {
+    /// A double over the real records in `lock`'s state dir.
+    fn over_records(lock: &'a CoverLock) -> Self {
+        Self {
+            records: Some(lock),
+            ..Default::default()
+        }
+    }
+
+    fn assert_no_record_names(&self, token: &str) {
+        let Some(lock) = self.records else { return };
+        let dir = lock.state_dir();
+        let named = [
+            pf_record::read::<state::FailClosedState>(dir)
+                .pf_token()
+                .map(str::to_owned),
+            pf_record::read::<lockdown_state::LockdownPfState>(dir)
+                .pf_token()
+                .map(str::to_owned),
+        ];
+        assert!(
+            !named.iter().flatten().any(|named| named == token),
+            "pfctl -X {token} while a record still names it: {named:?}; a crash here leaves a record for a token pf \
+             may hand to another app; calls so far: {:?}",
+            self.log
+        );
+    }
+}
+
+impl PfOps for RecordingPfOps<'_> {
     fn reload_default(&mut self) -> Result<(), RoutingError> {
+        let earlier_reloads = self.log.iter().filter(|call| **call == "reload_default").count();
         self.log.push("reload_default");
-        if self.fail_reload_default {
+        if self.fail_reload_default || self.reload_default_ok_calls.is_some_and(|ok| earlier_reloads >= ok) {
             Err(RoutingError::RouteSetup("mock reload_default failure".into()))
         } else {
             Ok(())
@@ -1453,6 +1509,7 @@ impl PfOps for RecordingPfOps {
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.assert_no_record_names(token);
         self.log.push("drop_token");
         self.dropped.push(token.to_owned());
         if self.fail_drop_token {
@@ -1462,21 +1519,23 @@ impl PfOps for RecordingPfOps {
         }
     }
 
-    fn clear_transient(&mut self) -> Result<(), RoutingError> {
+    fn clear_transient(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         self.log.push("clear_transient");
-        if self.fail_clear_transient {
-            Err(RoutingError::RouteSetup("mock clear_transient failure".into()))
-        } else {
-            Ok(())
+        self.cleared.push(token.map(str::to_owned));
+        match (&self.records, self.fail_clear_transient) {
+            (_, true) => Err(RoutingError::RouteSetup("mock clear_transient failure".into())),
+            (Some(lock), false) => RealPfOps { lock }.clear_transient(token),
+            (None, false) => Ok(self.cleared_as.unwrap_or(Cleared::Removed)),
         }
     }
 
-    fn clear_standing(&mut self) -> Result<(), RoutingError> {
+    fn clear_standing(&mut self, token: Option<&str>) -> Result<Cleared, RoutingError> {
         self.log.push("clear_standing");
-        if self.fail_clear_standing {
-            Err(RoutingError::RouteSetup("mock clear_standing failure".into()))
-        } else {
-            Ok(())
+        self.cleared.push(token.map(str::to_owned));
+        match (&self.records, self.fail_clear_standing) {
+            (_, true) => Err(RoutingError::RouteSetup("mock clear_standing failure".into())),
+            (Some(lock), false) => RealPfOps { lock }.clear_standing(token),
+            (None, false) => Ok(self.cleared_as.unwrap_or(Cleared::Removed)),
         }
     }
 }
@@ -1509,13 +1568,79 @@ fn release_all_attempts_the_standing_cover_after_a_transient_failure() {
         StateFile::Present(transient_state()),
         StateFile::Present(standing_state()),
         &mut ops,
-    );
+    )
+    .into_result();
     assert!(
         ops.log.contains(&"load_ruleset"),
         "the standing cover must still be attempted: {:?}",
         ops.log
     );
     assert!(result.is_err());
+}
+
+// `release_all`'s per-kind release ------------------------------------------------------------------------------------
+//
+// A held guard stops deleting once a sweep released its kind (its pf token is dropped and `/etc/pf.conf` reloaded,
+// so a second `pfctl -X` and reload would hit another install's state) and keeps retrying while a sweep did not.
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn release_all_whose_standing_block_failed_still_releases_the_transient_kind() {
+    // The transient reload is `reload_default` call 0 and succeeds; the standing snapshot load fails and its
+    // fallback `reload_default` (call 1) fails too.
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        reload_default_ok_calls: Some(1),
+        ..Default::default()
+    };
+    let outcome = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert_eq!(outcome.released(), [CoverKind::Transient]);
+    assert!(outcome.into_result().is_err(), "the standing failure still travels");
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn release_all_whose_transient_block_failed_still_releases_the_lockdown_kind() {
+    // The transient reload fails; the standing snapshot loads, so its block never reloads.
+    let mut ops = RecordingPfOps {
+        fail_reload_default: true,
+        ..Default::default()
+    };
+    let outcome = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert_eq!(outcome.released(), [CoverKind::Lockdown]);
+    assert!(outcome.into_result().is_err(), "the transient failure still travels");
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn release_all_whose_both_blocks_failed_releases_neither_kind() {
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        fail_reload_default: true,
+        ..Default::default()
+    };
+    let outcome = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert_eq!(outcome.released(), []);
+}
+
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn release_all_that_cleared_both_covers_releases_both_kinds() {
+    let mut ops = RecordingPfOps::default();
+    let outcome = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert_eq!(outcome.released(), [CoverKind::Transient, CoverKind::Lockdown]);
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
@@ -1532,6 +1657,11 @@ fn release_all_keeps_the_transient_state_file_when_the_restore_fails() {
         "must not clear the state file over an unconfirmed restore: {:?}",
         ops.log
     );
+    assert!(
+        ops.dropped.is_empty() && !ops.log.contains(&"drop_token"),
+        "the record names the token, so it is kept with the record: {:?}",
+        ops.log
+    );
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
@@ -1541,10 +1671,15 @@ fn release_all_keeps_the_standing_state_file_when_restore_and_fallback_both_fail
         fail_reload_default: true,
         ..Default::default()
     };
-    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops);
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops).into_result();
     assert!(
         !ops.log.contains(&"clear_standing"),
         "must not clear the state file when both the snapshot restore and the fallback failed: {:?}",
+        ops.log
+    );
+    assert!(
+        ops.dropped.is_empty() && !ops.log.contains(&"drop_token"),
+        "the record names the token, so it is kept with the record: {:?}",
         ops.log
     );
     assert!(result.is_err());
@@ -1556,7 +1691,7 @@ fn release_all_falls_back_to_the_default_ruleset_when_the_snapshot_will_not_load
         fail_load_ruleset: true,
         ..Default::default()
     };
-    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops);
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops).into_result();
     assert!(result.is_ok(), "a successful fallback is not an error: {result:?}");
     assert!(
         ops.log.contains(&"clear_standing"),
@@ -1582,7 +1717,7 @@ fn release_all_touches_nothing_when_both_state_files_are_absent() {
     // A blanket /etc/pf.conf reload here would destroy a healthy host's live
     // third-party ruleset.
     let mut ops = RecordingPfOps::default();
-    let result = release_all_with(StateFile::Absent, StateFile::Absent, &mut ops);
+    let result = release_all_with(StateFile::Absent, StateFile::Absent, &mut ops).into_result();
     assert!(ops.log.is_empty(), "must touch nothing on a clean host: {:?}", ops.log);
     assert!(result.is_ok());
 }
@@ -1594,7 +1729,7 @@ fn release_all_treats_an_unusable_transient_state_file_as_a_cover_to_clear() {
     // reloads the default ruleset rather than trying a restore first) — the
     // standing-side counterpart above does not exercise it.
     let mut ops = RecordingPfOps::default();
-    let result = release_all_with(unusable(), StateFile::Absent, &mut ops);
+    let result = release_all_with(unusable(), StateFile::Absent, &mut ops).into_result();
     assert!(
         ops.log.contains(&"reload_default"),
         "an Unusable transient state must still trigger the default-ruleset reload: {:?}",
@@ -1622,7 +1757,9 @@ fn release_all_drops_the_token_salvaged_from_an_unusable_record_on_both_arms() {
     }
 
     let mut ops = RecordingPfOps::default();
-    release_all_with(with_token("111"), StateFile::Absent, &mut ops).expect("a clean transient release");
+    let _ = release_all_with(with_token("111"), StateFile::Absent, &mut ops)
+        .into_result()
+        .expect("a clean transient release");
     assert_eq!(
         ops.dropped,
         vec!["111".to_owned()],
@@ -1631,7 +1768,9 @@ fn release_all_drops_the_token_salvaged_from_an_unusable_record_on_both_arms() {
     );
 
     let mut ops = RecordingPfOps::default();
-    release_all_with(StateFile::Absent, with_token("222"), &mut ops).expect("a clean standing release");
+    let _ = release_all_with(StateFile::Absent, with_token("222"), &mut ops)
+        .into_result()
+        .expect("a clean standing release");
     assert_eq!(
         ops.dropped,
         vec!["222".to_owned()],
@@ -1650,17 +1789,18 @@ fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
         StateFile::Present(transient_state()),
         StateFile::Present(standing_state()),
         &mut ops,
-    );
+    )
+    .into_result();
     assert!(result.is_ok(), "everything succeeded: {result:?}");
     assert_eq!(
         ops.log,
         vec![
             "reload_default",
-            "drop_token",
             "clear_transient",
-            "load_ruleset",
             "drop_token",
+            "load_ruleset",
             "clear_standing",
+            "drop_token",
         ],
         "the full transient-then-standing sequence must run in order: {:?}",
         ops.log
@@ -1668,38 +1808,29 @@ fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
-fn release_all_logs_a_swallowed_transient_clear_failure_but_still_reports_ok() {
-    // clear_transient/clear_standing are best-effort (contract item 5): a
-    // failure there must not fail the call, but it also must not vanish
-    // silently — every sibling caller of the same underlying clear
-    // (`disengage`, `disengage_lockdown`) logs on failure.
+fn release_all_reports_a_transient_clear_failure() {
     let mut ops = RecordingPfOps {
         fail_clear_transient: true,
         ..Default::default()
     };
-    let result = release_all_with(StateFile::Present(transient_state()), StateFile::Absent, &mut ops);
+    let result = release_all_with(StateFile::Present(transient_state()), StateFile::Absent, &mut ops).into_result();
     assert!(
-        result.is_ok(),
-        "a failed state-file clear must not fail the call: {result:?}"
-    );
-    assert!(
-        ops.log.contains(&"clear_transient"),
-        "the clear must still be attempted"
+        result.is_err(),
+        "a record left over a restored host is the cover's error, not a success: {result:?}"
     );
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
-fn release_all_logs_a_swallowed_standing_clear_failure_but_still_reports_ok() {
+fn release_all_reports_a_standing_clear_failure() {
     let mut ops = RecordingPfOps {
         fail_clear_standing: true,
         ..Default::default()
     };
-    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops);
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops).into_result();
     assert!(
-        result.is_ok(),
-        "a failed state-file clear must not fail the call: {result:?}"
+        result.is_err(),
+        "a record left over a restored host is the cover's error, not a success: {result:?}"
     );
-    assert!(ops.log.contains(&"clear_standing"), "the clear must still be attempted");
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
@@ -1707,10 +1838,9 @@ fn release_all_logs_every_failed_token_drop_instead_of_discarding_it() {
     // `release_all` is the emergency clear-every-cover path (`bridge unlock`,
     // the crash-recovery sweep), so a pf enable refcount that fails to drop
     // here leaks exactly as it would anywhere else. Non-propagation is the
-    // documented contract (`PfOps::drop_token`); silence is not — a `let _ =`
-    // leaves the operator no trace that pf stayed enabled. All THREE drop
-    // sites are covered, each with its own message so a warn in the log still
-    // says which one it came from.
+    // documented contract (a failed drop is logged, never the release's error); silence is not — a `let _ =`
+    // leaves the operator no trace that pf stayed enabled. Each cover has its
+    // own message so a warn in the log still says which one it came from.
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
     let writer = garter::test_utils::WaitableWriter::new();
@@ -1722,8 +1852,7 @@ fn release_all_logs_every_failed_token_drop_instead_of_discarding_it() {
     );
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-        // Sites 1 and 3: the transient cover, and the standing cover restored
-        // from its captured snapshot.
+        // The transient cover, and the standing cover restored from its captured snapshot.
         let mut ops = RecordingPfOps {
             fail_drop_token: true,
             ..Default::default()
@@ -1733,8 +1862,7 @@ fn release_all_logs_every_failed_token_drop_instead_of_discarding_it() {
             StateFile::Present(standing_state()),
             &mut ops,
         );
-        // Site 2: the standing cover with no captured baseline, which restores
-        // the default ruleset instead of a snapshot.
+        // The standing cover with no captured baseline, which restores the default ruleset instead of a snapshot.
         let mut ops = RecordingPfOps {
             fail_drop_token: true,
             ..Default::default()
@@ -1750,9 +1878,8 @@ fn release_all_logs_every_failed_token_drop_instead_of_discarding_it() {
     }
     let log = writer.snapshot();
     for site in [
-        "pfctl -X failed releasing the transient cover's pf refcount during release_all",
-        "pfctl -X failed releasing the standing cover's pf refcount during release_all after a snapshot restore",
-        "pfctl -X failed releasing the standing cover's pf refcount during release_all after a default-ruleset restore",
+        "pfctl -X failed releasing the transient failclosed-state pf refcount",
+        "pfctl -X failed releasing the standing lockdown-pf-state pf refcount",
     ] {
         assert!(
             log.contains(site),
@@ -1768,10 +1895,11 @@ use crate::routing::CoverPresence;
 #[skuld::test]
 fn presence_fold_is_closed_over_the_probe_and_the_state_file() {
     // (pf label answer, state file, expected)
-    let cases: [(Option<bool>, StateFile<lockdown_state::LockdownPfState>, CoverPresence); 9] = [
+    let cases: [(Option<bool>, StateFile<lockdown_state::LockdownPfState>, CoverPresence); 12] = [
         (Some(true), StateFile::Absent, CoverPresence::Live),
         (Some(true), StateFile::Present(standing_state()), CoverPresence::Live),
         (Some(true), unusable(), CoverPresence::Live),
+        (Some(true), unreadable(), CoverPresence::Live),
         (Some(false), StateFile::Absent, CoverPresence::Absent),
         (
             Some(false),
@@ -1779,9 +1907,11 @@ fn presence_fold_is_closed_over_the_probe_and_the_state_file() {
             CoverPresence::Recorded,
         ),
         (Some(false), unusable(), CoverPresence::Recorded),
+        (Some(false), unreadable(), CoverPresence::Recorded),
         (None, StateFile::Absent, CoverPresence::Unreachable),
         (None, StateFile::Present(standing_state()), CoverPresence::Recorded),
         (None, unusable(), CoverPresence::Recorded),
+        (None, unreadable(), CoverPresence::Recorded),
     ];
     for (label, file, expected) in cases {
         assert_eq!(
@@ -1797,7 +1927,12 @@ fn file_only_presence_never_reports_live() {
     // Pins the file-only body that ships before the pf probe lands: with no pf
     // answer the fold cannot reach `Live`, so it cannot trigger an intent
     // repair write off a state file alone.
-    for file in [StateFile::Absent, StateFile::Present(standing_state()), unusable()] {
+    for file in [
+        StateFile::Absent,
+        StateFile::Present(standing_state()),
+        unusable(),
+        unreadable(),
+    ] {
         assert_ne!(
             fold_presence(None, &file),
             CoverPresence::Live,
@@ -1954,10 +2089,11 @@ fn self_capture_persists_no_baseline_but_keeps_the_nat_rules() {
     // live host NAT (Internet Sharing, a VM bridge) the moment the cover
     // engages, with nothing on disk to restore it from.
     let tmp = tempfile::tempdir().unwrap();
+    let lock = CoverLock::acquire(tmp.path());
     let nat = "nat on en0 from any to any -> (en0)\n";
     let returned = persist_baseline(
         "tok",
-        tmp.path(),
+        &lock,
         None,
         CoverPresence::Live,
         "block drop out quick all label \"hole-lockdown\"\n".into(),
@@ -1966,23 +2102,32 @@ fn self_capture_persists_no_baseline_but_keeps_the_nat_rules() {
     .expect("the persist must succeed");
 
     assert_eq!(
-        returned, nat,
+        returned.0, nat,
         "the nat snapshot must reach the ruleset builder unchanged"
     );
-    let st = lockdown_state::load(tmp.path()).expect("state must be persisted");
+    let st = persisted(tmp.path());
     assert!(!st.main_snapshot_captured, "no host baseline was captured");
     assert!(st.main_snapshot.is_empty(), "our own ruleset must not be recorded");
     assert_eq!(st.nat_snapshot, nat, "the host NAT rules must be persisted verbatim");
 }
 
+/// The standing record on disk, which must be a usable one.
+fn persisted(dir: &std::path::Path) -> lockdown_state::LockdownPfState {
+    match pf_record::read::<lockdown_state::LockdownPfState>(dir) {
+        StateFile::Present(st) => st,
+        other => panic!("state must be persisted: {other:?}"),
+    }
+}
+
 #[skuld::test]
 fn a_measured_clean_host_captures_its_baseline() {
     let tmp = tempfile::tempdir().unwrap();
+    let lock = CoverLock::acquire(tmp.path());
     let main = "scrub-anchor \"com.apple/*\" all fragment reassemble\n";
     let nat = "nat-anchor \"com.apple/*\" all\n";
-    persist_baseline("tok", tmp.path(), None, CoverPresence::Absent, main.into(), nat.into()).unwrap();
+    persist_baseline("tok", &lock, None, CoverPresence::Absent, main.into(), nat.into()).unwrap();
 
-    let st = lockdown_state::load(tmp.path()).unwrap();
+    let st = persisted(tmp.path());
     assert!(st.main_snapshot_captured);
     assert_eq!(st.main_snapshot, main);
     assert_eq!(st.nat_snapshot, nat);
@@ -1994,7 +2139,9 @@ fn an_uncaptured_baseline_restores_the_default_ruleset() {
     st.main_snapshot_captured = false;
     st.main_snapshot = String::new();
     let mut ops = RecordingPfOps::default();
-    release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops).unwrap();
+    let _ = release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops)
+        .into_result()
+        .unwrap();
 
     assert!(
         ops.log.contains(&"reload_default"),
@@ -2018,7 +2165,9 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
     st.main_snapshot = String::new();
     assert!(st.main_snapshot_captured, "sample state is a captured baseline");
     let mut ops = RecordingPfOps::default();
-    release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops).unwrap();
+    let _ = release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops)
+        .into_result()
+        .unwrap();
 
     assert!(
         ops.log.contains(&"load_ruleset"),
@@ -2026,3 +2175,19 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
         ops.log
     );
 }
+
+// The best-effort disengage must not reach another host's sweep. Through the cfg-dispatched facade, a build of this
+// module on another host would run that host's sweep (the WFP one on Windows) instead of reaching the `pfctl` stub.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test(should_panic = "pfctl exists only on macOS")]
+fn lockdown_disengage_never_reaches_the_host_platforms_sweep() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = CoverLock::acquire(tmp.path());
+    lockdown_disengage(&lock);
+}
+
+// The order a release and an engage work in, as whole operations over the doubles above.
+#[path = "macos_matrix_tests.rs"]
+mod macos_matrix_tests;
+#[path = "macos_settle_tests.rs"]
+mod macos_settle_tests;

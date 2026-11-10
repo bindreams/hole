@@ -4,7 +4,7 @@
 //! a plugin chain starts and reads it back on startup to reap processes leaked
 //! by a previous crashed run. Mirrors the `routing::state` crash-recovery
 //! pattern. `plugin_recovery` owns the reap and is the only component allowed
-//! to delete the file.
+//! to remove records from the file.
 //!
 //! A record pairs the pid with the kernel's own start token, so a recycled pid
 //! never restores to the recorded process — see `cosca::identity`.
@@ -12,7 +12,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use util::versioned_file::{
-    Change, DefaultPlacement, Loaded, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
+    Change, DefaultPlacement, KeepOwner, Loaded, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile,
+    VersionedState,
 };
 
 // Types ===============================================================================================================
@@ -87,10 +88,68 @@ pub fn load(state_dir: &Path) -> Loaded<PluginState> {
     file(state_dir).observe().loaded
 }
 
-/// Deletes the record. One this release cannot read is kept ([`UpdateOutcome::Kept`]).
-pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
+/// Removes exactly the `accounted` records, and the file when none remain.
+///
+/// The caller loaded the file earlier and settled those records (killed, gone, or unrestorable here); the file may
+/// have grown since, and what grew is not the caller's to touch. The rewrite keeps the file's owner and never
+/// chowns the directory. A file this release cannot read, or that is missing, has no record of the caller's to edit:
+/// nothing is written and the outcome is [`UpdateOutcome::Unchanged`]. A file that cannot be read is named in a warning.
+pub(crate) fn remove_accounted(
+    state_dir: &Path,
+    accounted: &[cosca::identity::ProcessIdRecord],
+) -> Result<UpdateOutcome, StoreError> {
     file(state_dir)
-        .update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
+        .update(&KeepOwner, |observed| match &observed.loaded {
+            Loaded::Current { value, .. } => {
+                let mut state = value.clone();
+                state.plugins.retain(|r| !accounted.contains(r));
+                if state.plugins.is_empty() {
+                    (Change::Remove, ())
+                } else if state.plugins.len() == value.plugins.len() {
+                    (Change::Keep, ())
+                } else {
+                    (Change::Store(state), ())
+                }
+            }
+            Loaded::Absent => {
+                tracing::debug!("no plugin state file: nothing to remove");
+                (Change::Keep, ())
+            }
+            Loaded::Newer { .. } => {
+                tracing::warn!("the plugin state file is newer than this release reads: kept, nothing to remove");
+                (Change::Keep, ())
+            }
+            Loaded::Corrupt { .. } => {
+                tracing::warn!("the plugin state file is corrupt: kept, nothing to remove");
+                (Change::Keep, ())
+            }
+            Loaded::Unreadable { error, .. } => {
+                tracing::warn!(
+                    error = error as &dyn std::error::Error,
+                    "the plugin state file is unreadable: kept, nothing to remove"
+                );
+                (Change::Keep, ())
+            }
+            // Names no process at all, so no record of the caller's is in it.
+            Loaded::Obsolete { .. } => (Change::Keep, ()),
+        })
+        .map(|((), outcome)| outcome)
+}
+
+/// Deletes the record iff it is still obsolete. The caller classified it earlier; an append may have rewritten it
+/// with live records since, and one this release cannot read is left alone.
+pub(crate) fn clear_obsolete(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
+    file(state_dir)
+        .update(&DefaultPlacement::default(), |observed| match &observed.loaded {
+            Loaded::Obsolete { .. } => (Change::Remove, ()),
+            Loaded::Unreadable { .. } => {
+                tracing::warn!("the plugin state file could not be read, so it is kept rather than discarded");
+                (Change::Keep, ())
+            }
+            Loaded::Absent | Loaded::Current { .. } | Loaded::Newer { .. } | Loaded::Corrupt { .. } => {
+                (Change::Keep, ())
+            }
+        })
         .map(|((), outcome)| outcome)
 }
 

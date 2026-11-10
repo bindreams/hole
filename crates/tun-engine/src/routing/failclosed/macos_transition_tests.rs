@@ -60,23 +60,22 @@ use crate::{GLOBAL_NET_STATE, TUN};
 /// Test-only: wraps [`RealEngageOps`] rather than reimplementing it, and leaves
 /// production `engage`/`engage_with` untouched.
 fn engage_publishing(
+    lock: &CoverLock,
     server_ip: IpAddr,
-    state_dir: &std::path::Path,
     permitted_idx: &std::sync::atomic::AtomicUsize,
     commit_gen: &std::sync::atomic::AtomicUsize,
     server_idx: usize,
 ) -> Result<Cover, RoutingError> {
     let mut ops = PublishOnCommit {
-        inner: RealEngageOps { state_dir, owner: None },
+        inner: RealEngageOps { lock, owner: None },
         permitted_idx,
         commit_gen,
         server_idx,
     };
     let token = engage_with(server_ip, None, &mut ops)?;
     Ok(Cover {
-        token,
-        state_dir: state_dir.to_owned(),
-        kind: CoverKind::Transient,
+        held: Some(Held { token }),
+        stamp: lock.stamp_install(CoverKind::Transient),
     })
 }
 
@@ -112,6 +111,10 @@ impl<I: CoverRulesetOps> CoverRulesetOps for PublishOnCommit<'_, I> {
     fn flush_states(&mut self) -> Result<(), RoutingError> {
         self.inner.flush_states()
     }
+
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.inner.drop_token(token)
+    }
 }
 
 impl<I: EngageOps> EngageOps for PublishOnCommit<'_, I> {
@@ -121,11 +124,8 @@ impl<I: EngageOps> EngageOps for PublishOnCommit<'_, I> {
     fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
         self.inner.enable_capture_token()
     }
-    fn save_transient(&mut self, st: &state::FailClosedState) -> Result<(), RoutingError> {
+    fn save_transient(&mut self, st: &state::FailClosedState) -> Result<Option<String>, RoutingError> {
         self.inner.save_transient(st)
-    }
-    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        self.inner.drop_token(token)
     }
     fn transient_restore(&mut self, token: &str) {
         self.inner.transient_restore(token)
@@ -166,6 +166,9 @@ fn publish_on_commit_brackets_its_load_with_a_generation_change() {
             }
         }
         fn flush_states(&mut self) -> Result<(), RoutingError> {
+            Ok(())
+        }
+        fn drop_token(&mut self, _token: &str) -> Result<(), RoutingError> {
             Ok(())
         }
     }
@@ -255,6 +258,40 @@ fn publish_on_commit_brackets_its_load_with_a_generation_change() {
 ///   magnitude of slack on each side belongs.
 const CONTROL_RATE_FLOOR_PCT: f64 = 25.0;
 
+/// How many `pfctl -E` enable references pf holds right now, from `pfctl -s References` (it lists one row per held
+/// token: pid, process name, token, timestamp). The cover's enable refcount has no other reader. Counts every
+/// holder on the host, so anything else taking or dropping a pf reference mid-run fails the count, loudly.
+///
+/// Panics on a listing it cannot read, since a miscount would pass a leak.
+fn pf_enable_references() -> usize {
+    let listing = pfctl_stdout(
+        pfctl(&["-s", "References"], None, BestEffortPhase::RecoverCover),
+        "pfctl -s References",
+    )
+    .expect("pfctl -s References");
+    count_pf_references(&listing)
+}
+
+/// The rows of a `pfctl -s References` listing: with none held it says `No pf starter references held`, else a
+/// `TOKENS:` block whose `PID ... TIMESTAMP` header precedes one row per token, each opening with its pid.
+fn count_pf_references(listing: &str) -> usize {
+    if listing.contains("No pf starter references held") {
+        return 0;
+    }
+    let mut lines = listing.lines().skip_while(|l| !l.trim_start().starts_with("PID"));
+    assert!(
+        lines.next().is_some(),
+        "pfctl -s References printed neither a reference table nor 'No pf starter references held': {listing:?}"
+    );
+    lines
+        .filter(|l| {
+            l.split_whitespace()
+                .next()
+                .is_some_and(|pid| pid.parse::<i32>().is_ok())
+        })
+        .count()
+}
+
 /// Proves a transient-cover TRANSITION — a second real `engage()` replacing a
 /// still-live cover, with no intervening `disengage` — never admits a flow the
 /// OLD cover was blocking. This is the scenario `-Fa` broke: `pfctl -Fa -f -`
@@ -297,6 +334,11 @@ const CONTROL_RATE_FLOOR_PCT: f64 = 25.0;
 /// actually enabled, reported armed while egress runs in the clear. A load that
 /// outright fails already surfaces as an Err from `engage`; only a settled
 /// connect catches the silent half.
+///
+/// The transitions also leak no pf enable reference: each `engage` drops the reference its record write displaced
+/// (the old cover's). After every transition pf holds the baseline read before the cold engage plus the live
+/// cover's one, and after the last cover's release the baseline again ([`pf_enable_references`]). The test never
+/// `-X`es an old token itself: the engage owns that release.
 ///
 /// EVIDENTIARY SCOPE (`macos.rs`'s module doc has the ticket-discipline
 /// argument in full): a pass here is strong empirical
@@ -400,6 +442,10 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         || {
             let addrs = [SERVER_A, SERVER_B];
 
+            // The enable references pf holds before this test engages anything: the refcount oracle's baseline
+            // (see `pf_enable_references`).
+            let baseline_references = pf_enable_references();
+
             // COLD engage — its POST-CONDITION is the whole of its assertion (doc
             // comment above: the pre/mid-engage window is the open host `baseline`
             // just required, so there is nothing there to assert). Settling that
@@ -407,7 +453,8 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
             // after it: the host is KNOWN blocked from this point on, so the prober
             // pool spawned below needs no phase carve-out.
             let mut held: Option<Cover> = Some(
-                engage(addrs[0].parse().unwrap(), None, dir.path(), None).expect("cold engage real pf transient cover"),
+                engage(&CoverLock::acquire(dir.path()), addrs[0].parse().unwrap(), None, None)
+                    .expect("cold engage real pf transient cover"),
             );
             // The permitted server answers on both sides of the block probe, so a network loss cannot
             // pass for a block. The cover is released by `held` on an early return.
@@ -447,12 +494,6 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
             let control_hits = AtomicUsize::new(0);
             let control_permitted_attempts = AtomicUsize::new(0);
             let control_raw_hits = AtomicUsize::new(0);
-
-            // Counts (not just logs) a failed `-X` retiring the OLD cover's refcount
-            // below — production code in this module never swallows a `pfctl` result
-            // without at least logging it, and a refcount that fails to drop here is
-            // a real leak, not a benign no-op.
-            let mut old_x_failures = 0usize;
 
             // Stops the pool on EVERY exit from the scope below, a panic included.
             // Without it, a panic between the spawns and the explicit `stop.store` —
@@ -576,27 +617,30 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                     // `engage_publishing` publishes `permitted_idx` and `commit_gen`
                     // itself, synchronously at the real `pfctl -f -` commit — see its
                     // doc comment.
-                    let new_cover = engage_publishing(server_ip, dir.path(), &permitted_idx, &commit_gen, server_idx)
-                        .expect("engage real pf transient cover");
+                    let new_cover = engage_publishing(
+                        &CoverLock::acquire(dir.path()),
+                        server_ip,
+                        &permitted_idx,
+                        &commit_gen,
+                        server_idx,
+                    )
+                    .expect("engage real pf transient cover");
+                    // The engage owns the old cover's reference ([`drop_displaced`]); the count below checks it.
+                    // The old guard only gives up its claim, so its `Drop` does not reload /etc/pf.conf over the
+                    // new ruleset.
                     if let Some(old) = held.take() {
-                        // Retire the OLD cover's pf enable refcount only — never its
-                        // normal Drop, which would reload /etc/pf.conf (a pass-all host)
-                        // over the ruleset the NEW cover (already engaged above) just
-                        // loaded. The refcount stays balanced: this engage's own `-E`
-                        // already ran, so this `-X` brings it back down by exactly one.
-                        if let Err(e) = pfctl_status(
-                            pfctl(&["-X", &old.token], None, BestEffortPhase::RecoverCover),
-                            "pfctl -X",
-                        ) {
-                            tracing::warn!(
-                                error = &e as &dyn std::error::Error,
-                                iteration = i,
-                                "pfctl -X failed retiring the old cover's refcount mid-transition"
-                            );
-                            old_x_failures += 1;
-                        }
                         old.detach();
                     }
+                    // One live cover, one reference: a leaked reference reads as `baseline + 2`, a released
+                    // live cover's as `baseline`.
+                    let references = pf_enable_references();
+                    assert_eq!(
+                        references,
+                        baseline_references + 1,
+                        "transition {i}/{TRANSITIONS}: pf holds {references} enable references, expected the baseline \
+                         {baseline_references} plus the one live cover; a surplus is a reference the transition \
+                         leaked, a shortfall one it released from a cover still live"
+                    );
                     held = Some(new_cover);
                 }
 
@@ -613,12 +657,6 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
             assert!(
                 attempts > 0,
                 "prober pool made no attempts at all — this test is vacuous"
-            );
-            assert_eq!(
-                old_x_failures, 0,
-                "pfctl -X failed retiring the old cover's refcount on {old_x_failures}/{TRANSITIONS} \
-             transitions — each failure leaks a pf enable refcount (see the warn logged above for \
-             which iteration and why)"
             );
 
             // The guard stating its own sensitivity. Printed unconditionally (see the
@@ -715,6 +753,12 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
 
             // The last cover's normal Drop restores /etc/pf.conf.
             drop(held.take());
+            let references = pf_enable_references();
+            assert_eq!(
+                references, baseline_references,
+                "pf holds {references} enable references after the last cover was released, expected the baseline \
+                 {baseline_references}; a surplus is a reference the final release leaked"
+            );
             Ok(())
         },
     );
@@ -828,7 +872,8 @@ fn macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage() {
 
     // 3. Engage the transient cover over that live flow, and read the state
     //    table back while the cover is still the loaded ruleset.
-    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let cover = engage(&CoverLock::acquire(dir.path()), PERMITTED.parse().unwrap(), None, None)
+        .expect("engage the transient cover");
     let after = states();
     // Restore before asserting: a failure must not leave the machine behind a
     // block-all cover while the panic unwinds.
@@ -990,7 +1035,8 @@ fn macos_failclosed_cover_load_never_drops_a_loopback_datagram() {
     // A real cover: pf enabled, a blocking ruleset live, state file written.
     // RAII, so every exit path restores `/etc/pf.conf` — the guarded leg below
     // consumes it deliberately, inside the probe.
-    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let cover = engage(&CoverLock::acquire(dir.path()), PERMITTED.parse().unwrap(), None, None)
+        .expect("engage the transient cover");
 
     // The pre-fix ruleset shape: `set skip on lo0` and nothing else exempting
     // loopback.
@@ -1111,7 +1157,8 @@ fn macos_failclosed_cover_engage_does_not_sever_established_loopback_flows() {
         .expect("NETWORK/ENVIRONMENT problem (not the cover): a pre-cover loopback byte must arrive");
 
     let dir = tempfile::tempdir().unwrap();
-    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let cover = engage(&CoverLock::acquire(dir.path()), PERMITTED.parse().unwrap(), None, None)
+        .expect("engage the transient cover");
 
     // The actual assertion: a MID-STREAM segment, the exact packet a
     // `flags S/SA` pass rule could not match after the purge. Write and read

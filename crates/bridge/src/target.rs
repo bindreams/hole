@@ -514,8 +514,8 @@ pub(crate) fn load_startup_preference(state_dir: &Path) -> StartupPreference {
 /// and a torn pair is what lets an escape be undone: `handle_unblock` clearing
 /// the candidate while a concurrent `persist_after_start` re-adds it leaves
 /// `Off` plus a live candidate, which `AlwaysConnect` then reconnects from.
-/// Each file has its own lock, so the pair is made atomic by `IpcState`'s
-/// `intent_persist` mutex, which every IPC writer of both holds across them.
+/// Each file has its own lock, so the pair is made atomic by the cover lock, which every writer of both holds
+/// across them (`persist_after_start`, `handle_unblock`, `reconcile_once`).
 pub(crate) fn apply_startup_preference(
     state_dir: &Path,
     owner: Option<(u32, u32)>,

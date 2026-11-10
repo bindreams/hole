@@ -1186,9 +1186,9 @@ fn recover_without_state_file_is_a_noop() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let log = log.into_inner();
@@ -1217,9 +1217,9 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let log = log.into_inner();
@@ -1275,9 +1275,9 @@ fn recover_with_loopback_server_skips_bypass() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let log = log.into_inner();
@@ -1319,9 +1319,9 @@ fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
         Some("hole-tun"),
         failing,
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let remaining = load_record(tmp.path()).expect("a spawn failure on every command must keep the state file");
@@ -1359,9 +1359,9 @@ fn recover_narrows_the_state_file_to_the_command_that_failed_to_spawn() {
         Some("hole-tun"),
         failing_one,
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let remaining = load_record(tmp.path()).expect("the unconfirmed route must stay recorded");
@@ -1401,9 +1401,9 @@ fn recover_drops_an_unplannable_id_instead_of_looping_forever() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     assert!(
@@ -1425,9 +1425,9 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| swept.set(true),
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     assert!(log.into_inner().is_empty(), "no route-state file => no route commands");
@@ -1449,9 +1449,9 @@ fn recover_sweeps_lockdown_when_intent_off_and_present() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Live,
-        |decision, _| decided.set(Some(decision)),
+        |_lock, decision, _| decided.set(Some(decision)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Sweep));
 }
@@ -1467,9 +1467,9 @@ fn recover_adopts_lockdown_when_intent_on_and_present() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::On,
+        || failclosed::lockdown_state::Intent::On,
         || CoverPresence::Live,
-        |d, _| decided.set(Some(d)),
+        |_lock, d, _| decided.set(Some(d)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Adopt));
 }
@@ -1486,9 +1486,9 @@ fn recover_lockdown_noop_when_cover_absent() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::On,
+        || failclosed::lockdown_state::Intent::On,
         || CoverPresence::Absent,
-        |d, _| decided.set(Some(d)),
+        |_lock, d, _| decided.set(Some(d)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Noop), "absent cover => Noop");
 }
@@ -1506,13 +1506,13 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
         None,
         Some("hole-tun"),
         |_, _cmd, _phase| Ok(()),
-        |_state_dir, adopting| {
+        |_lock, adopting| {
             order.borrow_mut().push("sweep_cover");
             *adopting_seen.borrow_mut() = Some(adopting);
         },
-        /* lockdown_intent = */ failclosed::lockdown_state::Intent::On,
+        /* lockdown_intent = */ || failclosed::lockdown_state::Intent::On,
         /* lockdown_present = */ || CoverPresence::Live, // standing cover present
-        |decision, _tun_name| {
+        |_lock, decision, _tun_name| {
             order.borrow_mut().push("lockdown_recover");
             assert_eq!(decision, CoverRecovery::Adopt);
         },
@@ -1571,7 +1571,7 @@ const RECOVERY_TABLE: [(Intent, CoverPresence, CoverRecovery, bool); 20] = [
     (Intent::Unset, Indeterminate, Noop, false),
     (Intent::Unset, Absent, Noop, false),
     (Intent::Unset, Unreachable, Noop, false),
-    (Intent::Unreadable, Live, Adopt, true),
+    (Intent::Unreadable, Live, Adopt, false),
     (Intent::Unreadable, Recorded, Adopt, false),
     (Intent::Unreadable, Indeterminate, Adopt, false),
     (Intent::Unreadable, Absent, Noop, false),
@@ -1620,15 +1620,34 @@ fn cover_recovery_sweeps_only_on_an_explicit_off_intent() {
 #[skuld::test]
 fn cover_recovery_records_intent_only_on_a_live_cover() {
     // The repair write is grounded in a positive OS measurement, never
-    // inferred from a state file or from an unusable answer.
+    // inferred from a state file or from an unusable answer, and only over an
+    // intent nobody recorded: the same answer `promote_unrecorded` gives.
     for intent in [Intent::On, Intent::Off, Intent::Unset, Intent::Unreadable] {
         for presence in [Live, Recorded, Indeterminate, Absent, Unreachable] {
-            let expected = presence == Live && matches!(intent, Intent::Unset | Intent::Unreadable);
+            let expected = presence == Live && intent == Intent::Unset;
             assert_eq!(
                 decide_cover_recovery(intent, presence).record_intent_on,
                 expected,
                 "({intent:?}, {presence:?}) record_intent_on must be {expected}"
             );
+        }
+    }
+}
+
+#[skuld::test]
+fn cover_recovery_writes_only_where_the_starts_promotion_would() {
+    for intent in [Intent::On, Intent::Off, Intent::Unset, Intent::Unreadable] {
+        for presence in [Live, Recorded, Indeterminate, Absent, Unreachable] {
+            if decide_cover_recovery(intent, presence).record_intent_on {
+                assert_eq!(
+                    presence, Live,
+                    "({intent:?}, {presence:?}) writes without a measured cover"
+                );
+                assert!(
+                    intent.admits_adoption_promotion(),
+                    "({intent:?}, {presence:?}) writes over an intent the promotion declines"
+                );
+            }
         }
     }
 }
@@ -1669,9 +1688,9 @@ fn recover_passes_adopting_only_on_adopt() {
             Some("hole-tun"),
             |_, _c, _p| Ok(()),
             |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
-            intent,
+            || intent,
             || presence,
-            |_decision, _tun_name| {},
+            |_lock, _decision, _tun_name| {},
         );
         assert_eq!(
             *adopting_seen.borrow(),
@@ -1743,9 +1762,9 @@ fn recover_over(dir: &Path, presence: CoverPresence) -> (Recovery, Option<CoverR
         Some("hole-tun"),
         |_, _c, _p| Ok(()),
         |_d, _a| {},
-        failclosed::lockdown_state::load_intent(dir),
+        || failclosed::lockdown_state::load_intent(dir),
         || presence,
-        |action, _tun_name| acted.set(Some(action)),
+        |_lock, action, _tun_name| acted.set(Some(action)),
     );
     (decision, acted.get())
 }
@@ -1784,9 +1803,9 @@ fn recover_records_the_intent_before_acting_on_it() {
         Some("hole-tun"),
         |_, _c, _p| Ok(()),
         |_d, _a| {},
-        failclosed::lockdown_state::load_intent(dir.path()),
+        || failclosed::lockdown_state::load_intent(dir.path()),
         || Live,
-        |_action, _tun_name| observed.set(Some(failclosed::lockdown_state::load_intent(dir.path()))),
+        |_lock, _action, _tun_name| observed.set(Some(failclosed::lockdown_state::load_intent(dir.path()))),
     );
     assert_eq!(
         observed.get(),
@@ -1795,19 +1814,184 @@ fn recover_records_the_intent_before_acting_on_it() {
     );
 }
 
+/// A route record for recovery to work through, so the injected route runner actually runs.
+fn route_record() -> RouteState {
+    RouteState {
+        tun_name: "hole-tun".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        route_form: state::RouteForm::Via,
+        installed: planned_routes(ipv4_server()),
+        stale: Vec::new(),
+    }
+}
+
+/// Route recovery runs before recovery takes the cover lock, so a user's `Off` that lands during it is what the
+/// decision reads: the cover is swept as the `Off` says, not adopted over a stale `Unset`, and the `Off` survives.
 #[skuld::test]
-fn recover_repairs_an_unreadable_intent_over_a_live_cover() {
+fn recovery_does_not_adopt_over_an_off_that_lands_during_route_recovery() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join(failclosed::lockdown_state::STATE_FILE_NAME),
-        b"{corrupt",
-    )
-    .unwrap();
+    save_record(dir.path(), &route_record(), None).unwrap();
+    let acted: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
+    let landed = std::cell::Cell::new(false);
+    let decision = recover_routes_with(
+        dir.path(),
+        None,
+        Some("hole-tun"),
+        |_, _c, _p| {
+            if !landed.replace(true) {
+                let lock = failclosed::CoverLock::acquire(dir.path());
+                failclosed::lockdown_state::set_enabled(&lock, false, None).unwrap();
+            }
+            Ok(())
+        },
+        |_lock, _adopting| {},
+        || failclosed::lockdown_state::load_intent(dir.path()),
+        || Live,
+        |_lock, action, _tun_name| acted.set(Some(action)),
+    );
+
+    assert!(landed.get(), "the Off landed during route recovery");
+    assert_eq!(acted.get(), Some(Sweep), "the Off the decision read decides the action");
+    assert_eq!(decision.action, Sweep);
+    assert!(!decision.record_intent_on, "nothing was repaired");
+    assert_eq!(
+        failclosed::lockdown_state::load_intent(dir.path()),
+        Intent::Off,
+        "the user's Off is never turned into On"
+    );
+}
+
+/// The decision's `Unset` and the file can still disagree under the lock (the second read can fail), so a promotion
+/// the file declines is warned and skipped: the record stays as it is and recovery carries on.
+#[skuld::test]
+fn a_promotion_the_file_declines_is_warned_and_skipped() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let lock = failclosed::CoverLock::acquire(dir.path());
+        failclosed::lockdown_state::set_enabled(&lock, false, None).unwrap();
+    }
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Recover(CoverRecovery, Option<String>),
+        Sweep { adopting: bool },
+    }
+    let steps = std::cell::RefCell::new(Vec::new());
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        recover_routes_with(
+            dir.path(),
+            None,
+            Some("hole-tun"),
+            |_, _c, _p| Ok(()),
+            |_lock, adopting| steps.borrow_mut().push(Step::Sweep { adopting }),
+            || Intent::Unset,
+            || Live,
+            |_lock, action, tun_name| {
+                steps
+                    .borrow_mut()
+                    .push(Step::Recover(action, tun_name.map(str::to_owned)))
+            },
+        );
+    }
+    assert_eq!(
+        steps.into_inner(),
+        [
+            Step::Recover(Adopt, Some("hole-tun".into())),
+            Step::Sweep { adopting: true }
+        ],
+        "the decline must not stop the Adopt or the sweep"
+    );
+
+    let log = writer.snapshot();
+    assert!(
+        log.contains("declined the promotion"),
+        "the decline must be warned: {log}"
+    );
+    assert_eq!(
+        failclosed::lockdown_state::load_intent(dir.path()),
+        Intent::Off,
+        "the record is left as it was"
+    );
+}
+
+/// The same window with an `On` landing over a recorded `Off`: the cover is adopted as the `On` says, not swept on
+/// the `Off` a read taken before route recovery would have seen.
+#[skuld::test]
+fn recovery_does_not_sweep_a_cover_armed_during_route_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    save_record(dir.path(), &route_record(), None).unwrap();
+    {
+        let lock = failclosed::CoverLock::acquire(dir.path());
+        failclosed::lockdown_state::set_enabled(&lock, false, None).unwrap();
+    }
+    let acted: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
+    let landed = std::cell::Cell::new(false);
+    let decision = recover_routes_with(
+        dir.path(),
+        None,
+        Some("hole-tun"),
+        |_, _c, _p| {
+            if !landed.replace(true) {
+                let lock = failclosed::CoverLock::acquire(dir.path());
+                failclosed::lockdown_state::set_enabled(&lock, true, None).unwrap();
+            }
+            Ok(())
+        },
+        |_lock, _adopting| {},
+        || failclosed::lockdown_state::load_intent(dir.path()),
+        || Live,
+        |_lock, action, _tun_name| acted.set(Some(action)),
+    );
+
+    assert!(landed.get(), "the On landed during route recovery");
+    assert_eq!(acted.get(), Some(Adopt));
+    assert_eq!(decision.action, Adopt);
+    assert_eq!(failclosed::lockdown_state::load_intent(dir.path()), Intent::On);
+}
+
+/// An unreadable record may hold the user's `Off` (a newer or garbled schema): the cover is adopted and the
+/// record is left exactly as it is.
+#[skuld::test]
+fn recover_adopts_a_live_cover_and_leaves_an_unreadable_intent_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(failclosed::lockdown_state::STATE_FILE_NAME);
+    let garbled = b"{corrupt";
+    std::fs::write(&path, garbled).unwrap();
     let (decision, acted) = recover_over(dir.path(), Live);
 
     assert_eq!(acted, Some(Adopt));
-    assert!(decision.record_intent_on);
-    assert_eq!(failclosed::lockdown_state::load_intent(dir.path()), Intent::On);
+    assert!(!decision.record_intent_on);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        garbled,
+        "not one byte of it is rewritten"
+    );
+    assert_eq!(failclosed::lockdown_state::load_intent(dir.path()), Intent::Unreadable);
+}
+
+/// A read that fails (a directory at the name) classifies `Unreadable` as well, and is left alone.
+#[skuld::test]
+fn recover_leaves_an_intent_whose_read_fails_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(failclosed::lockdown_state::STATE_FILE_NAME);
+    std::fs::create_dir(&path).unwrap();
+    let (decision, acted) = recover_over(dir.path(), Live);
+
+    assert_eq!(acted, Some(Adopt));
+    assert!(!decision.record_intent_on);
+    assert!(path.is_dir(), "the name still holds what it held");
+    assert_eq!(failclosed::lockdown_state::load_intent(dir.path()), Intent::Unreadable);
 }
 
 #[skuld::test]
@@ -1867,9 +2051,9 @@ fn recover_prefers_its_own_route_state_tun_name_over_the_fallback() {
         Some("hole-tun-fallback"),
         |_, _c, _p| Ok(()),
         |_d, _a| {},
-        Intent::On,
+        || Intent::On,
         || Live,
-        |_decision, tun_name| *seen.borrow_mut() = Some(tun_name.map(str::to_owned)),
+        |_lock, _decision, tun_name| *seen.borrow_mut() = Some(tun_name.map(str::to_owned)),
     );
     assert_eq!(
         seen.into_inner(),
@@ -1895,9 +2079,9 @@ fn recover_falls_back_to_the_given_tun_name_when_no_route_state_exists() {
         Some("hole-tun-fallback"),
         |_, _c, _p| Ok(()),
         |_d, _a| {},
-        Intent::On,
+        || Intent::On,
         || Live,
-        |_decision, tun_name| *seen.borrow_mut() = Some(tun_name.map(str::to_owned)),
+        |_lock, _decision, tun_name| *seen.borrow_mut() = Some(tun_name.map(str::to_owned)),
     );
     assert_eq!(
         seen.into_inner(),
@@ -1918,9 +2102,9 @@ fn recover_returns_its_decision() {
             Some("hole-tun"),
             |_, _c, _p| Ok(()),
             |_d, _a| {},
-            intent,
+            || intent,
             || presence,
-            |_action, _tun_name| {},
+            |_lock, _action, _tun_name| {},
         );
         assert_eq!(
             returned,
@@ -2130,9 +2314,9 @@ fn recovery_deletes_only_the_recorded_routes() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let log = log.into_inner();
@@ -2172,9 +2356,9 @@ fn recovery_bypass_phase_does_not_repeat_the_split_deletes() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let log = log.into_inner();
@@ -2227,9 +2411,9 @@ fn recover_attempts_a_stale_group_and_clears_the_file_once_everything_drains() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let log = log.into_inner();
@@ -2287,9 +2471,9 @@ fn recover_keeps_the_file_when_only_the_stale_group_fails_to_confirm_gone() {
         Some("hole-tun"),
         runner,
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     assert!(
@@ -3279,9 +3463,9 @@ fn recovery_never_issues_the_same_split_delete_twice_across_groups() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let log = log.into_inner();
@@ -3336,9 +3520,9 @@ fn recovery_never_issues_the_same_macos_split_delete_twice_across_different_tun_
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let log = log.into_inner();
@@ -3398,9 +3582,9 @@ fn recover_groups_issues_one_bypass_delete_for_two_unmerged_groups() {
         Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
-        failclosed::lockdown_state::Intent::Off,
+        || failclosed::lockdown_state::Intent::Off,
         || CoverPresence::Absent,
-        |_, _| {},
+        |_lock, _, _| {},
     );
 
     let log = log.into_inner();

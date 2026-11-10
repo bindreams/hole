@@ -6,12 +6,8 @@
 //! Sweep to restore the host without `-Fa`, matching the engaged-without-flush
 //! contract).
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
-use util::versioned_file::{
-    Change, DefaultPlacement, Obsolete, Role, Schema, StoreError, UpdateOutcome, VersionedFile, VersionedState,
-};
+use util::versioned_file::{Obsolete, Role, Schema, VersionedState};
 
 pub const STATE_FILE_NAME: &str = "bridge-lockdown-pf.json";
 
@@ -21,7 +17,8 @@ pub struct LockdownPfState {
     pub pf_token: String,
     /// The host's filter ruleset (`pfctl -sr`) captured before we replaced the
     /// main ruleset with the lockdown policy. Re-loaded on Sweep so the host
-    /// returns to its pre-lockdown policy (NOT a blind `/etc/pf.conf` reload).
+    /// returns to its pre-lockdown policy. A record with no captured baseline (below) reloads `/etc/pf.conf` instead
+    /// (`StateFile::restore_choice`), and so does a snapshot that will not load (the restore falls back).
     pub main_snapshot: String,
     /// The host's translation rules (`pfctl -sn`: nat/rdr) captured alongside
     /// `main_snapshot`. Carried forward into the lockdown ruleset (so the
@@ -29,8 +26,8 @@ pub struct LockdownPfState {
     pub nat_snapshot: String,
     /// `false` when the host's filter ruleset at engage time was our OWN cover,
     /// so there was no pre-lockdown baseline to capture; a restore then reloads
-    /// `/etc/pf.conf` instead of `main_snapshot`. Read by `disengage_lockdown`
-    /// and by `release_all_with`'s standing `Present` arm.
+    /// `/etc/pf.conf` instead of `main_snapshot`. Read by
+    /// `StateFile::restore_choice`, which every standing release asks.
     ///
     /// A bool, not `main_snapshot.is_empty()`: a host really can have an empty
     /// filter ruleset, and that IS its policy — keying on emptiness would
@@ -38,11 +35,11 @@ pub struct LockdownPfState {
     ///
     /// Defaults `true` (NO schema bump) so a file written before this field
     /// existed reads as the captured baseline it was. Bumping the schema
-    /// version instead would make every existing file `Unusable`, which
-    /// [`load`] collapses to `None`, which makes `disengage_lockdown`
-    /// early-return `Ok(())` over a still-blocked host — silently breaking
-    /// `hole bridge unlock` and the tray's Unblock item on the ordinary macOS
-    /// upgrade path.
+    /// version instead would make every existing file `Unusable`, which a
+    /// reader that took it for an absent record would answer with an early
+    /// `Ok(())` from `disengage_lockdown` over a still-blocked host — silently
+    /// breaking `hole bridge unlock` and the tray's Unblock item on the
+    /// ordinary macOS upgrade path.
     #[serde(default = "default_true")]
     pub main_snapshot_captured: bool,
 }
@@ -61,7 +58,7 @@ impl Schema for LockdownPfState {
 }
 
 /// A cover's evidence: one this release cannot read is moved aside by a clear and backed up by a store, and its
-/// token is still salvaged for the sweep ([`super::StateFile::from`]).
+/// token is still salvaged for the sweep ([`super::StateFile::view`]).
 impl VersionedState for LockdownPfState {
     const FILE_NAME: &'static str = STATE_FILE_NAME;
     const ROLE: Role = Role::Cover;
@@ -69,51 +66,39 @@ impl VersionedState for LockdownPfState {
 
 util::assert_contiguous!(LockdownPfState);
 
-/// The record file. Every read and write of it goes through this type.
-pub type LockdownPfFile = VersionedFile<LockdownPfState>;
-
-pub fn file(state_dir: &Path) -> LockdownPfFile {
-    VersionedFile::new(state_dir)
-}
-
-/// Atomically persist `state`, creating `state_dir`. A file this release cannot read is backed up beside it first.
-pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> Result<(), StoreError> {
-    file(state_dir)
-        .update(&DefaultPlacement { owner }, |_| (Change::Store(state.clone()), ()))
-        .map(|_| ())
-}
-
-/// Trichotomy read distinguishing "no cover was ever engaged" (`Absent`) from
-/// "a cover's evidence exists but we cannot read it" (`Unusable`) — a corrupt,
-/// unparseable, or version-skewed file. Collapsing `Unusable` into `Absent`
-/// would make a release read a live, blocking cover as nothing to clear (see
-/// `release_all`'s doc). `Absent` is ONLY `ErrorKind::NotFound`; every other
-/// read/parse/version failure is `Unusable`. The parse failure is logged by the
-/// read as a category and a position: `main_snapshot` is a captured `pfctl -sr`
-/// ruleset, which holds the server IP whenever it captured Hole's own cover.
-pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
-    super::StateFile::from(file(state_dir).observe().loaded)
-}
-
-/// Load the state file, or `None` on any error (absent / corrupt / version
-/// mismatch). Thin wrapper over [`load_presence`], collapsing
-/// `Unusable` into `None` alongside `Absent` — every existing caller treats
-/// the two identically.
-pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
-    match load_presence(state_dir) {
-        super::StateFile::Present(s) => Some(s),
-        super::StateFile::Absent | super::StateFile::Unusable { .. } => None,
+impl super::pf_record::PfRecord for LockdownPfState {
+    fn pf_token(&self) -> &str {
+        &self.pf_token
     }
 }
 
-/// Remove the state file; absence is [`UpdateOutcome::Absent`]. A record this release cannot read is moved aside, and
-/// one whose read failed is [`UpdateOutcome::Kept`]. `Err` only on a real I/O error.
-pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
-    file(state_dir)
-        .update(&DefaultPlacement::default(), |_| (Change::Remove, ()))
-        .map(|((), outcome)| outcome)
+impl super::StateFile<LockdownPfState> {
+    /// The release's restore choice: the baseline a standing release loads, or `None` when it must reload
+    /// `/etc/pf.conf`. Every release of the standing cover asks it, and an unusable or unreadable record says here that
+    /// it has no snapshot to restore. That is a log line, so this is not a pure query: ask it once per release.
+    ///
+    /// A record with no captured baseline has none to load: its `main_snapshot` is empty, and loading that would leave
+    /// a pass-all host. No record at all means presence was established by pf's label alone.
+    pub(crate) fn restore_choice(&self) -> Option<&LockdownPfState> {
+        use super::StateFile;
+        match self {
+            StateFile::Present(st) if st.main_snapshot_captured => Some(st),
+            StateFile::Present(_) => None,
+            StateFile::Absent => None,
+            StateFile::Unusable { .. } => {
+                tracing::warn!(
+                    "standing lockdown-pf-state file is unusable; no snapshot to restore, falling back to the \
+                     default ruleset"
+                );
+                None
+            }
+            StateFile::Unreadable => {
+                tracing::warn!(
+                    "standing lockdown-pf-state file could not be read; no snapshot to restore, falling back to \
+                     the default ruleset"
+                );
+                None
+            }
+        }
+    }
 }
-
-#[cfg(test)]
-#[path = "lockdown_pf_state_tests.rs"]
-mod lockdown_pf_state_tests;

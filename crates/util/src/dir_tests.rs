@@ -344,6 +344,66 @@ fn a_missing_name_is_not_found_and_has_no_id() {
     );
 }
 
+// owner_of ------------------------------------------------------------------------------------------------------------
+
+/// The `(uid, gid)` the system reports for `path` itself, a link not followed. Windows has no such pair.
+fn lstat_owner(path: &Path) -> Option<(u32, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        Some((meta.uid(), meta.gid()))
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[skuld::test]
+fn owner_of_says_the_owner_of_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("f"), b"x").unwrap();
+
+    assert_eq!(dir.owner_of(&name("f")).unwrap(), lstat_owner(&tmp.path().join("f")));
+}
+
+#[skuld::test]
+fn owner_of_says_none_for_an_absent_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    assert_eq!(dir.owner_of(&name("absent")).unwrap(), None);
+}
+
+/// A link is not a file whose owner a writer may keep: refused, never followed to its target's owner.
+#[cfg(unix)]
+#[skuld::test]
+fn owner_of_refuses_a_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("target"), b"x").unwrap();
+    plant_file_symlink(&tmp.path().join("target"), &tmp.path().join("link"));
+
+    let err = dir.owner_of(&name("link")).unwrap_err();
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular), "{err:?}");
+}
+
+/// A second name is what a hard link a user planted adds; the owner of such a file is not the writer's to keep.
+#[cfg(unix)]
+#[skuld::test]
+fn owner_of_refuses_a_file_with_a_second_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    std::fs::write(tmp.path().join("f"), b"x").unwrap();
+    std::fs::hard_link(tmp.path().join("f"), tmp.path().join("second")).unwrap();
+
+    let err = dir.owner_of(&name("f")).unwrap_err();
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::ForeignFile), "{err:?}");
+}
+
 #[skuld::test]
 fn unlink_removes_the_name_and_not_what_a_symlink_points_at() {
     let tmp = tempfile::tempdir().unwrap();
@@ -378,6 +438,7 @@ fn a_name_that_is_not_one_file_name_is_refused_by_every_operation() {
             "{bad:?}"
         );
         assert_eq!(kind(dir.id_of(&bad)), Some(io::ErrorKind::InvalidInput), "{bad:?}");
+        assert_eq!(kind(dir.owner_of(&bad)), Some(io::ErrorKind::InvalidInput), "{bad:?}");
         assert_eq!(kind(dir.unlink(&bad)), Some(io::ErrorKind::InvalidInput), "{bad:?}");
         assert_eq!(
             kind(dir.write_atomic(&bad, b"", None, |_| Ok(())).map(|_| ())),

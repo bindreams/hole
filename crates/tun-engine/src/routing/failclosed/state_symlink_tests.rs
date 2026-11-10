@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use util::dir::testing::{plant_link, user_dir, SystemScratch};
 
-use super::{boottime_witness, lockdown_state};
+use super::{boottime_witness, lockdown_state, pf_record, CoverLock};
 
 /// A state directory that is a link to the folder the system owns, and the system's folder to look in: it is
 /// shared, so what it held before is what it must hold after.
@@ -28,7 +28,7 @@ fn lockdown_state_is_not_written_through_a_symlinked_state_directory() {
     let names = [lockdown_state::STATE_FILE_NAME];
     let before = present(&scratch, &names);
 
-    assert!(lockdown_state::set_enabled(&state_dir, true, None).is_err());
+    assert!(lockdown_state::set_enabled(&CoverLock::acquire(&state_dir), true, None).is_err());
 
     assert_eq!(
         present(&scratch, &names),
@@ -44,7 +44,7 @@ fn the_boottime_witness_is_not_written_through_a_symlinked_state_directory() {
     let before = present(&scratch, &names);
 
     // Reports no error by design; it must still write nothing.
-    boottime_witness::record_armed(&state_dir, None);
+    boottime_witness::record_armed(&CoverLock::acquire(&state_dir), None);
 
     assert_eq!(
         present(&scratch, &names),
@@ -54,9 +54,8 @@ fn the_boottime_witness_is_not_written_through_a_symlinked_state_directory() {
 }
 
 #[skuld::test]
-#[cfg(target_os = "macos")]
 fn failclosed_state_is_not_written_through_a_symlinked_state_directory() {
-    use super::failclosed_state::{save, FailClosedState, STATE_FILE_NAME};
+    use super::failclosed_state::{FailClosedState, STATE_FILE_NAME};
     let (_tmp, scratch, state_dir) = state_dir_linked_to_the_system();
     let before = present(&scratch, &[STATE_FILE_NAME]);
     let state = FailClosedState {
@@ -64,7 +63,9 @@ fn failclosed_state_is_not_written_through_a_symlinked_state_directory() {
         pf_was_enabled: true,
     };
 
-    assert!(save(&state_dir, &state, None).is_err());
+    let lock = CoverLock::acquire(&state_dir);
+
+    assert!(pf_record::swap(&lock, &state, None).is_err());
 
     assert_eq!(
         present(&scratch, &[STATE_FILE_NAME]),
@@ -74,9 +75,8 @@ fn failclosed_state_is_not_written_through_a_symlinked_state_directory() {
 }
 
 #[skuld::test]
-#[cfg(target_os = "macos")]
 fn lockdown_pf_state_is_not_written_through_a_symlinked_state_directory() {
-    use super::lockdown_pf_state::{save, LockdownPfState, STATE_FILE_NAME};
+    use super::lockdown_pf_state::{LockdownPfState, STATE_FILE_NAME};
     let (_tmp, scratch, state_dir) = state_dir_linked_to_the_system();
     let before = present(&scratch, &[STATE_FILE_NAME]);
     let state = LockdownPfState {
@@ -86,7 +86,9 @@ fn lockdown_pf_state_is_not_written_through_a_symlinked_state_directory() {
         main_snapshot_captured: false,
     };
 
-    assert!(save(&state_dir, &state, None).is_err());
+    let lock = CoverLock::acquire(&state_dir);
+
+    assert!(pf_record::swap(&lock, &state, None).is_err());
 
     assert_eq!(
         present(&scratch, &[STATE_FILE_NAME]),
@@ -103,7 +105,7 @@ fn lockdown_state_is_written_through_a_users_link_to_the_users_folder() {
     let state_dir = tmp.path().join("state");
     plant_link(&real, &state_dir);
 
-    lockdown_state::set_enabled(&state_dir, true, None).unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(&state_dir), true, None).unwrap();
 
     assert!(real.join(lockdown_state::STATE_FILE_NAME).is_file());
 }
@@ -116,7 +118,6 @@ fn lockdown_state_is_written_through_a_users_link_to_the_users_folder() {
 
 use util::dir::testing::{planted_name_is_not_read, PlantedName, Reader};
 
-#[cfg(target_os = "macos")]
 fn write_state(dir: &std::path::Path, name: &str, json: &[u8]) {
     util::dir::Dir::open(dir, true, None)
         .unwrap()
@@ -126,13 +127,12 @@ fn write_state(dir: &std::path::Path, name: &str, json: &[u8]) {
 
 /// The readers by name, and what each reports of a valid file.
 fn readers() -> Vec<(&'static str, Reader<'static>)> {
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut readers = vec![
         (
             "lockdown_state::load_intent",
             Reader {
                 file: lockdown_state::STATE_FILE_NAME,
-                write_valid: &|dir| lockdown_state::set_enabled(dir, true, None).unwrap(),
+                write_valid: &|dir| lockdown_state::set_enabled(&CoverLock::acquire(dir), true, None).unwrap(),
                 reads_it: &|dir| lockdown_state::load_intent(dir) == lockdown_state::Intent::On,
             },
         ),
@@ -140,23 +140,23 @@ fn readers() -> Vec<(&'static str, Reader<'static>)> {
             "boottime_witness::load",
             Reader {
                 file: boottime_witness::STATE_FILE_NAME,
-                write_valid: &|dir| boottime_witness::record_armed(dir, None),
+                write_valid: &|dir| boottime_witness::record_armed(&CoverLock::acquire(dir), None),
                 reads_it: &|dir| boottime_witness::load(dir) == super::ArmingWitness::Armed,
             },
         ),
     ];
-    #[cfg(target_os = "macos")]
     readers.extend(pf_readers());
     readers
 }
 
-/// The two readers of the pf state, which only macOS compiles.
-#[cfg(target_os = "macos")]
+/// The two readers of the pf state.
 fn pf_readers() -> Vec<(&'static str, Reader<'static>)> {
-    use super::{failclosed_state, lockdown_pf_state, StateFile};
+    use super::failclosed_state::{self, FailClosedState};
+    use super::lockdown_pf_state::{self, LockdownPfState};
+    use super::StateFile;
     vec![
         (
-            "failclosed_state::load_presence",
+            "pf_record::read::<FailClosedState>",
             Reader {
                 file: failclosed_state::STATE_FILE_NAME,
                 write_valid: &|dir| {
@@ -166,11 +166,11 @@ fn pf_readers() -> Vec<(&'static str, Reader<'static>)> {
                         br#"{"version":1,"pf_token":"1","pf_was_enabled":true}"#,
                     );
                 },
-                reads_it: &|dir| matches!(failclosed_state::load_presence(dir), StateFile::Present(_)),
+                reads_it: &|dir| matches!(pf_record::read::<FailClosedState>(dir), StateFile::Present(_)),
             },
         ),
         (
-            "lockdown_pf_state::load_presence",
+            "pf_record::read::<LockdownPfState>",
             Reader {
                 file: lockdown_pf_state::STATE_FILE_NAME,
                 write_valid: &|dir| {
@@ -180,7 +180,7 @@ fn pf_readers() -> Vec<(&'static str, Reader<'static>)> {
                         br#"{"version":1,"pf_token":"1","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":false}"#,
                     );
                 },
-                reads_it: &|dir| matches!(lockdown_pf_state::load_presence(dir), StateFile::Present(_)),
+                reads_it: &|dir| matches!(pf_record::read::<LockdownPfState>(dir), StateFile::Present(_)),
             },
         ),
     ]
@@ -255,7 +255,6 @@ fn warnings_for_a_file_that_quotes_a_secret(file: &str, head: &str, read: fn(&st
 type ParseFailureReader = (&'static str, &'static str, &'static str, fn(&std::path::Path));
 
 fn parse_failure_readers() -> Vec<ParseFailureReader> {
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut readers: Vec<ParseFailureReader> = vec![
         (
             "lockdown_state::load_intent",
@@ -274,23 +273,23 @@ fn parse_failure_readers() -> Vec<ParseFailureReader> {
             },
         ),
     ];
-    #[cfg(target_os = "macos")]
     {
-        use super::{failclosed_state, lockdown_pf_state};
+        use super::failclosed_state::{self, FailClosedState};
+        use super::lockdown_pf_state::{self, LockdownPfState};
         readers.push((
-            "failclosed_state::load_presence",
+            "pf_record::read::<FailClosedState>",
             failclosed_state::STATE_FILE_NAME,
             r#""version":1,"pf_token":"1","pf_was_enabled":"#,
             |dir| {
-                let _ = failclosed_state::load_presence(dir);
+                let _ = pf_record::read::<FailClosedState>(dir);
             },
         ));
         readers.push((
-            "lockdown_pf_state::load_presence",
+            "pf_record::read::<LockdownPfState>",
             lockdown_pf_state::STATE_FILE_NAME,
             r#""version":1,"pf_token":"1","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":"#,
             |dir| {
-                let _ = lockdown_pf_state::load_presence(dir);
+                let _ = pf_record::read::<LockdownPfState>(dir);
             },
         ));
     }
